@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Miniharness: run sample goal",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "miniharness.cli",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}\\.env",
+      "args": [
+        "请列出当前项目文件，并简短说明 agent loop 在哪里。",
+        "--max-turns",
+        "6"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
