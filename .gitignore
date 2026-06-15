@@ -1,6 +1,8 @@
 .miniharness/
 .venv/
 .env
+outputs/
+work/
 __pycache__/
 *.py[cod]
 *.egg-info/

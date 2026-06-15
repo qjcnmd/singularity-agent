@@ -8,6 +8,7 @@ Miniharness is a tiny read-only CLI coding agent harness. It is intentionally sm
 .
 ├── pyproject.toml
 ├── README.md
+├── tests/
 └── src/
     └── miniharness/
         ├── __init__.py
@@ -67,6 +68,8 @@ $env:MINIHARNESS_API_KEY = "local-key"
 $env:MINIHARNESS_MODEL = "your-model"
 ```
 
+The `.env` file is only loaded automatically by VSCode's `launch.json` debug configuration. A normal terminal session does not read `.env` by itself, so set the variables manually as shown above, or load them into the shell before running `miniharness`.
+
 ## Run
 
 ```powershell
@@ -78,6 +81,22 @@ You can cap the loop:
 ```powershell
 miniharness "找一下 agent loop 在哪里" --max-turns 6
 ```
+
+## Test
+
+Install the development dependency:
+
+```powershell
+python -m pip install -e ".[dev]"
+```
+
+Run the tests:
+
+```powershell
+python -m pytest tests --basetemp work/pytest-tmp
+```
+
+The tests use temporary files and a mock provider. They do not call a live model API and do not require `.env`.
 
 ## Agent Loop Flow
 
