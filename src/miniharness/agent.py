@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from rich.console import Console
 
+from miniharness.context import ContextManager
 from miniharness.provider import OpenAICompatibleProvider
 from miniharness.tools import ToolRegistry
 from miniharness.trace import TraceWriter
@@ -38,14 +38,12 @@ class MiniAgent:
         self.max_turns = max_turns
 
     def run(self, user_goal: str) -> str:
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_goal},
-        ]
+        context = ContextManager(system_prompt=SYSTEM_PROMPT, user_goal=user_goal)
         tool_schemas = self.tools.openai_tools()
 
         for turn in range(1, self.max_turns + 1):
             self.console.print(f"[cyan]model turn {turn}[/cyan]")
+            messages = context.messages()
             self.trace.record(
                 "model_request",
                 {"turn": turn, "messages": messages, "tools": tool_schemas},
@@ -55,7 +53,7 @@ class MiniAgent:
             self.trace.record("model_response", {"turn": turn, "response": response})
 
             assistant_message = self._extract_assistant_message(response)
-            messages.append(assistant_message)
+            context.add_assistant_message(assistant_message)
 
             tool_calls = assistant_message.get("tool_calls") or []
             if not tool_calls:
@@ -82,14 +80,7 @@ class MiniAgent:
                         "result": result,
                     },
                 )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.get("id"),
-                        "name": name,
-                        "content": json.dumps(result, ensure_ascii=False),
-                    }
-                )
+                context.add_tool_result(tool_call=tool_call, result=result)
 
         message = f"Stopped after max_turns={self.max_turns}; the model did not produce a final answer."
         self.trace.record("error", {"type": "MaxTurnsExceeded", "message": message})
