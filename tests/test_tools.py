@@ -46,8 +46,8 @@ def test_read_file_reads_project_file(tmp_path: Path) -> None:
     )
 
     assert result["ok"] is True
-    assert result["path"] == "README.md"
-    assert result["content"] == "hello from miniharness"
+    assert result["content"]["path"] == "README.md"
+    assert result["content"]["content"] == "hello from miniharness"
     assert result["truncated"] is False
 
 
@@ -61,7 +61,8 @@ def test_read_file_rejects_path_escape(tmp_path: Path) -> None:
     )
 
     assert result["ok"] is False
-    assert "escapes project root" in result["error"]
+    assert result["error_code"] == "validation_error"
+    assert "escapes project root" in result["error"]["message"]
 
 
 def test_dispatch_returns_error_for_invalid_json(tmp_path: Path) -> None:
@@ -70,7 +71,8 @@ def test_dispatch_returns_error_for_invalid_json(tmp_path: Path) -> None:
     result = registry.dispatch(make_raw_tool_call("read_file", "{not json"))
 
     assert result["ok"] is False
-    assert "Invalid JSON arguments" in result["error"]
+    assert result["error_code"] == "bad_arguments_json"
+    assert "Invalid JSON arguments" in result["error"]["message"]
 
 
 def test_dispatch_returns_error_for_unknown_tool(tmp_path: Path) -> None:
@@ -79,4 +81,5 @@ def test_dispatch_returns_error_for_unknown_tool(tmp_path: Path) -> None:
     result = registry.dispatch(make_tool_call("missing_tool", {"path": "README.md"}))
 
     assert result["ok"] is False
-    assert result["error"] == "Unknown tool: missing_tool"
+    assert result["error_code"] == "tool_not_found"
+    assert result["error"]["message"] == "Unknown tool: missing_tool"

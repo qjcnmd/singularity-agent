@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
+
+from miniharness.tools.models import (
+    PermissionLevel,
+    ToolExecutionFailure,
+    ToolSpec,
+)
 
 
 SKIP_DIRS = {
@@ -39,61 +44,16 @@ class SearchTextInput(BaseModel):
     max_results: int = Field(50, ge=1, le=200, description="Maximum matches to return.")
 
 
-class ToolRegistry:
+class ReadOnlyToolHandlers:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root.resolve()
-        self._tools: dict[str, tuple[type[BaseModel], Callable[[BaseModel], dict[str, Any]]]] = {
-            "list_files": (ListFilesInput, self._list_files),
-            "read_file": (ReadFileInput, self._read_file),
-            "search_text": (SearchTextInput, self._search_text),
-        }
 
-    def openai_tools(self, *, strict: bool = False) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        for name, (schema, _handler) in self._tools.items():
-            parameters = schema.model_json_schema()
-            function: dict[str, Any] = {
-                "name": name,
-                "description": self._description_for(name),
-                "parameters": self._parameters_schema(parameters, strict=strict),
-            }
-            if strict:
-                function["strict"] = True
-            tools.append(
-                {
-                    "type": "function",
-                    "function": function,
-                },
-            )
-        return tools
-
-    def dispatch(self, tool_call: dict[str, Any]) -> dict[str, Any]:
-        function = tool_call.get("function") or {}
-        name = function.get("name")
-        raw_arguments = function.get("arguments") or "{}"
-
-        if name not in self._tools:
-            return {"ok": False, "error": f"Unknown tool: {name}"}
-
-        schema, handler = self._tools[name]
-        try:
-            arguments = json.loads(raw_arguments)
-            validated = schema.model_validate(arguments)
-            return handler(validated)
-        except json.JSONDecodeError as exc:
-            return {"ok": False, "error": f"Invalid JSON arguments: {exc}"}
-        except ValidationError as exc:
-            return {"ok": False, "error": exc.errors()}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-
-    def _list_files(self, data: BaseModel) -> dict[str, Any]:
-        args = self._cast(data, ListFilesInput)
+    def list_files(self, args: ListFilesInput) -> dict[str, Any]:
         root = self._resolve_inside_root(args.path)
         if not root.exists():
-            return {"ok": False, "error": f"Path does not exist: {args.path}"}
+            raise ToolExecutionFailure(f"Path does not exist: {args.path}")
         if not root.is_dir():
-            return {"ok": False, "error": f"Path is not a directory: {args.path}"}
+            raise ToolExecutionFailure(f"Path is not a directory: {args.path}")
 
         files: list[str] = []
         for path in sorted(root.rglob("*")):
@@ -104,24 +64,22 @@ class ToolRegistry:
             if path.is_file():
                 files.append(self._relative(path))
 
-        return {"ok": True, "root": self._relative(root), "files": files}
+        return {"root": self._relative(root), "files": files}
 
-    def _read_file(self, data: BaseModel) -> dict[str, Any]:
-        args = self._cast(data, ReadFileInput)
+    def read_file(self, args: ReadFileInput) -> dict[str, Any]:
         path = self._resolve_inside_root(args.path)
         if not path.exists():
-            return {"ok": False, "error": f"File does not exist: {args.path}"}
+            raise ToolExecutionFailure(f"File does not exist: {args.path}")
         if not path.is_file():
-            return {"ok": False, "error": f"Path is not a file: {args.path}"}
+            raise ToolExecutionFailure(f"Path is not a file: {args.path}")
 
         raw = path.read_bytes()
         truncated = len(raw) > args.max_bytes
         chunk = raw[: args.max_bytes]
         if self._looks_binary(chunk):
-            return {"ok": False, "error": f"File appears to be binary: {args.path}"}
+            raise ToolExecutionFailure(f"File appears to be binary: {args.path}")
 
         return {
-            "ok": True,
             "path": self._relative(path),
             "content": chunk.decode("utf-8", errors="replace"),
             "truncated": truncated,
@@ -129,11 +87,10 @@ class ToolRegistry:
             "bytes_total": len(raw),
         }
 
-    def _search_text(self, data: BaseModel) -> dict[str, Any]:
-        args = self._cast(data, SearchTextInput)
+    def search_text(self, args: SearchTextInput) -> dict[str, Any]:
         start = self._resolve_inside_root(args.path)
         if not start.exists():
-            return {"ok": False, "error": f"Path does not exist: {args.path}"}
+            raise ToolExecutionFailure(f"Path does not exist: {args.path}")
 
         files = [start] if start.is_file() else sorted(start.rglob("*"))
         needle = args.query if args.case_sensitive else args.query.lower()
@@ -165,7 +122,6 @@ class ToolRegistry:
                         break
 
         return {
-            "ok": True,
             "query": args.query,
             "matches": matches,
             "truncated": len(matches) >= args.max_results,
@@ -174,7 +130,10 @@ class ToolRegistry:
     def _resolve_inside_root(self, user_path: str) -> Path:
         path = (self.project_root / user_path).resolve()
         if path != self.project_root and self.project_root not in path.parents:
-            raise ValueError(f"Path escapes project root: {user_path}")
+            raise ToolExecutionFailure(
+                f"Path escapes project root: {user_path}",
+                code="validation_error",
+            )
         return path
 
     def _relative(self, path: Path) -> str:
@@ -193,24 +152,51 @@ class ToolRegistry:
     def _looks_binary(raw: bytes) -> bool:
         return b"\x00" in raw
 
-    @staticmethod
-    def _description_for(name: str) -> str:
-        descriptions = {
-            "list_files": "List files inside the current project root.",
-            "read_file": "Read a UTF-8 text file inside the current project root.",
-            "search_text": "Search for text in files inside the current project root.",
-        }
-        return descriptions[name]
 
-    @staticmethod
-    def _cast(data: BaseModel, expected: type[BaseModel]) -> Any:
-        if not isinstance(data, expected):
-            raise TypeError(f"Expected {expected.__name__}, got {type(data).__name__}")
-        return data
-
-    @staticmethod
-    def _parameters_schema(parameters: dict[str, Any], *, strict: bool) -> dict[str, Any]:
-        if strict and parameters.get("type") == "object":
-            parameters = dict(parameters)
-            parameters["additionalProperties"] = False
-        return parameters
+def register_read_only_tools(registry: Any) -> None:
+    handlers = ReadOnlyToolHandlers(registry.project_root)
+    registry.register(
+        ToolSpec(
+            name="list_files",
+            version="0.0.4",
+            description="List files inside the current project root.",
+            input_model=ListFilesInput,
+            handler=handlers.list_files,
+            permission_level=PermissionLevel.READ_ONLY,
+            risk_tags=("read", "filesystem"),
+            timeout_seconds=5.0,
+            max_output_chars=20000,
+            cacheable=True,
+            idempotent=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="read_file",
+            version="0.0.4",
+            description="Read a UTF-8 text file inside the current project root.",
+            input_model=ReadFileInput,
+            handler=handlers.read_file,
+            permission_level=PermissionLevel.READ_ONLY,
+            risk_tags=("read", "filesystem"),
+            timeout_seconds=5.0,
+            max_output_chars=20000,
+            cacheable=True,
+            idempotent=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="search_text",
+            version="0.0.4",
+            description="Search for text in files inside the current project root.",
+            input_model=SearchTextInput,
+            handler=handlers.search_text,
+            permission_level=PermissionLevel.READ_ONLY,
+            risk_tags=("read", "filesystem"),
+            timeout_seconds=5.0,
+            max_output_chars=20000,
+            cacheable=True,
+            idempotent=True,
+        )
+    )

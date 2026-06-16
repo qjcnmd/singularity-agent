@@ -1,6 +1,14 @@
-# Miniharness v0.0.3
+# Miniharness v0.0.7
 
-Miniharness is a tiny read-only CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, tools, and trace file connect without using LangChain, LangGraph, or any other agent framework.
+Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, tools, context manager, trace file, workspace mutation runtime, and command runtime connect without using LangChain, LangGraph, or any other agent framework.
+
+v0.0.7 adds the Command / Shell Execution Runtime. Test, build, formatter, package manager, dev server, read-only git, and other process execution now flow through `CommandRequest`, `CommandPlan`, `CommandPolicy`, `ExecutionBackend`, `ProcessSupervisor`, resource limits, env redaction, output artifacts, workspace side-effect tracking, command observations, and structured command trace audit events.
+
+v0.0.6 upgrades file modification from demo-style `write_file` into a Workspace Mutation Runtime. Agent-owned changes now flow through `ChangeSet`, `MutationTransaction`, snapshots, structured policy decisions, atomic writes, diffs, journal entries, rollback checks, trace audit records, and compact context observations.
+
+v0.0.5 added the production Context Manager slice: context assembly is token-budget aware, tool observations are persisted to SQLite with references, long histories can be compressed, and run state can be recovered after interruption.
+
+v0.0.4 added the Tool Runtime minimal production slice: tool calls execute through `ToolSpec`, `ToolRegistry`, `ToolRuntime`, `ToolPolicy`, and structured `ToolResult` / `ToolError` objects.
 
 ## Project Structure
 
@@ -12,13 +20,15 @@ Miniharness is a tiny read-only CLI coding agent harness. It is intentionally sm
 └── src/
     └── miniharness/
         ├── __init__.py
-        ├── agent.py       # agent loop
-        ├── cli.py         # Typer command entry
-        ├── config.py      # environment variable loading
-        ├── context/       # context manager and tool observations
-        ├── provider.py    # OpenAI-compatible HTTP call via httpx
-        ├── tools.py       # read-only tools and Pydantic schemas
-        └── trace.py       # JSONL trace writer
+        ├── agent.py        # agent loop
+        ├── cli.py          # Typer command entry
+        ├── command/        # command runtime: policy, backend, output, process sessions
+        ├── config.py       # environment variable loading
+        ├── context/        # token budgets, context assembly, observations, recovery
+        ├── provider.py     # OpenAI-compatible HTTP call via httpx
+        ├── tools/          # tool specs, registry, runtime, policy, read-only and mutation tools
+        ├── workspace/      # mutation runtime: paths, policy, snapshots, diffs, journal, rollback
+        └── trace.py        # JSONL trace writer
 ```
 
 Each run creates:
@@ -27,7 +37,7 @@ Each run creates:
 .miniharness/runs/<run_id>.jsonl
 ```
 
-The trace records `user_goal`, `model_request`, `model_response`, `tool_call`, `tool_result`, `final_answer`, and `error` events.
+The trace records `user_goal`, `model_request`, `model_response`, `tool_call`, `tool_result`, `mutation`, `command`, `final_answer`, and `error` events. Tool runtime audit entries include validated arguments, permission level, risk tags, start/end timestamps, duration, status, error code, truncation status, output digest, and cache hit status. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, redaction count, semantic status, isolation report, and lightweight git state.
 
 ## Install
 
@@ -105,43 +115,103 @@ The tests use temporary files and a mock provider. They do not call a live model
 2. `agent.py` creates a `ContextManager` with the system message and user goal.
 3. `provider.py` sends the context-managed `messages` and tool schemas to the OpenAI-compatible API.
 4. If the model returns no tool calls, the assistant message is the final answer.
-5. If the model returns tool calls, `agent.py` dispatches them through `tools.py`.
-6. Each tool result is recorded as a `ToolObservation`; a preview is appended back into `messages` as a `tool` role message.
-7. The loop calls the model again with the updated `messages`.
-8. The loop stops when the model gives a final answer or `--max-turns` is reached.
+5. If the model returns tool calls, `agent.py` sends each call to `ToolRuntime.execute_tool_call`.
+6. The runtime parses JSON arguments, validates them with Pydantic, checks policy, applies timeout/output limits/cache, blocks unsafe write handlers that do not use the Workspace Mutation Runtime, blocks shell handlers that do not use the Command Runtime, and records the audit trace.
+7. Each structured tool result is recorded as a `ToolObservation`; a preview is appended back into `messages` as a `tool` role message.
+8. The loop calls the model again with the updated `messages`.
+9. The loop stops when the model gives a final answer or `--max-turns` is reached.
 
 ## Context Manager
 
-Miniharness v0.0.3 moves message ownership out of the agent loop and into `ContextManager`.
+`ContextManager` owns system, user, assistant, and tool observation messages. In v0.0.5 it also controls the request-sized view sent to the model.
 
 The context layer now:
 
 - Initializes the system and user messages.
 - Records assistant messages.
-- Records tool observations with raw results, previews, truncation status, and small metadata.
-- Sends only the first 4000 characters of long tool content back into model messages while keeping the full raw result in memory for traceable local inspection.
+- Counts message and tool-schema tokens with `tiktoken`.
+- Reserves output tokens and trims history to the configured model context window.
+- Keeps assistant `tool_calls` and matching `tool` messages grouped during trimming.
+- Records tool observations with raw results, previews, truncation status, digests, timing/cache/error metadata, and source references.
+- Persists observations, messages, snapshots, and references in SQLite under the run directory.
+- Sends only the first 4000 characters of long tool content back into model messages while keeping the full raw result in SQLite.
+- Uses `tool_choice=none` during compression so summary calls cannot trigger tools.
+- Provides recovery helpers that detect whether the next step should call the model or execute a pending tool.
 
-## Tool Calling Protocol
+## Tool Runtime
 
-Miniharness v0.0.3 keeps the existing default CLI behavior: tool choice is sent as `auto`, and strict tool schemas are disabled unless a caller explicitly enables them.
+Miniharness v0.0.4 keeps the existing default CLI behavior: tool choice is sent as `auto`, and strict tool schemas are disabled unless a caller explicitly enables them.
 
-The protocol layer now has:
+The protocol and runtime layer now have:
 
 - `ToolChoiceMode.AUTO`: the model may call tools or answer directly.
 - `ToolChoiceMode.REQUIRED`: the model must call at least one tool, for providers that support this mode.
 - `ToolChoiceMode.NONE`: the model must answer without tool calls.
 - `ProviderCapabilities`: a small capability record for OpenAI-compatible providers, including support flags for tools, strict schemas, required tool choice, and parallel tool calls.
 - `ToolRegistry.openai_tools(strict=True)`: emits `strict: true` function schemas and top-level `additionalProperties: false` parameters while still validating tool arguments locally with Pydantic.
+- `ToolSpec`: declares a tool name, version, description, Pydantic input model, handler, permission level, risk tags, timeout, output limit, cacheability, and idempotency.
+- `ToolRegistry`: only registered tools can be exposed or dispatched.
+- `ToolRuntime`: executes model tool calls and returns structured `ToolResult` / `ToolError` payloads.
+- `ToolPolicy.read_only()`: the default policy allows only read-only tools and rejects write, shell, git, and network risk.
+- Runtime errors are classified as `tool_not_found`, `bad_arguments_json`, `validation_error`, `permission_denied`, `policy_denied`, `timeout`, `execution_error`, or `internal_error`.
+- Cache is per run and only applies to `cacheable=true` read-only tools. The cache key includes tool name, version, normalized validated arguments, and workspace root.
+- Write tools must declare `uses_mutation_runtime=true`; otherwise `ToolRuntime` rejects them with `invalid_operation` before the handler can touch the filesystem.
+- Shell tools must declare `uses_command_runtime=true`; otherwise `ToolRuntime` rejects them with `invalid_operation` before the handler can spawn a process.
+
+## Command Runtime
+
+Miniharness v0.0.7 does not treat shell as a normal tool. Process execution is represented by `CommandRequest` and planned through `CommandPlan` before execution. The default command tools are:
+
+- `run_command`
+- `start_process`
+- `read_process_output`
+- `stop_process`
+- `list_processes`
+
+The runtime includes:
+
+- `CommandPolicy`: returns `allow`, `require_review`, or `deny` with risk tags, required backend, network/filesystem mode, and redaction rules.
+- `CommandPurpose` and `CommandRisk`: classify read-only commands, verification, formatters, builds, code generation, package managers, network operations, workspace writes, destructive commands, long-running processes, secret risk, VCS read/mutation, system mutation, project-code execution, and unknown commands.
+- `ExecutionBackend`: implemented by `LocalProcessBackend`, with `SandboxBackend` reserved as an explicit interface for future isolation.
+- `ProcessSupervisor`: starts processes, monitors timeout and idle timeout, and terminates process trees rather than only killing a parent process.
+- `ResourceLimits`: enforces timeout, idle timeout, stdout/stderr/combined output limits, and reports memory/process/disk limits as unsupported on the local backend.
+- `EnvPolicy`: avoids full parent env inheritance, allows a small safe inherited env set, denies secret-like env keys, and redacts secrets before trace or observation storage.
+- `NetworkMode` and `FilesystemMode`: make network and filesystem expectations explicit. The local backend reports `network_isolation_enforced=false` and filesystem isolation as advisory because it is not a sandbox.
+- `OutputCollector`: keeps stdout and stderr separate, builds ordered combined output, truncates oversized previews, records digests, and saves large output artifacts under `.miniharness/artifacts/commands/`.
+- Workspace side-effect tracking: snapshots workspace files before and after commands and returns changed files separately from model-owned mutation transactions.
+
+`CommandResult` distinguishes runtime failures, policy denials, review requirements, non-zero exits, and semantic failures such as `tests_failed`, `build_failed`, `lint_failed`, and `typecheck_failed`. Context Manager receives a compact `command_result` observation instead of raw stdout/stderr.
+
+Git read commands such as `git status`, `git diff`, and `git log` may run through the command runtime. Git mutation commands such as `git add`, `commit`, `reset`, `clean`, and `push` require review or a future dedicated GitRuntime path. See `docs/architecture/command-runtime.md` for design details and error taxonomy.
+
+## Workspace Mutation Runtime
+
+Miniharness v0.0.6 does not expose a raw `write_file` tool. File changes are represented as edit operations, assembled into a `ChangeSet`, checked by `WorkspacePolicy`, applied through a `MutationTransaction`, and recorded in a `MutationJournal`.
+
+The runtime includes:
+
+- `WorkspacePathResolver`: canonicalizes every path and rejects traversal, symlink escape, Windows drive or UNC escape, and any resolved path outside the workspace.
+- `FileClassifier` and `WorkspacePolicy`: classify files as source, config, test, docs, build script, lockfile, secret, VCS internal, generated, binary, large artifact, or unknown; decisions are structured as `allow`, `require_review`, or `deny`.
+- `FileSnapshot` and `WorkspaceIndex`: record path, sha256, size, mtime, encoding, line ending, and binary status so mutations can detect user, IDE, command, or agent races.
+- `EditOperation` types: `ReplaceText`, `InsertBefore`, `InsertAfter`, `ReplaceRange`, `ApplyUnifiedDiff`, `CreateFile`, `DeleteFile`, `MoveFile`, `UpdateJson`, `UpdateYaml`, `UpdateToml`, and `FormatFile`. Parser-backed operations that are not yet implemented return structured `invalid_operation` errors instead of silently writing.
+- `DiffEngine`: emits `FileDiff` and `DiffHunk` records with added and removed line counts, binary/rename flags, digest, truncation status, and artifact paths for large diffs.
+- `AtomicWriter`: writes text through temporary files, flush, fsync, and `os.replace`, while preserving existing permissions and line-ending/encoding strategy when possible.
+- `RollbackManager`: rolls back agent-owned transactions from the journal and returns `rollback_conflict` if the user changed a file after the transaction.
+- Verification hook fields are present in results and trace so a later Verification Runtime can attach formatters, lint, typecheck, tests, or builds without hard-coding them into mutation logic.
+
+Registered mutation tools currently include `workspace_replace_text`, `workspace_create_file`, `workspace_delete_file`, and `workspace_move_file`. High-risk operations such as project config edits, build scripts, lockfiles, deletion, moving, and formatting are represented as `require_review`; in the current CLI, that state is returned structurally instead of being silently applied.
+
+See `docs/architecture/workspace-mutation-runtime.md` for the design details and error taxonomy.
 
 ## Read-Only Tools
 
-Miniharness v0.0.3 only exposes these tools:
+Miniharness still exposes these registered read-only tools:
 
 - `list_files`: list files under the current project root.
 - `read_file`: read a file inside the current project root.
 - `search_text`: search text inside files under the current project root.
 
-The tools cannot write files, run shell commands, run Git commands, browse the web, store long-term memory, or start other agents. Paths are resolved inside the current project root, so `../outside-file` is rejected.
+The read-only tools themselves cannot write files, run shell commands, run Git commands, browse the web, store long-term memory, or start other agents. Paths are resolved inside the current project root, so `../outside-file` is rejected. File mutation tools are separate and must pass the Workspace Mutation Runtime path, policy, snapshot, diff, journal, rollback, and trace checks. Command tools are also separate and must pass CommandRuntime policy, env, output, process, trace, and side-effect checks.
 
 ## VSCode Setup
 

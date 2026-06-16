@@ -8,10 +8,14 @@ from rich.console import Console
 from rich.panel import Panel
 
 from miniharness.agent import MiniAgent
+from miniharness.command import CommandRuntime
 from miniharness.config import Settings
 from miniharness.provider import OpenAICompatibleProvider
 from miniharness.tools import ToolRegistry
+from miniharness.tools.command import register_command_tools
+from miniharness.tools.mutation import register_mutation_tools
 from miniharness.trace import TraceWriter
+from miniharness.workspace import MutationRuntime
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -52,6 +56,8 @@ def main(
         settings = Settings.from_env()
         provider = OpenAICompatibleProvider(settings)
         tools = ToolRegistry(project_root)
+        register_mutation_tools(tools, MutationRuntime(project_root, trace=trace))
+        register_command_tools(tools, CommandRuntime(project_root, trace=trace))
         agent = MiniAgent(
             provider=provider,
             tools=tools,

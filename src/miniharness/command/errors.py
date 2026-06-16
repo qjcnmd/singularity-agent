@@ -1,0 +1,26 @@
+COMMAND_ERROR_CODES = frozenset(
+    {
+        "command_parse_error",
+        "command_not_found",
+        "cwd_outside_workspace",
+        "cwd_denied",
+        "policy_denied",
+        "review_required",
+        "sandbox_unavailable",
+        "backend_error",
+        "env_denied",
+        "network_denied",
+        "timeout",
+        "idle_timeout",
+        "output_limit_exceeded",
+        "memory_limit_exceeded",
+        "disk_limit_exceeded",
+        "process_killed",
+        "spawn_failed",
+        "permission_error",
+        "exit_nonzero",
+        "semantic_failure",
+        "secret_redacted",
+        "internal_error",
+    }
+)
