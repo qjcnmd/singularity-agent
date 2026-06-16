@@ -8,6 +8,10 @@ def make_tool_call(name: str, arguments: dict) -> dict:
     return {"function": {"name": name, "arguments": json.dumps(arguments)}}
 
 
+def make_raw_tool_call(name: str, arguments: str) -> dict:
+    return {"function": {"name": name, "arguments": arguments}}
+
+
 def test_openai_tools_schema_contains_read_only_tools(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path)
 
@@ -19,6 +23,17 @@ def test_openai_tools_schema_contains_read_only_tools(tmp_path: Path) -> None:
         assert tool["type"] == "function"
         assert "description" in tool["function"]
         assert "parameters" in tool["function"]
+
+
+def test_openai_tools_strict_schema_marks_functions_strict(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    schemas = registry.openai_tools(strict=True)
+
+    for tool in schemas:
+        function = tool["function"]
+        assert function["strict"] is True
+        assert function["parameters"]["additionalProperties"] is False
 
 
 def test_read_file_reads_project_file(tmp_path: Path) -> None:
@@ -47,3 +62,21 @@ def test_read_file_rejects_path_escape(tmp_path: Path) -> None:
 
     assert result["ok"] is False
     assert "escapes project root" in result["error"]
+
+
+def test_dispatch_returns_error_for_invalid_json(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.dispatch(make_raw_tool_call("read_file", "{not json"))
+
+    assert result["ok"] is False
+    assert "Invalid JSON arguments" in result["error"]
+
+
+def test_dispatch_returns_error_for_unknown_tool(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.dispatch(make_tool_call("missing_tool", {"path": "README.md"}))
+
+    assert result["ok"] is False
+    assert result["error"] == "Unknown tool: missing_tool"

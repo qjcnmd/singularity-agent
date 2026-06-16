@@ -1,0 +1,68 @@
+from typing import Any
+
+import pytest
+
+from miniharness.config import Settings
+from miniharness.provider import OpenAICompatibleProvider, ToolChoiceMode
+
+
+class FakeResponse:
+    status_code = 200
+    text = "{}"
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+
+class FakeClient:
+    payloads: list[dict[str, Any]] = []
+
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+
+    def __enter__(self) -> "FakeClient":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, Any],
+    ) -> FakeResponse:
+        self.payloads.append(json)
+        return FakeResponse()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (ToolChoiceMode.AUTO, "auto"),
+        (ToolChoiceMode.REQUIRED, "required"),
+        (ToolChoiceMode.NONE, "none"),
+    ],
+)
+def test_provider_chat_passes_tool_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: ToolChoiceMode,
+    expected: str,
+) -> None:
+    FakeClient.payloads = []
+    monkeypatch.setattr("miniharness.provider.httpx.Client", FakeClient)
+    provider = OpenAICompatibleProvider(
+        Settings(
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            model="test-model",
+        )
+    )
+
+    provider.chat(messages=[{"role": "user", "content": "hi"}], tools=[], tool_choice=mode)
+
+    assert FakeClient.payloads[0]["tool_choice"] == expected

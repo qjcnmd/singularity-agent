@@ -48,19 +48,24 @@ class ToolRegistry:
             "search_text": (SearchTextInput, self._search_text),
         }
 
-    def openai_tools(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": schema.model_json_schema(),
-                },
+    def openai_tools(self, *, strict: bool = False) -> list[dict[str, Any]]:
+        tools: list[dict[str, Any]] = []
+        for name, (schema, _handler) in self._tools.items():
+            parameters = schema.model_json_schema()
+            function: dict[str, Any] = {
+                "name": name,
+                "description": self._description_for(name),
+                "parameters": self._parameters_schema(parameters, strict=strict),
             }
-            for name, (schema, _handler) in self._tools.items()
-            for description in (self._description_for(name),)
-        ]
+            if strict:
+                function["strict"] = True
+            tools.append(
+                {
+                    "type": "function",
+                    "function": function,
+                },
+            )
+        return tools
 
     def dispatch(self, tool_call: dict[str, Any]) -> dict[str, Any]:
         function = tool_call.get("function") or {}
@@ -202,3 +207,10 @@ class ToolRegistry:
         if not isinstance(data, expected):
             raise TypeError(f"Expected {expected.__name__}, got {type(data).__name__}")
         return data
+
+    @staticmethod
+    def _parameters_schema(parameters: dict[str, Any], *, strict: bool) -> dict[str, Any]:
+        if strict and parameters.get("type") == "object":
+            parameters = dict(parameters)
+            parameters["additionalProperties"] = False
+        return parameters

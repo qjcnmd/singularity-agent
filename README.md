@@ -1,4 +1,4 @@
-# Miniharness v0.0.1
+# Miniharness v0.0.3
 
 Miniharness is a tiny read-only CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, tools, and trace file connect without using LangChain, LangGraph, or any other agent framework.
 
@@ -15,6 +15,7 @@ Miniharness is a tiny read-only CLI coding agent harness. It is intentionally sm
         ├── agent.py       # agent loop
         ├── cli.py         # Typer command entry
         ├── config.py      # environment variable loading
+        ├── context/       # context manager and tool observations
         ├── provider.py    # OpenAI-compatible HTTP call via httpx
         ├── tools.py       # read-only tools and Pydantic schemas
         └── trace.py       # JSONL trace writer
@@ -101,17 +102,40 @@ The tests use temporary files and a mock provider. They do not call a live model
 ## Agent Loop Flow
 
 1. `cli.py` receives the user goal and creates a trace file.
-2. `agent.py` builds the initial `messages` list with a system message and user message.
-3. `provider.py` sends `messages` and tool schemas to the OpenAI-compatible API.
+2. `agent.py` creates a `ContextManager` with the system message and user goal.
+3. `provider.py` sends the context-managed `messages` and tool schemas to the OpenAI-compatible API.
 4. If the model returns no tool calls, the assistant message is the final answer.
 5. If the model returns tool calls, `agent.py` dispatches them through `tools.py`.
-6. Each tool result is appended back into `messages` as a `tool` role message.
+6. Each tool result is recorded as a `ToolObservation`; a preview is appended back into `messages` as a `tool` role message.
 7. The loop calls the model again with the updated `messages`.
 8. The loop stops when the model gives a final answer or `--max-turns` is reached.
 
+## Context Manager
+
+Miniharness v0.0.3 moves message ownership out of the agent loop and into `ContextManager`.
+
+The context layer now:
+
+- Initializes the system and user messages.
+- Records assistant messages.
+- Records tool observations with raw results, previews, truncation status, and small metadata.
+- Sends only the first 4000 characters of long tool content back into model messages while keeping the full raw result in memory for traceable local inspection.
+
+## Tool Calling Protocol
+
+Miniharness v0.0.3 keeps the existing default CLI behavior: tool choice is sent as `auto`, and strict tool schemas are disabled unless a caller explicitly enables them.
+
+The protocol layer now has:
+
+- `ToolChoiceMode.AUTO`: the model may call tools or answer directly.
+- `ToolChoiceMode.REQUIRED`: the model must call at least one tool, for providers that support this mode.
+- `ToolChoiceMode.NONE`: the model must answer without tool calls.
+- `ProviderCapabilities`: a small capability record for OpenAI-compatible providers, including support flags for tools, strict schemas, required tool choice, and parallel tool calls.
+- `ToolRegistry.openai_tools(strict=True)`: emits `strict: true` function schemas and top-level `additionalProperties: false` parameters while still validating tool arguments locally with Pydantic.
+
 ## Read-Only Tools
 
-Miniharness v0.0.1 only exposes these tools:
+Miniharness v0.0.3 only exposes these tools:
 
 - `list_files`: list files under the current project root.
 - `read_file`: read a file inside the current project root.
