@@ -36,6 +36,10 @@ class PlannerContextRenderer:
                         self._policy_summary(item)
                         for item in evidence.policy_observations[-10:]
                     ],
+                    "sandbox_observations": [
+                        str(item.get("summary") or self._sandbox_summary(item))
+                        for item in evidence.sandbox_observations[-10:]
+                    ],
                 },
             }
         }
@@ -62,3 +66,11 @@ class PlannerContextRenderer:
         }.get(str(observation.get("outcome") or ""), "blocked")
         reason = str(observation.get("reason") or "")
         return f"[policy] {runtime} {outcome}: {reason}"
+
+    @staticmethod
+    def _sandbox_summary(observation: dict) -> str:
+        status = str(observation.get("status") or "unknown")
+        backend = str(observation.get("backend") or "sandbox")
+        if status == "backend_unavailable":
+            return "[sandbox] command blocked: backend cannot enforce required isolation."
+        return f"[sandbox] command ran in isolated copy-on-write workspace via {backend}, status={status}."

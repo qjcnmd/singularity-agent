@@ -34,6 +34,7 @@ from miniharness.command.models import (
 )
 from miniharness.command.output import OutputCollector, OutputSnapshot, SecretRedactor
 from miniharness.command.policy import CommandPolicy
+from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.trace import TraceWriter
 from miniharness.policy import (
     Capability,
@@ -47,6 +48,12 @@ from miniharness.policy import (
     RuntimeName,
 )
 from miniharness.policy.audit import redact
+from miniharness.sandbox import (
+    SandboxFilesystemMode,
+    SandboxResult,
+    SandboxRuntime,
+    SandboxStatus,
+)
 
 if TYPE_CHECKING:
     from miniharness.workspace_state import LocalWorkspaceStateRuntime
@@ -118,6 +125,7 @@ class CommandRuntime:
         state_runtime: "LocalWorkspaceStateRuntime | None" = None,
         planner: Any | None = None,
         policy_runtime: PolicyRuntime | None = None,
+        sandbox_runtime: SandboxRuntime | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)
         self.policy = policy or CommandPolicy()
@@ -128,6 +136,10 @@ class CommandRuntime:
         self.planner = planner
         self.policy_runtime = policy_runtime or PolicyRuntime(
             PolicyConfig.runtime_default(self.workspace_root)
+        )
+        self.sandbox_runtime = sandbox_runtime or SandboxRuntime(
+            self.workspace_root,
+            trace=trace if trace is not None and hasattr(trace, "emit") else None,
         )
         self._sessions: dict[str, _SessionRecord] = {}
 
@@ -152,6 +164,13 @@ class CommandRuntime:
         tool_call_id: str | None = None,
         transaction_id: str | None = None,
     ) -> CommandResult:
+        self._emit_trace(
+            TraceEventType.COMMAND_REQUESTED,
+            request,
+            summary=f"Command requested: {request.display_command()}",
+            tool_call_id=tool_call_id,
+            transaction_id=transaction_id,
+        )
         started_at = _now()
         started = time.perf_counter()
         before_snapshot = self._capture_workspace_snapshot()
@@ -159,7 +178,11 @@ class CommandRuntime:
         policy_request = self._policy_request(request)
         policy_decision = self.policy_runtime.enforce(policy_request)
         self._record_policy_trace(policy_request, policy_decision)
-        if policy_decision.outcome != DecisionOutcome.ALLOW:
+        sandbox_required = (
+            policy_decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
+            or policy_decision.constraints.sandbox_required
+        )
+        if policy_decision.outcome != DecisionOutcome.ALLOW and not sandbox_required:
             result = self._policy_blocked_result(
                 request,
                 decision=policy_decision,
@@ -213,11 +236,52 @@ class CommandRuntime:
             )
             return result
 
+        if sandbox_required:
+            sandbox_request = self.sandbox_runtime.build_request_from_policy(
+                request,
+                policy_decision,
+                session_id=policy_request.session_id,
+                task_id=policy_request.task_id,
+                action_id=policy_request.action_id,
+                cwd=cwd,
+            )
+            sandbox_result = self.sandbox_runtime.run(sandbox_request)
+            git_after = self._git_state_summary()
+            result = self._result_from_sandbox(
+                request,
+                decision=decision,
+                sandbox_result=sandbox_result,
+                started_at=started_at,
+                started=started,
+                git_before=git_before,
+                git_after=git_after,
+            )
+            self._record_trace(
+                request,
+                result,
+                tool_call_id=tool_call_id,
+                transaction_id=transaction_id,
+            )
+            if self.planner is not None:
+                self.planner.update_from_command(
+                    {"command_result": result.to_observation().get("command_result", result.to_dict())},
+                    tool_call_id=tool_call_id,
+                )
+            self._notify_planner_policy(request, policy_request, policy_decision)
+            return result
+
         env_result = self.env_policy.build(request.env_request)
         collector = self._collector(
             request.command_id,
             request.resource_limits,
             env_result.redactor,
+        )
+        self._emit_trace(
+            TraceEventType.COMMAND_STARTED,
+            request,
+            summary=f"Command started: {request.display_command()}",
+            tool_call_id=tool_call_id,
+            transaction_id=transaction_id,
         )
         backend_result = self.backend.execute(
             request=request,
@@ -273,6 +337,22 @@ class CommandRuntime:
         policy_request = self._policy_request(request)
         policy_decision = self.policy_runtime.enforce(policy_request)
         self._record_policy_trace(policy_request, policy_decision)
+        if (
+            policy_decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
+            or policy_decision.constraints.sandbox_required
+        ):
+            return ProcessSession(
+                process_id=request.command_id,
+                command_id=request.command_id,
+                pid=None,
+                status="sandbox_required",
+                argv=request.argv,
+                shell=request.shell,
+                cwd=request.cwd,
+                started_at=started_at,
+                owner_transaction=transaction_id,
+                error_code="sandbox_required",
+            )
         if policy_decision.outcome != DecisionOutcome.ALLOW:
             return ProcessSession(
                 process_id=request.command_id,
@@ -509,6 +589,107 @@ class CommandRuntime:
             git_after=git_after,
         )
 
+    def _result_from_sandbox(
+        self,
+        request: CommandRequest,
+        *,
+        decision: CommandPolicyResult,
+        sandbox_result: SandboxResult,
+        started_at: str,
+        started: float,
+        git_before: dict[str, Any],
+        git_after: dict[str, Any],
+    ) -> CommandResult:
+        execution_status = self._sandbox_execution_status(sandbox_result)
+        semantic_status = self._sandbox_semantic_status(
+            request,
+            sandbox_result,
+            execution_status,
+        )
+        error_code = self._sandbox_error_code(sandbox_result, semantic_status)
+        stdout = sandbox_result.stdout
+        stderr = sandbox_result.stderr
+        combined = stdout + stderr
+        digest = hashlib.sha256(combined.encode("utf-8")).hexdigest()
+        artifact_path = (
+            sandbox_result.artifacts[0].relative_path
+            if sandbox_result.artifacts
+            else None
+        )
+        changed_files = sorted(
+            [
+                *sandbox_result.filesystem_changes.created_files,
+                *sandbox_result.filesystem_changes.modified_files,
+                *sandbox_result.filesystem_changes.deleted_files,
+            ]
+        )
+        sandbox_report = {
+            "sandbox_id": sandbox_result.sandbox_id,
+            "backend": sandbox_result.backend_name,
+            "status": sandbox_result.status.value,
+            "trace_id": sandbox_result.trace_id,
+            "artifact_count": len(sandbox_result.artifacts),
+            "artifacts": [artifact.to_dict() for artifact in sandbox_result.artifacts],
+            "changed_files": sandbox_result.filesystem_changes.to_dict(),
+            "changed_files_count": sandbox_result.filesystem_changes.total_changed_files,
+            "violations": [violation.to_dict() for violation in sandbox_result.violations],
+            "cleanup_status": sandbox_result.cleanup_status,
+            "imported_changes_count": 0,
+        }
+        isolation_report = self._isolation_report(request.resource_limits)
+        isolation_report["backend"] = sandbox_result.backend_name
+        isolation_report["filesystem_isolation"] = "copy_on_write_workspace"
+        isolation_report["sandbox"] = sandbox_report
+        return CommandResult(
+            command_id=request.command_id,
+            execution_status=execution_status,
+            semantic_status=semantic_status,
+            exit_code=sandbox_result.exit_code,
+            signal=None,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            timed_out=sandbox_result.status == SandboxStatus.TIMEOUT,
+            idle_timed_out=False,
+            stdout_preview=stdout,
+            stderr_preview=stderr,
+            combined_output_preview=combined,
+            output_truncated=bool(sandbox_result.metadata.get("output_truncated")),
+            output_digest=digest,
+            artifact_path=artifact_path,
+            changed_files=changed_files,
+            side_effects=[
+                {
+                    "kind": "sandbox_change_summary",
+                    "sandbox_id": sandbox_result.sandbox_id,
+                    "backend": sandbox_result.backend_name,
+                    "status": sandbox_result.status.value,
+                    "changed_files": changed_files,
+                    "imported": False,
+                }
+            ]
+            if changed_files
+            else [],
+            policy_decision=decision,
+            risk_tags=decision.risk_tags,
+            error_code=error_code,
+            isolation_report=isolation_report,
+            backend=sandbox_result.backend_name,
+            started_at=started_at,
+            ended_at=_now(),
+            stdout_bytes=len(stdout.encode("utf-8")),
+            stderr_bytes=len(stderr.encode("utf-8")),
+            git_before=git_before,
+            git_after=git_after,
+            metadata={
+                "sandbox_id": sandbox_result.sandbox_id,
+                "sandbox_backend": sandbox_result.backend_name,
+                "sandbox_status": sandbox_result.status.value,
+                "sandbox_trace_id": sandbox_result.trace_id,
+                "sandbox_artifacts": [artifact.to_dict() for artifact in sandbox_result.artifacts],
+                "sandbox_changed_files": sandbox_result.filesystem_changes.to_dict(),
+                "sandbox_violations": [violation.to_dict() for violation in sandbox_result.violations],
+            },
+        )
+
     def _blocked_result(
         self,
         request: CommandRequest,
@@ -589,6 +770,29 @@ class CommandRuntime:
     ) -> None:
         if self.trace is None:
             return
+        event_type = TraceEventType.COMMAND_COMPLETED
+        severity = TraceSeverity.INFO
+        if result.killed_reason:
+            event_type = TraceEventType.COMMAND_KILLED
+            severity = TraceSeverity.ERROR
+        elif result.timed_out or result.idle_timed_out:
+            event_type = TraceEventType.COMMAND_TIMEOUT
+            severity = TraceSeverity.ERROR
+        elif result.semantic_status != SemanticStatus.SUCCEEDED or result.error_code:
+            event_type = TraceEventType.COMMAND_FAILED
+            severity = TraceSeverity.ERROR
+        sandbox = (result.isolation_report or {}).get("sandbox") or {}
+        self._emit_trace(
+            event_type,
+            request,
+            summary=result.to_observation()["command_result"]["summary"],
+            payload=result.to_observation()["command_result"],
+            tool_call_id=tool_call_id,
+            transaction_id=transaction_id,
+            severity=severity,
+            sandbox_id=sandbox.get("sandbox_id"),
+            artifact_refs=[result.artifact_path] if result.artifact_path else [],
+        )
         self.trace.record(
             "command",
             {
@@ -599,7 +803,7 @@ class CommandRuntime:
                 "shell": request.shell,
                 "cwd": request.cwd,
                 "backend": result.backend,
-                "sandbox_id": None,
+                "sandbox_id": sandbox.get("sandbox_id"),
                 "policy_decision": result.policy_decision.decision.value,
                 "policy_reasons": result.policy_decision.reasons,
                 "risk_tags": [tag.value for tag in result.risk_tags],
@@ -630,6 +834,46 @@ class CommandRuntime:
                 "git_after": result.git_after,
                 "policy_runtime": True,
             },
+        )
+
+    def _emit_trace(
+        self,
+        event_type: TraceEventType,
+        request: CommandRequest,
+        *,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+        tool_call_id: str | None = None,
+        transaction_id: str | None = None,
+        severity: TraceSeverity = TraceSeverity.INFO,
+        sandbox_id: str | None = None,
+        artifact_refs: list[str] | None = None,
+    ) -> None:
+        if self.trace is None or not hasattr(self.trace, "emit"):
+            return
+        self.trace.emit(
+            event_type,
+            runtime="command",
+            summary=summary,
+            payload=payload
+            or {
+                "command": request.display_command(),
+                "cwd": request.cwd,
+                "purpose": request.purpose.value,
+                "network_mode": request.network_mode.value,
+                "filesystem_mode": request.filesystem_mode.value,
+            },
+            ids={
+                "session_id": getattr(self.planner, "session_id", None),
+                "task_id": getattr(self.planner, "task_id", None),
+                "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+                "action_id": tool_call_id or request.command_id,
+                "command_id": request.command_id,
+                "transaction_id": transaction_id,
+                "sandbox_id": sandbox_id,
+            },
+            severity=severity,
+            artifact_refs=artifact_refs,
         )
 
     def _collector(
@@ -711,6 +955,20 @@ class CommandRuntime:
         return ExecutionStatus.COMPLETED
 
     @staticmethod
+    def _sandbox_execution_status(sandbox_result: SandboxResult) -> ExecutionStatus:
+        if sandbox_result.status == SandboxStatus.TIMEOUT:
+            return ExecutionStatus.TIMED_OUT
+        if sandbox_result.status in {
+            SandboxStatus.BACKEND_UNAVAILABLE,
+            SandboxStatus.SETUP_FAILED,
+            SandboxStatus.CLEANUP_FAILED,
+        }:
+            return ExecutionStatus.BACKEND_ERROR
+        if sandbox_result.status in {SandboxStatus.POLICY_BLOCKED, SandboxStatus.VIOLATION}:
+            return ExecutionStatus.POLICY_DENIED
+        return ExecutionStatus.COMPLETED
+
+    @staticmethod
     def _semantic_status(
         request: CommandRequest,
         backend_result: BackendRunResult,
@@ -731,6 +989,28 @@ class CommandRuntime:
         if request.purpose == CommandPurpose.FORMAT_CHECK:
             return SemanticStatus.LINT_FAILED
         if request.purpose == CommandPurpose.FORMATTER:
+            return SemanticStatus.LINT_FAILED
+        return SemanticStatus.EXIT_NONZERO
+
+    @staticmethod
+    def _sandbox_semantic_status(
+        request: CommandRequest,
+        sandbox_result: SandboxResult,
+        execution_status: ExecutionStatus,
+    ) -> SemanticStatus:
+        if execution_status != ExecutionStatus.COMPLETED:
+            return SemanticStatus.RUNTIME_FAILED
+        if sandbox_result.exit_code == 0:
+            return SemanticStatus.SUCCEEDED
+        if request.purpose == CommandPurpose.PROJECT_VERIFICATION:
+            return SemanticStatus.TESTS_FAILED
+        if request.purpose == CommandPurpose.BUILD:
+            return SemanticStatus.BUILD_FAILED
+        if request.purpose == CommandPurpose.LINT:
+            return SemanticStatus.LINT_FAILED
+        if request.purpose == CommandPurpose.TYPECHECK:
+            return SemanticStatus.TYPECHECK_FAILED
+        if request.purpose in {CommandPurpose.FORMAT_CHECK, CommandPurpose.FORMATTER}:
             return SemanticStatus.LINT_FAILED
         return SemanticStatus.EXIT_NONZERO
 
@@ -756,6 +1036,32 @@ class CommandRuntime:
         if semantic_status == SemanticStatus.EXIT_NONZERO:
             return "exit_nonzero"
         if output.output_truncated:
+            return "output_limit_exceeded"
+        return None
+
+    @staticmethod
+    def _sandbox_error_code(
+        sandbox_result: SandboxResult,
+        semantic_status: SemanticStatus,
+    ) -> str | None:
+        if sandbox_result.status == SandboxStatus.BACKEND_UNAVAILABLE:
+            return "sandbox_unavailable"
+        if sandbox_result.status == SandboxStatus.VIOLATION:
+            return "sandbox_violation"
+        if sandbox_result.status == SandboxStatus.TIMEOUT:
+            return "timeout"
+        if sandbox_result.metadata.get("error_code"):
+            return str(sandbox_result.metadata["error_code"])
+        if semantic_status in {
+            SemanticStatus.TESTS_FAILED,
+            SemanticStatus.BUILD_FAILED,
+            SemanticStatus.LINT_FAILED,
+            SemanticStatus.TYPECHECK_FAILED,
+        }:
+            return "semantic_failure"
+        if semantic_status == SemanticStatus.EXIT_NONZERO:
+            return "exit_nonzero"
+        if sandbox_result.metadata.get("output_truncated"):
             return "output_limit_exceeded"
         return None
 

@@ -57,10 +57,12 @@ class ContextManager:
         db_path: Path | None = None,
         run_id: str | None = None,
         token_counter: TokenCounter | None = None,
+        trace: Any | None = None,
     ) -> None:
         self.run_id = run_id or uuid4().hex
         self.user_goal = user_goal
         self.provider = provider
+        self.trace = trace
         self.token_counter = token_counter or TokenCounter()
         self.assembler = ContextAssembler(
             token_counter=self.token_counter,
@@ -94,6 +96,20 @@ class ContextManager:
             summary=self._summary,
         )
         self.last_budget = budget
+        if self.trace is not None and hasattr(self.trace, "emit"):
+            self.trace.emit(
+                "context.rendered_for_model",
+                runtime="context",
+                summary="Context rendered for model.",
+                payload={
+                    "message_count": len(assembled),
+                    "tool_count": len(tools or []),
+                    "message_tokens": budget.message_tokens,
+                    "tool_tokens": budget.tool_tokens,
+                    "total_tokens": budget.total_tokens,
+                },
+                ids={"task_id": self.run_id},
+            )
         return assembled
 
     def add_assistant_message(self, message: dict[str, Any]) -> None:
@@ -163,7 +179,37 @@ class ContextManager:
         tool_message = self._tool_message(observation)
         self._messages.append(tool_message)
         self.store.append_message(run_id=self.run_id, message=tool_message)
+        if self.trace is not None and hasattr(self.trace, "emit"):
+            self.trace.emit(
+                "context.observation_added",
+                runtime="context",
+                summary=f"Tool observation added for {tool_name}.",
+                payload={
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "ok": observation.ok,
+                    "preview_tokens": observation.preview_tokens,
+                    "raw_digest": raw_digest,
+                },
+                ids={"task_id": self.run_id},
+            )
         return observation
+
+    def add_trace_summary(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        content = "\n".join(lines)
+        message = {"role": "system", "content": content}
+        self._messages.append(message)
+        self.store.append_message(run_id=self.run_id, message=message)
+        if self.trace is not None and hasattr(self.trace, "emit"):
+            self.trace.emit(
+                "context.observation_added",
+                runtime="context",
+                summary="Trace summary added to context.",
+                payload={"line_count": len(lines), "content_hash": self._digest_json(lines)},
+                ids={"task_id": self.run_id},
+            )
 
     def _persist_initial_messages(self) -> None:
         if self.store.load_messages(self.run_id):
@@ -219,6 +265,14 @@ class ContextManager:
             created_at=self._now(),
         )
         self.store.save_snapshot(snapshot)
+        if self.trace is not None and hasattr(self.trace, "emit"):
+            self.trace.emit(
+                "context.compacted",
+                runtime="context",
+                summary="Context compacted.",
+                payload={"snapshot_id": snapshot.id, "known_observation_ids": known_ids},
+                ids={"task_id": self.run_id},
+            )
 
     def _tool_message(self, observation: ToolObservation) -> dict[str, Any]:
         return {

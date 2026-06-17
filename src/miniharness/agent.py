@@ -5,6 +5,7 @@ from typing import Any
 from rich.console import Console
 
 from miniharness.context import ContextManager
+from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.planner import PlannerRuntime, TaskStatus
 from miniharness.provider import OpenAICompatibleProvider
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
@@ -70,7 +71,8 @@ class MiniAgent:
             user_goal=user_goal,
             provider=self.provider,
             run_id=self.trace.run_id,
-            db_path=self.trace.path.parent / self.trace.run_id / "context.sqlite3",
+            db_path=self._context_db_path(),
+            trace=self.trace,
         )
         tool_schemas = self.tools.openai_tools()
         runtime = ToolRuntime(
@@ -101,6 +103,27 @@ class MiniAgent:
             context.add_assistant_message(assistant_message)
 
             tool_calls = assistant_message.get("tool_calls") or []
+            for tool_call in tool_calls:
+                if hasattr(self.trace, "emit"):
+                    self.trace.emit(
+                        TraceEventType.MODEL_TOOL_CALL_PROPOSED,
+                        runtime="model",
+                        summary=(
+                            "Model proposed tool call "
+                            f"{tool_call.get('function', {}).get('name', '<unknown>')}."
+                        ),
+                        payload={
+                            "turn": turn,
+                            "tool_call_id": tool_call.get("id"),
+                            "function": tool_call.get("function", {}).get("name"),
+                        },
+                        ids={
+                            "task_id": planner.task_id,
+                            "session_id": planner.session_id,
+                            "phase_id": planner.state.current_phase if planner.state else None,
+                            "action_id": tool_call.get("id"),
+                        },
+                    )
             if not tool_calls:
                 final_answer = self._planner_final_answer(
                     planner,
@@ -186,6 +209,11 @@ class MiniAgent:
             },
             turn=turn,
         )
+
+    def _context_db_path(self) -> Any:
+        if hasattr(self.trace, "store"):
+            return self.trace.store.run_dir / "context.sqlite3"
+        return self.trace.path.parent / self.trace.run_id / "context.sqlite3"
 
     @staticmethod
     def _extract_assistant_message(response: dict[str, Any]) -> dict[str, Any]:

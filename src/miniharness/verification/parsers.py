@@ -185,6 +185,10 @@ def classify_failure(
 ) -> FailureType | None:
     if command_result is None:
         return FailureType.CHECK_BLOCKED
+    if command_result.error_code == "sandbox_unavailable":
+        return FailureType.SANDBOX_LIMITATION
+    if command_result.error_code == "sandbox_violation":
+        return FailureType.SANDBOX_VIOLATION
     if command_result.timed_out or command_result.execution_status == ExecutionStatus.TIMED_OUT:
         return FailureType.TIMEOUT
     if command_result.error_code == "command_not_found":

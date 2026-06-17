@@ -1,6 +1,6 @@
 # Verification Runtime
 
-Miniharness v0.0.8 adds a Verification Runtime so validation is not reduced to a hard-coded `run_tests` command. A production coding harness needs to know what changed, how the project is structured, which checks are available, which checks are risky, what a failure means, what the next repair observation should say, and whether the task is ready to hand back.
+Miniharness v0.0.8 adds a Verification Runtime so validation is not reduced to a hard-coded `run_tests` command. In v0.0.12, executable verification checks also run through the Sandbox Runtime when policy requires isolation. A production coding harness needs to know what changed, how the project is structured, which checks are available, which checks are risky, what a failure means, what the next repair observation should say, whether sandbox isolation was enforced, and whether the task is ready to hand back.
 
 The compact boundary is:
 
@@ -13,6 +13,7 @@ ToolRuntime
   -> VerificationPlan
   -> VerificationPolicy
   -> CommandRuntime
+  -> SandboxRuntime when policy requires isolation
   -> FailureParser + RepairHintGenerator
   -> CompletionAssessor
   -> trace + context observation
@@ -24,7 +25,7 @@ ToolRuntime
 
 `VerificationRuntime` owns project detection, command discovery, impact analysis, plan generation, verification policy, result interpretation, evidence shaping, repair hints, flaky handling, repair budget accounting, and completion assessment.
 
-`CommandRuntime` owns process execution. VerificationRuntime never calls `subprocess` directly. Every executable check is a `CommandRequest`, and every run returns a `CommandResult`.
+`CommandRuntime` owns process execution. VerificationRuntime never calls `subprocess` directly. Every executable check is a `CommandRequest`, and every run returns a `CommandResult`. If `PolicyRuntime` marks the check as sandbox-required, CommandRuntime routes the process into `SandboxRuntime`.
 
 `MutationRuntime` owns agent-authored file edits. VerificationRuntime receives changed file, transaction, and changeset context, but test/formatter/build side effects are recorded as command side effects, not mutation transactions.
 
@@ -120,7 +121,9 @@ passed, failed, skipped, blocked, flaky, timeout, inconclusive
 
 ```txt
 command_id, command, exit_code, output_excerpt, artifact_path,
-parsed_failures, duration_ms, timestamp
+parsed_failures, duration_ms, timestamp,
+sandbox_id, sandbox_backend, sandbox_status,
+sandbox_artifacts, sandbox_changed_files, sandbox_violations
 ```
 
 Only bounded excerpts enter observations. Full stdout/stderr remains owned by CommandRuntime artifacts.
@@ -191,6 +194,8 @@ status
 failure_type
 parsed_failures
 evidence_artifact
+sandbox_id
+sandbox_status
 duration_ms
 confidence_impact
 repair_hints

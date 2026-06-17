@@ -138,3 +138,31 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
     assert allowed.outcome == DecisionOutcome.ALLOW
     assert interactive.find_matching_grant(other) is None
     assert grant.consumed is True
+
+
+def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: Path) -> None:
+    runtime = PolicyRuntime(PolicyConfig(workspace_root=tmp_path))
+
+    verification = runtime.evaluate(
+        req(
+            tmp_path,
+            operation=OperationKind.VERIFICATION,
+            capability=Capability.EXECUTE_PROJECT_CODE,
+            resource_type="command",
+            identifier="python -m pytest",
+        )
+    )
+    generated = runtime.evaluate(
+        req(
+            tmp_path,
+            operation=OperationKind.EXECUTE_PROJECT_CODE,
+            capability=Capability.EXECUTE_GENERATED_CODE,
+            resource_type="command",
+            identifier="python generated.py",
+        )
+    )
+
+    assert verification.outcome == DecisionOutcome.SANDBOX_REQUIRED
+    assert verification.constraints.sandbox_required is True
+    assert verification.constraints.filesystem_mode == "copy_on_write_workspace"
+    assert generated.outcome == DecisionOutcome.SANDBOX_REQUIRED

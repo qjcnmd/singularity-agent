@@ -1,0 +1,368 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from miniharness.observability.exceptions import TraceSerializationError
+
+
+class TraceSeverity(str, Enum):
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+class TraceEventType(str, Enum):
+    TASK_STARTED = "task.started"
+    TASK_COMPLETED = "task.completed"
+    TASK_FAILED = "task.failed"
+    PHASE_STARTED = "phase.started"
+    PHASE_COMPLETED = "phase.completed"
+    ACTION_PROPOSED = "action.proposed"
+    ACTION_STARTED = "action.started"
+    ACTION_COMPLETED = "action.completed"
+    ACTION_FAILED = "action.failed"
+    PLANNER_REPLAN_TRIGGERED = "planner.replan_triggered"
+    PLANNER_COMPLETION_ASSESSED = "planner.completion_assessed"
+    MODEL_REQUEST_CREATED = "model.request.created"
+    MODEL_RESPONSE_RECEIVED = "model.response.received"
+    MODEL_TOOL_CALL_PROPOSED = "model.tool_call.proposed"
+    MODEL_OUTPUT_REJECTED = "model.output.rejected"
+    TOOL_VALIDATION_STARTED = "tool.validation.started"
+    TOOL_VALIDATION_FAILED = "tool.validation.failed"
+    TOOL_DISPATCH_STARTED = "tool.dispatch.started"
+    TOOL_DISPATCH_COMPLETED = "tool.dispatch.completed"
+    TOOL_DISPATCH_FAILED = "tool.dispatch.failed"
+    POLICY_REQUESTED = "policy.requested"
+    POLICY_DECIDED = "policy.decided"
+    POLICY_BLOCKED = "policy.blocked"
+    APPROVAL_REQUESTED = "approval.requested"
+    APPROVAL_GRANTED = "approval.granted"
+    APPROVAL_DENIED = "approval.denied"
+    COMMAND_REQUESTED = "command.requested"
+    COMMAND_STARTED = "command.started"
+    COMMAND_OUTPUT_CHUNK = "command.output_chunk"
+    COMMAND_COMPLETED = "command.completed"
+    COMMAND_FAILED = "command.failed"
+    COMMAND_TIMEOUT = "command.timeout"
+    COMMAND_KILLED = "command.killed"
+    SANDBOX_REQUESTED = "sandbox.requested"
+    SANDBOX_PREPARED = "sandbox.prepared"
+    SANDBOX_CAPABILITY_FAILED = "sandbox.capability_failed"
+    SANDBOX_STARTED = "sandbox.started"
+    SANDBOX_COMPLETED = "sandbox.completed"
+    SANDBOX_VIOLATION = "sandbox.violation"
+    SANDBOX_CLEANED = "sandbox.cleaned"
+    MUTATION_PROPOSED = "mutation.proposed"
+    MUTATION_TRANSACTION_STARTED = "mutation.transaction_started"
+    MUTATION_APPLIED = "mutation.applied"
+    MUTATION_FAILED = "mutation.failed"
+    MUTATION_ROLLBACK_STARTED = "mutation.rollback_started"
+    MUTATION_ROLLBACK_COMPLETED = "mutation.rollback_completed"
+    VERIFICATION_PLAN_CREATED = "verification.plan_created"
+    VERIFICATION_CHECK_STARTED = "verification.check_started"
+    VERIFICATION_CHECK_COMPLETED = "verification.check_completed"
+    VERIFICATION_FAILED = "verification.failed"
+    VERIFICATION_EVIDENCE_RECORDED = "verification.evidence_recorded"
+    REPAIR_HINT_CREATED = "repair.hint_created"
+    CONTEXT_SNAPSHOT_CREATED = "context.snapshot_created"
+    CONTEXT_COMPACTED = "context.compacted"
+    CONTEXT_OBSERVATION_ADDED = "context.observation_added"
+    CONTEXT_RENDERED_FOR_MODEL = "context.rendered_for_model"
+    FINAL_REPORT_CREATED = "final_report.created"
+    FINAL_REPORT_SECTION_ADDED = "final_report.section_added"
+    FINAL_REPORT_COMPLETED = "final_report.completed"
+
+
+class TraceStatus(str, Enum):
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
+    SKIPPED = "skipped"
+    BLOCKED = "blocked"
+
+
+class TraceArtifactKind(str, Enum):
+    STDOUT = "stdout"
+    STDERR = "stderr"
+    DIFF = "diff"
+    REPORT = "report"
+    SNAPSHOT = "snapshot"
+    SANDBOX = "sandbox"
+    VERIFICATION = "verification"
+    MODEL_MESSAGE = "model_message"
+    COMMAND_LOG = "command_log"
+    POLICY_AUDIT_REF = "policy_audit_ref"
+    GENERIC = "generic"
+
+
+@dataclass(frozen=True)
+class TraceEvent:
+    event_id: str
+    event_type: TraceEventType | str
+    run_id: str
+    session_id: str
+    task_id: str | None
+    phase_id: str | None
+    action_id: str | None
+    parent_event_id: str | None
+    timestamp: datetime
+    monotonic_ms: int
+    runtime: str
+    severity: TraceSeverity | str
+    summary: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    artifact_refs: list[str] = field(default_factory=list)
+    policy_decision_id: str | None = None
+    approval_grant_id: str | None = None
+    sandbox_id: str | None = None
+    command_id: str | None = None
+    transaction_id: str | None = None
+    verification_id: str | None = None
+    span_id: str | None = None
+    redaction_applied: bool = True
+    payload_hash: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "event_type", _enum(TraceEventType, self.event_type))
+        object.__setattr__(self, "severity", _enum(TraceSeverity, self.severity))
+        object.__setattr__(self, "timestamp", _datetime(self.timestamp))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "event_type": self.event_type.value,
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "phase_id": self.phase_id,
+            "action_id": self.action_id,
+            "parent_event_id": self.parent_event_id,
+            "timestamp": self.timestamp.isoformat(),
+            "monotonic_ms": self.monotonic_ms,
+            "runtime": self.runtime,
+            "severity": self.severity.value,
+            "summary": self.summary,
+            "payload": self.payload,
+            "artifact_refs": self.artifact_refs,
+            "policy_decision_id": self.policy_decision_id,
+            "approval_grant_id": self.approval_grant_id,
+            "sandbox_id": self.sandbox_id,
+            "command_id": self.command_id,
+            "transaction_id": self.transaction_id,
+            "verification_id": self.verification_id,
+            "span_id": self.span_id,
+            "redaction_applied": self.redaction_applied,
+            "payload_hash": self.payload_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "TraceEvent":
+        return cls(**payload)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, default=str)
+
+    @classmethod
+    def from_json(cls, text: str) -> "TraceEvent":
+        try:
+            return cls.from_dict(json.loads(text))
+        except Exception as exc:
+            raise TraceSerializationError(str(exc)) from exc
+
+
+@dataclass(frozen=True)
+class TraceSpan:
+    span_id: str
+    parent_span_id: str | None
+    run_id: str
+    session_id: str
+    task_id: str | None
+    phase_id: str | None
+    action_id: str | None
+    name: str
+    runtime: str
+    started_at: datetime
+    ended_at: datetime | None
+    duration_ms: int | None
+    status: TraceStatus | str
+    error_type: str | None
+    error_message: str | None
+    attributes: dict[str, Any] = field(default_factory=dict)
+    artifact_refs: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "started_at", _datetime(self.started_at))
+        if self.ended_at is not None:
+            object.__setattr__(self, "ended_at", _datetime(self.ended_at))
+        object.__setattr__(self, "status", _enum(TraceStatus, self.status))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "span_id": self.span_id,
+            "parent_span_id": self.parent_span_id,
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "phase_id": self.phase_id,
+            "action_id": self.action_id,
+            "name": self.name,
+            "runtime": self.runtime,
+            "started_at": self.started_at.isoformat(),
+            "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "duration_ms": self.duration_ms,
+            "status": self.status.value,
+            "error_type": self.error_type,
+            "error_message": self.error_message,
+            "attributes": self.attributes,
+            "artifact_refs": self.artifact_refs,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "TraceSpan":
+        return cls(**payload)
+
+
+@dataclass(frozen=True)
+class TraceArtifact:
+    artifact_id: str
+    run_id: str
+    session_id: str
+    task_id: str | None
+    kind: TraceArtifactKind | str
+    path: Path
+    relative_path: str
+    size_bytes: int
+    sha256: str
+    content_type: str
+    redacted: bool
+    sensitive: bool
+    summary: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", _enum(TraceArtifactKind, self.kind))
+        object.__setattr__(self, "path", Path(self.path))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "artifact_id": self.artifact_id,
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "kind": self.kind.value,
+            "path": str(self.path),
+            "relative_path": self.relative_path,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+            "content_type": self.content_type,
+            "redacted": self.redacted,
+            "sensitive": self.sensitive,
+            "summary": self.summary,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "TraceArtifact":
+        return cls(**payload)
+
+
+@dataclass(frozen=True)
+class TraceTimelineItem:
+    timestamp: datetime
+    event_id: str
+    event_type: str
+    runtime: str
+    summary: str
+    severity: str
+    related_ids: list[str] = field(default_factory=list)
+    artifact_refs: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "timestamp", _datetime(self.timestamp))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "event_id": self.event_id,
+            "event_type": self.event_type,
+            "runtime": self.runtime,
+            "summary": self.summary,
+            "severity": self.severity,
+            "related_ids": self.related_ids,
+            "artifact_refs": self.artifact_refs,
+        }
+
+
+@dataclass(frozen=True)
+class TraceSummary:
+    run_id: str | None
+    session_id: str | None
+    task_id: str | None
+    total_events: int
+    total_spans: int
+    total_artifacts: int
+    action_count: int
+    failed_action_count: int
+    command_count: int
+    sandboxed_command_count: int
+    mutation_count: int
+    verification_count: int
+    policy_denial_count: int
+    approval_count: int
+    replan_count: int
+    error_count: int
+    critical_events: list[dict[str, Any]] = field(default_factory=list)
+    key_artifacts: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "total_events": self.total_events,
+            "total_spans": self.total_spans,
+            "total_artifacts": self.total_artifacts,
+            "action_count": self.action_count,
+            "failed_action_count": self.failed_action_count,
+            "command_count": self.command_count,
+            "sandboxed_command_count": self.sandboxed_command_count,
+            "mutation_count": self.mutation_count,
+            "verification_count": self.verification_count,
+            "policy_denial_count": self.policy_denial_count,
+            "approval_count": self.approval_count,
+            "replan_count": self.replan_count,
+            "error_count": self.error_count,
+            "critical_events": self.critical_events,
+            "key_artifacts": self.key_artifacts,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "TraceSummary":
+        return cls(**payload)
+
+
+def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:
+    if isinstance(value, enum_type):
+        return value
+    text = str(value)
+    if text in enum_type.__members__:
+        return enum_type[text]
+    return enum_type(text)
+
+
+def _datetime(value: datetime | str) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
