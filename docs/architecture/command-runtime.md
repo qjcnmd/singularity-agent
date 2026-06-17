@@ -1,6 +1,6 @@
 # Command Runtime
 
-Miniharness v0.0.7 routes all process execution through a Command Runtime. A shell is not a normal tool: it can execute project code, mutate the workspace, leak environment secrets, access the network, start background processes, and leave child processes behind. The runtime makes those effects explicit before a command is started and keeps the result auditable afterward.
+Miniharness routes process execution through a Command Runtime. A shell is not a normal tool: it can execute project code, mutate the workspace, leak environment secrets, access the network, start background processes, and leave child processes behind. The runtime makes those effects explicit before a command is started and keeps the result auditable afterward.
 
 The compact production boundary is:
 
@@ -33,7 +33,7 @@ Most read-only tools have a bounded input/output shape. Shell does not. Even a s
 
 `MutationRuntime` owns model-authored file edits. Command-generated changes are tracked as command side effects and are not mixed with model apply operations or mutation journals.
 
-`VerificationRuntime` is not implemented yet. The intended boundary is that VerificationRuntime decides what to run, while CommandRuntime runs it and returns `CommandResult` with semantic statuses such as `tests_failed`, `build_failed`, `lint_failed`, and `typecheck_failed`.
+`VerificationRuntime` decides what checks to run, while CommandRuntime runs the approved command and returns `CommandResult` with semantic statuses such as `tests_failed`, `build_failed`, `lint_failed`, and `typecheck_failed`. Direct `run_command` tool calls reject verification-like commands with `verification_runtime_required`; this keeps tests, lint, typecheck, builds, and syntax checks on the verification planning path instead of ad-hoc shell execution.
 
 `GitRuntime` is not implemented yet. Read-only git commands can run through CommandRuntime. Git mutations such as `add`, `commit`, `reset`, `clean`, `push`, `pull`, and `rebase` require review or should move to a dedicated GitRuntime later.
 

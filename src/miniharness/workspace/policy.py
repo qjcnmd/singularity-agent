@@ -170,6 +170,7 @@ class WorkspacePolicy:
     denied_dirs = {
         ".git",
         ".hg",
+        ".miniharness",
         ".svn",
         ".venv",
         "__pycache__",

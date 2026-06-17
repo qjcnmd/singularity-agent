@@ -1,6 +1,10 @@
-# Miniharness v0.0.7
+# Miniharness v0.0.9
 
-Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, tools, context manager, trace file, workspace mutation runtime, and command runtime connect without using LangChain, LangGraph, or any other agent framework.
+Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, tools, context manager, trace file, local workspace state runtime, workspace mutation runtime, command runtime, and verification runtime connect without using LangChain, LangGraph, or any other agent framework.
+
+v0.0.9 adds the Local Workspace State Runtime. Miniharness can now create a non-Git session baseline, capture rich file snapshots, persist a JSONL state journal and SQLite query index, classify ownership for agent mutations and command side effects, detect external changes, store artifacts under session directories, report workspace health, recover interrupted sessions, and perform hash-checked agent-owned rollback without branches, commits, staging, push, or PR behavior.
+
+v0.0.8 adds the Verification Runtime. Tests, lint, typecheck, builds, syntax checks, and smoke checks are no longer treated as ad-hoc shell calls. The agent can detect project shape, discover commands, analyze changed files, build a verification plan, execute checks through `CommandRuntime`, parse failures, generate repair hints, track evidence, handle flaky reruns, and produce a `CompletionAssessment` before declaring work ready.
 
 v0.0.7 adds the Command / Shell Execution Runtime. Test, build, formatter, package manager, dev server, read-only git, and other process execution now flow through `CommandRequest`, `CommandPlan`, `CommandPolicy`, `ExecutionBackend`, `ProcessSupervisor`, resource limits, env redaction, output artifacts, workspace side-effect tracking, command observations, and structured command trace audit events.
 
@@ -26,7 +30,9 @@ v0.0.4 added the Tool Runtime minimal production slice: tool calls execute throu
         ├── config.py       # environment variable loading
         ├── context/        # token budgets, context assembly, observations, recovery
         ├── provider.py     # OpenAI-compatible HTTP call via httpx
-        ├── tools/          # tool specs, registry, runtime, policy, read-only and mutation tools
+        ├── tools/          # tool specs, registry, runtime, policy, read-only, mutation, command, verification tools
+        ├── verification/   # project detection, planning, execution, evidence, repair, completion assessment
+        ├── workspace_state/ # non-Git baseline, snapshot, ownership, journal, artifact, rollback, recovery
         ├── workspace/      # mutation runtime: paths, policy, snapshots, diffs, journal, rollback
         └── trace.py        # JSONL trace writer
 ```
@@ -35,9 +41,12 @@ Each run creates:
 
 ```txt
 .miniharness/runs/<run_id>.jsonl
+.miniharness/workspace_state.sqlite3
+.miniharness/sessions/<session_id>/journal.jsonl
+.miniharness/sessions/<session_id>/artifacts/
 ```
 
-The trace records `user_goal`, `model_request`, `model_response`, `tool_call`, `tool_result`, `mutation`, `command`, `final_answer`, and `error` events. Tool runtime audit entries include validated arguments, permission level, risk tags, start/end timestamps, duration, status, error code, truncation status, output digest, and cache hit status. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, redaction count, semantic status, isolation report, and lightweight git state.
+The trace records `user_goal`, `model_request`, `model_response`, `tool_call`, `tool_result`, `workspace_state`, `mutation`, `command`, `verification`, `final_answer`, and `error` events. Tool runtime audit entries include validated arguments, permission level, risk tags, start/end timestamps, duration, status, error code, truncation status, output digest, and cache hit status. Workspace state audit entries include session id, baseline id, event id, event type, path, ownership, before/after hashes, transaction id, command id, mutation id, artifact id, timestamp, and warning/error code. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, structured side effects, redaction count, semantic status, isolation report, and lightweight git state. Verification audit entries include project profile, impact analysis, plan/check ids, policy decision, command id, parsed failures, evidence artifacts, repair hints, and completion assessment.
 
 ## Install
 
@@ -158,6 +167,24 @@ The protocol and runtime layer now have:
 - Write tools must declare `uses_mutation_runtime=true`; otherwise `ToolRuntime` rejects them with `invalid_operation` before the handler can touch the filesystem.
 - Shell tools must declare `uses_command_runtime=true`; otherwise `ToolRuntime` rejects them with `invalid_operation` before the handler can spawn a process.
 
+## Local Workspace State Runtime
+
+Miniharness v0.0.9 adds `LocalWorkspaceStateRuntime` as the non-Git source of truth for local workspace state. It creates a baseline at CLI session start, captures rich `FileSnapshot` records, persists state to JSONL plus SQLite, stores large artifacts under the session directory, and reports workspace health without depending on branches, commits, staging, push, or pull requests.
+
+The runtime owns:
+
+- `WorkspaceBaseline`: session start snapshot index.
+- `WorkspaceJournal`: structured JSONL events such as `baseline_created`, `file_snapshot_captured`, `file_changed_by_mutation`, `file_changed_by_command`, `external_change_detected`, rollback events, artifact events, recovery, and close.
+- `WorkspaceStateStore`: `.miniharness/workspace_state.sqlite3` query index for current state.
+- `ArtifactStore`: session-scoped command output, diffs, verification evidence, rollback backups, scan reports, and trace exports.
+- `WorkspaceHealthReport`: compact state observation for planner, mutation, verification, context, and CLI surfaces.
+
+Ownership is explicit: `AGENT_MUTATION`, `FORMATTER_SIDE_EFFECT`, `TEST_ARTIFACT`, `PACKAGE_MANAGER_SIDE_EFFECT`, `GENERATED_ARTIFACT`, `COMMAND_SIDE_EFFECT`, `UNKNOWN_EXTERNAL`, and `USER_OWNED` are not collapsed into one dirty-file list. Rollback is agent-owned only: before restoring, the runtime checks that the current file hash still matches the agent's last after-write hash and returns `rollback_conflict` instead of overwriting user or external edits.
+
+The `.miniharness` state directory is excluded from scans and normal read-only tools, and `WorkspacePolicy` denies model-authored mutation attempts under that path. The `workspace_health` tool exposes compact health observations to the agent, and the agent injects that observation after tool calls so the next model turn can see external changes or rollback conflicts without receiving the full journal. CLI runs also print a separate workspace state panel after the final answer, keeping agent changes, command side effects, external changes, and rollback status distinct from the model's final text.
+
+See `docs/architecture/local-workspace-state-runtime.md` for the full design.
+
 ## Command Runtime
 
 Miniharness v0.0.7 does not treat shell as a normal tool. Process execution is represented by `CommandRequest` and planned through `CommandPlan` before execution. The default command tools are:
@@ -171,22 +198,46 @@ Miniharness v0.0.7 does not treat shell as a normal tool. Process execution is r
 The runtime includes:
 
 - `CommandPolicy`: returns `allow`, `require_review`, or `deny` with risk tags, required backend, network/filesystem mode, and redaction rules.
-- `CommandPurpose` and `CommandRisk`: classify read-only commands, verification, formatters, builds, code generation, package managers, network operations, workspace writes, destructive commands, long-running processes, secret risk, VCS read/mutation, system mutation, project-code execution, and unknown commands.
+- `CommandPurpose` and `CommandRisk`: classify read-only commands, project verification, lint, typecheck, format checks, formatters, builds, code generation, package managers, network operations, workspace writes, destructive commands, long-running processes, secret risk, VCS read/mutation, system mutation, project-code execution, and unknown commands.
 - `ExecutionBackend`: implemented by `LocalProcessBackend`, with `SandboxBackend` reserved as an explicit interface for future isolation.
 - `ProcessSupervisor`: starts processes, monitors timeout and idle timeout, and terminates process trees rather than only killing a parent process.
 - `ResourceLimits`: enforces timeout, idle timeout, stdout/stderr/combined output limits, and reports memory/process/disk limits as unsupported on the local backend.
 - `EnvPolicy`: avoids full parent env inheritance, allows a small safe inherited env set, denies secret-like env keys, and redacts secrets before trace or observation storage.
 - `NetworkMode` and `FilesystemMode`: make network and filesystem expectations explicit. The local backend reports `network_isolation_enforced=false` and filesystem isolation as advisory because it is not a sandbox.
 - `OutputCollector`: keeps stdout and stderr separate, builds ordered combined output, truncates oversized previews, records digests, and saves large output artifacts under `.miniharness/artifacts/commands/`.
-- Workspace side-effect tracking: snapshots workspace files before and after commands and returns changed files separately from model-owned mutation transactions.
+- Workspace side-effect tracking: uses `LocalWorkspaceStateRuntime` when available to snapshot workspace files before and after commands, classify ownership, return structured side effects, and keep command changes separate from model-owned mutation transactions.
 
 `CommandResult` distinguishes runtime failures, policy denials, review requirements, non-zero exits, and semantic failures such as `tests_failed`, `build_failed`, `lint_failed`, and `typecheck_failed`. Context Manager receives a compact `command_result` observation instead of raw stdout/stderr.
 
-Git read commands such as `git status`, `git diff`, and `git log` may run through the command runtime. Git mutation commands such as `git add`, `commit`, `reset`, `clean`, and `push` require review or a future dedicated GitRuntime path. See `docs/architecture/command-runtime.md` for design details and error taxonomy.
+Direct `run_command` calls reject verification-like commands with `verification_runtime_required`. VerificationRuntime is responsible for choosing and running tests, lint, typecheck, builds, and syntax checks, while CommandRuntime remains responsible for executing each approved command.
+
+Git read commands such as `git status`, `git diff`, and `git log` may run through the command runtime. Git mutation commands such as `git add`, `commit`, `reset`, `clean`, and `push` require review or a future dedicated GitRuntime path. Local workspace state, ownership, session recovery, and agent-owned rollback are handled by `LocalWorkspaceStateRuntime`, not Git. See `docs/architecture/command-runtime.md` and `docs/architecture/local-workspace-state-runtime.md` for design details and error taxonomy.
+
+## Verification Runtime
+
+Miniharness v0.0.8 adds a dedicated Verification Runtime. Verification is not a single `run_tests` helper: it is a planned workflow that connects project detection, command discovery, impact analysis, policy review, command execution, failure parsing, repair observation, flaky handling, evidence capture, and completion assessment.
+
+The default verification tools are:
+
+- `plan_verification`
+- `run_verification`
+- `get_verification_result`
+- `rerun_check`
+
+The runtime includes:
+
+- `ProjectDetector` and `CommandDiscovery`: inspect project files such as `package.json`, lockfiles, `pyproject.toml`, pytest/ruff/tox config, `Cargo.toml`, `go.mod`, Java build files, `Makefile`, `justfile`, `tsconfig.json`, ESLint config, and GitHub workflows.
+- `ImpactAnalyzer`: turns changed files, task intent, transaction id, and changeset id into affected modules, likely tests, risk reasons, and required build/typecheck/manual-review flags.
+- `VerificationPlan` and `VerificationCheck`: separate required, optional, skipped, and blocked checks.
+- `VerificationPolicy`: applies verification-specific risk rules before any command runs, while still using `CommandPolicy`.
+- `FailureParser` implementations for pytest/Python traceback, TypeScript `tsc`, ESLint, npm build output, and generic stderr fallback.
+- `RepairHintGenerator`, `RepairLoopController`, flaky rerun handling, and `CompletionAssessor`.
+
+Verification observations are compact and include plan status, failed checks, parsed failures, repair hints, and completion assessment. Large command output remains in command artifacts and is referenced by evidence. See `docs/architecture/verification-runtime.md` for design details and extension points.
 
 ## Workspace Mutation Runtime
 
-Miniharness v0.0.6 does not expose a raw `write_file` tool. File changes are represented as edit operations, assembled into a `ChangeSet`, checked by `WorkspacePolicy`, applied through a `MutationTransaction`, and recorded in a `MutationJournal`.
+Miniharness v0.0.6 does not expose a raw `write_file` tool. File changes are represented as edit operations, assembled into a `ChangeSet`, checked by `WorkspacePolicy`, applied through a `MutationTransaction`, and recorded in a `MutationJournal`. In v0.0.9, successful mutations also flow into `LocalWorkspaceStateRuntime` so agent-owned changes, rollback evidence, workspace health, and trace correlation share the same local state layer as command side effects.
 
 The runtime includes:
 
@@ -197,7 +248,7 @@ The runtime includes:
 - `DiffEngine`: emits `FileDiff` and `DiffHunk` records with added and removed line counts, binary/rename flags, digest, truncation status, and artifact paths for large diffs.
 - `AtomicWriter`: writes text through temporary files, flush, fsync, and `os.replace`, while preserving existing permissions and line-ending/encoding strategy when possible.
 - `RollbackManager`: rolls back agent-owned transactions from the journal and returns `rollback_conflict` if the user changed a file after the transaction.
-- Verification hook fields are present in results and trace so a later Verification Runtime can attach formatters, lint, typecheck, tests, or builds without hard-coding them into mutation logic.
+- Verification hook fields are present in results and trace so VerificationRuntime can attach formatters, lint, typecheck, tests, or builds without hard-coding them into mutation logic.
 
 Registered mutation tools currently include `workspace_replace_text`, `workspace_create_file`, `workspace_delete_file`, and `workspace_move_file`. High-risk operations such as project config edits, build scripts, lockfiles, deletion, moving, and formatting are represented as `require_review`; in the current CLI, that state is returned structurally instead of being silently applied.
 

@@ -55,6 +55,8 @@ SYSTEM_MUTATORS = {
 }
 DESTRUCTIVE_PROGRAMS = {"del", "erase", "rmdir"}
 FORMATTERS = {"black", "prettier", "ruff"}
+LINTERS = {"eslint", "flake8", "ruff"}
+TYPECHECKERS = {"mypy", "pyright", "tsc"}
 BUILD_TOOLS = {"make", "tsc"}
 TEST_TOOLS = {"pytest", "tox", "nox"}
 
@@ -150,7 +152,7 @@ class CommandPolicy:
                 redaction_rules=redaction_rules,
                 error_code="review_required",
             )
-        if CommandRisk.PACKAGE_MANAGER in risk_tags:
+        if CommandRisk.PACKAGE_MANAGER in risk_tags and not request.risk_acceptance_reason:
             return CommandPolicyResult(
                 decision=CommandDecision.REQUIRE_REVIEW,
                 reasons=["Package manager commands can change dependency state and require review."],
@@ -221,7 +223,19 @@ class CommandPolicy:
         lowered = [part.lower() for part in argv]
         joined = " ".join(lowered)
 
-        if request.purpose == CommandPurpose.PROJECT_VERIFICATION or _is_test_command(program, lowered):
+        if (
+            request.purpose
+            in {
+                CommandPurpose.PROJECT_VERIFICATION,
+                CommandPurpose.LINT,
+                CommandPurpose.TYPECHECK,
+                CommandPurpose.FORMAT_CHECK,
+            }
+            or _is_test_command(program, lowered)
+            or _is_lint_command(program, lowered)
+            or _is_typecheck_command(program, lowered)
+            or _is_format_check(program, lowered)
+        ):
             tags.add(CommandRisk.PROJECT_VERIFICATION)
             tags.add(CommandRisk.EXECUTES_PROJECT_CODE)
         if request.purpose == CommandPurpose.BUILD or _is_build_command(program, lowered):
@@ -312,10 +326,36 @@ def _is_build_command(program: str, lowered: list[str]) -> bool:
     return program in {"npm", "pnpm", "yarn"} and "build" in lowered
 
 
-def _is_formatter(program: str, lowered: list[str]) -> bool:
-    if program == "ruff" and any(part in {"format", "check"} for part in lowered[1:]):
+def _is_lint_command(program: str, lowered: list[str]) -> bool:
+    if program in LINTERS and "--fix" not in lowered:
         return True
-    if program in FORMATTERS:
+    return program in {"npm", "pnpm", "yarn"} and "lint" in lowered[1:3]
+
+
+def _is_typecheck_command(program: str, lowered: list[str]) -> bool:
+    if program in TYPECHECKERS:
+        return True
+    return program in {"npm", "pnpm", "yarn"} and any(
+        part in {"typecheck", "type-check", "tsc"} for part in lowered[1:3]
+    )
+
+
+def _is_format_check(program: str, lowered: list[str]) -> bool:
+    if program in {"black", "prettier"} and any(part in {"--check", "-c", "check"} for part in lowered[1:]):
+        return True
+    if program == "ruff" and "format" in lowered and "--check" in lowered:
+        return True
+    return program in {"npm", "pnpm", "yarn"} and any(
+        "format" in part and "check" in part for part in lowered[1:3]
+    )
+
+
+def _is_formatter(program: str, lowered: list[str]) -> bool:
+    if _is_format_check(program, lowered):
+        return False
+    if program == "ruff" and "format" in lowered[1:]:
+        return True
+    if program in {"black", "prettier"}:
         return True
     return program == "eslint" and "--fix" in lowered
 
