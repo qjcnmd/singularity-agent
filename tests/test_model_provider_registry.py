@@ -1,0 +1,154 @@
+import pytest
+import httpx
+
+from miniharness.config import Settings
+from miniharness.model import (
+    MockModelProvider,
+    ModelCapabilities,
+    ModelCapabilityError,
+    ModelPreferences,
+    ModelMessage,
+    ModelRole,
+    OpenAICompatibleModelProvider,
+    ModelProviderNotFound,
+    ModelProviderRegistry,
+    ProviderRequest,
+    ToolChoiceMode,
+    ToolChoicePolicy,
+    ContentBlock,
+)
+
+
+def test_registry_selects_default_provider_and_checks_capabilities() -> None:
+    provider = MockModelProvider(
+        provider_name="mock",
+        model_name="mock-model",
+        capabilities=ModelCapabilities(
+            supports_tools=True,
+            supports_streaming=False,
+            supports_json_mode=False,
+        ),
+    )
+    registry = ModelProviderRegistry(default_provider_name="mock")
+    registry.register(provider)
+
+    selected = registry.select_provider(ModelPreferences(provider_name=None), purpose=None)
+
+    assert selected.name() == "mock"
+    assert registry.default_provider().name() == "mock"
+    registry.check_capabilities(selected, requires_tools=True)
+    with pytest.raises(ModelCapabilityError):
+        registry.check_capabilities(selected, requires_streaming=True)
+    with pytest.raises(ModelProviderNotFound):
+        registry.get("missing")
+
+
+class _FakeResponse:
+    status_code = 200
+    text = "{}"
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return {
+            "id": "resp_1",
+            "model": "test-model",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }
+
+
+class _FakeErrorResponse:
+    status_code = 500
+    text = "provider echoed OPENAI_API_KEY=sk-leaked"
+
+    def raise_for_status(self) -> None:
+        request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+        response = httpx.Response(self.status_code, request=request, text=self.text)
+        raise httpx.HTTPStatusError("server error", request=request, response=response)
+
+
+class _FakeClient:
+    payloads: list[dict] = []
+
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+
+    def __enter__(self) -> "_FakeClient":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+    def post(self, url: str, *, headers: dict[str, str], json: dict) -> _FakeResponse:
+        self.payloads.append(json)
+        return _FakeResponse()
+
+
+class _FakeErrorClient(_FakeClient):
+    def post(self, url: str, *, headers: dict[str, str], json: dict) -> _FakeErrorResponse:
+        self.payloads.append(json)
+        return _FakeErrorResponse()
+
+
+def test_openai_compatible_model_provider_serializes_runtime_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeClient.payloads = []
+    monkeypatch.setattr("miniharness.model.providers.httpx.Client", _FakeClient)
+    provider = OpenAICompatibleModelProvider(
+        Settings(base_url="https://example.test/v1", api_key="test-key", model="test-model")
+    )
+
+    response = provider.complete(
+        ProviderRequest(
+            request_id="req_1",
+            purpose="plan_next_action",
+            messages=[
+                ModelMessage(
+                    role=ModelRole.USER,
+                    content=[ContentBlock.text("hi")],
+                )
+            ],
+            tool_choice=ToolChoicePolicy(mode=ToolChoiceMode.NONE),
+        )
+    )
+
+    assert response.message.text == "ok"
+    assert response.usage.total_tokens == 5
+    assert _FakeClient.payloads[0]["tool_choice"] == "none"
+
+
+def test_openai_compatible_provider_keeps_parallel_tool_compatibility() -> None:
+    provider = OpenAICompatibleModelProvider(
+        Settings(base_url="https://example.test/v1", api_key="test-key", model="test-model")
+    )
+
+    assert provider.capabilities().supports_parallel_tool_calls is True
+
+
+def test_openai_provider_error_does_not_include_response_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("miniharness.model.providers.httpx.Client", _FakeErrorClient)
+    provider = OpenAICompatibleModelProvider(
+        Settings(base_url="https://example.test/v1", api_key="test-key", model="test-model")
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        provider.complete(
+            ProviderRequest(
+                request_id="req_1",
+                purpose="plan_next_action",
+                messages=[
+                    ModelMessage(
+                        role=ModelRole.USER,
+                        content=[ContentBlock.text("hi")],
+                    )
+                ],
+            )
+        )
+
+    assert "sk-leaked" not in str(exc_info.value)
+    assert "OPENAI_API_KEY" not in str(exc_info.value)

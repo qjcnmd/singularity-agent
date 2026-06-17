@@ -18,6 +18,7 @@ pyproject.toml
    └─ src/miniharness/cli.py
       └─ src/miniharness/agent.py
          ├─ src/miniharness/context/
+         ├─ src/miniharness/model/
          ├─ src/miniharness/observability/
          ├─ src/miniharness/planner/
          ├─ src/miniharness/tools/
@@ -41,8 +42,9 @@ pyproject.toml
 
 - `cli.py`: 命令入口、会话启动/恢复、runtime 组装。
 - `agent.py`: model loop、context 注入、tool dispatch、最终收口。
-- `provider.py`: OpenAI-compatible 调用。
+- `provider.py`: 旧 OpenAI-compatible provider 兼容入口。
 - `trace.py`: 旧 JSONL trace 兼容入口。
+- `model/`: 模型调用运行时、provider registry、message/tool 转换、validation、budget、retry、streaming。
 - `observability/`: 结构化 TraceRuntime、TraceStore、artifact、span、timeline、summary、redaction。
 - `context/`: token budget、上下文组装、观察记录、压缩与恢复。
 - `planner/`: task state、phase、evidence、budget、completion。
@@ -58,6 +60,7 @@ pyproject.toml
 | 任务 | 先看 | 再看 |
 |---|---|---|
 | 启动、入口、运行方式 | `README.md`, `src/miniharness/cli.py`, `src/miniharness/agent.py` | `tests/test_cli.py`, `tests/test_agent.py` |
+| 模型调用、provider、tool call 校验 | `src/miniharness/model/`, `src/miniharness/provider.py`, `tests/test_model_*.py` | `docs/architecture/model-inference-runtime.md`, `tests/test_provider.py`, `tests/test_agent.py` |
 | 上下文压缩、恢复、引用 | `src/miniharness/context/`, `tests/test_context.py`, `tests/test_context_production.py` | `README.md` 的 Context Manager 段 |
 | 规划、阶段、完成条件 | `src/miniharness/planner/`, `tests/test_planner_runtime.py` | `docs/architecture/planner-task-execution-runtime.md` |
 | 验证、检测、失败解析、修复 | `src/miniharness/verification/`, `tests/test_verification_runtime.py` | `docs/architecture/verification-runtime.md` |

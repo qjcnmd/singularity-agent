@@ -53,6 +53,7 @@ class TraceSummaryBuilder:
             if event.severity in {TraceSeverity.ERROR, TraceSeverity.CRITICAL}
         ][:10]
         key_artifacts = [artifact.artifact_id for artifact in selected_artifacts if not artifact.sensitive][:20]
+        model_usage_summary = _model_usage_summary(selected_events)
         return TraceSummary(
             run_id=run_id or _first([event.run_id for event in selected_events]),
             session_id=_first([event.session_id for event in selected_events]),
@@ -133,6 +134,7 @@ class TraceSummaryBuilder:
             ),
             critical_events=critical,
             key_artifacts=key_artifacts,
+            model_usage_summary=model_usage_summary,
         )
 
     def final_report_summary(
@@ -178,6 +180,7 @@ class TraceSummaryBuilder:
             "policy_denials": summary.policy_denial_count,
             "approvals": summary.approval_count,
             "replans": summary.replan_count,
+            "model_usage_summary": summary.model_usage_summary,
             "key_failures": [
                 event.summary
                 for event in selected_events
@@ -230,3 +233,37 @@ def _first(values: list[Any]) -> Any | None:
         if value is not None:
             return value
     return None
+
+
+def _model_usage_summary(events: list[TraceEvent]) -> dict[str, Any]:
+    usage = {
+        "requests": 0,
+        "responses": 0,
+        "failures": 0,
+        "tool_calls_proposed": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    for event in events:
+        if event.event_type == TraceEventType.MODEL_REQUEST_CREATED:
+            usage["requests"] += 1
+        elif event.event_type == TraceEventType.MODEL_RESPONSE_RECEIVED:
+            usage["responses"] += 1
+            payload_usage = event.payload.get("usage") or {}
+            if isinstance(payload_usage, dict):
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "cached_input_tokens",
+                    "reasoning_tokens",
+                ):
+                    usage[key] += int(payload_usage.get(key) or 0)
+        elif event.event_type == TraceEventType.MODEL_REQUEST_FAILED:
+            usage["failures"] += 1
+        elif event.event_type == TraceEventType.MODEL_TOOL_CALL_PROPOSED:
+            usage["tool_calls_proposed"] += 1
+    return usage

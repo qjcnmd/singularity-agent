@@ -52,6 +52,7 @@ class ContextManager:
         system_prompt: str,
         user_goal: str,
         provider: Any | None = None,
+        model_runtime: Any | None = None,
         model_context_window: int = 128000,
         output_token_reserve: int = 4096,
         db_path: Path | None = None,
@@ -62,6 +63,7 @@ class ContextManager:
         self.run_id = run_id or uuid4().hex
         self.user_goal = user_goal
         self.provider = provider
+        self.model_runtime = model_runtime
         self.trace = trace
         self.token_counter = token_counter or TokenCounter()
         self.assembler = ContextAssembler(
@@ -218,7 +220,7 @@ class ContextManager:
             self.store.append_message(run_id=self.run_id, message=message)
 
     def _compress_if_possible(self) -> None:
-        if self.provider is None:
+        if self.provider is None and self.model_runtime is None:
             return
         compression_messages = [
             {
@@ -243,15 +245,42 @@ class ContextManager:
                 ),
             },
         ]
-        response = self.provider.chat(
-            messages=compression_messages,
-            tools=[],
-            tool_choice=ToolChoiceMode.NONE,
-        )
-        content = (
-            ((response.get("choices") or [{}])[0].get("message") or {}).get("content")
-            or ""
-        )
+        if self.model_runtime is not None:
+            from miniharness.model import (
+                ModelBudget,
+                ModelPurpose,
+                ModelTurnRequest,
+                ToolChoicePolicy,
+                ToolChoiceMode as RuntimeToolChoiceMode,
+            )
+
+            request_id = f"model_compact_{uuid4().hex[:12]}"
+            result = self.model_runtime.run_turn(
+                ModelTurnRequest(
+                    request_id=request_id,
+                    run_id=self.run_id,
+                    session_id=self.run_id,
+                    task_id=self.run_id,
+                    phase_id="context_compaction",
+                    action_id=request_id,
+                    purpose=ModelPurpose.COMPACT_CONTEXT,
+                    messages=compression_messages,
+                    tools=[],
+                    tool_choice=ToolChoicePolicy(mode=RuntimeToolChoiceMode.NONE),
+                    budget=ModelBudget(),
+                )
+            )
+            content = result.assistant_message.text if result.assistant_message else ""
+        else:
+            response = self.provider.chat(
+                messages=compression_messages,
+                tools=[],
+                tool_choice=ToolChoiceMode.NONE,
+            )
+            content = (
+                ((response.get("choices") or [{}])[0].get("message") or {}).get("content")
+                or ""
+            )
         summary, known_ids = self._parse_summary(content)
         self._summary = summary
         snapshot = ContextSnapshot(
