@@ -12,6 +12,18 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from miniharness.trace import TraceWriter
+from miniharness.policy import (
+    Capability,
+    DecisionOutcome,
+    OperationKind,
+    PolicyConfig,
+    PolicyRequest,
+    PolicyRuntime,
+    PolicySubject,
+    ResourceRef,
+    RuntimeName,
+)
+from miniharness.policy.audit import redact
 from miniharness.workspace.diff import DiffEngine, FileDiff
 from miniharness.workspace.errors import MutationError
 from miniharness.workspace.git import GitState, collect_git_state
@@ -207,6 +219,7 @@ class MutationRuntime:
         verification_hook: Any | None = None,
         state_runtime: "LocalWorkspaceStateRuntime | None" = None,
         planner: Any | None = None,
+        policy_runtime: PolicyRuntime | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.resolver = WorkspacePathResolver(self.workspace_root)
@@ -222,6 +235,9 @@ class MutationRuntime:
         self.verification_hook = verification_hook
         self.state_runtime = state_runtime
         self.planner = planner
+        self.policy_runtime = policy_runtime or PolicyRuntime(
+            PolicyConfig.runtime_default(self.workspace_root)
+        )
         self._journals: dict[str, MutationJournal] = {}
 
     def preview_operations(
@@ -383,6 +399,11 @@ class MutationRuntime:
         try:
             changeset.validate()
             self._preflight_current_state(changeset)
+            policy_decision = self._enforce_policy(changeset, transaction_id)
+            if policy_decision is not None:
+                result = policy_decision
+                self._record_failure_trace(result, tool_call_id=tool_call_id, started=started)
+                return result
             for path in changeset.affected_files:
                 resolved = self.resolver.resolve(path)
                 before_snapshot = changeset.base_snapshots.get(path)
@@ -493,6 +514,135 @@ class MutationRuntime:
         if self.planner is not None:
             self.planner.update_from_mutation(result.observation | {"transaction_id": transaction_id}, tool_call_id=tool_call_id)
         return result
+
+    def _enforce_policy(
+        self,
+        changeset: ChangeSet,
+        transaction_id: str,
+    ) -> MutationResult | None:
+        request = self._policy_request(changeset, transaction_id=transaction_id)
+        decision = self.policy_runtime.enforce(request)
+        self._record_policy_trace(request, decision)
+        if decision.outcome == DecisionOutcome.ALLOW:
+            return None
+        self._record_policy_observation(request, decision)
+        return MutationResult(
+            ok=False,
+            status=(
+                "requires_review"
+                if decision.outcome == DecisionOutcome.REQUIRE_REVIEW
+                else decision.outcome.value
+            ),
+            error_code=_policy_error_code(decision.outcome),
+            message=decision.reason,
+            changeset_id=changeset.id,
+            transaction_id=transaction_id,
+            affected_files=changeset.affected_files,
+            diffs=changeset.diffs,
+            policy_decisions=changeset.policy_decisions,
+            observation=self._observation(
+                "requires_review"
+                if decision.outcome == DecisionOutcome.REQUIRE_REVIEW
+                else "rejected",
+                changeset,
+                error_code=_policy_error_code(decision.outcome),
+                error_details={"policy": decision.to_dict(), "request": request.to_dict()},
+            ),
+        )
+
+    def _policy_request(
+        self,
+        changeset: ChangeSet,
+        *,
+        transaction_id: str,
+    ) -> PolicyRequest:
+        operation = _operation_kind_for_changeset(changeset)
+        capability = _capability_for_changeset(changeset)
+        resource = ResourceRef(
+            resource_type="file" if len(changeset.affected_files) <= 1 else "workspace",
+            identifier=changeset.affected_files[0] if len(changeset.affected_files) == 1 else ",".join(changeset.affected_files),
+            workspace_relative=True,
+            metadata={"files": changeset.affected_files},
+        )
+        return PolicyRequest(
+            session_id=getattr(self.planner, "session_id", "mutation_session"),
+            task_id=getattr(self.planner, "task_id", "mutation_task"),
+            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "mutation"),
+            action_id=transaction_id,
+            runtime=RuntimeName.MUTATION,
+            operation=operation,
+            capability=capability,
+            subject=PolicySubject(subject_type="runtime", name="MutationRuntime"),
+            resource=resource,
+            reason=changeset.intent,
+            proposed_by_model=True,
+            metadata={
+                "diff_summary": changeset.preview(),
+                "files_changed": changeset.affected_files,
+                "created": [
+                    path
+                    for path, snapshot in changeset.base_snapshots.items()
+                    if snapshot is None and path in changeset.affected_files
+                ],
+                "deleted": [
+                    path
+                    for path, final_text in changeset.final_texts.items()
+                    if final_text is None
+                ],
+                "reversible": True,
+                "transaction_id": transaction_id,
+                "changeset_id": changeset.id,
+            },
+            reversible=True,
+            touches_workspace=True,
+            destructive=operation == OperationKind.DELETE_FILE,
+            workspace_root=str(self.workspace_root),
+        )
+
+    def _record_policy_observation(
+        self,
+        request: PolicyRequest,
+        decision: Any,
+    ) -> None:
+        if self.planner is None or not hasattr(self.planner, "record_policy_observation"):
+            return
+        self.planner.record_policy_observation(
+            {
+                "outcome": decision.outcome.value,
+                "runtime": request.runtime.value,
+                "operation": request.operation.value,
+                "reason": decision.reason,
+                "risk_level": decision.risk_level.value,
+                "resource": request.resource.identifier,
+                "decision_id": decision.decision_id,
+            }
+        )
+
+    def _record_policy_trace(self, request: PolicyRequest, decision: Any) -> None:
+        if self.trace is None:
+            return
+        self.trace.record(
+            "policy",
+            redact(
+                {
+                    "request_id": request.request_id,
+                    "decision_id": decision.decision_id,
+                    "runtime": request.runtime.value,
+                    "operation": request.operation.value,
+                    "capability": request.capability.value,
+                    "resource": request.resource.identifier,
+                    "outcome": decision.outcome.value,
+                    "risk_level": decision.risk_level.value,
+                    "risk_tags": [
+                        tag.value if hasattr(tag, "value") else str(tag)
+                        for tag in decision.risk_tags
+                    ],
+                    "reason": decision.reason,
+                    "rule_ids": decision.rule_ids,
+                    "approval_required": decision.required_approval is not None,
+                }
+            ),
+        )
 
     def _snapshot_for_operation(
         self,
@@ -1002,3 +1152,31 @@ def normalize_line_endings(text: str, line_ending: str | None) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _operation_kind_for_changeset(changeset: ChangeSet) -> OperationKind:
+    if any(final_text is None for final_text in changeset.final_texts.values()):
+        return OperationKind.DELETE_FILE
+    if any(path not in changeset.base_snapshots or changeset.base_snapshots[path] is None for path in changeset.affected_files):
+        return OperationKind.CREATE_FILE
+    return OperationKind.MUTATE_FILE
+
+
+def _capability_for_changeset(changeset: ChangeSet) -> Capability:
+    operation = _operation_kind_for_changeset(changeset)
+    if operation == OperationKind.CREATE_FILE:
+        return Capability.CREATE_FILE
+    if operation == OperationKind.DELETE_FILE:
+        return Capability.DELETE_FILE
+    return Capability.MUTATE_WORKSPACE
+
+
+def _policy_error_code(outcome: DecisionOutcome) -> str:
+    mapping = {
+        DecisionOutcome.DENY: "policy_denied",
+        DecisionOutcome.REQUIRE_REVIEW: "approval_required",
+        DecisionOutcome.SANDBOX_REQUIRED: "sandbox_required",
+        DecisionOutcome.ASK_USER: "policy_ask_user_required",
+        DecisionOutcome.ESCALATE: "policy_escalation_required",
+    }
+    return mapping.get(outcome, "policy_denied")

@@ -1,0 +1,159 @@
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
+
+from miniharness.command import CommandRequest, CommandRuntime, ExecutionStatus
+from miniharness.planner import EvidenceLedger, PlannerRuntime, TaskStatus, TaskState
+from miniharness.planner.finalizer import Finalizer
+from miniharness.policy import DecisionOutcome, PolicyConfig, PolicyRuntime
+from miniharness.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
+from miniharness.verification import VerificationRuntime
+from miniharness.workspace import CreateFile, MutationRuntime
+
+
+class EmptyInput(BaseModel):
+    pass
+
+
+class CountingPolicyRuntime(PolicyRuntime):
+    def __init__(self, tmp_path: Path) -> None:
+        super().__init__(PolicyConfig(workspace_root=tmp_path))
+        self.calls: list[str] = []
+
+    def enforce(self, request):  # type: ignore[no-untyped-def]
+        self.calls.append(f"{request.runtime.value}:{request.operation.value}:{request.resource.identifier}")
+        decision = super().enforce(request)
+        if decision.outcome == DecisionOutcome.REQUIRE_REVIEW:
+            return decision.model_copy_with(outcome=DecisionOutcome.ALLOW, reason="test grant")
+        return decision
+
+
+def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": "call_policy",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
+
+
+def test_tool_runtime_dispatch_calls_policy_before_handler(tmp_path: Path) -> None:
+    called = False
+
+    def handler(_args: EmptyInput) -> str:
+        nonlocal called
+        called = True
+        return "ok"
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="safe_read",
+            description="safe",
+            input_model=EmptyInput,
+            handler=handler,
+            permission_level=PermissionLevel.READ_ONLY,
+        )
+    )
+    policy = CountingPolicyRuntime(tmp_path)
+    runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.coding_agent(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_runtime=policy,
+    )
+
+    result = runtime.execute_tool_call(tool_call("safe_read", {}))
+
+    assert result.ok is True
+    assert called is True
+    assert policy.calls and policy.calls[0].startswith("tool:")
+
+
+def test_mutation_runtime_calls_policy_before_apply(tmp_path: Path) -> None:
+    policy = CountingPolicyRuntime(tmp_path)
+    runtime = MutationRuntime(tmp_path, policy_runtime=policy)
+
+    result = runtime.apply_operations(
+        [CreateFile(path="app.py", content="print('ok')\n")],
+        intent="create app",
+        created_by="test",
+    )
+
+    assert result.ok is True
+    assert any(":create_file:" in call or ":mutate_file:" in call for call in policy.calls)
+
+
+def test_command_runtime_calls_policy_before_execute(tmp_path: Path) -> None:
+    policy = CountingPolicyRuntime(tmp_path)
+    runtime = CommandRuntime(tmp_path, policy_runtime=policy)
+
+    result = runtime.run(
+        CommandRequest(argv=[sys.executable, "-c", "print('ok')"], cwd=".")
+    )
+
+    assert result.execution_status == ExecutionStatus.COMPLETED
+    assert any(call.startswith("command:execute_command") for call in policy.calls)
+
+
+def test_verification_runtime_does_not_bypass_policy(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "sample"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+""",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    policy = CountingPolicyRuntime(tmp_path)
+    command_runtime = CommandRuntime(tmp_path, policy_runtime=policy)
+    runtime = VerificationRuntime(tmp_path, command_runtime=command_runtime, policy_runtime=policy)
+
+    plan = runtime.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")
+    runtime.run_plan(plan.id)
+
+    assert any(call.startswith("verification:verification") for call in policy.calls)
+    assert any(call.startswith("command:verification") for call in policy.calls)
+
+
+def test_planner_records_policy_observation_and_final_report_summary(tmp_path: Path) -> None:
+    planner = PlannerRuntime(tmp_path, session_id="session", task_id="task")
+    planner.start_task("Policy blocked task")
+    planner.record_policy_observation(
+        {
+            "outcome": "deny",
+            "runtime": "command",
+            "operation": "package_install",
+            "reason": "package install requires review but session is non-interactive.",
+            "risk_level": "high",
+            "resource": "npm install",
+        }
+    )
+
+    assert planner.evidence.policy_observations
+    assert "[policy] Command denied" in planner.renderer.render(
+        state=planner.state,
+        plan=planner.plan,
+        evidence=planner.evidence,
+    )
+
+    state = TaskState(
+        task_id="task",
+        session_id="session",
+        user_goal="report",
+        normalized_goal="report",
+        status=TaskStatus.COMPLETED,
+    )
+    evidence = EvidenceLedger(policy_observations=planner.evidence.policy_observations)
+    report = Finalizer().build(state=state, evidence=evidence)
+
+    assert report.policy_approval_summary["denied_actions_count"] == 1
+    assert report.policy_approval_summary["skipped_actions_due_to_policy"] == 1

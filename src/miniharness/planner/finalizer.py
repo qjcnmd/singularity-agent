@@ -40,6 +40,48 @@ class Finalizer:
             unresolved_issues=list(evidence.unresolved_failures),
             risks=list(evidence.risks),
             rollback_status={"available": bool(files_changed), "transactions": state.linked_transactions},
+            policy_approval_summary=self._policy_summary(evidence),
             artifacts=sorted(artifacts),
             next_steps=next_steps,
         )
+
+    @staticmethod
+    def _policy_summary(evidence: EvidenceLedger) -> dict[str, Any]:
+        observations = evidence.policy_observations
+        allowed = [item for item in observations if item.get("outcome") == "allow"]
+        reviewed = [
+            item
+            for item in observations
+            if item.get("outcome") in {"require_review", "reviewed", "approved"}
+        ]
+        denied = [item for item in observations if item.get("outcome") == "deny"]
+        sandbox = [
+            item for item in observations if item.get("outcome") == "sandbox_required"
+        ]
+        approved = [
+            item
+            for item in observations
+            if item.get("approved_by_user") or item.get("approval_grant_id")
+        ]
+        high_risk_commands = [
+            item
+            for item in observations
+            if item.get("runtime") == "command"
+            and item.get("risk_level") in {"high", "critical"}
+        ]
+        skipped = [
+            item
+            for item in observations
+            if item.get("outcome") in {"deny", "sandbox_required", "escalate"}
+        ]
+        return {
+            "allowed_low_risk_actions_count": len(
+                [item for item in allowed if item.get("risk_level") in {None, "none", "low"}]
+            ),
+            "reviewed_actions_count": len(reviewed),
+            "denied_actions_count": len(denied),
+            "sandbox_required_actions_count": len(sandbox),
+            "user_approved_actions": approved,
+            "high_risk_commands": high_risk_commands,
+            "skipped_actions_due_to_policy": len(skipped),
+        }

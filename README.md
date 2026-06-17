@@ -1,6 +1,8 @@
-# Miniharness v0.0.10
+# Miniharness v0.0.11
 
-Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, planner, tools, context manager, trace file, local workspace state runtime, workspace mutation runtime, command runtime, and verification runtime connect without using LangChain, LangGraph, or any other agent framework.
+Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, planner, policy runtime, tools, context manager, trace file, local workspace state runtime, workspace mutation runtime, command runtime, and verification runtime connect without using LangChain, LangGraph, or any other agent framework.
+
+v0.0.11 adds the Policy / Approval Runtime. Tool dispatch, workspace mutation, command execution, verification checks, and planner failure handling now pass through `PolicyRuntime`, which builds structured `PolicyRequest` objects, classifies risk, returns auditable `PolicyDecision` values, records append-only policy JSONL, supports scoped single-use `ApprovalGrant` objects, and carries policy observations into planner context and final reports. Local CLI approval is modeled, but real remote approval, Git policy, and a container sandbox backend are still intentionally out of scope.
 
 v0.0.10 adds the Planner / Task Execution Runtime. The model no longer gets every tool and advances from a bare loop alone: each turn goes through `PlannerRuntime`, which tracks `TaskState`, phase policy, allowed action/tool gates, evidence ledger updates, execution budget, deterministic replanning, risk escalation, resume state, completion criteria, and a factual final report built from runtime evidence.
 
@@ -31,6 +33,7 @@ v0.0.4 added the Tool Runtime minimal production slice: tool calls execute throu
         ├── command/        # command runtime: policy, backend, output, process sessions
         ├── config.py       # environment variable loading
         ├── context/        # token budgets, context assembly, observations, recovery
+        ├── policy/         # unified local policy, approval, risk, audit runtime
         ├── planner/        # task state machine, action gating, evidence, replan, budget, final reports
         ├── provider.py     # OpenAI-compatible HTTP call via httpx
         ├── tools/          # tool specs, registry, runtime, policy, read-only, mutation, command, verification tools
@@ -44,13 +47,14 @@ Each run creates:
 
 ```txt
 .miniharness/runs/<run_id>.jsonl
+.miniharness/policy/audit.jsonl
 .miniharness/workspace_state.sqlite3
 .miniharness/planner/<session_id>/
 .miniharness/sessions/<session_id>/journal.jsonl
 .miniharness/sessions/<session_id>/artifacts/
 ```
 
-The trace records `user_goal`, `model_request`, `model_response`, `planner`, `tool_call`, `tool_result`, `workspace_state`, `mutation`, `command`, `verification`, `final_answer`, and `error` events. Planner audit entries include task id, session id, phase, action id/kind, decision, reason, evidence refs, budget state, risk level, replan decision, and completion assessment. Tool runtime audit entries include validated arguments, permission level, risk tags, start/end timestamps, duration, status, error code, truncation status, output digest, and cache hit status. Workspace state audit entries include session id, baseline id, event id, event type, path, ownership, before/after hashes, transaction id, command id, mutation id, artifact id, timestamp, and warning/error code. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, structured side effects, redaction count, semantic status, isolation report, and lightweight git state. Verification audit entries include project profile, impact analysis, plan/check ids, policy decision, command id, parsed failures, evidence artifacts, repair hints, and completion assessment.
+The trace records `user_goal`, `model_request`, `model_response`, `planner`, `tool_call`, `tool_result`, `workspace_state`, `mutation`, `command`, `verification`, `final_answer`, and `error` events. Planner audit entries include task id, session id, phase, action id/kind, decision, reason, evidence refs, budget state, risk level, replan decision, completion assessment, and compact policy observations. Tool runtime audit entries include validated arguments, permission level, risk tags, start/end timestamps, duration, status, error code, truncation status, output digest, and cache hit status. Policy audit entries are written as append-only JSONL under `.miniharness/policy/audit.jsonl` with request id, decision id, outcome, risk level, constraints, approval grant references, and secret redaction. Workspace state audit entries include session id, baseline id, event id, event type, path, ownership, before/after hashes, transaction id, command id, mutation id, artifact id, timestamp, and warning/error code. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, structured side effects, redaction count, semantic status, isolation report, and lightweight git state. Verification audit entries include project profile, impact analysis, plan/check ids, policy decision, command id, parsed failures, evidence artifacts, repair hints, and completion assessment.
 
 ## Install
 
@@ -128,6 +132,22 @@ python -m pytest tests --basetemp work/pytest-tmp
 
 The tests use temporary files and a mock provider. They do not call a live model API and do not require `.env`.
 
+## Policy Runtime
+
+Miniharness v0.0.11 adds a unified `PolicyRuntime` in `src/miniharness/policy/`. It classifies risk, returns auditable policy decisions, records scoped approval grants, writes append-only policy audit JSONL, and feeds compact policy observations into planner context and final reports.
+
+The runtime boundary is:
+
+```txt
+ToolRuntime / MutationRuntime / CommandRuntime / VerificationRuntime
+  -> PolicyRequest
+  -> PolicyRuntime
+  -> PolicyDecision
+  -> allow / deny / require_review / sandbox_required / escalate / ask_user
+```
+
+Policy decisions are local-only. There is no Git policy, remote approval flow, or real sandbox backend in this slice.
+
 ## Agent Loop Flow
 
 1. `cli.py` receives the user goal, creates a trace file, starts or resumes local workspace state, and starts or resumes `PlannerRuntime`.
@@ -189,10 +209,10 @@ The runtime owns:
 - `TaskState`: task id, session id, user goal, normalized goal, current phase, status, risk level, completion criteria, linked transactions, linked commands, linked verifications, and final assessment.
 - `TaskPlan` and `TaskPhase`: auditable phases with allowed tools/actions and required evidence.
 - `AgentAction`: structured action intent, phase, tool allowance, expected evidence, risk level, status, and result reference.
-- `EvidenceLedger`: inspected files, search results, applied changes, command results, verification results, parsed failures, external changes, missing evidence, unresolved failures, assumptions, and risks.
+- `EvidenceLedger`: inspected files, search results, applied changes, command results, verification results, parsed failures, external changes, missing evidence, unresolved failures, assumptions, risks, and policy observations.
 - `ExecutionBudget`, `Replanner`, `RiskEscalation`, and `FinalReport`.
 
-Planner state persists under `.miniharness/planner/<session_id>/`. See `docs/architecture/planner-task-execution-runtime.md` for the state machine, evidence-driven completion, failure replanning, budget control, and final report design.
+Planner state persists under `.miniharness/planner/<session_id>/`. Policy observations are rendered into compact context summaries and final reports include a `policy_approval_summary`. See `docs/architecture/planner-task-execution-runtime.md` for the state machine, evidence-driven completion, failure replanning, budget control, and final report design.
 
 ## Local Workspace State Runtime
 

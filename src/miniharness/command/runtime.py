@@ -22,6 +22,7 @@ from miniharness.command.models import (
     CommandPurpose,
     CommandRequest,
     CommandResult,
+    CommandRisk,
     ExecutionStatus,
     FilesystemMode,
     NetworkMode,
@@ -34,6 +35,18 @@ from miniharness.command.models import (
 from miniharness.command.output import OutputCollector, OutputSnapshot, SecretRedactor
 from miniharness.command.policy import CommandPolicy
 from miniharness.trace import TraceWriter
+from miniharness.policy import (
+    Capability,
+    DecisionOutcome,
+    OperationKind,
+    PolicyConfig,
+    PolicyRequest,
+    PolicyRuntime,
+    PolicySubject,
+    ResourceRef,
+    RuntimeName,
+)
+from miniharness.policy.audit import redact
 
 if TYPE_CHECKING:
     from miniharness.workspace_state import LocalWorkspaceStateRuntime
@@ -104,6 +117,7 @@ class CommandRuntime:
         env_policy: EnvPolicy | None = None,
         state_runtime: "LocalWorkspaceStateRuntime | None" = None,
         planner: Any | None = None,
+        policy_runtime: PolicyRuntime | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)
         self.policy = policy or CommandPolicy()
@@ -112,6 +126,9 @@ class CommandRuntime:
         self.env_policy = env_policy or EnvPolicy()
         self.state_runtime = state_runtime
         self.planner = planner
+        self.policy_runtime = policy_runtime or PolicyRuntime(
+            PolicyConfig.runtime_default(self.workspace_root)
+        )
         self._sessions: dict[str, _SessionRecord] = {}
 
     def plan(self, request: CommandRequest) -> CommandPlan:
@@ -139,6 +156,27 @@ class CommandRuntime:
         started = time.perf_counter()
         before_snapshot = self._capture_workspace_snapshot()
         git_before = self._git_state_summary()
+        policy_request = self._policy_request(request)
+        policy_decision = self.policy_runtime.enforce(policy_request)
+        self._record_policy_trace(policy_request, policy_decision)
+        if policy_decision.outcome != DecisionOutcome.ALLOW:
+            result = self._policy_blocked_result(
+                request,
+                decision=policy_decision,
+                started_at=started_at,
+                started=started,
+                git_before=git_before,
+                git_after=git_before,
+                policy_request=policy_request,
+            )
+            self._record_trace(
+                request,
+                result,
+                tool_call_id=tool_call_id,
+                transaction_id=transaction_id,
+            )
+            self._notify_planner_policy(request, policy_request, policy_decision)
+            return result
         decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
         if decision.decision != CommandDecision.ALLOW:
             result = self._blocked_result(
@@ -220,6 +258,7 @@ class CommandRuntime:
                 {"command_result": result.to_observation().get("command_result", result.to_dict())},
                 tool_call_id=tool_call_id,
             )
+        self._notify_planner_policy(request, policy_request, policy_decision)
         return result
 
     def start_process(
@@ -230,6 +269,23 @@ class CommandRuntime:
         transaction_id: str | None = None,
     ) -> ProcessSession:
         started_at = _now()
+        decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
+        policy_request = self._policy_request(request)
+        policy_decision = self.policy_runtime.enforce(policy_request)
+        self._record_policy_trace(policy_request, policy_decision)
+        if policy_decision.outcome != DecisionOutcome.ALLOW:
+            return ProcessSession(
+                process_id=request.command_id,
+                command_id=request.command_id,
+                pid=None,
+                status=_policy_process_status(policy_decision.outcome),
+                argv=request.argv,
+                shell=request.shell,
+                cwd=request.cwd,
+                started_at=started_at,
+                owner_transaction=transaction_id,
+                error_code=_policy_error_code(policy_decision.outcome),
+            )
         decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
         if decision.decision != CommandDecision.ALLOW:
             session = ProcessSession(
@@ -572,6 +628,7 @@ class CommandRuntime:
                 "isolation_report": result.isolation_report,
                 "git_before": result.git_before,
                 "git_after": result.git_after,
+                "policy_runtime": True,
             },
         )
 
@@ -753,6 +810,114 @@ class CommandRuntime:
             "head": head,
         }
 
+    def _policy_request(self, request: CommandRequest) -> PolicyRequest:
+        operation, capability, resource = _command_policy_shape(request)
+        return PolicyRequest(
+            session_id=getattr(self.planner, "session_id", "command_session"),
+            task_id=getattr(self.planner, "task_id", "command_task"),
+            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "command"),
+            action_id=request.command_id,
+            runtime=RuntimeName.COMMAND,
+            operation=operation,
+            capability=capability,
+            subject=PolicySubject(subject_type="runtime", name="CommandRuntime"),
+            resource=resource,
+            reason=request.display_command(),
+            proposed_by_model=True,
+            metadata={
+                "command": request.display_command(),
+                "cwd": request.cwd,
+                "env_policy": request.env_request,
+                "network_policy": request.network_mode.value,
+                "filesystem_mode": request.filesystem_mode.value,
+                "timeout": request.resource_limits.timeout_seconds,
+                "long_running": request.purpose == CommandPurpose.LONG_RUNNING,
+                "risk_acceptance_reason": request.risk_acceptance_reason,
+            },
+            requires_network=request.network_mode != NetworkMode.DISABLED,
+            touches_workspace=request.filesystem_mode != FilesystemMode.READ_ONLY_WORKSPACE,
+            long_running=request.purpose == CommandPurpose.LONG_RUNNING,
+            destructive=request.purpose == CommandPurpose.DESTRUCTIVE,
+            workspace_root=str(self.workspace_root),
+        )
+
+    def _policy_blocked_result(
+        self,
+        request: CommandRequest,
+        *,
+        decision: Any,
+        started_at: str,
+        started: float,
+        git_before: dict[str, Any],
+        git_after: dict[str, Any],
+        policy_request: PolicyRequest,
+    ) -> CommandResult:
+        cmd_decision = CommandPolicyResult(
+            decision=CommandDecision.REQUIRE_REVIEW
+            if decision.outcome == DecisionOutcome.REQUIRE_REVIEW
+            else CommandDecision.DENY,
+            reasons=[decision.reason],
+            risk_tags=[CommandRisk.UNKNOWN],
+            required_network=request.network_mode,
+            required_filesystem=request.filesystem_mode,
+            redaction_rules=[],
+            error_code=_policy_error_code(decision.outcome),
+        )
+        return self._blocked_result(
+            request,
+            decision=cmd_decision,
+            started_at=started_at,
+            started=started,
+            git_before=git_before,
+            git_after=git_after,
+        )
+
+    def _notify_planner_policy(
+        self,
+        request: CommandRequest,
+        policy_request: PolicyRequest,
+        decision: Any,
+    ) -> None:
+        if self.planner is None or not hasattr(self.planner, "record_policy_observation"):
+            return
+        self.planner.record_policy_observation(
+            {
+                "outcome": decision.outcome.value,
+                "runtime": policy_request.runtime.value,
+                "operation": policy_request.operation.value,
+                "reason": decision.reason,
+                "risk_level": decision.risk_level.value,
+                "resource": policy_request.resource.identifier,
+                "decision_id": decision.decision_id,
+            }
+        )
+
+    def _record_policy_trace(self, request: PolicyRequest, decision: Any) -> None:
+        if self.trace is None:
+            return
+        self.trace.record(
+            "policy",
+            redact(
+                {
+                    "request_id": request.request_id,
+                    "decision_id": decision.decision_id,
+                    "runtime": request.runtime.value,
+                    "operation": request.operation.value,
+                    "capability": request.capability.value,
+                    "resource": request.resource.identifier,
+                    "outcome": decision.outcome.value,
+                    "risk_level": decision.risk_level.value,
+                    "risk_tags": [
+                        tag.value if hasattr(tag, "value") else str(tag)
+                        for tag in decision.risk_tags
+                    ],
+                    "reason": decision.reason,
+                    "rule_ids": decision.rule_ids,
+                    "approval_required": decision.required_approval is not None,
+                }
+            ),
+        )
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -763,3 +928,82 @@ def _relative_or_absolute(path: Path, root: Path) -> str:
         return path.relative_to(root).as_posix() or "."
     except ValueError:
         return str(path)
+
+
+def _command_policy_shape(
+    request: CommandRequest,
+) -> tuple[OperationKind, Capability, ResourceRef]:
+    command = request.display_command()
+    if request.purpose == CommandPurpose.PACKAGE_MANAGER and _looks_like_package_manager(request):
+        return (
+            OperationKind.PACKAGE_INSTALL,
+            Capability.PACKAGE_INSTALL,
+            ResourceRef("command", command),
+        )
+    if request.purpose == CommandPurpose.NETWORK or request.network_mode != NetworkMode.DISABLED:
+        return (
+            OperationKind.NETWORK_ACCESS,
+            Capability.NETWORK_ACCESS,
+            ResourceRef("command", command),
+        )
+    if request.purpose == CommandPurpose.LONG_RUNNING:
+        return (
+            OperationKind.START_LONG_PROCESS,
+            Capability.START_LONG_PROCESS,
+            ResourceRef("command", command),
+        )
+    if request.purpose in {
+        CommandPurpose.PROJECT_VERIFICATION,
+        CommandPurpose.LINT,
+        CommandPurpose.TYPECHECK,
+        CommandPurpose.FORMAT_CHECK,
+        CommandPurpose.BUILD,
+    }:
+        return (
+            OperationKind.VERIFICATION,
+            Capability.EXECUTE_PROJECT_CODE,
+            ResourceRef("command", command),
+        )
+    if request.purpose == CommandPurpose.CODE_GENERATION:
+        return (
+            OperationKind.EXECUTE_PROJECT_CODE,
+            Capability.EXECUTE_GENERATED_CODE,
+            ResourceRef("command", command),
+        )
+    return (
+        OperationKind.EXECUTE_COMMAND,
+        Capability.EXECUTE_COMMAND,
+        ResourceRef("command", command),
+    )
+
+
+def _looks_like_package_manager(request: CommandRequest) -> bool:
+    argv = [str(part).lower() for part in (request.argv or [])]
+    if not argv:
+        return bool(request.shell and any(token in request.shell.lower() for token in ("npm install", "pnpm install", "yarn add", "pip install", "uv pip install", "cargo install")))
+    program = Path(argv[0]).name.lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        if program.endswith(suffix):
+            program = program[: -len(suffix)]
+    if program in {"npm", "pnpm", "yarn", "cargo"}:
+        return any(part in {"install", "add", "update", "upgrade"} for part in argv[1:])
+    if program in {"python", "python3", "py"}:
+        return argv[1:3] == ["-m", "pip"] and any(part in {"install", "uninstall"} for part in argv[3:])
+    return program == "uv" and any(part in {"add", "pip", "sync"} for part in argv[1:])
+
+
+def _policy_error_code(outcome: DecisionOutcome) -> str:
+    mapping = {
+        DecisionOutcome.DENY: "policy_denied",
+        DecisionOutcome.REQUIRE_REVIEW: "review_required",
+        DecisionOutcome.SANDBOX_REQUIRED: "sandbox_required",
+        DecisionOutcome.ASK_USER: "policy_ask_user_required",
+        DecisionOutcome.ESCALATE: "policy_escalation_required",
+    }
+    return mapping.get(outcome, "policy_denied")
+
+
+def _policy_process_status(outcome: DecisionOutcome) -> str:
+    if outcome == DecisionOutcome.REQUIRE_REVIEW:
+        return "review_required"
+    return _policy_error_code(outcome)

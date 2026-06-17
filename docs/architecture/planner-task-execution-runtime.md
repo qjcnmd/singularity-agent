@@ -83,7 +83,8 @@ RepairChange, AskUser, RequireReview, Finalize, Abort
 ```txt
 inspected_files, relevant_symbols, search_results, applied_changes,
 command_results, verification_results, parsed_failures, assumptions,
-missing_evidence, unresolved_failures, external_changes, risks
+missing_evidence, unresolved_failures, external_changes, risks,
+policy_observations
 ```
 
 Tool results are compact in model context, but the planner receives richer runtime result objects through observer hooks from mutation, command, and verification runtimes.
@@ -151,8 +152,10 @@ If the criteria are not met, `PlannerRuntime` returns `blocked`, `needs_review`,
 ```txt
 user_goal, status, files_changed, agent_changes,
 command_side_effects, verification_summary, unresolved_issues,
-risks, rollback_status, artifacts, next_steps
+risks, rollback_status, policy_approval_summary, artifacts, next_steps
 ```
+
+`policy_approval_summary` counts allowed low-risk actions, reviewed actions, denied actions, sandbox-required actions, user-approved actions, high-risk commands, and actions skipped due to policy.
 
 For read-only goals, completion criteria do not require mutation or verification evidence. For coding goals, finalization requires applied change evidence and a ready or ready-with-warnings verification assessment.
 

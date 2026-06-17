@@ -20,6 +20,18 @@ from miniharness.tools.models import (
 from miniharness.tools.policy import ToolPolicy
 from miniharness.tools.registry import ToolRegistry
 from miniharness.trace import TraceWriter
+from miniharness.policy import (
+    Capability,
+    DecisionOutcome,
+    OperationKind,
+    PolicyConfig,
+    PolicyRequest,
+    PolicyRuntime,
+    PolicySubject,
+    ResourceRef,
+    RuntimeName,
+)
+from miniharness.policy.audit import redact
 
 
 class ToolRuntime:
@@ -31,12 +43,16 @@ class ToolRuntime:
         trace: TraceWriter | None,
         workspace_root: Path,
         planner: Any | None = None,
+        policy_runtime: PolicyRuntime | None = None,
     ) -> None:
         self.registry = registry
         self.policy = policy
         self.trace = trace
         self.workspace_root = workspace_root.resolve()
         self.planner = planner
+        self.policy_runtime = policy_runtime or PolicyRuntime(
+            PolicyConfig.runtime_default(self.workspace_root)
+        )
         self._cache: dict[str, ToolResult] = {}
 
     def execute_tool_call(self, tool_call: dict[str, Any]) -> ToolResult:
@@ -115,6 +131,17 @@ class ToolRuntime:
                     message="Shell tools must execute through CommandRuntime.",
                     details={"tool_name": spec.name},
                 )
+                output_digest = self._result_digest(result)
+                return result
+
+            policy_decision = self._enforce_policy(
+                tool_name=tool_name,
+                spec=spec,
+                validated_args=validated_args,
+                tool_call_id=tool_call_id,
+            )
+            if policy_decision is not None:
+                result = policy_decision
                 output_digest = self._result_digest(result)
                 return result
 
@@ -216,6 +243,122 @@ class ToolRuntime:
             tool_name=tool_name,
             result=result,
             action_id=action_id,
+        )
+
+    def _enforce_policy(
+        self,
+        *,
+        tool_name: str,
+        spec: ToolSpec,
+        validated_args: dict[str, Any],
+        tool_call_id: str | None,
+    ) -> ToolResult | None:
+        request = self._policy_request(
+            tool_name=tool_name,
+            spec=spec,
+            validated_args=validated_args,
+            tool_call_id=tool_call_id,
+        )
+        decision = self.policy_runtime.enforce(request)
+        self._record_policy_trace(request, decision)
+        if decision.outcome == DecisionOutcome.ALLOW:
+            return None
+        self._record_policy_observation(request, decision)
+        return ToolResult.failure(
+            code=_policy_error_code(decision.outcome),
+            message=decision.reason,
+            details={"policy": decision.to_dict(), "request": request.to_dict()},
+            metadata={"policy_decision_id": decision.decision_id},
+        )
+
+    def _policy_request(
+        self,
+        *,
+        tool_name: str,
+        spec: ToolSpec,
+        validated_args: dict[str, Any],
+        tool_call_id: str | None,
+    ) -> PolicyRequest:
+        operation, capability, resource = _tool_policy_shape(
+            tool_name,
+            spec,
+            validated_args,
+        )
+        return PolicyRequest(
+            session_id=getattr(self.planner, "session_id", self.trace.run_id if self.trace else "tool_session"),
+            task_id=getattr(self.planner, "task_id", self.trace.run_id if self.trace else "tool_task"),
+            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "tool_dispatch"),
+            action_id=tool_call_id or "tool_dispatch",
+            runtime=RuntimeName.TOOL,
+            operation=operation,
+            capability=capability,
+            subject=PolicySubject(subject_type="runtime", name="ToolRuntime"),
+            resource=resource,
+            reason=f"Dispatch tool {tool_name}",
+            proposed_by_model=True,
+            metadata={
+                "tool_name": tool_name,
+                "arguments": validated_args,
+                "permission_level": spec.permission_level.value,
+                "risk_tags": list(spec.risk_tags),
+                "delegated_runtime": spec.uses_mutation_runtime or spec.uses_command_runtime,
+            },
+            touches_workspace=capability
+            in {
+                Capability.READ_WORKSPACE,
+                Capability.MUTATE_WORKSPACE,
+                Capability.CREATE_FILE,
+                Capability.DELETE_FILE,
+                Capability.MOVE_FILE,
+            },
+            destructive=capability == Capability.DELETE_FILE,
+            long_running=operation == OperationKind.START_LONG_PROCESS,
+            workspace_root=str(self.workspace_root),
+        )
+
+    def _record_policy_observation(
+        self,
+        request: PolicyRequest,
+        decision: Any,
+    ) -> None:
+        if self.planner is None or not hasattr(self.planner, "record_policy_observation"):
+            return
+        self.planner.record_policy_observation(
+            {
+                "outcome": decision.outcome.value,
+                "runtime": request.runtime.value,
+                "operation": request.operation.value,
+                "reason": decision.reason,
+                "risk_level": decision.risk_level.value,
+                "resource": request.resource.identifier,
+                "decision_id": decision.decision_id,
+            }
+        )
+
+    def _record_policy_trace(self, request: PolicyRequest, decision: Any) -> None:
+        if self.trace is None:
+            return
+        self.trace.record(
+            "policy",
+            redact(
+                {
+                    "request_id": request.request_id,
+                    "decision_id": decision.decision_id,
+                    "runtime": request.runtime.value,
+                    "operation": request.operation.value,
+                    "capability": request.capability.value,
+                    "resource": request.resource.identifier,
+                    "outcome": decision.outcome.value,
+                    "risk_level": decision.risk_level.value,
+                    "risk_tags": [
+                        tag.value if hasattr(tag, "value") else str(tag)
+                        for tag in decision.risk_tags
+                    ],
+                    "reason": decision.reason,
+                    "rule_ids": decision.rule_ids,
+                    "approval_required": decision.required_approval is not None,
+                }
+            ),
         )
 
     def _execute_handler(
@@ -359,3 +502,112 @@ class ToolRuntime:
     def _result_digest(self, result: ToolResult) -> str:
         dumped = result.model_dump(mode="json")
         return self._digest(json.dumps(dumped, ensure_ascii=False, sort_keys=True))
+
+
+def _tool_policy_shape(
+    tool_name: str,
+    spec: ToolSpec,
+    args: dict[str, Any],
+) -> tuple[OperationKind, Capability, ResourceRef]:
+    if tool_name == "read_file":
+        return (
+            OperationKind.READ_FILE,
+            Capability.READ_WORKSPACE,
+            ResourceRef("file", str(args.get("path") or "."), workspace_relative=True),
+        )
+    if tool_name == "list_files":
+        return (
+            OperationKind.LIST_DIRECTORY,
+            Capability.LIST_DIRECTORY,
+            ResourceRef("directory", str(args.get("path") or "."), workspace_relative=True),
+        )
+    if tool_name == "search_text":
+        return (
+            OperationKind.SEARCH,
+            Capability.READ_WORKSPACE,
+            ResourceRef("directory", str(args.get("path") or "."), workspace_relative=True),
+        )
+    if tool_name == "workspace_create_file":
+        return (
+            OperationKind.CREATE_FILE,
+            Capability.CREATE_FILE,
+            ResourceRef("file", str(args.get("path") or "."), workspace_relative=True),
+        )
+    if tool_name == "workspace_delete_file":
+        return (
+            OperationKind.DELETE_FILE,
+            Capability.DELETE_FILE,
+            ResourceRef("file", str(args.get("path") or "."), workspace_relative=True),
+        )
+    if tool_name == "workspace_move_file":
+        return (
+            OperationKind.MUTATE_FILE,
+            Capability.MOVE_FILE,
+            ResourceRef("file", str(args.get("path") or "."), workspace_relative=True),
+        )
+    if tool_name.startswith("workspace_"):
+        return (
+            OperationKind.MUTATE_FILE,
+            Capability.MUTATE_WORKSPACE,
+            ResourceRef("file", str(args.get("path") or "."), workspace_relative=True),
+        )
+    if tool_name == "start_process":
+        return (
+            OperationKind.START_LONG_PROCESS,
+            Capability.START_LONG_PROCESS,
+            ResourceRef("command", _command_identifier(args)),
+        )
+    if tool_name == "stop_process":
+        return (
+            OperationKind.KILL_PROCESS,
+            Capability.KILL_PROCESS,
+            ResourceRef("process", str(args.get("process_id") or "")),
+        )
+    if tool_name == "run_command":
+        return (
+            OperationKind.EXECUTE_COMMAND,
+            Capability.EXECUTE_COMMAND,
+            ResourceRef("command", _command_identifier(args)),
+        )
+    if "verification" in tool_name:
+        return (
+            OperationKind.VERIFICATION,
+            Capability.EXECUTE_PROJECT_CODE,
+            ResourceRef("workspace", tool_name, workspace_relative=True),
+        )
+    if spec.permission_level == PermissionLevel.WRITE:
+        return (
+            OperationKind.MUTATE_FILE,
+            Capability.MUTATE_WORKSPACE,
+            ResourceRef("workspace", tool_name, workspace_relative=True),
+        )
+    if spec.permission_level == PermissionLevel.SHELL:
+        return (
+            OperationKind.EXECUTE_COMMAND,
+            Capability.EXECUTE_COMMAND,
+            ResourceRef("command", _command_identifier(args) or tool_name),
+        )
+    return (
+        OperationKind.READ_FILE,
+        Capability.READ_WORKSPACE,
+        ResourceRef("workspace", tool_name, workspace_relative=True),
+    )
+
+
+def _command_identifier(args: dict[str, Any]) -> str:
+    if args.get("shell"):
+        return str(args["shell"])
+    if args.get("argv"):
+        return " ".join(str(part) for part in args["argv"])
+    return ""
+
+
+def _policy_error_code(outcome: DecisionOutcome) -> str:
+    mapping = {
+        DecisionOutcome.DENY: "policy_denied",
+        DecisionOutcome.REQUIRE_REVIEW: "approval_required",
+        DecisionOutcome.SANDBOX_REQUIRED: "sandbox_required",
+        DecisionOutcome.ASK_USER: "policy_ask_user_required",
+        DecisionOutcome.ESCALATE: "policy_escalation_required",
+    }
+    return mapping.get(outcome, "policy_denied")

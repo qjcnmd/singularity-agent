@@ -319,6 +319,32 @@ class PlannerRuntime:
             self._plan().current_phase = "repairing_failures"
         self._persist()
 
+    def record_policy_observation(self, observation: dict[str, Any]) -> None:
+        state = self._state()
+        payload = {
+            "outcome": observation.get("outcome"),
+            "runtime": observation.get("runtime"),
+            "operation": observation.get("operation"),
+            "reason": observation.get("reason"),
+            "risk_level": observation.get("risk_level"),
+            "resource": observation.get("resource"),
+            "decision_id": observation.get("decision_id"),
+        }
+        if payload not in self.evidence.policy_observations:
+            self.evidence.policy_observations.append(payload)
+        if payload["outcome"] in {"deny", "require_review", "sandbox_required", "escalate"}:
+            self.evidence.unresolved_failures.append({"policy": payload})
+            state.status = TaskStatus.NEEDS_REVIEW
+            if payload["reason"]:
+                self._append_unique(state.blocked_reasons, payload["reason"])
+        self._persist()
+        self._record_event(
+            decision="policy_observation",
+            reason=str(payload.get("reason") or "Policy observation recorded."),
+            evidence_refs=[str(payload.get("decision_id"))] if payload.get("decision_id") else [],
+            extra={"policy_observation": payload},
+        )
+
     def replan(self, signal: dict[str, Any]) -> ReplanDecision:
         state = self._state()
         fingerprint = signal.get("failure_fingerprint")
@@ -627,6 +653,7 @@ class PlannerRuntime:
         evidence_refs: list[str] | None = None,
         replan_decision: dict[str, Any] | None = None,
         completion_assessment: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         if self.state is None:
             return
@@ -643,11 +670,10 @@ class PlannerRuntime:
             risk_level=self.state.risk_level.value,
             replan_decision=replan_decision,
             completion_assessment=completion_assessment,
+            extra=extra,
         )
         if self.trace is not None:
-            self.trace.record(
-                "planner",
-                {
+            payload = {
                     "task_id": self.state.task_id,
                     "session_id": self.state.session_id,
                     "phase": self.state.current_phase,
@@ -660,8 +686,9 @@ class PlannerRuntime:
                     "risk_level": self.state.risk_level.value,
                     "replan_decision": replan_decision,
                     "completion_assessment": completion_assessment,
-                },
-            )
+                }
+            payload.update(extra or {})
+            self.trace.record("planner", payload)
 
     def _state(self) -> TaskState:
         if self.state is None:

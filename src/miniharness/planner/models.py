@@ -333,6 +333,7 @@ class EvidenceLedger:
     external_changes: list[str] = field(default_factory=list)
     risks: list[dict[str, Any]] = field(default_factory=list)
     tool_results: list[dict[str, Any]] = field(default_factory=list)
+    policy_observations: list[dict[str, Any]] = field(default_factory=list)
 
     def add_unique_file(self, path: str) -> None:
         if path and path not in self.inspected_files:
@@ -353,6 +354,7 @@ class EvidenceLedger:
             "external_changes": self.external_changes,
             "risks": self.risks,
             "tool_results": self.tool_results,
+            "policy_observations": self.policy_observations,
         }
 
     @classmethod
@@ -371,6 +373,7 @@ class EvidenceLedger:
             external_changes=list(payload.get("external_changes") or []),
             risks=list(payload.get("risks") or []),
             tool_results=list(payload.get("tool_results") or []),
+            policy_observations=list(payload.get("policy_observations") or []),
         )
 
 
@@ -459,6 +462,7 @@ class FinalReport:
     unresolved_issues: list[Any]
     risks: list[Any]
     rollback_status: dict[str, Any]
+    policy_approval_summary: dict[str, Any]
     artifacts: list[str]
     next_steps: list[str]
 
@@ -473,6 +477,7 @@ class FinalReport:
             "unresolved_issues": self.unresolved_issues,
             "risks": self.risks,
             "rollback_status": self.rollback_status,
+            "policy_approval_summary": self.policy_approval_summary,
             "artifacts": self.artifacts,
             "next_steps": self.next_steps,
         }
@@ -489,6 +494,7 @@ class FinalReport:
             unresolved_issues=list(payload.get("unresolved_issues") or []),
             risks=list(payload.get("risks") or []),
             rollback_status=dict(payload.get("rollback_status") or {}),
+            policy_approval_summary=dict(payload.get("policy_approval_summary") or {}),
             artifacts=list(payload.get("artifacts") or []),
             next_steps=list(payload.get("next_steps") or []),
         )

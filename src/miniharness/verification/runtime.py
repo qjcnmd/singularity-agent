@@ -10,11 +10,26 @@ from miniharness.command import (
     CommandPurpose,
     CommandRequest,
     CommandRuntime,
+    CommandDecision,
+    CommandPolicyResult,
+    CommandRisk,
     ExecutionStatus,
     FilesystemMode,
     ResourceLimits,
     SemanticStatus,
 )
+from miniharness.policy import (
+    Capability,
+    DecisionOutcome,
+    OperationKind,
+    PolicyConfig,
+    PolicyRequest,
+    PolicyRuntime,
+    PolicySubject,
+    ResourceRef,
+    RuntimeName,
+)
+from miniharness.policy.audit import redact
 from miniharness.trace import TraceWriter
 from miniharness.verification.assessor import CompletionAssessor
 from miniharness.verification.discovery import ProjectDetector
@@ -46,11 +61,15 @@ class VerificationRuntime:
         trace: TraceWriter | None = None,
         policy: VerificationPolicy | None = None,
         planner: Any | None = None,
+        policy_runtime: PolicyRuntime | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.command_runtime = command_runtime or CommandRuntime(self.workspace_root, trace=trace)
         self.trace = trace
         self.planner = planner
+        self.policy_runtime = policy_runtime or PolicyRuntime(
+            PolicyConfig.runtime_default(self.workspace_root)
+        )
         self.policy = policy or VerificationPolicy(self.command_runtime.policy)
         self.parsers = FailureParserRegistry()
         self.hints = RepairHintGenerator()
@@ -340,6 +359,12 @@ class VerificationRuntime:
     def _run_check(self, plan: VerificationPlan, check: VerificationCheck) -> VerificationResult:
         if check.command is None:
             return self._blocked_result(check)
+        policy_request = self._policy_request(plan, check)
+        policy_decision = self.policy_runtime.enforce(policy_request)
+        self._record_policy_trace(policy_request, policy_decision)
+        if policy_decision.outcome != DecisionOutcome.ALLOW:
+            self._record_policy_observation(policy_request, policy_decision)
+            return self._policy_blocked_result(check, policy_decision)
         command_result = self.command_runtime.run(
             check.command,
             transaction_id=plan.transaction_id,
@@ -398,6 +423,127 @@ class VerificationRuntime:
             )
         self._record_result_trace(plan, check, result)
         return result
+
+    def _policy_request(
+        self,
+        plan: VerificationPlan,
+        check: VerificationCheck,
+    ) -> PolicyRequest:
+        command = check.command.display_command() if check.command else check.kind.value
+        return PolicyRequest(
+            session_id=getattr(self.planner, "session_id", "verification_session"),
+            task_id=getattr(self.planner, "task_id", "verification_task"),
+            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "verification"),
+            action_id=check.id,
+            runtime=RuntimeName.VERIFICATION,
+            operation=OperationKind.VERIFICATION,
+            capability=Capability.EXECUTE_PROJECT_CODE,
+            subject=PolicySubject(subject_type="runtime", name="VerificationRuntime"),
+            resource=ResourceRef("command", command),
+            reason=f"Run verification check {check.kind.value}",
+            proposed_by_model=False,
+            metadata={
+                "plan_id": plan.id,
+                "check_id": check.id,
+                "check_kind": check.kind.value,
+                "command": command,
+                "transaction_id": plan.transaction_id,
+                "changeset_id": plan.changeset_id,
+            },
+            touches_workspace=False,
+            workspace_root=str(self.workspace_root),
+        )
+
+    def _policy_blocked_result(
+        self,
+        check: VerificationCheck,
+        decision: Any,
+    ) -> VerificationResult:
+        evidence = VerificationEvidence(
+            command_id=None,
+            command=check.command.display_command() if check.command else None,
+            exit_code=None,
+            output_excerpt=decision.reason,
+            artifact_path=None,
+            parsed_failures=[],
+            duration_ms=0,
+            timestamp=_now(),
+        )
+        failure = (
+            FailureType.CHECK_REVIEW_REQUIRED
+            if decision.outcome == DecisionOutcome.REQUIRE_REVIEW
+            else FailureType.SANDBOX_LIMITATION
+            if decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
+            else FailureType.CHECK_POLICY_DENIED
+        )
+        return VerificationResult(
+            check_id=check.id,
+            kind=check.kind,
+            status=CheckStatus.BLOCKED,
+            failure_type=failure,
+            evidence=evidence,
+            repair_hints=self.hints.generate(
+                parsed_failures=[],
+                failure_type=failure,
+                changed_files=[],
+                task_intent=decision.reason,
+            ),
+            confidence_impact=-0.3,
+            duration_ms=0,
+            policy_decision=CommandPolicyResult(
+                decision=CommandDecision.REQUIRE_REVIEW
+                if decision.outcome == DecisionOutcome.REQUIRE_REVIEW
+                else CommandDecision.DENY,
+                reasons=[decision.reason],
+                risk_tags=[CommandRisk.PROJECT_VERIFICATION],
+                error_code=_policy_error_code(decision.outcome),
+            ),
+        )
+
+    def _record_policy_observation(
+        self,
+        request: PolicyRequest,
+        decision: Any,
+    ) -> None:
+        if self.planner is None or not hasattr(self.planner, "record_policy_observation"):
+            return
+        self.planner.record_policy_observation(
+            {
+                "outcome": decision.outcome.value,
+                "runtime": request.runtime.value,
+                "operation": request.operation.value,
+                "reason": decision.reason,
+                "risk_level": decision.risk_level.value,
+                "resource": request.resource.identifier,
+                "decision_id": decision.decision_id,
+            }
+        )
+
+    def _record_policy_trace(self, request: PolicyRequest, decision: Any) -> None:
+        if self.trace is None:
+            return
+        self.trace.record(
+            "policy",
+            redact(
+                {
+                    "request_id": request.request_id,
+                    "decision_id": decision.decision_id,
+                    "runtime": request.runtime.value,
+                    "operation": request.operation.value,
+                    "capability": request.capability.value,
+                    "resource": request.resource.identifier,
+                    "outcome": decision.outcome.value,
+                    "risk_level": decision.risk_level.value,
+                    "risk_tags": [
+                        tag.value if hasattr(tag, "value") else str(tag)
+                        for tag in decision.risk_tags
+                    ],
+                    "reason": decision.reason,
+                    "rule_ids": decision.rule_ids,
+                    "approval_required": decision.required_approval is not None,
+                }
+            ),
+        )
 
     def _result_from_command(
         self,
@@ -674,3 +820,14 @@ def _excerpt(output: str, limit: int = 1200) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _policy_error_code(outcome: DecisionOutcome) -> str:
+    mapping = {
+        DecisionOutcome.DENY: "check_policy_denied",
+        DecisionOutcome.REQUIRE_REVIEW: "check_review_required",
+        DecisionOutcome.SANDBOX_REQUIRED: "sandbox_required",
+        DecisionOutcome.ASK_USER: "policy_ask_user_required",
+        DecisionOutcome.ESCALATE: "policy_escalation_required",
+    }
+    return mapping.get(outcome, "check_policy_denied")
