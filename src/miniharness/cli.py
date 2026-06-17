@@ -10,9 +10,14 @@ from rich.panel import Panel
 from miniharness.agent import MiniAgent
 from miniharness.command import CommandRuntime
 from miniharness.config import Settings
+from miniharness.model import (
+    ModelProviderRegistry,
+    ModelRuntime,
+    ModelRuntimeConfig,
+    OpenAICompatibleModelProvider,
+)
 from miniharness.observability import TraceRuntime, TraceStore
 from miniharness.planner import PlannerRuntime
-from miniharness.provider import OpenAICompatibleProvider
 from miniharness.tools import ToolRegistry
 from miniharness.tools.command import register_command_tools
 from miniharness.tools.mutation import register_mutation_tools
@@ -96,8 +101,22 @@ def main(
     final_health: WorkspaceHealthReport | None = None
     try:
         settings = Settings.from_env()
-        provider = OpenAICompatibleProvider(settings)
+        model_config = ModelRuntimeConfig.from_env()
         tools = ToolRegistry(project_root)
+        model_provider = OpenAICompatibleModelProvider(
+            settings,
+            timeout_seconds=model_config.request_timeout_seconds,
+        )
+        model_registry = ModelProviderRegistry(
+            default_provider_name=model_config.default_provider
+        )
+        model_registry.register(model_provider)
+        model_runtime = ModelRuntime(
+            registry=model_registry,
+            tool_registry=tools,
+            config=model_config,
+            trace=trace,
+        )
         planner = create_or_resume_planner(
             workspace_root=project_root,
             session_id=resume_session,
@@ -133,7 +152,7 @@ def main(
             ),
         )
         agent = MiniAgent(
-            provider=provider,
+            model_runtime=model_runtime,
             tools=tools,
             trace=trace,
             console=console,

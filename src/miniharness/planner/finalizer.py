@@ -56,6 +56,11 @@ class Finalizer:
             sandbox_isolation_summary=self._sandbox_summary(evidence),
             execution_trace_summary=trace_summary
             or self._execution_trace_summary(evidence),
+            model_usage_summary=(
+                (trace_summary or {}).get("model_usage_summary")
+                if trace_summary
+                else {}
+            ),
         )
 
     @staticmethod

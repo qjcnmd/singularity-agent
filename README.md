@@ -1,6 +1,8 @@
-# Miniharness v0.0.13
+# Miniharness v0.0.14
 
-Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, planner, policy runtime, tools, context manager, observability trace runtime, local workspace state runtime, workspace mutation runtime, command runtime, verification runtime, and sandbox runtime connect without using LangChain, LangGraph, or any other agent framework.
+Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, model runtime, provider adapter, planner, policy runtime, tools, context manager, observability trace runtime, local workspace state runtime, workspace mutation runtime, command runtime, verification runtime, and sandbox runtime connect without using LangChain, LangGraph, or any other agent framework.
+
+v0.0.14 adds the Model / Inference Runtime. Model calls now flow through `src/miniharness/model/` instead of direct provider calls in the agent loop. `ModelRuntime` owns stable request/result objects, provider selection, OpenAI-compatible adaptation, message conversion, tool schema rendering, response validation, token budget checks, retry/fallback handling, stream aggregation, redacted trace metadata, context export policy checks, and structured model failures. It does not execute tools, mutate files, run commands, stage commits, or implement a Git Runtime.
 
 v0.0.13 adds the Observability / Trace Runtime. Planner, tool dispatch, policy, approval, command execution, workspace mutation, sandbox execution, verification, context rendering, and final reporting now write structured `TraceEvent`, `TraceSpan`, and `TraceArtifact` records into an append-only local trace store. Large stdout, stderr, diffs, reports, model messages, and sandbox logs are represented as artifacts instead of being embedded directly in event payloads. Trace payloads and artifacts are redacted before storage, can be queried by run/session/task/action/runtime identifiers, can produce a timeline, and feed a compact Execution Trace Summary into final reports and model context. This is local telemetry only; there is no remote telemetry exporter.
 
@@ -37,6 +39,7 @@ v0.0.4 added the Tool Runtime minimal production slice: tool calls execute throu
         ├── command/        # command runtime: policy, backend, output, process sessions
         ├── config.py       # environment variable loading
         ├── context/        # token budgets, context assembly, observations, recovery
+        ├── model/          # model runtime: request/result schema, provider registry, validation, budget, retry
         ├── observability/  # structured trace events, spans, artifacts, timeline, summary
         ├── policy/         # unified local policy, approval, risk, audit runtime
         ├── planner/        # task state machine, action gating, evidence, replan, budget, final reports
@@ -64,7 +67,7 @@ work/traces/runs/<run_id>/artifacts/
 .miniharness/sessions/<session_id>/artifacts/
 ```
 
-The structured trace records `task.started`, `action.*`, `model.*`, `tool.*`, `policy.*`, `approval.*`, `command.*`, `sandbox.*`, `mutation.*`, `verification.*`, `context.*`, and `final_report.*` events. Planner audit entries include task id, session id, phase, action id/kind, decision, reason, evidence refs, budget state, risk level, replan decision, completion assessment, and compact policy/sandbox observations. Tool runtime audit entries include validation, dispatch start/completion/failure, redacted argument summaries, permission level, risk tags, duration, status, error code, truncation status, output digest, and cache hit status. Policy audit entries are written as append-only JSONL under `.miniharness/policy/audit.jsonl` and mirrored into structured trace events with request id, decision id, outcome, risk level, constraints, approval grant references, and secret redaction. Sandbox audit entries are still compatible with `.miniharness/sandbox/trace.jsonl` and are also emitted as structured trace events when `TraceRuntime` is installed. Workspace state audit entries include session id, baseline id, event id, event type, path, ownership, before/after hashes, transaction id, command id, mutation id, artifact id, timestamp, and warning/error code. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, structured side effects, redaction count, semantic status, isolation report, sandbox metadata, and lightweight git state. Verification audit entries include project profile, impact analysis, plan/check ids, policy decision, command id, parsed failures, evidence artifacts, sandbox evidence, repair hints, and completion assessment.
+The structured trace records `task.started`, `action.*`, `model.*`, `tool.*`, `policy.*`, `approval.*`, `command.*`, `sandbox.*`, `mutation.*`, `verification.*`, `context.*`, and `final_report.*` events. Planner audit entries include task id, session id, phase, action id/kind, decision, reason, evidence refs, budget state, risk level, replan decision, completion assessment, and compact policy/sandbox observations. Model runtime audit entries include request/response/failure events, message/tool counts, request and content hashes, schema hash, usage, finish reason, proposed tool call metadata, and optional redacted `model_message` artifacts. Tool runtime audit entries include validation, dispatch start/completion/failure, redacted argument summaries, permission level, risk tags, duration, status, error code, truncation status, output digest, and cache hit status. Policy audit entries are written as append-only JSONL under `.miniharness/policy/audit.jsonl` and mirrored into structured trace events with request id, decision id, outcome, risk level, constraints, approval grant references, and secret redaction. Sandbox audit entries are still compatible with `.miniharness/sandbox/trace.jsonl` and are also emitted as structured trace events when `TraceRuntime` is installed. Workspace state audit entries include session id, baseline id, event id, event type, path, ownership, before/after hashes, transaction id, command id, mutation id, artifact id, timestamp, and warning/error code. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, structured side effects, redaction count, semantic status, isolation report, sandbox metadata, and lightweight git state. Verification audit entries include project profile, impact analysis, plan/check ids, policy decision, command id, parsed failures, evidence artifacts, sandbox evidence, repair hints, and completion assessment.
 
 Basic trace CLI commands are available:
 
@@ -190,15 +193,34 @@ Sandbox changes are not imported into the real workspace. Future import must go 
 ## Agent Loop Flow
 
 1. `cli.py` receives the user goal, creates a `TraceRuntime` run under `work/traces/runs/<run_id>/`, starts or resumes local workspace state, and starts or resumes `PlannerRuntime`.
-2. `agent.py` creates a `ContextManager` with the system message, user goal, and compact planner context.
-3. Each turn calls `PlannerRuntime.step()`, then exposes only tools allowed by the current phase.
-4. `provider.py` sends the context-managed `messages` and phase-filtered tool schemas to the OpenAI-compatible API.
-5. If the model returns tool calls, `agent.py` sends each call to `ToolRuntime.execute_tool_call`.
-6. `ToolRuntime` parses JSON arguments, validates them with Pydantic, checks tool policy, asks `PlannerRuntime` whether the action is allowed, applies timeout/output limits/cache, blocks unsafe runtime bypasses, records audit trace, and reports the full `ToolResult` back to the planner.
-7. Mutation, command, and verification runtimes also report rich result objects back to the planner, so the evidence ledger is not limited to truncated model-facing previews.
-8. Each structured tool result is recorded as a `ToolObservation`; a preview is appended back into `messages` as a `tool` role message.
-9. If the model returns no tool calls, `PlannerRuntime.assess_completion()` decides whether finalization is allowed. Coding tasks need applied change evidence and ready or ready-with-warnings verification evidence; read-only tasks can return the model answer when their read evidence criteria are met.
-10. For completed coding tasks, `PlannerRuntime.finalize()` creates a factual `FinalReport` with verification, policy, sandbox, and execution trace summaries. Otherwise the loop returns a blocked completion message or stops at `--max-turns`.
+2. `cli.py` creates `ModelRuntime` around the OpenAI-compatible provider; old `Provider.chat(...)` remains available as a compatibility wrapper.
+3. `agent.py` creates a `ContextManager` with the system message, user goal, and compact planner context.
+4. Each turn calls `PlannerRuntime.step()`, then exposes only tools allowed by the current phase.
+5. `ModelRuntime.build_request_from_context()` asks `ContextManager` for the request-sized OpenAI chat view, renders `ToolRegistry` tools into `ModelToolSchema`, and records policy/trace metadata.
+6. `ModelRuntime.run_turn()` checks context export policy, provider capabilities, token budgets, retry/fallback rules, response shape, tool choice, allowed tools, JSON arguments, Pydantic schema, duplicate ids, and empty output.
+7. If the validated model result contains tool calls, `agent.py` sends each canonical call to `ToolRuntime.execute_tool_call`.
+8. `ToolRuntime` parses JSON arguments, validates them with Pydantic, checks tool policy, asks `PlannerRuntime` whether the action is allowed, applies timeout/output limits/cache, blocks unsafe runtime bypasses, records audit trace, and reports the full `ToolResult` back to the planner.
+9. Mutation, command, and verification runtimes also report rich result objects back to the planner, so the evidence ledger is not limited to truncated model-facing previews.
+10. Each structured tool result is recorded as a `ToolObservation`; a preview is appended back into `messages` as a `tool` role message.
+11. If the model returns no tool calls, `PlannerRuntime.assess_completion()` decides whether finalization is allowed. Coding tasks need applied change evidence and ready or ready-with-warnings verification evidence; read-only tasks can return the model answer when their read evidence criteria are met.
+12. For completed coding tasks, `PlannerRuntime.finalize()` creates a factual `FinalReport` with verification, policy, sandbox, execution trace, and model usage summaries. Otherwise the loop returns a blocked completion message or stops at `--max-turns`.
+
+## Model / Inference Runtime
+
+Miniharness v0.0.14 adds `src/miniharness/model/` as the model protocol boundary. The runtime owns model request construction, provider selection, message conversion, tool schema exposure, response validation, budget checks, retry/fallback handling, stream aggregation, redacted trace events, and structured failure results.
+
+The key files are:
+
+- `models.py`: stable dataclasses and enums for purpose, role, messages, tool schemas, tool calls, capabilities, preferences, budgets, usage, errors, requests, and results.
+- `providers.py`: `ModelProvider`, `ProviderRequest`, `ProviderResponse`, `MockModelProvider`, legacy chat adapter, and OpenAI-compatible model provider.
+- `registry.py`: provider registration, default selection, and capability checks.
+- `messages.py`: model-message to provider-message conversion, developer fallback metadata, `tool_call_id` preservation, and token estimation.
+- `tools.py`: `ToolRegistry` to model tool schema rendering, allowed-tool filtering, schema hashing, and canonical tool call normalization.
+- `validation.py`: tool choice, unknown tool, JSON/Pydantic schema, duplicate id, empty response, max tool call, and provider capability validation.
+- `budget.py`, `retry.py`, and `streaming.py`: token budgeting, usage merge, retryable error handling, fallback model selection, and text/tool delta aggregation.
+- `config.py`: env/config defaults, raw prompt/response storage controls, redacted trace defaults, and context export policy.
+
+ModelRuntime never executes a tool. It only returns validated canonical tool calls to the agent loop. `ToolRuntime` remains the only tool execution path, with planner and policy checks still applied as a second boundary.
 
 ## Context Manager
 
@@ -216,7 +238,7 @@ The context layer now:
 - Sends only the first 4000 characters of long tool content back into model messages while keeping the full raw result in SQLite.
 - Accepts a compact planner context message so the model sees current phase, allowed tools, latest evidence, unresolved failures, and risks without receiving full journals or raw stdout.
 - Accepts compact trace summary lines such as policy blocks, sandbox unavailable notices, verification failures, mutation summaries, and current task timeline notes without receiving full trace payloads.
-- Uses `tool_choice=none` during compression so summary calls cannot trigger tools.
+- Uses `ModelRuntime` with `compact_context` purpose for compression when available, and still uses `tool_choice=none` so summary calls cannot trigger tools.
 - Provides recovery helpers that detect whether the next step should call the model or execute a pending tool.
 
 ## Tool Runtime

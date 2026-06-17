@@ -470,6 +470,7 @@ class FinalReport:
     next_steps: list[str]
     sandbox_isolation_summary: dict[str, Any] = field(default_factory=dict)
     execution_trace_summary: dict[str, Any] = field(default_factory=dict)
+    model_usage_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -485,6 +486,7 @@ class FinalReport:
             "policy_approval_summary": self.policy_approval_summary,
             "sandbox_isolation_summary": self.sandbox_isolation_summary,
             "execution_trace_summary": self.execution_trace_summary,
+            "model_usage_summary": self.model_usage_summary,
             "artifacts": self.artifacts,
             "next_steps": self.next_steps,
         }
@@ -504,6 +506,7 @@ class FinalReport:
             policy_approval_summary=dict(payload.get("policy_approval_summary") or {}),
             sandbox_isolation_summary=dict(payload.get("sandbox_isolation_summary") or {}),
             execution_trace_summary=dict(payload.get("execution_trace_summary") or {}),
+            model_usage_summary=dict(payload.get("model_usage_summary") or {}),
             artifacts=list(payload.get("artifacts") or []),
             next_steps=list(payload.get("next_steps") or []),
         )

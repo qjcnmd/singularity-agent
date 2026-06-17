@@ -32,6 +32,7 @@ class TraceEventType(str, Enum):
     PLANNER_COMPLETION_ASSESSED = "planner.completion_assessed"
     MODEL_REQUEST_CREATED = "model.request.created"
     MODEL_RESPONSE_RECEIVED = "model.response.received"
+    MODEL_REQUEST_FAILED = "model.request.failed"
     MODEL_TOOL_CALL_PROPOSED = "model.tool_call.proposed"
     MODEL_OUTPUT_REJECTED = "model.output.rejected"
     TOOL_VALIDATION_STARTED = "tool.validation.started"
@@ -322,6 +323,7 @@ class TraceSummary:
     error_count: int
     critical_events: list[dict[str, Any]] = field(default_factory=list)
     key_artifacts: list[str] = field(default_factory=list)
+    model_usage_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -343,6 +345,7 @@ class TraceSummary:
             "error_count": self.error_count,
             "critical_events": self.critical_events,
             "key_artifacts": self.key_artifacts,
+            "model_usage_summary": self.model_usage_summary,
         }
 
     @classmethod
