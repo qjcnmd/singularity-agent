@@ -10,6 +10,7 @@ from miniharness.model import ModelPurpose, ModelRuntime, ModelTurnStatus
 from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.planner import PlannerRuntime, TaskStatus
 from miniharness.provider import OpenAICompatibleProvider
+from miniharness.policy import ApprovalGate, PolicyRuntime
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.trace import TraceWriter
 from miniharness.workspace_state import LocalWorkspaceStateRuntime
@@ -50,6 +51,8 @@ class MiniAgent:
         max_turns: int,
         state_runtime: LocalWorkspaceStateRuntime | None = None,
         planner: PlannerRuntime | None = None,
+        policy_runtime: PolicyRuntime | None = None,
+        approval_gate: ApprovalGate | None = None,
     ) -> None:
         if provider is None and model_runtime is None:
             raise ValueError("provider or model_runtime is required.")
@@ -61,6 +64,8 @@ class MiniAgent:
         self.max_turns = max_turns
         self.state_runtime = state_runtime
         self.planner = planner
+        self.policy_runtime = policy_runtime
+        self.approval_gate = approval_gate
 
     def run(self, user_goal: str) -> str:
         planner = self.planner or PlannerRuntime(
@@ -98,6 +103,8 @@ class MiniAgent:
             trace=self.trace,
             workspace_root=self.tools.project_root,
             planner=planner,
+            policy_runtime=self.policy_runtime,
+            approval_gate=self.approval_gate,
         )
 
         for turn in range(1, self.max_turns + 1):

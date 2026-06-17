@@ -3,10 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from miniharness.policy import Capability, OperationKind, ResourceRef
 from miniharness.tools.models import (
     PermissionLevel,
+    ToolExecutionBackendKind,
+    ToolSideEffectKind,
+    ToolSensitivityLevel,
     ToolExecutionFailure,
     ToolSpec,
 )
@@ -14,6 +18,8 @@ from miniharness.workspace import CreateFile, DeleteFile, MoveFile, MutationRunt
 
 
 class ReplaceTextInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     path: str = Field(..., description="Workspace-relative file path.")
     old_text: str = Field(..., min_length=1, description="Text to replace exactly once.")
     new_text: str = Field(..., description="Replacement text.")
@@ -26,6 +32,8 @@ class ReplaceTextInput(BaseModel):
 
 
 class CreateFileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     path: str
     content: str
     intent: str = "create file"
@@ -33,6 +41,8 @@ class CreateFileInput(BaseModel):
 
 
 class DeleteFileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     path: str
     intent: str = "delete file"
     expected_sha256: str | None = None
@@ -40,6 +50,8 @@ class DeleteFileInput(BaseModel):
 
 
 class MoveFileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     path: str
     new_path: str
     intent: str = "move file"
@@ -141,6 +153,14 @@ def register_mutation_tools(
             input_model=ReplaceTextInput,
             handler=handlers.replace_text,
             permission_level=PermissionLevel.WRITE,
+            capabilities=(Capability.MUTATE_WORKSPACE,),
+            operation=OperationKind.MUTATE_FILE,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("file", args.get("path") or ".", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
             risk_tags=("write", "filesystem", "mutation"),
             timeout_seconds=10.0,
             max_output_chars=12000,
@@ -157,6 +177,14 @@ def register_mutation_tools(
             input_model=CreateFileInput,
             handler=handlers.create_file,
             permission_level=PermissionLevel.WRITE,
+            capabilities=(Capability.CREATE_FILE,),
+            operation=OperationKind.CREATE_FILE,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("file", args.get("path") or ".", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
             risk_tags=("write", "filesystem", "mutation", "create"),
             timeout_seconds=10.0,
             max_output_chars=12000,
@@ -173,6 +201,14 @@ def register_mutation_tools(
             input_model=DeleteFileInput,
             handler=handlers.delete_file,
             permission_level=PermissionLevel.WRITE,
+            capabilities=(Capability.DELETE_FILE,),
+            operation=OperationKind.DELETE_FILE,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("file", args.get("path") or ".", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
             risk_tags=("write", "filesystem", "mutation", "delete"),
             timeout_seconds=10.0,
             max_output_chars=12000,
@@ -189,6 +225,15 @@ def register_mutation_tools(
             input_model=MoveFileInput,
             handler=handlers.move_file,
             permission_level=PermissionLevel.WRITE,
+            capabilities=(Capability.MOVE_FILE,),
+            operation=OperationKind.MUTATE_FILE,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("file", args.get("path") or ".", workspace_relative=True),
+                ResourceRef("file", args.get("new_path") or ".", workspace_relative=True),
+            ],
+            side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
             risk_tags=("write", "filesystem", "mutation", "move"),
             timeout_seconds=10.0,
             max_output_chars=12000,

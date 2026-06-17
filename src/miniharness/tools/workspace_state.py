@@ -3,13 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from miniharness.policy import Capability, OperationKind, ResourceRef
 from miniharness.tools.models import PermissionLevel, ToolSpec
+from miniharness.tools.models import ToolSideEffectKind, ToolSensitivityLevel
 from miniharness.workspace_state import LocalWorkspaceStateRuntime
 
 
 class WorkspaceHealthInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     refresh_external: bool = Field(
         True,
         description="Refresh external workspace changes before reporting health.",
@@ -40,6 +44,13 @@ def register_workspace_state_tools(
             input_model=WorkspaceHealthInput,
             handler=handlers.workspace_health,
             permission_level=PermissionLevel.READ_ONLY,
+            capabilities=(Capability.READ_WORKSPACE,),
+            operation=OperationKind.READ_FILE,
+            resource_resolver=lambda _args, _root: [
+                ResourceRef("workspace", "workspace_health", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.READ_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
             risk_tags=("workspace_state",),
             timeout_seconds=5.0,
             max_output_chars=12000,

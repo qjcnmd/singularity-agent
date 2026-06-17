@@ -17,6 +17,7 @@ from miniharness.model import (
     OpenAICompatibleModelProvider,
 )
 from miniharness.observability import TraceRuntime, TraceStore
+from miniharness.policy import ApprovalGate, PolicyConfig, PolicyRuntime
 from miniharness.planner import PlannerRuntime
 from miniharness.tools import ToolRegistry
 from miniharness.tools.command import register_command_tools
@@ -125,11 +126,15 @@ def main(
             trace=trace,
             workspace_health=resume_health or state_runtime.get_workspace_health(),
         )
+        policy_config = PolicyConfig.runtime_default(project_root)
+        policy_runtime = PolicyRuntime(policy_config, trace=trace)
+        approval_gate = ApprovalGate(policy_config, trace=trace)
         command_runtime = CommandRuntime(
             project_root,
             trace=trace,
             state_runtime=state_runtime,
             planner=planner,
+            policy_runtime=policy_runtime,
         )
         register_mutation_tools(
             tools,
@@ -138,6 +143,7 @@ def main(
                 trace=trace,
                 state_runtime=state_runtime,
                 planner=planner,
+                policy_runtime=policy_runtime,
             ),
         )
         register_command_tools(tools, command_runtime)
@@ -149,6 +155,7 @@ def main(
                 command_runtime=command_runtime,
                 trace=trace,
                 planner=planner,
+                policy_runtime=policy_runtime,
             ),
         )
         agent = MiniAgent(
@@ -159,6 +166,8 @@ def main(
             max_turns=max_turns,
             state_runtime=state_runtime,
             planner=planner,
+            policy_runtime=policy_runtime,
+            approval_gate=approval_gate,
         )
         final_answer = agent.run(goal)
         state_runtime.record_external_changes()

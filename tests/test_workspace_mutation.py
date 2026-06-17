@@ -16,6 +16,7 @@ from miniharness.workspace import (
     WorkspacePathResolver,
     WorkspacePolicy,
 )
+from tests.tool_runtime_helpers import runtime_default_policy_runtime
 from miniharness.tools.mutation import register_mutation_tools
 
 
@@ -279,6 +280,7 @@ def test_tool_runtime_rejects_write_tool_that_does_not_use_mutation_runtime(
     tmp_path: Path,
 ) -> None:
     from pydantic import BaseModel
+    import pytest
 
     class RawWriteInput(BaseModel):
         path: str
@@ -293,32 +295,17 @@ def test_tool_runtime_rejects_write_tool_that_does_not_use_mutation_runtime(
         return {"status": "wrote"}
 
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    registry.register(
-        ToolSpec(
-            name="raw_write",
-            description="Unsafe write.",
-            input_model=RawWriteInput,
-            handler=raw_write,
-            permission_level=PermissionLevel.WRITE,
-            risk_tags=("write",),
+    with pytest.raises(ValueError, match="mutation runtime"):
+        registry.register(
+            ToolSpec(
+                name="raw_write",
+                description="Unsafe write.",
+                input_model=RawWriteInput,
+                handler=raw_write,
+                permission_level=PermissionLevel.WRITE,
+                risk_tags=("write",),
+            )
         )
-    )
-    runtime = ToolRuntime(
-        registry=registry,
-        policy=ToolPolicy(
-            allowed_permissions=frozenset({PermissionLevel.READ_ONLY, PermissionLevel.WRITE}),
-            denied_risk_tags=frozenset(),
-        ),
-        trace=None,
-        workspace_root=tmp_path,
-    )
-
-    result = runtime.execute_tool_call(
-        tool_call("raw_write", {"path": "unsafe.txt", "content": "bad"})
-    )
-
-    assert result.ok is False
-    assert result.error_code == "invalid_operation"
     assert called is False
     assert not (tmp_path / "unsafe.txt").exists()
 
@@ -336,6 +323,7 @@ def test_registered_mutation_tool_applies_through_runtime(tmp_path: Path) -> Non
         ),
         trace=None,
         workspace_root=tmp_path,
+        policy_runtime=runtime_default_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(

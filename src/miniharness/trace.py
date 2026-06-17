@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from miniharness.observability.redaction import TraceRedactor
+
 
 class TraceWriter:
     def __init__(self, *, run_id: str, path: Path) -> None:
@@ -19,11 +21,13 @@ class TraceWriter:
         return cls(run_id=run_id, path=trace_dir / f"{run_id}.jsonl")
 
     def record(self, event: str, data: dict) -> None:
+        redactor = TraceRedactor()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "ts": datetime.now(UTC).isoformat(),
             "run_id": self.run_id,
             "event": event,
-            "data": data,
+            "data": redactor.redact_payload(data),
         }
         with self.path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(entry, ensure_ascii=False) + "\n")

@@ -45,6 +45,7 @@ from miniharness.sandbox import (
     default_sandbox_profile,
 )
 from miniharness.verification import VerificationRuntime
+from tests.tool_runtime_helpers import make_test_policy_runtime
 
 
 def _event_values(trace: TraceRuntime) -> list[str]:
@@ -58,6 +59,7 @@ def test_tool_runtime_dispatch_emits_structured_trace(tmp_path: Path) -> None:
         policy=ToolPolicy.read_only(),
         trace=trace,
         workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(

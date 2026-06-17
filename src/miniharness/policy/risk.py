@@ -141,6 +141,7 @@ class RiskClassifier:
         inside = is_inside(resolved, self.workspace_root)
         name = resolved.name.lower()
         parts = {part.lower() for part in resolved.parts}
+        relative_text = str(resolved.relative_to(self.workspace_root)) if inside else str(resolved)
         level = RiskLevel.LOW if inside else RiskLevel.HIGH
 
         if inside:
@@ -149,7 +150,7 @@ class RiskClassifier:
             tags.add(RiskTag.OUTSIDE_WORKSPACE)
             reasons.append("Path is outside workspace.")
 
-        if name == ".env" or name.startswith(".env.") or SECRET_NAME_RE.search(name) or SECRET_NAME_RE.search(str(resolved)):
+        if name == ".env" or name.startswith(".env.") or SECRET_NAME_RE.search(name) or SECRET_NAME_RE.search(relative_text):
             tags.add(RiskTag.SECRET_ACCESS)
             level = max_level(level, RiskLevel.HIGH)
             reasons.append("Path looks sensitive.")

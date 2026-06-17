@@ -12,6 +12,7 @@ from miniharness.tools.mutation import register_mutation_tools
 from miniharness.trace import TraceWriter
 from miniharness.workspace import MutationRuntime
 from miniharness.workspace_state import LocalWorkspaceStateRuntime
+from tests.tool_runtime_helpers import make_test_policy_runtime
 
 
 class MockProvider:
@@ -45,6 +46,7 @@ def test_agent_returns_final_answer_without_tool_calls(tmp_path: Path) -> None:
         trace=TraceWriter.create(tmp_path),
         console=Console(file=StringIO(), force_terminal=False),
         max_turns=3,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     answer = agent.run("say something")
@@ -100,6 +102,7 @@ def test_agent_runs_complete_tool_call_loop(tmp_path: Path) -> None:
         trace=TraceWriter.create(tmp_path),
         console=Console(file=StringIO(), force_terminal=False),
         max_turns=3,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     answer = agent.run("read the README")
@@ -157,6 +160,7 @@ def test_agent_injects_workspace_state_observation_after_tool_call(tmp_path: Pat
         console=Console(file=StringIO(), force_terminal=False),
         max_turns=3,
         state_runtime=state,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     answer = agent.run("read the README")
@@ -198,6 +202,7 @@ def test_agent_filters_tools_and_injects_planner_context(tmp_path: Path) -> None
         console=Console(file=StringIO(), force_terminal=False),
         max_turns=1,
         planner=planner,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     agent.run("inspect only")
@@ -234,6 +239,7 @@ def test_agent_returns_planner_final_report_when_completion_evidence_exists(tmp_
         console=Console(file=StringIO(), force_terminal=False),
         max_turns=1,
         planner=planner,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     original_start = planner.start_task
@@ -284,6 +290,7 @@ def test_agent_blocks_final_answer_when_completion_evidence_is_missing(tmp_path:
         console=Console(file=StringIO(), force_terminal=False),
         max_turns=1,
         planner=planner,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     answer = agent.run("change code")
