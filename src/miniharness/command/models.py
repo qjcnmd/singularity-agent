@@ -10,6 +10,9 @@ from uuid import uuid4
 class CommandPurpose(str, Enum):
     READ_ONLY_COMMAND = "READ_ONLY_COMMAND"
     PROJECT_VERIFICATION = "PROJECT_VERIFICATION"
+    LINT = "LINT"
+    TYPECHECK = "TYPECHECK"
+    FORMAT_CHECK = "FORMAT_CHECK"
     FORMATTER = "FORMATTER"
     BUILD = "BUILD"
     CODE_GENERATION = "CODE_GENERATION"
@@ -261,6 +264,7 @@ class CommandResult:
     secret_redactions: int = 0
     git_before: dict[str, Any] = field(default_factory=dict)
     git_after: dict[str, Any] = field(default_factory=dict)
+    side_effects: list[dict[str, Any]] = field(default_factory=list)
 
     def to_observation(self) -> dict[str, Any]:
         key_output = self.combined_output_preview or self.stderr_preview or self.stdout_preview
@@ -276,6 +280,7 @@ class CommandResult:
                 "summary": self._summary(),
                 "key_output": key_output,
                 "changed_files": self.changed_files,
+                "side_effects": self.side_effects,
                 "truncated": self.output_truncated,
                 "artifact": self.artifact_path,
                 "error_code": self.error_code,
@@ -328,6 +333,7 @@ class CommandResult:
             "secret_redactions": self.secret_redactions,
             "git_before": self.git_before,
             "git_after": self.git_after,
+            "side_effects": self.side_effects,
         }
 
 

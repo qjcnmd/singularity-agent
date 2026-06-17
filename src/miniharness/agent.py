@@ -8,6 +8,7 @@ from miniharness.context import ContextManager
 from miniharness.provider import OpenAICompatibleProvider
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.trace import TraceWriter
+from miniharness.workspace_state import LocalWorkspaceStateRuntime
 
 
 SYSTEM_PROMPT = """You are Miniharness, a local coding agent harness.
@@ -19,9 +20,15 @@ You can inspect the current project by using the provided read-only tools:
 
 All file mutations must use the workspace mutation tools. Never claim that you
 edited files unless a workspace mutation tool returned an applied mutation.
-All command, test, build, formatter, package-manager, dev-server, and git
-read-only execution must use the command runtime tools. Never claim that you ran
-commands unless run_command or a process-session tool returned a command result.
+All ad-hoc commands, formatter, package-manager, dev-server, and git read-only
+execution must use the command runtime tools. Verification behavior such as
+tests, lint, typecheck, builds, syntax checks, and smoke checks must use the
+VerificationRuntime tools, not direct run_command. Never claim that you ran
+commands unless run_command, a process-session tool, or run_verification
+returned a command or verification result.
+Never claim a coding task is complete unless the latest VerificationRuntime
+CompletionAssessment says it is ready or ready_with_warnings, and report any
+warnings or remaining risks.
 Do not claim that you browsed the web, stored memory, or contacted other agents.
 When you have enough information, answer the user directly.
 """
@@ -36,12 +43,14 @@ class MiniAgent:
         trace: TraceWriter,
         console: Console,
         max_turns: int,
+        state_runtime: LocalWorkspaceStateRuntime | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.trace = trace
         self.console = console
         self.max_turns = max_turns
+        self.state_runtime = state_runtime
 
     def run(self, user_goal: str) -> str:
         context = ContextManager(
@@ -97,11 +106,40 @@ class MiniAgent:
                     },
                 )
                 context.add_tool_result(tool_call=tool_call, result=result, turn=turn)
+                self._inject_workspace_state(
+                    context,
+                    tool_call_name=name,
+                    turn=turn,
+                )
 
         message = f"Stopped after max_turns={self.max_turns}; the model did not produce a final answer."
         self.trace.record("error", {"type": "MaxTurnsExceeded", "message": message})
         self.trace.record("final_answer", {"turn": self.max_turns, "content": message})
         return message
+
+    def _inject_workspace_state(
+        self,
+        context: ContextManager,
+        *,
+        tool_call_name: str,
+        turn: int,
+    ) -> None:
+        if self.state_runtime is None or tool_call_name == "workspace_health":
+            return
+        self.state_runtime.record_external_changes()
+        context.add_tool_result(
+            tool_call={
+                "id": f"workspace_state_{self.trace.run_id}_{turn}",
+                "type": "function",
+                "function": {"name": "workspace_health", "arguments": "{}"},
+            },
+            result={
+                "ok": True,
+                "content": self.state_runtime.get_workspace_health().to_observation(),
+                "metadata": {"tool_version": "internal"},
+            },
+            turn=turn,
+        )
 
     @staticmethod
     def _extract_assistant_message(response: dict[str, Any]) -> dict[str, Any]:

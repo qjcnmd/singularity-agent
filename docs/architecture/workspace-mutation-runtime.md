@@ -156,7 +156,7 @@ Git is only awareness here. Rollback uses mutation journal entries and file hash
 
 ## Verification Hook
 
-`MutationRuntime` accepts a verification hook and carries `verification_status` in results and trace. The current runtime does not hard-code formatting, linting, type checking, testing, or builds. Those belong in a future Verification Runtime.
+`MutationRuntime` accepts a verification hook and carries `verification_status` in results and trace. The runtime does not hard-code formatting, linting, type checking, testing, or builds. Those belong to VerificationRuntime, which receives changed-file, transaction, and changeset context and then runs checks through CommandRuntime.
 
 ## Error Taxonomy
 

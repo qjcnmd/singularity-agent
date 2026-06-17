@@ -1,3 +1,4 @@
+import json
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,7 @@ from rich.console import Console
 from miniharness.agent import MiniAgent
 from miniharness.tools import ToolRegistry
 from miniharness.trace import TraceWriter
+from miniharness.workspace_state import LocalWorkspaceStateRuntime
 
 
 class MockProvider:
@@ -105,3 +107,65 @@ def test_agent_runs_complete_tool_call_loop(tmp_path: Path) -> None:
     tool_messages = [message for message in second_messages if message["role"] == "tool"]
     assert len(tool_messages) == 1
     assert "MiniHarness README content" in tool_messages[0]["content"]
+
+
+def test_agent_injects_workspace_state_observation_after_tool_call(tmp_path: Path) -> None:
+    readme = tmp_path / "README.md"
+    readme.write_text("MiniHarness README content", encoding="utf-8")
+    trace = TraceWriter.create(tmp_path)
+    state = LocalWorkspaceStateRuntime(tmp_path, trace=trace)
+    state.begin_session(task_id="task_1", session_id="session_1")
+    provider = MockProvider(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_readme",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path": "README.md"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "done",
+                    }
+                }
+            ]
+        },
+    )
+    agent = MiniAgent(
+        provider=provider,  # type: ignore[arg-type]
+        tools=ToolRegistry(tmp_path),
+        trace=trace,
+        console=Console(file=StringIO(), force_terminal=False),
+        max_turns=3,
+        state_runtime=state,
+    )
+
+    answer = agent.run("read the README")
+
+    assert answer == "done"
+    second_messages = provider.calls[1]["messages"]
+    workspace_messages = [
+        message
+        for message in second_messages
+        if message["role"] == "tool" and message.get("name") == "workspace_health"
+    ]
+    assert len(workspace_messages) == 1
+    payload = json.loads(workspace_messages[0]["content"])
+    assert "workspace_state" in payload["content"]
+    assert "journal" not in workspace_messages[0]["content"].lower()

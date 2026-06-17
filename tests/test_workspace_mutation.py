@@ -73,6 +73,25 @@ def test_policy_denies_secret_and_git_internal_paths(tmp_path: Path) -> None:
     assert not (tmp_path / ".env").exists()
 
 
+def test_policy_denies_miniharness_state_dir(tmp_path: Path) -> None:
+    runtime = MutationRuntime(tmp_path)
+
+    result = runtime.apply_operations(
+        [
+            CreateFile(
+                path=".miniharness/sessions/x/tamper.json",
+                content='{"bad": true}\n',
+            )
+        ],
+        intent="tamper with state",
+        created_by="test",
+    )
+
+    assert result.ok is False
+    assert result.error_code == "path_denied"
+    assert not (tmp_path / ".miniharness" / "sessions" / "x" / "tamper.json").exists()
+
+
 def test_replace_text_generates_changeset_diff_apply_and_trace(tmp_path: Path) -> None:
     source = tmp_path / "src" / "app.py"
     source.parent.mkdir()

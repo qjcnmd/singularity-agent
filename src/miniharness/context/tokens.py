@@ -13,18 +13,25 @@ class TokenCounter:
         try:
             import tiktoken
         except ModuleNotFoundError as exc:
-            raise TokenizerUnavailableError(
+            self.encoding = None
+            self.model = model
+            self.unavailable_error = TokenizerUnavailableError(
                 "Precise token counting requires the 'tiktoken' package. "
-                "Install Miniharness dependencies before running context budgeting."
-            ) from exc
+                "Using an approximate local token estimate."
+            )
+            self.unavailable_error.__cause__ = exc
+            return
 
         try:
             self.encoding = tiktoken.encoding_for_model(model)
         except KeyError:
             self.encoding = tiktoken.get_encoding("o200k_base")
         self.model = model
+        self.unavailable_error = None
 
     def count_text(self, text: str) -> int:
+        if self.encoding is None:
+            return max(1, (len(text) + 3) // 4)
         return len(self.encoding.encode(text))
 
     def count_messages(self, messages: list[dict[str, Any]]) -> int:

@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from miniharness.command.backend import (
     BackendRunResult,
@@ -34,6 +34,9 @@ from miniharness.command.models import (
 from miniharness.command.output import OutputCollector, OutputSnapshot, SecretRedactor
 from miniharness.command.policy import CommandPolicy
 from miniharness.trace import TraceWriter
+
+if TYPE_CHECKING:
+    from miniharness.workspace_state import LocalWorkspaceStateRuntime
 
 
 SKIP_SIDE_EFFECT_DIRS = {
@@ -87,7 +90,7 @@ class WorkspaceSnapshot:
 class _SessionRecord:
     session: ProcessSession
     running: RunningProcess
-    before_snapshot: WorkspaceSnapshot
+    before_snapshot: Any
 
 
 class CommandRuntime:
@@ -99,12 +102,14 @@ class CommandRuntime:
         backend: ExecutionBackend | None = None,
         trace: TraceWriter | None = None,
         env_policy: EnvPolicy | None = None,
+        state_runtime: "LocalWorkspaceStateRuntime | None" = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)
         self.policy = policy or CommandPolicy()
         self.backend = backend or LocalProcessBackend()
         self.trace = trace
         self.env_policy = env_policy or EnvPolicy()
+        self.state_runtime = state_runtime
         self._sessions: dict[str, _SessionRecord] = {}
 
     def plan(self, request: CommandRequest) -> CommandPlan:
@@ -130,7 +135,7 @@ class CommandRuntime:
     ) -> CommandResult:
         started_at = _now()
         started = time.perf_counter()
-        before_snapshot = WorkspaceSnapshot.capture(self.workspace_root)
+        before_snapshot = self._capture_workspace_snapshot()
         git_before = self._git_state_summary()
         decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
         if decision.decision != CommandDecision.ALLOW:
@@ -181,14 +186,21 @@ class CommandRuntime:
             collector=collector,
         )
         snapshot = collector.snapshot()
-        after_snapshot = WorkspaceSnapshot.capture(self.workspace_root)
+        after_snapshot = self._capture_workspace_snapshot()
+        side_effects = self._record_command_side_effects(
+            request=request,
+            before_snapshot=before_snapshot,
+            after_snapshot=after_snapshot,
+            transaction_id=transaction_id,
+        )
         git_after = self._git_state_summary()
         result = self._completed_result(
             request,
             decision=decision,
             backend_result=backend_result,
             output=snapshot,
-            changed_files=before_snapshot.changed_files(after_snapshot),
+            changed_files=self._changed_files(before_snapshot, after_snapshot),
+            side_effects=side_effects,
             env_denied=env_result.denied,
             started_at=started_at,
             started=started,
@@ -272,7 +284,7 @@ class CommandRuntime:
         self._sessions[session.process_id] = _SessionRecord(
             session=session,
             running=running,
-            before_snapshot=WorkspaceSnapshot.capture(self.workspace_root),
+            before_snapshot=self._capture_workspace_snapshot(),
         )
         return session
 
@@ -312,8 +324,20 @@ class CommandRuntime:
         exit_code = None
         if isinstance(self.backend, LocalProcessBackend):
             exit_code = self.backend.stop(record.running, reason="stopped")
-        after_snapshot = WorkspaceSnapshot.capture(self.workspace_root)
-        changed_files = record.before_snapshot.changed_files(after_snapshot)
+        after_snapshot = self._capture_workspace_snapshot()
+        changed_files = self._changed_files(record.before_snapshot, after_snapshot)
+        side_effects = self._record_command_side_effects(
+            request=CommandRequest(
+                argv=record.session.argv,
+                shell=record.session.shell,
+                cwd=record.session.cwd,
+                purpose=CommandPurpose.LONG_RUNNING,
+                command_id=record.session.command_id,
+            ),
+            before_snapshot=record.before_snapshot,
+            after_snapshot=after_snapshot,
+            transaction_id=record.session.owner_transaction,
+        )
         snapshot = record.running.collector.snapshot()
         stopped = ProcessStopResult(
             process_id=process_id,
@@ -379,6 +403,7 @@ class CommandRuntime:
         backend_result: BackendRunResult,
         output: OutputSnapshot,
         changed_files: list[str],
+        side_effects: list[dict[str, Any]],
         env_denied: list[str],
         started_at: str,
         started: float,
@@ -404,6 +429,7 @@ class CommandRuntime:
             output_digest=output.output_digest,
             artifact_path=output.artifact_path,
             changed_files=changed_files,
+            side_effects=side_effects,
             policy_decision=decision,
             risk_tags=decision.risk_tags,
             error_code=error_code,
@@ -532,6 +558,7 @@ class CommandRuntime:
                 "output_digest": result.output_digest,
                 "artifact_path": result.artifact_path,
                 "changed_files": result.changed_files,
+                "side_effects": result.side_effects,
                 "secret_redactions": result.secret_redactions,
                 "error_code": result.error_code,
                 "semantic_status": result.semantic_status.value,
@@ -553,6 +580,45 @@ class CommandRuntime:
             limits=limits,
             redactor=redactor,
         )
+
+    def _capture_workspace_snapshot(self) -> Any:
+        if self.state_runtime is not None:
+            return self.state_runtime.capture_snapshot()
+        return WorkspaceSnapshot.capture(self.workspace_root)
+
+    def _changed_files(self, before: Any, after: Any) -> list[str]:
+        if isinstance(before, WorkspaceSnapshot) and isinstance(after, WorkspaceSnapshot):
+            return before.changed_files(after)
+        before_hashes = {
+            path: snapshot.sha256 for path, snapshot in before.items()
+        }
+        after_hashes = {
+            path: snapshot.sha256 for path, snapshot in after.items()
+        }
+        changed = {
+            path for path, digest in after_hashes.items() if before_hashes.get(path) != digest
+        }
+        changed.update(path for path in before_hashes if path not in after_hashes)
+        return sorted(changed)
+
+    def _record_command_side_effects(
+        self,
+        *,
+        request: CommandRequest,
+        before_snapshot: Any,
+        after_snapshot: Any,
+        transaction_id: str | None,
+    ) -> list[dict[str, Any]]:
+        if self.state_runtime is None:
+            return []
+        changes = self.state_runtime.record_command_side_effects(
+            command_id=request.command_id,
+            purpose=request.purpose,
+            before_snapshot=before_snapshot,
+            after_snapshot=after_snapshot,
+            transaction_id=transaction_id,
+        )
+        return [change.to_dict() for change in changes]
 
     def _resolve_cwd(self, cwd: str) -> Path | None:
         root = self.workspace_root
@@ -594,6 +660,12 @@ class CommandRuntime:
             return SemanticStatus.TESTS_FAILED
         if request.purpose == CommandPurpose.BUILD:
             return SemanticStatus.BUILD_FAILED
+        if request.purpose == CommandPurpose.LINT:
+            return SemanticStatus.LINT_FAILED
+        if request.purpose == CommandPurpose.TYPECHECK:
+            return SemanticStatus.TYPECHECK_FAILED
+        if request.purpose == CommandPurpose.FORMAT_CHECK:
+            return SemanticStatus.LINT_FAILED
         if request.purpose == CommandPurpose.FORMATTER:
             return SemanticStatus.LINT_FAILED
         return SemanticStatus.EXIT_NONZERO

@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from miniharness.trace import TraceWriter
@@ -36,6 +36,9 @@ from miniharness.workspace.operations import (
 from miniharness.workspace.pathing import ResolvedWorkspacePath, WorkspacePathResolver
 from miniharness.workspace.policy import ALLOW, DENY, REQUIRE_REVIEW, PolicyDecision, WorkspacePolicy
 from miniharness.workspace.snapshot import FileSnapshot, WorkspaceIndex, hash_bytes
+
+if TYPE_CHECKING:
+    from miniharness.workspace_state import LocalWorkspaceStateRuntime
 
 
 @dataclass(frozen=True)
@@ -202,6 +205,7 @@ class MutationRuntime:
         diff_context_lines: int = 3,
         max_inline_diff_lines: int = 200,
         verification_hook: Any | None = None,
+        state_runtime: "LocalWorkspaceStateRuntime | None" = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.resolver = WorkspacePathResolver(self.workspace_root)
@@ -215,6 +219,7 @@ class MutationRuntime:
         )
         self.atomic_writer = AtomicWriter()
         self.verification_hook = verification_hook
+        self.state_runtime = state_runtime
         self._journals: dict[str, MutationJournal] = {}
 
     def preview_operations(
@@ -415,6 +420,17 @@ class MutationRuntime:
                 )
                 journal.append(entry)
                 applied.append(entry)
+                if self.state_runtime is not None:
+                    self.state_runtime.record_mutation(
+                        path=path,
+                        before_snapshot=before_snapshot,
+                        after_snapshot=after_snapshot,
+                        transaction_id=transaction_id,
+                        mutation_id=entry.operation_id,
+                        tool_call_id=tool_call_id,
+                        before_bytes=before_raw,
+                        metadata={"changeset_id": changeset.id, "action": action},
+                    )
                 self._record_mutation_trace(
                     changeset=changeset,
                     transaction_id=transaction_id,
