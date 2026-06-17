@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from miniharness.policy import Capability, OperationKind, ResourceRef
 from miniharness.command import (
     CommandPurpose,
     CommandRequest,
@@ -12,10 +13,19 @@ from miniharness.command import (
     NetworkMode,
     ResourceLimits,
 )
-from miniharness.tools.models import PermissionLevel, ToolExecutionFailure, ToolSpec
+from miniharness.tools.models import (
+    PermissionLevel,
+    ToolExecutionBackendKind,
+    ToolExecutionFailure,
+    ToolSensitivityLevel,
+    ToolSideEffectKind,
+    ToolSpec,
+)
 
 
 class RunCommandInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     argv: list[str] | None = Field(None, description="Structured argv command.")
     shell: str | None = Field(None, description="Shell command string; high risk.")
     cwd: str = Field(".", description="Workspace-relative working directory.")
@@ -29,13 +39,23 @@ class RunCommandInput(BaseModel):
     expected_outputs: list[str] = Field(default_factory=list)
     risk_acceptance_reason: str | None = None
 
+    @model_validator(mode="after")
+    def _argv_or_shell(self) -> "RunCommandInput":
+        if bool(self.argv) == bool(self.shell):
+            raise ValueError("Exactly one of argv or shell is required.")
+        if self.argv is not None and len(self.argv) == 0:
+            raise ValueError("argv must not be empty.")
+        return self
+
 
 class ProcessIdInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     process_id: str
 
 
 class EmptyInput(BaseModel):
-    pass
+    model_config = ConfigDict(extra="forbid")
 
 
 class CommandToolHandlers:
@@ -129,6 +149,14 @@ def _requires_verification_runtime(args: RunCommandInput) -> bool:
     return " pytest" in joined or " npm test" in joined or " pnpm test" in joined
 
 
+def _command_identifier(args: dict[str, Any]) -> str:
+    if args.get("shell"):
+        return str(args["shell"])
+    if args.get("argv"):
+        return " ".join(str(part) for part in args["argv"])
+    return ""
+
+
 def register_command_tools(registry: Any, runtime: CommandRuntime | None = None) -> None:
     command_runtime = runtime or CommandRuntime(registry.project_root)
     handlers = CommandToolHandlers(command_runtime)
@@ -140,6 +168,14 @@ def register_command_tools(registry: Any, runtime: CommandRuntime | None = None)
             input_model=RunCommandInput,
             handler=handlers.run_command,
             permission_level=PermissionLevel.SHELL,
+            capabilities=(Capability.EXECUTE_COMMAND,),
+            operation=OperationKind.EXECUTE_COMMAND,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("command", _command_identifier(args))
+            ],
+            side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
             risk_tags=("command_runtime",),
             timeout_seconds=60.0,
             max_output_chars=12000,
@@ -156,6 +192,14 @@ def register_command_tools(registry: Any, runtime: CommandRuntime | None = None)
             input_model=RunCommandInput,
             handler=handlers.start_process,
             permission_level=PermissionLevel.SHELL,
+            capabilities=(Capability.START_LONG_PROCESS,),
+            operation=OperationKind.START_LONG_PROCESS,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("command", _command_identifier(args))
+            ],
+            side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
             risk_tags=("command_runtime", "long_running"),
             timeout_seconds=10.0,
             max_output_chars=12000,
@@ -172,6 +216,14 @@ def register_command_tools(registry: Any, runtime: CommandRuntime | None = None)
             input_model=ProcessIdInput,
             handler=handlers.read_process_output,
             permission_level=PermissionLevel.SHELL,
+            capabilities=(Capability.EXECUTE_COMMAND,),
+            operation=OperationKind.READ_FILE,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("process", args.get("process_id") or "")
+            ],
+            side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
             risk_tags=("command_runtime",),
             timeout_seconds=5.0,
             max_output_chars=12000,
@@ -188,6 +240,14 @@ def register_command_tools(registry: Any, runtime: CommandRuntime | None = None)
             input_model=ProcessIdInput,
             handler=handlers.stop_process,
             permission_level=PermissionLevel.SHELL,
+            capabilities=(Capability.KILL_PROCESS,),
+            operation=OperationKind.KILL_PROCESS,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("process", args.get("process_id") or "")
+            ],
+            side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
             risk_tags=("command_runtime",),
             timeout_seconds=10.0,
             max_output_chars=12000,
@@ -204,6 +264,14 @@ def register_command_tools(registry: Any, runtime: CommandRuntime | None = None)
             input_model=EmptyInput,
             handler=handlers.list_processes,
             permission_level=PermissionLevel.SHELL,
+            capabilities=(Capability.EXECUTE_COMMAND,),
+            operation=OperationKind.LIST_DIRECTORY,
+            resource_resolver=lambda _args, _root: [
+                ResourceRef("process", "command_runtime_sessions")
+            ],
+            side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
             risk_tags=("command_runtime",),
             timeout_seconds=5.0,
             max_output_chars=12000,

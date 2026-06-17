@@ -23,6 +23,7 @@ from miniharness.planner import (
 from miniharness.tools.mutation import register_mutation_tools
 from miniharness.trace import TraceWriter
 from miniharness.workspace import MutationRuntime
+from tests.tool_runtime_helpers import runtime_default_policy_runtime, make_test_policy_runtime
 
 
 def make_tool_call(
@@ -51,6 +52,7 @@ def make_runtime(tmp_path: Path) -> ToolRuntime:
         policy=ToolPolicy.read_only(),
         trace=TraceWriter.create(tmp_path),
         workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
 
@@ -120,6 +122,7 @@ def test_runtime_policy_denies_write_tools_by_default(tmp_path: Path) -> None:
             handler=write_handler,
             permission_level=PermissionLevel.WRITE,
             risk_tags=("write",),
+            uses_mutation_runtime=True,
         )
     )
     runtime = ToolRuntime(
@@ -127,6 +130,7 @@ def test_runtime_policy_denies_write_tools_by_default(tmp_path: Path) -> None:
         policy=ToolPolicy.read_only(),
         trace=TraceWriter.create(tmp_path),
         workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(make_tool_call("write_file", {"path": "x.txt"}))
@@ -163,6 +167,7 @@ def test_runtime_timeout_returns_timeout_error(tmp_path: Path) -> None:
         policy=ToolPolicy.read_only(),
         trace=TraceWriter.create(tmp_path),
         workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(make_tool_call("slow_read", {}))
@@ -193,6 +198,7 @@ def test_runtime_truncates_oversized_output_with_head_and_tail(tmp_path: Path) -
         policy=ToolPolicy.read_only(),
         trace=TraceWriter.create(tmp_path),
         workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(make_tool_call("large_read", {}))
@@ -212,6 +218,7 @@ def test_runtime_writes_audit_trace(tmp_path: Path) -> None:
         policy=ToolPolicy.read_only(),
         trace=trace,
         workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     runtime.execute_tool_call(
@@ -224,7 +231,8 @@ def test_runtime_writes_audit_trace(tmp_path: Path) -> None:
     audit = tool_events[0]["data"]
     assert audit["tool_call_id"] == "call_list"
     assert audit["tool_name"] == "list_files"
-    assert audit["validated_args"] == {"path": ".", "max_depth": 1}
+    assert audit["argument_summary"]["shape"] == "object"
+    assert audit["argument_summary"]["keys"] == ["max_depth", "path"]
     assert audit["permission_level"] == "read_only"
     assert audit["status"] == "ok"
     assert audit["error_code"] is None
@@ -263,10 +271,15 @@ def test_runtime_uses_run_cache_for_cacheable_read_only_tools(tmp_path: Path) ->
         policy=ToolPolicy.read_only(),
         trace=trace,
         workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
-    first = runtime.execute_tool_call(make_tool_call("echo_read", {"value": "same"}))
-    second = runtime.execute_tool_call(make_tool_call("echo_read", {"value": "same"}))
+    first = runtime.execute_tool_call(
+        make_tool_call("echo_read", {"value": "same"}, tool_call_id="call_cache_first")
+    )
+    second = runtime.execute_tool_call(
+        make_tool_call("echo_read", {"value": "same"}, tool_call_id="call_cache_second")
+    )
 
     assert first.ok is True
     assert second.ok is True
@@ -318,6 +331,7 @@ def test_runtime_asks_planner_before_executing_tool(tmp_path: Path) -> None:
         trace=TraceWriter.create(tmp_path),
         workspace_root=tmp_path,
         planner=DenyingPlanner(),
+        policy_runtime=runtime_default_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(make_tool_call("write_file", {"path": "x.txt"}))
@@ -359,6 +373,7 @@ def test_runtime_reports_executed_tool_result_to_planner(tmp_path: Path) -> None
         trace=TraceWriter.create(tmp_path),
         workspace_root=tmp_path,
         planner=planner,
+        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(
@@ -390,6 +405,7 @@ def test_mutation_tool_with_runtime_observer_records_one_planner_change(tmp_path
         trace=TraceWriter.create(tmp_path),
         workspace_root=tmp_path,
         planner=planner,
+        policy_runtime=runtime_default_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(

@@ -21,6 +21,12 @@ SECRET_VALUE_RE = re.compile(
     r"(Bearer\s+)[A-Za-z0-9._\-]+|sk-[A-Za-z0-9._\-]+|secret-token",
     re.IGNORECASE,
 )
+SENSITIVE_PATH_RE = re.compile(
+    r"(^\.env(?:\..*)?$|(^|[\\/])\.ssh([\\/]|$)|(^|[\\/])\.gnupg([\\/]|$)|"
+    r"(^|[\\/])\.aws([\\/]|$)|(^|[\\/])\.azure([\\/]|$)|id_rsa|id_dsa|id_ecdsa|id_ed25519|"
+    r"credentials?|credential|token|secret|api[_-]?key|password|\.pem$|\.pfx$|\.p12$|\.key$)",
+    re.IGNORECASE,
+)
 
 
 class PolicyAuditWriter:
@@ -49,7 +55,7 @@ class PolicyAuditWriter:
             runtime=request.runtime,
             operation=request.operation,
             capability=request.capability,
-            resource_summary=redact(request.resource.identifier),
+            resource_summary=redact_resource_identifier(request.resource.identifier),
             normalized_input_hash=stable_hash(request_payload),
             risk_level=decision.risk_level,
             risk_tags=decision.risk_tags,
@@ -66,13 +72,20 @@ class PolicyAuditWriter:
         payload = redact(entry.to_dict())
         payload["request_summary"] = redact(
             {
-                "resource": request.resource.identifier,
+                "resource": redact_resource_identifier(request.resource.identifier),
                 "reason": request.reason,
                 "metadata": request.metadata,
             }
         )
         with self.path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+
+def redact_resource_identifier(value: str) -> str:
+    normalized = value.replace("\\", "/")
+    if SENSITIVE_PATH_RE.search(normalized):
+        return "<redacted>"
+    return redact(value)
 
 
 def redact(value: Any) -> Any:

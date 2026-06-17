@@ -37,6 +37,7 @@ from miniharness.verification import (
     WorkspaceKind,
 )
 from miniharness.verification.models import VerificationPlan
+from tests.tool_runtime_helpers import runtime_default_policy_runtime
 
 
 def tool_call(name: str, arguments: dict, *, tool_call_id: str = "call_verify") -> dict:
@@ -404,6 +405,7 @@ def test_verification_tool_observation_enters_context_manager(tmp_path: Path) ->
         policy=ToolPolicy.coding_agent(),
         trace=None,
         workspace_root=tmp_path,
+        policy_runtime=runtime_default_policy_runtime(tmp_path),
     )
     result = runtime.execute_tool_call(
         tool_call("plan_verification", {"changed_files": ["README.md"], "task_intent": "docs"})
@@ -427,6 +429,7 @@ def test_direct_run_command_rejects_verification_like_commands(tmp_path: Path) -
         policy=ToolPolicy.coding_agent(),
         trace=None,
         workspace_root=tmp_path,
+        policy_runtime=runtime_default_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(

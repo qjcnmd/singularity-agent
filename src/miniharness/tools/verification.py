@@ -3,18 +3,24 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from miniharness.policy import Capability, OperationKind, ResourceRef
 from miniharness.command import CommandRuntime
 from miniharness.tools.models import (
     PermissionLevel,
+    ToolExecutionBackendKind,
     ToolExecutionFailure,
+    ToolSensitivityLevel,
+    ToolSideEffectKind,
     ToolSpec,
 )
 from miniharness.verification import VerificationRuntime
 
 
 class PlanVerificationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     changed_files: list[str] = Field(default_factory=list)
     task_intent: str = ""
     transaction_id: str | None = None
@@ -22,6 +28,8 @@ class PlanVerificationInput(BaseModel):
 
 
 class RunVerificationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     plan_id: str | None = None
     changed_files: list[str] = Field(default_factory=list)
     task_intent: str = ""
@@ -30,10 +38,14 @@ class RunVerificationInput(BaseModel):
 
 
 class GetVerificationResultInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     plan_id: str | None = None
 
 
 class RerunCheckInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     plan_id: str
     check_id: str
 
@@ -101,6 +113,13 @@ def register_verification_tools(
             input_model=PlanVerificationInput,
             handler=handlers.plan_verification,
             permission_level=PermissionLevel.READ_ONLY,
+            capabilities=(Capability.READ_WORKSPACE,),
+            operation=OperationKind.READ_FILE,
+            resource_resolver=lambda _args, _root: [
+                ResourceRef("workspace", "plan_verification", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.READ_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
             risk_tags=("verification_runtime", "planning"),
             timeout_seconds=10.0,
             max_output_chars=16000,
@@ -116,12 +135,21 @@ def register_verification_tools(
             input_model=RunVerificationInput,
             handler=handlers.run_verification,
             permission_level=PermissionLevel.SHELL,
+            capabilities=(Capability.EXECUTE_PROJECT_CODE,),
+            operation=OperationKind.VERIFICATION,
+            resource_resolver=lambda _args, _root: [
+                ResourceRef("workspace", "run_verification", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNTIME,
             risk_tags=("verification_runtime", "command_runtime"),
             timeout_seconds=300.0,
             max_output_chars=20000,
             cacheable=False,
             idempotent=False,
             uses_command_runtime=True,
+            delegates_policy_constraints=True,
         )
     )
     registry.register(
@@ -132,6 +160,13 @@ def register_verification_tools(
             input_model=GetVerificationResultInput,
             handler=handlers.get_verification_result,
             permission_level=PermissionLevel.READ_ONLY,
+            capabilities=(Capability.READ_WORKSPACE,),
+            operation=OperationKind.READ_FILE,
+            resource_resolver=lambda _args, _root: [
+                ResourceRef("workspace", "get_verification_result", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.READ_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
             risk_tags=("verification_runtime",),
             timeout_seconds=5.0,
             max_output_chars=16000,
@@ -147,11 +182,20 @@ def register_verification_tools(
             input_model=RerunCheckInput,
             handler=handlers.rerun_check,
             permission_level=PermissionLevel.SHELL,
+            capabilities=(Capability.EXECUTE_PROJECT_CODE,),
+            operation=OperationKind.VERIFICATION,
+            resource_resolver=lambda _args, _root: [
+                ResourceRef("workspace", "rerun_check", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNTIME,
             risk_tags=("verification_runtime", "command_runtime"),
             timeout_seconds=180.0,
             max_output_chars=16000,
             cacheable=False,
             idempotent=False,
             uses_command_runtime=True,
+            delegates_policy_constraints=True,
         )
     )

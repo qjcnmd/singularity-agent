@@ -5,6 +5,7 @@ from typing import Any
 
 from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.policy.audit import PolicyAuditWriter
+from miniharness.policy.audit import redact_resource_identifier
 from miniharness.policy.config import ApprovalMode, PolicyConfig
 from miniharness.policy.models import (
     ApprovalGrant,
@@ -131,7 +132,7 @@ class PolicyRuntime:
                 "decision_id": decision.decision_id if decision else None,
                 "operation": request.operation.value,
                 "capability": request.capability.value,
-                "resource": request.resource.identifier,
+                "resource": redact_resource_identifier(request.resource.identifier),
                 "outcome": decision.outcome.value if decision else None,
                 "risk_level": decision.risk_level.value if decision else None,
                 "rule_ids": decision.rule_ids if decision else [],

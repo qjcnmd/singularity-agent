@@ -22,6 +22,7 @@ from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.tools.command import register_command_tools
 from miniharness.tools.models import ToolResult
 from miniharness.trace import TraceWriter
+from tests.tool_runtime_helpers import runtime_default_policy_runtime
 
 
 class SimpleTokenCounter:
@@ -423,6 +424,7 @@ def test_run_command_tool_is_registered_and_uses_command_runtime(tmp_path: Path)
         policy=ToolPolicy.coding_agent(),
         trace=None,
         workspace_root=tmp_path,
+        policy_runtime=runtime_default_policy_runtime(tmp_path),
     )
 
     result = runtime.execute_tool_call(

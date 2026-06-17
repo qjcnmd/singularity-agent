@@ -3,13 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from miniharness.policy import Capability, OperationKind, ResourceRef
 from miniharness.tools.models import (
     PermissionLevel,
+    ToolCachePolicy,
+    ToolIdempotencyPolicy,
+    ToolSensitivityLevel,
+    ToolSideEffectKind,
     ToolExecutionFailure,
     ToolSpec,
 )
+from miniharness.tools.safety import FileSensitivityClassifier, redact_secret_text
 
 
 SKIP_DIRS = {
@@ -26,11 +32,15 @@ SKIP_DIRS = {
 
 
 class ListFilesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     path: str = Field(".", description="Directory to list, relative to project root.")
     max_depth: int = Field(4, ge=0, le=10, description="Maximum directory depth.")
 
 
 class ReadFileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     path: str = Field(..., description="File path, relative to project root.")
     max_bytes: int = Field(
         20000, ge=1, le=200000, description="Maximum bytes to read."
@@ -38,6 +48,8 @@ class ReadFileInput(BaseModel):
 
 
 class SearchTextInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     query: str = Field(..., min_length=1, description="Text to search for.")
     path: str = Field(".", description="File or directory path to search.")
     case_sensitive: bool = Field(False, description="Whether matching is case-sensitive.")
@@ -47,6 +59,7 @@ class SearchTextInput(BaseModel):
 class ReadOnlyToolHandlers:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root.resolve()
+        self.sensitivity = FileSensitivityClassifier(self.project_root)
 
     def list_files(self, args: ListFilesInput) -> dict[str, Any]:
         root = self._resolve_inside_root(args.path)
@@ -56,15 +69,23 @@ class ReadOnlyToolHandlers:
             raise ToolExecutionFailure(f"Path is not a directory: {args.path}")
 
         files: list[str] = []
+        sensitive_hidden_count = 0
         for path in sorted(root.rglob("*")):
             if self._should_skip(path):
                 continue
             if len(path.relative_to(root).parts) > args.max_depth:
                 continue
             if path.is_file():
+                if self.sensitivity.is_sensitive(path):
+                    sensitive_hidden_count += 1
+                    continue
                 files.append(self._relative(path))
 
-        return {"root": self._relative(root), "files": files}
+        return {
+            "root": self._relative(root),
+            "files": files,
+            "sensitive_hidden_count": sensitive_hidden_count,
+        }
 
     def read_file(self, args: ReadFileInput) -> dict[str, Any]:
         path = self._resolve_inside_root(args.path)
@@ -72,6 +93,11 @@ class ReadOnlyToolHandlers:
             raise ToolExecutionFailure(f"File does not exist: {args.path}")
         if not path.is_file():
             raise ToolExecutionFailure(f"Path is not a file: {args.path}")
+        if self.sensitivity.is_sensitive(path):
+            raise ToolExecutionFailure(
+                "Sensitive path cannot be read by read-only tools.",
+                code="sensitive_path_denied",
+            )
 
         raw = path.read_bytes()
         truncated = len(raw) > args.max_bytes
@@ -101,6 +127,8 @@ class ReadOnlyToolHandlers:
                 break
             if not path.is_file() or self._should_skip(path):
                 continue
+            if self.sensitivity.is_sensitive(path):
+                continue
             try:
                 raw = path.read_bytes()
             except OSError:
@@ -115,7 +143,7 @@ class ReadOnlyToolHandlers:
                         {
                             "path": self._relative(path),
                             "line": line_number,
-                            "text": line,
+                            "text": redact_secret_text(line),
                         }
                     )
                     if len(matches) >= args.max_results:
@@ -163,9 +191,18 @@ def register_read_only_tools(registry: Any) -> None:
             input_model=ListFilesInput,
             handler=handlers.list_files,
             permission_level=PermissionLevel.READ_ONLY,
+            capabilities=(Capability.LIST_DIRECTORY,),
+            operation=OperationKind.LIST_DIRECTORY,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("directory", args.get("path") or ".", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.READ_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
             risk_tags=("read", "filesystem"),
             timeout_seconds=5.0,
             max_output_chars=20000,
+            cache_policy=ToolCachePolicy(cacheable=True, max_entries=128),
+            idempotency_policy=ToolIdempotencyPolicy(idempotent=True),
             cacheable=True,
             idempotent=True,
         )
@@ -178,9 +215,18 @@ def register_read_only_tools(registry: Any) -> None:
             input_model=ReadFileInput,
             handler=handlers.read_file,
             permission_level=PermissionLevel.READ_ONLY,
+            capabilities=(Capability.READ_WORKSPACE,),
+            operation=OperationKind.READ_FILE,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("file", args.get("path") or ".", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.READ_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
             risk_tags=("read", "filesystem"),
             timeout_seconds=5.0,
             max_output_chars=20000,
+            cache_policy=ToolCachePolicy(cacheable=True, max_entries=128),
+            idempotency_policy=ToolIdempotencyPolicy(idempotent=True),
             cacheable=True,
             idempotent=True,
         )
@@ -193,9 +239,18 @@ def register_read_only_tools(registry: Any) -> None:
             input_model=SearchTextInput,
             handler=handlers.search_text,
             permission_level=PermissionLevel.READ_ONLY,
+            capabilities=(Capability.READ_WORKSPACE,),
+            operation=OperationKind.SEARCH,
+            resource_resolver=lambda args, _root: [
+                ResourceRef("directory", args.get("path") or ".", workspace_relative=True)
+            ],
+            side_effects=ToolSideEffectKind.READ_WORKSPACE,
+            sensitivity=ToolSensitivityLevel.WORKSPACE,
             risk_tags=("read", "filesystem"),
             timeout_seconds=5.0,
             max_output_chars=20000,
+            cache_policy=ToolCachePolicy(cacheable=True, max_entries=128),
+            idempotency_policy=ToolIdempotencyPolicy(idempotent=True),
             cacheable=True,
             idempotent=True,
         )

@@ -1,4 +1,4 @@
-# Miniharness v0.0.15
+# Miniharness v0.0.16
 
 Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, model runtime, provider adapter, planner, policy runtime, tools, context manager, observability trace runtime, local workspace state runtime, workspace mutation runtime, command runtime, verification runtime, and sandbox runtime connect without using LangChain, LangGraph, or any other agent framework.
 
@@ -24,7 +24,7 @@ v0.0.6 upgrades file modification from demo-style `write_file` into a Workspace 
 
 v0.0.5 added the production Context Manager slice: context assembly is token-budget aware, tool observations are persisted to SQLite with references, long histories can be compressed, and run state can be recovered after interruption.
 
-v0.0.4 added the Tool Runtime minimal production slice: tool calls execute through `ToolSpec`, `ToolRegistry`, `ToolRuntime`, `ToolPolicy`, and structured `ToolResult` / `ToolError` objects.
+v0.0.16 tightens the Tool Runtime into a production-grade slice: tool calls now flow through `ToolSpec`, `ToolRegistry`, `ToolRuntime`, `ToolPolicy`, `ToolResult`, `ToolError`, approval gating, planner authorization, output validation, cache invalidation, replay tracking, and redacted trace records.
 
 ## Project Structure
 
@@ -262,24 +262,17 @@ The context layer now:
 
 ## Tool Runtime
 
-Miniharness v0.0.4 keeps the existing default CLI behavior: tool choice is sent as `auto`, and strict tool schemas are disabled unless a caller explicitly enables them.
+Miniharness v0.0.16 keeps tool execution behind a single runtime boundary, but the contract is now explicit:
 
-The protocol and runtime layer now have:
+- `ToolSpec` carries `name`, `version`, `description`, `input_model`, `output_model`, `handler`, `permission_level`, `risk_tags`, `timeout_seconds`, `max_output_chars`, `cacheable`, `idempotent`, backend hints, and sensitivity metadata.
+- `ToolRegistry` only registers admitted tools, exports strict OpenAI tool schema, and refuses the old bypass-style dispatch path.
+- `ToolRuntime` performs JSON parsing, Pydantic validation, policy evaluation, optional approval gating, planner authorization, per-run replay tracking, bounded cache, backend checks, handler execution, output validation, truncation, and trace/audit emission. It must be constructed with the session `PolicyRuntime`; it no longer creates a fallback policy runtime internally.
+- Default policy stays read-only. Write, shell, git, and other high-risk tools are rejected unless they are registered through the proper mutation/command/verification backends.
+- Sensitive files such as `.env`, `id_rsa`, `*.pem`, `*.key`, and similar names are hidden from directory listing and excluded from directory search results.
+- Legacy `TraceWriter` now redacts payloads before writing JSONL so older runtime paths do not leak raw tool arguments, sensitive path names, or secret-like values.
+- Tool errors are classified as `tool_not_found`, `bad_arguments_json`, `validation_error`, `permission_denied`, `policy_denied`, `approval_required`, `sandbox_required`, `timeout`, `execution_error`, `output_validation_error`, `conflicting_replay`, `replay_not_allowed`, or `internal_error`.
 
-- `ToolChoiceMode.AUTO`: the model may call tools or answer directly.
-- `ToolChoiceMode.REQUIRED`: the model must call at least one tool, for providers that support this mode.
-- `ToolChoiceMode.NONE`: the model must answer without tool calls.
-- `ProviderCapabilities`: a small capability record for OpenAI-compatible providers, including support flags for tools, strict schemas, required tool choice, and parallel tool calls.
-- `ToolRegistry.openai_tools(strict=True)`: emits `strict: true` function schemas and top-level `additionalProperties: false` parameters while still validating tool arguments locally with Pydantic.
-- `ToolSpec`: declares a tool name, version, description, Pydantic input model, handler, permission level, risk tags, timeout, output limit, cacheability, and idempotency.
-- `ToolRegistry`: only registered tools can be exposed or dispatched.
-- `ToolRuntime`: executes model tool calls and returns structured `ToolResult` / `ToolError` payloads.
-- `ToolPolicy.read_only()`: the default policy allows only read-only tools and rejects write, shell, git, and network risk.
-- Runtime errors are classified as `tool_not_found`, `bad_arguments_json`, `validation_error`, `permission_denied`, `policy_denied`, `timeout`, `execution_error`, or `internal_error`.
-- Cache is per run and only applies to `cacheable=true` read-only tools. The cache key includes tool name, version, normalized validated arguments, and workspace root.
-- When a planner is attached, `ToolRuntime` returns `action_not_allowed`, `risk_escalated`, or `needs_review` before executing a handler that violates the current planner phase.
-- Write tools must declare `uses_mutation_runtime=true`; otherwise `ToolRuntime` rejects them with `invalid_operation` before the handler can touch the filesystem.
-- Shell tools must declare `uses_command_runtime=true`; otherwise `ToolRuntime` rejects them with `invalid_operation` before the handler can spawn a process.
+Tool runtime cache is per run and only applies to `cacheable=true`, read-only, idempotent tools with non-sensitive results. Cache keys include tool name, version, schema fingerprint, normalized arguments, workspace root, and path snapshots or directory fingerprints so file changes invalidate stale entries. Duplicate `tool_call_id` values are checked before cache lookup for every tool, so same-id/different-argument calls are rejected with `conflicting_replay` even for cacheable tools.
 
 ## Planner / Task Execution Runtime
 

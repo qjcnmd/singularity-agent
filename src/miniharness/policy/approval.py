@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from miniharness.observability.models import TraceEventType, TraceSeverity
+from miniharness.policy.audit import redact_resource_identifier
 from miniharness.policy.config import ApprovalMode, PolicyConfig
 from miniharness.policy.exceptions import (
     ApprovalDenied,
@@ -134,7 +135,7 @@ class ApprovalGate:
                 "request_id": request.request_id,
                 "decision_id": decision.decision_id,
                 "operation": request.operation.value,
-                "resource": request.resource.identifier,
+                "resource": redact_resource_identifier(request.resource.identifier),
                 "outcome": decision.outcome.value,
                 "approval_grant_id": approval_grant_id,
             },
