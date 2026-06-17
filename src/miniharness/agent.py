@@ -5,6 +5,7 @@ from typing import Any
 from rich.console import Console
 
 from miniharness.context import ContextManager
+from miniharness.instructions import InstructionRuntime
 from miniharness.model import ModelPurpose, ModelRuntime, ModelTurnStatus
 from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.planner import PlannerRuntime, TaskStatus
@@ -86,6 +87,10 @@ class MiniAgent:
             trace=self.trace,
         )
         self.model_runtime = model_runtime
+        instruction_runtime = InstructionRuntime(
+            workspace_root=self.tools.project_root,
+            trace=self.trace,
+        )
         tool_schemas = self.tools.openai_tools()
         runtime = ToolRuntime(
             registry=self.tools,
@@ -114,7 +119,10 @@ class MiniAgent:
                 purpose=ModelPurpose.PLAN_NEXT_ACTION,
                 allowed_tool_names=allowed_tool_names,
                 planner_context=planner.planner_context_message(),
+                instruction_runtime=instruction_runtime,
+                user_task=user_goal,
             )
+            planner.record_instruction_prompt_observation(instruction_runtime.summary())
             result = model_runtime.run_turn(request)
             if result.status != ModelTurnStatus.SUCCESS:
                 self._record_model_failure(planner, result, turn=turn)

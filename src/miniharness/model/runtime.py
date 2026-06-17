@@ -19,6 +19,7 @@ from miniharness.model.models import (
     ModelError,
     ModelErrorKind,
     ModelMessage,
+    ModelPreferences,
     ModelPurpose,
     ModelRole,
     ModelToolCall,
@@ -128,12 +129,73 @@ class ModelRuntime:
         allowed_tool_names: list[str] | None = None,
         planner_context: dict[str, Any] | None = None,
         tool_choice: ToolChoicePolicy | None = None,
+        instruction_runtime: Any | None = None,
+        user_task: str | None = None,
+        user_session_instructions: list[str] | None = None,
+        runtime_observations: list[dict[str, Any]] | None = None,
+        retrieved_content: list[dict[str, Any]] | None = None,
+        supports_developer_message: bool | None = None,
     ) -> ModelTurnRequest:
         tools = self.tool_renderer.render(allowed_tool_names=allowed_tool_names)
         provider_tools = self.tool_renderer.to_provider_tools(tools)
-        messages = context.messages(
-            tools=provider_tools,
-            planner_context=planner_context,
+        prompt_bundle = None
+        if instruction_runtime is not None:
+            selected_provider = self.registry.select_provider(
+                ModelPreferences(),
+                purpose=purpose,
+            )
+            provider_supports_developer = selected_provider.capabilities().supports_developer_message
+            if supports_developer_message is not None:
+                provider_supports_developer = supports_developer_message
+            observations = list(runtime_observations or [])
+            if planner_context is not None:
+                observations.append(
+                    {
+                        "source_type": "runtime_observation",
+                        "origin": "planner_context",
+                        "content": planner_context.get("content") if isinstance(planner_context, dict) else planner_context,
+                    }
+                )
+            if hasattr(context, "instruction_sources"):
+                observations.extend(context.instruction_sources())
+            prompt_bundle = instruction_runtime.build_for_model_turn(
+                user_task=user_task or getattr(context, "user_goal", ""),
+                purpose=purpose,
+                user_session_instructions=user_session_instructions,
+                runtime_observations=observations,
+                retrieved_content=retrieved_content,
+                tool_protocol_summary=self._tool_protocol_summary(tools),
+                supports_developer_message=provider_supports_developer,
+                ids={
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "phase_id": phase_id,
+                    "action_id": action_id,
+                },
+            )
+            history_messages = context.messages(
+                tools=provider_tools,
+                planner_context=None,
+            )[2:]
+            messages = [*prompt_bundle.messages, *history_messages]
+            for message in messages:
+                if isinstance(message, ModelMessage):
+                    message.metadata.setdefault("prompt_manifest_id", prompt_bundle.manifest.manifest_id)
+                    message.metadata.setdefault("prompt_hash", prompt_bundle.prompt_hash)
+        else:
+            messages = context.messages(
+                tools=provider_tools,
+                planner_context=planner_context,
+            )
+        prompt_metadata = (
+            {
+                "prompt_manifest_id": prompt_bundle.manifest.manifest_id,
+                "prompt_hash": prompt_bundle.prompt_hash,
+                "token_estimate": prompt_bundle.token_estimate,
+            }
+            if prompt_bundle is not None
+            else {}
         )
         return ModelTurnRequest(
             request_id=f"model_req_{uuid4().hex[:12]}",
@@ -163,8 +225,10 @@ class ModelRuntime:
                     context.last_budget.__dict__.copy()
                     if getattr(context, "last_budget", None) is not None
                     else {}
-                )
+                ),
+                **prompt_metadata,
             },
+            trace_metadata=prompt_metadata,
         )
 
     def run_turn(self, request: ModelTurnRequest) -> ModelTurnResult:
@@ -439,6 +503,19 @@ class ModelRuntime:
         if request.tools:
             return [tool.name for tool in request.tools]
         return [spec.name for spec in self.tool_registry.list()]
+
+    @staticmethod
+    def _tool_protocol_summary(tools: list[ModelToolSchema]) -> str:
+        names = ", ".join(tool.name for tool in tools) if tools else "none"
+        return "\n".join(
+            [
+                "Tool protocol summary:",
+                "Only registered tools exposed in this request may be called.",
+                "Tool calls must use complete JSON arguments.",
+                "The model must not claim tool execution unless ToolRuntime returns a result.",
+                f"Exposed tools: {names}.",
+            ]
+        )
 
     def _context_export_error(self, request: ModelTurnRequest) -> str | None:
         if not self.config.allow_remote_provider:
