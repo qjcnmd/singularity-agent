@@ -17,7 +17,7 @@ ToolRuntime / MutationRuntime / CommandRuntime / VerificationRuntime
   -> FinalReport Policy & Approval Summary
 ```
 
-Git policy, remote approval, persistent approval profiles, and a real container sandbox backend are intentionally not implemented in this slice.
+Git policy, remote approval, persistent approval profiles, and container sandbox backends are intentionally not implemented in this slice. Miniharness v0.0.12 adds a local staging sandbox backend, but it is not a Docker/Podman/WSL or kernel-level security boundary.
 
 ## Core Objects
 
@@ -99,7 +99,7 @@ encoded shell commands
 critical destructive commands
 ```
 
-`SANDBOX_REQUIRED` is returned for generated-code execution or future high-uncertainty scripts that require isolation. Miniharness does not pretend local process execution is a sandbox.
+`SANDBOX_REQUIRED` is returned for generated-code execution and verification command execution. `CommandRuntime` maps that decision into `SandboxRuntime` and must not fall back to normal local process execution. The current backend is `LocalStagingBackend`, which provides copy-on-write workspace staging, env filtering, timeout/output limits, artifact capture, change detection, and trace. It fails closed for hard network isolation or unsupported memory/process limits.
 
 ## Runtime Integration
 
@@ -109,7 +109,7 @@ critical destructive commands
 
 `CommandRuntime` constructs a request before process spawn or long-running process start. Metadata includes command preview, cwd, env policy, network policy, filesystem mode, timeout, long-running flag, and risk acceptance reason. Non-allow decisions become `CommandResult` / `ProcessSession` policy-blocked results.
 
-`VerificationRuntime` constructs a verification-scoped request before each executable check, then still calls `CommandRuntime.run(...)`. This keeps both verification policy and command policy in the execution path.
+`VerificationRuntime` constructs a verification-scoped request before each executable check, then still calls `CommandRuntime.run(...)`. This keeps both verification policy and command policy in the execution path. When policy requires sandboxing, the actual process is executed by `SandboxRuntime`, not by the bare local process backend.
 
 `PlannerRuntime` records compact policy observations into `EvidenceLedger.policy_observations`. The context renderer exposes summaries such as:
 
@@ -117,7 +117,7 @@ critical destructive commands
 [policy] Command denied: package install requires review but session is non-interactive.
 ```
 
-`FinalReport` includes `policy_approval_summary` with allowed low-risk action count, reviewed action count, denied action count, sandbox-required count, user-approved actions, high-risk commands, and skipped actions due to policy.
+`FinalReport` includes `policy_approval_summary` with allowed low-risk action count, reviewed action count, denied action count, sandbox-required count, user-approved actions, high-risk commands, and skipped actions due to policy. It also includes `sandbox_isolation_summary` from sandbox execution evidence.
 
 ## Failure Handling
 
@@ -144,7 +144,7 @@ project policy file
 user policy file
 session policy
 persistent approval profile
-real sandbox backend
+container or VM sandbox backend
 remote approval workflow
 GitRuntime-specific policy
 ```

@@ -10,8 +10,9 @@ ToolRuntime
   -> CommandRuntime
   -> CommandPlan
   -> CommandPolicy
+  -> PolicyRuntime sandbox check
   -> EnvPolicy + ResourceLimits + OutputCollector
-  -> ExecutionBackend
+  -> ExecutionBackend or SandboxRuntime
   -> ProcessSupervisor
   -> workspace side-effect tracking
   -> trace + context observation
@@ -34,6 +35,8 @@ Most read-only tools have a bounded input/output shape. Shell does not. Even a s
 `MutationRuntime` owns model-authored file edits. Command-generated changes are tracked as command side effects and are not mixed with model apply operations or mutation journals.
 
 `VerificationRuntime` decides what checks to run, while CommandRuntime runs the approved command and returns `CommandResult` with semantic statuses such as `tests_failed`, `build_failed`, `lint_failed`, and `typecheck_failed`. Direct `run_command` tool calls reject verification-like commands with `verification_runtime_required`; this keeps tests, lint, typecheck, builds, and syntax checks on the verification planning path instead of ad-hoc shell execution.
+
+When `PolicyRuntime` returns `sandbox_required`, CommandRuntime calls `SandboxRuntime` and does not spawn the command through `LocalProcessBackend`.
 
 `GitRuntime` is not implemented yet. Read-only git commands can run through CommandRuntime. Git mutations such as `add`, `commit`, `reset`, `clean`, `push`, `pull`, and `rebase` require review or should move to a dedicated GitRuntime later.
 
@@ -153,13 +156,15 @@ home_access_blocked=false
 
 This is intentional. Unsupported isolation is explicit in `isolation_report` instead of being implied.
 
+Commands that require sandboxing use `LocalStagingBackend` instead. That backend copies the workspace into `work/sandboxes/<sandbox_id>/workspace`, filters env, runs there, captures artifacts and changes, then cleans up. Sandbox file changes are reported as sandbox evidence only and are not written back to the real workspace.
+
 ## Execution Backends
 
 `ExecutionBackend` is the abstraction boundary.
 
 `LocalProcessBackend` is implemented. It applies policy before spawn, receives a resolved workspace cwd, receives a reduced env, streams stdout/stderr into `OutputCollector`, and uses `ProcessSupervisor` for timeout and cleanup.
 
-`SandboxBackend` is an explicit placeholder. It returns `sandbox_unavailable` until a real backend is added.
+`LocalStagingBackend` is implemented through `SandboxRuntime`. It provides practical local copy-on-write isolation, not a hard OS security boundary. It reports `network_isolation=false`, `memory_limit=false`, and `process_limit=false`, and fails closed when policy requires those unsupported capabilities.
 
 Future backends can implement the same interface:
 

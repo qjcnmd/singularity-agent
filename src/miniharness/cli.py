@@ -10,6 +10,7 @@ from rich.panel import Panel
 from miniharness.agent import MiniAgent
 from miniharness.command import CommandRuntime
 from miniharness.config import Settings
+from miniharness.observability import TraceRuntime, TraceStore
 from miniharness.planner import PlannerRuntime
 from miniharness.provider import OpenAICompatibleProvider
 from miniharness.tools import ToolRegistry
@@ -17,7 +18,6 @@ from miniharness.tools.command import register_command_tools
 from miniharness.tools.mutation import register_mutation_tools
 from miniharness.tools.verification import register_verification_tools
 from miniharness.tools.workspace_state import register_workspace_state_tools
-from miniharness.trace import TraceWriter
 from miniharness.verification import VerificationRuntime
 from miniharness.workspace import MutationRuntime
 from miniharness.workspace_state import (
@@ -28,6 +28,8 @@ from miniharness.workspace_state import (
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
+app.add_typer(trace_app, name="trace")
 console = Console()
 
 
@@ -55,7 +57,7 @@ def main(
     """Run the minimal read-only agent loop."""
 
     project_root = Path.cwd()
-    trace = TraceWriter.create(project_root)
+    trace = TraceRuntime.create(project_root)
     trace.record(
         "user_goal",
         {
@@ -67,7 +69,7 @@ def main(
     )
 
     console.print(f"[bold]run_id[/bold] {trace.run_id}")
-    console.print(f"[bold]trace[/bold] {trace.path}")
+    console.print(f"[bold]trace[/bold] {trace.store.run_dir}")
 
     state_runtime = LocalWorkspaceStateRuntime(project_root, trace=trace)
     recovery = state_runtime.recover_session(resume_session)
@@ -174,7 +176,7 @@ def create_or_resume_planner(
     session_id: str | None,
     task_id: str,
     user_goal: str,
-    trace: TraceWriter | None,
+    trace: TraceRuntime | None,
     workspace_health: WorkspaceHealthReport,
 ) -> PlannerRuntime:
     planner = PlannerRuntime(
@@ -202,6 +204,70 @@ def _workspace_health_panel(health: WorkspaceHealthReport) -> Panel:
 
 def _format_list(values: list[str]) -> str:
     return ", ".join(values) if values else "-"
+
+
+@trace_app.command("list")
+def trace_list() -> None:
+    """List local structured trace runs."""
+
+    traces_root = Path.cwd() / "work" / "traces" / "runs"
+    if not traces_root.exists():
+        console.print("No trace runs found.")
+        return
+    for run_dir in sorted(path for path in traces_root.iterdir() if path.is_dir()):
+        console.print(run_dir.name)
+
+
+@trace_app.command("show")
+def trace_show(run_id: str) -> None:
+    """Show a trace run summary."""
+
+    store = TraceStore(Path.cwd(), run_id=run_id)
+    summary = store.summarize(run_id=run_id).to_dict()
+    console.print(json_dumps(summary))
+
+
+@trace_app.command("timeline")
+def trace_timeline(run_id: str) -> None:
+    """Show a trace run timeline."""
+
+    store = TraceStore(Path.cwd(), run_id=run_id)
+    for item in store.get_timeline(run_id=run_id):
+        console.print(
+            f"{item.timestamp.isoformat()} {item.event_type} "
+            f"[{item.runtime}] {item.summary}"
+        )
+
+
+@trace_app.command("errors")
+def trace_errors(run_id: str) -> None:
+    """Show warning/error/critical events for a trace run."""
+
+    store = TraceStore(Path.cwd(), run_id=run_id)
+    for event in store.query_events(run_id=run_id):
+        if event.severity.value in {"warning", "error", "critical"}:
+            console.print(
+                f"{event.timestamp.isoformat()} {event.event_type.value} "
+                f"[{event.severity.value}] {event.summary}"
+            )
+
+
+@trace_app.command("artifacts")
+def trace_artifacts(run_id: str) -> None:
+    """List artifacts for a trace run."""
+
+    store = TraceStore(Path.cwd(), run_id=run_id)
+    for artifact in store.artifacts():
+        console.print(
+            f"{artifact.artifact_id} {artifact.kind.value} "
+            f"{artifact.size_bytes} bytes {artifact.relative_path}"
+        )
+
+
+def json_dumps(payload: object) -> str:
+    import json
+
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
 
 
 if __name__ == "__main__":

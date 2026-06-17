@@ -334,6 +334,7 @@ class EvidenceLedger:
     risks: list[dict[str, Any]] = field(default_factory=list)
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     policy_observations: list[dict[str, Any]] = field(default_factory=list)
+    sandbox_observations: list[dict[str, Any]] = field(default_factory=list)
 
     def add_unique_file(self, path: str) -> None:
         if path and path not in self.inspected_files:
@@ -355,6 +356,7 @@ class EvidenceLedger:
             "risks": self.risks,
             "tool_results": self.tool_results,
             "policy_observations": self.policy_observations,
+            "sandbox_observations": self.sandbox_observations,
         }
 
     @classmethod
@@ -374,6 +376,7 @@ class EvidenceLedger:
             risks=list(payload.get("risks") or []),
             tool_results=list(payload.get("tool_results") or []),
             policy_observations=list(payload.get("policy_observations") or []),
+            sandbox_observations=list(payload.get("sandbox_observations") or []),
         )
 
 
@@ -465,6 +468,8 @@ class FinalReport:
     policy_approval_summary: dict[str, Any]
     artifacts: list[str]
     next_steps: list[str]
+    sandbox_isolation_summary: dict[str, Any] = field(default_factory=dict)
+    execution_trace_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -478,6 +483,8 @@ class FinalReport:
             "risks": self.risks,
             "rollback_status": self.rollback_status,
             "policy_approval_summary": self.policy_approval_summary,
+            "sandbox_isolation_summary": self.sandbox_isolation_summary,
+            "execution_trace_summary": self.execution_trace_summary,
             "artifacts": self.artifacts,
             "next_steps": self.next_steps,
         }
@@ -495,6 +502,8 @@ class FinalReport:
             risks=list(payload.get("risks") or []),
             rollback_status=dict(payload.get("rollback_status") or {}),
             policy_approval_summary=dict(payload.get("policy_approval_summary") or {}),
+            sandbox_isolation_summary=dict(payload.get("sandbox_isolation_summary") or {}),
+            execution_trace_summary=dict(payload.get("execution_trace_summary") or {}),
             artifacts=list(payload.get("artifacts") or []),
             next_steps=list(payload.get("next_steps") or []),
         )

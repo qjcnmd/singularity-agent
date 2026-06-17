@@ -279,6 +279,7 @@ class PlannerRuntime:
             BudgetController(self.budget).record_command()
             command = {**command, "tool_call_id": tool_call_id}
             self.evidence.command_results.append(command)
+            self._record_sandbox_from_command(command, source="command")
             self._append_unique(self._state().linked_commands, command_id)
             for failure in command.get("parsed_failures") or []:
                 self.evidence.parsed_failures.append(failure)
@@ -302,6 +303,7 @@ class PlannerRuntime:
             return
         verification = {**verification, "tool_call_id": tool_call_id}
         self.evidence.verification_results.append(verification)
+        self._record_sandbox_from_verification(verification)
         for status in verification.get("check_status") or []:
             self._append_unique(self._state().linked_verifications, status.get("check_id"))
             if status.get("status") in {"failed", "blocked", "timeout", "flaky"}:
@@ -318,6 +320,78 @@ class PlannerRuntime:
             self._state().current_phase = "repairing_failures"
             self._plan().current_phase = "repairing_failures"
         self._persist()
+
+    def _record_sandbox_from_command(self, command: dict[str, Any], *, source: str) -> None:
+        sandbox = ((command.get("isolation_report") or {}).get("sandbox") or {})
+        if not isinstance(sandbox, dict) or not sandbox.get("sandbox_id"):
+            return
+        payload = {
+            "source": source,
+            "command_id": command.get("command_id"),
+            "sandbox_id": sandbox.get("sandbox_id"),
+            "backend": sandbox.get("backend"),
+            "status": sandbox.get("status"),
+            "trace_id": sandbox.get("trace_id"),
+            "artifact_count": sandbox.get("artifact_count", 0),
+            "artifacts": sandbox.get("artifacts") or [],
+            "changed_files_count": sandbox.get("changed_files_count", 0),
+            "changed_files": sandbox.get("changed_files") or {},
+            "violations": sandbox.get("violations") or [],
+            "imported_changes_count": sandbox.get("imported_changes_count", 0),
+            "summary": self._sandbox_summary(command, sandbox),
+        }
+        if payload not in self.evidence.sandbox_observations:
+            self.evidence.sandbox_observations.append(payload)
+
+    def _record_sandbox_from_verification(self, verification: dict[str, Any]) -> None:
+        for result in verification.get("results") or []:
+            evidence = result.get("evidence") or {}
+            sandbox_id = evidence.get("sandbox_id")
+            if not sandbox_id:
+                continue
+            payload = {
+                "source": "verification",
+                "check_id": result.get("check_id"),
+                "kind": result.get("kind"),
+                "command_id": evidence.get("command_id"),
+                "sandbox_id": sandbox_id,
+                "backend": evidence.get("sandbox_backend"),
+                "status": evidence.get("sandbox_status"),
+                "artifact_count": len(evidence.get("sandbox_artifacts") or []),
+                "artifacts": evidence.get("sandbox_artifacts") or [],
+                "changed_files_count": (evidence.get("sandbox_changed_files") or {}).get("total_changed_files", 0),
+                "changed_files": evidence.get("sandbox_changed_files") or {},
+                "violations": evidence.get("sandbox_violations") or [],
+                "imported_changes_count": 0,
+                "summary": self._sandbox_summary(
+                    {
+                        "exit_code": evidence.get("exit_code"),
+                        "command_id": evidence.get("command_id"),
+                    },
+                    {
+                        "sandbox_id": sandbox_id,
+                        "backend": evidence.get("sandbox_backend"),
+                        "status": evidence.get("sandbox_status"),
+                    },
+                    prefix=f"{result.get('kind') or 'verification'} ran",
+                ),
+            }
+            if payload not in self.evidence.sandbox_observations:
+                self.evidence.sandbox_observations.append(payload)
+
+    @staticmethod
+    def _sandbox_summary(
+        command: dict[str, Any],
+        sandbox: dict[str, Any],
+        *,
+        prefix: str = "command ran",
+    ) -> str:
+        status = sandbox.get("status")
+        backend = sandbox.get("backend")
+        exit_code = command.get("exit_code")
+        if status == "backend_unavailable":
+            return "[sandbox] command blocked: backend cannot enforce required isolation."
+        return f"[sandbox] {prefix} in isolated copy-on-write workspace via {backend}, exit_code={exit_code}."
 
     def record_policy_observation(self, observation: dict[str, Any]) -> None:
         state = self._state()
@@ -417,7 +491,16 @@ class PlannerRuntime:
         return assessment
 
     def finalize(self) -> FinalReport:
-        report = self.finalizer.build(state=self._state(), evidence=self.evidence)
+        trace_summary = (
+            self.trace.final_report_summary(task_id=self.task_id)
+            if self.trace is not None and hasattr(self.trace, "final_report_summary")
+            else None
+        )
+        report = self.finalizer.build(
+            state=self._state(),
+            evidence=self.evidence,
+            trace_summary=trace_summary,
+        )
         self.final_report = report
         if report.status == TaskStatus.COMPLETED:
             self._state().status = TaskStatus.COMPLETED

@@ -160,7 +160,29 @@ class DefaultLocalPolicyRules:
                 DecisionOutcome.SANDBOX_REQUIRED,
                 "Generated code execution requires a sandbox backend.",
                 "sandbox_generated_code",
-                constraints=PolicyConstraints(sandbox_required=True),
+                constraints=PolicyConstraints(
+                    sandbox_required=True,
+                    filesystem_mode="copy_on_write_workspace",
+                    network_allowed=False,
+                    max_duration_seconds=request.metadata.get("timeout"),
+                    max_output_chars=request.metadata.get("max_output_chars"),
+                    env_redaction=True,
+                ),
+            )
+
+        if operation == OperationKind.VERIFICATION:
+            return RuleResult(
+                DecisionOutcome.SANDBOX_REQUIRED,
+                "Verification command execution requires an isolated sandbox.",
+                "sandbox_verification",
+                constraints=PolicyConstraints(
+                    sandbox_required=True,
+                    filesystem_mode="copy_on_write_workspace",
+                    network_allowed=False,
+                    max_duration_seconds=request.metadata.get("timeout"),
+                    max_output_chars=request.metadata.get("max_output_chars"),
+                    env_redaction=True,
+                ),
             )
 
         if config.approval_mode == ApprovalMode.AUTO_SAFE and _auto_safe_runtime_allow(request, risk):

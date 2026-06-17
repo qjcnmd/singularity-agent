@@ -30,6 +30,7 @@ from miniharness.policy import (
     RuntimeName,
 )
 from miniharness.policy.audit import redact
+from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.trace import TraceWriter
 from miniharness.verification.assessor import CompletionAssessor
 from miniharness.verification.discovery import ProjectDetector
@@ -359,10 +360,28 @@ class VerificationRuntime:
     def _run_check(self, plan: VerificationPlan, check: VerificationCheck) -> VerificationResult:
         if check.command is None:
             return self._blocked_result(check)
+        self._emit_observability(
+            TraceEventType.VERIFICATION_CHECK_STARTED,
+            plan=plan,
+            check=check,
+            summary=f"Verification check started: {check.kind.value}.",
+            payload={
+                "verification_plan_id": plan.id,
+                "verification_check_id": check.id,
+                "check_kind": check.kind.value,
+                "command": check.command.display_command(),
+                "transaction_id": plan.transaction_id,
+                "changeset_id": plan.changeset_id,
+            },
+        )
         policy_request = self._policy_request(plan, check)
         policy_decision = self.policy_runtime.enforce(policy_request)
         self._record_policy_trace(policy_request, policy_decision)
-        if policy_decision.outcome != DecisionOutcome.ALLOW:
+        sandbox_required = (
+            policy_decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
+            or policy_decision.constraints.sandbox_required
+        )
+        if policy_decision.outcome != DecisionOutcome.ALLOW and not sandbox_required:
             self._record_policy_observation(policy_request, policy_decision)
             return self._policy_blocked_result(check, policy_decision)
         command_result = self.command_runtime.run(
@@ -568,6 +587,12 @@ class VerificationRuntime:
             parsed_failures=parsed,
             duration_ms=command_result.duration_ms,
             timestamp=_now(),
+            sandbox_id=command_result.metadata.get("sandbox_id"),
+            sandbox_backend=command_result.metadata.get("sandbox_backend"),
+            sandbox_status=command_result.metadata.get("sandbox_status"),
+            sandbox_artifacts=list(command_result.metadata.get("sandbox_artifacts") or []),
+            sandbox_changed_files=dict(command_result.metadata.get("sandbox_changed_files") or {}),
+            sandbox_violations=list(command_result.metadata.get("sandbox_violations") or []),
         )
         repair_hints = (
             []
@@ -603,6 +628,8 @@ class VerificationRuntime:
             FailureType.CHECK_POLICY_DENIED,
             FailureType.MISSING_COMMAND,
             FailureType.ENVIRONMENT_ERROR,
+            FailureType.SANDBOX_LIMITATION,
+            FailureType.SANDBOX_VIOLATION,
         }:
             return CheckStatus.BLOCKED
         return CheckStatus.FAILED
@@ -741,6 +768,34 @@ class VerificationRuntime:
         check: VerificationCheck,
         result: VerificationResult,
     ) -> None:
+        self._emit_observability(
+            TraceEventType.VERIFICATION_EVIDENCE_RECORDED,
+            plan=plan,
+            check=check,
+            result=result,
+            summary=f"Verification evidence recorded for {check.kind.value}.",
+            payload={
+                "verification_plan_id": plan.id,
+                "verification_check_id": check.id,
+                "command_id": result.evidence.command_id,
+                "artifact_path": result.evidence.artifact_path,
+                "status": result.status.value,
+                "failure_type": result.failure_type.value if result.failure_type else None,
+            },
+            severity=TraceSeverity.WARNING
+            if result.status.value in {"failed", "blocked", "timeout", "flaky"}
+            else TraceSeverity.INFO,
+        )
+        for hint in result.repair_hints:
+            self._emit_observability(
+                TraceEventType.REPAIR_HINT_CREATED,
+                plan=plan,
+                check=check,
+                result=result,
+                summary=hint.message,
+                payload=hint.to_dict(),
+                severity=TraceSeverity.WARNING,
+            )
         self._record_trace(
             "result",
             {
@@ -774,6 +829,40 @@ class VerificationRuntime:
         payload["phase"] = phase
         self.trace.record("verification", payload)
 
+    def _emit_observability(
+        self,
+        event_type: TraceEventType,
+        *,
+        plan: VerificationPlan,
+        check: VerificationCheck,
+        summary: str,
+        payload: dict[str, Any],
+        result: VerificationResult | None = None,
+        severity: TraceSeverity = TraceSeverity.INFO,
+    ) -> None:
+        if self.trace is None or not hasattr(self.trace, "emit"):
+            return
+        self.trace.emit(
+            event_type,
+            runtime="verification",
+            summary=summary,
+            payload=payload,
+            ids={
+                "session_id": getattr(self.planner, "session_id", None),
+                "task_id": getattr(self.planner, "task_id", None),
+                "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+                "action_id": check.id,
+                "verification_id": check.id,
+                "command_id": result.evidence.command_id if result else None,
+                "transaction_id": plan.transaction_id,
+                "sandbox_id": result.evidence.sandbox_id if result else None,
+            },
+            severity=severity,
+            artifact_refs=[result.evidence.artifact_path]
+            if result and result.evidence.artifact_path
+            else [],
+        )
+
     @staticmethod
     def _observation(
         plan: VerificationPlan,
@@ -799,6 +888,7 @@ class VerificationRuntime:
                     for result in results
                 ],
                 "failed_checks": [result.to_dict() for result in failed],
+                "results": [result.to_dict() for result in results],
                 "repair_hints": [
                     hint.to_dict()
                     for result in failed

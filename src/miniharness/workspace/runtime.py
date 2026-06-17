@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from miniharness.trace import TraceWriter
+from miniharness.observability.models import TraceEventType
 from miniharness.policy import (
     Capability,
     DecisionOutcome,
@@ -290,6 +291,19 @@ class MutationRuntime:
             self._record_failure_trace(result, tool_call_id=tool_call_id, started=started)
             return result
 
+        self._emit_observability(
+            TraceEventType.MUTATION_PROPOSED,
+            summary=f"Mutation proposed for {len(changeset.affected_files)} file(s).",
+            payload={
+                "changeset_id": changeset.id,
+                "intent": changeset.intent,
+                "affected_files": changeset.affected_files,
+                "risk_level": changeset.risk_level,
+                "diff_summary": [diff.summary() for diff in changeset.diffs],
+            },
+            transaction_id=None,
+            action_id=tool_call_id,
+        )
         policy_result = self._policy_result(changeset)
         if policy_result is not None:
             self._record_failure_trace(policy_result, tool_call_id=tool_call_id, started=started)
@@ -395,6 +409,17 @@ class MutationRuntime:
         self._journals[transaction_id] = journal
         git_before = collect_git_state(self.workspace_root)
         applied: list[JournalEntry] = []
+        self._emit_observability(
+            TraceEventType.MUTATION_TRANSACTION_STARTED,
+            summary=f"Mutation transaction started for {len(changeset.affected_files)} file(s).",
+            payload={
+                "changeset_id": changeset.id,
+                "affected_files": changeset.affected_files,
+                "risk_level": changeset.risk_level,
+            },
+            transaction_id=transaction_id,
+            action_id=tool_call_id,
+        )
 
         try:
             changeset.validate()
@@ -979,6 +1004,31 @@ class MutationRuntime:
                 "duration_ms": duration_ms,
                 "artifact_path": diff.artifact_path if diff else None,
                 "verification_status": "not_run",
+            },
+        )
+
+    def _emit_observability(
+        self,
+        event_type: TraceEventType,
+        *,
+        summary: str,
+        payload: dict[str, Any],
+        transaction_id: str | None,
+        action_id: str | None = None,
+    ) -> None:
+        if self.trace is None or not hasattr(self.trace, "emit"):
+            return
+        self.trace.emit(
+            event_type,
+            runtime="mutation",
+            summary=summary,
+            payload=payload,
+            ids={
+                "session_id": getattr(self.planner, "session_id", None),
+                "task_id": getattr(self.planner, "task_id", None),
+                "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+                "action_id": action_id,
+                "transaction_id": transaction_id,
             },
         )
 

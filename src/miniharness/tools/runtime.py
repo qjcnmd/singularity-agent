@@ -20,6 +20,7 @@ from miniharness.tools.models import (
 from miniharness.tools.policy import ToolPolicy
 from miniharness.tools.registry import ToolRegistry
 from miniharness.trace import TraceWriter
+from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.policy import (
     Capability,
     DecisionOutcome,
@@ -81,6 +82,13 @@ class ToolRuntime:
             try:
                 arguments = self._parse_arguments(raw_arguments)
             except json.JSONDecodeError as exc:
+                self._emit_trace(
+                    TraceEventType.TOOL_VALIDATION_FAILED,
+                    summary=f"Tool {tool_name} arguments were invalid JSON.",
+                    payload={"tool_name": tool_name, "tool_call_id": tool_call_id},
+                    ids={"action_id": tool_call_id},
+                    severity=TraceSeverity.ERROR,
+                )
                 result = ToolResult.failure(
                     code="bad_arguments_json",
                     message=f"Invalid JSON arguments: {exc}",
@@ -88,9 +96,30 @@ class ToolRuntime:
                 output_digest = self._result_digest(result)
                 return result
 
+            self._emit_trace(
+                TraceEventType.TOOL_VALIDATION_STARTED,
+                summary=f"Validating tool {tool_name}.",
+                payload={
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "arguments": self._argument_trace_summary(arguments),
+                },
+                ids={"action_id": tool_call_id},
+            )
             try:
                 validated = spec.input_model.model_validate(arguments)
             except ValidationError as exc:
+                self._emit_trace(
+                    TraceEventType.TOOL_VALIDATION_FAILED,
+                    summary=f"Tool {tool_name} arguments failed validation.",
+                    payload={
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "errors": exc.errors(),
+                    },
+                    ids={"action_id": tool_call_id},
+                    severity=TraceSeverity.ERROR,
+                )
                 result = ToolResult.failure(
                     code="validation_error",
                     message="Tool arguments failed validation.",
@@ -113,6 +142,13 @@ class ToolRuntime:
                 spec.permission_level == PermissionLevel.WRITE
                 and not spec.uses_mutation_runtime
             ):
+                self._emit_trace(
+                    TraceEventType.TOOL_DISPATCH_FAILED,
+                    summary=f"Tool {tool_name} failed runtime boundary validation.",
+                    payload={"tool_name": tool_name, "reason": "write_without_mutation_runtime"},
+                    ids={"action_id": tool_call_id},
+                    severity=TraceSeverity.ERROR,
+                )
                 result = ToolResult.failure(
                     code="invalid_operation",
                     message=(
@@ -126,6 +162,13 @@ class ToolRuntime:
                 spec.permission_level == PermissionLevel.SHELL
                 and not spec.uses_command_runtime
             ):
+                self._emit_trace(
+                    TraceEventType.TOOL_DISPATCH_FAILED,
+                    summary=f"Tool {tool_name} failed runtime boundary validation.",
+                    payload={"tool_name": tool_name, "reason": "shell_without_command_runtime"},
+                    ids={"action_id": tool_call_id},
+                    severity=TraceSeverity.ERROR,
+                )
                 result = ToolResult.failure(
                     code="invalid_operation",
                     message="Shell tools must execute through CommandRuntime.",
@@ -152,6 +195,17 @@ class ToolRuntime:
                 validated_args=validated_args,
             )
             if planner_decision is not None and not planner_decision.allowed:
+                self._emit_trace(
+                    TraceEventType.TOOL_DISPATCH_FAILED,
+                    summary=f"Tool {tool_name} was denied by planner.",
+                    payload={
+                        "tool_name": tool_name,
+                        "planner_reason": planner_decision.reason,
+                        "risk_decision": planner_decision.risk_decision.value,
+                    },
+                    ids={"action_id": tool_call_id},
+                    severity=TraceSeverity.WARNING,
+                )
                 result = ToolResult.failure(
                     code=planner_decision.error_code or "action_not_allowed",
                     message="Planner denied tool execution.",
@@ -173,6 +227,18 @@ class ToolRuntime:
                 output_digest = result.metadata.get("output_digest")
                 return result
 
+            self._emit_trace(
+                TraceEventType.TOOL_DISPATCH_STARTED,
+                summary=f"Dispatching tool {tool_name}.",
+                payload={
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "permission_level": spec.permission_level.value,
+                    "risk_tags": list(spec.risk_tags),
+                    "arguments": self._argument_trace_summary(validated_args),
+                },
+                ids={"action_id": planner_action_id or tool_call_id},
+            )
             result, output_digest = self._execute_handler(spec, validated)
             self._update_planner(
                 tool_call_id=tool_call_id,
@@ -262,6 +328,12 @@ class ToolRuntime:
         decision = self.policy_runtime.enforce(request)
         self._record_policy_trace(request, decision)
         if decision.outcome == DecisionOutcome.ALLOW:
+            return None
+        if (
+            decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
+            and spec.uses_command_runtime
+        ):
+            self._record_policy_observation(request, decision)
             return None
         self._record_policy_observation(request, decision)
         return ToolResult.failure(
@@ -441,6 +513,32 @@ class ToolRuntime:
             },
         )
 
+    def _emit_trace(
+        self,
+        event_type: TraceEventType,
+        *,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+        ids: dict[str, Any] | None = None,
+        severity: TraceSeverity = TraceSeverity.INFO,
+    ) -> None:
+        if self.trace is None or not hasattr(self.trace, "emit"):
+            return
+        resolved_ids = {
+            "session_id": getattr(self.planner, "session_id", None),
+            "task_id": getattr(self.planner, "task_id", None),
+            "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+        }
+        resolved_ids.update(ids or {})
+        self.trace.emit(
+            event_type,
+            runtime="tool",
+            summary=summary,
+            payload=payload or {},
+            ids=resolved_ids,
+            severity=severity,
+        )
+
     @staticmethod
     def _parse_arguments(raw_arguments: Any) -> Any:
         if isinstance(raw_arguments, dict):
@@ -498,6 +596,27 @@ class ToolRuntime:
     @staticmethod
     def _digest(text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _argument_trace_summary(self, arguments: Any) -> dict[str, Any]:
+        text = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
+        if isinstance(arguments, dict):
+            keys = sorted(str(key) for key in arguments)
+            count = len(arguments)
+            shape = "object"
+        elif isinstance(arguments, list):
+            keys = []
+            count = len(arguments)
+            shape = "array"
+        else:
+            keys = []
+            count = 1 if arguments is not None else 0
+            shape = type(arguments).__name__
+        return {
+            "shape": shape,
+            "keys": keys,
+            "count": count,
+            "hash": self._digest(text),
+        }
 
     def _result_digest(self, result: ToolResult) -> str:
         dumped = result.model_dump(mode="json")
@@ -569,7 +688,13 @@ def _tool_policy_shape(
             Capability.EXECUTE_COMMAND,
             ResourceRef("command", _command_identifier(args)),
         )
-    if "verification" in tool_name:
+    if tool_name in {"plan_verification", "get_verification_result"}:
+        return (
+            OperationKind.READ_FILE,
+            Capability.READ_WORKSPACE,
+            ResourceRef("workspace", tool_name, workspace_relative=True),
+        )
+    if tool_name in {"run_verification", "rerun_check"}:
         return (
             OperationKind.VERIFICATION,
             Capability.EXECUTE_PROJECT_CODE,

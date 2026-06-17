@@ -1,8 +1,12 @@
-# Miniharness v0.0.11
+# Miniharness v0.0.13
 
-Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, planner, policy runtime, tools, context manager, trace file, local workspace state runtime, workspace mutation runtime, command runtime, and verification runtime connect without using LangChain, LangGraph, or any other agent framework.
+Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, planner, policy runtime, tools, context manager, observability trace runtime, local workspace state runtime, workspace mutation runtime, command runtime, verification runtime, and sandbox runtime connect without using LangChain, LangGraph, or any other agent framework.
 
-v0.0.11 adds the Policy / Approval Runtime. Tool dispatch, workspace mutation, command execution, verification checks, and planner failure handling now pass through `PolicyRuntime`, which builds structured `PolicyRequest` objects, classifies risk, returns auditable `PolicyDecision` values, records append-only policy JSONL, supports scoped single-use `ApprovalGrant` objects, and carries policy observations into planner context and final reports. Local CLI approval is modeled, but real remote approval, Git policy, and a container sandbox backend are still intentionally out of scope.
+v0.0.13 adds the Observability / Trace Runtime. Planner, tool dispatch, policy, approval, command execution, workspace mutation, sandbox execution, verification, context rendering, and final reporting now write structured `TraceEvent`, `TraceSpan`, and `TraceArtifact` records into an append-only local trace store. Large stdout, stderr, diffs, reports, model messages, and sandbox logs are represented as artifacts instead of being embedded directly in event payloads. Trace payloads and artifacts are redacted before storage, can be queried by run/session/task/action/runtime identifiers, can produce a timeline, and feed a compact Execution Trace Summary into final reports and model context. This is local telemetry only; there is no remote telemetry exporter.
+
+v0.0.12 adds the Sandbox / Isolation Runtime. Policy outcomes such as `sandbox_required` now route command and verification execution into `SandboxRuntime` instead of the bare local process backend. The implemented `LocalStagingBackend` creates a copy-on-write workspace under `work/sandboxes/<sandbox_id>/`, filters and redacts environment variables, enforces timeout/output limits, captures artifacts, detects sandbox-only file changes, writes append-only sandbox trace, and carries isolation evidence into command results, verification evidence, planner context, and final reports. It is practical local staging isolation, not Docker/Podman/WSL or a kernel-level security boundary.
+
+v0.0.11 adds the Policy / Approval Runtime. Tool dispatch, workspace mutation, command execution, verification checks, and planner failure handling now pass through `PolicyRuntime`, which builds structured `PolicyRequest` objects, classifies risk, returns auditable `PolicyDecision` values, records append-only policy JSONL, supports scoped single-use `ApprovalGrant` objects, and carries policy observations into planner context and final reports. Local CLI approval is modeled, but real remote approval, Git policy, and container-backed sandboxing are still intentionally out of scope.
 
 v0.0.10 adds the Planner / Task Execution Runtime. The model no longer gets every tool and advances from a bare loop alone: each turn goes through `PlannerRuntime`, which tracks `TaskState`, phase policy, allowed action/tool gates, evidence ledger updates, execution budget, deterministic replanning, risk escalation, resume state, completion criteria, and a factual final report built from runtime evidence.
 
@@ -33,28 +37,44 @@ v0.0.4 added the Tool Runtime minimal production slice: tool calls execute throu
         ├── command/        # command runtime: policy, backend, output, process sessions
         ├── config.py       # environment variable loading
         ├── context/        # token budgets, context assembly, observations, recovery
+        ├── observability/  # structured trace events, spans, artifacts, timeline, summary
         ├── policy/         # unified local policy, approval, risk, audit runtime
         ├── planner/        # task state machine, action gating, evidence, replan, budget, final reports
         ├── provider.py     # OpenAI-compatible HTTP call via httpx
+        ├── sandbox/        # local staging sandbox runtime: COW workspace, env filtering, artifacts, trace
         ├── tools/          # tool specs, registry, runtime, policy, read-only, mutation, command, verification tools
         ├── verification/   # project detection, planning, execution, evidence, repair, completion assessment
         ├── workspace_state/ # non-Git baseline, snapshot, ownership, journal, artifact, rollback, recovery
         ├── workspace/      # mutation runtime: paths, policy, snapshots, diffs, journal, rollback
-        └── trace.py        # JSONL trace writer
+        └── trace.py        # legacy JSONL trace writer compatibility
 ```
 
 Each run creates:
 
 ```txt
-.miniharness/runs/<run_id>.jsonl
+work/traces/runs/<run_id>/events.jsonl
+work/traces/runs/<run_id>/spans.jsonl
+work/traces/runs/<run_id>/artifacts.jsonl
+work/traces/runs/<run_id>/artifacts/
 .miniharness/policy/audit.jsonl
+.miniharness/sandbox/trace.jsonl
 .miniharness/workspace_state.sqlite3
 .miniharness/planner/<session_id>/
 .miniharness/sessions/<session_id>/journal.jsonl
 .miniharness/sessions/<session_id>/artifacts/
 ```
 
-The trace records `user_goal`, `model_request`, `model_response`, `planner`, `tool_call`, `tool_result`, `workspace_state`, `mutation`, `command`, `verification`, `final_answer`, and `error` events. Planner audit entries include task id, session id, phase, action id/kind, decision, reason, evidence refs, budget state, risk level, replan decision, completion assessment, and compact policy observations. Tool runtime audit entries include validated arguments, permission level, risk tags, start/end timestamps, duration, status, error code, truncation status, output digest, and cache hit status. Policy audit entries are written as append-only JSONL under `.miniharness/policy/audit.jsonl` with request id, decision id, outcome, risk level, constraints, approval grant references, and secret redaction. Workspace state audit entries include session id, baseline id, event id, event type, path, ownership, before/after hashes, transaction id, command id, mutation id, artifact id, timestamp, and warning/error code. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, structured side effects, redaction count, semantic status, isolation report, and lightweight git state. Verification audit entries include project profile, impact analysis, plan/check ids, policy decision, command id, parsed failures, evidence artifacts, repair hints, and completion assessment.
+The structured trace records `task.started`, `action.*`, `model.*`, `tool.*`, `policy.*`, `approval.*`, `command.*`, `sandbox.*`, `mutation.*`, `verification.*`, `context.*`, and `final_report.*` events. Planner audit entries include task id, session id, phase, action id/kind, decision, reason, evidence refs, budget state, risk level, replan decision, completion assessment, and compact policy/sandbox observations. Tool runtime audit entries include validation, dispatch start/completion/failure, redacted argument summaries, permission level, risk tags, duration, status, error code, truncation status, output digest, and cache hit status. Policy audit entries are written as append-only JSONL under `.miniharness/policy/audit.jsonl` and mirrored into structured trace events with request id, decision id, outcome, risk level, constraints, approval grant references, and secret redaction. Sandbox audit entries are still compatible with `.miniharness/sandbox/trace.jsonl` and are also emitted as structured trace events when `TraceRuntime` is installed. Workspace state audit entries include session id, baseline id, event id, event type, path, ownership, before/after hashes, transaction id, command id, mutation id, artifact id, timestamp, and warning/error code. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, structured side effects, redaction count, semantic status, isolation report, sandbox metadata, and lightweight git state. Verification audit entries include project profile, impact analysis, plan/check ids, policy decision, command id, parsed failures, evidence artifacts, sandbox evidence, repair hints, and completion assessment.
+
+Basic trace CLI commands are available:
+
+```powershell
+miniharness trace list
+miniharness trace show <run_id>
+miniharness trace timeline <run_id>
+miniharness trace errors <run_id>
+miniharness trace artifacts <run_id>
+```
 
 ## Install
 
@@ -134,7 +154,7 @@ The tests use temporary files and a mock provider. They do not call a live model
 
 ## Policy Runtime
 
-Miniharness v0.0.11 adds a unified `PolicyRuntime` in `src/miniharness/policy/`. It classifies risk, returns auditable policy decisions, records scoped approval grants, writes append-only policy audit JSONL, and feeds compact policy observations into planner context and final reports.
+Miniharness v0.0.11 adds a unified `PolicyRuntime` in `src/miniharness/policy/`. It classifies risk, returns auditable policy decisions, records scoped approval grants, writes append-only policy audit JSONL, and feeds compact policy observations into planner context and final reports. In v0.0.12, generated-code and verification execution can return `sandbox_required`, which CommandRuntime enforces through SandboxRuntime.
 
 The runtime boundary is:
 
@@ -146,11 +166,30 @@ ToolRuntime / MutationRuntime / CommandRuntime / VerificationRuntime
   -> allow / deny / require_review / sandbox_required / escalate / ask_user
 ```
 
-Policy decisions are local-only. There is no Git policy, remote approval flow, or real sandbox backend in this slice.
+Policy decisions are local-only. There is no Git policy or remote approval flow in this slice. The current sandbox backend is local staging only; hard network, memory, and process isolation are reserved for future backends.
+
+## Sandbox Runtime
+
+Miniharness v0.0.12 adds `src/miniharness/sandbox/`. `SandboxRuntime` owns backend selection, capability checks, local staging setup, execution, cleanup, artifact collection, change detection, and sandbox trace.
+
+The only implemented backend is `LocalStagingBackend`. It can:
+
+- copy the workspace into `work/sandboxes/<sandbox_id>/workspace`
+- exclude `.git`, `node_modules`, virtualenvs, caches, build outputs, coverage, and nested sandboxes
+- reject cwd values outside the workspace
+- filter and redact secret-like environment variables
+- enforce timeout and output preview limits
+- attempt process-tree cleanup
+- capture stdout/stderr and declared artifacts
+- report created, modified, and deleted files inside the sandbox copy
+
+It cannot enforce hard network denial, hard memory limits, hard process-count limits, or container-level filesystem security. If policy requires one of those unsupported capabilities, Miniharness returns `backend_unavailable` / `sandbox_unavailable` and does not run the command naked.
+
+Sandbox changes are not imported into the real workspace. Future import must go through `MutationRuntime` and `PolicyRuntime`.
 
 ## Agent Loop Flow
 
-1. `cli.py` receives the user goal, creates a trace file, starts or resumes local workspace state, and starts or resumes `PlannerRuntime`.
+1. `cli.py` receives the user goal, creates a `TraceRuntime` run under `work/traces/runs/<run_id>/`, starts or resumes local workspace state, and starts or resumes `PlannerRuntime`.
 2. `agent.py` creates a `ContextManager` with the system message, user goal, and compact planner context.
 3. Each turn calls `PlannerRuntime.step()`, then exposes only tools allowed by the current phase.
 4. `provider.py` sends the context-managed `messages` and phase-filtered tool schemas to the OpenAI-compatible API.
@@ -159,7 +198,7 @@ Policy decisions are local-only. There is no Git policy, remote approval flow, o
 7. Mutation, command, and verification runtimes also report rich result objects back to the planner, so the evidence ledger is not limited to truncated model-facing previews.
 8. Each structured tool result is recorded as a `ToolObservation`; a preview is appended back into `messages` as a `tool` role message.
 9. If the model returns no tool calls, `PlannerRuntime.assess_completion()` decides whether finalization is allowed. Coding tasks need applied change evidence and ready or ready-with-warnings verification evidence; read-only tasks can return the model answer when their read evidence criteria are met.
-10. For completed coding tasks, `PlannerRuntime.finalize()` creates a factual `FinalReport`. Otherwise the loop returns a blocked completion message or stops at `--max-turns`.
+10. For completed coding tasks, `PlannerRuntime.finalize()` creates a factual `FinalReport` with verification, policy, sandbox, and execution trace summaries. Otherwise the loop returns a blocked completion message or stops at `--max-turns`.
 
 ## Context Manager
 
@@ -176,6 +215,7 @@ The context layer now:
 - Persists observations, messages, snapshots, and references in SQLite under the run directory.
 - Sends only the first 4000 characters of long tool content back into model messages while keeping the full raw result in SQLite.
 - Accepts a compact planner context message so the model sees current phase, allowed tools, latest evidence, unresolved failures, and risks without receiving full journals or raw stdout.
+- Accepts compact trace summary lines such as policy blocks, sandbox unavailable notices, verification failures, mutation summaries, and current task timeline notes without receiving full trace payloads.
 - Uses `tool_choice=none` during compression so summary calls cannot trigger tools.
 - Provides recovery helpers that detect whether the next step should call the model or execute a pending tool.
 
@@ -254,7 +294,9 @@ The runtime includes:
 - `OutputCollector`: keeps stdout and stderr separate, builds ordered combined output, truncates oversized previews, records digests, and saves large output artifacts under `.miniharness/artifacts/commands/`.
 - Workspace side-effect tracking: uses `LocalWorkspaceStateRuntime` when available to snapshot workspace files before and after commands, classify ownership, return structured side effects, and keep command changes separate from model-owned mutation transactions.
 
-`CommandResult` distinguishes runtime failures, policy denials, review requirements, non-zero exits, and semantic failures such as `tests_failed`, `build_failed`, `lint_failed`, and `typecheck_failed`. Context Manager receives a compact `command_result` observation instead of raw stdout/stderr.
+`CommandResult` distinguishes runtime failures, policy denials, review requirements, sandbox backend failures, non-zero exits, and semantic failures such as `tests_failed`, `build_failed`, `lint_failed`, and `typecheck_failed`. Context Manager receives a compact `command_result` observation instead of raw stdout/stderr.
+
+When policy requires sandboxing, CommandRuntime calls SandboxRuntime and maps the `SandboxResult` back into `CommandResult`. Sandbox metadata appears under `isolation_report.sandbox` and `metadata.sandbox_*`.
 
 Direct `run_command` calls reject verification-like commands with `verification_runtime_required`. VerificationRuntime is responsible for choosing and running tests, lint, typecheck, builds, and syntax checks, while CommandRuntime remains responsible for executing each approved command.
 
@@ -280,7 +322,7 @@ The runtime includes:
 - `FailureParser` implementations for pytest/Python traceback, TypeScript `tsc`, ESLint, npm build output, and generic stderr fallback.
 - `RepairHintGenerator`, `RepairLoopController`, flaky rerun handling, and `CompletionAssessor`.
 
-Verification observations are compact and include plan status, failed checks, parsed failures, repair hints, and completion assessment. Large command output remains in command artifacts and is referenced by evidence. See `docs/architecture/verification-runtime.md` for design details and extension points.
+Verification observations are compact and include plan status, failed checks, parsed failures, repair hints, sandbox evidence, and completion assessment. Large command output remains in command or sandbox artifacts and is referenced by evidence. See `docs/architecture/verification-runtime.md` for design details and extension points.
 
 ## Workspace Mutation Runtime
 

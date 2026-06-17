@@ -73,6 +73,7 @@ class FailureType(str, Enum):
     EXTERNAL_SERVICE_UNAVAILABLE = "external_service_unavailable"
     PERMISSION_DENIED = "permission_denied"
     SANDBOX_LIMITATION = "sandbox_limitation"
+    SANDBOX_VIOLATION = "sandbox_violation"
     INCONCLUSIVE_RESULT = "inconclusive_result"
     REPAIR_BUDGET_EXCEEDED = "repair_budget_exceeded"
     UNKNOWN_FAILURE = "unknown_failure"
@@ -304,6 +305,12 @@ class VerificationEvidence:
     parsed_failures: list[ParsedFailure]
     duration_ms: int
     timestamp: str
+    sandbox_id: str | None = None
+    sandbox_backend: str | None = None
+    sandbox_status: str | None = None
+    sandbox_artifacts: list[dict[str, Any]] = field(default_factory=list)
+    sandbox_changed_files: dict[str, Any] = field(default_factory=dict)
+    sandbox_violations: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -317,6 +324,12 @@ class VerificationEvidence:
             ],
             "duration_ms": self.duration_ms,
             "timestamp": self.timestamp,
+            "sandbox_id": self.sandbox_id,
+            "sandbox_backend": self.sandbox_backend,
+            "sandbox_status": self.sandbox_status,
+            "sandbox_artifacts": self.sandbox_artifacts,
+            "sandbox_changed_files": self.sandbox_changed_files,
+            "sandbox_violations": self.sandbox_violations,
         }
 
 
