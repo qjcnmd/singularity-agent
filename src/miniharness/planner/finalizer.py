@@ -61,6 +61,7 @@ class Finalizer:
                 if trace_summary
                 else {}
             ),
+            instruction_prompt_summary=self._instruction_prompt_summary(evidence),
         )
 
     @staticmethod
@@ -206,3 +207,31 @@ class Finalizer:
                 if artifact
             ],
         }
+
+    @staticmethod
+    def _instruction_prompt_summary(evidence: EvidenceLedger) -> dict[str, Any]:
+        summary = {
+            "prompt_bundles_compiled_count": 0,
+            "project_instruction_files_loaded_count": 0,
+            "injection_warning_count": 0,
+            "conflict_count": 0,
+            "developer_message_folded_count": 0,
+            "prompt_budget_exceeded_count": 0,
+            "untrusted_context_sections_count": 0,
+            "prompt_hash_references": [],
+        }
+        refs: set[str] = set()
+        for observation in evidence.instruction_prompt_observations:
+            for key in (
+                "prompt_bundles_compiled_count",
+                "project_instruction_files_loaded_count",
+                "injection_warning_count",
+                "conflict_count",
+                "developer_message_folded_count",
+                "prompt_budget_exceeded_count",
+                "untrusted_context_sections_count",
+            ):
+                summary[key] += int(observation.get(key) or 0)
+            refs.update(str(item) for item in observation.get("prompt_hash_references") or [])
+        summary["prompt_hash_references"] = sorted(refs)
+        return summary

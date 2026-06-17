@@ -335,6 +335,7 @@ class EvidenceLedger:
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     policy_observations: list[dict[str, Any]] = field(default_factory=list)
     sandbox_observations: list[dict[str, Any]] = field(default_factory=list)
+    instruction_prompt_observations: list[dict[str, Any]] = field(default_factory=list)
 
     def add_unique_file(self, path: str) -> None:
         if path and path not in self.inspected_files:
@@ -357,6 +358,7 @@ class EvidenceLedger:
             "tool_results": self.tool_results,
             "policy_observations": self.policy_observations,
             "sandbox_observations": self.sandbox_observations,
+            "instruction_prompt_observations": self.instruction_prompt_observations,
         }
 
     @classmethod
@@ -377,6 +379,7 @@ class EvidenceLedger:
             tool_results=list(payload.get("tool_results") or []),
             policy_observations=list(payload.get("policy_observations") or []),
             sandbox_observations=list(payload.get("sandbox_observations") or []),
+            instruction_prompt_observations=list(payload.get("instruction_prompt_observations") or []),
         )
 
 
@@ -471,6 +474,7 @@ class FinalReport:
     sandbox_isolation_summary: dict[str, Any] = field(default_factory=dict)
     execution_trace_summary: dict[str, Any] = field(default_factory=dict)
     model_usage_summary: dict[str, Any] = field(default_factory=dict)
+    instruction_prompt_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -487,6 +491,7 @@ class FinalReport:
             "sandbox_isolation_summary": self.sandbox_isolation_summary,
             "execution_trace_summary": self.execution_trace_summary,
             "model_usage_summary": self.model_usage_summary,
+            "instruction_prompt_summary": self.instruction_prompt_summary,
             "artifacts": self.artifacts,
             "next_steps": self.next_steps,
         }
@@ -507,6 +512,7 @@ class FinalReport:
             sandbox_isolation_summary=dict(payload.get("sandbox_isolation_summary") or {}),
             execution_trace_summary=dict(payload.get("execution_trace_summary") or {}),
             model_usage_summary=dict(payload.get("model_usage_summary") or {}),
+            instruction_prompt_summary=dict(payload.get("instruction_prompt_summary") or {}),
             artifacts=list(payload.get("artifacts") or []),
             next_steps=list(payload.get("next_steps") or []),
         )

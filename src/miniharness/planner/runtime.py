@@ -419,6 +419,26 @@ class PlannerRuntime:
             extra={"policy_observation": payload},
         )
 
+    def record_instruction_prompt_observation(self, observation: dict[str, Any]) -> None:
+        payload = {
+            "prompt_bundles_compiled_count": int(observation.get("prompt_bundles_compiled_count") or 0),
+            "project_instruction_files_loaded_count": int(observation.get("project_instruction_files_loaded_count") or 0),
+            "injection_warning_count": int(observation.get("injection_warning_count") or 0),
+            "conflict_count": int(observation.get("conflict_count") or 0),
+            "developer_message_folded_count": int(observation.get("developer_message_folded_count") or 0),
+            "prompt_budget_exceeded_count": int(observation.get("prompt_budget_exceeded_count") or 0),
+            "untrusted_context_sections_count": int(observation.get("untrusted_context_sections_count") or 0),
+            "prompt_hash_references": list(observation.get("prompt_hash_references") or []),
+        }
+        self.evidence.instruction_prompt_observations = [payload]
+        self._persist()
+        self._record_event(
+            decision="instruction_prompt_observation",
+            reason="Instruction prompt observation recorded.",
+            evidence_refs=payload["prompt_hash_references"],
+            extra={"instruction_prompt_observation": payload},
+        )
+
     def replan(self, signal: dict[str, Any]) -> ReplanDecision:
         state = self._state()
         fingerprint = signal.get("failure_fingerprint")

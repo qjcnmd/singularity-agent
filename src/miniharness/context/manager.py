@@ -213,6 +213,44 @@ class ContextManager:
                 ids={"task_id": self.run_id},
             )
 
+    def instruction_sources(self) -> list[dict[str, Any]]:
+        sources: list[dict[str, Any]] = []
+        for observation in self.tool_observations:
+            source_type = "tool_output"
+            if observation.tool_name in {"run_command", "read_process_output", "start_process"}:
+                source_type = "command_output"
+            elif "verification" in observation.tool_name:
+                source_type = "verification_evidence"
+            sources.append(
+                {
+                    "source_type": source_type,
+                    "origin": observation.tool_name,
+                    "content": observation.preview,
+                    "trust_level": "untrusted_content",
+                    "metadata": {
+                        "observation_id": observation.id,
+                        "tool_call_id": observation.tool_call_id,
+                        "tool_name": observation.tool_name,
+                        "ok": observation.ok,
+                        "truncated": observation.truncated,
+                        "raw_digest": observation.raw_digest,
+                        "reference_ids": [ref.id for ref in observation.source_refs],
+                        "error_code": observation.error_code,
+                    },
+                }
+            )
+        if self._summary:
+            sources.append(
+                {
+                    "source_type": "context_summary",
+                    "origin": "context.compaction",
+                    "content": self._summary,
+                    "trust_level": "untrusted_content",
+                    "metadata": {"summary": True},
+                }
+            )
+        return sources
+
     def _persist_initial_messages(self) -> None:
         if self.store.load_messages(self.run_id):
             return
