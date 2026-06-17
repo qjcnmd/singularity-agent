@@ -5,6 +5,7 @@ from typing import Any
 from rich.console import Console
 
 from miniharness.context import ContextManager
+from miniharness.planner import PlannerRuntime, TaskStatus
 from miniharness.provider import OpenAICompatibleProvider
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.trace import TraceWriter
@@ -44,6 +45,7 @@ class MiniAgent:
         console: Console,
         max_turns: int,
         state_runtime: LocalWorkspaceStateRuntime | None = None,
+        planner: PlannerRuntime | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
@@ -51,8 +53,18 @@ class MiniAgent:
         self.console = console
         self.max_turns = max_turns
         self.state_runtime = state_runtime
+        self.planner = planner
 
     def run(self, user_goal: str) -> str:
+        planner = self.planner or PlannerRuntime(
+            self.tools.project_root,
+            session_id=self.trace.run_id,
+            task_id=self.trace.run_id,
+            trace=self.trace,
+        )
+        self.planner = planner
+        if planner.state is None:
+            planner.start_task(user_goal)
         context = ContextManager(
             system_prompt=SYSTEM_PROMPT,
             user_goal=user_goal,
@@ -66,17 +78,23 @@ class MiniAgent:
             policy=ToolPolicy.coding_agent(),
             trace=self.trace,
             workspace_root=self.tools.project_root,
+            planner=planner,
         )
 
         for turn in range(1, self.max_turns + 1):
             self.console.print(f"[cyan]model turn {turn}[/cyan]")
-            messages = context.messages(tools=tool_schemas)
+            planner.step()
+            active_tool_schemas = planner.filtered_tools(tool_schemas)
+            messages = context.messages(
+                tools=active_tool_schemas,
+                planner_context=planner.planner_context_message(),
+            )
             self.trace.record(
                 "model_request",
-                {"turn": turn, "messages": messages, "tools": tool_schemas},
+                {"turn": turn, "messages": messages, "tools": active_tool_schemas},
             )
 
-            response = self.provider.chat(messages=messages, tools=tool_schemas)
+            response = self.provider.chat(messages=messages, tools=active_tool_schemas)
             self.trace.record("model_response", {"turn": turn, "response": response})
 
             assistant_message = self._extract_assistant_message(response)
@@ -84,7 +102,10 @@ class MiniAgent:
 
             tool_calls = assistant_message.get("tool_calls") or []
             if not tool_calls:
-                final_answer = assistant_message.get("content") or ""
+                final_answer = self._planner_final_answer(
+                    planner,
+                    model_answer=assistant_message.get("content") or "",
+                )
                 self.trace.record(
                     "final_answer", {"turn": turn, "content": final_answer}
                 )
@@ -116,6 +137,31 @@ class MiniAgent:
         self.trace.record("error", {"type": "MaxTurnsExceeded", "message": message})
         self.trace.record("final_answer", {"turn": self.max_turns, "content": message})
         return message
+
+    @staticmethod
+    def _planner_final_answer(planner: PlannerRuntime, *, model_answer: str) -> str:
+        assessment = planner.assess_completion()
+        if assessment["status"] != TaskStatus.COMPLETED.value:
+            return (
+                "Planner blocked finalization because completion criteria are unmet: "
+                + ", ".join(assessment["unmet"])
+            )
+        if (
+            planner.state is not None
+            and not planner.state.completion_criteria.required_changes_applied
+            and not planner.state.completion_criteria.required_verifications_passed
+        ):
+            return model_answer
+        report = planner.finalize()
+        return "\n".join(
+            [
+                f"status: {report.status.value}",
+                f"files_changed: {', '.join(report.files_changed) if report.files_changed else '-'}",
+                f"verification: {report.verification_summary.get('status', 'unknown')}",
+                f"unresolved_issues: {len(report.unresolved_issues)}",
+                f"risks: {len(report.risks)}",
+            ]
+        )
 
     def _inject_workspace_state(
         self,

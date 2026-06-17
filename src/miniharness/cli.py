@@ -10,6 +10,7 @@ from rich.panel import Panel
 from miniharness.agent import MiniAgent
 from miniharness.command import CommandRuntime
 from miniharness.config import Settings
+from miniharness.planner import PlannerRuntime
 from miniharness.provider import OpenAICompatibleProvider
 from miniharness.tools import ToolRegistry
 from miniharness.tools.command import register_command_tools
@@ -43,6 +44,13 @@ def main(
             help="Maximum number of model turns before stopping.",
         ),
     ] = 8,
+    resume_session: Annotated[
+        str | None,
+        typer.Option(
+            "--resume-session",
+            help="Resume a PlannerRuntime and workspace state session by id.",
+        ),
+    ] = None,
 ) -> None:
     """Run the minimal read-only agent loop."""
 
@@ -54,6 +62,7 @@ def main(
             "goal": goal,
             "project_root": str(project_root),
             "max_turns": max_turns,
+            "resume_session": resume_session,
         },
     )
 
@@ -61,27 +70,45 @@ def main(
     console.print(f"[bold]trace[/bold] {trace.path}")
 
     state_runtime = LocalWorkspaceStateRuntime(project_root, trace=trace)
-    recovery = state_runtime.recover_session()
+    recovery = state_runtime.recover_session(resume_session)
+    resume_health: WorkspaceHealthReport | None = None
     if recovery.status != RecoveryStatus.CLEAN:
         console.print(
             f"[yellow]workspace recovery[/yellow] {recovery.status.value} "
             f"session={recovery.session_id}"
         )
-    baseline = state_runtime.begin_session(task_id=trace.run_id, session_id=trace.run_id)
-    console.print(
-        f"[bold]workspace baseline[/bold] {baseline.baseline_id} "
-        f"files={len(baseline.snapshots)}"
-    )
+    if resume_session:
+        resume_health = state_runtime.get_workspace_health()
+        if state_runtime.baseline is not None:
+            console.print(
+                f"[bold]workspace baseline[/bold] {state_runtime.baseline.baseline_id} "
+                f"files={len(state_runtime.baseline.snapshots)}"
+            )
+    else:
+        baseline = state_runtime.begin_session(task_id=trace.run_id, session_id=trace.run_id)
+        console.print(
+            f"[bold]workspace baseline[/bold] {baseline.baseline_id} "
+            f"files={len(baseline.snapshots)}"
+        )
     session_status = "interrupted"
     final_health: WorkspaceHealthReport | None = None
     try:
         settings = Settings.from_env()
         provider = OpenAICompatibleProvider(settings)
         tools = ToolRegistry(project_root)
+        planner = create_or_resume_planner(
+            workspace_root=project_root,
+            session_id=resume_session,
+            task_id=trace.run_id,
+            user_goal=goal,
+            trace=trace,
+            workspace_health=resume_health or state_runtime.get_workspace_health(),
+        )
         command_runtime = CommandRuntime(
             project_root,
             trace=trace,
             state_runtime=state_runtime,
+            planner=planner,
         )
         register_mutation_tools(
             tools,
@@ -89,6 +116,7 @@ def main(
                 project_root,
                 trace=trace,
                 state_runtime=state_runtime,
+                planner=planner,
             ),
         )
         register_command_tools(tools, command_runtime)
@@ -99,6 +127,7 @@ def main(
                 project_root,
                 command_runtime=command_runtime,
                 trace=trace,
+                planner=planner,
             ),
         )
         agent = MiniAgent(
@@ -108,6 +137,7 @@ def main(
             console=console,
             max_turns=max_turns,
             state_runtime=state_runtime,
+            planner=planner,
         )
         final_answer = agent.run(goal)
         state_runtime.record_external_changes()
@@ -136,6 +166,30 @@ def workspace_health_summary(health: WorkspaceHealthReport) -> str:
         f"recommended_next_action: {payload['recommended_next_action']}",
     ]
     return "\n".join(lines)
+
+
+def create_or_resume_planner(
+    *,
+    workspace_root: Path,
+    session_id: str | None,
+    task_id: str,
+    user_goal: str,
+    trace: TraceWriter | None,
+    workspace_health: WorkspaceHealthReport,
+) -> PlannerRuntime:
+    planner = PlannerRuntime(
+        workspace_root,
+        session_id=session_id or task_id,
+        task_id=task_id,
+        trace=trace,
+    )
+    if session_id:
+        return planner.resume(
+            session_id,
+            workspace_health=workspace_health.to_dict(),
+        )
+    planner.start_task(user_goal)
+    return planner
 
 
 def _workspace_health_panel(health: WorkspaceHealthReport) -> Panel:

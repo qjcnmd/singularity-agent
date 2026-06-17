@@ -206,6 +206,7 @@ class MutationRuntime:
         max_inline_diff_lines: int = 200,
         verification_hook: Any | None = None,
         state_runtime: "LocalWorkspaceStateRuntime | None" = None,
+        planner: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.resolver = WorkspacePathResolver(self.workspace_root)
@@ -220,6 +221,7 @@ class MutationRuntime:
         self.atomic_writer = AtomicWriter()
         self.verification_hook = verification_hook
         self.state_runtime = state_runtime
+        self.planner = planner
         self._journals: dict[str, MutationJournal] = {}
 
     def preview_operations(
@@ -473,7 +475,7 @@ class MutationRuntime:
 
         git_after = collect_git_state(self.workspace_root)
         verification_status = self._run_verification_hook(transaction_id)
-        return MutationResult(
+        result = MutationResult(
             ok=True,
             status="applied",
             message="Mutation transaction applied.",
@@ -482,11 +484,15 @@ class MutationRuntime:
             affected_files=changeset.affected_files,
             diffs=changeset.diffs,
             policy_decisions=changeset.policy_decisions,
-            observation=self._observation("applied", changeset),
+            observation=self._observation("applied", changeset)
+            | {"transaction_id": transaction_id},
             verification_status=verification_status,
             git_before=git_before,
             git_after=git_after,
         )
+        if self.planner is not None:
+            self.planner.update_from_mutation(result.observation | {"transaction_id": transaction_id}, tool_call_id=tool_call_id)
+        return result
 
     def _snapshot_for_operation(
         self,
@@ -902,7 +908,7 @@ class MutationRuntime:
             if decision.decision != ALLOW
             for reason in decision.reasons
         ]
-        return {
+        observation = {
             "mutation_status": status,
             "changeset_id": changeset.id,
             "changed_files": changeset.affected_files,
@@ -919,6 +925,7 @@ class MutationRuntime:
             "error_code": error_code,
             "error_details": error_details,
         }
+        return observation
 
     @staticmethod
     def _risk_level(decisions: list[PolicyDecision], diffs: list[FileDiff]) -> str:

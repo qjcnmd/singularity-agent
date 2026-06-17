@@ -77,11 +77,19 @@ class ContextManager:
         self._summary: str | None = None
         self._persist_initial_messages()
 
-    def messages(self, *, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    def messages(
+        self,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        planner_context: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         if self.assembler.needs_compression(messages=self._messages, tools=tools):
             self._compress_if_possible()
+        source_messages = self._messages
+        if planner_context is not None:
+            source_messages = [*self._messages, planner_context]
         assembled, budget = self.assembler.assemble(
-            messages=self._messages,
+            messages=source_messages,
             tools=tools,
             summary=self._summary,
         )

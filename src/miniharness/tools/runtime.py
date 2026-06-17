@@ -30,11 +30,13 @@ class ToolRuntime:
         policy: ToolPolicy,
         trace: TraceWriter | None,
         workspace_root: Path,
+        planner: Any | None = None,
     ) -> None:
         self.registry = registry
         self.policy = policy
         self.trace = trace
         self.workspace_root = workspace_root.resolve()
+        self.planner = planner
         self._cache: dict[str, ToolResult] = {}
 
     def execute_tool_call(self, tool_call: dict[str, Any]) -> ToolResult:
@@ -45,6 +47,7 @@ class ToolRuntime:
         tool_name = function.get("name") or "<unknown>"
         spec: ToolSpec | None = None
         validated_args: dict[str, Any] | None = None
+        planner_action_id: str | None = None
         cache_hit = False
         output_digest: str | None = None
 
@@ -115,6 +118,26 @@ class ToolRuntime:
                 output_digest = self._result_digest(result)
                 return result
 
+            planner_decision = self._authorize_with_planner(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                spec=spec,
+                validated_args=validated_args,
+            )
+            if planner_decision is not None and not planner_decision.allowed:
+                result = ToolResult.failure(
+                    code=planner_decision.error_code or "action_not_allowed",
+                    message="Planner denied tool execution.",
+                    details={
+                        "planner_reason": planner_decision.reason,
+                        "risk_decision": planner_decision.risk_decision.value,
+                    },
+                )
+                output_digest = self._result_digest(result)
+                return result
+            if planner_decision is not None and planner_decision.action is not None:
+                planner_action_id = planner_decision.action.action_id
+
             cache_key = self._cache_key(spec, validated_args)
             if self._should_cache(spec) and cache_key in self._cache:
                 cache_hit = True
@@ -124,6 +147,12 @@ class ToolRuntime:
                 return result
 
             result, output_digest = self._execute_handler(spec, validated)
+            self._update_planner(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                result=result,
+                action_id=planner_action_id,
+            )
             if self._should_cache(spec) and result.ok:
                 self._cache[cache_key] = result.model_copy(deep=True)
             return result
@@ -154,6 +183,40 @@ class ToolRuntime:
                     output_digest=output_digest,
                     cache_hit=cache_hit,
                 )
+
+    def _authorize_with_planner(
+        self,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        spec: ToolSpec,
+        validated_args: dict[str, Any],
+    ) -> Any | None:
+        if self.planner is None:
+            return None
+        return self.planner.authorize_tool_call(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            spec=spec,
+            arguments=validated_args,
+        )
+
+    def _update_planner(
+        self,
+        *,
+        tool_call_id: str | None,
+        tool_name: str,
+        result: ToolResult,
+        action_id: str | None,
+    ) -> None:
+        if self.planner is None:
+            return
+        self.planner.update_from_tool_result(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            result=result,
+            action_id=action_id,
+        )
 
     def _execute_handler(
         self, spec: ToolSpec, validated_args: Any

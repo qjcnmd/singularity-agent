@@ -103,6 +103,7 @@ class CommandRuntime:
         trace: TraceWriter | None = None,
         env_policy: EnvPolicy | None = None,
         state_runtime: "LocalWorkspaceStateRuntime | None" = None,
+        planner: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)
         self.policy = policy or CommandPolicy()
@@ -110,6 +111,7 @@ class CommandRuntime:
         self.trace = trace
         self.env_policy = env_policy or EnvPolicy()
         self.state_runtime = state_runtime
+        self.planner = planner
         self._sessions: dict[str, _SessionRecord] = {}
 
     def plan(self, request: CommandRequest) -> CommandPlan:
@@ -213,6 +215,11 @@ class CommandRuntime:
             tool_call_id=tool_call_id,
             transaction_id=transaction_id,
         )
+        if self.planner is not None:
+            self.planner.update_from_command(
+                {"command_result": result.to_observation().get("command_result", result.to_dict())},
+                tool_call_id=tool_call_id,
+            )
         return result
 
     def start_process(

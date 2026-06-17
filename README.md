@@ -1,6 +1,8 @@
-# Miniharness v0.0.9
+# Miniharness v0.0.10
 
-Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, tools, context manager, trace file, local workspace state runtime, workspace mutation runtime, command runtime, and verification runtime connect without using LangChain, LangGraph, or any other agent framework.
+Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, provider, planner, tools, context manager, trace file, local workspace state runtime, workspace mutation runtime, command runtime, and verification runtime connect without using LangChain, LangGraph, or any other agent framework.
+
+v0.0.10 adds the Planner / Task Execution Runtime. The model no longer gets every tool and advances from a bare loop alone: each turn goes through `PlannerRuntime`, which tracks `TaskState`, phase policy, allowed action/tool gates, evidence ledger updates, execution budget, deterministic replanning, risk escalation, resume state, completion criteria, and a factual final report built from runtime evidence.
 
 v0.0.9 adds the Local Workspace State Runtime. Miniharness can now create a non-Git session baseline, capture rich file snapshots, persist a JSONL state journal and SQLite query index, classify ownership for agent mutations and command side effects, detect external changes, store artifacts under session directories, report workspace health, recover interrupted sessions, and perform hash-checked agent-owned rollback without branches, commits, staging, push, or PR behavior.
 
@@ -29,6 +31,7 @@ v0.0.4 added the Tool Runtime minimal production slice: tool calls execute throu
         ├── command/        # command runtime: policy, backend, output, process sessions
         ├── config.py       # environment variable loading
         ├── context/        # token budgets, context assembly, observations, recovery
+        ├── planner/        # task state machine, action gating, evidence, replan, budget, final reports
         ├── provider.py     # OpenAI-compatible HTTP call via httpx
         ├── tools/          # tool specs, registry, runtime, policy, read-only, mutation, command, verification tools
         ├── verification/   # project detection, planning, execution, evidence, repair, completion assessment
@@ -42,11 +45,12 @@ Each run creates:
 ```txt
 .miniharness/runs/<run_id>.jsonl
 .miniharness/workspace_state.sqlite3
+.miniharness/planner/<session_id>/
 .miniharness/sessions/<session_id>/journal.jsonl
 .miniharness/sessions/<session_id>/artifacts/
 ```
 
-The trace records `user_goal`, `model_request`, `model_response`, `tool_call`, `tool_result`, `workspace_state`, `mutation`, `command`, `verification`, `final_answer`, and `error` events. Tool runtime audit entries include validated arguments, permission level, risk tags, start/end timestamps, duration, status, error code, truncation status, output digest, and cache hit status. Workspace state audit entries include session id, baseline id, event id, event type, path, ownership, before/after hashes, transaction id, command id, mutation id, artifact id, timestamp, and warning/error code. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, structured side effects, redaction count, semantic status, isolation report, and lightweight git state. Verification audit entries include project profile, impact analysis, plan/check ids, policy decision, command id, parsed failures, evidence artifacts, repair hints, and completion assessment.
+The trace records `user_goal`, `model_request`, `model_response`, `planner`, `tool_call`, `tool_result`, `workspace_state`, `mutation`, `command`, `verification`, `final_answer`, and `error` events. Planner audit entries include task id, session id, phase, action id/kind, decision, reason, evidence refs, budget state, risk level, replan decision, and completion assessment. Tool runtime audit entries include validated arguments, permission level, risk tags, start/end timestamps, duration, status, error code, truncation status, output digest, and cache hit status. Workspace state audit entries include session id, baseline id, event id, event type, path, ownership, before/after hashes, transaction id, command id, mutation id, artifact id, timestamp, and warning/error code. Mutation audit entries include transaction and changeset ids, operation id, path, operation type, policy decision, risk tags, before/after hashes, diff digest, line counts, status flags, error code, duration, artifact path, and verification status. Command audit entries include command id, argv/shell, cwd, backend, policy decision, risk tags, env policy, network/filesystem modes, resource limits, duration, exit code, output digest, artifact path, changed files, structured side effects, redaction count, semantic status, isolation report, and lightweight git state. Verification audit entries include project profile, impact analysis, plan/check ids, policy decision, command id, parsed failures, evidence artifacts, repair hints, and completion assessment.
 
 ## Install
 
@@ -102,6 +106,12 @@ You can cap the loop:
 miniharness "找一下 agent loop 在哪里" --max-turns 6
 ```
 
+You can resume an interrupted planner/workspace session by id:
+
+```powershell
+miniharness "继续刚才的任务" --resume-session <session_id>
+```
+
 ## Test
 
 Install the development dependency:
@@ -120,15 +130,16 @@ The tests use temporary files and a mock provider. They do not call a live model
 
 ## Agent Loop Flow
 
-1. `cli.py` receives the user goal and creates a trace file.
-2. `agent.py` creates a `ContextManager` with the system message and user goal.
-3. `provider.py` sends the context-managed `messages` and tool schemas to the OpenAI-compatible API.
-4. If the model returns no tool calls, the assistant message is the final answer.
+1. `cli.py` receives the user goal, creates a trace file, starts or resumes local workspace state, and starts or resumes `PlannerRuntime`.
+2. `agent.py` creates a `ContextManager` with the system message, user goal, and compact planner context.
+3. Each turn calls `PlannerRuntime.step()`, then exposes only tools allowed by the current phase.
+4. `provider.py` sends the context-managed `messages` and phase-filtered tool schemas to the OpenAI-compatible API.
 5. If the model returns tool calls, `agent.py` sends each call to `ToolRuntime.execute_tool_call`.
-6. The runtime parses JSON arguments, validates them with Pydantic, checks policy, applies timeout/output limits/cache, blocks unsafe write handlers that do not use the Workspace Mutation Runtime, blocks shell handlers that do not use the Command Runtime, and records the audit trace.
-7. Each structured tool result is recorded as a `ToolObservation`; a preview is appended back into `messages` as a `tool` role message.
-8. The loop calls the model again with the updated `messages`.
-9. The loop stops when the model gives a final answer or `--max-turns` is reached.
+6. `ToolRuntime` parses JSON arguments, validates them with Pydantic, checks tool policy, asks `PlannerRuntime` whether the action is allowed, applies timeout/output limits/cache, blocks unsafe runtime bypasses, records audit trace, and reports the full `ToolResult` back to the planner.
+7. Mutation, command, and verification runtimes also report rich result objects back to the planner, so the evidence ledger is not limited to truncated model-facing previews.
+8. Each structured tool result is recorded as a `ToolObservation`; a preview is appended back into `messages` as a `tool` role message.
+9. If the model returns no tool calls, `PlannerRuntime.assess_completion()` decides whether finalization is allowed. Coding tasks need applied change evidence and ready or ready-with-warnings verification evidence; read-only tasks can return the model answer when their read evidence criteria are met.
+10. For completed coding tasks, `PlannerRuntime.finalize()` creates a factual `FinalReport`. Otherwise the loop returns a blocked completion message or stops at `--max-turns`.
 
 ## Context Manager
 
@@ -144,6 +155,7 @@ The context layer now:
 - Records tool observations with raw results, previews, truncation status, digests, timing/cache/error metadata, and source references.
 - Persists observations, messages, snapshots, and references in SQLite under the run directory.
 - Sends only the first 4000 characters of long tool content back into model messages while keeping the full raw result in SQLite.
+- Accepts a compact planner context message so the model sees current phase, allowed tools, latest evidence, unresolved failures, and risks without receiving full journals or raw stdout.
 - Uses `tool_choice=none` during compression so summary calls cannot trigger tools.
 - Provides recovery helpers that detect whether the next step should call the model or execute a pending tool.
 
@@ -164,8 +176,23 @@ The protocol and runtime layer now have:
 - `ToolPolicy.read_only()`: the default policy allows only read-only tools and rejects write, shell, git, and network risk.
 - Runtime errors are classified as `tool_not_found`, `bad_arguments_json`, `validation_error`, `permission_denied`, `policy_denied`, `timeout`, `execution_error`, or `internal_error`.
 - Cache is per run and only applies to `cacheable=true` read-only tools. The cache key includes tool name, version, normalized validated arguments, and workspace root.
+- When a planner is attached, `ToolRuntime` returns `action_not_allowed`, `risk_escalated`, or `needs_review` before executing a handler that violates the current planner phase.
 - Write tools must declare `uses_mutation_runtime=true`; otherwise `ToolRuntime` rejects them with `invalid_operation` before the handler can touch the filesystem.
 - Shell tools must declare `uses_command_runtime=true`; otherwise `ToolRuntime` rejects them with `invalid_operation` before the handler can spawn a process.
+
+## Planner / Task Execution Runtime
+
+Miniharness v0.0.10 adds `PlannerRuntime` as the execution controller. It owns structured task state, phase transitions, allowed actions, evidence, budgets, risk escalation, replanning, completion assessment, interrupt/resume, and final reports.
+
+The runtime owns:
+
+- `TaskState`: task id, session id, user goal, normalized goal, current phase, status, risk level, completion criteria, linked transactions, linked commands, linked verifications, and final assessment.
+- `TaskPlan` and `TaskPhase`: auditable phases with allowed tools/actions and required evidence.
+- `AgentAction`: structured action intent, phase, tool allowance, expected evidence, risk level, status, and result reference.
+- `EvidenceLedger`: inspected files, search results, applied changes, command results, verification results, parsed failures, external changes, missing evidence, unresolved failures, assumptions, and risks.
+- `ExecutionBudget`, `Replanner`, `RiskEscalation`, and `FinalReport`.
+
+Planner state persists under `.miniharness/planner/<session_id>/`. See `docs/architecture/planner-task-execution-runtime.md` for the state machine, evidence-driven completion, failure replanning, budget control, and final report design.
 
 ## Local Workspace State Runtime
 
