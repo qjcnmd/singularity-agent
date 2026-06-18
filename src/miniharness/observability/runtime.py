@@ -289,6 +289,48 @@ class TraceRuntime:
                     ids,
                 )
             return TraceEventType.ACTION_PROPOSED, "planner", str(data.get("reason") or "Planner event."), TraceSeverity.INFO, ids
+        if event in {
+            "kernel.boot.started",
+            "kernel.boot.completed",
+            "kernel.boot.failed",
+            "runtime.initialized",
+            "runtime.health_checked",
+            "cancellation.requested",
+            "shutdown.started",
+            "shutdown.completed",
+            "recovery.detected",
+            "recovery.completed",
+            "finalization.completed",
+        }:
+            event_map = {
+                "kernel.boot.started": TraceEventType.KERNEL_BOOT_STARTED,
+                "kernel.boot.completed": TraceEventType.KERNEL_BOOT_COMPLETED,
+                "kernel.boot.failed": TraceEventType.KERNEL_BOOT_FAILED,
+                "runtime.initialized": TraceEventType.RUNTIME_INITIALIZED,
+                "runtime.health_checked": TraceEventType.RUNTIME_HEALTH_CHECKED,
+                "cancellation.requested": TraceEventType.CANCELLATION_REQUESTED,
+                "shutdown.started": TraceEventType.SHUTDOWN_STARTED,
+                "shutdown.completed": TraceEventType.SHUTDOWN_COMPLETED,
+                "recovery.detected": TraceEventType.RECOVERY_DETECTED,
+                "recovery.completed": TraceEventType.RECOVERY_COMPLETED,
+                "finalization.completed": TraceEventType.FINALIZATION_COMPLETED,
+            }
+            severity = TraceSeverity.ERROR if event.endswith(".failed") else TraceSeverity.INFO
+            return event_map[event], "kernel", event, severity, ids
+        if event == "lifecycle":
+            lifecycle_type = str(data.get("event_type") or "")
+            event_map = {
+                "lifecycle.run.started": TraceEventType.LIFECYCLE_RUN_STARTED,
+                "lifecycle.session.started": TraceEventType.LIFECYCLE_SESSION_STARTED,
+                "lifecycle.task.started": TraceEventType.LIFECYCLE_TASK_STARTED,
+            }
+            return (
+                event_map.get(lifecycle_type, TraceEventType.CONTEXT_OBSERVATION_ADDED),
+                "lifecycle",
+                lifecycle_type or "lifecycle",
+                TraceSeverity.INFO,
+                ids,
+            )
         if event == "tool_call":
             failed = data.get("status") == "error" or bool(data.get("error_code"))
             return (

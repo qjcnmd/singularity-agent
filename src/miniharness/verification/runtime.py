@@ -89,6 +89,7 @@ class VerificationRuntime:
         transaction_id: str | None = None,
         changeset_id: str | None = None,
     ) -> VerificationPlan:
+        self._throw_if_cancelled()
         profile = ProjectDetector(self.workspace_root).detect()
         impact = ImpactAnalyzer().analyze(
             changed_files=changed_files,
@@ -123,6 +124,7 @@ class VerificationRuntime:
         self,
         plan_id: str | None = None,
     ) -> dict[str, Any]:
+        self._throw_if_cancelled()
         plan = self._plan(plan_id)
         started = time.perf_counter()
         results: list[VerificationResult] = []
@@ -131,6 +133,7 @@ class VerificationRuntime:
         for check in plan.blocked_checks:
             results.append(self._blocked_result(check))
         for check in plan.executable_checks():
+            self._throw_if_cancelled()
             result = self._run_check(plan, check)
             results.append(result)
             self.repair_loop.record_result(result)
@@ -156,6 +159,7 @@ class VerificationRuntime:
         return observation
 
     def rerun_check(self, *, plan_id: str, check_id: str) -> dict[str, Any]:
+        self._throw_if_cancelled()
         plan = self._plan(plan_id)
         check = next((candidate for candidate in plan.all_checks() if candidate.id == check_id), None)
         if check is None:
@@ -172,6 +176,7 @@ class VerificationRuntime:
         return observation
 
     def get_result(self, plan_id: str | None = None) -> dict[str, Any]:
+        self._throw_if_cancelled()
         plan = self._plan(plan_id)
         results = self._results.get(plan.id, [])
         assessment = self._assessments.get(plan.id)
@@ -358,6 +363,7 @@ class VerificationRuntime:
         return allowed_required, allowed_optional, blocked_checks
 
     def _run_check(self, plan: VerificationPlan, check: VerificationCheck) -> VerificationResult:
+        self._throw_if_cancelled()
         if check.command is None:
             return self._blocked_result(check)
         self._emit_observability(
@@ -828,6 +834,11 @@ class VerificationRuntime:
         payload = dict(data)
         payload["phase"] = phase
         self.trace.record("verification", payload)
+
+    def _throw_if_cancelled(self) -> None:
+        token = getattr(self, "cancellation_token", None)
+        if token is not None and hasattr(token, "throw_if_cancelled"):
+            token.throw_if_cancelled()
 
     def _emit_observability(
         self,

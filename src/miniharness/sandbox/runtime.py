@@ -36,6 +36,7 @@ class SandboxRuntime:
         self.trace = trace or SandboxTraceWriter.create(self.workspace_root)
 
     def run(self, request: SandboxRequest) -> SandboxResult:
+        self._throw_if_cancelled()
         started = time.perf_counter()
         backend = self.backends[0] if self.backends else None
         prepared = None
@@ -50,7 +51,9 @@ class SandboxRuntime:
             return result
         try:
             self.ensure_capabilities(request, backend)
+            self._throw_if_cancelled()
             prepared = backend.prepare(request)
+            self._throw_if_cancelled()
             self._emit_trace(
                 TraceEventType.SANDBOX_PREPARED,
                 request=request,
@@ -65,6 +68,7 @@ class SandboxRuntime:
                 summary=f"Sandbox command started in {prepared.sandbox_id}.",
             )
             result = backend.run(prepared)
+            self._throw_if_cancelled()
             try:
                 backend.cleanup(prepared)
                 result.cleanup_status = "cleaned"
@@ -102,6 +106,13 @@ class SandboxRuntime:
             )
             return result
         except Exception as exc:
+            if _is_cancellation_error(exc):
+                if prepared is not None:
+                    try:
+                        backend.cleanup(prepared)
+                    except Exception:
+                        pass
+                raise
             result = SandboxResult(
                 sandbox_id=request.sandbox_id,
                 backend_name=backend.name(),
@@ -135,6 +146,9 @@ class SandboxRuntime:
             raise SandboxCapabilityError("Backend cannot enforce memory limits.")
         if request.profile.resources.max_processes is not None and not capabilities.process_limit:
             raise SandboxCapabilityError("Backend cannot enforce process limits.")
+
+    def shutdown(self) -> None:
+        return None
 
     def build_request_from_policy(
         self,
@@ -297,6 +311,11 @@ class SandboxRuntime:
             else [],
         )
 
+    def _throw_if_cancelled(self) -> None:
+        token = getattr(self, "cancellation_token", None)
+        if token is not None and hasattr(token, "throw_if_cancelled"):
+            token.throw_if_cancelled()
+
     @staticmethod
     def _profile_name(command_request: Any) -> SandboxProfileName:
         purpose = getattr(getattr(command_request, "purpose", None), "value", "")
@@ -313,3 +332,7 @@ class SandboxRuntime:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _is_cancellation_error(exc: BaseException) -> bool:
+    return type(exc).__name__ == "CancellationError" and getattr(exc, "code", None) == "cancelled"

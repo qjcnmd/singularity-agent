@@ -236,6 +236,7 @@ class ModelRuntime:
         )
 
     def run_turn(self, request: ModelTurnRequest) -> ModelTurnResult:
+        _throw_if_cancelled(self)
         self.turn_count += 1
         started = time.perf_counter()
         request = self._normalize_request(request)
@@ -356,6 +357,8 @@ class ModelRuntime:
             event_ids.extend(self._emit_request_failed(request, error))
             return self._failed_result(request, status=ModelTurnStatus.FAILED, error=error, event_ids=event_ids, started=started)
         except Exception as exc:
+            if _is_cancellation_error(exc):
+                raise
             error = ModelError(
                 kind=ModelErrorKind.UNKNOWN_PROVIDER_ERROR,
                 message=str(exc),
@@ -371,6 +374,7 @@ class ModelRuntime:
         provider: ModelProvider,
         request: ModelTurnRequest,
     ) -> ProviderResponse:
+        _throw_if_cancelled(self)
         policy = RetryPolicy(
             max_attempts=max(1, request.budget.max_retries + 1),
             backoff_seconds=float(self.config.retry_policy.get("backoff_seconds", 0.25)),
@@ -382,6 +386,7 @@ class ModelRuntime:
         controller = ModelRetryController(policy)
 
         def operation(model_name: str | None) -> ProviderResponse:
+            _throw_if_cancelled(self)
             preferences = request.model_preferences
             if model_name is not None:
                 preferences = preferences.__class__.from_dict(
@@ -415,6 +420,7 @@ class ModelRuntime:
         finish_reason = "stop"
         usage = ModelUsage()
         for event in provider.stream(provider_request):
+            _throw_if_cancelled(self)
             if event.type == ProviderStreamEventType.ERROR:
                 if isinstance(event.error, ModelError):
                     raise event.error
@@ -757,3 +763,13 @@ def _hash_text(text: str) -> str:
     import hashlib
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _throw_if_cancelled(runtime: Any) -> None:
+    token = getattr(runtime, "cancellation_token", None)
+    if token is not None and hasattr(token, "throw_if_cancelled"):
+        token.throw_if_cancelled()
+
+
+def _is_cancellation_error(exc: BaseException) -> bool:
+    return type(exc).__name__ == "CancellationError" and getattr(exc, "code", None) == "cancelled"

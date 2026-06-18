@@ -51,6 +51,7 @@ class ExecutionBackend:
         cwd: Path,
         env: dict[str, str],
         collector: OutputCollector,
+        cancellation_token: object | None = None,
     ) -> BackendRunResult:
         raise NotImplementedError
 
@@ -76,6 +77,7 @@ class SandboxBackend(ExecutionBackend):
         cwd: Path,
         env: dict[str, str],
         collector: OutputCollector,
+        cancellation_token: object | None = None,
     ) -> BackendRunResult:
         return BackendRunResult(
             exit_code=None,
@@ -98,6 +100,7 @@ class LocalProcessBackend(ExecutionBackend):
         cwd: Path,
         env: dict[str, str],
         collector: OutputCollector,
+        cancellation_token: object | None = None,
     ) -> BackendRunResult:
         running = self.start(
             request=request,
@@ -115,6 +118,7 @@ class LocalProcessBackend(ExecutionBackend):
         return self._monitor_until_exit(
             running,
             limits=request.resource_limits,
+            cancellation_token=cancellation_token,
         )
 
     def start(
@@ -214,6 +218,7 @@ class LocalProcessBackend(ExecutionBackend):
         running: RunningProcess,
         *,
         limits: ResourceLimits,
+        cancellation_token: object | None = None,
     ) -> BackendRunResult:
         process = running.process
         if process is None:
@@ -226,6 +231,12 @@ class LocalProcessBackend(ExecutionBackend):
         killed_reason: str | None = None
 
         while True:
+            try:
+                _throw_if_cancelled(cancellation_token)
+            except Exception:
+                killed_reason = "cancelled"
+                self.supervisor.kill_process_tree(process, reason=killed_reason)
+                raise
             saw_output = self._drain_available_output(running)
             if saw_output:
                 last_output = time.perf_counter()
@@ -387,3 +398,8 @@ def _reader_thread(
     thread = threading.Thread(target=run, name=f"command-{stream_name}-reader", daemon=True)
     thread.start()
     return thread
+
+
+def _throw_if_cancelled(cancellation_token: object | None) -> None:
+    if cancellation_token is not None and hasattr(cancellation_token, "throw_if_cancelled"):
+        cancellation_token.throw_if_cancelled()

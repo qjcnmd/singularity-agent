@@ -52,6 +52,7 @@ class Settings(BaseModel):
 class ProductionRuntimeConfig:
     project_root: Path
     max_turns: int = 8
+    profile: str | None = None
     approval_mode: ApprovalMode = ApprovalMode.AUTO_SAFE
     strict: bool = False
     dry_run: bool = False
@@ -68,6 +69,7 @@ class ProductionRuntimeConfig:
         *,
         project_root: Path | str,
         max_turns: int = 8,
+        profile: str | None = None,
         approval_mode: ApprovalMode | str = ApprovalMode.AUTO_SAFE,
         strict: bool = False,
         dry_run: bool = False,
@@ -81,6 +83,7 @@ class ProductionRuntimeConfig:
         return cls(
             project_root=Path(project_root).expanduser().resolve(strict=False),
             max_turns=max_turns,
+            profile=profile,
             approval_mode=_approval_mode(approval_mode),
             strict=strict,
             dry_run=dry_run,

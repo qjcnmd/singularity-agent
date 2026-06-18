@@ -54,6 +54,7 @@ class MiniAgent:
         tool_runtime: ToolRuntime,
         protocol_runtime: ToolCallingProtocolRuntime,
         instruction_runtime: InstructionRuntime,
+        context_manager: ContextManager | None = None,
         context_db_path: Path | None = None,
         strict: bool = False,
     ) -> None:
@@ -82,6 +83,7 @@ class MiniAgent:
         self.tool_runtime = tool_runtime
         self.protocol_runtime = protocol_runtime
         self.instruction_runtime = instruction_runtime
+        self.context_manager = context_manager
         self.context_db_path = context_db_path
         self.strict = strict
 
@@ -89,17 +91,21 @@ class MiniAgent:
         planner = self.planner
         if planner.state is None:
             planner.start_task(user_goal)
-        context = ContextManager(
-            system_prompt=SYSTEM_PROMPT,
-            user_goal=user_goal,
-            provider=self.provider,
-            model_runtime=self.model_runtime,
-            run_id=self.trace.run_id,
-            session_id=getattr(planner, "session_id", self.trace.run_id),
-            task_id=getattr(planner, "task_id", self.trace.run_id),
-            db_path=self.context_db_path or self._context_db_path(),
-            trace=self.trace,
-        )
+        context = self.context_manager
+        if context is None:
+            context = ContextManager(
+                system_prompt=SYSTEM_PROMPT,
+                user_goal=user_goal,
+                provider=self.provider,
+                model_runtime=self.model_runtime,
+                run_id=self.trace.run_id,
+                session_id=getattr(planner, "session_id", self.trace.run_id),
+                task_id=getattr(planner, "task_id", self.trace.run_id),
+                db_path=self.context_db_path or self._context_db_path(),
+                trace=self.trace,
+            )
+        else:
+            context.user_goal = user_goal
         model_runtime = self.model_runtime
         instruction_runtime = self.instruction_runtime
         tool_schemas = self.tools.openai_tools(strict=self.strict)

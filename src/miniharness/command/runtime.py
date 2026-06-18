@@ -164,6 +164,7 @@ class CommandRuntime:
         tool_call_id: str | None = None,
         transaction_id: str | None = None,
     ) -> CommandResult:
+        self._throw_if_cancelled()
         self._emit_trace(
             TraceEventType.COMMAND_REQUESTED,
             request,
@@ -283,7 +284,7 @@ class CommandRuntime:
             tool_call_id=tool_call_id,
             transaction_id=transaction_id,
         )
-        backend_result = self.backend.execute(
+        backend_result = self._execute_backend(
             request=request,
             cwd=cwd,
             env=env_result.env,
@@ -332,6 +333,7 @@ class CommandRuntime:
         tool_call_id: str | None = None,
         transaction_id: str | None = None,
     ) -> ProcessSession:
+        self._throw_if_cancelled()
         started_at = _now()
         decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
         policy_request = self._policy_request(request)
@@ -432,6 +434,7 @@ class CommandRuntime:
         return session
 
     def read_process_output(self, process_id: str) -> ProcessOutput:
+        self._throw_if_cancelled()
         record = self._sessions.get(process_id)
         if record is None:
             return ProcessOutput(
@@ -537,6 +540,42 @@ class CommandRuntime:
                 )
             )
         return sessions
+
+    def stop(self) -> None:
+        for session in self.list_processes():
+            if session.status == "running":
+                self.stop_process(session.process_id)
+
+    def _execute_backend(
+        self,
+        *,
+        request: CommandRequest,
+        cwd: Path,
+        env: dict[str, str],
+        collector: OutputCollector,
+    ) -> BackendRunResult:
+        try:
+            return self.backend.execute(
+                request=request,
+                cwd=cwd,
+                env=env,
+                collector=collector,
+                cancellation_token=getattr(self, "cancellation_token", None),
+            )
+        except TypeError as exc:
+            if "cancellation_token" not in str(exc):
+                raise
+            return self.backend.execute(
+                request=request,
+                cwd=cwd,
+                env=env,
+                collector=collector,
+            )
+
+    def _throw_if_cancelled(self) -> None:
+        token = getattr(self, "cancellation_token", None)
+        if token is not None and hasattr(token, "throw_if_cancelled"):
+            token.throw_if_cancelled()
 
     def _completed_result(
         self,

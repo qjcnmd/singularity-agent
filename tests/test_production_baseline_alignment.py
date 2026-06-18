@@ -61,6 +61,7 @@ def test_cli_help_exposes_production_baseline_options_without_legacy_copy() -> N
     assert "read-only agent loop" not in output.lower()
     for option in [
         "--max-turns",
+        "--profile",
         "--approval-mode",
         "--trace-dir",
         "--context-db",
@@ -79,6 +80,7 @@ def test_production_runtime_config_maps_cli_policy_and_model_overrides(tmp_path:
     config = ProductionRuntimeConfig.from_cli(
         project_root=tmp_path,
         max_turns=3,
+        profile="local-dev",
         approval_mode="read_only",
         strict=True,
         dry_run=True,
@@ -91,6 +93,7 @@ def test_production_runtime_config_maps_cli_policy_and_model_overrides(tmp_path:
     )
 
     assert config.max_turns == 3
+    assert config.profile == "local-dev"
     assert config.approval_mode == ApprovalMode.READ_ONLY
     assert config.strict is True
     assert config.dry_run is True

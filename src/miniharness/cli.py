@@ -7,30 +7,12 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from miniharness.agent import MiniAgent
-from miniharness.command import CommandRuntime
 from miniharness.config import ProductionRuntimeConfig
-from miniharness.instructions import InstructionRuntime
-from miniharness.model import (
-    ModelProviderRegistry,
-    ModelRuntime,
-    OpenAICompatibleModelProvider,
-)
-from miniharness.observability import TraceRuntime, TraceStore
-from miniharness.policy import ApprovalGate, ApprovalMode, PolicyRuntime
+from miniharness.kernel import CancellationError, KernelBootstrap
+from miniharness.observability import TraceStore
+from miniharness.policy import ApprovalMode
 from miniharness.planner import PlannerRuntime
-from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
-from miniharness.tool_protocol.state import ToolProtocolStateStore
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from miniharness.tools.command import register_command_tools
-from miniharness.tools.mutation import register_mutation_tools
-from miniharness.tools.verification import register_verification_tools
-from miniharness.tools.workspace_state import register_workspace_state_tools
-from miniharness.verification import VerificationRuntime
-from miniharness.workspace import MutationRuntime
 from miniharness.workspace_state import (
-    LocalWorkspaceStateRuntime,
-    RecoveryStatus,
     WorkspaceHealthReport,
 )
 
@@ -61,6 +43,13 @@ def main(
             help="Maximum number of model turns before stopping.",
         ),
     ] = 8,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            help="Label this run with a runtime profile name for trace and final report summaries.",
+        ),
+    ] = None,
     resume_session: Annotated[
         str | None,
         typer.Option(
@@ -133,6 +122,7 @@ def main(
     runtime_config = ProductionRuntimeConfig.from_cli(
         project_root=project_root,
         max_turns=max_turns,
+        profile=profile,
         approval_mode=approval_mode,
         strict=strict,
         dry_run=dry_run,
@@ -143,155 +133,74 @@ def main(
         raw_artifacts=raw_artifacts,
         resume_session=resume_session,
     )
-    trace = TraceRuntime.create(
-        project_root,
-        run_id=runtime_config.resume_session,
-        session_id=runtime_config.resume_session,
-        trace_dir=runtime_config.trace_dir,
-    )
-    trace.record(
-        "user_goal",
-        {
-            "goal": goal,
-            "project_root": str(project_root),
-            "max_turns": runtime_config.max_turns,
-            "resume_session": runtime_config.resume_session,
-            "approval_mode": runtime_config.approval_mode.value,
-            "strict": runtime_config.strict,
-            "dry_run": runtime_config.dry_run,
-            "raw_artifacts": runtime_config.raw_artifacts,
-        },
-    )
-
-    console.print(f"[bold]run_id[/bold] {trace.run_id}")
-    console.print(f"[bold]trace[/bold] {trace.store.run_dir}")
-
-    state_runtime = LocalWorkspaceStateRuntime(project_root, trace=trace)
-    recovery = state_runtime.recover_session(runtime_config.resume_session)
-    resume_health: WorkspaceHealthReport | None = None
-    if recovery.status != RecoveryStatus.CLEAN:
-        console.print(
-            f"[yellow]workspace recovery[/yellow] {recovery.status.value} "
-            f"session={recovery.session_id}"
-        )
-    if runtime_config.resume_session:
-        resume_health = state_runtime.get_workspace_health()
-        if state_runtime.baseline is not None:
-            console.print(
-                f"[bold]workspace baseline[/bold] {state_runtime.baseline.baseline_id} "
-                f"files={len(state_runtime.baseline.snapshots)}"
-            )
-    else:
-        baseline = state_runtime.begin_session(task_id=trace.run_id, session_id=trace.run_id)
-        console.print(
-            f"[bold]workspace baseline[/bold] {baseline.baseline_id} "
-            f"files={len(baseline.snapshots)}"
-        )
-    session_status = "interrupted"
-    final_health: WorkspaceHealthReport | None = None
+    kernel = None
     try:
-        settings = runtime_config.to_settings()
-        model_config = runtime_config.to_model_runtime_config()
-        tools = ToolRegistry(project_root)
-        model_provider = OpenAICompatibleModelProvider(
-            settings,
-            timeout_seconds=model_config.request_timeout_seconds,
-        )
-        model_registry = ModelProviderRegistry(
-            default_provider_name=model_config.default_provider
-        )
-        model_registry.register(model_provider)
-        model_runtime = ModelRuntime(
-            registry=model_registry,
-            tool_registry=tools,
-            config=model_config,
-            trace=trace,
-        )
-        planner = create_or_resume_planner(
-            workspace_root=project_root,
-            session_id=resume_session,
-            task_id=trace.run_id,
-            user_goal=goal,
-            trace=trace,
-            workspace_health=resume_health or state_runtime.get_workspace_health(),
-        )
-        policy_config = runtime_config.to_policy_config()
-        policy_runtime = PolicyRuntime(policy_config, trace=trace)
-        approval_gate = ApprovalGate(policy_config, trace=trace)
-        command_runtime = CommandRuntime(
-            project_root,
-            trace=trace,
-            state_runtime=state_runtime,
-            planner=planner,
-            policy_runtime=policy_runtime,
-        )
-        register_mutation_tools(
-            tools,
-            MutationRuntime(
-                project_root,
-                trace=trace,
-                state_runtime=state_runtime,
-                planner=planner,
-                policy_runtime=policy_runtime,
-            ),
-        )
-        register_command_tools(tools, command_runtime)
-        register_workspace_state_tools(tools, state_runtime)
-        register_verification_tools(
-            tools,
-            VerificationRuntime(
-                project_root,
-                command_runtime=command_runtime,
-                trace=trace,
-                planner=planner,
-                policy_runtime=policy_runtime,
-            ),
-        )
-        tool_runtime = ToolRuntime(
-            registry=tools,
-            policy=ToolPolicy.coding_agent(),
-            trace=trace,
-            workspace_root=project_root,
-            planner=planner,
-            policy_runtime=policy_runtime,
-            approval_gate=approval_gate,
-            dry_run=runtime_config.dry_run,
-        )
-        protocol_runtime = ToolCallingProtocolRuntime(
-            registry=tools,
-            trace=trace,
-            state_store=ToolProtocolStateStore(trace.store.run_dir / "tool_protocol.sqlite3"),
-            workspace_state_hook=_workspace_state_context_hook(state_runtime),
-        )
-        instruction_runtime = InstructionRuntime(workspace_root=project_root, trace=trace)
-        context_db_path = runtime_config.context_db_path(trace.store.run_dir)
-        agent = MiniAgent(
-            model_runtime=model_runtime,
-            tools=tools,
-            trace=trace,
+        kernel = KernelBootstrap(
+            project_root=project_root,
+            config=runtime_config,
             console=console,
-            max_turns=runtime_config.max_turns,
-            planner=planner,
-            policy_runtime=policy_runtime,
-            tool_runtime=tool_runtime,
-            protocol_runtime=protocol_runtime,
-            instruction_runtime=instruction_runtime,
-            context_db_path=context_db_path,
-            strict=runtime_config.strict,
+        ).boot(goal)
+        kernel.graph.trace.record(
+            "user_goal",
+            {
+                "goal": goal,
+                "project_root": str(project_root),
+                "max_turns": runtime_config.max_turns,
+                "profile": runtime_config.profile,
+                "resume_session": runtime_config.resume_session,
+                "approval_mode": runtime_config.approval_mode.value,
+                "strict": runtime_config.strict,
+                "dry_run": runtime_config.dry_run,
+                "raw_artifacts": runtime_config.raw_artifacts,
+            },
         )
-        final_answer = agent.run(goal)
-        state_runtime.record_external_changes()
-        final_health = state_runtime.get_workspace_health()
-        session_status = "closed"
+        console.print(f"[bold]run_id[/bold] {kernel.context.identity.run_id}")
+        console.print(f"[bold]trace[/bold] {kernel.graph.trace.store.run_dir}")
+        if kernel.recovery_report and kernel.recovery_report.recovered:
+            console.print(
+                "[yellow]workspace recovery[/yellow] "
+                + json_dumps(kernel.recovery_report.to_dict())
+            )
+        if kernel.graph.workspace_state.baseline is not None:
+            baseline = kernel.graph.workspace_state.baseline
+            console.print(
+                f"[bold]workspace baseline[/bold] {baseline.baseline_id} "
+                f"files={len(baseline.snapshots)}"
+            )
+        result = kernel.run_task(goal)
+        final_answer = result.final_answer
+        final_report = result.final_report
+        final_health = kernel.graph.workspace_state.get_workspace_health()
     except Exception as exc:
-        trace.record("error", {"type": type(exc).__name__, "message": str(exc)})
-        console.print(f"[red]error[/red] {exc}")
+        if isinstance(exc, CancellationError):
+            console.print(f"[yellow]cancelled[/yellow] {exc}")
+        else:
+            console.print(f"[red]error[/red] {exc}")
+        report = getattr(exc, "final_report", None)
+        if report is not None:
+            console.print(
+                Panel(
+                    json_dumps(report.to_dict()),
+                    title="final report",
+                    border_style="yellow",
+                )
+            )
+        elif kernel is not None:
+            try:
+                console.print(
+                    Panel(
+                        json_dumps(kernel.final_report().to_dict()),
+                        title="final report",
+                        border_style="yellow",
+                    )
+                )
+            except Exception as report_exc:
+                console.print(f"[yellow]final report unavailable[/yellow] {report_exc}")
         raise typer.Exit(1) from exc
-    finally:
-        state_runtime.close_session(status=session_status)
 
     console.print(Panel(final_answer, title="final answer", border_style="green"))
-    console.print(_workspace_health_panel(final_health or state_runtime.get_workspace_health()))
+    console.print(Panel(json_dumps(final_report.to_dict()), title="final report", border_style="green"))
+    console.print(_workspace_health_panel(final_health))
 
 
 def workspace_health_summary(health: WorkspaceHealthReport) -> str:
@@ -342,15 +251,6 @@ def _workspace_health_panel(health: WorkspaceHealthReport) -> Panel:
 
 def _format_list(values: list[str]) -> str:
     return ", ".join(values) if values else "-"
-
-
-def _workspace_state_context_hook(state_runtime: LocalWorkspaceStateRuntime):
-    def hook(context, *, batch, tool_call_id: str | None) -> None:
-        _ = batch, tool_call_id
-        state_runtime.record_external_changes()
-        context.add_workspace_state(state_runtime.get_workspace_health().to_observation())
-
-    return hook
 
 
 @trace_app.command("list")

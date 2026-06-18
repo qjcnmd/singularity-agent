@@ -66,6 +66,7 @@ class PlannerRuntime:
         constraints: list[str] | None = None,
         assumptions: list[str] | None = None,
     ) -> TaskState:
+        self._throw_if_cancelled()
         self.state = TaskState(
             task_id=self.task_id,
             session_id=self.session_id,
@@ -90,6 +91,7 @@ class PlannerRuntime:
         return self.state
 
     def step(self) -> AgentAction:
+        self._throw_if_cancelled()
         state = self._state()
         plan = self._plan()
         self._auto_advance_before_step()
@@ -122,6 +124,7 @@ class PlannerRuntime:
         spec: ToolSpec,
         arguments: dict[str, Any] | None = None,
     ) -> AuthorizationDecision:
+        self._throw_if_cancelled()
         state = self._state()
         plan = self._plan()
         phase = plan.phase(state.current_phase)
@@ -190,6 +193,7 @@ class PlannerRuntime:
         result: ToolResult | dict[str, Any],
         action_id: str | None = None,
     ) -> None:
+        self._throw_if_cancelled()
         state = self._state()
         BudgetController(self.budget).record_tool_call()
         payload = result.model_dump(mode="json") if isinstance(result, ToolResult) else result
@@ -237,6 +241,7 @@ class PlannerRuntime:
     def update_from_mutation(
         self, result: Any, *, tool_call_id: str | None = None
     ) -> None:
+        self._throw_if_cancelled()
         payload = self._content_payload(result)
         if payload.get("mutation_status") not in {None, "preview"}:
             changed_files = list(payload.get("changed_files") or [])
@@ -267,6 +272,7 @@ class PlannerRuntime:
     def update_from_command(
         self, result: Any, *, tool_call_id: str | None = None
     ) -> None:
+        self._throw_if_cancelled()
         payload = self._content_payload(result)
         command = payload.get("command_result") if isinstance(payload.get("command_result"), dict) else payload
         if isinstance(command, dict):
@@ -290,6 +296,7 @@ class PlannerRuntime:
     def update_from_verification(
         self, result: Any, *, tool_call_id: str | None = None
     ) -> None:
+        self._throw_if_cancelled()
         payload = self._content_payload(result)
         verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else payload
         if not isinstance(verification, dict):
@@ -394,6 +401,7 @@ class PlannerRuntime:
         return f"[sandbox] {prefix} in isolated copy-on-write workspace via {backend}, exit_code={exit_code}."
 
     def record_policy_observation(self, observation: dict[str, Any]) -> None:
+        self._throw_if_cancelled()
         state = self._state()
         payload = {
             "outcome": observation.get("outcome"),
@@ -420,6 +428,7 @@ class PlannerRuntime:
         )
 
     def record_instruction_prompt_observation(self, observation: dict[str, Any]) -> None:
+        self._throw_if_cancelled()
         payload = {
             "prompt_bundles_compiled_count": int(observation.get("prompt_bundles_compiled_count") or 0),
             "project_instruction_files_loaded_count": int(observation.get("project_instruction_files_loaded_count") or 0),
@@ -440,6 +449,7 @@ class PlannerRuntime:
         )
 
     def replan(self, signal: dict[str, Any]) -> ReplanDecision:
+        self._throw_if_cancelled()
         state = self._state()
         fingerprint = signal.get("failure_fingerprint")
         if fingerprint:
@@ -479,6 +489,7 @@ class PlannerRuntime:
         return decision
 
     def assess_completion(self) -> dict[str, Any]:
+        self._throw_if_cancelled()
         state = self._state()
         unmet: list[str] = []
         if state.completion_criteria.required_files_inspected and not self.evidence.inspected_files:
@@ -511,6 +522,7 @@ class PlannerRuntime:
         return assessment
 
     def finalize(self) -> FinalReport:
+        self._throw_if_cancelled()
         trace_summary = (
             self.trace.final_report_summary(task_id=self.task_id)
             if self.trace is not None and hasattr(self.trace, "final_report_summary")
@@ -551,6 +563,7 @@ class PlannerRuntime:
         *,
         workspace_health: dict[str, Any] | None = None,
     ) -> "PlannerRuntime":
+        self._throw_if_cancelled()
         state, plan, evidence, budget, final_report = self.store.load(session_id)
         self.session_id = session_id
         self.task_id = state.task_id
@@ -575,6 +588,7 @@ class PlannerRuntime:
         return self
 
     def abort(self, reason: str = "aborted") -> TaskState:
+        self._throw_if_cancelled()
         state = self._state()
         state.status = TaskStatus.FAILED
         state.blocked_reasons.append(reason)
@@ -594,6 +608,7 @@ class PlannerRuntime:
         }
 
     def filtered_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self._throw_if_cancelled()
         allowed = set(self._plan().phase(self._state().current_phase).allowed_tools)
         return [
             tool
@@ -797,6 +812,11 @@ class PlannerRuntime:
         if self.state is None:
             raise RuntimeError("Planner task has not started.")
         return self.state
+
+    def _throw_if_cancelled(self) -> None:
+        token = getattr(self, "cancellation_token", None)
+        if token is not None and hasattr(token, "throw_if_cancelled"):
+            token.throw_if_cancelled()
 
     def _plan(self) -> TaskPlan:
         if self.plan is None:

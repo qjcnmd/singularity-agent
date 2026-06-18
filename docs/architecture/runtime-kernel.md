@@ -1,0 +1,142 @@
+# Runtime Kernel / Session Lifecycle Runtime
+
+MiniHarness now has a runtime kernel layer in `src/miniharness/kernel/`. The kernel is the process-level control plane: it owns boot, runtime graph assembly, run/session lifecycle, workspace locking, cancellation, shutdown, crash recovery, health checks, and final report aggregation. PlannerRuntime remains focused on task planning and completion evidence; it no longer owns system lifecycle.
+
+## CLI Entry
+
+The CLI path is:
+
+```text
+CLI -> KernelBootstrap -> AgentKernel -> MiniAgent -> PlannerRuntime
+```
+
+`src/miniharness/cli.py` still parses user flags into `ProductionRuntimeConfig`, but runtime construction is delegated to `KernelBootstrap`. The CLI then calls `AgentKernel.run_task()` and prints both the model final answer and the kernel `FinalReport`.
+
+Supported CLI inputs still flow through the config object:
+
+- `--max-turns`
+- `--profile`
+- `--resume`
+- `--approval-mode`, including `read_only`
+- `--trace-dir`
+- `--context-db`
+- `--model`
+- `--base-url`
+- `--raw-artifacts`
+- `--dry-run`
+- `--strict`
+
+## RuntimeGraph
+
+`RuntimeFactory` builds a `RuntimeGraph` in this declared order:
+
+1. Configuration
+2. Observability
+3. WorkspaceState
+4. Policy
+5. Sandbox
+6. Command
+7. Mutation
+8. Tools
+9. Verification
+10. Instructions
+11. Model
+12. Context
+13. Planner
+
+Each component is recorded as `runtime.initialized` in trace. The graph creates `ContextManager` before Planner, then `AgentKernel` passes that context into `MiniAgent`. Command, Mutation, Tool, and Verification runtimes are wired back to the session PlannerRuntime after Planner creation so execution evidence still lands in the existing planner ledger.
+
+## Lifecycle
+
+`RunLifecycleManager` creates `AgentRun`, `AgentSession`, and `LifecycleEvent` records for:
+
+- `lifecycle.run.started`
+- `lifecycle.session.started`
+- `lifecycle.task.started`
+- run completed, failed, or cancelled
+
+Lifecycle events are written to trace and summarized into `FinalReport.lifecycle_summary`.
+
+## Cancellation
+
+`CancellationManager` owns a root `CancellationToken` and child tokens. `AgentKernel` attaches child tokens to Planner, Model, Command, Sandbox, and Verification runtime objects so downstream layers can honor cancellation without owning process shutdown.
+
+`KeyboardInterrupt` is converted into:
+
+```text
+Ctrl+C -> kernel.cancel(user_interrupted) -> graceful shutdown -> finalization path
+```
+
+No KeyboardInterrupt path is expected to bypass shutdown/finalization.
+
+Shutdown also cancels the root token, so later Planner, Model, Command, Sandbox, and Verification entrypoints fail through their cancellation checks instead of accepting new actions.
+
+## Workspace Lock
+
+`WorkspaceLockManager` stores its default lock at:
+
+```text
+.miniharness/locks/workspace.lock
+```
+
+Behavior:
+
+- write mode blocks all concurrent runs
+- read-only mode allows shared read-only holders
+- stale locks are detected by timestamp and PID liveness; stale-lock facts are retained in the recovery report even when acquiring a new lock has to remove the stale file
+- lock state is independent of Git
+- shutdown releases the active holder even if previous cleanup steps fail
+
+## Health Check
+
+`RuntimeHealthChecker` checks config, trace, workspace, policy, sandbox, command, mutation, tools, verification, instructions, model, and planner. Missing components become diagnostics; critical missing components fail closed. Results are written to trace as `runtime.health_checked` and included in `FinalReport.runtime_health_summary`.
+
+## Shutdown
+
+`ShutdownManager` executes cleanup in this order and continues after failures:
+
+```text
+stop planner
+-> reject actions
+-> cancel model
+-> terminate commands
+-> terminate sandbox
+-> finalize mutations
+-> checkpoint
+-> flush trace
+-> write report
+-> release lock
+```
+
+The `write report` step generates a kernel final report before lock release. After all cleanup steps finish, `AgentKernel` refreshes the in-memory report with the full shutdown summary. The cleanup result is included in `FinalReport.shutdown_summary`.
+
+## Recovery
+
+`CrashRecoveryManager` checks for stale workspace locks, incomplete trace spans, recoverable workspace-state sessions, unfinished mutation journals, leftover sandboxes, and running process records. Recovery marks mutation journals with `recovered.json`, cleans leftover sandbox directories, stops recorded running command sessions, and repairs trace spans when the trace store supports it. It does not automatically continue an unfinished planner action. The recovery result is included in `FinalReport.recovery_summary`.
+
+Bootstrap failures still release the workspace lock and carry a partial kernel `FinalReport` on `KernelBootstrapError`; the CLI prints that report before exiting.
+
+## FinalReport
+
+The kernel-level `FinalReport` includes:
+
+- `run_id`
+- `session_id`
+- `task_id`
+- `kernel_status`
+- `shutdown_reason`
+- `diagnostics_count`
+- `cleanup_status`
+- `recovered_previous_run`
+- `uncertain_transactions`
+- `workspace_lock_status`
+- `runtime_health_summary`
+- `shutdown_summary`
+- `recovery_summary`
+- `lifecycle_summary`
+
+Planner `FinalReport` also accepts the four new summary fields so planner-level reports can carry kernel summaries when needed. All final report payloads go through trace redaction before serialization.
+
+## Extension Points
+
+This layer is ready to support later daemon, TUI, remote attach, external supervisor, and multi-session capabilities because runtime construction and process lifecycle now sit above PlannerRuntime instead of inside the CLI command body.
