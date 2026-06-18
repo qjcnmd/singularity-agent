@@ -1,7 +1,7 @@
 [project]
 name = "miniharness"
-version = "0.0.17"
-description = "A minimal local coding agent harness with production-grade instruction, prompt, model, planner, policy, tool, context, workspace state, mutation, command, verification, sandbox, and observability runtime slices."
+version = "0.1.0"
+description = "A production-grade local CLI coding agent harness."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

@@ -325,29 +325,123 @@ class ContextManager:
         self,
         envelope: "ToolProtocolResultEnvelope | dict[str, Any]",
     ) -> ToolObservation:
-        payload = envelope if isinstance(envelope, dict) else envelope.to_dict()
-        tool_call = {
-            "id": payload.get("tool_call_id"),
-            "type": "function",
-            "function": {
-                "name": payload.get("tool_name"),
-                "arguments": "{}",
-            },
-        }
-        result = dict(payload)
-        result["ok"] = bool(payload.get("ok"))
-        result.setdefault("content", payload.get("content_preview") or "")
-        result["metadata"] = {
-            "tool_name": payload.get("tool_name"),
+        from miniharness.tool_protocol.models import ToolProtocolResultEnvelope
+
+        result_envelope = (
+            ToolProtocolResultEnvelope.from_dict(envelope)
+            if isinstance(envelope, dict)
+            else envelope
+        )
+        payload = result_envelope.to_dict()
+        preview = str(payload.get("content_preview") or "")
+        sensitivity = self.classifier.classify(payload)
+        rendered_preview = (
+            self.redactor.redact_text(preview)
+            if sensitivity in {ContextSensitivity.SECRET, ContextSensitivity.SENSITIVE}
+            else preview
+        )
+        raw_digest = digest_value(payload)
+        metadata = {
             "status": payload.get("status"),
-            "observation_id": payload.get("observation_id"),
             "policy_decision_id": payload.get("policy_decision_id"),
             "approval_grant_id": payload.get("approval_grant_id"),
             "truncated": bool(payload.get("truncated")),
-            "redacted": bool(payload.get("redacted")),
-            **dict(payload.get("metadata") or {}),
+            "redacted": True,
+            "result_ref": payload.get("raw_result_ref"),
+            **{
+                key: value
+                for key, value in dict(payload.get("metadata") or {}).items()
+                if key not in {"raw_result", "raw_args", "raw_arguments", "result"}
+            },
         }
-        observation = self.add_tool_result(tool_call=tool_call, result=result)
+        observation = ToolObservation(
+            id=uuid4().hex,
+            run_id=self.run_id,
+            turn=0,
+            tool_name=str(payload.get("tool_name") or "<unknown>"),
+            tool_call_id=payload.get("tool_call_id"),
+            ok=bool(payload.get("ok")),
+            raw_result={
+                "tool_call_id": payload.get("tool_call_id"),
+                "tool_name": payload.get("tool_name"),
+                "status": payload.get("status"),
+                "ok": bool(payload.get("ok")),
+                "content": rendered_preview,
+                "content_preview": rendered_preview,
+                "content_digest": payload.get("content_digest"),
+                "result_ref": payload.get("raw_result_ref"),
+                "artifact_refs": list(payload.get("artifact_refs") or []),
+                "error_code": payload.get("error_code"),
+                "error_kind": payload.get("error_kind"),
+                "observation_id": payload.get("observation_id"),
+                "policy_decision_id": payload.get("policy_decision_id"),
+                "approval_grant_id": payload.get("approval_grant_id"),
+                "truncated": bool(payload.get("truncated")),
+                "redacted": True,
+                "metadata": metadata,
+            },
+            preview=rendered_preview,
+            truncated=bool(payload.get("truncated")),
+            metadata=metadata,
+            created_at=self._now(),
+            input_tokens=0,
+            preview_tokens=self.token_counter.count_text(rendered_preview),
+            raw_digest=raw_digest,
+            source_refs=[
+                ContextReference(
+                    ref_id=str(ref),
+                    ref_type="artifact",
+                    target=str(ref),
+                    source_item_id="",
+                )
+                for ref in list(payload.get("artifact_refs") or [])
+            ],
+            cache_hit=bool(metadata.get("cache_hit")),
+            duration_seconds=metadata.get("duration_seconds"),
+            error_code=payload.get("error_code"),
+            tool_version=metadata.get("tool_version"),
+            truncation_reason="tool_result" if payload.get("truncated") else None,
+            sensitivity=sensitivity,
+        )
+        self.tool_observations.append(observation)
+        self.store.save_observation(observation)
+        tool_message = self._tool_message(observation)
+        self._messages.append(tool_message)
+        self.store.append_message(run_id=self.run_id, message=tool_message)
+        self.add_context_item(
+            self._make_item(
+                item_id=observation.id,
+                layer=ContextLayer.TOOL_OBSERVATIONS,
+                source_runtime=ContextRuntime.TOOL_PROTOCOL,
+                item_type=ContextItemType.TOOL_OBSERVATION,
+                content=tool_message,
+                authority=ContextAuthority.TOOL,
+                sensitivity=sensitivity,
+                importance=0.7 if observation.ok else 0.9,
+                references=observation.source_refs,
+                metadata={
+                    "tool_name": observation.tool_name,
+                    "tool_call_id": observation.tool_call_id,
+                    "ok": observation.ok,
+                    "raw_digest": raw_digest,
+                    "error_code": observation.error_code,
+                    "truncated": observation.truncated,
+                    "result_ref": payload.get("raw_result_ref"),
+                },
+            )
+        )
+        self._emit_context_event(
+            "context.item_added",
+            {
+                "tool_name": observation.tool_name,
+                "tool_call_id": observation.tool_call_id,
+                "ok": observation.ok,
+                "preview_tokens": observation.preview_tokens,
+                "raw_digest": raw_digest,
+                "sensitivity": sensitivity.value,
+                "source_runtime": ContextRuntime.TOOL_PROTOCOL.value,
+            },
+        )
         return observation
 
     def add_synthetic_tool_error(

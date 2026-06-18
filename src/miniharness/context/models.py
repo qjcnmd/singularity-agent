@@ -12,6 +12,7 @@ from uuid import uuid4
 class ContextRuntime(str, Enum):
     MODEL = "model"
     TOOL = "tool"
+    TOOL_PROTOCOL = "tool_protocol"
     PLANNER = "planner"
     MUTATION = "mutation"
     COMMAND = "command"

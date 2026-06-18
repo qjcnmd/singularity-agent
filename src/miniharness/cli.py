@@ -9,17 +9,19 @@ from rich.panel import Panel
 
 from miniharness.agent import MiniAgent
 from miniharness.command import CommandRuntime
-from miniharness.config import Settings
+from miniharness.config import ProductionRuntimeConfig
+from miniharness.instructions import InstructionRuntime
 from miniharness.model import (
     ModelProviderRegistry,
     ModelRuntime,
-    ModelRuntimeConfig,
     OpenAICompatibleModelProvider,
 )
 from miniharness.observability import TraceRuntime, TraceStore
-from miniharness.policy import ApprovalGate, PolicyConfig, PolicyRuntime
+from miniharness.policy import ApprovalGate, ApprovalMode, PolicyRuntime
 from miniharness.planner import PlannerRuntime
-from miniharness.tools import ToolRegistry
+from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
+from miniharness.tool_protocol.state import ToolProtocolStateStore
+from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.tools.command import register_command_tools
 from miniharness.tools.mutation import register_mutation_tools
 from miniharness.tools.verification import register_verification_tools
@@ -33,7 +35,11 @@ from miniharness.workspace_state import (
 )
 
 
-app = typer.Typer(add_completion=False, no_args_is_help=True)
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="production-grade local CLI coding agent harness",
+)
 trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 console = Console()
@@ -41,7 +47,10 @@ console = Console()
 
 @app.command()
 def main(
-    goal: Annotated[str, typer.Argument(help="User goal for the read-only agent.")],
+    goal: Annotated[
+        str,
+        typer.Argument(help="User goal for the production-grade local CLI coding agent harness."),
+    ],
     max_turns: Annotated[
         int,
         typer.Option(
@@ -55,22 +64,102 @@ def main(
     resume_session: Annotated[
         str | None,
         typer.Option(
+            "--resume",
             "--resume-session",
-            help="Resume a PlannerRuntime and workspace state session by id.",
+            help="Resume a PlannerRuntime, context, protocol, and workspace state session by id.",
         ),
     ] = None,
+    approval_mode: Annotated[
+        ApprovalMode,
+        typer.Option(
+            "--approval-mode",
+            case_sensitive=False,
+            help="Runtime approval mode: interactive, review_all, auto_safe, read_only, or non_interactive.",
+        ),
+    ] = ApprovalMode.AUTO_SAFE,
+    trace_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--trace-dir",
+            help="Directory that contains trace run/session directories.",
+        ),
+    ] = None,
+    context_db: Annotated[
+        Path | None,
+        typer.Option(
+            "--context-db",
+            help="Exact ContextStore SQLite path; defaults to the trace run directory.",
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Override MINIHARNESS_MODEL for this session.",
+        ),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option(
+            "--base-url",
+            help="Override MINIHARNESS_BASE_URL for this session.",
+        ),
+    ] = None,
+    raw_artifacts: Annotated[
+        bool,
+        typer.Option(
+            "--raw-artifacts/--no-raw-artifacts",
+            help="Store redacted raw model response artifacts.",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Block mutation, command, verification, and other side-effect tools before execution.",
+        ),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict",
+            help="Enable strict tool schema/protocol validation and redaction hardening.",
+        ),
+    ] = False,
 ) -> None:
-    """Run the minimal read-only agent loop."""
+    """Run the production-grade local CLI coding agent harness."""
 
     project_root = Path.cwd()
-    trace = TraceRuntime.create(project_root)
+    runtime_config = ProductionRuntimeConfig.from_cli(
+        project_root=project_root,
+        max_turns=max_turns,
+        approval_mode=approval_mode,
+        strict=strict,
+        dry_run=dry_run,
+        trace_dir=trace_dir,
+        context_db=context_db,
+        model=model,
+        base_url=base_url,
+        raw_artifacts=raw_artifacts,
+        resume_session=resume_session,
+    )
+    trace = TraceRuntime.create(
+        project_root,
+        run_id=runtime_config.resume_session,
+        session_id=runtime_config.resume_session,
+        trace_dir=runtime_config.trace_dir,
+    )
     trace.record(
         "user_goal",
         {
             "goal": goal,
             "project_root": str(project_root),
-            "max_turns": max_turns,
-            "resume_session": resume_session,
+            "max_turns": runtime_config.max_turns,
+            "resume_session": runtime_config.resume_session,
+            "approval_mode": runtime_config.approval_mode.value,
+            "strict": runtime_config.strict,
+            "dry_run": runtime_config.dry_run,
+            "raw_artifacts": runtime_config.raw_artifacts,
         },
     )
 
@@ -78,14 +167,14 @@ def main(
     console.print(f"[bold]trace[/bold] {trace.store.run_dir}")
 
     state_runtime = LocalWorkspaceStateRuntime(project_root, trace=trace)
-    recovery = state_runtime.recover_session(resume_session)
+    recovery = state_runtime.recover_session(runtime_config.resume_session)
     resume_health: WorkspaceHealthReport | None = None
     if recovery.status != RecoveryStatus.CLEAN:
         console.print(
             f"[yellow]workspace recovery[/yellow] {recovery.status.value} "
             f"session={recovery.session_id}"
         )
-    if resume_session:
+    if runtime_config.resume_session:
         resume_health = state_runtime.get_workspace_health()
         if state_runtime.baseline is not None:
             console.print(
@@ -101,8 +190,8 @@ def main(
     session_status = "interrupted"
     final_health: WorkspaceHealthReport | None = None
     try:
-        settings = Settings.from_env()
-        model_config = ModelRuntimeConfig.from_env()
+        settings = runtime_config.to_settings()
+        model_config = runtime_config.to_model_runtime_config()
         tools = ToolRegistry(project_root)
         model_provider = OpenAICompatibleModelProvider(
             settings,
@@ -126,7 +215,7 @@ def main(
             trace=trace,
             workspace_health=resume_health or state_runtime.get_workspace_health(),
         )
-        policy_config = PolicyConfig.runtime_default(project_root)
+        policy_config = runtime_config.to_policy_config()
         policy_runtime = PolicyRuntime(policy_config, trace=trace)
         approval_gate = ApprovalGate(policy_config, trace=trace)
         command_runtime = CommandRuntime(
@@ -158,16 +247,38 @@ def main(
                 policy_runtime=policy_runtime,
             ),
         )
+        tool_runtime = ToolRuntime(
+            registry=tools,
+            policy=ToolPolicy.coding_agent(),
+            trace=trace,
+            workspace_root=project_root,
+            planner=planner,
+            policy_runtime=policy_runtime,
+            approval_gate=approval_gate,
+            dry_run=runtime_config.dry_run,
+        )
+        protocol_runtime = ToolCallingProtocolRuntime(
+            registry=tools,
+            trace=trace,
+            state_store=ToolProtocolStateStore(trace.store.run_dir / "tool_protocol.sqlite3"),
+        )
+        instruction_runtime = InstructionRuntime(workspace_root=project_root, trace=trace)
+        context_db_path = runtime_config.context_db_path(trace.store.run_dir)
         agent = MiniAgent(
             model_runtime=model_runtime,
             tools=tools,
             trace=trace,
             console=console,
-            max_turns=max_turns,
+            max_turns=runtime_config.max_turns,
             state_runtime=state_runtime,
             planner=planner,
             policy_runtime=policy_runtime,
             approval_gate=approval_gate,
+            tool_runtime=tool_runtime,
+            protocol_runtime=protocol_runtime,
+            instruction_runtime=instruction_runtime,
+            context_db_path=context_db_path,
+            strict=runtime_config.strict,
         )
         final_answer = agent.run(goal)
         state_runtime.record_external_changes()
@@ -235,10 +346,15 @@ def _format_list(values: list[str]) -> str:
 
 
 @trace_app.command("list")
-def trace_list() -> None:
+def trace_list(
+    trace_dir: Annotated[
+        Path | None,
+        typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
+    ] = None,
+) -> None:
     """List local structured trace runs."""
 
-    traces_root = Path.cwd() / "work" / "traces" / "runs"
+    traces_root = trace_dir or (Path.cwd() / "work" / "traces" / "runs")
     if not traces_root.exists():
         console.print("No trace runs found.")
         return
@@ -247,19 +363,31 @@ def trace_list() -> None:
 
 
 @trace_app.command("show")
-def trace_show(run_id: str) -> None:
+def trace_show(
+    run_id: str,
+    trace_dir: Annotated[
+        Path | None,
+        typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
+    ] = None,
+) -> None:
     """Show a trace run summary."""
 
-    store = TraceStore(Path.cwd(), run_id=run_id)
+    store = TraceStore(Path.cwd(), run_id=run_id, trace_dir=trace_dir)
     summary = store.summarize(run_id=run_id).to_dict()
     console.print(json_dumps(summary))
 
 
 @trace_app.command("timeline")
-def trace_timeline(run_id: str) -> None:
+def trace_timeline(
+    run_id: str,
+    trace_dir: Annotated[
+        Path | None,
+        typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
+    ] = None,
+) -> None:
     """Show a trace run timeline."""
 
-    store = TraceStore(Path.cwd(), run_id=run_id)
+    store = TraceStore(Path.cwd(), run_id=run_id, trace_dir=trace_dir)
     for item in store.get_timeline(run_id=run_id):
         console.print(
             f"{item.timestamp.isoformat()} {item.event_type} "
@@ -268,10 +396,16 @@ def trace_timeline(run_id: str) -> None:
 
 
 @trace_app.command("errors")
-def trace_errors(run_id: str) -> None:
+def trace_errors(
+    run_id: str,
+    trace_dir: Annotated[
+        Path | None,
+        typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
+    ] = None,
+) -> None:
     """Show warning/error/critical events for a trace run."""
 
-    store = TraceStore(Path.cwd(), run_id=run_id)
+    store = TraceStore(Path.cwd(), run_id=run_id, trace_dir=trace_dir)
     for event in store.query_events(run_id=run_id):
         if event.severity.value in {"warning", "error", "critical"}:
             console.print(
@@ -281,10 +415,16 @@ def trace_errors(run_id: str) -> None:
 
 
 @trace_app.command("artifacts")
-def trace_artifacts(run_id: str) -> None:
+def trace_artifacts(
+    run_id: str,
+    trace_dir: Annotated[
+        Path | None,
+        typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
+    ] = None,
+) -> None:
     """List artifacts for a trace run."""
 
-    store = TraceStore(Path.cwd(), run_id=run_id)
+    store = TraceStore(Path.cwd(), run_id=run_id, trace_dir=trace_dir)
     for artifact in store.artifacts():
         console.print(
             f"{artifact.artifact_id} {artifact.kind.value} "

@@ -190,6 +190,8 @@ class ToolProtocolStateStore:
         tool_call_id: str,
         phase: ToolCallPhase,
         *,
+        policy_decision_id: str | None = None,
+        approval_grant_id: str | None = None,
         error_kind: ToolCallFailureKind | None = None,
         error_message: str | None = None,
         tool_result_digest: str | None = None,
@@ -204,6 +206,8 @@ class ToolProtocolStateStore:
                 call,
                 batch_id=str(batch_row["batch_id"]),
                 phase=phase,
+                policy_decision_id=policy_decision_id,
+                approval_grant_id=approval_grant_id,
                 error_kind=error_kind,
                 error_message=error_message,
                 tool_result_digest=tool_result_digest,
@@ -213,6 +217,8 @@ class ToolProtocolStateStore:
             batch_id=str(self._record_row_by_id(record.record_id)["batch_id"]),
             phase=phase,
             previous_phase=record.phase,
+            policy_decision_id=policy_decision_id,
+            approval_grant_id=approval_grant_id,
             error_kind=error_kind,
             error_message=error_message,
             tool_result_digest=tool_result_digest,
@@ -555,10 +561,10 @@ class ToolProtocolStateStore:
             resolved_idempotent = True
         if not resolved_idempotent or _is_side_effectful(resolved_side_effects):
             return ToolProtocolReplayDecision(
-                status="replay_not_allowed",
+                status="side_effect_replay",
                 allowed=False,
                 previous_result=None,
-                message="replay_not_allowed",
+                message="side_effect_replay",
             )
         row = self._record_row(call.run_id, call.tool_call_id)
         if row is None:
@@ -584,10 +590,10 @@ class ToolProtocolStateStore:
                 message="no_previous_result",
             )
         return ToolProtocolReplayDecision(
-            status="replay_hit",
+            status="read_only_replay",
             allowed=True,
             previous_result=self._binding_from_row(binding).result,
-            message="replay_hit",
+            message="read_only_replay",
         )
 
     def append_recovered(

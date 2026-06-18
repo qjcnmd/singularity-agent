@@ -286,7 +286,7 @@ class ObservationStore:
             preview = observation.preview
             sensitivity = self.classifier.classify(raw_result)
             if (
-                sensitivity == ContextSensitivity.SECRET
+                sensitivity in {ContextSensitivity.SECRET, ContextSensitivity.SENSITIVE}
                 and not self.allow_raw_secret_storage
             ):
                 raw_result = self.redactor.redact_value(raw_result)

@@ -135,9 +135,13 @@ class ModelRuntime:
         runtime_observations: list[dict[str, Any]] | None = None,
         retrieved_content: list[dict[str, Any]] | None = None,
         supports_developer_message: bool | None = None,
+        strict_tools: bool = False,
     ) -> ModelTurnRequest:
-        tools = self.tool_renderer.render(allowed_tool_names=allowed_tool_names)
-        provider_tools = self.tool_renderer.to_provider_tools(tools)
+        tools = self.tool_renderer.render(
+            allowed_tool_names=allowed_tool_names,
+            strict=strict_tools,
+        )
+        provider_tools = self.tool_renderer.to_provider_tools(tools, strict=strict_tools)
         prompt_bundle = None
         if instruction_runtime is not None:
             selected_provider = self.registry.select_provider(

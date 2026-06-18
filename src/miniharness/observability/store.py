@@ -21,10 +21,20 @@ from miniharness.observability.timeline import TraceTimelineBuilder
 
 
 class TraceStore:
-    def __init__(self, root: Path | str, *, run_id: str) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        *,
+        run_id: str,
+        trace_dir: Path | str | None = None,
+    ) -> None:
         self.root = Path(root)
         self.run_id = run_id
-        self.run_dir = self.root / "work" / "traces" / "runs" / run_id
+        self.trace_dir = Path(trace_dir).expanduser() if trace_dir is not None else None
+        if self.trace_dir is not None:
+            self.run_dir = self.trace_dir / run_id
+        else:
+            self.run_dir = self.root / "work" / "traces" / "runs" / run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.events_path = self.run_dir / "events.jsonl"
         self.spans_path = self.run_dir / "spans.jsonl"
