@@ -64,7 +64,7 @@ pyproject.toml
 | 启动、入口、运行方式 | `README.md`, `src/miniharness/cli.py`, `src/miniharness/agent.py` | `tests/test_cli.py`, `tests/test_agent.py` |
 | 模型调用、provider、tool call 校验 | `src/miniharness/model/`, `src/miniharness/provider.py`, `tests/test_model_*.py` | `docs/architecture/model-inference-runtime.md`, `tests/test_provider.py`, `tests/test_agent.py` |
 | 指令来源、prompt 编译、prompt injection | `src/miniharness/instructions/`, `tests/test_instruction_*.py`, `tests/test_prompt_*.py` | `docs/architecture/instruction-prompt-runtime.md`, `src/miniharness/model/runtime.py`, `src/miniharness/agent.py` |
-| 上下文压缩、恢复、引用 | `src/miniharness/context/`, `tests/test_context.py`, `tests/test_context_production.py` | `README.md` 的 Context Manager 段 |
+| 上下文账本、预算、压缩、恢复、引用、redaction | `src/miniharness/context/`, `tests/test_context*.py` | `README.md` 的 Context Manager 段 |
 | 规划、阶段、完成条件 | `src/miniharness/planner/`, `tests/test_planner_runtime.py` | `docs/architecture/planner-task-execution-runtime.md` |
 | 验证、检测、失败解析、修复 | `src/miniharness/verification/`, `tests/test_verification_runtime.py` | `docs/architecture/verification-runtime.md` |
 | 命令执行、进程、输出、环境 | `src/miniharness/command/`, `tests/test_command_runtime.py` | `docs/architecture/command-runtime.md` |
