@@ -1,6 +1,8 @@
-# Miniharness v0.0.16
+# Miniharness v0.0.17
 
 Miniharness is a tiny CLI coding agent harness. It is intentionally small so you can see how the agent loop, model runtime, provider adapter, planner, policy runtime, tools, context manager, observability trace runtime, local workspace state runtime, workspace mutation runtime, command runtime, verification runtime, and sandbox runtime connect without using LangChain, LangGraph, or any other agent framework.
+
+v0.0.17 upgrades the Context Manager into a production-grade Context Runtime control plane. Context is now stored as typed `ContextItem` ledger entries, assembled into budgeted `ContextBundle` requests, redacted before model rendering, linked to traceable `ContextReference` records, and recoverable through SQLite checkpoints and runtime evidence. This release does not add new tools and does not implement Git Runtime behavior.
 
 v0.0.15 adds the Instruction / Prompt Runtime. Model requests now flow through `src/miniharness/instructions/` before reaching `ModelRuntime`: instruction sources are collected, assigned priority and trust, checked for prompt injection, resolved for conflicts, compiled into a `PromptBundle`, and summarized in a redacted `PromptManifest`. Project instructions such as `AGENTS.md` are treated as `project_declared`, not as user commands, and project files, logs, tool output, command output, summaries, and model output remain data unless a higher-trust runtime classifies them otherwise. Full prompts are not written to trace or final reports by default; trace records only manifest ids, hashes, token estimates, counts, conflicts, and warning metadata.
 
@@ -243,22 +245,22 @@ The runtime owns:
 
 ## Context Manager
 
-`ContextManager` owns system, user, assistant, and tool observation messages. In v0.0.5 it also controls the request-sized view sent to the model.
+`ContextManager` still exposes the small API used by the agent loop: `messages()`, `add_assistant_message()`, `add_tool_result()`, and `add_trace_summary()`. Internally, v0.0.17 turns those operations into a typed context ledger rather than appending raw chat messages everywhere.
 
 The context layer now:
 
-- Initializes the system and user messages.
-- Records assistant messages.
-- Counts message and tool-schema tokens with `tiktoken`.
-- Reserves output tokens and trims history to the configured model context window.
-- Keeps assistant `tool_calls` and matching `tool` messages grouped during trimming.
-- Records tool observations with raw results, previews, truncation status, digests, timing/cache/error metadata, and source references.
-- Persists observations, messages, snapshots, and references in SQLite under the run directory.
-- Sends only the first 4000 characters of long tool content back into model messages while keeping the full raw result in SQLite.
-- Accepts a compact planner context message so the model sees current phase, allowed tools, latest evidence, unresolved failures, and risks without receiving full journals or raw stdout.
-- Accepts compact trace summary lines such as policy blocks, sandbox unavailable notices, verification failures, mutation summaries, and current task timeline notes without receiving full trace payloads.
-- Uses `ModelRuntime` with `compact_context` purpose for compression when available, and still uses `tool_choice=none` so summary calls cannot trigger tools.
-- Provides recovery helpers that detect whether the next step should call the model or execute a pending tool.
+- Stores `ContextItem` records with run/session/task/phase ids, layer, source runtime, item type, authority, freshness, sensitivity, token count, references, digest, and metadata.
+- Builds `ContextBundle` objects through `ContextAssembler`, including included/excluded item ids, `ContextBudgetPlan`, render policy, bundle digest, and lost-context warnings.
+- Uses phase-aware retrieval and ranking across system instructions, user goal, planner state, policy observations, workspace state, evidence, tool observations, verification results, recent dialogue, compressed history, failures, and references.
+- Keeps assistant `tool_calls` and matching `role=tool` messages paired during window trimming; the pair is retained or removed together.
+- Counts message tokens, tool-schema tokens, output reserve, and reasoning reserve, and raises a structured `ContextOverflowError` when pinned context cannot fit.
+- Persists context items, append-only context events, bundles, references, snapshots, summaries, recovery checkpoints, legacy messages, and tool observations in SQLite.
+- Redacts secret-like content before storage/render by default; raw secret storage is opt-in and normal model rendering never receives unredacted secrets.
+- Records tool observations with raw digests, previews, truncation metadata, timing/cache/error metadata, source references, and 4000-character message previews.
+- Validates structured compression output: verified facts require reference ids, invalid JSON is rejected, policy constraints are drift-checked, and raw evidence remains preserved.
+- Resolves references by id, file path, mutation transaction, policy decision, and verification id; references can be marked stale when a target changes.
+- Reconstructs interrupted runs from SQLite, messages, latest bundle, trace tail, checkpoints, pending tool calls, policy approvals, open mutation transactions, active command observations, and verification status.
+- Emits context trace events for item addition, bundle build, rendering, compaction, stale references, and recovery without writing raw content to trace payloads.
 
 ## Tool Runtime
 
