@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from miniharness.context.assembler import ContextAssembler, ContextBudget
@@ -35,6 +35,9 @@ from miniharness.context.redaction import ContextRedactor, SensitivityClassifier
 from miniharness.context.store import ObservationStore
 from miniharness.context.tokens import TokenCounter
 from miniharness.provider import ToolChoiceMode
+
+if TYPE_CHECKING:
+    from miniharness.tool_protocol.models import ToolProtocolResultEnvelope
 
 
 TOOL_RESULT_PREVIEW_LIMIT = 4000
@@ -316,6 +319,71 @@ class ContextManager:
                 "sensitivity": sensitivity.value,
             },
         )
+        return observation
+
+    def add_tool_protocol_result(
+        self,
+        envelope: "ToolProtocolResultEnvelope | dict[str, Any]",
+    ) -> ToolObservation:
+        payload = envelope if isinstance(envelope, dict) else envelope.to_dict()
+        tool_call = {
+            "id": payload.get("tool_call_id"),
+            "type": "function",
+            "function": {
+                "name": payload.get("tool_name"),
+                "arguments": "{}",
+            },
+        }
+        result = dict(payload)
+        result["ok"] = bool(payload.get("ok"))
+        result.setdefault("content", payload.get("content_preview") or "")
+        result["metadata"] = {
+            "tool_name": payload.get("tool_name"),
+            "status": payload.get("status"),
+            "observation_id": payload.get("observation_id"),
+            "policy_decision_id": payload.get("policy_decision_id"),
+            "approval_grant_id": payload.get("approval_grant_id"),
+            "truncated": bool(payload.get("truncated")),
+            "redacted": bool(payload.get("redacted")),
+            **dict(payload.get("metadata") or {}),
+        }
+        observation = self.add_tool_result(tool_call=tool_call, result=result)
+        return observation
+
+    def add_synthetic_tool_error(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        error_code: str,
+        message: str,
+        turn: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> ToolObservation:
+        from miniharness.tool_protocol.models import ToolProtocolResultEnvelope
+
+        tool_name = str((tool_call.get("function") or {}).get("name") or "<unknown>")
+        envelope = ToolProtocolResultEnvelope(
+            tool_call_id=str(tool_call.get("id") or ""),
+            tool_name=tool_name,
+            ok=False,
+            status="rejected",
+            error_code=error_code,
+            content_preview=message,
+            content_digest=digest_value(
+                {
+                    "tool_call_id": tool_call.get("id"),
+                    "tool_name": tool_name,
+                    "error_code": error_code,
+                    "message": message,
+                }
+            ),
+            redacted=True,
+            truncated=False,
+            metadata={"synthetic": True, **(metadata or {})},
+        )
+        observation = self.add_tool_protocol_result(envelope)
+        if turn:
+            observation.turn = turn
         return observation
 
     def add_trace_summary(self, lines: list[str]) -> None:
@@ -680,24 +748,26 @@ class ContextManager:
             raise
 
     def _tool_message(self, observation: ToolObservation) -> dict[str, Any]:
+        raw_result = observation.raw_result
+        if isinstance(raw_result, dict) and {"tool_call_id", "tool_name", "status"}.issubset(raw_result):
+            content = raw_result
+        else:
+            content = {
+                "ok": observation.ok,
+                "tool_name": observation.tool_name,
+                "tool_call_id": observation.tool_call_id,
+                "observation_id": observation.id,
+                "reference_ids": [ref.ref_id for ref in observation.source_refs],
+                "content": observation.preview,
+                "truncated": observation.truncated,
+                "truncation_reason": observation.truncation_reason,
+                "raw_digest": observation.raw_digest,
+            }
         return {
             "role": "tool",
             "tool_call_id": observation.tool_call_id,
             "name": observation.tool_name,
-            "content": json.dumps(
-                {
-                    "ok": observation.ok,
-                    "tool_name": observation.tool_name,
-                    "tool_call_id": observation.tool_call_id,
-                    "observation_id": observation.id,
-                    "reference_ids": [ref.ref_id for ref in observation.source_refs],
-                    "content": observation.preview,
-                    "truncated": observation.truncated,
-                    "truncation_reason": observation.truncation_reason,
-                    "raw_digest": observation.raw_digest,
-                },
-                ensure_ascii=False,
-            ),
+            "content": json.dumps(content, ensure_ascii=False),
         }
 
     def _make_item(

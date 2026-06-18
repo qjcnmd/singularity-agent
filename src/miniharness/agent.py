@@ -7,10 +7,11 @@ from rich.console import Console
 from miniharness.context import ContextManager
 from miniharness.instructions import InstructionRuntime
 from miniharness.model import ModelPurpose, ModelRuntime, ModelTurnStatus
-from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.planner import PlannerRuntime, TaskStatus
 from miniharness.provider import OpenAICompatibleProvider
 from miniharness.policy import ApprovalGate, PolicyRuntime
+from miniharness.tool_protocol.models import ToolProtocolResultEnvelope
+from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.trace import TraceWriter
 from miniharness.workspace_state import LocalWorkspaceStateRuntime
@@ -106,6 +107,11 @@ class MiniAgent:
             policy_runtime=self.policy_runtime,
             approval_gate=self.approval_gate,
         )
+        protocol_runtime = ToolCallingProtocolRuntime(
+            registry=self.tools,
+            trace=self.trace,
+            workspace_state_hook=self._workspace_state_hook,
+        )
 
         for turn in range(1, self.max_turns + 1):
             self.console.print(f"[cyan]model turn {turn}[/cyan]")
@@ -147,31 +153,8 @@ class MiniAgent:
                 return final_answer
 
             assistant_message = self._assistant_message_from_result(result)
-            context.add_assistant_message(assistant_message)
-
-            tool_calls = assistant_message.get("tool_calls") or []
-            for tool_call in tool_calls:
-                if hasattr(self.trace, "emit"):
-                    self.trace.emit(
-                        TraceEventType.MODEL_TOOL_CALL_PROPOSED,
-                        runtime="model",
-                        summary=(
-                            "Model proposed tool call "
-                            f"{tool_call.get('function', {}).get('name', '<unknown>')}."
-                        ),
-                        payload={
-                            "turn": turn,
-                            "tool_call_id": tool_call.get("id"),
-                            "function": tool_call.get("function", {}).get("name"),
-                        },
-                        ids={
-                            "task_id": planner.task_id,
-                            "session_id": planner.session_id,
-                            "phase_id": planner.state.current_phase if planner.state else None,
-                            "action_id": tool_call.get("id"),
-                        },
-                    )
-            if not tool_calls:
+            if not result.tool_calls:
+                context.add_assistant_message(assistant_message)
                 final_answer = self._planner_final_answer(
                     planner,
                     model_answer=assistant_message.get("content") or "",
@@ -181,27 +164,24 @@ class MiniAgent:
                 )
                 return final_answer
 
-            for tool_call in tool_calls:
-                name = tool_call.get("function", {}).get("name", "<unknown>")
-                self.console.print(f"[magenta]tool[/magenta] {name}")
-
-                result_model = runtime.execute_tool_call(tool_call)
-                result = result_model.model_dump(mode="json")
+            protocol_result = protocol_runtime.process_model_turn(
+                request=request,
+                result=result,
+                turn=turn,
+                context=context,
+                tool_runtime=runtime,
+                planner=planner,
+                policy_runtime=self.policy_runtime,
+            )
+            if protocol_result.next_action == "finalize":
+                final_answer = self._planner_final_answer(
+                    planner,
+                    model_answer=assistant_message.get("content") or "",
+                )
                 self.trace.record(
-                    "tool_result",
-                    {
-                        "turn": turn,
-                        "tool_call_id": tool_call.get("id"),
-                        "name": name,
-                        "result": result,
-                    },
+                    "final_answer", {"turn": turn, "content": final_answer}
                 )
-                context.add_tool_result(tool_call=tool_call, result=result, turn=turn)
-                self._inject_workspace_state(
-                    context,
-                    tool_call_name=name,
-                    turn=turn,
-                )
+                return final_answer
 
         message = f"Stopped after max_turns={self.max_turns}; the model did not produce a final answer."
         self.trace.record("error", {"type": "MaxTurnsExceeded", "message": message})
@@ -233,28 +213,28 @@ class MiniAgent:
             ]
         )
 
-    def _inject_workspace_state(
+    def _workspace_state_hook(
         self,
         context: ContextManager,
         *,
-        tool_call_name: str,
-        turn: int,
+        batch: Any,
+        tool_call_id: str | None,
     ) -> None:
-        if self.state_runtime is None or tool_call_name == "workspace_health":
+        if self.state_runtime is None:
             return
         self.state_runtime.record_external_changes()
-        context.add_tool_result(
-            tool_call={
-                "id": f"workspace_state_{self.trace.run_id}_{turn}",
-                "type": "function",
-                "function": {"name": "workspace_health", "arguments": "{}"},
-            },
-            result={
-                "ok": True,
-                "content": self.state_runtime.get_workspace_health().to_observation(),
-                "metadata": {"tool_version": "internal"},
-            },
-            turn=turn,
+        observation = self.state_runtime.get_workspace_health().to_observation()
+        context.add_tool_protocol_result(
+            ToolProtocolResultEnvelope(
+                tool_call_id=f"workspace_state_{batch.batch_id}",
+                tool_name="workspace_health",
+                ok=True,
+                status="ok",
+                content_preview=str(observation),
+                content_digest="",
+                redacted=True,
+                metadata={"origin_tool_call_id": tool_call_id},
+            )
         )
 
     def _context_db_path(self) -> Any:
