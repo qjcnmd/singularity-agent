@@ -42,7 +42,7 @@ class ToolCallingProtocolRuntime:
     ) -> None:
         self.registry = registry
         self.trace = ToolProtocolTrace(trace)
-        default_state_path = registry.project_root / ".miniharness" / "tool_protocol.sqlite3"
+        default_state_path = _default_state_path(registry, trace)
         self.state_store = state_store or ToolProtocolStateStore(default_state_path)
         self.validator = ToolProtocolValidator(registry)
         self.scheduler = ToolProtocolScheduler(registry)
@@ -359,6 +359,8 @@ class ToolCallingProtocolRuntime:
                     envelope=call,
                     result=tool_result,
                     raw_result_ref=tool_result.metadata.get("output_digest"),
+                    policy_decision_id=tool_result.metadata.get("policy_decision_id"),
+                    approval_grant_id=tool_result.metadata.get("approval_grant_id"),
                 )
                 self.state_store.bind_result(
                     record.record_id,
@@ -377,6 +379,8 @@ class ToolCallingProtocolRuntime:
                 self.state_store.transition(
                     call.tool_call_id,
                     phase,
+                    policy_decision_id=protocol_result.policy_decision_id,
+                    approval_grant_id=protocol_result.approval_grant_id,
                     error_kind=protocol_result.error_kind,
                     error_message=protocol_result.error_code,
                     tool_result_digest=protocol_result.content_digest,
@@ -634,3 +638,15 @@ def _provider_capabilities_from_result(model_result: ModelTurnResult) -> ModelCa
     if isinstance(payload, dict):
         return ModelCapabilities.from_dict(payload)
     return None
+
+
+def _default_state_path(registry: ToolRegistry, trace: Any | None) -> Any:
+    store = getattr(trace, "store", None)
+    run_dir = getattr(store, "run_dir", None)
+    if run_dir is not None:
+        return run_dir / "tool_protocol.sqlite3"
+    path = getattr(trace, "path", None)
+    run_id = getattr(trace, "run_id", None)
+    if path is not None and run_id:
+        return path.parent / "tool_protocol.sqlite3"
+    return registry.project_root / ".miniharness" / "runs" / "default" / "tool_protocol.sqlite3"

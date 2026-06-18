@@ -28,6 +28,7 @@ class ToolProtocolRecoveryManager:
         batches = self._batches_for_run(run_id)
         pending_call_ids: list[str] = []
         running_call_ids: list[str] = []
+        pending_approval_call_ids: list[str] = []
         succeeded_but_not_appended_call_ids: list[str] = []
         missing_tool_messages: list[str] = []
         recovered_call_ids: list[str] = []
@@ -37,6 +38,8 @@ class ToolProtocolRecoveryManager:
             for record in self.store.records_for_batch(batch.batch_id):
                 if record.phase in {ToolCallPhase.PROPOSED, ToolCallPhase.VALIDATED}:
                     pending_call_ids.append(record.envelope.tool_call_id)
+                elif record.phase == ToolCallPhase.WAITING_APPROVAL:
+                    pending_approval_call_ids.append(record.envelope.tool_call_id)
                 elif record.phase == ToolCallPhase.RUNNING:
                     running_call_ids.append(record.envelope.tool_call_id)
                 elif record.phase == ToolCallPhase.SUCCEEDED:
@@ -50,7 +53,10 @@ class ToolProtocolRecoveryManager:
 
         next_action = "request_model"
         status = ToolProtocolTurnStatus.PROCESSED
-        if pending_call_ids:
+        if pending_approval_call_ids:
+            next_action = "resume_pending_approval"
+            status = ToolProtocolTurnStatus.PENDING_APPROVAL
+        elif pending_call_ids:
             next_action = "execute_pending_tool"
             status = ToolProtocolTurnStatus.RECOVERED
         elif running_call_ids:
@@ -69,13 +75,17 @@ class ToolProtocolRecoveryManager:
             succeeded_but_not_appended_call_ids=sorted(set(succeeded_but_not_appended_call_ids)),
             assistant_message_ids_missing_tool_messages=sorted(set(missing_tool_messages)),
             recovered_call_ids=sorted(set(recovered_call_ids)),
-            warnings=warnings,
+            warnings=warnings
+            + [
+                f"pending approval: {call_id}"
+                for call_id in sorted(set(pending_approval_call_ids))
+            ],
             next_action=next_action,
         )
         return ToolProtocolTurnResult(
             status=status,
             batch_id=batches[0].batch_id if batches else None,
-            pending_approval_count=0,
+            pending_approval_count=len(set(pending_approval_call_ids)),
             appended_tool_message_count=len(recovered_call_ids),
             next_action=next_action,
             recovery_report=report.to_dict(),
@@ -98,6 +108,7 @@ class ToolProtocolRecoveryManager:
         batches = self._batches_for_run(run_id)
         pending_call_ids: list[str] = []
         running_call_ids: list[str] = []
+        pending_approval_call_ids: list[str] = []
         succeeded_but_not_appended_call_ids: list[str] = []
         missing_tool_messages: list[str] = []
         recovered_call_ids: list[str] = []
@@ -107,6 +118,8 @@ class ToolProtocolRecoveryManager:
             for record in self.store.records_for_batch(batch.batch_id):
                 if record.phase in {ToolCallPhase.PROPOSED, ToolCallPhase.VALIDATED}:
                     pending_call_ids.append(record.envelope.tool_call_id)
+                elif record.phase == ToolCallPhase.WAITING_APPROVAL:
+                    pending_approval_call_ids.append(record.envelope.tool_call_id)
                 elif record.phase == ToolCallPhase.RUNNING:
                     running_call_ids.append(record.envelope.tool_call_id)
                 elif record.phase == ToolCallPhase.SUCCEEDED:
@@ -120,7 +133,10 @@ class ToolProtocolRecoveryManager:
 
         next_action = "request_model"
         status = ToolProtocolTurnStatus.PROCESSED
-        if pending_call_ids:
+        if pending_approval_call_ids:
+            next_action = "resume_pending_approval"
+            status = ToolProtocolTurnStatus.PENDING_APPROVAL
+        elif pending_call_ids:
             next_action = "execute_pending_tool"
             status = ToolProtocolTurnStatus.RECOVERED
         elif running_call_ids:
@@ -139,12 +155,17 @@ class ToolProtocolRecoveryManager:
             succeeded_but_not_appended_call_ids=sorted(set(succeeded_but_not_appended_call_ids)),
             assistant_message_ids_missing_tool_messages=sorted(set(missing_tool_messages)),
             recovered_call_ids=sorted(set(recovered_call_ids)),
-            warnings=warnings,
+            warnings=warnings
+            + [
+                f"pending approval: {call_id}"
+                for call_id in sorted(set(pending_approval_call_ids))
+            ],
             next_action=next_action,
         )
         return ToolProtocolTurnResult(
             status=status,
             batch_id=batches[0].batch_id if batches else None,
+            pending_approval_count=len(set(pending_approval_call_ids)),
             appended_tool_message_count=len(recovered_call_ids),
             next_action=next_action,
             recovery_report=report.to_dict(),

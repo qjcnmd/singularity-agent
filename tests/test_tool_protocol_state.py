@@ -151,7 +151,7 @@ def test_state_store_replay_protection_and_conflicts() -> None:
         idempotent=True,
     )
     assert side_effect_decision.allowed is False
-    assert side_effect_decision.status == "replay_not_allowed"
+    assert side_effect_decision.status == "side_effect_replay"
 
 
 def test_state_store_queries_pending_by_run_session_task_and_batch_by_assistant_message() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -54,6 +55,11 @@ class MiniAgent:
         planner: PlannerRuntime | None = None,
         policy_runtime: PolicyRuntime | None = None,
         approval_gate: ApprovalGate | None = None,
+        tool_runtime: ToolRuntime | None = None,
+        protocol_runtime: ToolCallingProtocolRuntime | None = None,
+        instruction_runtime: InstructionRuntime | None = None,
+        context_db_path: Path | None = None,
+        strict: bool = False,
     ) -> None:
         if provider is None and model_runtime is None:
             raise ValueError("provider or model_runtime is required.")
@@ -67,6 +73,11 @@ class MiniAgent:
         self.planner = planner
         self.policy_runtime = policy_runtime
         self.approval_gate = approval_gate
+        self.tool_runtime = tool_runtime
+        self.protocol_runtime = protocol_runtime
+        self.instruction_runtime = instruction_runtime
+        self.context_db_path = context_db_path
+        self.strict = strict
 
     def run(self, user_goal: str) -> str:
         planner = self.planner or PlannerRuntime(
@@ -84,7 +95,9 @@ class MiniAgent:
             provider=self.provider,
             model_runtime=self.model_runtime,
             run_id=self.trace.run_id,
-            db_path=self._context_db_path(),
+            session_id=getattr(planner, "session_id", self.trace.run_id),
+            task_id=getattr(planner, "task_id", self.trace.run_id),
+            db_path=self.context_db_path or self._context_db_path(),
             trace=self.trace,
         )
         model_runtime = self.model_runtime or ModelRuntime.from_chat_provider(
@@ -93,12 +106,13 @@ class MiniAgent:
             trace=self.trace,
         )
         self.model_runtime = model_runtime
-        instruction_runtime = InstructionRuntime(
+        instruction_runtime = self.instruction_runtime or InstructionRuntime(
             workspace_root=self.tools.project_root,
             trace=self.trace,
         )
-        tool_schemas = self.tools.openai_tools()
-        runtime = ToolRuntime(
+        self.instruction_runtime = instruction_runtime
+        tool_schemas = self.tools.openai_tools(strict=self.strict)
+        runtime = self.tool_runtime or ToolRuntime(
             registry=self.tools,
             policy=ToolPolicy.coding_agent(),
             trace=self.trace,
@@ -107,11 +121,13 @@ class MiniAgent:
             policy_runtime=self.policy_runtime,
             approval_gate=self.approval_gate,
         )
-        protocol_runtime = ToolCallingProtocolRuntime(
+        self.tool_runtime = runtime
+        protocol_runtime = self.protocol_runtime or ToolCallingProtocolRuntime(
             registry=self.tools,
             trace=self.trace,
             workspace_state_hook=self._workspace_state_hook,
         )
+        self.protocol_runtime = protocol_runtime
 
         for turn in range(1, self.max_turns + 1):
             self.console.print(f"[cyan]model turn {turn}[/cyan]")
@@ -134,6 +150,7 @@ class MiniAgent:
                 planner_context=planner.planner_context_message(),
                 instruction_runtime=instruction_runtime,
                 user_task=user_goal,
+                strict_tools=self.strict,
             )
             planner.record_instruction_prompt_observation(instruction_runtime.summary())
             result = model_runtime.run_turn(request)
@@ -224,6 +241,7 @@ class MiniAgent:
             return
         self.state_runtime.record_external_changes()
         observation = self.state_runtime.get_workspace_health().to_observation()
+        context.add_workspace_state(observation)
         context.add_tool_protocol_result(
             ToolProtocolResultEnvelope(
                 tool_call_id=f"workspace_state_{batch.batch_id}",

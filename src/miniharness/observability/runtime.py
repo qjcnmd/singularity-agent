@@ -34,17 +34,19 @@ class TraceRuntime:
         store: TraceStore | None = None,
         artifacts: TraceArtifactStore | None = None,
         redactor: TraceRedactor | None = None,
+        trace_dir: Path | str | None = None,
     ) -> None:
         self.root = Path(root)
         self.run_id = run_id
         self.session_id = session_id
         self.redactor = redactor or TraceRedactor()
-        self.store = store or TraceStore(self.root, run_id=run_id)
+        self.store = store or TraceStore(self.root, run_id=run_id, trace_dir=trace_dir)
         self.artifacts = artifacts or TraceArtifactStore(
             self.root,
             run_id=run_id,
             session_id=session_id,
             redactor=self.redactor,
+            run_dir=self.store.run_dir,
         )
         self.spans = SpanManager(store=self.store, run_id=run_id, session_id=session_id)
         self.path = self.store.events_path
@@ -57,12 +59,14 @@ class TraceRuntime:
         *,
         run_id: str | None = None,
         session_id: str | None = None,
+        trace_dir: Path | str | None = None,
     ) -> "TraceRuntime":
         resolved_run_id = run_id or _new_run_id()
         return cls(
             root=root,
             run_id=resolved_run_id,
             session_id=session_id or resolved_run_id,
+            trace_dir=trace_dir,
         )
 
     def emit(

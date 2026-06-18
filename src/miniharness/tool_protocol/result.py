@@ -75,5 +75,9 @@ class ToolProtocolResultBuilder:
             return None
         result_id = f"tool_result_{uuid4().hex[:12]}"
         path = self.artifact_root / f"{result_id}.json"
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        redacted_payload = self.redactor.redact_value(payload)
+        path.write_text(
+            json.dumps(redacted_payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
         return str(path)

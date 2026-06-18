@@ -28,6 +28,14 @@ from miniharness.policy import (
     RuntimeName,
 )
 from miniharness.policy.audit import redact_resource_identifier
+from miniharness.policy.exceptions import (
+    ApprovalDenied,
+    ApprovalRequired,
+    PolicyAskUserRequired,
+    PolicyDenied,
+    PolicyEscalationRequired,
+    SandboxRequired,
+)
 from miniharness.tools.models import (
     PermissionLevel,
     ToolError,
@@ -35,6 +43,7 @@ from miniharness.tools.models import (
     ToolExecutionFailure,
     ToolResult,
     ToolSensitivityLevel,
+    ToolSideEffectKind,
     ToolSpec,
 )
 from miniharness.tools.policy import ToolPolicy
@@ -156,6 +165,7 @@ class ToolRuntime:
         policy_runtime: PolicyRuntime | None = None,
         approval_gate: ApprovalGate | Any | None = None,
         standalone_can_execute: bool = True,
+        dry_run: bool = False,
     ) -> None:
         self.registry = registry
         self.policy = policy
@@ -169,6 +179,7 @@ class ToolRuntime:
         self.policy_runtime = policy_runtime
         self.approval_gate = approval_gate
         self.standalone_can_execute = standalone_can_execute
+        self.dry_run = dry_run
         self._cache = ToolResultCache()
         self._ledger = IdempotencyLedger()
         self._redactor = TraceRedactor()
@@ -269,14 +280,14 @@ class ToolRuntime:
                 self._remember_replay(tool_call_id, args_fingerprint, spec, result)
                 return result
 
-            policy_error = self.policy.check(spec)
-            if policy_error is not None:
-                result = self._failure_from_tool_error(policy_error)
+            dry_run_error = self._dry_run_error(spec)
+            if dry_run_error is not None:
+                result = dry_run_error
                 output_digest = self._result_digest(result)
                 self._remember_replay(tool_call_id, args_fingerprint, spec, result)
                 return result
 
-            policy_result, approval_grant_id = self._enforce_policy(
+            policy_result, approval_grant_id, policy_decision_id = self._enforce_policy(
                 tool_name=tool_name,
                 spec=spec,
                 validated_args=validated_args,
@@ -353,6 +364,8 @@ class ToolRuntime:
             result, output_digest = self._execute_handler(spec, validated)
             if approval_grant_id:
                 result.metadata["approval_grant_id"] = approval_grant_id
+            if policy_decision_id:
+                result.metadata["policy_decision_id"] = policy_decision_id
             self._update_planner(
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
@@ -470,7 +483,7 @@ class ToolRuntime:
         spec: ToolSpec,
         validated_args: dict[str, Any],
         tool_call_id: str | None,
-    ) -> tuple[ToolResult | None, str | None]:
+    ) -> tuple[ToolResult | None, str | None, str | None]:
         request = self._policy_request(
             tool_name=tool_name,
             spec=spec,
@@ -480,22 +493,33 @@ class ToolRuntime:
         decision = self.policy_runtime.enforce(request)
         self._record_policy_trace(request, decision)
         if decision.outcome == DecisionOutcome.ALLOW:
-            return None, decision.approval_grant_id
+            return None, decision.approval_grant_id, decision.decision_id
         if decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate is not None:
-            grant = self.approval_gate.resolve(request, decision)
+            try:
+                grant = self.approval_gate.resolve(request, decision)
+            except (
+                ApprovalDenied,
+                ApprovalRequired,
+                PolicyAskUserRequired,
+                PolicyDenied,
+                PolicyEscalationRequired,
+                SandboxRequired,
+            ):
+                self._record_policy_observation(request, decision)
+                return self._policy_failure(request, decision), None, decision.decision_id
             if grant is None:
                 self._record_policy_observation(request, decision)
-                return self._policy_failure(request, decision), None
+                return self._policy_failure(request, decision), None, decision.decision_id
             if hasattr(self.policy_runtime, "register_grant"):
                 self.policy_runtime.register_grant(grant)
             second = self.policy_runtime.enforce(request)
             self._record_policy_trace(request, second)
             if second.outcome == DecisionOutcome.ALLOW:
-                return None, second.approval_grant_id or grant.grant_id
+                return None, second.approval_grant_id or grant.grant_id, second.decision_id
             self._record_policy_observation(request, second)
-            return self._policy_failure(request, second), None
+            return self._policy_failure(request, second), None, second.decision_id
         self._record_policy_observation(request, decision)
-        return self._policy_failure(request, decision), None
+        return self._policy_failure(request, decision), None, decision.decision_id
 
     def _policy_failure(self, request: PolicyRequest, decision: PolicyDecision) -> ToolResult:
         return ToolResult.failure(
@@ -774,6 +798,29 @@ class ToolRuntime:
                 details={"tool_name": spec.name},
             )
         return None
+
+    def _dry_run_error(self, spec: ToolSpec) -> ToolResult | None:
+        if not self.dry_run:
+            return None
+        read_only_side_effects = {
+            ToolSideEffectKind.NONE,
+            ToolSideEffectKind.READ_WORKSPACE,
+        }
+        if (
+            spec.permission_level == PermissionLevel.READ_ONLY
+            and spec.side_effects in read_only_side_effects
+        ):
+            return None
+        return ToolResult.failure(
+            code="dry_run_blocked",
+            message="Dry-run mode blocks mutation, command, verification, and other side-effect tools.",
+            details={
+                "tool_name": spec.name,
+                "permission_level": spec.permission_level.value,
+                "side_effects": spec.side_effects.value,
+                "backend": spec.execution_backend.value,
+            },
+        )
 
     def _delegated_backend_error(self, spec: ToolSpec) -> ToolResult | None:
         if spec.execution_backend == ToolExecutionBackendKind.IN_PROCESS:

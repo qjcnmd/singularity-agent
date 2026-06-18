@@ -389,7 +389,14 @@ class CommandDiscovery:
                     name="pytest",
                     kind=CheckKind.UNIT_TEST,
                     request=CommandRequest(
-                        argv=[sys.executable, "-m", "pytest", test_target],
+                        argv=[
+                            sys.executable,
+                            "-m",
+                            "pytest",
+                            test_target,
+                            "--basetemp",
+                            "work/pytest-tmp",
+                        ],
                         cwd=".",
                         purpose=CommandPurpose.PROJECT_VERIFICATION,
                         timeout_seconds=180,

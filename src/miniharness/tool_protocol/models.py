@@ -382,7 +382,9 @@ class ToolProtocolResultEnvelope(SerializableDataclass):
                     "tool_call_id": self.tool_call_id,
                     "status": self.status,
                     "content": self.content_preview,
+                    "content_preview": self.content_preview,
                     "content_digest": self.content_digest,
+                    "result_ref": self.raw_result_ref,
                     "error_code": self.error_code,
                     "error_kind": self.error_kind.value if self.error_kind else None,
                     "reference_ids": self.artifact_refs,
@@ -391,7 +393,11 @@ class ToolProtocolResultEnvelope(SerializableDataclass):
                     "approval_grant_id": self.approval_grant_id,
                     "truncated": self.truncated,
                     "redacted": self.redacted,
-                    "metadata": self.metadata,
+                    "metadata": {
+                        key: value
+                        for key, value in self.metadata.items()
+                        if key not in {"raw_result", "raw_args", "raw_arguments", "result"}
+                    },
                 },
                 ensure_ascii=False,
             ),

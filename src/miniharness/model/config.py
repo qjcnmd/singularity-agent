@@ -30,17 +30,26 @@ class ModelRuntimeConfig:
     retry_policy: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_env(cls) -> "ModelRuntimeConfig":
+    def from_env(
+        cls,
+        *,
+        base_url: str | None = None,
+        model: str | None = None,
+        store_raw_responses: bool | None = None,
+    ) -> "ModelRuntimeConfig":
         providers: dict[str, dict[str, Any]] = {}
-        if os.getenv("MINIHARNESS_BASE_URL") and os.getenv("MINIHARNESS_MODEL"):
+        resolved_base_url = base_url or os.getenv("MINIHARNESS_BASE_URL")
+        resolved_model = model or os.getenv("MINIHARNESS_MODEL")
+        if resolved_base_url and resolved_model:
             providers["openai_compatible"] = {
-                "base_url": os.environ["MINIHARNESS_BASE_URL"],
+                "base_url": resolved_base_url,
                 "api_key": os.getenv("MINIHARNESS_API_KEY", ""),
-                "model": os.environ["MINIHARNESS_MODEL"],
+                "model": resolved_model,
             }
         return cls(
             default_provider=os.getenv("MINIHARNESS_MODEL_PROVIDER", "openai_compatible"),
-            default_model=os.getenv("MINIHARNESS_MODEL"),
+            default_model=resolved_model,
             providers=providers,
+            store_raw_responses=bool(store_raw_responses),
         )
 

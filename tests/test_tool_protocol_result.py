@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from miniharness.tool_protocol.models import ToolCallEnvelope
 from miniharness.tool_protocol.result import ToolProtocolResultBuilder
 from miniharness.tools.models import ToolResult
@@ -69,4 +71,7 @@ def test_result_builder_redacts_api_keys_and_keeps_large_output_as_preview(tmp_p
     assert "sk-secret-value" not in envelope.content_preview
     assert "ghp_secretvalue" not in envelope.content_preview
     assert envelope.raw_result_ref is not None
+    artifact_text = Path(envelope.raw_result_ref).read_text(encoding="utf-8")
+    assert "sk-secret-value" not in artifact_text
+    assert "ghp_secretvalue" not in artifact_text
     assert "raw_result" not in envelope.to_context_message()["content"]
