@@ -10,12 +10,10 @@ from miniharness.instructions import InstructionRuntime
 from miniharness.model import ModelPurpose, ModelRuntime, ModelTurnStatus
 from miniharness.planner import PlannerRuntime, TaskStatus
 from miniharness.provider import OpenAICompatibleProvider
-from miniharness.policy import ApprovalGate, PolicyRuntime
-from miniharness.tool_protocol.models import ToolProtocolResultEnvelope
+from miniharness.policy import PolicyRuntime
 from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from miniharness.tools import ToolRegistry, ToolRuntime
 from miniharness.trace import TraceWriter
-from miniharness.workspace_state import LocalWorkspaceStateRuntime
 
 
 SYSTEM_PROMPT = """You are Miniharness, a local coding agent harness.
@@ -46,33 +44,41 @@ class MiniAgent:
         self,
         *,
         provider: OpenAICompatibleProvider | None = None,
-        model_runtime: ModelRuntime | None = None,
+        model_runtime: ModelRuntime,
         tools: ToolRegistry,
         trace: TraceWriter,
         console: Console,
         max_turns: int,
-        state_runtime: LocalWorkspaceStateRuntime | None = None,
-        planner: PlannerRuntime | None = None,
+        planner: PlannerRuntime,
         policy_runtime: PolicyRuntime | None = None,
-        approval_gate: ApprovalGate | None = None,
-        tool_runtime: ToolRuntime | None = None,
-        protocol_runtime: ToolCallingProtocolRuntime | None = None,
-        instruction_runtime: InstructionRuntime | None = None,
+        tool_runtime: ToolRuntime,
+        protocol_runtime: ToolCallingProtocolRuntime,
+        instruction_runtime: InstructionRuntime,
         context_db_path: Path | None = None,
         strict: bool = False,
     ) -> None:
-        if provider is None and model_runtime is None:
-            raise ValueError("provider or model_runtime is required.")
+        if model_runtime is None:
+            raise ValueError("model_runtime is required; MiniAgent does not assemble model runtimes.")
+        if planner is None:
+            raise ValueError("planner is required; MiniAgent does not assemble PlannerRuntime.")
+        if tool_runtime is None:
+            raise ValueError("tool_runtime is required; MiniAgent does not assemble ToolRuntime.")
+        if protocol_runtime is None:
+            raise ValueError(
+                "protocol_runtime is required; MiniAgent does not assemble ToolCallingProtocolRuntime."
+            )
+        if instruction_runtime is None:
+            raise ValueError(
+                "instruction_runtime is required; MiniAgent does not assemble InstructionRuntime."
+            )
         self.provider = provider
         self.model_runtime = model_runtime
         self.tools = tools
         self.trace = trace
         self.console = console
         self.max_turns = max_turns
-        self.state_runtime = state_runtime
         self.planner = planner
         self.policy_runtime = policy_runtime
-        self.approval_gate = approval_gate
         self.tool_runtime = tool_runtime
         self.protocol_runtime = protocol_runtime
         self.instruction_runtime = instruction_runtime
@@ -80,13 +86,7 @@ class MiniAgent:
         self.strict = strict
 
     def run(self, user_goal: str) -> str:
-        planner = self.planner or PlannerRuntime(
-            self.tools.project_root,
-            session_id=self.trace.run_id,
-            task_id=self.trace.run_id,
-            trace=self.trace,
-        )
-        self.planner = planner
+        planner = self.planner
         if planner.state is None:
             planner.start_task(user_goal)
         context = ContextManager(
@@ -100,34 +100,11 @@ class MiniAgent:
             db_path=self.context_db_path or self._context_db_path(),
             trace=self.trace,
         )
-        model_runtime = self.model_runtime or ModelRuntime.from_chat_provider(
-            self.provider,
-            tool_registry=self.tools,
-            trace=self.trace,
-        )
-        self.model_runtime = model_runtime
-        instruction_runtime = self.instruction_runtime or InstructionRuntime(
-            workspace_root=self.tools.project_root,
-            trace=self.trace,
-        )
-        self.instruction_runtime = instruction_runtime
+        model_runtime = self.model_runtime
+        instruction_runtime = self.instruction_runtime
         tool_schemas = self.tools.openai_tools(strict=self.strict)
-        runtime = self.tool_runtime or ToolRuntime(
-            registry=self.tools,
-            policy=ToolPolicy.coding_agent(),
-            trace=self.trace,
-            workspace_root=self.tools.project_root,
-            planner=planner,
-            policy_runtime=self.policy_runtime,
-            approval_gate=self.approval_gate,
-        )
-        self.tool_runtime = runtime
-        protocol_runtime = self.protocol_runtime or ToolCallingProtocolRuntime(
-            registry=self.tools,
-            trace=self.trace,
-            workspace_state_hook=self._workspace_state_hook,
-        )
-        self.protocol_runtime = protocol_runtime
+        runtime = self.tool_runtime
+        protocol_runtime = self.protocol_runtime
 
         for turn in range(1, self.max_turns + 1):
             self.console.print(f"[cyan]model turn {turn}[/cyan]")
@@ -228,31 +205,6 @@ class MiniAgent:
                 f"unresolved_issues: {len(report.unresolved_issues)}",
                 f"risks: {len(report.risks)}",
             ]
-        )
-
-    def _workspace_state_hook(
-        self,
-        context: ContextManager,
-        *,
-        batch: Any,
-        tool_call_id: str | None,
-    ) -> None:
-        if self.state_runtime is None:
-            return
-        self.state_runtime.record_external_changes()
-        observation = self.state_runtime.get_workspace_health().to_observation()
-        context.add_workspace_state(observation)
-        context.add_tool_protocol_result(
-            ToolProtocolResultEnvelope(
-                tool_call_id=f"workspace_state_{batch.batch_id}",
-                tool_name="workspace_health",
-                ok=True,
-                status="ok",
-                content_preview=str(observation),
-                content_digest="",
-                redacted=True,
-                metadata={"origin_tool_call_id": tool_call_id},
-            )
         )
 
     def _context_db_path(self) -> Any:

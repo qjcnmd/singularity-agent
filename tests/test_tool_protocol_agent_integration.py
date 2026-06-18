@@ -2,17 +2,12 @@ from __future__ import annotations
 
 import json
 import inspect
-from io import StringIO
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console
-
 from miniharness.agent import MiniAgent
-from miniharness.planner import PlannerRuntime
-from miniharness.tools import ToolRegistry
 from miniharness.trace import TraceWriter
-from tests.tool_runtime_helpers import make_test_policy_runtime
+from tests.agent_runtime_helpers import make_agent_session
 
 
 class MockProvider:
@@ -27,7 +22,7 @@ class MockProvider:
         return self.responses.pop(0)
 
 
-def test_agent_delegates_tool_call_processing_to_protocol_runtime(tmp_path: Path, monkeypatch) -> None:
+def test_agent_delegates_tool_call_processing_to_protocol_runtime(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
     readme.write_text("MiniHarness README content", encoding="utf-8")
     provider = MockProvider(
@@ -111,15 +106,12 @@ def test_agent_delegates_tool_call_processing_to_protocol_runtime(tmp_path: Path
                 },
             )()
 
-    monkeypatch.setattr("miniharness.agent.ToolCallingProtocolRuntime", FakeProtocolRuntime)
-
-    agent = MiniAgent(
+    agent = make_agent_session(
+        tmp_path,
         provider=provider,  # type: ignore[arg-type]
-        tools=ToolRegistry(tmp_path),
         trace=trace,
-        console=Console(file=StringIO(), force_terminal=False),
         max_turns=3,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        protocol_runtime=FakeProtocolRuntime(),
     )
 
     answer = agent.run("read the README")
@@ -141,5 +133,9 @@ def test_agent_run_does_not_manually_loop_tool_calls() -> None:
 
     assert "for tool_call in tool_calls" not in source
     assert ".execute_tool_call(tool_call)" not in source
-    assert "ToolCallingProtocolRuntime" in source
+    assert "PlannerRuntime(" not in source
+    assert "ToolRuntime(" not in source
+    assert "ToolCallingProtocolRuntime(" not in source
+    assert "InstructionRuntime(" not in source
+    assert "self.protocol_runtime" in source
     assert "process_model_turn" in source

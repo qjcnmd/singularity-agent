@@ -20,7 +20,7 @@ from miniharness.model import (
     ToolChoiceMode,
     ToolChoicePolicy,
 )
-from miniharness.tool_protocol.models import ToolProtocolResultEnvelope, ToolProtocolTurnStatus
+from miniharness.tool_protocol.models import ToolProtocolTurnStatus
 from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
 from miniharness.tool_protocol.state import ToolProtocolStateStore
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
@@ -193,17 +193,8 @@ def test_protocol_runtime_invokes_workspace_state_hook(tmp_path: Path) -> None:
 
     def workspace_state_hook(hook_context: ContextManager, *, batch: Any, tool_call_id: str | None) -> None:
         hook_calls.append((str(batch.batch_id), 7))
-        hook_context.add_tool_protocol_result(
-            ToolProtocolResultEnvelope(
-                tool_call_id=f"workspace_state_{batch.batch_id}",
-                tool_name="workspace_health",
-                ok=True,
-                status="ok",
-                content_preview=json.dumps({"workspace_state": "clean"}),
-                content_digest="digest",
-                redacted=True,
-            )
-        )
+        _ = tool_call_id
+        hook_context.add_workspace_state({"workspace_state": {"status": "clean"}})
 
     protocol_runtime, tool_runtime = _make_protocol_runtime(
         tmp_path,
@@ -221,8 +212,11 @@ def test_protocol_runtime_invokes_workspace_state_hook(tmp_path: Path) -> None:
     assert result.status == ToolProtocolTurnStatus.PROCESSED
     assert len(hook_calls) == 1
     tool_messages = [message for message in context.messages() if message["role"] == "tool"]
-    assert len(tool_messages) == 2
-    assert json.loads(tool_messages[-1]["content"])["tool_name"] == "workspace_health"
+    assert len(tool_messages) == 1
+    assert any(
+        message["role"] == "system" and "workspace_state" in str(message.get("content"))
+        for message in context.messages()
+    )
 
 
 def test_protocol_runtime_appends_tool_message_when_tool_runtime_fails(tmp_path: Path) -> None:

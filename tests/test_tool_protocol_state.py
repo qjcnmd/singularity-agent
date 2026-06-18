@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from uuid import uuid4
 
 from miniharness.tool_protocol.models import (
     ToolCallBatch,
@@ -14,12 +13,6 @@ from miniharness.tool_protocol.models import (
 from miniharness.tool_protocol.result import ToolProtocolResultBuilder
 from miniharness.tool_protocol.state import ToolProtocolStateStore
 from miniharness.tools.models import ToolResult, ToolSideEffectKind
-
-
-def _workspace_tmp(name: str) -> Path:
-    path = Path("work/pytest-tmp") / f"{name}-{uuid4().hex}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def make_envelope(
@@ -61,8 +54,7 @@ def make_batch() -> ToolCallBatch:
     )
 
 
-def test_state_store_persists_batch_records_events_and_results() -> None:
-    tmp_path = _workspace_tmp("tool-protocol-state")
+def test_state_store_persists_batch_records_events_and_results(tmp_path: Path) -> None:
     store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
 
     batch = store.create_batch(make_batch())
@@ -99,8 +91,7 @@ def test_state_store_persists_batch_records_events_and_results() -> None:
     ]
 
 
-def test_state_store_replay_protection_and_conflicts() -> None:
-    tmp_path = _workspace_tmp("tool-protocol-replay")
+def test_state_store_replay_protection_and_conflicts(tmp_path: Path) -> None:
     store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
     batch = store.create_batch(make_batch())
     record = store.upsert_record(batch.tool_calls[0], phase=ToolCallPhase.VALIDATED)
@@ -154,8 +145,7 @@ def test_state_store_replay_protection_and_conflicts() -> None:
     assert side_effect_decision.status == "side_effect_replay"
 
 
-def test_state_store_queries_pending_by_run_session_task_and_batch_by_assistant_message() -> None:
-    tmp_path = _workspace_tmp("tool-protocol-query")
+def test_state_store_queries_pending_by_run_session_task_and_batch_by_assistant_message(tmp_path: Path) -> None:
     store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
     batch = store.create_batch(make_batch())
     store.upsert_record(batch.tool_calls[0], phase=ToolCallPhase.VALIDATED)
@@ -169,14 +159,80 @@ def test_state_store_queries_pending_by_run_session_task_and_batch_by_assistant_
     assert store.batch_by_assistant_message_id("missing") is None
 
 
-def test_state_store_exposes_independent_tables() -> None:
-    db_path = _workspace_tmp("tool-protocol-schema") / "tool_protocol.sqlite3"
+def test_state_store_redacts_protocol_arguments_before_persistence(tmp_path: Path) -> None:
+    db_path = tmp_path / "tool_protocol.sqlite3"
+    store = ToolProtocolStateStore(db_path)
+    secret_call = make_envelope(
+        raw_arguments='{"api_key":"sk-secret-value","path":"README.md"}',
+        normalized_arguments={"api_key": "sk-secret-value", "path": "README.md"},
+    )
+    batch = ToolCallBatch(
+        batch_id="batch_secret",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        model_request_id="req_1",
+        model_response_id="resp_1",
+        assistant_message={"id": "assistant_secret", "role": "assistant", "content": None},
+        tool_calls=[secret_call],
+    )
+
+    store.create_batch(batch)
+    record = store.upsert_record(secret_call, phase=ToolCallPhase.VALIDATED)
+    store.bind_result(
+        record.record_id,
+        result=ToolProtocolResultEnvelope(
+            tool_call_id=secret_call.tool_call_id,
+            tool_name=secret_call.tool_name,
+            ok=True,
+            status="ok",
+            content_preview="api_key=sk-secret-value",
+            content_digest="digest",
+            raw_result_ref="artifact_digest",
+            redacted=True,
+            metadata={
+                "raw_result": {"api_key": "sk-secret-value"},
+                "token": "sk-secret-value",
+                "safe": "README.md",
+            },
+        ),
+    )
+
+    texts: list[str] = []
+    with sqlite3.connect(db_path) as connection:
+        for table, columns in {
+            "tool_call_batches": ["assistant_message", "tool_calls"],
+            "tool_call_records": [
+                "raw_arguments",
+                "parsed_arguments",
+                "normalized_arguments",
+                "envelope",
+            ],
+            "tool_result_bindings": ["result_payload", "metadata"],
+            "tool_protocol_events": ["payload"],
+        }.items():
+            rows = connection.execute(
+                f"select {', '.join(columns)} from {table}"
+            ).fetchall()
+            for row in rows:
+                texts.extend(str(value) for value in row if value is not None)
+
+    serialized = "\n".join(texts)
+    assert "sk-secret-value" not in serialized
+    assert '"raw_result"' not in serialized
+    assert "<redacted:" in serialized
+    assert "README.md" in serialized
+
+
+def test_state_store_exposes_independent_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "tool_protocol.sqlite3"
     ToolProtocolStateStore(db_path)
 
-    connection = sqlite3.connect(db_path)
-    rows = connection.execute(
-        "select name from sqlite_master where type = 'table' order by name"
-    ).fetchall()
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "select name from sqlite_master where type = 'table' order by name"
+        ).fetchall()
     table_names = {row[0] for row in rows}
 
     assert {

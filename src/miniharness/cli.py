@@ -261,6 +261,7 @@ def main(
             registry=tools,
             trace=trace,
             state_store=ToolProtocolStateStore(trace.store.run_dir / "tool_protocol.sqlite3"),
+            workspace_state_hook=_workspace_state_context_hook(state_runtime),
         )
         instruction_runtime = InstructionRuntime(workspace_root=project_root, trace=trace)
         context_db_path = runtime_config.context_db_path(trace.store.run_dir)
@@ -270,10 +271,8 @@ def main(
             trace=trace,
             console=console,
             max_turns=runtime_config.max_turns,
-            state_runtime=state_runtime,
             planner=planner,
             policy_runtime=policy_runtime,
-            approval_gate=approval_gate,
             tool_runtime=tool_runtime,
             protocol_runtime=protocol_runtime,
             instruction_runtime=instruction_runtime,
@@ -343,6 +342,15 @@ def _workspace_health_panel(health: WorkspaceHealthReport) -> Panel:
 
 def _format_list(values: list[str]) -> str:
     return ", ".join(values) if values else "-"
+
+
+def _workspace_state_context_hook(state_runtime: LocalWorkspaceStateRuntime):
+    def hook(context, *, batch, tool_call_id: str | None) -> None:
+        _ = batch, tool_call_id
+        state_runtime.record_external_changes()
+        context.add_workspace_state(state_runtime.get_workspace_health().to_observation())
+
+    return hook
 
 
 @trace_app.command("list")

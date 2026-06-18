@@ -22,6 +22,9 @@ from miniharness.context.models import (
 from miniharness.context.redaction import ContextRedactor, SensitivityClassifier
 
 
+_RAW_OBSERVATION_KEYS = {"raw_result", "raw_args", "raw_arguments", "result"}
+
+
 class ContextVersionConflict(RuntimeError):
     pass
 
@@ -282,15 +285,15 @@ class ObservationStore:
     def save_observation(self, observation: ToolObservation) -> None:
         with self._lock:
             self._ensure_run(observation.run_id)
-            raw_result = observation.raw_result
-            preview = observation.preview
-            sensitivity = self.classifier.classify(raw_result)
+            preview = self._stored_observation_preview(observation.preview)
+            raw_result = self._stored_observation_result(observation, preview=preview)
+            sensitivity = self.classifier.classify(observation.raw_result)
             if (
                 sensitivity in {ContextSensitivity.SECRET, ContextSensitivity.SENSITIVE}
                 and not self.allow_raw_secret_storage
             ):
-                raw_result = self.redactor.redact_value(raw_result)
-                preview = self.redactor.redact_text(preview)
+                preview = self._stored_observation_preview(preview)
+                raw_result = self._stored_observation_result(observation, preview=preview)
             self._connection.execute(
                 """
                 insert or replace into observations(
@@ -311,7 +314,11 @@ class ObservationStore:
                     json.dumps(raw_result, ensure_ascii=False, default=str),
                     preview,
                     1 if observation.truncated else 0,
-                    json.dumps(observation.metadata, ensure_ascii=False, default=str),
+                    json.dumps(
+                        self._stored_observation_metadata(observation),
+                        ensure_ascii=False,
+                        default=str,
+                    ),
                     observation.created_at,
                     observation.input_tokens,
                     observation.preview_tokens,
@@ -332,6 +339,51 @@ class ObservationStore:
             for ref in observation.source_refs:
                 self._insert_reference(ref)
             self._connection.commit()
+
+    def _stored_observation_result(
+        self,
+        observation: ToolObservation,
+        *,
+        preview: str,
+    ) -> dict[str, Any]:
+        metadata = self._stored_observation_metadata(observation)
+        return self.redactor.redact_value(
+            {
+                "tool_name": observation.tool_name,
+                "tool_call_id": observation.tool_call_id,
+                "ok": observation.ok,
+                "content_preview": preview,
+                "raw_digest": observation.raw_digest,
+                "truncated": observation.truncated,
+                "reference_ids": [ref.ref_id for ref in observation.source_refs],
+                "error_code": observation.error_code,
+                "result_ref": metadata.get("result_ref"),
+                "redacted": True,
+                "metadata": metadata,
+            }
+        )
+
+    def _stored_observation_metadata(self, observation: ToolObservation) -> dict[str, Any]:
+        return self.redactor.redact_value(
+            {
+                str(key): value
+                for key, value in observation.metadata.items()
+                if str(key) not in _RAW_OBSERVATION_KEYS
+            }
+        )
+
+    def _stored_observation_preview(self, preview: str) -> str:
+        try:
+            parsed = json.loads(preview)
+        except (TypeError, json.JSONDecodeError):
+            return self.redactor.redact_text(str(preview))
+        safe = _drop_raw_observation_keys(parsed)
+        return json.dumps(
+            self.redactor.redact_value(safe),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
 
     def get_observation(self, observation_id: str) -> ToolObservation | None:
         row = self._connection.execute(
@@ -1167,3 +1219,17 @@ def _value(value: Any) -> str | None:
     if value is None:
         return None
     return getattr(value, "value", str(value))
+
+
+def _drop_raw_observation_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _drop_raw_observation_keys(item)
+            for key, item in value.items()
+            if str(key) not in _RAW_OBSERVATION_KEYS
+        }
+    if isinstance(value, list):
+        return [_drop_raw_observation_keys(item) for item in value]
+    if isinstance(value, tuple):
+        return [_drop_raw_observation_keys(item) for item in value]
+    return value

@@ -7,7 +7,6 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 from typer.testing import CliRunner
 
-from miniharness.agent import MiniAgent
 from miniharness.cli import app
 from miniharness.config import ProductionRuntimeConfig
 from miniharness.context import ContextManager
@@ -43,6 +42,7 @@ from miniharness.tools import (
     ToolSideEffectKind,
     ToolSpec,
 )
+from tests.agent_runtime_helpers import make_agent_session
 from tests.test_tool_runtime_policy_approval import (
     EmptyInput,
     SequencedPolicyRuntime,
@@ -345,8 +345,9 @@ def test_min_agent_uses_injected_protocol_and_tool_runtime(tmp_path: Path) -> No
         policy_runtime=make_test_policy_runtime(tmp_path),
     )
     protocol_runtime = CountingProtocolRuntime(registry=registry, trace=None)
-    agent = MiniAgent(
-        provider=provider,  # type: ignore[arg-type]
+    agent = make_agent_session(
+        tmp_path,
+        provider=provider,
         tools=registry,
         trace=TraceRuntime.create(tmp_path),
         console=NullConsole(),

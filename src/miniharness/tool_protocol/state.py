@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from miniharness.context.redaction import ContextRedactor
 from miniharness.tool_protocol.errors import ToolProtocolStateError
 from miniharness.tool_protocol.models import (
     ToolCallBatch,
@@ -19,6 +20,10 @@ from miniharness.tool_protocol.models import (
     _now,
 )
 from miniharness.tools.models import ToolSideEffectKind
+
+
+_STATE_REDACTOR = ContextRedactor()
+_RAW_RESULT_KEYS = {"raw_result", "raw_args", "result"}
 
 
 class ToolProtocolReplayDecision:
@@ -72,8 +77,16 @@ class ToolProtocolStateStore:
                     batch_obj.phase_id,
                     batch_obj.model_request_id,
                     batch_obj.model_response_id,
-                    json.dumps(batch_obj.assistant_message, ensure_ascii=False, default=str),
-                    json.dumps([call.to_dict() for call in batch_obj.tool_calls], ensure_ascii=False, default=str),
+                    json.dumps(
+                        _state_redact_value(batch_obj.assistant_message),
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    json.dumps(
+                        [_state_safe_envelope_dict(call) for call in batch_obj.tool_calls],
+                        ensure_ascii=False,
+                        default=str,
+                    ),
                     1 if batch_obj.supports_parallel_execution else 0,
                     batch_obj.max_tool_calls,
                     batch_obj.created_at,
@@ -271,14 +284,22 @@ class ToolProtocolStateStore:
                     binding.record_id,
                     binding.tool_call_id,
                     binding.result_id,
-                    json.dumps(result.to_dict(), ensure_ascii=False, default=str),
+                    json.dumps(
+                        _state_safe_result_payload(result.to_dict()),
+                        ensure_ascii=False,
+                        default=str,
+                    ),
                     binding.raw_result_ref,
                     binding.context_message_id,
                     binding.result_digest,
                     1 if binding.appended else 0,
                     binding.created_at,
                     _now(),
-                    json.dumps(binding.metadata, ensure_ascii=False, default=str),
+                    json.dumps(
+                        _state_safe_event_payload(binding.metadata),
+                        ensure_ascii=False,
+                        default=str,
+                    ),
                 ),
             )
             self._connection.execute(
@@ -301,7 +322,7 @@ class ToolProtocolStateStore:
                 record_id=record_id,
                 run_id=row["run_id"],
                 event_type=ToolCallPhase.SUCCEEDED.value if result.ok else ToolCallPhase.FAILED.value,
-                payload=result.to_dict(),
+                payload=_state_safe_result_payload(result.to_dict()),
             )
             self._connection.commit()
         return binding
@@ -378,7 +399,7 @@ class ToolProtocolStateStore:
             batch_id=batch_id,
             tool_call_id=tool_call_id or self._tool_call_id_for_record(record_id),
             event_type=event_type,
-            payload=dict(payload),
+            payload=_state_safe_event_payload(payload),
         )
         with self._lock:
             self._connection.execute(
@@ -393,7 +414,7 @@ class ToolProtocolStateStore:
                     record_id,
                     run_id,
                     event_type,
-                    json.dumps(payload, ensure_ascii=False, default=str),
+                    json.dumps(event.payload, ensure_ascii=False, default=str),
                     event.created_at,
                 ),
             )
@@ -405,7 +426,7 @@ class ToolProtocolStateStore:
             batch_id=batch_id,
             tool_call_id=tool_call_id or self._tool_call_id_for_record(record_id),
             event_type=event_type,
-            payload=dict(payload),
+            payload=dict(event.payload),
             created_at=event.created_at,
         )
 
@@ -893,6 +914,7 @@ def _result_id(record_id: str) -> str:
 
 def _record_values(record: ToolCallRecord, batch_id: str) -> tuple[Any, ...]:
     envelope = record.envelope
+    safe_envelope = _state_safe_envelope_dict(envelope)
     return (
         record.record_id,
         batch_id,
@@ -906,9 +928,9 @@ def _record_values(record: ToolCallRecord, batch_id: str) -> tuple[Any, ...]:
         envelope.tool_call_id,
         envelope.tool_name,
         envelope.argument_digest,
-        envelope.raw_arguments,
-        json.dumps(envelope.parsed_arguments, ensure_ascii=False, default=str),
-        json.dumps(envelope.normalized_arguments, ensure_ascii=False, default=str),
+        safe_envelope["raw_arguments"],
+        json.dumps(safe_envelope["parsed_arguments"], ensure_ascii=False, default=str),
+        json.dumps(safe_envelope["normalized_arguments"], ensure_ascii=False, default=str),
         record.phase.value,
         record.previous_phase.value if record.previous_phase else None,
         record.policy_decision_id,
@@ -920,7 +942,7 @@ def _record_values(record: ToolCallRecord, batch_id: str) -> tuple[Any, ...]:
         record.error_kind.value if record.error_kind else None,
         record.error_message,
         record.attempts,
-        json.dumps(envelope.to_dict(), ensure_ascii=False, default=str),
+        json.dumps(safe_envelope, ensure_ascii=False, default=str),
         record.created_at,
         record.updated_at,
     )
@@ -928,6 +950,7 @@ def _record_values(record: ToolCallRecord, batch_id: str) -> tuple[Any, ...]:
 
 def _record_update_values(record: ToolCallRecord, batch_id: str) -> tuple[Any, ...]:
     envelope = record.envelope
+    safe_envelope = _state_safe_envelope_dict(envelope)
     return (
         batch_id,
         envelope.run_id,
@@ -939,9 +962,9 @@ def _record_update_values(record: ToolCallRecord, batch_id: str) -> tuple[Any, .
         envelope.assistant_message_id,
         envelope.tool_name,
         envelope.argument_digest,
-        envelope.raw_arguments,
-        json.dumps(envelope.parsed_arguments, ensure_ascii=False, default=str),
-        json.dumps(envelope.normalized_arguments, ensure_ascii=False, default=str),
+        safe_envelope["raw_arguments"],
+        json.dumps(safe_envelope["parsed_arguments"], ensure_ascii=False, default=str),
+        json.dumps(safe_envelope["normalized_arguments"], ensure_ascii=False, default=str),
         record.phase.value,
         record.previous_phase.value if record.previous_phase else None,
         record.policy_decision_id,
@@ -953,7 +976,7 @@ def _record_update_values(record: ToolCallRecord, batch_id: str) -> tuple[Any, .
         record.error_kind.value if record.error_kind else None,
         record.error_message,
         record.attempts,
-        json.dumps(envelope.to_dict(), ensure_ascii=False, default=str),
+        json.dumps(safe_envelope, ensure_ascii=False, default=str),
         record.updated_at,
         record.record_id,
     )
@@ -973,3 +996,51 @@ def _is_side_effectful(side_effects: ToolSideEffectKind | str | None) -> bool:
         ToolSideEffectKind.NONE.value,
         ToolSideEffectKind.READ_WORKSPACE.value,
     }
+
+
+def _state_safe_envelope_dict(envelope: ToolCallEnvelope) -> dict[str, Any]:
+    payload = envelope.to_dict()
+    payload["raw_arguments"] = _state_redact_raw_arguments(envelope.raw_arguments)
+    payload["parsed_arguments"] = _state_redact_value(envelope.parsed_arguments)
+    payload["normalized_arguments"] = _state_redact_value(envelope.normalized_arguments)
+    payload["metadata"] = _state_safe_event_payload(envelope.metadata)
+    return _state_redact_value(payload)
+
+
+def _state_safe_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return _state_safe_event_payload(payload)
+
+
+def _state_safe_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    safe = _drop_raw_result_keys(payload)
+    redacted = _state_redact_value(safe)
+    return redacted if isinstance(redacted, dict) else {}
+
+
+def _state_redact_raw_arguments(raw_arguments: Any) -> str:
+    if not isinstance(raw_arguments, str):
+        raw_arguments = json.dumps(raw_arguments, ensure_ascii=False, default=str)
+    try:
+        parsed = json.loads(raw_arguments)
+    except (TypeError, json.JSONDecodeError):
+        return _STATE_REDACTOR.redact_text(str(raw_arguments))
+    redacted = _state_redact_value(parsed)
+    return json.dumps(redacted, ensure_ascii=False, default=str)
+
+
+def _state_redact_value(value: Any) -> Any:
+    return _STATE_REDACTOR.redact_value(value)
+
+
+def _drop_raw_result_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _drop_raw_result_keys(item)
+            for key, item in value.items()
+            if str(key) not in _RAW_RESULT_KEYS
+        }
+    if isinstance(value, list):
+        return [_drop_raw_result_keys(item) for item in value]
+    if isinstance(value, tuple):
+        return [_drop_raw_result_keys(item) for item in value]
+    return value
