@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -171,7 +172,7 @@ def test_compression_creates_summary_with_references_when_history_exceeds_budget
     assert "ref_readme" in snapshot.known_observation_ids
 
 
-def test_observation_store_persists_raw_results_and_references(tmp_path: Path) -> None:
+def test_observation_store_persists_result_digest_preview_and_references(tmp_path: Path) -> None:
     db_path = tmp_path / "context.sqlite3"
     context = ContextManager(
         system_prompt="system",
@@ -197,10 +198,45 @@ def test_observation_store_persists_raw_results_and_references(tmp_path: Path) -
     refs = ReferenceResolver(store).references_for_observation(observation.id)
 
     assert reloaded is not None
-    assert reloaded.raw_result == result
+    assert reloaded.raw_result != result
+    assert reloaded.raw_result["tool_name"] == "read_file"
+    assert reloaded.raw_result["tool_call_id"] == "call_readme"
+    assert "hello" in reloaded.raw_result["content_preview"]
+    assert reloaded.raw_result["raw_digest"] == observation.raw_digest
+    assert reloaded.raw_result["redacted"] is True
     assert reloaded.raw_digest == observation.raw_digest
     assert refs[0].path == "README.md"
     assert refs[0].digest == observation.raw_digest
+
+
+def test_observation_store_does_not_persist_raw_result_or_secret_metadata(tmp_path: Path) -> None:
+    db_path = tmp_path / "context.sqlite3"
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="user",
+        db_path=db_path,
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+    call = tool_call("call_secret")
+    result = {
+        "ok": True,
+        "content": {"api_key": "sk-secret-value", "path": "README.md"},
+        "metadata": {
+            "raw_result": {"api_key": "sk-secret-value"},
+            "token": "sk-secret-value",
+            "safe": "README.md",
+        },
+    }
+
+    context.add_tool_result(tool_call=call, result=result, turn=2)
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute("select raw_result, metadata, preview from observations").fetchone()
+    serialized = "\n".join(str(value) for value in row if value is not None)
+    assert "sk-secret-value" not in serialized
+    assert "raw_result" not in serialized
+    assert "<redacted:" in serialized
+    assert "README.md" in serialized
 
 
 def test_recovery_restores_completed_tool_result_without_repeating_call(

@@ -1,14 +1,9 @@
-from io import StringIO
 from pathlib import Path
 
-from rich.console import Console
-
-from miniharness.agent import MiniAgent
 from miniharness.model import MockModelProvider, ModelRuntime
 from miniharness.planner import PlannerRuntime
 from miniharness.tools import ToolRegistry
-from miniharness.trace import TraceWriter
-from tests.tool_runtime_helpers import make_test_policy_runtime
+from tests.agent_runtime_helpers import make_agent_session
 
 
 def test_agent_uses_model_runtime_for_turns_and_final_report_has_usage(tmp_path: Path) -> None:
@@ -17,14 +12,12 @@ def test_agent_uses_model_runtime_for_turns_and_final_report_has_usage(tmp_path:
         MockModelProvider(text="done"),
         tool_registry=ToolRegistry(tmp_path),
     )
-    agent = MiniAgent(
+    agent = make_agent_session(
+        tmp_path,
         model_runtime=runtime,
         tools=ToolRegistry(tmp_path),
-        trace=TraceWriter.create(tmp_path),
-        console=Console(file=StringIO(), force_terminal=False),
         max_turns=1,
         planner=planner,
-        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     answer = agent.run("say something")

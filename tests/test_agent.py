@@ -1,18 +1,13 @@
-import json
-from io import StringIO
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console
-
-from miniharness.agent import MiniAgent
 from miniharness.planner import PlannerRuntime
 from miniharness.tools import ToolRegistry
 from miniharness.tools.mutation import register_mutation_tools
 from miniharness.trace import TraceWriter
 from miniharness.workspace import MutationRuntime
 from miniharness.workspace_state import LocalWorkspaceStateRuntime
-from tests.tool_runtime_helpers import make_test_policy_runtime
+from tests.agent_runtime_helpers import make_agent_session
 
 
 class MockProvider:
@@ -40,14 +35,7 @@ def test_agent_returns_final_answer_without_tool_calls(tmp_path: Path) -> None:
             ]
         }
     )
-    agent = MiniAgent(
-        provider=provider,  # type: ignore[arg-type]
-        tools=ToolRegistry(tmp_path),
-        trace=TraceWriter.create(tmp_path),
-        console=Console(file=StringIO(), force_terminal=False),
-        max_turns=3,
-        policy_runtime=make_test_policy_runtime(tmp_path),
-    )
+    agent = make_agent_session(tmp_path, provider=provider)
 
     answer = agent.run("say something")
 
@@ -96,14 +84,7 @@ def test_agent_runs_complete_tool_call_loop(tmp_path: Path) -> None:
             ]
         },
     )
-    agent = MiniAgent(
-        provider=provider,  # type: ignore[arg-type]
-        tools=ToolRegistry(tmp_path),
-        trace=TraceWriter.create(tmp_path),
-        console=Console(file=StringIO(), force_terminal=False),
-        max_turns=3,
-        policy_runtime=make_test_policy_runtime(tmp_path),
-    )
+    agent = make_agent_session(tmp_path, provider=provider)
 
     answer = agent.run("read the README")
 
@@ -153,28 +134,24 @@ def test_agent_injects_workspace_state_observation_after_tool_call(tmp_path: Pat
             ]
         },
     )
-    agent = MiniAgent(
-        provider=provider,  # type: ignore[arg-type]
-        tools=ToolRegistry(tmp_path),
+    agent = make_agent_session(
+        tmp_path,
+        provider=provider,
         trace=trace,
-        console=Console(file=StringIO(), force_terminal=False),
-        max_turns=3,
         state_runtime=state,
-        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     answer = agent.run("read the README")
 
     assert answer == "done"
     second_messages = provider.calls[1]["messages"]
+    assert not any(message["role"] == "tool" and message.get("name") == "workspace_health" for message in second_messages)
     workspace_messages = [
         message
         for message in second_messages
-        if message["role"] == "tool" and message.get("name") == "workspace_health"
+        if message["role"] == "system" and "workspace_state" in str(message.get("content"))
     ]
     assert len(workspace_messages) == 1
-    payload = json.loads(workspace_messages[0]["content"])
-    assert "workspace_state" in payload["content"]
     assert "journal" not in workspace_messages[0]["content"].lower()
 
 
@@ -195,14 +172,13 @@ def test_agent_filters_tools_and_injects_planner_context(tmp_path: Path) -> None
             ]
         }
     )
-    agent = MiniAgent(
-        provider=provider,  # type: ignore[arg-type]
+    agent = make_agent_session(
+        tmp_path,
+        provider=provider,
         tools=tools,
         trace=trace,
-        console=Console(file=StringIO(), force_terminal=False),
         max_turns=1,
         planner=planner,
-        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     agent.run("inspect only")
@@ -232,14 +208,11 @@ def test_agent_returns_planner_final_report_when_completion_evidence_exists(tmp_
             ]
         }
     )
-    agent = MiniAgent(
-        provider=provider,  # type: ignore[arg-type]
-        tools=ToolRegistry(tmp_path),
-        trace=TraceWriter.create(tmp_path),
-        console=Console(file=StringIO(), force_terminal=False),
+    agent = make_agent_session(
+        tmp_path,
+        provider=provider,
         max_turns=1,
         planner=planner,
-        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     original_start = planner.start_task
@@ -283,14 +256,11 @@ def test_agent_blocks_final_answer_when_completion_evidence_is_missing(tmp_path:
             ]
         }
     )
-    agent = MiniAgent(
-        provider=provider,  # type: ignore[arg-type]
-        tools=ToolRegistry(tmp_path),
-        trace=TraceWriter.create(tmp_path),
-        console=Console(file=StringIO(), force_terminal=False),
+    agent = make_agent_session(
+        tmp_path,
+        provider=provider,
         max_turns=1,
         planner=planner,
-        policy_runtime=make_test_policy_runtime(tmp_path),
     )
 
     answer = agent.run("change code")

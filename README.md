@@ -102,6 +102,8 @@ miniharness trace artifacts <run_id> --trace-dir work/traces/runs
 
 The agent does not execute tools directly, construct tool result messages by hand, make policy decisions, write raw tool trace records, or own protocol state.
 
+The CLI assembles `PlannerRuntime`, `ModelRuntime`, `ToolRuntime`, `ToolCallingProtocolRuntime`, `InstructionRuntime`, `PolicyRuntime`, and `ApprovalGate` before creating `MiniAgent`. Direct `MiniAgent` construction must inject those runtime dependencies instead of relying on a private fallback loop.
+
 `ToolRuntime` requires the session `PolicyRuntime`. It validates schemas and runtime boundaries, enforces policy decisions, resolves local approval grants, blocks dry-run side effects, executes the registered handler only after those gates pass, and records redacted structured trace events.
 
 Mutation, command, and verification tools are registered through their dedicated runtimes. Verification command discovery uses `python -m pytest tests --basetemp work/pytest-tmp` for this repository shape.
@@ -130,7 +132,7 @@ All model tool calls flow through `ToolCallingProtocolRuntime`. Invalid tool cal
 
 Pending approvals are recoverable through protocol recovery reports. MiniHarness reports `pending_approval_count` and a resume action, but does not implement remote approval.
 
-`ContextItem` and `ContextBundle` are the primary context state. `_messages` is only the provider projection cache. Tool results enter context through `add_tool_protocol_result()`; `add_tool_result()` remains as a compatibility adapter. Workspace health enters context through `add_workspace_state()` and is not treated as the primary tool result state.
+`ContextItem` and `ContextBundle` are the primary context state. `_messages` is only the provider projection cache. Tool results enter context through `add_tool_protocol_result()`; `add_tool_result()` remains as a compatibility adapter. Workspace health enters context through `add_workspace_state()` and is rendered as structured runtime context, not as a synthetic `workspace_health` tool result.
 
 Policy, planner, mutation, command, verification, and workspace-state observations use structured context items. Secrets are redacted before storage and rendering.
 
