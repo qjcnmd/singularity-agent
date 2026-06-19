@@ -65,6 +65,7 @@ class VerificationRuntime:
         policy_runtime: PolicyRuntime | None = None,
         project_index_runtime: Any | None = None,
         review_runtime: Any | None = None,
+        memory_runtime: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.command_runtime = command_runtime or CommandRuntime(self.workspace_root, trace=trace)
@@ -75,6 +76,7 @@ class VerificationRuntime:
         )
         self.project_index_runtime = project_index_runtime
         self.review_runtime = review_runtime
+        self.memory_runtime = memory_runtime
         self.policy = policy or VerificationPolicy(self.command_runtime.policy)
         self.parsers = FailureParserRegistry()
         self.hints = RepairHintGenerator()
@@ -167,6 +169,7 @@ class VerificationRuntime:
         )
         if review_report is not None:
             observation["verification"]["review_report"] = review_report.model_dump(mode="json")
+        self._record_memory(observation)
         if self.planner is not None:
             self.planner.update_from_verification(observation, tool_call_id=None)
         return observation
@@ -192,6 +195,7 @@ class VerificationRuntime:
         )
         if review_report is not None:
             observation["verification"]["review_report"] = review_report.model_dump(mode="json")
+        self._record_memory(observation)
         if self.planner is not None:
             self.planner.update_from_verification(observation, tool_call_id=None)
         return observation
@@ -941,6 +945,11 @@ class VerificationRuntime:
             assessment=assessment,
             observation=observation,
         )
+
+    def _record_memory(self, observation: dict[str, Any]) -> None:
+        if self.memory_runtime is None or not hasattr(self.memory_runtime, "ingest_verification_observation"):
+            return
+        self.memory_runtime.ingest_verification_observation(observation)
 
     def _throw_if_cancelled(self) -> None:
         token = getattr(self, "cancellation_token", None)

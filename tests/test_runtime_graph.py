@@ -30,6 +30,7 @@ def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, 
         RuntimeComponentName.INTERACTION,
         RuntimeComponentName.WORKSPACE_STATE,
         RuntimeComponentName.PROJECT_INDEX,
+        RuntimeComponentName.MEMORY,
         RuntimeComponentName.POLICY,
         RuntimeComponentName.SANDBOX,
         RuntimeComponentName.COMMAND,
@@ -45,9 +46,14 @@ def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, 
     ]
     assert graph.state(RuntimeComponentName.PLANNER) == RuntimeComponentState.READY
     assert graph.planner is not None
+    assert graph.memory_runtime is not None
+    assert graph.memory_runtime.session_id == trace.session_id
+    assert graph.components_for_health()["memory"] is graph.memory_runtime
     assert graph.edit_runtime is not None
     assert graph.review_runtime is not None
     assert graph.edit_runtime.review_runtime is graph.review_runtime
     assert graph.verification_runtime.review_runtime is graph.review_runtime
+    assert graph.review_runtime.memory_runtime is graph.memory_runtime
+    assert graph.verification_runtime.memory_runtime is graph.memory_runtime
     assert graph.model_runtime is not None
     assert graph.tool_runtime is not None

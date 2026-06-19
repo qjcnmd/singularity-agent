@@ -680,6 +680,27 @@ class ContextManager:
             )
         )
 
+    def add_memory_context_block(self, block: Any) -> ContextItem:
+        payload = block.to_dict() if hasattr(block, "to_dict") else dict(block)
+        payload["trust_level"] = "untrusted_memory"
+        return self.add_context_item(
+            self._make_item(
+                layer=ContextLayer.FAILURE_MEMORY,
+                source_runtime=ContextRuntime.MEMORY,
+                item_type=ContextItemType.MEMORY_CONTEXT,
+                content=payload,
+                authority=ContextAuthority.RUNTIME,
+                sensitivity=ContextSensitivity.WORKSPACE,
+                importance=float(payload.get("priority") or 0.65),
+                metadata={
+                    "trust_level": "untrusted_memory",
+                    "pollution_risk": payload.get("pollution_risk"),
+                    "token_budget": payload.get("budget"),
+                    "item_count": len(payload.get("items") or []),
+                },
+            )
+        )
+
     def add_failure(self, failure: dict[str, Any] | str) -> ContextItem:
         return self.add_context_item(
             self._make_item(

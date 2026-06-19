@@ -17,6 +17,7 @@ from miniharness.model import (
     ModelRuntime,
     OpenAICompatibleModelProvider,
 )
+from miniharness.memory import MemoryRuntime
 from miniharness.observability import TraceRuntime
 from miniharness.policy import ApprovalGate, ApprovalMode, PolicyRuntime
 from miniharness.planner import PlannerRuntime
@@ -49,6 +50,7 @@ RUNTIME_INITIALIZATION_ORDER = [
     RuntimeComponentName.INTERACTION,
     RuntimeComponentName.WORKSPACE_STATE,
     RuntimeComponentName.PROJECT_INDEX,
+    RuntimeComponentName.MEMORY,
     RuntimeComponentName.POLICY,
     RuntimeComponentName.SANDBOX,
     RuntimeComponentName.COMMAND,
@@ -71,6 +73,7 @@ class RuntimeGraph:
     interaction_runtime: InteractionRuntime
     workspace_state: LocalWorkspaceStateRuntime
     project_index_runtime: ProjectIndexRuntime
+    memory_runtime: MemoryRuntime
     policy_runtime: PolicyRuntime
     approval_gate: ApprovalGate
     sandbox_runtime: SandboxRuntime
@@ -108,6 +111,7 @@ class RuntimeGraph:
             "interaction": self.interaction_runtime,
             "workspace": self.workspace_state,
             "project_index": self.project_index_runtime,
+            "memory": self.memory_runtime,
             "policy": self.policy_runtime,
             "sandbox": self.sandbox_runtime,
             "command": self.command_runtime,
@@ -179,6 +183,10 @@ class RuntimeFactory:
                 project_index_runtime.bootstrap(reason="kernel_boot")
             mark(RuntimeComponentName.PROJECT_INDEX)
 
+            memory_runtime = MemoryRuntime(project_root, trace=trace)
+            memory_runtime.start_session(session_id=identity.session_id, user_goal=user_goal)
+            mark(RuntimeComponentName.MEMORY)
+
             policy_config = config.to_policy_config()
             policy_runtime = PolicyRuntime(policy_config, trace=trace)
             approval_gate = ApprovalGate(
@@ -245,9 +253,11 @@ class RuntimeFactory:
                 project_index_runtime=project_index_runtime,
                 policy_runtime=policy_runtime,
                 model_runtime=None,
+                memory_runtime=memory_runtime,
             )
             edit_runtime.review_runtime = review_runtime
             verification_runtime.review_runtime = review_runtime
+            verification_runtime.memory_runtime = memory_runtime
             mark(RuntimeComponentName.REVIEW)
 
             instruction_runtime = InstructionRuntime(workspace_root=project_root, trace=trace)
@@ -309,6 +319,13 @@ class RuntimeFactory:
             index_observation = project_index_runtime.observation_for_goal(user_goal)
             context_manager.add_project_index(index_observation)
             planner.record_project_index_observation(index_observation)
+            memory_block = memory_runtime.context_block(
+                goal=user_goal,
+                max_items=6,
+                token_budget=512,
+            )
+            if memory_block.items:
+                context_manager.add_memory_context_block(memory_block)
             for runtime in (
                 planner,
                 model_runtime,
@@ -338,6 +355,7 @@ class RuntimeFactory:
                 interaction_runtime=interaction_runtime,
                 workspace_state=state_runtime,
                 project_index_runtime=project_index_runtime,
+                memory_runtime=memory_runtime,
                 policy_runtime=policy_runtime,
                 approval_gate=approval_gate,
                 sandbox_runtime=sandbox_runtime,

@@ -11,6 +11,7 @@ from miniharness.code_index import ProjectIndexRuntime
 from miniharness.config import ProductionRuntimeConfig
 from miniharness.interaction import RichCliRenderer
 from miniharness.kernel import CancellationError, KernelBootstrap
+from miniharness.memory.cli import memory_app
 from miniharness.observability import TraceRuntime, TraceStore
 from miniharness.policy import ApprovalMode
 from miniharness.planner import PlannerRuntime
@@ -28,6 +29,7 @@ trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
 index_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 app.add_typer(index_app, name="index")
+app.add_typer(memory_app, name="memory")
 console = Console()
 
 

@@ -271,11 +271,31 @@ class AgentKernel:
         )
         self.context.status = KernelStatus.FINALIZED
         self.graph.trace.record("finalization.completed", self._final_report.to_dict())
+        self._record_memory_session_end(self._final_report, trace_summary=trace_summary)
         self._build_interaction_final_report(
             planner_report=planner_report,
             kernel_report=self._final_report,
         )
         return self._final_report
+
+    def _record_memory_session_end(
+        self,
+        final_report: FinalReport,
+        *,
+        trace_summary: dict[str, Any],
+    ) -> None:
+        memory_runtime = getattr(self.graph, "memory_runtime", None)
+        if memory_runtime is None or not hasattr(memory_runtime, "ingest_session_end"):
+            return
+        try:
+            memory_runtime.ingest_session_end(
+                final_reports=[final_report],
+                trace_summary=trace_summary,
+            )
+        except Exception as exc:
+            self.context.diagnostics.append(
+                {"type": type(exc).__name__, "message": str(exc), "stage": "memory_ingest"}
+            )
 
     def interaction_final_report(self) -> InteractionFinalReport | None:
         return self._interaction_report

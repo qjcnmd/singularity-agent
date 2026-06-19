@@ -1,4 +1,5 @@
 from miniharness.context import ContextManager
+from miniharness.memory.models import MemoryContextBlock
 
 
 def test_context_manager_initializes_system_and_user_messages() -> None:
@@ -69,3 +70,29 @@ def test_long_tool_result_is_truncated_in_message_but_raw_result_is_preserved() 
     assert '"truncated": true' in tool_message["content"]
     assert long_content not in tool_message["content"]
     assert "x" * 4000 in tool_message["content"]
+
+
+def test_add_memory_context_block_adds_untrusted_memory_item() -> None:
+    context = ContextManager(system_prompt="system rules", user_goal="inspect project")
+    block = MemoryContextBlock(
+        items=[
+            {
+                "id": "mem_1",
+                "title": "Use pytest",
+                "body": "Run python -m pytest tests.",
+                "source": "verification",
+                "confidence": "high",
+                "last_verified_at": "2026-06-19T00:00:00+00:00",
+                "pollution_risk": "low",
+            }
+        ],
+        token_count=12,
+        budget=128,
+    )
+
+    item = context.add_memory_context_block(block)
+
+    assert item.item_type.value == "memory_context"
+    assert item.source_runtime.value == "memory"
+    assert item.content["trust_level"] == "untrusted_memory"
+    assert item.content["items"][0]["id"] == "mem_1"

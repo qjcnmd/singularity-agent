@@ -337,6 +337,47 @@ def test_post_verification_review_report_is_written_to_observation(tmp_path: Pat
     assert report["decision"]["repair_targets"]
 
 
+def test_verification_runtime_sends_structured_observation_to_memory(tmp_path: Path) -> None:
+    request = CommandRequest(argv=["pytest"])
+    fake = FakeCommandRuntime(
+        [
+            command_result(
+                request,
+                command_id="cmd_fail",
+                exit_code=1,
+                semantic_status=SemanticStatus.TESTS_FAILED,
+                output="FAILED tests/test_app.py::test_bad - AssertionError",
+                error_code="semantic_failure",
+            ),
+            command_result(
+                request,
+                command_id="cmd_fail_again",
+                exit_code=1,
+                semantic_status=SemanticStatus.TESTS_FAILED,
+                output="FAILED tests/test_app.py::test_bad - AssertionError",
+                error_code="semantic_failure",
+            ),
+        ]
+    )
+
+    class FakeMemoryRuntime:
+        def __init__(self) -> None:
+            self.observations = []
+
+        def ingest_verification_observation(self, observation):
+            self.observations.append(observation)
+
+    memory = FakeMemoryRuntime()
+    (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "pytest"}}), encoding="utf-8")
+    runtime = VerificationRuntime(tmp_path, command_runtime=fake)
+    runtime.memory_runtime = memory
+
+    plan = runtime.plan_verification(changed_files=["src/app.js"], task_intent="code")
+    observation = runtime.run_plan(plan.id)
+
+    assert memory.observations == [observation]
+
+
 def test_flaky_rerun_is_recorded_and_marked_flaky(tmp_path: Path) -> None:
     request = CommandRequest(argv=["pytest"])
     fake = FakeCommandRuntime(

@@ -13,6 +13,7 @@ DEFAULT_HEALTH_COMPONENTS = [
     RuntimeComponentName.INTERACTION,
     RuntimeComponentName.WORKSPACE_STATE,
     RuntimeComponentName.PROJECT_INDEX,
+    RuntimeComponentName.MEMORY,
     RuntimeComponentName.POLICY,
     RuntimeComponentName.SANDBOX,
     RuntimeComponentName.COMMAND,

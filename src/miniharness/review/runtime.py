@@ -28,6 +28,7 @@ class ReviewRuntime:
         project_index_runtime: Any | None = None,
         policy_runtime: Any | None = None,
         model_runtime: Any | None = None,
+        memory_runtime: Any | None = None,
         planner: Any | None = None,
         enable_model_critic: bool = True,
     ) -> None:
@@ -36,6 +37,7 @@ class ReviewRuntime:
         self.project_index_runtime = project_index_runtime
         self.policy_runtime = policy_runtime
         self.model_runtime = model_runtime
+        self.memory_runtime = memory_runtime
         self.planner = planner
         self.enable_model_critic = enable_model_critic
         self.finding_collector = RuleFindingCollector()
@@ -259,6 +261,7 @@ class ReviewRuntime:
         report.trace_event_ids.extend(self._emit_decision(report))
         report.trace_event_ids.extend(self._emit_completed(report))
         self._record_planner(report)
+        self._record_memory(report)
         return report
 
     def _context(self, **values: Any) -> dict[str, Any]:
@@ -404,6 +407,11 @@ class ReviewRuntime:
         if self.planner is None or not hasattr(self.planner, "record_review_observation"):
             return
         self.planner.record_review_observation(report.model_dump(mode="json"))
+
+    def _record_memory(self, report: ReviewReport) -> None:
+        if self.memory_runtime is None or not hasattr(self.memory_runtime, "ingest_review_report"):
+            return
+        self.memory_runtime.ingest_review_report(report)
 
 
 def _severity(finding: ReviewFinding) -> TraceSeverity:

@@ -59,6 +59,7 @@ class RuntimeComponentName(str, Enum):
     INTERACTION = "interaction"
     WORKSPACE_STATE = "workspace"
     PROJECT_INDEX = "project_index"
+    MEMORY = "memory"
     POLICY = "policy"
     SANDBOX = "sandbox"
     COMMAND = "command"

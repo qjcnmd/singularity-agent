@@ -51,3 +51,32 @@ def test_post_verification_review_repairs_failed_checks(tmp_path: Path) -> None:
 
     assert report.decision.action == ReviewDecisionAction.REPAIR
     assert report.decision.repair_targets == ["check_1"]
+
+
+def test_review_runtime_sends_structured_reports_to_memory(tmp_path: Path) -> None:
+    calls = []
+
+    class FakeMemoryRuntime:
+        def ingest_review_report(self, report):
+            calls.append(report)
+
+    runtime = ReviewRuntime(tmp_path, enable_model_critic=False)
+    runtime.memory_runtime = FakeMemoryRuntime()
+
+    report = runtime.post_verification_review(
+        verification={
+            "plan": {"verification_plan_id": "vplan_1"},
+            "check_status": [{"check_id": "check_1", "kind": "unit_test", "status": "failed"}],
+            "failed_checks": [
+                {
+                    "check_id": "check_1",
+                    "kind": "unit_test",
+                    "status": "failed",
+                    "failure_type": "unit_test_failure",
+                }
+            ],
+            "completion_assessment": {"status": "failed", "remaining_risks": ["tests failed"]},
+        }
+    )
+
+    assert calls == [report]
