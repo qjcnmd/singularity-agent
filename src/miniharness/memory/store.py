@@ -19,7 +19,8 @@ from miniharness.memory.models import (
 
 HUMAN_FILES = {
     "project": "project.md",
-    "user_preferences": "user_preferences.md",
+    "commands": "commands.md",
+    "preferences": "preferences.md",
     "lessons": "lessons.md",
 }
 
@@ -27,10 +28,12 @@ HUMAN_FILES = {
 @dataclass(frozen=True)
 class MemoryLayout:
     root: Path
+    auto_dir: Path
     entries_jsonl: Path
     candidates_jsonl: Path
     index_json: Path
     human_dir: Path
+    rules_dir: Path
 
 
 class MemoryStore:
@@ -39,15 +42,20 @@ class MemoryStore:
         self.root = memory_root or (self.workspace_root / ".miniharness" / "memory")
         self.layout = MemoryLayout(
             root=self.root,
-            entries_jsonl=self.root / "entries.jsonl",
-            candidates_jsonl=self.root / "candidates.jsonl",
-            index_json=self.root / "index.json",
+            auto_dir=self.root / "auto",
+            entries_jsonl=self.root / "auto" / "entries.jsonl",
+            candidates_jsonl=self.root / "auto" / "candidates.jsonl",
+            index_json=self.root / "auto" / "index.json",
             human_dir=self.root / "human",
+            rules_dir=self.workspace_root / ".miniharness" / "rules",
         )
 
     def initialize(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        self.layout.auto_dir.mkdir(parents=True, exist_ok=True)
         self.layout.human_dir.mkdir(parents=True, exist_ok=True)
+        self.layout.rules_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_auto_files()
         for path in (self.layout.entries_jsonl, self.layout.candidates_jsonl):
             if not path.exists():
                 _atomic_write(path, "")
@@ -55,6 +63,14 @@ class MemoryStore:
             path = self.layout.human_dir / filename
             if not path.exists():
                 _atomic_write(path, _initial_markdown(label))
+        legacy_preferences = self.layout.human_dir / "user_preferences.md"
+        preferences = self.layout.human_dir / HUMAN_FILES["preferences"]
+        if (
+            legacy_preferences.exists()
+            and preferences.exists()
+            and _is_template_only(preferences.read_text(encoding="utf-8"))
+        ):
+            _atomic_write(preferences, legacy_preferences.read_text(encoding="utf-8"))
         if not self.layout.index_json.exists():
             self.rebuild_index()
 
@@ -108,9 +124,20 @@ class MemoryStore:
         candidate = self.get_candidate(candidate_id)
         accepted = candidate.with_status(MemoryStatus.ACTIVE, reason="accepted")
         entry = accepted.to_entry()
-        existing = next((item for item in self.load_entries() if item.id == entry.id), None)
+        entries = self.load_entries()
+        existing = next((item for item in entries if item.id == entry.id), None)
         if existing is not None and existing.status == MemoryStatus.TOMBSTONED:
             raise ValueError(f"Cannot restore tombstoned memory entry: {entry.id}")
+        tombstoned_match = next(
+            (
+                item
+                for item in entries
+                if item.status == MemoryStatus.TOMBSTONED and item.content_hash == entry.content_hash
+            ),
+            None,
+        )
+        if tombstoned_match is not None:
+            raise ValueError(f"Cannot restore tombstoned memory entry: {tombstoned_match.id}")
         self.upsert_candidate(accepted)
         return self.upsert_entry(entry)
 
@@ -171,44 +198,13 @@ class MemoryStore:
             "error_types": sorted({error for entry in active for error in entry.error_types}),
         }
         _atomic_write(self.layout.index_json, json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True))
-        self.write_human_projection(entries)
         return index
 
     def write_human_projection(self, entries: list[MemoryEntry] | None = None) -> None:
-        entries = entries if entries is not None else self.load_entries()
-        active_or_review = [
-            entry
-            for entry in entries
-            if entry.status in {MemoryStatus.ACTIVE, MemoryStatus.EXPIRED}
-        ]
-        project_entries = [
-            entry
-            for entry in active_or_review
-            if entry.type
-            in {
-                MemoryType.PROJECT_CONVENTION,
-                MemoryType.BUILD_COMMAND,
-                MemoryType.TEST_COMMAND,
-                MemoryType.MODULE_BOUNDARY,
-                MemoryType.VERIFICATION_FACT,
-            }
-        ]
-        user_entries = [
-            entry for entry in active_or_review if entry.type == MemoryType.USER_PREFERENCE
-        ]
-        lesson_entries = [
-            entry
-            for entry in active_or_review
-            if entry.type in {MemoryType.LESSON, MemoryType.CAUTION, MemoryType.FAILURE_LESSON, MemoryType.TOOL_RUNTIME}
-        ]
-        projections = {
-            "project": project_entries,
-            "user_preferences": user_entries,
-            "lessons": lesson_entries,
-        }
-        for label, items in projections.items():
-            path = self.layout.human_dir / HUMAN_FILES[label]
-            _atomic_write(path, _render_markdown(label, items))
+        # Human-authored files are the editable source of truth. Keep this
+        # compatibility method as a no-op so refresh/index rebuilds never
+        # overwrite operator-maintained Markdown.
+        self.initialize()
 
     def _write_entries(self, entries: list[MemoryEntry]) -> None:
         _write_jsonl(self.layout.entries_jsonl, [entry.to_dict() for entry in entries])
@@ -217,6 +213,13 @@ class MemoryStore:
     def _write_candidates(self, candidates: list[MemoryCandidate]) -> None:
         _write_jsonl(self.layout.candidates_jsonl, [candidate.to_dict() for candidate in candidates])
         self.rebuild_index()
+
+    def _migrate_legacy_auto_files(self) -> None:
+        for filename in ("entries.jsonl", "candidates.jsonl", "index.json"):
+            legacy = self.root / filename
+            target = self.layout.auto_dir / filename
+            if legacy.exists() and not target.exists():
+                _atomic_write(target, legacy.read_text(encoding="utf-8"))
 
 
 def _render_markdown(label: str, entries: list[MemoryEntry]) -> str:
@@ -244,7 +247,8 @@ def _render_markdown(label: str, entries: list[MemoryEntry]) -> str:
 def _initial_markdown(label: str) -> str:
     titles = {
         "project": "Project Memory",
-        "user_preferences": "User Preference Memory",
+        "commands": "Command Memory",
+        "preferences": "Preference Memory",
         "lessons": "Lessons Memory",
     }
     return (
@@ -254,6 +258,19 @@ def _initial_markdown(label: str) -> str:
         "but protected memory blocks are validated on refresh.\n"
         "<!-- /memory:template -->\n"
     )
+
+
+def _is_template_only(text: str) -> bool:
+    import re
+
+    without_template = re.sub(
+        r"<!-- memory:template -->.*?<!-- /memory:template -->",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    lines = [line.strip() for line in without_template.splitlines() if line.strip()]
+    return len(lines) <= 1 and (not lines or lines[0].startswith("#"))
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

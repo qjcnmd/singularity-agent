@@ -35,11 +35,68 @@ def test_runtime_start_session_ingests_candidates_and_retrieves_context(tmp_path
         accept=True,
     )
 
+    assert runtime.store.load_entries() == []
+    stored_candidate = runtime.store.load_candidates()[0]
+    accepted = runtime.accept_candidate(stored_candidate.id)
+
     block = runtime.context_block(goal="pytest memory", tools=["pytest"], max_items=3)
 
     assert block.items
     assert block.items[0]["source"] == MemorySource.VERIFICATION.value
     assert block.items[0]["last_verified_at"]
+    assert block.items[0]["id"] == accepted.id
+
+
+def test_runtime_loads_human_memory_and_path_scoped_rules(tmp_path: Path) -> None:
+    memory_root = tmp_path / ".miniharness" / "memory" / "human"
+    rules_root = tmp_path / ".miniharness" / "rules"
+    memory_root.mkdir(parents=True)
+    rules_root.mkdir(parents=True)
+    memory_root.joinpath("commands.md").write_text(
+        "# Commands\n\nUse `python -m pytest tests --basetemp work/pytest-tmp` for verification.\n",
+        encoding="utf-8",
+    )
+    rules_root.joinpath("memory-tests.md").write_text(
+        "---\npaths:\n  - tests/memory/**\n---\n# Memory Tests\n\nKeep memory tests focused on JSONL and context injection.\n",
+        encoding="utf-8",
+    )
+    rules_root.joinpath("global.md").write_text(
+        "# Global Rule\n\nNever treat memory as approval policy.\n",
+        encoding="utf-8",
+    )
+
+    runtime = MemoryRuntime(tmp_path)
+    runtime.start_session(session_id="session_rules", user_goal="fix memory tests")
+
+    matched = runtime.context_block(
+        goal="pytest memory policy",
+        paths=["tests/memory/test_store.py"],
+        max_items=5,
+        token_budget=120,
+    )
+    unmatched = runtime.context_block(
+        goal="pytest memory policy",
+        paths=["src/miniharness/agent.py"],
+        max_items=5,
+        token_budget=120,
+    )
+
+    matched_titles = {item["title"] for item in matched.items}
+    unmatched_titles = {item["title"] for item in unmatched.items}
+    assert "Commands" in matched_titles
+    assert "Memory Tests" in matched_titles
+    assert "Global Rule" in matched_titles
+    assert "Memory Tests" not in unmatched_titles
+    assert "Global Rule" in unmatched_titles
+
+
+def test_runtime_does_not_inject_pristine_human_templates(tmp_path: Path) -> None:
+    runtime = MemoryRuntime(tmp_path)
+    runtime.start_session(session_id="session_empty", user_goal="inspect project")
+
+    block = runtime.context_block(goal="project preferences lessons commands", max_items=10)
+
+    assert block.items == []
 
 
 def test_cli_memory_commands_cover_candidate_lifecycle(monkeypatch, tmp_path: Path) -> None:
@@ -73,6 +130,8 @@ def test_cli_memory_commands_cover_candidate_lifecycle(monkeypatch, tmp_path: Pa
     deleted = runner.invoke(app, ["memory", "delete", "mem_cand_cli"])
     rejected = runner.invoke(app, ["memory", "reject", "cand_cli"])
     refresh = runner.invoke(app, ["memory", "refresh"])
+    candidates = runner.invoke(app, ["memory", "candidates"])
+    rules = runner.invoke(app, ["memory", "rules", "list"])
 
     assert accept.exit_code == 0
     assert "accepted" in accept.output
@@ -85,6 +144,8 @@ def test_cli_memory_commands_cover_candidate_lifecycle(monkeypatch, tmp_path: Pa
     assert "deleted" in deleted.output
     assert rejected.exit_code == 0
     assert refresh.exit_code == 0
+    assert candidates.exit_code == 0
+    assert rules.exit_code == 0
 
 
 def test_runtime_manual_accept_redacts_and_requires_non_guess_content(tmp_path: Path) -> None:

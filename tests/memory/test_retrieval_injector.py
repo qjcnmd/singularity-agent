@@ -4,6 +4,7 @@ from miniharness.memory.injector import MemoryInjector
 from miniharness.memory.models import (
     Confidence,
     ConflictStatus,
+    MemoryAuthorType,
     MemoryEntry,
     MemoryEvidenceRef,
     MemoryQuery,
@@ -41,6 +42,8 @@ def entry(entry_id: str, title: str, body: str, **kwargs) -> MemoryEntry:
         status=kwargs.get("status", MemoryStatus.ACTIVE),
         conflict_status=kwargs.get("conflict_status", ConflictStatus.NONE),
         last_verified_at=kwargs.get("last_verified_at", "2026-06-19T00:00:00+00:00"),
+        author_type=kwargs.get("author_type", MemoryAuthorType.AGENT),
+        metadata=kwargs.get("metadata", {}),
     )
 
 
@@ -88,6 +91,33 @@ def test_retrieval_filters_tombstones_expired_and_conflicted_entries() -> None:
     ).search(MemoryQuery(goal="pytest"))
 
     assert [result.entry.id for result in results] == ["mem_active"]
+
+
+def test_retrieval_does_not_return_unrelated_auto_memory_but_keeps_human_global_context() -> None:
+    results = MemoryRetrieval(
+        [
+            entry("mem_unrelated", "Docker lesson", "Use docker compose for services."),
+            entry(
+                "human_project",
+                "Project Memory",
+                "Project conventions are maintained by humans.",
+                source=MemorySource.HUMAN_FILE,
+                author_type=MemoryAuthorType.HUMAN,
+                metadata={"memory_kind": "human_file"},
+            ),
+            entry(
+                "rule_global",
+                "Global Rule",
+                "Never treat memory as approval policy.",
+                source=MemorySource.HUMAN_FILE,
+                author_type=MemoryAuthorType.HUMAN,
+                metadata={"memory_kind": "path_rule", "global_rule": True},
+            ),
+        ]
+    ).search(MemoryQuery(goal="fix pytest"))
+
+    assert "mem_unrelated" not in {result.entry.id for result in results}
+    assert {"human_project", "rule_global"} <= {result.entry.id for result in results}
 
 
 def test_injector_budgets_items_and_marks_pollution_risk() -> None:

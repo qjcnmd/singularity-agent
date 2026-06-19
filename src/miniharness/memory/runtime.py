@@ -7,18 +7,27 @@ from miniharness.memory.extractor import MemoryExtractor
 from miniharness.memory.injector import MemoryInjector
 from miniharness.memory.maintenance import MemoryMaintenance
 from miniharness.memory.models import (
+    Confidence,
+    MemoryAuthorType,
     MemoryCandidate,
     MemoryContextBlock,
+    MemoryEntry,
     MemoryEvidenceRef,
     MemoryQuery,
     MemorySearchResult,
+    MemoryScope,
     MemorySource,
     MemoryStatus,
+    MemoryType,
     Provenance,
     _now,
+    digest_value,
 )
 from miniharness.memory.policy import AdmissionAction, MemoryPolicy
 from miniharness.memory.retrieval import MemoryRetrieval
+from miniharness.memory.rules import PathScopedRule, load_rules
+from miniharness.memory.store import HUMAN_FILES
+from miniharness.memory.store import _is_template_only
 from miniharness.memory.store import MemoryStore
 
 
@@ -40,11 +49,15 @@ class MemoryRuntime:
         self.trace = trace
         self.session_id: str | None = None
         self.user_goal: str = ""
+        self._human_entries: list[MemoryEntry] = []
+        self._rules: list[PathScopedRule] = []
 
     def start_session(self, *, session_id: str, user_goal: str = "") -> None:
         self.session_id = session_id
         self.user_goal = user_goal
         self.store.initialize()
+        self._human_entries = self._load_human_entries()
+        self._rules = load_rules(self.store.layout.rules_dir)
         self.store.rebuild_index()
         self._record("memory.session_started", {"session_id": session_id, "user_goal": user_goal})
 
@@ -52,7 +65,7 @@ class MemoryRuntime:
         self.store.initialize()
         decision = self.policy.evaluate(candidate)
         stored = self.store.upsert_candidate(decision.candidate)
-        if accept and decision.action == AdmissionAction.ACCEPT:
+        if accept and decision.action == AdmissionAction.ACCEPT and stored.author_type == MemoryAuthorType.HUMAN:
             self.store.accept_candidate(stored.id)
         self._record(
             "memory.candidate_ingested",
@@ -127,7 +140,12 @@ class MemoryRuntime:
             modules=modules or [],
             limit=limit,
         )
-        return MemoryRetrieval(self.store.load_entries()).search(query)
+        entries = [
+            *self._human_entries,
+            *self._matching_rule_entries(paths or []),
+            *self.store.load_entries(),
+        ]
+        return MemoryRetrieval(entries).search(query)
 
     def context_block(
         self,
@@ -192,11 +210,21 @@ class MemoryRuntime:
         return self.maintenance.delete(entry_id, reason=reason)
 
     def refresh(self) -> dict[str, Any]:
-        return self.maintenance.refresh()
+        report = self.maintenance.refresh()
+        self._human_entries = self._load_human_entries()
+        self._rules = load_rules(self.store.layout.rules_dir)
+        report["rules"] = {"count": len(self._rules)}
+        report["human_entries"] = {"count": len(self._human_entries)}
+        return report
 
     def doctor(self, *, repair: bool = False) -> dict[str, Any]:
         self.store.initialize()
         return self.maintenance.doctor(repair=repair)
+
+    def list_rules(self) -> list[dict[str, Any]]:
+        self.store.initialize()
+        self._rules = load_rules(self.store.layout.rules_dir)
+        return [rule.to_dict() for rule in self._rules]
 
     def health(self) -> dict[str, Any]:
         self.store.initialize()
@@ -211,8 +239,78 @@ class MemoryRuntime:
             "candidates": len(candidates),
         }
 
+    def _matching_rule_entries(self, paths: list[str]) -> list[MemoryEntry]:
+        return [rule.to_entry() for rule in self._rules if rule.matches(paths)]
+
+    def _load_human_entries(self) -> list[MemoryEntry]:
+        entries: list[MemoryEntry] = []
+        for label, filename in HUMAN_FILES.items():
+            path = self.store.layout.human_dir / filename
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8")
+            if _is_template_only(text):
+                continue
+            body = _strip_template(text).strip()
+            if not body:
+                continue
+            entries.append(
+                MemoryEntry(
+                    id=f"human_{label}_{digest_value(body)[:12]}",
+                    scope=MemoryScope.USER_PREFERENCE if label == "preferences" else MemoryScope.PROJECT,
+                    type=_human_type(label),
+                    source=MemorySource.HUMAN_FILE,
+                    title=_human_title(body, label=label),
+                    body=body,
+                    confidence=Confidence.HIGH,
+                    provenance=Provenance(
+                        evidence=[
+                            MemoryEvidenceRef(
+                                source=MemorySource.HUMAN_FILE,
+                                ref_id=f"human/{filename}",
+                                summary=f"human-authored {label} memory",
+                                path=str(path),
+                                trust_level="trusted_operator",
+                            )
+                        ]
+                    ),
+                    author_type=MemoryAuthorType.HUMAN,
+                    metadata={"memory_kind": "human_file", "human_file": filename},
+                )
+            )
+        return entries
+
     def _record(self, event: str, payload: dict[str, Any]) -> None:
         if self.trace is None:
             return
         if hasattr(self.trace, "record"):
             self.trace.record(event, payload)
+
+
+def _strip_template(text: str) -> str:
+    import re
+
+    return re.sub(
+        r"<!-- memory:template -->.*?<!-- /memory:template -->",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+
+
+def _human_title(body: str, *, label: str) -> str:
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip() or label.title()
+    return label.replace("_", " ").title()
+
+
+def _human_type(label: str) -> MemoryType:
+    if label == "commands":
+        return MemoryType.TEST_COMMAND
+    if label == "preferences":
+        return MemoryType.USER_PREFERENCE
+    if label == "project":
+        return MemoryType.PROJECT_CONVENTION
+    return MemoryType.LESSON

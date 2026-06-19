@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from miniharness.memory.models import (
     Confidence,
     ConflictStatus,
+    MemoryAuthorType,
     MemoryEntry,
     MemoryEvidenceRef,
     MemoryScope,
@@ -44,6 +45,7 @@ def test_memory_entry_round_trips_schema_versioned_payload() -> None:
     restored = MemoryEntry.from_dict(payload)
 
     assert payload["schema_version"] == 1
+    assert payload["author_type"] == MemoryAuthorType.AGENT.value
     assert restored == entry
     assert restored.provenance.evidence[0].source == MemorySource.VERIFICATION
 
@@ -72,3 +74,29 @@ def test_ttl_expiry_and_conflict_status_are_explicit() -> None:
 
     assert active.is_expired(now=datetime.now(UTC)) is True
     assert active.conflict_status == ConflictStatus.MANUAL_REVIEW_REQUIRED
+
+
+def test_human_authored_memory_round_trips_explicitly() -> None:
+    entry = MemoryEntry(
+        id="human_project_1",
+        scope=MemoryScope.PROJECT,
+        type=MemoryType.PROJECT_CONVENTION,
+        source=MemorySource.HUMAN_FILE,
+        title="Project structure",
+        body="Runtime modules live under src/miniharness.",
+        author_type=MemoryAuthorType.HUMAN,
+        provenance=Provenance(
+            evidence=[
+                MemoryEvidenceRef(
+                    source=MemorySource.HUMAN_FILE,
+                    ref_id="human/project.md",
+                    summary="human-authored project memory",
+                )
+            ]
+        ),
+    )
+
+    restored = MemoryEntry.from_dict(entry.to_dict())
+
+    assert restored.author_type == MemoryAuthorType.HUMAN
+    assert restored.source == MemorySource.HUMAN_FILE

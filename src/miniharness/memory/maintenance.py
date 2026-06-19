@@ -7,6 +7,7 @@ from typing import Any
 from miniharness.memory.models import (
     Confidence,
     ConflictStatus,
+    MemoryAuthorType,
     MemoryCandidate,
     MemoryEntry,
     MemoryEvidenceRef,
@@ -83,11 +84,12 @@ class MemoryMaintenance:
                 candidate = MemoryCandidate(
                     id=f"cand_human_{abs(hash(text)) & 0xFFFFFFFF:x}",
                     scope=MemoryScope.PROJECT,
-                    type=MemoryType.LESSON,
+                    type=_memory_type_for_human_file(filename),
                     source=MemorySource.HUMAN_FILE,
                     title=text.splitlines()[0].lstrip("# ").strip()[:100],
                     body=text,
                     confidence=Confidence.LOW,
+                    author_type=MemoryAuthorType.HUMAN,
                     provenance=Provenance(
                         evidence=[
                             MemoryEvidenceRef(
@@ -249,3 +251,13 @@ def _manual_section_content(section: str) -> str:
         if line.strip() and not line.lstrip().startswith("#")
     ]
     return "\n".join(lines).strip()
+
+
+def _memory_type_for_human_file(filename: str) -> MemoryType:
+    if filename == "commands.md":
+        return MemoryType.TEST_COMMAND
+    if filename == "preferences.md" or filename == "user_preferences.md":
+        return MemoryType.USER_PREFERENCE
+    if filename == "project.md":
+        return MemoryType.PROJECT_CONVENTION
+    return MemoryType.LESSON

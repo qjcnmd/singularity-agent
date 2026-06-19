@@ -4,6 +4,7 @@ from miniharness.memory.maintenance import MemoryMaintenance
 from miniharness.memory.models import (
     Confidence,
     ConflictStatus,
+    MemoryAuthorType,
     MemoryCandidate,
     MemoryContextBlock,
     MemoryEntry,
@@ -19,6 +20,7 @@ from miniharness.memory.models import (
 )
 from miniharness.memory.policy import AdmissionAction, AdmissionDecision, MemoryPolicy
 from miniharness.memory.retrieval import MemoryRetrieval
+from miniharness.memory.rules import PathScopedRule
 from miniharness.memory.runtime import MemoryRuntime
 from miniharness.memory.store import MemoryStore
 
@@ -28,6 +30,7 @@ __all__ = [
     "Confidence",
     "ConflictStatus",
     "MemoryCandidate",
+    "MemoryAuthorType",
     "MemoryContextBlock",
     "MemoryEntry",
     "MemoryEvidenceRef",
@@ -44,6 +47,7 @@ __all__ = [
     "MemoryStatus",
     "MemoryStore",
     "MemoryType",
+    "PathScopedRule",
     "Provenance",
     "TTL",
 ]

@@ -26,6 +26,15 @@ class TokenCounter:
             self.encoding = tiktoken.encoding_for_model(model)
         except KeyError:
             self.encoding = tiktoken.get_encoding("o200k_base")
+        except Exception as exc:
+            self.encoding = None
+            self.model = model
+            self.unavailable_error = TokenizerUnavailableError(
+                "Precise token counting could not initialize locally. "
+                "Using an approximate local token estimate."
+            )
+            self.unavailable_error.__cause__ = exc
+            return
         self.model = model
         self.unavailable_error = None
 

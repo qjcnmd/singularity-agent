@@ -11,6 +11,8 @@ from miniharness.memory.runtime import MemoryRuntime
 
 
 memory_app = typer.Typer(add_completion=False, no_args_is_help=True)
+rules_app = typer.Typer(add_completion=False, no_args_is_help=True)
+memory_app.add_typer(rules_app, name="rules")
 console = Console()
 
 
@@ -21,6 +23,15 @@ def memory_list(
     runtime = _runtime()
     entries = [entry.to_dict() for entry in runtime.store.load_entries()]
     _print(entries, json_output=json_output, title="memory entries")
+
+
+@memory_app.command("candidates")
+def memory_candidates(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    runtime = _runtime()
+    candidates = [candidate.to_dict() for candidate in runtime.store.load_candidates()]
+    _print(candidates, json_output=json_output, title="memory candidates")
 
 
 @memory_app.command("show")
@@ -87,6 +98,15 @@ def memory_refresh(
     runtime = _runtime()
     report = runtime.refresh()
     _print(report, json_output=json_output, title="memory refresh")
+
+
+@rules_app.command("list")
+def memory_rules_list(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    runtime = _runtime()
+    rules = runtime.list_rules()
+    _print(rules, json_output=json_output, title="memory rules")
 
 
 def _runtime() -> MemoryRuntime:

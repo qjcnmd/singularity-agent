@@ -6,6 +6,7 @@ from typing import Iterable
 
 from miniharness.memory.models import (
     Confidence,
+    MemoryAuthorType,
     MemoryEntry,
     MemoryQuery,
     MemorySearchResult,
@@ -27,6 +28,8 @@ class MemoryRetrieval:
             if query.min_confidence is not None and entry.confidence.score < query.min_confidence.score:
                 continue
             score, matched_fields = _score(entry, query, now=now)
+            if _requires_explicit_match(entry) and not _has_explicit_match(matched_fields):
+                continue
             if score <= 0:
                 continue
             results.append(MemorySearchResult(entry=entry, score=round(score, 4), matched_fields=matched_fields))
@@ -58,6 +61,9 @@ def _score(entry: MemoryEntry, query: MemoryQuery, *, now: datetime) -> tuple[fl
     if entry.provenance.evidence:
         score += min(0.4, 0.1 * len(entry.provenance.evidence))
         matched.append("provenance")
+    if _is_human_context(entry):
+        score += 0.45
+        matched.append("human_context")
     return score, list(dict.fromkeys(matched))
 
 
@@ -90,3 +96,17 @@ def _tokens(text: str) -> set[str]:
 
 def _normalize(value: str) -> str:
     return value.replace("\\", "/").strip().lower()
+
+
+def _requires_explicit_match(entry: MemoryEntry) -> bool:
+    return not _is_human_context(entry)
+
+
+def _has_explicit_match(matched_fields: list[str]) -> bool:
+    return any(field in {"goal", "path", "tool", "error_type", "module"} for field in matched_fields)
+
+
+def _is_human_context(entry: MemoryEntry) -> bool:
+    if entry.author_type == MemoryAuthorType.HUMAN:
+        return True
+    return entry.metadata.get("memory_kind") in {"human_file", "path_rule"}

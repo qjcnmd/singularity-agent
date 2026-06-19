@@ -78,6 +78,11 @@ class MemoryStatus(str, Enum):
     EXPIRED = "expired"
 
 
+class MemoryAuthorType(str, Enum):
+    HUMAN = "human"
+    AGENT = "agent"
+
+
 @dataclass(frozen=True)
 class MemoryEvidenceRef:
     source: MemorySource | str
@@ -193,6 +198,7 @@ class MemoryEntry:
     ttl: TTL = field(default_factory=TTL)
     conflict_status: ConflictStatus | str = ConflictStatus.NONE
     status: MemoryStatus | str = MemoryStatus.ACTIVE
+    author_type: MemoryAuthorType | str = MemoryAuthorType.AGENT
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
     last_verified_at: str | None = None
@@ -213,6 +219,7 @@ class MemoryEntry:
         self.confidence = _enum(Confidence, self.confidence)
         self.conflict_status = _enum(ConflictStatus, self.conflict_status)
         self.status = _enum(MemoryStatus, self.status)
+        self.author_type = _enum(MemoryAuthorType, self.author_type)
         if not isinstance(self.provenance, Provenance):
             self.provenance = Provenance.from_dict(self.provenance)
         if not isinstance(self.ttl, TTL):
@@ -269,6 +276,7 @@ class MemoryEntry:
             ttl=TTL.from_dict(payload.get("ttl")),
             conflict_status=payload.get("conflict_status") or ConflictStatus.NONE,
             status=payload.get("status") or MemoryStatus.ACTIVE,
+            author_type=payload.get("author_type") or MemoryAuthorType.AGENT,
             created_at=str(payload.get("created_at") or _now()),
             updated_at=str(payload.get("updated_at") or _now()),
             last_verified_at=payload.get("last_verified_at"),
@@ -296,6 +304,7 @@ class MemoryCandidate:
     provenance: Provenance = field(default_factory=Provenance)
     ttl: TTL = field(default_factory=TTL)
     status: MemoryStatus | str = MemoryStatus.CANDIDATE
+    author_type: MemoryAuthorType | str = MemoryAuthorType.AGENT
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
     last_verified_at: str | None = None
@@ -314,6 +323,7 @@ class MemoryCandidate:
         self.source = _enum(MemorySource, self.source)
         self.confidence = _enum(Confidence, self.confidence)
         self.status = _enum(MemoryStatus, self.status)
+        self.author_type = _enum(MemoryAuthorType, self.author_type)
         if not isinstance(self.provenance, Provenance):
             self.provenance = Provenance.from_dict(self.provenance)
         if not isinstance(self.ttl, TTL):
@@ -332,6 +342,7 @@ class MemoryCandidate:
             provenance=entry.provenance,
             ttl=entry.ttl,
             last_verified_at=entry.last_verified_at,
+            author_type=entry.author_type,
             tags=list(entry.tags),
             paths=list(entry.paths),
             tools=list(entry.tools),
@@ -360,6 +371,7 @@ class MemoryCandidate:
             provenance=self.provenance,
             ttl=self.ttl,
             status=MemoryStatus.ACTIVE,
+            author_type=self.author_type,
             created_at=self.created_at,
             updated_at=_now(),
             last_verified_at=self.last_verified_at,
@@ -391,6 +403,7 @@ class MemoryCandidate:
             provenance=Provenance.from_dict(payload.get("provenance")),
             ttl=TTL.from_dict(payload.get("ttl")),
             status=payload.get("status") or MemoryStatus.CANDIDATE,
+            author_type=payload.get("author_type") or MemoryAuthorType.AGENT,
             created_at=str(payload.get("created_at") or _now()),
             updated_at=str(payload.get("updated_at") or _now()),
             last_verified_at=payload.get("last_verified_at"),

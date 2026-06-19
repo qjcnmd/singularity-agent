@@ -136,10 +136,7 @@ def test_maintenance_expires_demotes_conflicts_and_reloads_human_edits(tmp_path:
     maintenance = MemoryMaintenance(store)
     report = maintenance.run()
     lessons_path = store.root / "human" / "lessons.md"
-    lessons_path.write_text(
-        lessons_path.read_text(encoding="utf-8").replace("Use pytest.", "Use pytest edited."),
-        encoding="utf-8",
-    )
+    lessons_path.write_text(_protected_block("mem_first", "Test command", "Use pytest edited."), encoding="utf-8")
     reload_report = maintenance.reload_human_edits()
 
     assert store.get_entry("mem_old").status == MemoryStatus.EXPIRED
@@ -180,14 +177,32 @@ def test_refresh_preserves_visible_human_edit_for_manual_review(tmp_path: Path) 
     )
     store.upsert_entry(entry)
     lessons_path = store.root / "human" / "lessons.md"
-    lessons_path.write_text(
-        lessons_path.read_text(encoding="utf-8").replace("Use pytest.", "Use pytest with --basetemp."),
-        encoding="utf-8",
-    )
+    lessons_path.write_text(_protected_block("mem_lesson", "Pytest", "Use pytest with --basetemp."), encoding="utf-8")
 
     report = MemoryMaintenance(store).refresh()
 
     refreshed = lessons_path.read_text(encoding="utf-8")
     assert report["reload"]["manual_review_required"] == 1
     assert "Use pytest with --basetemp." in refreshed
-    assert "manual_review_required" in refreshed
+    assert store.get_entry("mem_lesson").conflict_status == ConflictStatus.MANUAL_REVIEW_REQUIRED
+
+
+def _protected_block(entry_id: str, title: str, body: str) -> str:
+    return "\n".join(
+        [
+            "# Lessons Memory",
+            "",
+            f"<!-- memory:id={entry_id} schema_version=1 content_hash=test -->",
+            f"## {title}",
+            "Scope: project",
+            "Type: lesson",
+            "Source: verification",
+            "Confidence: medium",
+            "Status: active",
+            "Conflict: none",
+            "Last verified: -",
+            "",
+            body,
+            "",
+        ]
+    )
