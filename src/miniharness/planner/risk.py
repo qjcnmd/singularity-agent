@@ -32,6 +32,20 @@ class RiskEscalator:
         new_path = arguments.get("new_path")
         if isinstance(new_path, str):
             candidate_paths.append(new_path)
+        for operation in arguments.get("operations") or []:
+            if not isinstance(operation, dict):
+                continue
+            path = operation.get("path")
+            if isinstance(path, str):
+                candidate_paths.append(path)
+            new_path = operation.get("new_path")
+            if isinstance(new_path, str):
+                candidate_paths.append(new_path)
+        scope = arguments.get("scope")
+        if isinstance(scope, dict):
+            for path in scope.get("paths") or []:
+                if isinstance(path, str):
+                    candidate_paths.append(path)
 
         for candidate in candidate_paths:
             normalized = candidate.replace("\\", "/")

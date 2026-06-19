@@ -7,9 +7,11 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from miniharness.code_index import ProjectIndexRuntime
 from miniharness.config import ProductionRuntimeConfig
+from miniharness.interaction import RichCliRenderer
 from miniharness.kernel import CancellationError, KernelBootstrap
-from miniharness.observability import TraceStore
+from miniharness.observability import TraceRuntime, TraceStore
 from miniharness.policy import ApprovalMode
 from miniharness.planner import PlannerRuntime
 from miniharness.workspace_state import (
@@ -23,7 +25,9 @@ app = typer.Typer(
     help="production-grade local CLI coding agent harness",
 )
 trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
+index_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
+app.add_typer(index_app, name="index")
 console = Console()
 
 
@@ -58,6 +62,24 @@ def main(
             help="Resume a PlannerRuntime, context, protocol, and workspace state session by id.",
         ),
     ] = None,
+    project_index_enabled: Annotated[
+        bool,
+        typer.Option(
+            "--project-index/--no-project-index",
+            help="Enable ProjectIndexRuntime bootstrap and context/planner observations.",
+        ),
+    ] = True,
+    project_index_db: Annotated[
+        Path | None,
+        typer.Option("--project-index-db", help="Exact ProjectIndexRuntime SQLite path."),
+    ] = None,
+    project_index_build_on_boot: Annotated[
+        bool,
+        typer.Option(
+            "--project-index-build-on-boot/--no-project-index-build-on-boot",
+            help="Build or refresh the project index during kernel boot.",
+        ),
+    ] = True,
     approval_mode: Annotated[
         ApprovalMode,
         typer.Option(
@@ -132,8 +154,12 @@ def main(
         base_url=base_url,
         raw_artifacts=raw_artifacts,
         resume_session=resume_session,
+        project_index_enabled=project_index_enabled,
+        project_index_db=project_index_db,
+        project_index_build_on_boot=project_index_build_on_boot,
     )
     kernel = None
+    renderer = RichCliRenderer(console)
     try:
         kernel = KernelBootstrap(
             project_root=project_root,
@@ -152,6 +178,7 @@ def main(
                 "strict": runtime_config.strict,
                 "dry_run": runtime_config.dry_run,
                 "raw_artifacts": runtime_config.raw_artifacts,
+                "project_index_enabled": runtime_config.project_index_enabled,
             },
         )
         console.print(f"[bold]run_id[/bold] {kernel.context.identity.run_id}")
@@ -178,28 +205,27 @@ def main(
             console.print(f"[red]error[/red] {exc}")
         report = getattr(exc, "final_report", None)
         if report is not None:
-            console.print(
-                Panel(
-                    json_dumps(report.to_dict()),
-                    title="final report",
-                    border_style="yellow",
-                )
-            )
+            renderer.render_final_report(report, border_style="yellow")
         elif kernel is not None:
             try:
-                console.print(
-                    Panel(
-                        json_dumps(kernel.final_report().to_dict()),
-                        title="final report",
-                        border_style="yellow",
-                    )
+                interaction_report = (
+                    kernel.interaction_final_report()
+                    if hasattr(kernel, "interaction_final_report")
+                    else None
+                )
+                renderer.render_final_report(
+                    interaction_report or kernel.final_report(),
+                    border_style="yellow",
                 )
             except Exception as report_exc:
                 console.print(f"[yellow]final report unavailable[/yellow] {report_exc}")
         raise typer.Exit(1) from exc
 
     console.print(Panel(final_answer, title="final answer", border_style="green"))
-    console.print(Panel(json_dumps(final_report.to_dict()), title="final report", border_style="green"))
+    renderer.render_final_report(
+        getattr(result, "interaction_report", None) or final_report,
+        border_style="green",
+    )
     console.print(_workspace_health_panel(final_health))
 
 
@@ -251,6 +277,90 @@ def _workspace_health_panel(health: WorkspaceHealthReport) -> Panel:
 
 def _format_list(values: list[str]) -> str:
     return ", ".join(values) if values else "-"
+
+
+@index_app.command("build")
+def index_build(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+) -> None:
+    """Build the ProjectIndexRuntime SQLite index."""
+
+    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    summary = runtime.build_full_index(reason="cli_build").to_dict()
+    _print_index_payload(summary, json_output=json_output, title="project index")
+
+
+@index_app.command("refresh")
+def index_refresh(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+) -> None:
+    """Refresh the ProjectIndexRuntime index incrementally when possible."""
+
+    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    summary = runtime.refresh(reason="cli_refresh").to_dict()
+    _print_index_payload(summary, json_output=json_output, title="project index")
+
+
+@index_app.command("explain")
+def index_explain(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+) -> None:
+    """Explain indexed project structure and limitations."""
+
+    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime.bootstrap(reason="cli_explain")
+    _print_index_payload(runtime.explain(), json_output=json_output, title="project index explain")
+
+
+@index_app.command("relevant")
+def index_relevant(
+    goal: Annotated[str, typer.Argument(help="Goal or query used to rank relevant files.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+) -> None:
+    """Rank relevant files for a goal."""
+
+    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime.bootstrap(reason="cli_relevant")
+    payload = {"relevant_files": [item.to_dict() for item in runtime.find_relevant_files(goal)]}
+    _print_index_payload(payload, json_output=json_output, title="project index relevant")
+
+
+@index_app.command("impact")
+def index_impact(
+    paths: Annotated[list[str], typer.Argument(help="Workspace-relative paths to analyze.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+) -> None:
+    """Analyze code-index impact for paths."""
+
+    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime.bootstrap(reason="cli_impact")
+    _print_index_payload(runtime.analyze_impact(paths).to_dict(), json_output=json_output, title="project index impact")
+
+
+@index_app.command("tests")
+def index_tests(
+    paths: Annotated[list[str], typer.Argument(help="Changed workspace-relative paths.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+) -> None:
+    """Return test impact for changed paths."""
+
+    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime.bootstrap(reason="cli_tests")
+    _print_index_payload(runtime.get_test_impact(paths).to_dict(), json_output=json_output, title="project index tests")
+
+
+def _print_index_payload(payload: object, *, json_output: bool, title: str) -> None:
+    text = json_dumps(payload)
+    if json_output:
+        console.print(text)
+        return
+    console.print(Panel(text, title=title, border_style="cyan"))
 
 
 @trace_app.command("list")

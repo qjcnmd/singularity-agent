@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
+from miniharness.interaction import DecisionPrompt, InteractionRuntime
 from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.policy.audit import redact_resource_identifier
 from miniharness.policy.config import ApprovalMode, PolicyConfig
@@ -24,9 +24,16 @@ from miniharness.policy.models import (
 
 
 class ApprovalGate:
-    def __init__(self, config: PolicyConfig, *, trace: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: PolicyConfig,
+        *,
+        trace: Any | None = None,
+        interaction: InteractionRuntime | None = None,
+    ) -> None:
         self.config = config
         self.trace = trace
+        self.interaction = interaction
 
     def resolve(
         self,
@@ -54,55 +61,75 @@ class ApprovalGate:
             raise PolicyEscalationRequired(decision.reason)
         if decision.outcome != DecisionOutcome.REQUIRE_REVIEW:
             raise PolicyDenied(decision.reason)
-        if self.config.approval_mode == ApprovalMode.NON_INTERACTIVE:
+        if self.interaction is None:
             self._emit(
                 TraceEventType.APPROVAL_DENIED,
                 request,
                 decision,
-                summary="Review required but approval mode is non_interactive.",
+                summary=(
+                    "Review required but approval mode is non_interactive."
+                    if self.config.approval_mode == ApprovalMode.NON_INTERACTIVE
+                    else "Review required but no interaction runtime is configured."
+                ),
                 severity=TraceSeverity.WARNING,
             )
             raise ApprovalRequired(decision.reason)
 
-        while True:
-            self._print_review(request, decision)
-            answer = input("[a]pprove once, [d]eny, [v]iew details: ").strip().lower()
-            if answer in {"a", "approve", "approve once"}:
-                requirement = decision.required_approval
-                grant = ApprovalGrant(
-                    decision_id=decision.decision_id,
-                    request_id=request.request_id,
-                    approved_by="local-cli-user",
-                    scope=requirement.scope if requirement else approval_scope_for_request(request),
-                    single_use=True,
-                    reason="approved once via local CLI",
-                )
-                self._emit(
-                    TraceEventType.APPROVAL_GRANTED,
-                    request,
-                    decision,
-                    summary=grant.reason,
-                    approval_grant_id=grant.grant_id,
-                )
-                return grant
-            if answer in {"d", "deny", "n", "no"}:
-                self._emit(
-                    TraceEventType.APPROVAL_DENIED,
-                    request,
-                    decision,
-                    summary=decision.reason,
-                    severity=TraceSeverity.WARNING,
-                )
-                raise ApprovalDenied(decision.reason)
-            if answer in {"v", "view", "details"}:
-                print(json.dumps(decision.to_dict(), ensure_ascii=False, indent=2))
+        user_decision = self.interaction.request_decision(
+            self._decision_prompt(request, decision)
+        )
+        answer = user_decision.decision.strip().lower()
+        if answer in {"a", "approve", "approve once", "continue", "c"}:
+            requirement = decision.required_approval
+            grant = ApprovalGrant(
+                decision_id=decision.decision_id,
+                request_id=request.request_id,
+                approved_by=user_decision.decided_by,
+                scope=requirement.scope if requirement else approval_scope_for_request(request),
+                single_use=True,
+                reason=user_decision.reason or "approved once via interaction runtime",
+            )
+            self._emit(
+                TraceEventType.APPROVAL_GRANTED,
+                request,
+                decision,
+                summary=grant.reason,
+                approval_grant_id=grant.grant_id,
+            )
+            return grant
+        if answer in {"revise", "v"}:
+            self._emit(
+                TraceEventType.APPROVAL_DENIED,
+                request,
+                decision,
+                summary=user_decision.reason or "User requested goal revision.",
+                severity=TraceSeverity.WARNING,
+            )
+            raise PolicyAskUserRequired(user_decision.reason or decision.reason)
+        if user_decision.metadata.get("fail_closed"):
+            self._emit(
+                TraceEventType.APPROVAL_DENIED,
+                request,
+                decision,
+                summary="Review required but interaction runtime failed closed.",
+                severity=TraceSeverity.WARNING,
+            )
+            raise ApprovalRequired(decision.reason)
+        self._emit(
+            TraceEventType.APPROVAL_DENIED,
+            request,
+            decision,
+            summary=user_decision.reason or decision.reason,
+            severity=TraceSeverity.WARNING,
+        )
+        raise ApprovalDenied(user_decision.reason or decision.reason)
 
     @staticmethod
-    def _print_review(request: PolicyRequest, decision: PolicyDecision) -> None:
+    def _review_details(request: PolicyRequest, decision: PolicyDecision) -> dict[str, Any]:
         details: dict[str, Any] = {
             "action": request.reason,
             "operation": request.operation.value,
-            "resource": request.resource.identifier,
+            "resource": redact_resource_identifier(request.resource.identifier),
             "risk_level": decision.risk_level.value,
             "risk_tags": [str(tag.value if hasattr(tag, "value") else tag) for tag in decision.risk_tags],
             "reason": decision.reason,
@@ -110,10 +137,36 @@ class ApprovalGate:
             "rollback_available": request.reversible,
         }
         if request.resource.resource_type == "command":
-            details["command_preview"] = request.resource.identifier
+            details["command_preview"] = redact_resource_identifier(request.resource.identifier)
         if request.metadata.get("diff_summary"):
             details["diff_summary"] = request.metadata["diff_summary"]
-        print(json.dumps(details, ensure_ascii=False, indent=2))
+        return details
+
+    def _decision_prompt(self, request: PolicyRequest, decision: PolicyDecision) -> DecisionPrompt:
+        details = self._review_details(request, decision)
+        message = (
+            decision.user_message
+            or (decision.required_approval.message if decision.required_approval else "")
+            or decision.reason
+        )
+        return DecisionPrompt(
+            title="Approval required",
+            message=message,
+            choices=["approve", "reject", "revise", "continue", "abort"],
+            recommended="reject",
+            risk_level=decision.risk_level.value,
+            metadata={
+                "request": {
+                    "request_id": request.request_id,
+                    "session_id": request.session_id,
+                    "task_id": request.task_id,
+                    "phase_id": request.phase_id,
+                    "action_id": request.action_id,
+                },
+                "decision": decision.to_dict(),
+                "review": details,
+            },
+        )
 
     def _emit(
         self,

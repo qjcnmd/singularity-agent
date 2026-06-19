@@ -24,7 +24,13 @@ from miniharness.planner.models import (
     TaskState,
     TaskStatus,
 )
-from miniharness.planner.policy import PlannerPolicy, READ_TOOLS, MUTATION_TOOLS, VERIFICATION_TOOLS
+from miniharness.planner.policy import (
+    EDIT_PLAN_TOOLS,
+    PlannerPolicy,
+    READ_TOOLS,
+    MUTATION_TOOLS,
+    VERIFICATION_TOOLS,
+)
 from miniharness.planner.replanner import Replanner
 from miniharness.planner.risk import RiskEscalator
 from miniharness.planner.store import PlannerStore
@@ -67,11 +73,13 @@ class PlannerRuntime:
         assumptions: list[str] | None = None,
     ) -> TaskState:
         self._throw_if_cancelled()
+        normalized_goal = " ".join(user_goal.split())
         self.state = TaskState(
             task_id=self.task_id,
             session_id=self.session_id,
             user_goal=user_goal,
-            normalized_goal=" ".join(user_goal.split()),
+            normalized_goal=normalized_goal,
+            effective_goal=normalized_goal,
             constraints=constraints or [],
             assumptions=assumptions or [],
             status=TaskStatus.UNDERSTANDING_TASK,
@@ -89,6 +97,38 @@ class PlannerRuntime:
         self._persist()
         self._record_event(decision="start_task", reason="Task initialized.")
         return self.state
+
+    def record_clarification_answer(self, request: Any, answer: Any) -> TaskState:
+        self._throw_if_cancelled()
+        state = self._state()
+        request_payload = request.to_dict() if hasattr(request, "to_dict") else dict(request)
+        answer_payload = answer.to_dict() if hasattr(answer, "to_dict") else dict(answer)
+        revised_goal = answer_payload.get("revised_goal")
+        revision = {
+            "request_id": request_payload.get("request_id"),
+            "question": request_payload.get("question"),
+            "reason": request_payload.get("reason"),
+            "answer": answer_payload.get("answer"),
+            "revised_goal": revised_goal,
+            "answered_by": answer_payload.get("answered_by"),
+            "timestamp": answer_payload.get("timestamp"),
+        }
+        state.goal_revisions.append(revision)
+        if revised_goal:
+            state.effective_goal = " ".join(str(revised_goal).split())
+        elif answer_payload.get("answer"):
+            state.effective_goal = (
+                f"{state.effective_goal or state.normalized_goal}\n"
+                f"Clarification: {answer_payload['answer']}"
+            )
+        state.touch()
+        self._persist()
+        self._record_event(
+            decision="clarification_answer",
+            reason=str(request_payload.get("reason") or "Clarification answered."),
+            extra={"clarification": revision, "effective_goal": state.effective_goal},
+        )
+        return state
 
     def step(self) -> AgentAction:
         self._throw_if_cancelled()
@@ -217,6 +257,13 @@ class PlannerRuntime:
                 self.evidence.add_unique_file(str(root))
         elif tool_name == "search_text" and isinstance(content, dict):
             self.evidence.search_results.extend(content.get("matches") or [])
+        elif tool_name.startswith("index_") and isinstance(content, dict):
+            observation = content.get("project_index") if isinstance(content.get("project_index"), dict) else content
+            self.record_project_index_observation(observation)
+        elif tool_name.startswith("edit_") and isinstance(content, dict):
+            self.update_from_edit(content, tool_call_id=tool_call_id)
+        elif tool_name.startswith("review_") and isinstance(content, dict):
+            self.record_review_observation(content)
         elif tool_name.startswith("workspace_") and isinstance(content, dict):
             self.update_from_mutation(content, tool_call_id=tool_call_id)
         elif tool_name in {"run_command", "start_process", "stop_process"} and isinstance(content, dict):
@@ -326,6 +373,8 @@ class PlannerRuntime:
             self._state().status = TaskStatus.REPAIRING_FAILURES
             self._state().current_phase = "repairing_failures"
             self._plan().current_phase = "repairing_failures"
+        if isinstance(verification.get("review_report"), dict):
+            self.record_review_observation(verification["review_report"])
         self._persist()
 
     def _record_sandbox_from_command(self, command: dict[str, Any], *, source: str) -> None:
@@ -446,6 +495,138 @@ class PlannerRuntime:
             reason="Instruction prompt observation recorded.",
             evidence_refs=payload["prompt_hash_references"],
             extra={"instruction_prompt_observation": payload},
+        )
+
+    def record_project_index_observation(self, observation: dict[str, Any]) -> None:
+        self._throw_if_cancelled()
+        payload = {
+            "index_id": observation.get("index_id"),
+            "summary": observation.get("summary") or {},
+            "relevant_files": list(observation.get("relevant_files") or [])[:20],
+            "context_candidates": list(observation.get("context_candidates") or [])[:20],
+            "impact": observation.get("impact"),
+            "test_impact": observation.get("test_impact"),
+            "warnings": list(observation.get("warnings") or []),
+            "trust_level": observation.get("trust_level") or "untrusted_workspace_data",
+            "truncated": bool(observation.get("truncated")),
+        }
+        self.evidence.project_index_observations.append(payload)
+        for candidate in payload["relevant_files"]:
+            path = candidate.get("path")
+            if path:
+                self.evidence.relevant_symbols.append(
+                    {
+                        "source": "project_index",
+                        "path": path,
+                        "score": candidate.get("score"),
+                        "reasons": candidate.get("reasons") or [],
+                        "freshness": candidate.get("freshness"),
+                    }
+                )
+        self._persist()
+
+    def update_from_edit(
+        self, result: Any, *, tool_call_id: str | None = None
+    ) -> None:
+        self._throw_if_cancelled()
+        payload = self._content_payload(result)
+        edit = payload.get("edit") if isinstance(payload.get("edit"), dict) else payload
+        if not isinstance(edit, dict):
+            return
+        plan_id = edit.get("edit_plan_id")
+        plan_entry = {
+            "tool_call_id": tool_call_id,
+            "edit_plan_id": plan_id,
+            "intent_id": edit.get("intent_id"),
+            "strategy": edit.get("strategy"),
+            "patch_digest": edit.get("patch_digest"),
+            "changed_files": list(edit.get("changed_files") or []),
+            "status": edit.get("status"),
+        }
+        if plan_id and not any(existing.get("edit_plan_id") == plan_id for existing in self.evidence.edit_plans):
+            self.evidence.edit_plans.append(plan_entry)
+        result_id = edit.get("edit_result_id")
+        if result_id and not any(existing.get("edit_result_id") == result_id for existing in self.evidence.edit_results):
+            self.evidence.edit_results.append(
+                {
+                    **plan_entry,
+                    "edit_result_id": result_id,
+                    "ok": edit.get("ok"),
+                    "error_code": edit.get("error_code"),
+                    "validation": edit.get("validation"),
+                    "repair_attempts": edit.get("repair_attempts") or [],
+                    "changeset_id": edit.get("changeset_id"),
+                    "transaction_id": edit.get("transaction_id"),
+                    "verification_plan_id": (edit.get("verification_plan") or {}).get("id")
+                    or (edit.get("verification_plan") or {}).get("verification_plan_id"),
+                    "review_report_id": (edit.get("review_report") or {}).get("review_id")
+                    if isinstance(edit.get("review_report"), dict)
+                    else None,
+                }
+            )
+        if edit.get("transaction_id") or edit.get("mutation_status"):
+            self.update_from_mutation(edit, tool_call_id=tool_call_id)
+        if edit.get("error_code"):
+            self.replan({"error_code": edit.get("error_code")})
+        if isinstance(edit.get("review_report"), dict):
+            self.record_review_observation(edit["review_report"])
+        self._persist()
+        self._record_event(
+            decision="edit_observation",
+            reason="Edit observation recorded.",
+            evidence_refs=[str(result_id)] if result_id else [],
+            extra={"edit_observation": plan_entry},
+        )
+
+    def record_review_observation(self, observation: dict[str, Any]) -> None:
+        self._throw_if_cancelled()
+        if not isinstance(observation, dict):
+            return
+        decision = observation.get("decision") if isinstance(observation.get("decision"), dict) else {}
+        target = observation.get("target") if isinstance(observation.get("target"), dict) else {}
+        findings = observation.get("findings") if isinstance(observation.get("findings"), list) else []
+        payload = {
+            "review_id": observation.get("review_id"),
+            "target": target,
+            "decision": decision,
+            "findings": findings[:50],
+            "next_actions": list(observation.get("next_actions") or []),
+            "model_critic_status": observation.get("model_critic_status"),
+            "input_summary": observation.get("input_summary"),
+            "created_at": observation.get("created_at"),
+        }
+        review_id = payload.get("review_id")
+        if review_id and any(existing.get("review_id") == review_id for existing in self.evidence.review_results):
+            return
+        self.evidence.review_results.append(payload)
+        action = str(decision.get("action") or "")
+        blocking = [item for item in findings if isinstance(item, dict) and item.get("blocking")]
+        if action == "repair":
+            self._state().status = TaskStatus.REPAIRING_FAILURES
+            self._state().current_phase = "repairing_failures"
+            self._plan().current_phase = "repairing_failures"
+            if blocking:
+                self.evidence.unresolved_failures.extend({"review": item} for item in blocking)
+        elif action == "replan":
+            signal = decision.get("replan_signal") if isinstance(decision.get("replan_signal"), dict) else {}
+            self.replan(signal or {"error_code": "review_replan"})
+        elif action == "needs_human_approval":
+            self._state().status = TaskStatus.NEEDS_REVIEW
+            for reason in decision.get("reasons") or []:
+                self._append_unique(self._state().blocked_reasons, reason)
+            if blocking:
+                self.evidence.unresolved_failures.extend({"review": item} for item in blocking)
+        elif action == "rollback":
+            self._state().status = TaskStatus.NEEDS_REVIEW
+            self._append_unique(self._state().blocked_reasons, "review requested rollback")
+            if blocking:
+                self.evidence.unresolved_failures.extend({"review": item} for item in blocking)
+        self._persist()
+        self._record_event(
+            decision="review_observation",
+            reason=f"Review decision recorded: {action or 'unknown'}.",
+            evidence_refs=[str(review_id)] if review_id else [],
+            extra={"review_observation": payload},
         )
 
     def replan(self, signal: dict[str, Any]) -> ReplanDecision:
@@ -627,7 +808,7 @@ class PlannerRuntime:
             state.status = TaskStatus.PLANNING_CHANGES
             state.current_phase = "planning_changes"
             plan.current_phase = "planning_changes"
-        elif state.current_phase == "planning_changes" and tool_name in READ_TOOLS:
+        elif state.current_phase == "planning_changes" and tool_name in (READ_TOOLS | EDIT_PLAN_TOOLS):
             state.status = TaskStatus.APPLYING_CHANGES
             state.current_phase = "applying_changes"
             plan.current_phase = "applying_changes"
@@ -683,7 +864,7 @@ class PlannerRuntime:
                 phase_id="planning_changes",
                 name="Plan Changes",
                 purpose="Propose a small changeset from inspected evidence.",
-                allowed_tools=sorted(READ_TOOLS),
+                allowed_tools=sorted(READ_TOOLS | EDIT_PLAN_TOOLS),
                 allowed_actions=[
                     ActionKind.ANALYZE_ISSUE,
                     ActionKind.PROPOSE_CHANGE_SET,
@@ -695,7 +876,7 @@ class PlannerRuntime:
             TaskPhase(
                 phase_id="applying_changes",
                 name="Apply Changes",
-                purpose="Apply mutations only through Workspace Mutation Runtime.",
+                purpose="Apply mutations through EditRuntime, which delegates writes to Workspace Mutation Runtime.",
                 allowed_tools=sorted(MUTATION_TOOLS | READ_TOOLS),
                 allowed_actions=[
                     ActionKind.APPLY_MUTATION,
@@ -716,7 +897,7 @@ class PlannerRuntime:
                 phase_id="repairing_failures",
                 name="Repair Failures",
                 purpose="Repair failures using parsed evidence and bounded retries.",
-                allowed_tools=sorted(MUTATION_TOOLS | READ_TOOLS | VERIFICATION_TOOLS),
+                allowed_tools=sorted(MUTATION_TOOLS | EDIT_PLAN_TOOLS | READ_TOOLS | VERIFICATION_TOOLS),
                 allowed_actions=[
                     ActionKind.PARSE_FAILURE,
                     ActionKind.REPAIR_CHANGE,

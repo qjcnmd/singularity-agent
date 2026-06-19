@@ -176,6 +176,20 @@ class TraceSummaryBuilder:
             "commands_executed": summary.command_count,
             "sandboxed_commands": summary.sandboxed_command_count,
             "workspace_mutations": summary.mutation_count,
+            "edit_events": len(
+                [
+                    event
+                    for event in selected_events
+                    if event.event_type
+                    in {
+                        TraceEventType.EDIT_PLAN_CREATED,
+                        TraceEventType.EDIT_PATCH_VALIDATED,
+                        TraceEventType.EDIT_APPLIED,
+                        TraceEventType.EDIT_REPAIR_ATTEMPTED,
+                        TraceEventType.EDIT_FAILED,
+                    }
+                ]
+            ),
             "verification_checks": summary.verification_count,
             "policy_denials": summary.policy_denial_count,
             "approvals": summary.approval_count,
@@ -217,6 +231,14 @@ class TraceSummaryBuilder:
                 TraceEventType.VERIFICATION_CHECK_COMPLETED,
             } and event.severity in {TraceSeverity.WARNING, TraceSeverity.ERROR, TraceSeverity.CRITICAL}:
                 lines.append(f"[trace] Verification issue: {event.summary}")
+            elif event.event_type in {
+                TraceEventType.EDIT_PLAN_CREATED,
+                TraceEventType.EDIT_PATCH_VALIDATED,
+                TraceEventType.EDIT_APPLIED,
+                TraceEventType.EDIT_REPAIR_ATTEMPTED,
+                TraceEventType.EDIT_FAILED,
+            }:
+                lines.append(f"[trace] Edit: {event.summary}")
             elif event.event_type in {
                 TraceEventType.MUTATION_TRANSACTION_STARTED,
                 TraceEventType.MUTATION_APPLIED,

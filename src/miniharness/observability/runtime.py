@@ -35,6 +35,7 @@ class TraceRuntime:
         artifacts: TraceArtifactStore | None = None,
         redactor: TraceRedactor | None = None,
         trace_dir: Path | str | None = None,
+        interaction_sink: Any | None = None,
     ) -> None:
         self.root = Path(root)
         self.run_id = run_id
@@ -51,6 +52,7 @@ class TraceRuntime:
         self.spans = SpanManager(store=self.store, run_id=run_id, session_id=session_id)
         self.path = self.store.events_path
         self._started = time.perf_counter()
+        self.interaction_sink = interaction_sink
 
     @classmethod
     def create(
@@ -113,6 +115,7 @@ class TraceRuntime:
                 payload_hash=self.redactor.hash_payload(raw_payload),
             )
             self.store.append_event(event)
+            self._notify_interaction(event)
             return event
         except Exception as exc:
             warning = {
@@ -122,6 +125,33 @@ class TraceRuntime:
             }
             print(f"[miniharness trace warning] {warning}", file=sys.stderr)
             return warning
+
+    def set_interaction_sink(self, sink: Any | None) -> None:
+        self.interaction_sink = sink
+
+    def _notify_interaction(self, event: TraceEvent) -> None:
+        if self.interaction_sink is None:
+            return
+        if isinstance(event.payload, dict) and event.payload.get("_interaction_origin_event_id"):
+            return
+        try:
+            if callable(self.interaction_sink):
+                self.interaction_sink(event)
+            elif hasattr(self.interaction_sink, "consume_trace_event"):
+                self.interaction_sink.consume_trace_event(event)
+            elif hasattr(self.interaction_sink, "handle"):
+                self.interaction_sink.handle(event)
+            else:
+                raise TypeError(
+                    f"Unsupported interaction sink: {type(self.interaction_sink).__name__}"
+                )
+        except Exception as exc:
+            warning = {
+                "warning": "interaction_sink_failed",
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            print(f"[miniharness trace warning] {warning}", file=sys.stderr)
 
     def record(self, event: str, data: dict[str, Any]) -> TraceEvent | dict[str, Any]:
         event_type, runtime, summary, severity, ids = self._legacy_event(event, data)

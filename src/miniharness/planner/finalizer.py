@@ -37,7 +37,14 @@ class Finalizer:
             if "check_status" in latest:
                 verification_summary["check_status"] = latest["check_status"]
 
-        status = TaskStatus.COMPLETED if verification_summary.get("status") in {"ready", "ready_with_warnings"} else state.status
+        review_summary = self._review_summary(evidence)
+        latest_review_decision = review_summary.get("latest_decision")
+        status = (
+            TaskStatus.COMPLETED
+            if verification_summary.get("status") in {"ready", "ready_with_warnings"}
+            and latest_review_decision in {None, "accept"}
+            else state.status
+        )
         next_steps = [] if status == TaskStatus.COMPLETED else ["Resolve unmet completion criteria."]
 
         return FinalReport(
@@ -62,6 +69,10 @@ class Finalizer:
                 else {}
             ),
             instruction_prompt_summary=self._instruction_prompt_summary(evidence),
+            runtime_health_summary={
+                "project_index": self._project_index_summary(evidence),
+            },
+            review_summary=review_summary,
         )
 
     @staticmethod
@@ -235,3 +246,44 @@ class Finalizer:
             refs.update(str(item) for item in observation.get("prompt_hash_references") or [])
         summary["prompt_hash_references"] = sorted(refs)
         return summary
+
+    @staticmethod
+    def _project_index_summary(evidence: EvidenceLedger) -> dict[str, Any]:
+        if not evidence.project_index_observations:
+            return {"status": "not_recorded"}
+        latest = evidence.project_index_observations[-1]
+        summary = dict(latest.get("summary") or {})
+        return {
+            "status": "recorded",
+            "index_id": latest.get("index_id"),
+            "freshness": summary.get("freshness"),
+            "file_count": summary.get("file_count"),
+            "symbol_count": summary.get("symbol_count"),
+            "dependency_count": summary.get("dependency_count"),
+            "entrypoint_count": summary.get("entrypoint_count"),
+            "relevant_files_count": len(latest.get("relevant_files") or []),
+            "warnings": latest.get("warnings") or [],
+        }
+
+    @staticmethod
+    def _review_summary(evidence: EvidenceLedger) -> dict[str, Any]:
+        if not evidence.review_results:
+            return {"status": "not_recorded", "latest_decision": None}
+        latest = evidence.review_results[-1]
+        decision = latest.get("decision") if isinstance(latest.get("decision"), dict) else {}
+        findings = latest.get("findings") if isinstance(latest.get("findings"), list) else []
+        blocking = [item for item in findings if isinstance(item, dict) and item.get("blocking")]
+        remaining_risks = [
+            item.get("title")
+            for item in findings
+            if isinstance(item, dict)
+            and item.get("severity") in {"warning", "error", "critical"}
+        ][:10]
+        return {
+            "status": "recorded",
+            "latest_review_id": latest.get("review_id"),
+            "latest_decision": decision.get("action"),
+            "finding_count": len(findings),
+            "blocking_finding_count": len(blocking),
+            "remaining_risks": remaining_risks,
+        }

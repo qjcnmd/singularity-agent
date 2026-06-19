@@ -27,13 +27,17 @@ def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, 
     assert graph.initialization_order == [
         RuntimeComponentName.CONFIGURATION,
         RuntimeComponentName.OBSERVABILITY,
+        RuntimeComponentName.INTERACTION,
         RuntimeComponentName.WORKSPACE_STATE,
+        RuntimeComponentName.PROJECT_INDEX,
         RuntimeComponentName.POLICY,
         RuntimeComponentName.SANDBOX,
         RuntimeComponentName.COMMAND,
         RuntimeComponentName.MUTATION,
+        RuntimeComponentName.EDIT,
         RuntimeComponentName.TOOLS,
         RuntimeComponentName.VERIFICATION,
+        RuntimeComponentName.REVIEW,
         RuntimeComponentName.INSTRUCTIONS,
         RuntimeComponentName.MODEL,
         RuntimeComponentName.CONTEXT,
@@ -41,5 +45,9 @@ def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, 
     ]
     assert graph.state(RuntimeComponentName.PLANNER) == RuntimeComponentState.READY
     assert graph.planner is not None
+    assert graph.edit_runtime is not None
+    assert graph.review_runtime is not None
+    assert graph.edit_runtime.review_runtime is graph.review_runtime
+    assert graph.verification_runtime.review_runtime is graph.review_runtime
     assert graph.model_runtime is not None
     assert graph.tool_runtime is not None

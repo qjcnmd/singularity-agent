@@ -37,6 +37,7 @@ from miniharness.verification import (
     WorkspaceKind,
 )
 from miniharness.verification.models import VerificationPlan
+from miniharness.review import ReviewRuntime
 from tests.tool_runtime_helpers import runtime_default_policy_runtime
 
 
@@ -299,6 +300,41 @@ def test_timeout_converts_to_timeout_verification_result(tmp_path: Path) -> None
     observation = runtime.run_plan(plan.id)
 
     assert any(check["status"] == CheckStatus.TIMEOUT.value for check in observation["verification"]["failed_checks"])
+
+
+def test_post_verification_review_report_is_written_to_observation(tmp_path: Path) -> None:
+    request = CommandRequest(argv=["pytest"])
+    fake = FakeCommandRuntime(
+        [
+            command_result(
+                request,
+                command_id="cmd_fail",
+                exit_code=1,
+                semantic_status=SemanticStatus.TESTS_FAILED,
+                output="FAILED tests/test_app.py::test_bad - AssertionError",
+                error_code="semantic_failure",
+            ),
+            command_result(
+                request,
+                command_id="cmd_fail_again",
+                exit_code=1,
+                semantic_status=SemanticStatus.TESTS_FAILED,
+                output="FAILED tests/test_app.py::test_bad - AssertionError",
+                error_code="semantic_failure",
+            ),
+        ]
+    )
+    (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "pytest"}}), encoding="utf-8")
+    review = ReviewRuntime(tmp_path, enable_model_critic=False)
+    runtime = VerificationRuntime(tmp_path, command_runtime=fake, review_runtime=review)
+
+    plan = runtime.plan_verification(changed_files=["src/app.js"], task_intent="code")
+    observation = runtime.run_plan(plan.id)
+
+    report = observation["verification"]["review_report"]
+    assert report["target"]["stage"] == "post_verification"
+    assert report["decision"]["action"] == "repair"
+    assert report["decision"]["repair_targets"]
 
 
 def test_flaky_rerun_is_recorded_and_marked_flaky(tmp_path: Path) -> None:

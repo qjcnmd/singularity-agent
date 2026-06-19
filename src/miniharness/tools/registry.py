@@ -122,9 +122,18 @@ class ToolRegistry:
         if (
             spec.permission_level == PermissionLevel.WRITE
             and not spec.uses_mutation_runtime
-            and spec.execution_backend != ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME
+            and spec.execution_backend
+            not in {
+                ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
+                ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
+            }
         ):
             raise ValueError("Write tools must declare a mutation runtime backend.")
+        if spec.execution_backend == ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME:
+            if not spec.uses_edit_runtime:
+                raise ValueError("Edit runtime tools must declare uses_edit_runtime=True.")
+            if not spec.uses_mutation_runtime:
+                raise ValueError("Edit runtime tools must delegate writes to mutation runtime.")
         if (
             spec.permission_level == PermissionLevel.SHELL
             and not spec.uses_command_runtime

@@ -221,6 +221,7 @@ class MutationRuntime:
         state_runtime: "LocalWorkspaceStateRuntime | None" = None,
         planner: Any | None = None,
         policy_runtime: PolicyRuntime | None = None,
+        project_index_runtime: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.resolver = WorkspacePathResolver(self.workspace_root)
@@ -239,6 +240,7 @@ class MutationRuntime:
         self.policy_runtime = policy_runtime or PolicyRuntime(
             PolicyConfig.runtime_default(self.workspace_root)
         )
+        self.project_index_runtime = project_index_runtime
         self._journals: dict[str, MutationJournal] = {}
 
     def preview_operations(
@@ -520,7 +522,8 @@ class MutationRuntime:
             return result
 
         git_after = collect_git_state(self.workspace_root)
-        verification_status = self._run_verification_hook(transaction_id)
+        index_update = self._update_project_index(changeset, transaction_id)
+        verification_status = self._run_verification_hook(transaction_id, changeset=changeset)
         result = MutationResult(
             ok=True,
             status="applied",
@@ -531,7 +534,10 @@ class MutationRuntime:
             diffs=changeset.diffs,
             policy_decisions=changeset.policy_decisions,
             observation=self._observation("applied", changeset)
-            | {"transaction_id": transaction_id},
+            | {
+                "transaction_id": transaction_id,
+                "project_index": index_update,
+            },
             verification_status=verification_status,
             git_before=git_before,
             git_after=git_after,
@@ -549,6 +555,9 @@ class MutationRuntime:
         decision = self.policy_runtime.enforce(request)
         self._record_policy_trace(request, decision)
         if decision.outcome == DecisionOutcome.ALLOW:
+            impact_result = self._project_index_policy_result(changeset, transaction_id)
+            if impact_result is not None:
+                return impact_result
             return None
         self._record_policy_observation(request, decision)
         return MutationResult(
@@ -604,6 +613,7 @@ class MutationRuntime:
             metadata={
                 "diff_summary": changeset.preview(),
                 "files_changed": changeset.affected_files,
+                "project_index_impact": self._project_index_impact(changeset),
                 "created": [
                     path
                     for path, snapshot in changeset.base_snapshots.items()
@@ -1148,14 +1158,86 @@ class MutationRuntime:
                 payload[key] = value
         return payload
 
-    def _run_verification_hook(self, transaction_id: str) -> str:
+    def _run_verification_hook(self, transaction_id: str, *, changeset: ChangeSet | None = None) -> str:
         if self.verification_hook is None:
             return "not_run"
         try:
             result = self.verification_hook(transaction_id)
+        except TypeError:
+            try:
+                result = self.verification_hook(
+                    transaction_id=transaction_id,
+                    changeset_id=changeset.id if changeset else None,
+                    changed_files=changeset.affected_files if changeset else [],
+                    intent=changeset.intent if changeset else "",
+                    diff_digests=[diff.digest for diff in changeset.diffs] if changeset else [],
+                )
+            except Exception:
+                return "failed"
         except Exception:
             return "failed"
         return str(result or "completed")
+
+    def _project_index_impact(self, changeset: ChangeSet) -> dict[str, Any]:
+        if self.project_index_runtime is None:
+            return {}
+        try:
+            return self.project_index_runtime.analyze_impact(changeset.affected_files).to_dict()
+        except Exception as exc:
+            return {"error": type(exc).__name__, "message": str(exc)}
+
+    def _project_index_policy_result(
+        self,
+        changeset: ChangeSet,
+        transaction_id: str,
+    ) -> MutationResult | None:
+        impact = self._project_index_impact(changeset)
+        if not impact or impact.get("error"):
+            return None
+        if not (
+            impact.get("config_impact")
+            or impact.get("generated_or_vendor_impact")
+            or impact.get("broad_impact")
+            or impact.get("affected_entrypoints")
+        ):
+            return None
+        reasons = list(impact.get("risk_reasons") or ["Code index impact requires review."])
+        return MutationResult(
+            ok=False,
+            status="requires_review",
+            error_code="approval_required",
+            message="Code index impact requires review: " + "; ".join(str(item) for item in reasons),
+            changeset_id=changeset.id,
+            transaction_id=transaction_id,
+            affected_files=changeset.affected_files,
+            diffs=changeset.diffs,
+            policy_decisions=changeset.policy_decisions,
+            observation=self._observation(
+                "requires_review",
+                changeset,
+                error_code="approval_required",
+                error_details={"project_index_impact": impact},
+            ),
+        )
+
+    def _update_project_index(self, changeset: ChangeSet, transaction_id: str) -> dict[str, Any]:
+        if self.project_index_runtime is None:
+            return {}
+        try:
+            result = self.project_index_runtime.update_after_changeset(
+                {
+                    "changeset_id": changeset.id,
+                    "transaction_id": transaction_id,
+                    "changed_files": changeset.affected_files,
+                    "deleted_files": [
+                        path for path, final_text in changeset.final_texts.items() if final_text is None
+                    ],
+                },
+                reason="mutation_applied",
+            )
+            return result.to_dict() if hasattr(result, "to_dict") else dict(result)
+        except Exception as exc:
+            return {"error": type(exc).__name__, "message": str(exc)}
 
 
 class RollbackManager:

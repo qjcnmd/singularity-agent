@@ -164,6 +164,12 @@ class ImpactAnalysis:
     risk_level: str
     transaction_id: str | None = None
     changeset_id: str | None = None
+    affected_symbols: list[str] = field(default_factory=list)
+    dependent_files: list[str] = field(default_factory=list)
+    test_mappings: list[dict[str, Any]] = field(default_factory=list)
+    mapping_confidence: float = 0.0
+    index_source: str | None = None
+    index_stale: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,6 +184,12 @@ class ImpactAnalysis:
             "risk_level": self.risk_level,
             "transaction_id": self.transaction_id,
             "changeset_id": self.changeset_id,
+            "affected_symbols": self.affected_symbols,
+            "dependent_files": self.dependent_files,
+            "test_mappings": self.test_mappings,
+            "mapping_confidence": self.mapping_confidence,
+            "index_source": self.index_source,
+            "index_stale": self.index_stale,
         }
 
 

@@ -63,6 +63,8 @@ class VerificationRuntime:
         policy: VerificationPolicy | None = None,
         planner: Any | None = None,
         policy_runtime: PolicyRuntime | None = None,
+        project_index_runtime: Any | None = None,
+        review_runtime: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.command_runtime = command_runtime or CommandRuntime(self.workspace_root, trace=trace)
@@ -71,6 +73,8 @@ class VerificationRuntime:
         self.policy_runtime = policy_runtime or PolicyRuntime(
             PolicyConfig.runtime_default(self.workspace_root)
         )
+        self.project_index_runtime = project_index_runtime
+        self.review_runtime = review_runtime
         self.policy = policy or VerificationPolicy(self.command_runtime.policy)
         self.parsers = FailureParserRegistry()
         self.hints = RepairHintGenerator()
@@ -98,6 +102,7 @@ class VerificationRuntime:
             transaction_id=transaction_id,
             changeset_id=changeset_id,
         )
+        impact = self._augment_impact_with_project_index(impact)
         plan = self._build_plan(
             profile=profile,
             impact=impact,
@@ -154,6 +159,14 @@ class VerificationRuntime:
             },
         )
         observation = self._observation(plan, results, assessment)
+        review_report = self._post_verification_review(
+            plan=plan,
+            results=results,
+            assessment=assessment,
+            observation=observation,
+        )
+        if review_report is not None:
+            observation["verification"]["review_report"] = review_report.model_dump(mode="json")
         if self.planner is not None:
             self.planner.update_from_verification(observation, tool_call_id=None)
         return observation
@@ -171,6 +184,14 @@ class VerificationRuntime:
         assessment = self.assessor.assess(plan=plan, results=existing)
         self._assessments[plan.id] = assessment
         observation = self._observation(plan, existing, assessment)
+        review_report = self._post_verification_review(
+            plan=plan,
+            results=existing,
+            assessment=assessment,
+            observation=observation,
+        )
+        if review_report is not None:
+            observation["verification"]["review_report"] = review_report.model_dump(mode="json")
         if self.planner is not None:
             self.planner.update_from_verification(observation, tool_call_id=None)
         return observation
@@ -221,6 +242,35 @@ class VerificationRuntime:
                 )
             )
 
+        targeted_tests = [
+            item.get("test_path")
+            for item in impact.test_mappings
+            if isinstance(item, dict) and item.get("test_path")
+        ]
+        targeted_pytests = sorted(
+            {
+                str(path)
+                for path in targeted_tests
+                if str(path).endswith(".py") and (self.workspace_root / str(path)).exists()
+            }
+        )
+        if targeted_pytests:
+            required.append(
+                self._check(
+                    kind=CheckKind.UNIT_TEST,
+                    command=CommandRequest(
+                        argv=[sys.executable, "-m", "pytest", *targeted_pytests, "--basetemp", "work/pytest-tmp"],
+                        cwd=".",
+                        purpose=CommandPurpose.PROJECT_VERIFICATION,
+                        timeout_seconds=180,
+                    ),
+                    scope="code_index_targeted_tests",
+                    required=True,
+                    source="project_index:test_mapping",
+                    risk_tags=["unit_test", "project_index_targeted"],
+                )
+            )
+
         if docs_only:
             skipped.append(
                 self._check(
@@ -242,7 +292,7 @@ class VerificationRuntime:
                     skip_reason="Documentation correctness requires human review.",
                 )
             )
-        else:
+        if not targeted_pytests or impact.requires_full_test:
             unit_command = self._command_for(profile, CheckKind.UNIT_TEST)
             if unit_command is not None:
                 required.append(self._check_from_command(unit_command, required=True, scope="project"))
@@ -361,6 +411,46 @@ class VerificationRuntime:
                     check.skip_reason = "; ".join(decision.reasons)
                     blocked_checks.append(check)
         return allowed_required, allowed_optional, blocked_checks
+
+    def _augment_impact_with_project_index(self, impact: ImpactAnalysis) -> ImpactAnalysis:
+        if self.project_index_runtime is None:
+            return impact
+        try:
+            code_impact = self.project_index_runtime.analyze_impact(impact.changed_files)
+            test_impact = self.project_index_runtime.get_test_impact(impact.changed_files)
+        except Exception:
+            payload = impact.to_dict()
+            payload.update({"index_source": "project_index_unavailable", "index_stale": True})
+            return ImpactAnalysis(**payload)
+        risk_reasons = list(dict.fromkeys([*impact.risk_reasons, *code_impact.risk_reasons]))
+        likely_tests = sorted(set(impact.likely_tests) | set(test_impact.likely_tests))
+        requires_full_test = impact.requires_full_test or test_impact.require_full_test or code_impact.broad_impact
+        requires_build = impact.requires_build or code_impact.config_impact
+        requires_typecheck = impact.requires_typecheck or code_impact.config_impact
+        requires_manual_review = impact.requires_manual_review or code_impact.generated_or_vendor_impact
+        risk_level = _max_risk(impact.risk_level, code_impact.risk_level)
+        return ImpactAnalysis(
+            changed_files=impact.changed_files,
+            affected_modules=sorted(set(impact.affected_modules) | set(code_impact.direct_files) | set(code_impact.reverse_dependencies)),
+            likely_tests=likely_tests,
+            requires_full_test=requires_full_test,
+            requires_build=requires_build,
+            requires_typecheck=requires_typecheck,
+            requires_manual_review=requires_manual_review,
+            risk_reasons=risk_reasons,
+            risk_level=risk_level,
+            transaction_id=impact.transaction_id,
+            changeset_id=impact.changeset_id,
+            affected_symbols=code_impact.affected_symbols,
+            dependent_files=code_impact.reverse_dependencies,
+            test_mappings=[
+                {"test_path": path, "source": "project_index", "confidence": test_impact.confidence}
+                for path in test_impact.likely_tests
+            ],
+            mapping_confidence=test_impact.confidence,
+            index_source="ProjectIndexRuntime",
+            index_stale=code_impact.freshness.value != "fresh" or test_impact.freshness.value != "fresh",
+        )
 
     def _run_check(self, plan: VerificationPlan, check: VerificationCheck) -> VerificationResult:
         self._throw_if_cancelled()
@@ -835,6 +925,23 @@ class VerificationRuntime:
         payload["phase"] = phase
         self.trace.record("verification", payload)
 
+    def _post_verification_review(
+        self,
+        *,
+        plan: VerificationPlan,
+        results: list[VerificationResult],
+        assessment: CompletionAssessment,
+        observation: dict[str, Any],
+    ) -> Any | None:
+        if self.review_runtime is None or not hasattr(self.review_runtime, "post_verification_review"):
+            return None
+        return self.review_runtime.post_verification_review(
+            plan=plan,
+            results=results,
+            assessment=assessment,
+            observation=observation,
+        )
+
     def _throw_if_cancelled(self) -> None:
         token = getattr(self, "cancellation_token", None)
         if token is not None and hasattr(token, "throw_if_cancelled"):
@@ -932,3 +1039,10 @@ def _policy_error_code(outcome: DecisionOutcome) -> str:
         DecisionOutcome.ESCALATE: "policy_escalation_required",
     }
     return mapping.get(outcome, "check_policy_denied")
+
+
+def _max_risk(left: str, right: str) -> str:
+    order = ["low", "medium", "high", "critical"]
+    left = left if left in order else "medium"
+    right = right if right in order else "medium"
+    return order[max(order.index(left), order.index(right))]

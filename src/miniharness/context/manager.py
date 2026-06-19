@@ -627,6 +627,59 @@ class ContextManager:
             )
         )
 
+    def add_edit_result(self, result: dict[str, Any]) -> ContextItem:
+        payload = _bounded_edit_payload(result)
+        refs = []
+        if payload.get("edit_plan_id"):
+            refs.append(
+                ContextReference(
+                    ref_id=f"ref_edit_plan_{payload['edit_plan_id']}",
+                    ref_type="edit_plan",
+                    target=str(payload["edit_plan_id"]),
+                    source_item_id="",
+                )
+            )
+        if payload.get("patch_digest"):
+            refs.append(
+                ContextReference(
+                    ref_id=f"ref_patch_{str(payload['patch_digest'])[:16]}",
+                    ref_type="patch_digest",
+                    target=str(payload["patch_digest"]),
+                    source_item_id="",
+                )
+            )
+        return self.add_context_item(
+            self._make_item(
+                layer=ContextLayer.EVIDENCE,
+                source_runtime=ContextRuntime.EDIT,
+                item_type=ContextItemType.EDIT_EVIDENCE,
+                content=payload,
+                authority=ContextAuthority.RUNTIME,
+                importance=0.88 if payload.get("ok") else 0.94,
+                references=refs,
+            )
+        )
+
+    def add_project_index(self, observation: dict[str, Any]) -> ContextItem:
+        payload = dict(observation)
+        payload["trust_level"] = "untrusted_workspace_data"
+        return self.add_context_item(
+            self._make_item(
+                layer=ContextLayer.WORKSPACE_STATE,
+                source_runtime=ContextRuntime.PROJECT_INDEX,
+                item_type=ContextItemType.PROJECT_INDEX,
+                content=payload,
+                authority=ContextAuthority.RUNTIME,
+                sensitivity=ContextSensitivity.WORKSPACE,
+                importance=0.86,
+                metadata={
+                    "index_id": payload.get("index_id"),
+                    "freshness": ((payload.get("summary") or {}).get("freshness")),
+                    "trust_level": "untrusted_workspace_data",
+                },
+            )
+        )
+
     def add_failure(self, failure: dict[str, Any] | str) -> ContextItem:
         return self.add_context_item(
             self._make_item(
@@ -653,8 +706,12 @@ class ContextManager:
                 source_type = "command_output"
             elif "verification" in observation.tool_name:
                 source_type = "verification_evidence"
+            elif observation.tool_name.startswith("edit_"):
+                source_type = "edit_evidence"
             elif observation.tool_name == "workspace_health":
                 source_type = "workspace_state"
+            elif "index" in observation.tool_name:
+                source_type = "project_index"
             sources.append(
                 {
                     "source_type": source_type,
@@ -683,6 +740,21 @@ class ContextManager:
                     "metadata": {"summary": True},
                 }
             )
+        for item in self.store.query_items(run_id=self.run_id):
+            if item.source_runtime == ContextRuntime.PROJECT_INDEX:
+                sources.append(
+                    {
+                        "source_type": "project_index",
+                        "origin": "ProjectIndexRuntime",
+                        "content": json.dumps(item.content, ensure_ascii=False, sort_keys=True, default=str),
+                        "trust_level": "untrusted_content",
+                        "metadata": {
+                            "item_id": item.item_id,
+                            "content_digest": item.content_digest,
+                            "freshness": item.freshness.value,
+                        },
+                    }
+                )
         return sources
 
     def _persist_initial_messages(self) -> None:
@@ -1034,3 +1106,42 @@ def _plain(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     return value
+
+
+def _bounded_edit_payload(result: dict[str, Any]) -> dict[str, Any]:
+    validation = result.get("validation") or {}
+    issues = validation.get("issues") or []
+    return {
+        "edit_result_id": result.get("edit_result_id"),
+        "edit_plan_id": result.get("edit_plan_id"),
+        "intent_id": result.get("intent_id"),
+        "strategy": result.get("strategy"),
+        "status": result.get("status"),
+        "ok": result.get("ok"),
+        "patch_candidate_id": result.get("patch_candidate_id"),
+        "patch_digest": result.get("patch_digest"),
+        "changed_files": list(result.get("changed_files") or [])[:50],
+        "changeset_id": result.get("changeset_id"),
+        "transaction_id": result.get("transaction_id"),
+        "verification_plan_id": (result.get("verification_plan") or {}).get("id")
+        or (result.get("verification_plan") or {}).get("verification_plan_id"),
+        "validation": {
+            "ok": validation.get("ok"),
+            "requires_review": validation.get("requires_review"),
+            "failure_category": validation.get("failure_category"),
+            "issue_codes": [issue.get("code") for issue in issues if isinstance(issue, dict)][:20],
+            "diff_summary": list(validation.get("diff_summary") or [])[:20],
+        },
+        "repair_attempts": [
+            {
+                "attempt": attempt.get("attempt"),
+                "category": attempt.get("category"),
+                "action": attempt.get("action"),
+                "status": attempt.get("status"),
+            }
+            for attempt in list(result.get("repair_attempts") or [])[:5]
+            if isinstance(attempt, dict)
+        ],
+        "error_code": result.get("error_code"),
+        "message": result.get("message"),
+    }

@@ -12,7 +12,7 @@ from miniharness.planner import (
     RiskDecisionKind,
     TaskStatus,
 )
-from miniharness.tools.models import ToolResult, ToolSpec, PermissionLevel
+from miniharness.tools.models import ToolExecutionBackendKind, ToolResult, ToolSpec, PermissionLevel
 from pydantic import BaseModel
 from miniharness.workspace import CreateFile, MutationRuntime
 from miniharness.command import CommandRequest, CommandRuntime
@@ -31,6 +31,12 @@ def spec(name: str, *, permission: PermissionLevel = PermissionLevel.READ_ONLY) 
         input_model=EmptyInput,
         handler=lambda _args: {"ok": True},
         permission_level=permission,
+        execution_backend=(
+            ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME
+            if name == "edit_apply"
+            else ToolExecutionBackendKind.IN_PROCESS
+        ),
+        uses_edit_runtime=name == "edit_apply",
         uses_mutation_runtime=permission == PermissionLevel.WRITE,
         uses_command_runtime=permission == PermissionLevel.SHELL,
     )
@@ -83,6 +89,34 @@ def test_phase_policy_allows_read_tools_before_mutation_and_blocks_write(tmp_pat
     assert allowed.action.kind == ActionKind.READ_RELEVANT_FILES
     assert denied.allowed is False
     assert denied.error_code == "action_not_allowed"
+
+
+def test_applying_phase_defaults_to_edit_apply_not_low_level_workspace_tools(tmp_path: Path) -> None:
+    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner.start_task("Change code")
+    planner.state.status = TaskStatus.APPLYING_CHANGES
+    planner.state.current_phase = "applying_changes"
+
+    edit_allowed = planner.authorize_tool_call(
+        tool_name="edit_apply",
+        tool_call_id="call_edit",
+        spec=spec("edit_apply", permission=PermissionLevel.WRITE),
+        arguments={
+            "summary": "create",
+            "operations": [{"kind": "create_file", "path": "x.txt", "content": "x\n"}],
+        },
+    )
+    low_level_denied = planner.authorize_tool_call(
+        tool_name="workspace_create_file",
+        tool_call_id="call_workspace",
+        spec=spec("workspace_create_file", permission=PermissionLevel.WRITE),
+        arguments={"path": "x.txt"},
+    )
+
+    assert edit_allowed.allowed is True
+    assert edit_allowed.action.kind == ActionKind.APPLY_MUTATION
+    assert low_level_denied.allowed is False
+    assert low_level_denied.error_code == "action_not_allowed"
 
 
 def test_tool_result_updates_evidence_ledger_and_advances_phase(tmp_path: Path) -> None:
@@ -218,10 +252,19 @@ def test_risk_escalation_requires_review_for_high_risk_actions(tmp_path: Path) -
     planner.state.current_phase = "applying_changes"
 
     decision = planner.authorize_tool_call(
-        tool_name="workspace_create_file",
+        tool_name="edit_apply",
         tool_call_id="call_ci",
-        spec=spec("workspace_create_file", permission=PermissionLevel.WRITE),
-        arguments={"path": ".github/workflows/ci.yml"},
+        spec=spec("edit_apply", permission=PermissionLevel.WRITE),
+        arguments={
+            "summary": "Change CI",
+            "operations": [
+                {
+                    "kind": "create_file",
+                    "path": ".github/workflows/ci.yml",
+                    "content": "name: ci\n",
+                }
+            ],
+        },
     )
 
     assert decision.allowed is False
@@ -325,3 +368,45 @@ testpaths = ["tests"]
         "failed",
         "needs_review",
     }
+
+
+def test_planner_records_review_observation_and_routes_decision(tmp_path: Path) -> None:
+    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner.start_task("Review")
+
+    planner.record_review_observation(
+        {
+            "review_id": "review_1",
+            "target": {"stage": "post_verification"},
+            "findings": [
+                {
+                    "finding_id": "finding_1",
+                    "title": "Verification failed",
+                    "severity": "error",
+                    "category": "bug_risk",
+                    "blocking": True,
+                }
+            ],
+            "decision": {
+                "action": "repair",
+                "reasons": ["Verification failed"],
+                "repair_targets": ["check_1"],
+                "replan_signal": {"verification_failed": True},
+            },
+        }
+    )
+
+    assert planner.evidence.review_results[-1]["review_id"] == "review_1"
+    assert planner.state.status == TaskStatus.REPAIRING_FAILURES
+    assert planner.state.current_phase == "repairing_failures"
+
+    planner.record_review_observation(
+        {
+            "review_id": "review_2",
+            "target": {"stage": "pre_edit"},
+            "findings": [],
+            "decision": {"action": "needs_human_approval", "reasons": ["policy"]},
+        }
+    )
+
+    assert planner.state.status == TaskStatus.NEEDS_REVIEW

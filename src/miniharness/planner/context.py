@@ -17,6 +17,9 @@ class PlannerContextRenderer:
             "planner": {
                 "task_id": state.task_id,
                 "session_id": state.session_id,
+                "user_goal": state.user_goal,
+                "effective_goal": state.effective_goal or state.normalized_goal,
+                "goal_revisions": state.goal_revisions[-5:],
                 "phase": state.current_phase,
                 "status": state.status.value,
                 "risk_level": state.risk_level.value,
@@ -40,6 +43,12 @@ class PlannerContextRenderer:
                         str(item.get("summary") or self._sandbox_summary(item))
                         for item in evidence.sandbox_observations[-10:]
                     ],
+                    "project_index": self._project_index_summary(evidence),
+                    "latest_review": (
+                        evidence.review_results[-1]
+                        if evidence.review_results
+                        else None
+                    ),
                 },
             }
         }
@@ -74,3 +83,29 @@ class PlannerContextRenderer:
         if status == "backend_unavailable":
             return "[sandbox] command blocked: backend cannot enforce required isolation."
         return f"[sandbox] command ran in isolated copy-on-write workspace via {backend}, status={status}."
+
+    @staticmethod
+    def _project_index_summary(evidence: EvidenceLedger) -> dict:
+        if not evidence.project_index_observations:
+            return {}
+        latest = evidence.project_index_observations[-1]
+        summary = latest.get("summary") or {}
+        return {
+            "index_id": latest.get("index_id"),
+            "freshness": summary.get("freshness"),
+            "file_count": summary.get("file_count"),
+            "symbol_count": summary.get("symbol_count"),
+            "entrypoint_count": summary.get("entrypoint_count"),
+            "languages": summary.get("languages") or [],
+            "relevant_files": [
+                {
+                    "path": item.get("path"),
+                    "score": item.get("score"),
+                    "reasons": item.get("reasons") or [],
+                    "freshness": item.get("freshness"),
+                }
+                for item in (latest.get("relevant_files") or [])[:12]
+            ],
+            "warnings": latest.get("warnings") or [],
+            "trust_level": latest.get("trust_level") or "untrusted_workspace_data",
+        }

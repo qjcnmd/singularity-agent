@@ -6,6 +6,11 @@ from typing import Any
 from rich.console import Console
 
 from miniharness.agent import MiniAgent
+from miniharness.interaction import (
+    ControlCommand,
+    FinalReport as InteractionFinalReport,
+    InteractionRuntime,
+)
 
 from miniharness.kernel.cancellation import CancellationManager
 from miniharness.kernel.exceptions import CancellationError, KernelError
@@ -30,12 +35,16 @@ class AgentRunResult:
     final_answer: str
     final_report: FinalReport
     status: RunStatus
+    interaction_report: InteractionFinalReport | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "final_answer": self.final_answer,
             "final_report": self.final_report.to_dict(),
             "status": self.status.value,
+            "interaction_report": (
+                self.interaction_report.to_dict() if self.interaction_report else None
+            ),
         }
 
 
@@ -62,15 +71,29 @@ class AgentKernel:
         self.health_report = health_report
         self.shutdown_summary: ShutdownSummary | None = None
         self._final_report: FinalReport | None = None
+        self._interaction_report: InteractionFinalReport | None = None
         self._finalizing_during_shutdown = False
+        self.interaction_runtime = getattr(self.graph, "interaction_runtime", None)
+        if self.interaction_runtime is None:
+            self.interaction_runtime = InteractionRuntime(
+                trace=getattr(self.graph, "trace", None),
+                cancellation_manager=self.cancellation,
+            )
+            try:
+                setattr(self.graph, "interaction_runtime", self.interaction_runtime)
+            except Exception:
+                pass
+        self.interaction_runtime.cancellation_manager = self.cancellation
         for runtime in (
             self.graph.planner,
             self.graph.model_runtime,
             self.graph.command_runtime,
             self.graph.sandbox_runtime,
             self.graph.verification_runtime,
+            getattr(self.graph, "edit_runtime", None),
         ):
-            setattr(runtime, "cancellation_token", self.cancellation.child_token())
+            if runtime is not None:
+                setattr(runtime, "cancellation_token", self.cancellation.child_token())
 
     def boot(self) -> "AgentKernel":
         self.context.status = KernelStatus.READY
@@ -92,6 +115,7 @@ class AgentKernel:
                 tool_runtime=self.graph.tool_runtime,
                 protocol_runtime=self.graph.protocol_runtime,
                 instruction_runtime=self.graph.instruction_runtime,
+                interaction_runtime=self.interaction_runtime,
                 context_manager=getattr(self.graph, "context_manager", None),
                 context_db_path=self.graph.config.context_db_path(self.graph.trace.store.run_dir),
                 strict=self.graph.config.strict,
@@ -101,21 +125,48 @@ class AgentKernel:
             self.lifecycle.mark_completed(final_answer)
             self.shutdown(ShutdownReason.NORMAL)
             report = self.final_report()
+            interaction_report = self.interaction_final_report()
             return AgentRunResult(
                 final_answer=final_answer,
                 final_report=report,
                 status=RunStatus.COMPLETED,
+                interaction_report=interaction_report,
             )
         except KeyboardInterrupt:
-            self.cancel(CancellationReason.USER_INTERRUPTED, "KeyboardInterrupt")
+            self.interaction_runtime.handle_command(
+                ControlCommand.CANCEL,
+                message="KeyboardInterrupt",
+                cancellation_manager=self.cancellation,
+            )
+            self.cancellation.cancel(
+                CancellationReason.USER_INTERRUPTED,
+                "KeyboardInterrupt",
+            )
+            self.context.status = KernelStatus.CANCELLING
             self.lifecycle.mark_cancelled("KeyboardInterrupt")
             self.shutdown(ShutdownReason.KEYBOARD_INTERRUPT)
-            self._finalize_after_shutdown("keyboard_interrupt")
+            self._finalize_after_shutdown(
+                "keyboard_interrupt",
+                cancelled=True,
+                cancellation_reason="KeyboardInterrupt",
+            )
             raise CancellationError("Cancelled by KeyboardInterrupt.", code="keyboard_interrupt")
         except CancellationError:
+            self.interaction_runtime.handle_command(
+                ControlCommand.CANCEL,
+                message="cancelled",
+                cancellation_manager=self.cancellation,
+            )
+            if not self.cancellation.token.cancelled:
+                self.cancellation.cancel(CancellationReason.USER_INTERRUPTED, "cancelled")
+            self.context.status = KernelStatus.CANCELLING
             self.lifecycle.mark_cancelled("cancelled")
             self.shutdown(ShutdownReason.CANCELLED)
-            self._finalize_after_shutdown("cancelled")
+            self._finalize_after_shutdown(
+                "cancelled",
+                cancelled=True,
+                cancellation_reason="cancelled",
+            )
             raise
         except Exception as exc:
             self.lifecycle.mark_failed(exc)
@@ -123,7 +174,7 @@ class AgentKernel:
                 {"type": type(exc).__name__, "message": str(exc)}
             )
             self.shutdown(ShutdownReason.ERROR)
-            self._finalize_after_shutdown("error")
+            self._finalize_after_shutdown("error", error=exc)
             if isinstance(exc, KernelError):
                 raise
             raise
@@ -208,20 +259,43 @@ class AgentKernel:
                 "max_turns": self.graph.config.max_turns,
                 "profile": self.graph.config.profile,
                 "approval_mode": self.graph.config.approval_mode.value,
+                "interaction_mode": self.graph.config.interaction_mode.value,
                 "strict": self.graph.config.strict,
                 "dry_run": self.graph.config.dry_run,
                 "raw_artifacts": self.graph.config.raw_artifacts,
+                "project_index_enabled": self.graph.config.project_index_enabled,
+                "project_index_db": str(self.graph.config.project_index_db_path()),
             },
             workspace_summary=workspace_health.to_dict(),
             trace_summary=trace_summary,
         )
         self.context.status = KernelStatus.FINALIZED
         self.graph.trace.record("finalization.completed", self._final_report.to_dict())
+        self._build_interaction_final_report(
+            planner_report=planner_report,
+            kernel_report=self._final_report,
+        )
         return self._final_report
 
-    def _finalize_after_shutdown(self, stage: str) -> None:
+    def interaction_final_report(self) -> InteractionFinalReport | None:
+        return self._interaction_report
+
+    def _finalize_after_shutdown(
+        self,
+        stage: str,
+        *,
+        cancelled: bool = False,
+        cancellation_reason: str | None = None,
+        error: BaseException | None = None,
+    ) -> None:
         try:
-            self.final_report()
+            kernel_report = self.final_report()
+            self._build_interaction_final_report(
+                kernel_report=kernel_report,
+                cancelled=cancelled,
+                cancellation_reason=cancellation_reason,
+                error=error,
+            )
         except Exception as exc:
             self.context.diagnostics.append(
                 {
@@ -239,3 +313,42 @@ class AgentKernel:
             self.final_report()
         finally:
             self._finalizing_during_shutdown = False
+
+    def _build_interaction_final_report(
+        self,
+        *,
+        planner_report: Any | None = None,
+        kernel_report: FinalReport | None = None,
+        cancelled: bool = False,
+        cancellation_reason: str | None = None,
+        error: BaseException | None = None,
+    ) -> InteractionFinalReport | None:
+        if self._interaction_report is not None and not (cancelled or error):
+            return self._interaction_report
+        state = getattr(self.graph.planner, "state", None)
+        if planner_report is None:
+            planner_report = getattr(self.graph.planner, "final_report", None)
+        blocked_reasons = list(getattr(state, "blocked_reasons", []) or [])
+        verification_required = True
+        if state is not None:
+            verification_required = bool(
+                state.completion_criteria.required_verifications_passed
+            )
+        run_status = self.context.run.status
+        interaction_report = self.interaction_runtime.build_final_report(
+            planner_report=planner_report,
+            kernel_report=kernel_report,
+            workspace_summary=(
+                kernel_report.workspace_summary if kernel_report is not None else None
+            ),
+            trace_summary=(
+                kernel_report.trace_summary if kernel_report is not None else None
+            ),
+            error=error or (self.context.run.error if run_status == RunStatus.FAILED else None),
+            cancelled=cancelled or run_status == RunStatus.CANCELLED,
+            cancellation_reason=cancellation_reason,
+            blocked_reasons=blocked_reasons,
+            verification_required=verification_required,
+        )
+        self._interaction_report = interaction_report
+        return interaction_report

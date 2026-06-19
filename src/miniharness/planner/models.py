@@ -120,6 +120,8 @@ class TaskState:
     session_id: str
     user_goal: str
     normalized_goal: str
+    effective_goal: str | None = None
+    goal_revisions: list[dict[str, Any]] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
     current_phase: str = "understanding_task"
@@ -144,6 +146,8 @@ class TaskState:
             "session_id": self.session_id,
             "user_goal": self.user_goal,
             "normalized_goal": self.normalized_goal,
+            "effective_goal": self.effective_goal or self.normalized_goal,
+            "goal_revisions": self.goal_revisions,
             "constraints": self.constraints,
             "assumptions": self.assumptions,
             "current_phase": self.current_phase,
@@ -167,6 +171,8 @@ class TaskState:
             session_id=str(payload["session_id"]),
             user_goal=str(payload["user_goal"]),
             normalized_goal=str(payload["normalized_goal"]),
+            effective_goal=str(payload.get("effective_goal") or payload["normalized_goal"]),
+            goal_revisions=list(payload.get("goal_revisions") or []),
             constraints=list(payload.get("constraints") or []),
             assumptions=list(payload.get("assumptions") or []),
             current_phase=str(payload.get("current_phase") or "understanding_task"),
@@ -336,6 +342,10 @@ class EvidenceLedger:
     policy_observations: list[dict[str, Any]] = field(default_factory=list)
     sandbox_observations: list[dict[str, Any]] = field(default_factory=list)
     instruction_prompt_observations: list[dict[str, Any]] = field(default_factory=list)
+    project_index_observations: list[dict[str, Any]] = field(default_factory=list)
+    edit_plans: list[dict[str, Any]] = field(default_factory=list)
+    edit_results: list[dict[str, Any]] = field(default_factory=list)
+    review_results: list[dict[str, Any]] = field(default_factory=list)
 
     def add_unique_file(self, path: str) -> None:
         if path and path not in self.inspected_files:
@@ -359,6 +369,10 @@ class EvidenceLedger:
             "policy_observations": self.policy_observations,
             "sandbox_observations": self.sandbox_observations,
             "instruction_prompt_observations": self.instruction_prompt_observations,
+            "project_index_observations": self.project_index_observations,
+            "edit_plans": self.edit_plans,
+            "edit_results": self.edit_results,
+            "review_results": self.review_results,
         }
 
     @classmethod
@@ -380,6 +394,10 @@ class EvidenceLedger:
             policy_observations=list(payload.get("policy_observations") or []),
             sandbox_observations=list(payload.get("sandbox_observations") or []),
             instruction_prompt_observations=list(payload.get("instruction_prompt_observations") or []),
+            project_index_observations=list(payload.get("project_index_observations") or []),
+            edit_plans=list(payload.get("edit_plans") or []),
+            edit_results=list(payload.get("edit_results") or []),
+            review_results=list(payload.get("review_results") or []),
         )
 
 
@@ -479,6 +497,7 @@ class FinalReport:
     shutdown_summary: dict[str, Any] = field(default_factory=dict)
     recovery_summary: dict[str, Any] = field(default_factory=dict)
     lifecycle_summary: dict[str, Any] = field(default_factory=dict)
+    review_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -500,6 +519,7 @@ class FinalReport:
             "shutdown_summary": self.shutdown_summary,
             "recovery_summary": self.recovery_summary,
             "lifecycle_summary": self.lifecycle_summary,
+            "review_summary": self.review_summary,
             "artifacts": self.artifacts,
             "next_steps": self.next_steps,
         }
@@ -525,6 +545,7 @@ class FinalReport:
             shutdown_summary=dict(payload.get("shutdown_summary") or {}),
             recovery_summary=dict(payload.get("recovery_summary") or {}),
             lifecycle_summary=dict(payload.get("lifecycle_summary") or {}),
+            review_summary=dict(payload.get("review_summary") or {}),
             artifacts=list(payload.get("artifacts") or []),
             next_steps=list(payload.get("next_steps") or []),
         )

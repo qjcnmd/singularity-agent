@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from miniharness.interaction.models import InteractionMode
 from miniharness.policy.config import ApprovalMode, PolicyConfig
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ class ProductionRuntimeConfig:
     max_turns: int = 8
     profile: str | None = None
     approval_mode: ApprovalMode = ApprovalMode.AUTO_SAFE
+    interaction_mode: InteractionMode = InteractionMode.INTERACTIVE
     strict: bool = False
     dry_run: bool = False
     trace_dir: Path | None = None
@@ -62,6 +64,12 @@ class ProductionRuntimeConfig:
     base_url: str | None = None
     raw_artifacts: bool = False
     resume_session: str | None = None
+    project_index_enabled: bool = True
+    project_index_db: Path | None = None
+    project_index_build_on_boot: bool = True
+    project_index_max_files: int = 20_000
+    project_index_max_file_size: int = 1_000_000
+    project_index_max_total_bytes: int = 50_000_000
 
     @classmethod
     def from_cli(
@@ -71,6 +79,7 @@ class ProductionRuntimeConfig:
         max_turns: int = 8,
         profile: str | None = None,
         approval_mode: ApprovalMode | str = ApprovalMode.AUTO_SAFE,
+        interaction_mode: InteractionMode | str = InteractionMode.INTERACTIVE,
         strict: bool = False,
         dry_run: bool = False,
         trace_dir: Path | str | None = None,
@@ -79,12 +88,19 @@ class ProductionRuntimeConfig:
         base_url: str | None = None,
         raw_artifacts: bool = False,
         resume_session: str | None = None,
+        project_index_enabled: bool = True,
+        project_index_db: Path | str | None = None,
+        project_index_build_on_boot: bool = True,
+        project_index_max_files: int = 20_000,
+        project_index_max_file_size: int = 1_000_000,
+        project_index_max_total_bytes: int = 50_000_000,
     ) -> "ProductionRuntimeConfig":
         return cls(
             project_root=Path(project_root).expanduser().resolve(strict=False),
             max_turns=max_turns,
             profile=profile,
             approval_mode=_approval_mode(approval_mode),
+            interaction_mode=_interaction_mode(interaction_mode),
             strict=strict,
             dry_run=dry_run,
             trace_dir=Path(trace_dir).expanduser() if trace_dir is not None else None,
@@ -93,6 +109,12 @@ class ProductionRuntimeConfig:
             base_url=base_url,
             raw_artifacts=raw_artifacts,
             resume_session=resume_session,
+            project_index_enabled=project_index_enabled,
+            project_index_db=Path(project_index_db).expanduser() if project_index_db is not None else None,
+            project_index_build_on_boot=project_index_build_on_boot,
+            project_index_max_files=project_index_max_files,
+            project_index_max_file_size=project_index_max_file_size,
+            project_index_max_total_bytes=project_index_max_total_bytes,
         )
 
     def to_policy_config(self) -> PolicyConfig:
@@ -117,6 +139,21 @@ class ProductionRuntimeConfig:
     def context_db_path(self, run_dir: Path) -> Path:
         return self.context_db or (run_dir / "context.sqlite3")
 
+    def project_index_db_path(self) -> Path:
+        return self.project_index_db or (self.project_root / ".miniharness" / "index.sqlite")
+
+    def to_project_index_config(self):
+        from miniharness.code_index import ProjectIndexRuntimeConfig
+
+        return ProjectIndexRuntimeConfig(
+            enabled=self.project_index_enabled,
+            db_path=self.project_index_db_path(),
+            build_on_boot=self.project_index_build_on_boot,
+            max_files=self.project_index_max_files,
+            max_file_size=self.project_index_max_file_size,
+            max_total_bytes=self.project_index_max_total_bytes,
+        )
+
 
 def _approval_mode(value: ApprovalMode | str) -> ApprovalMode:
     if isinstance(value, ApprovalMode):
@@ -125,3 +162,12 @@ def _approval_mode(value: ApprovalMode | str) -> ApprovalMode:
         return ApprovalMode[str(value).upper()]
     except KeyError:
         return ApprovalMode(str(value))
+
+
+def _interaction_mode(value: InteractionMode | str) -> InteractionMode:
+    if isinstance(value, InteractionMode):
+        return value
+    try:
+        return InteractionMode[str(value).upper()]
+    except KeyError:
+        return InteractionMode(str(value))

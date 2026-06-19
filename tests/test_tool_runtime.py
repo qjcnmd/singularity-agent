@@ -12,6 +12,7 @@ from miniharness.tools import (
     ToolRuntime,
     ToolSpec,
 )
+from miniharness.edit import EditRuntime
 from miniharness.planner import (
     ActionKind,
     AgentAction,
@@ -20,7 +21,7 @@ from miniharness.planner import (
     RiskLevel,
     TaskStatus,
 )
-from miniharness.tools.mutation import register_mutation_tools
+from miniharness.tools.edit import register_edit_tools
 from miniharness.trace import TraceWriter
 from miniharness.workspace import MutationRuntime
 from tests.tool_runtime_helpers import runtime_default_policy_runtime, make_test_policy_runtime
@@ -388,16 +389,17 @@ def test_runtime_reports_executed_tool_result_to_planner(tmp_path: Path) -> None
     assert planner.updates[0]["action_id"].startswith("action_")
 
 
-def test_mutation_tool_with_runtime_observer_records_one_planner_change(tmp_path: Path) -> None:
+def test_edit_tool_with_runtime_observer_records_one_planner_change(tmp_path: Path) -> None:
     planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Add file")
     planner.state.status = TaskStatus.APPLYING_CHANGES
     planner.state.current_phase = "applying_changes"
     planner.plan.current_phase = "applying_changes"
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    register_mutation_tools(
+    mutation = MutationRuntime(tmp_path, planner=planner)
+    register_edit_tools(
         registry,
-        MutationRuntime(tmp_path, planner=planner),
+        EditRuntime(tmp_path, mutation_runtime=mutation, planner=planner),
     )
     runtime = ToolRuntime(
         registry=registry,
@@ -410,8 +412,17 @@ def test_mutation_tool_with_runtime_observer_records_one_planner_change(tmp_path
 
     result = runtime.execute_tool_call(
         make_tool_call(
-            "workspace_create_file",
-            {"path": "app.py", "content": "print('ok')\n", "intent": "add app"},
+            "edit_apply",
+            {
+                "summary": "add app",
+                "operations": [
+                    {
+                        "kind": "create_file",
+                        "path": "app.py",
+                        "content": "print('ok')\n",
+                    }
+                ],
+            },
             tool_call_id="call_mutate",
         )
     )
@@ -419,3 +430,4 @@ def test_mutation_tool_with_runtime_observer_records_one_planner_change(tmp_path
     assert result.ok is True
     assert len(planner.evidence.applied_changes) == 1
     assert planner.evidence.applied_changes[0]["transaction_id"]
+    assert len(planner.evidence.edit_results) == 1

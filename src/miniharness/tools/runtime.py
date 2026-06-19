@@ -776,13 +776,24 @@ class ToolRuntime:
         if (
             spec.permission_level == PermissionLevel.WRITE
             and not spec.uses_mutation_runtime
-            and spec.execution_backend != ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME
+            and spec.execution_backend
+            not in {
+                ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
+                ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
+            }
         ):
             return ToolResult.failure(
                 code="invalid_operation",
                 message="Write tools must execute through Workspace Mutation Runtime.",
                 details={"tool_name": spec.name},
             )
+        if spec.execution_backend == ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME:
+            if not spec.uses_edit_runtime or not spec.uses_mutation_runtime:
+                return ToolResult.failure(
+                    code="invalid_operation",
+                    message="EditRuntime tools must declare edit runtime usage and mutation delegation.",
+                    details={"tool_name": spec.name},
+                )
         if (
             spec.permission_level == PermissionLevel.SHELL
             and not spec.uses_command_runtime
@@ -1052,6 +1063,13 @@ class ToolRuntime:
 
 def _default_resource(spec: ToolSpec, args: dict[str, Any]) -> ResourceRef:
     name = spec.name
+    if name in {"edit_plan", "edit_preview", "edit_apply"}:
+        operations = args.get("operations") or []
+        if isinstance(operations, list):
+            for operation in operations:
+                if isinstance(operation, dict) and operation.get("path"):
+                    return ResourceRef("file", str(operation.get("path")), workspace_relative=True)
+        return ResourceRef("workspace", "edit", workspace_relative=True)
     if name in {"read_file", "workspace_create_file", "workspace_delete_file", "workspace_replace_text"}:
         return ResourceRef("file", str(args.get("path") or "."), workspace_relative=True)
     if name == "workspace_move_file":

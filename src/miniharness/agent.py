@@ -7,6 +7,7 @@ from rich.console import Console
 
 from miniharness.context import ContextManager
 from miniharness.instructions import InstructionRuntime
+from miniharness.interaction import InteractionRuntime, ProgressEvent
 from miniharness.model import ModelPurpose, ModelRuntime, ModelTurnStatus
 from miniharness.planner import PlannerRuntime, TaskStatus
 from miniharness.provider import OpenAICompatibleProvider
@@ -54,6 +55,7 @@ class MiniAgent:
         tool_runtime: ToolRuntime,
         protocol_runtime: ToolCallingProtocolRuntime,
         instruction_runtime: InstructionRuntime,
+        interaction_runtime: InteractionRuntime | None = None,
         context_manager: ContextManager | None = None,
         context_db_path: Path | None = None,
         strict: bool = False,
@@ -83,6 +85,7 @@ class MiniAgent:
         self.tool_runtime = tool_runtime
         self.protocol_runtime = protocol_runtime
         self.instruction_runtime = instruction_runtime
+        self.interaction_runtime = interaction_runtime
         self.context_manager = context_manager
         self.context_db_path = context_db_path
         self.strict = strict
@@ -91,11 +94,12 @@ class MiniAgent:
         planner = self.planner
         if planner.state is None:
             planner.start_task(user_goal)
+        effective_goal = getattr(planner.state, "effective_goal", None) or user_goal
         context = self.context_manager
         if context is None:
             context = ContextManager(
                 system_prompt=SYSTEM_PROMPT,
-                user_goal=user_goal,
+                user_goal=effective_goal,
                 provider=self.provider,
                 model_runtime=self.model_runtime,
                 run_id=self.trace.run_id,
@@ -105,7 +109,7 @@ class MiniAgent:
                 trace=self.trace,
             )
         else:
-            context.user_goal = user_goal
+            context.user_goal = effective_goal
         model_runtime = self.model_runtime
         instruction_runtime = self.instruction_runtime
         tool_schemas = self.tools.openai_tools(strict=self.strict)
@@ -113,8 +117,10 @@ class MiniAgent:
         protocol_runtime = self.protocol_runtime
 
         for turn in range(1, self.max_turns + 1):
-            self.console.print(f"[cyan]model turn {turn}[/cyan]")
+            self._publish_progress(turn)
             planner.step()
+            effective_goal = getattr(planner.state, "effective_goal", None) or user_goal
+            context.user_goal = effective_goal
             active_tool_schemas = planner.filtered_tools(tool_schemas)
             allowed_tool_names = [
                 tool.get("function", {}).get("name")
@@ -132,7 +138,7 @@ class MiniAgent:
                 allowed_tool_names=allowed_tool_names,
                 planner_context=planner.planner_context_message(),
                 instruction_runtime=instruction_runtime,
-                user_task=user_goal,
+                user_task=effective_goal,
                 strict_tools=self.strict,
             )
             planner.record_instruction_prompt_observation(instruction_runtime.summary())
@@ -234,6 +240,27 @@ class MiniAgent:
         planner.evidence.unresolved_failures.append({"model_turn": details})
         if planner.state is not None:
             planner.state.blocked_reasons.append("model_runtime_failed")
+
+    def _publish_progress(self, turn: int) -> None:
+        if self.interaction_runtime is None:
+            return
+        phase = (
+            getattr(getattr(self.planner, "state", None), "current_phase", None)
+            or "model"
+        )
+        self.interaction_runtime.publish(
+            ProgressEvent(
+                phase=str(phase),
+                status="started",
+                summary=f"model turn {turn}",
+                current=turn,
+                total=self.max_turns,
+                run_id=getattr(self.trace, "run_id", None),
+                session_id=getattr(self.planner, "session_id", None),
+                task_id=getattr(self.planner, "task_id", None),
+                action_id=f"turn_{turn}",
+            )
+        )
 
     @staticmethod
     def _assistant_message_from_result(result: Any) -> dict[str, Any]:

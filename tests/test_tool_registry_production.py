@@ -49,6 +49,60 @@ def test_invalid_write_tool_without_mutation_backend_is_rejected(tmp_path: Path)
         )
 
 
+def test_edit_backend_requires_edit_runtime_and_mutation_delegation(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+
+    with pytest.raises(ValueError, match="uses_edit_runtime"):
+        registry.register(
+            ToolSpec(
+                name="bad_edit",
+                description="bad",
+                input_model=EmptyInput,
+                handler=handler,
+                permission_level=PermissionLevel.WRITE,
+                side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
+                capabilities=(Capability.MUTATE_WORKSPACE,),
+                operation=OperationKind.MUTATE_FILE,
+                execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
+                uses_mutation_runtime=True,
+            )
+        )
+
+    with pytest.raises(ValueError, match="mutation runtime"):
+        registry.register(
+            ToolSpec(
+                name="bad_edit_no_mutation",
+                description="bad",
+                input_model=EmptyInput,
+                handler=handler,
+                permission_level=PermissionLevel.WRITE,
+                side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
+                capabilities=(Capability.MUTATE_WORKSPACE,),
+                operation=OperationKind.MUTATE_FILE,
+                execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
+                uses_edit_runtime=True,
+            )
+        )
+
+    registry.register(
+        ToolSpec(
+            name="good_edit",
+            description="good",
+            input_model=EmptyInput,
+            handler=handler,
+            permission_level=PermissionLevel.WRITE,
+            side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
+            capabilities=(Capability.MUTATE_WORKSPACE,),
+            operation=OperationKind.MUTATE_FILE,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
+            uses_edit_runtime=True,
+            uses_mutation_runtime=True,
+        )
+    )
+
+    assert registry.get("good_edit") is not None
+
+
 def test_invalid_shell_tool_without_command_backend_is_rejected(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
 

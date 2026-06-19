@@ -6,6 +6,12 @@ from typing import Any
 from rich.console import Console
 
 from miniharness.config import ProductionRuntimeConfig
+from miniharness.interaction import (
+    InteractionMode,
+    InteractionRuntime,
+    RichCliRenderer,
+    RichInteractionProvider,
+)
 from miniharness.observability import TraceRuntime
 from miniharness.policy import ApprovalMode
 from miniharness.workspace_state import LocalWorkspaceStateRuntime
@@ -60,6 +66,27 @@ class KernelBootstrap:
             session_id=config.resume_session or trace.session_id,
             task_id=trace.run_id,
         )
+        interaction_mode = (
+            InteractionMode.NON_INTERACTIVE
+            if config.approval_mode == ApprovalMode.NON_INTERACTIVE
+            else config.interaction_mode
+        )
+        renderer = RichCliRenderer(self.console)
+        provider = (
+            RichInteractionProvider(self.console)
+            if interaction_mode == InteractionMode.INTERACTIVE
+            else None
+        )
+        cancellation = CancellationManager()
+        interaction_runtime = InteractionRuntime(
+            mode=interaction_mode,
+            trace=trace,
+            provider=provider,
+            sinks=[renderer],
+            cancellation_manager=cancellation,
+        )
+        if hasattr(trace, "set_interaction_sink"):
+            trace.set_interaction_sink(interaction_runtime.consume_trace_event)
         lifecycle = RunLifecycleManager(identity=identity, trace=trace)
         run = lifecycle.create_run(user_goal)
         session = lifecycle.start_session()
@@ -89,6 +116,7 @@ class KernelBootstrap:
                 trace=trace,
                 identity=identity,
                 user_goal=user_goal,
+                interaction_runtime=interaction_runtime,
             )
             context.components = dict(graph.components)
             health = RuntimeHealthChecker(trace=trace).enforce(graph.components_for_health())
@@ -97,7 +125,7 @@ class KernelBootstrap:
                 graph=graph,
                 lifecycle=lifecycle,
                 workspace_lock=self.workspace_lock,
-                cancellation=CancellationManager(),
+                cancellation=cancellation,
                 console=self.console,
                 recovery_report=recovery,
                 health_report=health,
@@ -126,9 +154,12 @@ class KernelBootstrap:
                     "max_turns": config.max_turns,
                     "profile": config.profile,
                     "approval_mode": config.approval_mode.value,
+                    "interaction_mode": config.interaction_mode.value,
                     "strict": config.strict,
                     "dry_run": config.dry_run,
                     "raw_artifacts": config.raw_artifacts,
+                    "project_index_enabled": config.project_index_enabled,
+                    "project_index_db": str(config.project_index_db_path()),
                 },
             )
             trace.record("finalization.completed", final_report.to_dict())

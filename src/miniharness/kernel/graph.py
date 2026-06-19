@@ -6,22 +6,28 @@ from typing import Any
 
 from miniharness.command import CommandRuntime
 from miniharness.config import ProductionRuntimeConfig
+from miniharness.code_index import ProjectIndexRuntime
+from miniharness.edit import EditRuntime
 from miniharness.agent import SYSTEM_PROMPT
 from miniharness.context import ContextManager
 from miniharness.instructions import InstructionRuntime
+from miniharness.interaction import InteractionMode, InteractionRuntime
 from miniharness.model import (
     ModelProviderRegistry,
     ModelRuntime,
     OpenAICompatibleModelProvider,
 )
 from miniharness.observability import TraceRuntime
-from miniharness.policy import ApprovalGate, PolicyRuntime
+from miniharness.policy import ApprovalGate, ApprovalMode, PolicyRuntime
 from miniharness.planner import PlannerRuntime
+from miniharness.review import ReviewRuntime
 from miniharness.sandbox import SandboxRuntime
 from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
 from miniharness.tool_protocol.state import ToolProtocolStateStore
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.tools.command import register_command_tools
+from miniharness.tools.code_index import register_code_index_tools
+from miniharness.tools.edit import register_edit_tools
 from miniharness.tools.mutation import register_mutation_tools
 from miniharness.tools.verification import register_verification_tools
 from miniharness.tools.workspace_state import register_workspace_state_tools
@@ -40,13 +46,17 @@ from miniharness.kernel.models import (
 RUNTIME_INITIALIZATION_ORDER = [
     RuntimeComponentName.CONFIGURATION,
     RuntimeComponentName.OBSERVABILITY,
+    RuntimeComponentName.INTERACTION,
     RuntimeComponentName.WORKSPACE_STATE,
+    RuntimeComponentName.PROJECT_INDEX,
     RuntimeComponentName.POLICY,
     RuntimeComponentName.SANDBOX,
     RuntimeComponentName.COMMAND,
     RuntimeComponentName.MUTATION,
+    RuntimeComponentName.EDIT,
     RuntimeComponentName.TOOLS,
     RuntimeComponentName.VERIFICATION,
+    RuntimeComponentName.REVIEW,
     RuntimeComponentName.INSTRUCTIONS,
     RuntimeComponentName.MODEL,
     RuntimeComponentName.CONTEXT,
@@ -58,14 +68,18 @@ RUNTIME_INITIALIZATION_ORDER = [
 class RuntimeGraph:
     config: ProductionRuntimeConfig
     trace: TraceRuntime
+    interaction_runtime: InteractionRuntime
     workspace_state: LocalWorkspaceStateRuntime
+    project_index_runtime: ProjectIndexRuntime
     policy_runtime: PolicyRuntime
     approval_gate: ApprovalGate
     sandbox_runtime: SandboxRuntime
     command_runtime: CommandRuntime
     mutation_runtime: MutationRuntime
+    edit_runtime: EditRuntime
     tools: ToolRegistry
     verification_runtime: VerificationRuntime
+    review_runtime: ReviewRuntime
     instruction_runtime: InstructionRuntime
     model_runtime: ModelRuntime
     context_manager: ContextManager
@@ -91,13 +105,17 @@ class RuntimeGraph:
         return {
             "config": self.config,
             "trace": self.trace,
+            "interaction": self.interaction_runtime,
             "workspace": self.workspace_state,
+            "project_index": self.project_index_runtime,
             "policy": self.policy_runtime,
             "sandbox": self.sandbox_runtime,
             "command": self.command_runtime,
             "mutation": self.mutation_runtime,
+            "edit": self.edit_runtime,
             "tools": self.tools,
             "verification": self.verification_runtime,
+            "review": self.review_runtime,
             "instructions": self.instruction_runtime,
             "model": self.model_runtime,
             "planner": self.planner,
@@ -114,6 +132,7 @@ class RuntimeFactory:
         identity: RunIdentity,
         user_goal: str,
         workspace_health: WorkspaceHealthReport | None = None,
+        interaction_runtime: InteractionRuntime | None = None,
     ) -> RuntimeGraph:
         components = {
             component: RuntimeComponentState.PENDING
@@ -130,6 +149,19 @@ class RuntimeFactory:
         try:
             mark(RuntimeComponentName.CONFIGURATION)
             mark(RuntimeComponentName.OBSERVABILITY)
+            if interaction_runtime is None:
+                interaction_mode = (
+                    InteractionMode.NON_INTERACTIVE
+                    if config.approval_mode == ApprovalMode.NON_INTERACTIVE
+                    else config.interaction_mode
+                )
+                interaction_runtime = InteractionRuntime(
+                    mode=interaction_mode,
+                    trace=trace,
+                )
+            if hasattr(trace, "set_interaction_sink"):
+                trace.set_interaction_sink(interaction_runtime.consume_trace_event)
+            mark(RuntimeComponentName.INTERACTION)
 
             state_runtime = LocalWorkspaceStateRuntime(project_root, trace=trace)
             if config.resume_session:
@@ -138,9 +170,22 @@ class RuntimeFactory:
                 state_runtime.begin_session(task_id=identity.task_id, session_id=identity.session_id)
             mark(RuntimeComponentName.WORKSPACE_STATE)
 
+            project_index_runtime = ProjectIndexRuntime(
+                project_root,
+                trace=trace,
+                config=config.to_project_index_config(),
+            )
+            if config.project_index_enabled:
+                project_index_runtime.bootstrap(reason="kernel_boot")
+            mark(RuntimeComponentName.PROJECT_INDEX)
+
             policy_config = config.to_policy_config()
             policy_runtime = PolicyRuntime(policy_config, trace=trace)
-            approval_gate = ApprovalGate(policy_config, trace=trace)
+            approval_gate = ApprovalGate(
+                policy_config,
+                trace=trace,
+                interaction=interaction_runtime,
+            )
             mark(RuntimeComponentName.POLICY)
 
             sandbox_runtime = SandboxRuntime(project_root, trace=trace)
@@ -162,13 +207,24 @@ class RuntimeFactory:
                 state_runtime=state_runtime,
                 planner=None,
                 policy_runtime=policy_runtime,
+                project_index_runtime=project_index_runtime,
             )
             mark(RuntimeComponentName.MUTATION)
 
+            edit_runtime = EditRuntime(
+                project_root,
+                mutation_runtime=mutation_runtime,
+                project_index_runtime=project_index_runtime,
+                trace=trace,
+            )
+            mark(RuntimeComponentName.EDIT)
+
             tools = ToolRegistry(project_root)
             register_mutation_tools(tools, mutation_runtime)
+            register_edit_tools(tools, edit_runtime)
             register_command_tools(tools, command_runtime)
             register_workspace_state_tools(tools, state_runtime)
+            register_code_index_tools(tools, project_index_runtime)
             mark(RuntimeComponentName.TOOLS)
 
             verification_runtime = VerificationRuntime(
@@ -177,9 +233,22 @@ class RuntimeFactory:
                 trace=trace,
                 planner=None,
                 policy_runtime=policy_runtime,
+                project_index_runtime=project_index_runtime,
             )
             register_verification_tools(tools, verification_runtime)
+            edit_runtime.verification_runtime = verification_runtime
             mark(RuntimeComponentName.VERIFICATION)
+
+            review_runtime = ReviewRuntime(
+                project_root,
+                trace=trace,
+                project_index_runtime=project_index_runtime,
+                policy_runtime=policy_runtime,
+                model_runtime=None,
+            )
+            edit_runtime.review_runtime = review_runtime
+            verification_runtime.review_runtime = review_runtime
+            mark(RuntimeComponentName.REVIEW)
 
             instruction_runtime = InstructionRuntime(workspace_root=project_root, trace=trace)
             mark(RuntimeComponentName.INSTRUCTIONS)
@@ -200,6 +269,7 @@ class RuntimeFactory:
                 config=model_config,
                 trace=trace,
             )
+            review_runtime.model_runtime = model_runtime
             mark(RuntimeComponentName.MODEL)
 
             context_manager = ContextManager(
@@ -213,6 +283,7 @@ class RuntimeFactory:
                 db_path=config.context_db_path(trace.store.run_dir),
                 trace=trace,
             )
+            edit_runtime.context_manager = context_manager
             mark(RuntimeComponentName.CONTEXT)
 
             protocol_runtime = ToolCallingProtocolRuntime(
@@ -233,12 +304,19 @@ class RuntimeFactory:
             command_runtime.planner = planner
             mutation_runtime.planner = planner
             verification_runtime.planner = planner
+            edit_runtime.planner = planner
+            review_runtime.planner = planner
+            index_observation = project_index_runtime.observation_for_goal(user_goal)
+            context_manager.add_project_index(index_observation)
+            planner.record_project_index_observation(index_observation)
             for runtime in (
                 planner,
                 model_runtime,
                 command_runtime,
                 sandbox_runtime,
                 verification_runtime,
+                edit_runtime,
+                review_runtime,
             ):
                 setattr(runtime, "cancellation_token", None)
             mark(RuntimeComponentName.PLANNER)
@@ -257,14 +335,18 @@ class RuntimeFactory:
             return RuntimeGraph(
                 config=config,
                 trace=trace,
+                interaction_runtime=interaction_runtime,
                 workspace_state=state_runtime,
+                project_index_runtime=project_index_runtime,
                 policy_runtime=policy_runtime,
                 approval_gate=approval_gate,
                 sandbox_runtime=sandbox_runtime,
                 command_runtime=command_runtime,
                 mutation_runtime=mutation_runtime,
+                edit_runtime=edit_runtime,
                 tools=tools,
                 verification_runtime=verification_runtime,
+                review_runtime=review_runtime,
                 instruction_runtime=instruction_runtime,
                 model_runtime=model_runtime,
                 context_manager=context_manager,

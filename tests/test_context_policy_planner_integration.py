@@ -60,6 +60,22 @@ def test_context_manager_records_structured_runtime_observations(
             status="applied",
         )
     )
+    context.add_edit_result(
+        {
+            "edit_result_id": "edit_result_1",
+            "edit_plan_id": "edit_plan_1",
+            "intent_id": "intent_1",
+            "strategy": "targeted_patch",
+            "status": "applied",
+            "ok": True,
+            "patch_candidate_id": "patch_1",
+            "patch_digest": "digest_1",
+            "changed_files": ["src/miniharness/context/manager.py"],
+            "changeset_id": "change_1",
+            "transaction_id": "tx_1",
+            "validation": {"ok": True, "requires_review": False, "issues": []},
+        }
+    )
     context.add_command_observation(
         CommandObservation(
             command_id="cmd_1",
@@ -95,6 +111,7 @@ def test_context_manager_records_structured_runtime_observations(
     assert "planner_state" in item_types
     assert "policy_observation" in item_types
     assert "mutation_evidence" in item_types
+    assert "edit_evidence" in item_types
     assert "command_observation" in item_types
     assert "verification_evidence" in item_types
     assert "workspace_state" in item_types

@@ -6,9 +6,9 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from miniharness.policy import (
+    ApprovalGate,
     ApprovalGrant,
     ApprovalMode,
-    ApprovalScope,
     Capability,
     DecisionOutcome,
     PolicyConfig,
@@ -16,6 +16,7 @@ from miniharness.policy import (
     PolicyRequest,
     RiskLevel,
 )
+from miniharness.interaction import InteractionRuntime, UserDecision
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
 from miniharness.trace import TraceWriter
 
@@ -59,26 +60,24 @@ class SequencedPolicyRuntime:
         self.registered.append(grant)
 
 
-class GrantingApprovalGate:
-    def __init__(self) -> None:
-        self.calls: list[tuple[PolicyRequest, PolicyDecision]] = []
-
-    def resolve(self, request: PolicyRequest, decision: PolicyDecision) -> ApprovalGrant:
-        self.calls.append((request, decision))
-        return ApprovalGrant(
-            decision_id=decision.decision_id,
-            request_id=request.request_id,
-            approved_by="test",
-            scope=ApprovalScope(capabilities=[request.capability], path_globs=["*"]),
-            single_use=True,
+class ApprovingProvider:
+    def request_decision(self, prompt):
+        return UserDecision(
+            prompt_id=prompt.prompt_id,
+            decision="approve",
+            reason="approved in tool runtime test",
+            decided_by="test-user",
         )
+
+    def request_clarification(self, request):
+        raise AssertionError("not used")
 
 
 def runtime_with_policy(
     tmp_path: Path,
     policy_runtime: SequencedPolicyRuntime,
     *,
-    approval_gate: GrantingApprovalGate | None = None,
+    approval_gate: Any | None = None,
     handler_calls: list[str] | None = None,
 ) -> ToolRuntime:
     calls = handler_calls if handler_calls is not None else []
@@ -111,7 +110,10 @@ def test_require_review_uses_approval_gate_and_consumes_grant(tmp_path: Path) ->
     policy_runtime = SequencedPolicyRuntime(
         [DecisionOutcome.REQUIRE_REVIEW, DecisionOutcome.ALLOW]
     )
-    gate = GrantingApprovalGate()
+    gate = ApprovalGate(
+        PolicyConfig(workspace_root=tmp_path, approval_mode=ApprovalMode.INTERACTIVE),
+        interaction=InteractionRuntime(provider=ApprovingProvider()),
+    )
     runtime = runtime_with_policy(
         tmp_path, policy_runtime, approval_gate=gate, handler_calls=calls
     )
@@ -120,7 +122,6 @@ def test_require_review_uses_approval_gate_and_consumes_grant(tmp_path: Path) ->
 
     assert result.ok is True
     assert calls == ["called"]
-    assert len(gate.calls) == 1
     assert len(policy_runtime.registered) == 1
     assert result.metadata["approval_grant_id"] == policy_runtime.registered[0].grant_id
 
