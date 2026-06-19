@@ -14,7 +14,7 @@ Only after narrowing the scope should you read source files. Prefer targeted rea
 
 ## Repo Map Maintenance
 
-The repo map is maintained with the `repo-mapping` skill and stored at:
+The repo map is maintained with the `repo-mapping` skill as a local cache and stored at:
 
 ```text
 .codex/repo-map.json
@@ -22,7 +22,7 @@ The repo map is maintained with the `repo-mapping` skill and stored at:
 
 If the map is missing, stale, or clearly inconsistent with the current task, refresh it before relying on it. Use `ast-grep` through the `repo-mapping` skill. Do not install or update mapping dependencies without explicit user approval.
 
-When source files are added, removed, or renamed, update the repo map as part of the same change.
+When source files are added, removed, or renamed, refresh the repo map locally before relying on it. Do not commit `.codex/repo-map.json`; it is intentionally ignored to avoid large generated diffs.
 
 ## Default Skip Paths
 
