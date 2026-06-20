@@ -1,8 +1,10 @@
 import json
+import queue
 import sys
 import time
 from pathlib import Path
 
+from miniharness.command.backend import RunningProcess
 from miniharness.command import (
     CommandDecision,
     CommandPlan,
@@ -422,6 +424,39 @@ def test_long_running_process_can_start_read_stop_and_list(tmp_path: Path) -> No
 
     assert stopped.status == "stopped"
     assert stopped.exit_code is not None
+
+
+def test_start_process_tracks_files_written_immediately_after_spawn(tmp_path: Path) -> None:
+    class ImmediateWriteBackend:
+        name = "immediate_write"
+
+        def start(self, *, request, cwd, env, collector, owner_transaction=None):
+            _ = request, env, owner_transaction
+            (cwd / "generated.txt").write_text("new", encoding="utf-8")
+            return RunningProcess(
+                process_id="process_1",
+                process=None,
+                request=request,
+                cwd=cwd,
+                collector=collector,
+                reader_threads=[],
+                output_queue=queue.Queue(),
+                started_at_monotonic=time.perf_counter(),
+            )
+
+    runtime = compat_command_runtime(tmp_path, backend=ImmediateWriteBackend())
+    request = CommandRequest(
+        argv=[sys.executable, "-c", "pass"],
+        cwd=".",
+        purpose=CommandPurpose.LONG_RUNNING,
+        filesystem_mode=FilesystemMode.READ_WRITE_WORKSPACE,
+        risk_acceptance_reason="test writes a known generated file",
+    )
+
+    session = runtime.start_process(request)
+    stopped = runtime.stop_process(session.process_id)
+
+    assert stopped.changed_files == ["generated.txt"]
 
 
 def test_workspace_side_effects_are_tracked(tmp_path: Path) -> None:

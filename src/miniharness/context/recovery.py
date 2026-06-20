@@ -123,8 +123,10 @@ class RecoveryManager:
             if item.item_type != ContextItemType.COMMAND_OBSERVATION:
                 continue
             content = item.content if isinstance(item.content, dict) else {}
-            if content.get("status") in {"running", "started"} and content.get("command_id"):
-                sessions.append(str(content["command_id"]))
+            if content.get("status") in {"running", "started"}:
+                process_id = content.get("process_id") or content.get("command_id")
+                if process_id:
+                    sessions.append(str(process_id))
         return sessions
 
     @staticmethod

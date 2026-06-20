@@ -679,7 +679,7 @@ class ToolRuntime:
             )
             return result, self._result_digest(result)
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
 
         if spec.output_model is not None:
             try:

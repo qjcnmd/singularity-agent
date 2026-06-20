@@ -27,7 +27,8 @@ def test_add_assistant_message_includes_assistant_message() -> None:
 
     context.add_assistant_message(assistant_message)
 
-    assert context.messages()[-1] == assistant_message
+    persisted = context.messages()[-1]
+    assert persisted == assistant_message
 
 
 def test_add_tool_result_generates_tool_message() -> None:

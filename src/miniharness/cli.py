@@ -23,7 +23,7 @@ from miniharness.memory.cli import memory_app
 from miniharness.observability import TraceRedactor, TraceRuntime, TraceStore
 from miniharness.command import CommandRuntime
 from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
-from miniharness.planner import PlannerRuntime
+from miniharness.planner import PlannerRuntime, create_or_resume_planner as _create_or_resume_planner
 from miniharness.sandbox import SandboxRuntime
 from miniharness.verification import VerificationRuntime
 from miniharness.workspace_state import (
@@ -294,19 +294,14 @@ def create_or_resume_planner(
     trace: TraceRuntime | None,
     workspace_health: WorkspaceHealthReport,
 ) -> PlannerRuntime:
-    planner = PlannerRuntime(
-        workspace_root,
-        session_id=session_id or task_id,
+    return _create_or_resume_planner(
+        workspace_root=workspace_root,
+        session_id=session_id,
         task_id=task_id,
+        user_goal=user_goal,
         trace=trace,
+        workspace_health=workspace_health,
     )
-    if session_id:
-        return planner.resume(
-            session_id,
-            workspace_health=workspace_health.to_dict(),
-        )
-    planner.start_task(user_goal)
-    return planner
 
 
 def _workspace_health_panel(health: WorkspaceHealthReport) -> Panel:

@@ -5,7 +5,9 @@ from pathlib import Path
 from miniharness.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
+    ToolCallFailureKind,
     ToolCallPhase,
+    ToolProtocolResultEnvelope,
     ToolProtocolRecoveryReport,
     ToolProtocolTurnStatus,
 )
@@ -78,3 +80,29 @@ def test_recovery_report_serializes_and_defaults_to_request_model() -> None:
     report = ToolProtocolRecoveryReport()
     assert report.next_action == "request_model"
     assert ToolProtocolTurnStatus.RECOVERED.value == "recovered"
+
+
+def test_recovery_reports_bound_approval_result_as_pending_approval(tmp_path: Path) -> None:
+    store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
+    batch = store.create_batch(_batch())
+    record = store.upsert_record(batch.tool_calls[0], phase=ToolCallPhase.RUNNING)
+    store.bind_result(
+        record.record_id,
+        result=ToolProtocolResultEnvelope(
+            tool_call_id=record.tool_call_id,
+            tool_name=record.envelope.tool_name,
+            ok=False,
+            status="waiting_approval",
+            error_code="approval_required",
+            error_kind=ToolCallFailureKind.approval_required,
+            content_preview="approval required",
+            content_digest="approval_digest",
+        ),
+    )
+
+    report = ToolProtocolRecoveryManager(store).recover(run_id="run_1")
+
+    assert report.status == ToolProtocolTurnStatus.PENDING_APPROVAL
+    assert report.next_action == "resume_pending_approval"
+    assert report.pending_approval_count == 1
+    assert "pending approval: call_1" in report.recovery_report["warnings"]

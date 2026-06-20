@@ -19,6 +19,7 @@ from miniharness.model import (
     MockModelProvider,
 )
 from miniharness.tool_protocol.models import ToolProtocolTurnStatus
+from miniharness.tool_protocol.models import ToolCallFailureKind, ToolCallPhase
 from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
 from miniharness.tool_protocol.state import ToolProtocolStateStore
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
@@ -131,6 +132,7 @@ def test_protocol_runtime_executes_tool_call_and_appends_tool_message(tmp_path: 
     assert payload["tool_name"] == "read_file"
     assert payload["ok"] is True
     assert "MiniHarness README content" in payload["content_preview"]
+    assert context.tool_observations[-1].turn == 1
 
 
 def test_protocol_runtime_creates_synthetic_result_for_rejected_call(tmp_path: Path) -> None:
@@ -269,6 +271,54 @@ def test_protocol_runtime_appends_tool_message_when_tool_runtime_fails(tmp_path:
     assert payload["ok"] is False
     assert payload["error_code"] == "boom"
     assert "super-secret" not in tool_message["content"]
+
+
+def test_protocol_runtime_marks_existing_context_tool_message_as_appended(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    protocol_runtime = ToolCallingProtocolRuntime(
+        registry=registry,
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    call = ModelToolCall(
+        tool_call_id="call_readme",
+        tool_name="read_file",
+        arguments={"path": "README.md"},
+        raw_arguments='{"path":"README.md"}',
+        parse_status=ModelToolParseStatus.VALID,
+    )
+    model_result = _tool_result(call)
+    assistant_message = protocol_runtime._assistant_message_from_model_result(model_result)
+    validation = protocol_runtime.validate_batch(
+        model_result,
+        context=context,
+        assistant_message=assistant_message,
+    )
+    batch = protocol_runtime.state_store.save_batch(validation.batch)
+    record = protocol_runtime.state_store.upsert_record(
+        batch.tool_calls[0],
+        phase=ToolCallPhase.SUCCEEDED,
+    )
+    result = protocol_runtime._synthetic_result(
+        batch.tool_calls[0],
+        error_kind=ToolCallFailureKind.replay_detected,
+        message="already appended",
+        error_code="replay_detected",
+    )
+    protocol_runtime.state_store.bind_result(record.record_id, result=result)
+    context.add_tool_protocol_result(result)
+
+    observation_id = protocol_runtime.append_results_to_context(
+        context,
+        envelope=batch.tool_calls[0],
+        result=result,
+    )
+
+    binding = protocol_runtime.state_store.result_binding(record.record_id)
+    assert observation_id is None
+    assert binding is not None
+    assert binding.appended is True
 
 
 def test_protocol_runtime_blocks_side_effect_replay_without_calling_handler(tmp_path: Path) -> None:

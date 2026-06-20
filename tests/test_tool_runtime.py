@@ -177,6 +177,43 @@ def test_runtime_timeout_returns_timeout_error(tmp_path: Path) -> None:
     assert result.error_code == "timeout"
 
 
+def test_runtime_timeout_waits_for_started_in_process_handler_to_settle(tmp_path: Path) -> None:
+    marker = tmp_path / "late.txt"
+
+    def slow_handler(_args: EmptyInput) -> str:
+        time.sleep(0.05)
+        marker.write_text("settled", encoding="utf-8")
+        return "done"
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="slow_read",
+            version="0.0.1",
+            description="Slow read.",
+            input_model=EmptyInput,
+            handler=slow_handler,
+            permission_level=PermissionLevel.READ_ONLY,
+            risk_tags=("read",),
+            timeout_seconds=0.01,
+        )
+    )
+    runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=TraceWriter.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
+    )
+
+    started = time.perf_counter()
+    result = runtime.execute_tool_call(make_tool_call("slow_read", {}))
+
+    assert result.error_code == "timeout"
+    assert time.perf_counter() - started >= 0.05
+    assert marker.read_text(encoding="utf-8") == "settled"
+
+
 def test_runtime_truncates_oversized_output_with_head_and_tail(tmp_path: Path) -> None:
     def large_handler(_args: EmptyInput) -> str:
         return "A" * 80 + "Z" * 80

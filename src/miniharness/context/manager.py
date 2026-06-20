@@ -216,14 +216,15 @@ class ContextManager:
 
     def add_assistant_message(self, message: dict[str, Any]) -> None:
         copied = dict(message)
+        safe = _safe_message(copied)
         self._messages.append(copied)
-        self.store.append_message(run_id=self.run_id, message=copied)
+        self.store.append_message(run_id=self.run_id, message=safe)
         self.add_context_item(
             self._make_item(
                 layer=ContextLayer.RECENT_DIALOGUE,
                 source_runtime=ContextRuntime.MODEL,
                 item_type=ContextItemType.ASSISTANT_MESSAGE,
-                content=copied,
+                content=safe,
                 authority=ContextAuthority.MODEL,
                 importance=0.55 if not copied.get("tool_calls") else 0.8,
             )
@@ -334,6 +335,8 @@ class ContextManager:
     def add_tool_protocol_result(
         self,
         envelope: "ToolProtocolResultEnvelope | dict[str, Any]",
+        *,
+        turn: int = 0,
     ) -> ToolObservation:
         from miniharness.tool_protocol.models import ToolProtocolResultEnvelope
 
@@ -367,7 +370,7 @@ class ContextManager:
         observation = ToolObservation(
             id=uuid4().hex,
             run_id=self.run_id,
-            turn=0,
+            turn=turn,
             tool_name=str(payload.get("tool_name") or "<unknown>"),
             tool_call_id=payload.get("tool_call_id"),
             ok=bool(payload.get("ok")),
@@ -793,7 +796,7 @@ class ContextManager:
             self._messages = self.store.load_messages(self.run_id)
             return
         for message in self._messages:
-            self.store.append_message(run_id=self.run_id, message=message)
+            self.store.append_message(run_id=self.run_id, message=_safe_message(message))
 
     def _persist_initial_items(self, *, system_prompt: str, user_goal: str) -> None:
         existing = self.store.query_items(run_id=self.run_id)
@@ -849,7 +852,7 @@ class ContextManager:
                 "content": json.dumps(
                     {
                         "goal": self.user_goal,
-                        "messages": self._messages,
+                        "messages": [_safe_message(message) for message in self._messages],
                         "observation_ids": [
                             observation.id for observation in self.tool_observations
                         ],
@@ -927,7 +930,7 @@ class ContextManager:
                 goal=self.user_goal,
                 summary=summary,
                 retained_item_ids=[f"{self.run_id}_system", f"{self.run_id}_user_goal", summary_item.item_id],
-                retained_messages=self._messages[:2],
+                retained_messages=[_safe_message(message) for message in self._messages[:2]],
                 known_observation_ids=known_ids,
                 version=self.store.current_version(self.run_id),
                 created_at=self._now(),
@@ -1137,6 +1140,24 @@ def _plain(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     return value
+
+
+def _safe_message(message: dict[str, Any]) -> dict[str, Any]:
+    copied = dict(message)
+    if "tool_calls" in copied:
+        copied["tool_calls"] = [_safe_tool_call(tool_call) for tool_call in copied.get("tool_calls") or []]
+    return copied
+
+
+def _safe_tool_call(tool_call: Any) -> dict[str, Any]:
+    if not isinstance(tool_call, dict):
+        return {"id": "", "type": "function", "function": {"name": "<unknown>", "arguments": "{}"}}
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    return {
+        "id": str(tool_call.get("id") or ""),
+        "type": str(tool_call.get("type") or "function"),
+        "function": {"name": str(function.get("name") or "<unknown>"), "arguments": "{}"},
+    }
 
 
 def _bounded_edit_payload(result: dict[str, Any]) -> dict[str, Any]:

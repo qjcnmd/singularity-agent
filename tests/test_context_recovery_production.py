@@ -1,11 +1,7 @@
 from pathlib import Path
 
 from miniharness.context import ContextManager, RecoveryManager
-from miniharness.context.models import (
-    MutationEvidence,
-    PolicyObservation,
-    RecoveredContext,
-)
+from miniharness.context.models import MutationEvidence, PolicyObservation, RecoveredContext
 from miniharness.context.tokens import TokenCounter
 
 
@@ -106,3 +102,32 @@ def test_recovery_reads_structured_trace_event_type(tmp_path: Path) -> None:
 
     assert recovered.trace_last_event == "model_request"
     assert recovered.recommended_next_action == "request_model"
+
+
+def test_recovery_returns_process_ids_for_active_process_sessions(tmp_path: Path) -> None:
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="watch server",
+        db_path=tmp_path / "context.sqlite3",
+        run_id="run_1",
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+    context.add_command_observation(
+        {
+            "command_id": "cmd_1",
+            "process_id": "proc_1",
+            "command_preview": "python -m http.server",
+            "exit_code": None,
+            "status": "running",
+            "stdout_preview": "",
+            "stderr_preview": "",
+            "output_ref": None,
+            "resource_limits": {},
+            "policy_decision_id": None,
+        }
+    )
+
+    recovered = RecoveryManager(tmp_path / "context.sqlite3").recover("run_1")
+
+    assert recovered.active_process_sessions == ["proc_1"]
+    assert recovered.recommended_next_action == "resume_process_observation"

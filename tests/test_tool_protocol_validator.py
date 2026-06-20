@@ -368,6 +368,16 @@ def test_validator_enforces_max_tool_calls_and_provider_parallel_capability(tmp_
         assistant_message=assistant_message,
         max_tool_calls=1,
     )
+    tool_choice_max_result = validator.validate_assistant_message(
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        model_request_id="req_tool_choice",
+        model_response_id="resp_tool_choice",
+        assistant_message=assistant_message,
+        tool_choice=ToolChoicePolicy(max_tool_calls=1),
+    )
     sequential_result = validator.validate_assistant_message(
         run_id="run_1",
         session_id="session_1",
@@ -381,6 +391,8 @@ def test_validator_enforces_max_tool_calls_and_provider_parallel_capability(tmp_
 
     assert max_result.valid is False
     assert "max_tool_calls_exceeded" in max_result.errors
+    assert tool_choice_max_result.valid is False
+    assert "max_tool_calls_exceeded" in tool_choice_max_result.errors
     assert sequential_result.valid is True
     assert sequential_result.batch is not None
     assert sequential_result.batch.supports_parallel_execution is False

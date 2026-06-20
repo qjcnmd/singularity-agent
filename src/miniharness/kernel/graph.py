@@ -21,7 +21,7 @@ from miniharness.model import (
 from miniharness.memory import MemoryRuntime
 from miniharness.observability import TraceRuntime
 from miniharness.policy import ApprovalGate, ApprovalMode, PolicyRuntime
-from miniharness.planner import PlannerRuntime
+from miniharness.planner import PlannerRuntime, create_or_resume_planner
 from miniharness.review import ReviewRuntime
 from miniharness.sandbox import SandboxRuntime
 from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
@@ -341,13 +341,14 @@ class RuntimeFactory:
             )
             mark(RuntimeComponentName.TOOL_PROTOCOL)
 
-            planner = _create_or_resume_planner(
+            planner = create_or_resume_planner(
                 workspace_root=project_root,
                 session_id=config.resume_session,
-                identity=identity,
+                task_id=identity.task_id,
                 user_goal=user_goal,
                 trace=trace,
                 workspace_health=workspace_health or state_runtime.get_workspace_health(),
+                fallback_session_id=identity.session_id,
             )
             command_runtime.planner = planner
             mutation_runtime.planner = planner
@@ -417,30 +418,6 @@ class RuntimeFactory:
                 code="runtime_graph_failed",
                 details={"error_type": type(exc).__name__, "message": str(exc)},
             ) from exc
-
-
-def _create_or_resume_planner(
-    *,
-    workspace_root: Path,
-    session_id: str | None,
-    identity: RunIdentity,
-    user_goal: str,
-    trace: TraceRuntime,
-    workspace_health: WorkspaceHealthReport,
-) -> PlannerRuntime:
-    planner = PlannerRuntime(
-        workspace_root,
-        session_id=session_id or identity.session_id,
-        task_id=identity.task_id,
-        trace=trace,
-    )
-    if session_id:
-        return planner.resume(
-            session_id,
-            workspace_health=workspace_health.to_dict(),
-        )
-    planner.start_task(user_goal)
-    return planner
 
 
 def _workspace_state_context_hook(state_runtime: LocalWorkspaceStateRuntime):

@@ -334,8 +334,29 @@ def _model_messages_to_openai(
         metadata = payload.pop("metadata", {}) or {}
         tool_calls = messages[index].metadata.get("tool_calls") or metadata.get("tool_calls")
         if tool_calls:
-            payload["tool_calls"] = tool_calls
+            payload["tool_calls"] = [_safe_provider_tool_call(tool_call) for tool_call in tool_calls]
     return provider_messages
+
+
+def _safe_provider_tool_call(tool_call: Any) -> dict[str, Any]:
+    if not isinstance(tool_call, dict):
+        return {
+            "id": "",
+            "type": "function",
+            "function": {"name": "<unknown>", "arguments": "{}"},
+        }
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    arguments = function.get("arguments", "{}")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
+    return {
+        "id": str(tool_call.get("id") or ""),
+        "type": str(tool_call.get("type") or "function"),
+        "function": {
+            "name": str(function.get("name") or "<unknown>"),
+            "arguments": arguments or "{}",
+        },
+    }
 
 
 def _model_tool_to_openai(tool: ModelToolSchema) -> dict[str, Any]:

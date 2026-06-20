@@ -302,6 +302,7 @@ class ToolProtocolStateStore:
                     ),
                 ),
             )
+            result_phase = _phase_for_bound_result(result)
             self._connection.execute(
                 """
                 update tool_call_records
@@ -310,7 +311,7 @@ class ToolProtocolStateStore:
                 where record_id = ?
                 """,
                 (
-                    ToolCallPhase.SUCCEEDED.value if result.ok else ToolCallPhase.FAILED.value,
+                    result_phase.value,
                     result.content_digest,
                     _now(),
                     _now(),
@@ -321,7 +322,7 @@ class ToolProtocolStateStore:
                 batch_id=row["batch_id"],
                 record_id=record_id,
                 run_id=row["run_id"],
-                event_type=ToolCallPhase.SUCCEEDED.value if result.ok else ToolCallPhase.FAILED.value,
+                event_type=result_phase.value,
                 payload=_state_safe_result_payload(result.to_dict()),
             )
             self._connection.commit()
@@ -921,6 +922,14 @@ class ToolProtocolStateStore:
 
 def _record_id(tool_call_id: str) -> str:
     return f"record_{tool_call_id}"
+
+
+def _phase_for_bound_result(result: ToolProtocolResultEnvelope) -> ToolCallPhase:
+    if result.ok:
+        return ToolCallPhase.SUCCEEDED
+    if result.error_code == ToolCallFailureKind.approval_required.value:
+        return ToolCallPhase.WAITING_APPROVAL
+    return ToolCallPhase.FAILED
 
 
 def _binding_id(record_id: str) -> str:

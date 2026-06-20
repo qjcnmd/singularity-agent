@@ -422,6 +422,7 @@ class CommandRuntime:
             request.resource_limits,
             env_result.redactor,
         )
+        before_snapshot = self._capture_workspace_snapshot()
         running = self.backend.start(
             request=request,
             cwd=cwd,
@@ -446,7 +447,7 @@ class CommandRuntime:
         self._sessions[session.process_id] = _SessionRecord(
             session=session,
             running=running,
-            before_snapshot=self._capture_workspace_snapshot(),
+            before_snapshot=before_snapshot,
         )
         return session
 

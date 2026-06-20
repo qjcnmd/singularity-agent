@@ -1077,3 +1077,25 @@ class PlannerRuntime:
             "文件",
         }
         return any(marker in lowered for marker in markers)
+
+
+def create_or_resume_planner(
+    *,
+    workspace_root: Path,
+    session_id: str | None,
+    task_id: str,
+    user_goal: str,
+    trace: TraceWriter | None,
+    workspace_health: Any,
+    fallback_session_id: str | None = None,
+) -> PlannerRuntime:
+    planner = PlannerRuntime(
+        workspace_root,
+        session_id=session_id or fallback_session_id or task_id,
+        task_id=task_id,
+        trace=trace,
+    )
+    if session_id:
+        return planner.resume(session_id, workspace_health=workspace_health.to_dict())
+    planner.start_task(user_goal)
+    return planner

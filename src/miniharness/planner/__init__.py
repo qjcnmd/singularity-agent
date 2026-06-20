@@ -18,7 +18,7 @@ from miniharness.planner.models import (
     TaskState,
     TaskStatus,
 )
-from miniharness.planner.runtime import PlannerRuntime
+from miniharness.planner.runtime import PlannerRuntime, create_or_resume_planner
 from miniharness.planner.store import PlannerStore
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "PLANNER_ERROR_CODES",
     "PlannerRuntime",
     "PlannerStore",
+    "create_or_resume_planner",
     "ReplanDecision",
     "ReplanDecisionKind",
     "RiskDecisionKind",

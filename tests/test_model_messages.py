@@ -8,6 +8,7 @@ from miniharness.model import (
     ProviderRequest,
     ModelRole,
 )
+from miniharness.model.providers import _model_messages_to_openai
 
 
 def test_message_converter_preserves_tool_call_id_and_developer_fallback() -> None:
@@ -61,3 +62,32 @@ def test_legacy_chat_adapter_applies_developer_fallback_without_metadata_leak() 
 
     assert provider.messages[0]["role"] == "system"
     assert "metadata" not in provider.messages[0]
+
+
+def test_provider_messages_use_safe_empty_arguments_for_historical_tool_calls() -> None:
+    message = ModelMessage(
+        role=ModelRole.ASSISTANT,
+        content=[ContentBlock.from_text("")],
+        metadata={
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file"},
+                }
+            ]
+        },
+    )
+
+    provider_messages = _model_messages_to_openai(
+        [message],
+        ModelCapabilities(supports_tools=True),
+    )
+
+    assert provider_messages[0]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }
+    ]

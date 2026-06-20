@@ -65,7 +65,7 @@ class ToolProtocolValidator:
             errors.append(ToolCallFailureKind.protocol_violation.value)
         if resolved_tool_choice.mode == ToolChoiceMode.REQUIRED and not raw_calls:
             errors.append(ToolCallFailureKind.protocol_violation.value)
-        if max_tool_calls is not None and len(raw_calls) > max_tool_calls:
+        if resolved_max_tool_calls is not None and len(raw_calls) > resolved_max_tool_calls:
             errors.append("max_tool_calls_exceeded")
 
         seen: set[str] = set()

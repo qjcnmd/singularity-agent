@@ -38,7 +38,7 @@ class ToolProtocolRecoveryManager:
             for record in self.store.records_for_batch(batch.batch_id):
                 if record.phase in {ToolCallPhase.PROPOSED, ToolCallPhase.VALIDATED}:
                     pending_call_ids.append(record.envelope.tool_call_id)
-                elif record.phase == ToolCallPhase.WAITING_APPROVAL:
+                elif self._is_pending_approval(record):
                     pending_approval_call_ids.append(record.envelope.tool_call_id)
                 elif record.phase == ToolCallPhase.RUNNING:
                     running_call_ids.append(record.envelope.tool_call_id)
@@ -118,7 +118,7 @@ class ToolProtocolRecoveryManager:
             for record in self.store.records_for_batch(batch.batch_id):
                 if record.phase in {ToolCallPhase.PROPOSED, ToolCallPhase.VALIDATED}:
                     pending_call_ids.append(record.envelope.tool_call_id)
-                elif record.phase == ToolCallPhase.WAITING_APPROVAL:
+                elif self._is_pending_approval(record):
                     pending_approval_call_ids.append(record.envelope.tool_call_id)
                 elif record.phase == ToolCallPhase.RUNNING:
                     running_call_ids.append(record.envelope.tool_call_id)
@@ -177,6 +177,17 @@ class ToolProtocolRecoveryManager:
             (run_id,),
         ).fetchall()
         return [self.store._batch_from_row(row) for row in rows]
+
+    def _is_pending_approval(self, record: Any) -> bool:
+        if record.phase == ToolCallPhase.WAITING_APPROVAL:
+            return True
+        binding = self.store.result_binding(record.record_id)
+        result = binding.result if binding is not None else None
+        return bool(
+            record.phase == ToolCallPhase.FAILED
+            and result is not None
+            and result.error_code == "approval_required"
+        )
 
 
 ToolProtocolRecovery = ToolProtocolRecoveryManager

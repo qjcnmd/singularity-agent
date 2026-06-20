@@ -64,6 +64,7 @@ class ToolCallingProtocolRuntime:
         return self.handle_model_turn_result(
             result,
             request=request,
+            turn=turn,
             context=context,
             tool_runtime=tool_runtime,
             planner=planner,
@@ -75,6 +76,7 @@ class ToolCallingProtocolRuntime:
         model_result: ModelTurnResult,
         *,
         request: Any | None = None,
+        turn: int = 0,
         context: ContextManager,
         tool_runtime: ToolRuntime,
         planner: PlannerRuntime | None,
@@ -153,6 +155,7 @@ class ToolCallingProtocolRuntime:
             tool_runtime=tool_runtime,
             planner=planner,
             policy_runtime=policy_runtime,
+            turn=turn,
         )
         self._throw_if_cancelled()
         if self.workspace_state_hook is not None:
@@ -207,6 +210,7 @@ class ToolCallingProtocolRuntime:
         tool_runtime: ToolRuntime,
         planner: PlannerRuntime | None,
         policy_runtime: PolicyRuntime | None,
+        turn: int = 0,
     ) -> ToolProtocolTurnResult:
         self._throw_if_cancelled()
         _ = planner, policy_runtime
@@ -273,7 +277,7 @@ class ToolCallingProtocolRuntime:
                         result=synthetic,
                         raw_result_ref=synthetic.raw_result_ref,
                     )
-                    observation_id = self._append_result(context, record, synthetic)
+                    observation_id = self._append_result(context, record, synthetic, turn=turn)
                     appended_tool_message_count += 1 if observation_id else 0
                     self.trace.emit(
                         "tool_protocol.call_rejected",
@@ -334,7 +338,7 @@ class ToolCallingProtocolRuntime:
                         result=synthetic,
                         raw_result_ref=synthetic.raw_result_ref,
                     )
-                    observation_id = self._append_result(context, record, synthetic)
+                    observation_id = self._append_result(context, record, synthetic, turn=turn)
                     appended_tool_message_count += 1 if observation_id else 0
                     self.trace.emit(
                         "tool_protocol.replay_blocked",
@@ -362,7 +366,7 @@ class ToolCallingProtocolRuntime:
                         result=replay,
                         raw_result_ref=replay.raw_result_ref,
                     )
-                    observation_id = self._append_result(context, record, replay)
+                    observation_id = self._append_result(context, record, replay, turn=turn)
                     appended_tool_message_count += 1 if observation_id else 0
                     self.trace.emit(
                         "tool_protocol.replay_detected",
@@ -437,7 +441,7 @@ class ToolCallingProtocolRuntime:
                     pending_approval_count += 1
                 elif not protocol_result.ok:
                     failed_count += 1
-                observation_id = self._append_result(context, record, protocol_result)
+                observation_id = self._append_result(context, record, protocol_result, turn=turn)
                 appended_tool_message_count += 1 if observation_id else 0
                 self.trace.emit(
                     "tool_protocol.call_completed",
@@ -495,6 +499,7 @@ class ToolCallingProtocolRuntime:
         *,
         envelope: ToolCallEnvelope,
         result: ToolProtocolResultEnvelope,
+        turn: int = 0,
     ) -> str | None:
         record = self.state_store.record_by_tool_call_id(envelope.tool_call_id)
         if self._context_has_tool_message(
@@ -502,8 +507,12 @@ class ToolCallingProtocolRuntime:
             envelope.tool_call_id,
             content_digest=result.content_digest,
         ):
+            self.state_store.mark_result_appended(
+                record.record_id,
+                context_message_id=record.context_message_id,
+            )
             return None
-        observation = context.add_tool_protocol_result(result)
+        observation = context.add_tool_protocol_result(result, turn=turn)
         self.state_store.mark_result_appended(
             record.record_id,
             context_message_id=observation.id,
@@ -515,11 +524,14 @@ class ToolCallingProtocolRuntime:
         context: ContextManager,
         record: Any,
         result: ToolProtocolResultEnvelope,
+        *,
+        turn: int = 0,
     ) -> str | None:
         return self.append_results_to_context(
             context,
             envelope=record.envelope,
             result=result,
+            turn=turn,
         )
 
     def recover_pending(
