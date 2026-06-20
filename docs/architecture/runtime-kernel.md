@@ -52,7 +52,7 @@ Supported CLI inputs still flow through the config object:
 20. Context
 21. Planner
 
-Each component is recorded as `runtime.initialized` in trace when its boot-time boundary is ready. The evaluation boundary is registered during boot but the full `EvaluationRuntime` object is created only when evaluation functionality is actually accessed, so normal agent runs do not pay for benchmark scoring, replay, and artifact-writer setup. The graph creates `ContextManager` before Planner, then `AgentKernel` passes that context into `MiniAgent`. Command, Mutation, Tool, Review, Evaluation, and Verification runtimes are wired back to the session PlannerRuntime after Planner creation so execution evidence still lands in the existing planner ledger.
+Each component is recorded as `runtime.initialized` in trace when its boot-time boundary is ready. `RuntimeFactory.build()` assembles the graph in explicit phases: infra, policy/sandbox, execution core, tools/protocol, verification/review, model/context, then planner wiring. The evaluation boundary is registered during boot but the full `EvaluationRuntime` object is created only when evaluation functionality is actually accessed, so normal agent runs do not pay for benchmark scoring, replay, and artifact-writer setup. The graph creates `ContextManager` before Planner, then `AgentKernel` passes that context into `MiniAgent`. Command, Mutation, Tool, Review, Evaluation, and Verification runtimes are wired back to the session PlannerRuntime after Planner creation so execution evidence still lands in the existing planner ledger.
 
 ## Lifecycle
 
@@ -67,7 +67,7 @@ Lifecycle events are written to trace and summarized into `FinalReport.lifecycle
 
 ## Cancellation
 
-`CancellationManager` owns a root `CancellationToken` and child tokens. `AgentKernel` attaches child tokens to Planner, Model, Command, Sandbox, and Verification runtime objects so downstream layers can honor cancellation without owning process shutdown.
+`CancellationManager` owns a root `CancellationToken` and child tokens. `RuntimeGraph` owns the list of cancellation-aware runtime targets, and `AgentKernel` asks the graph to attach child tokens so downstream layers can honor cancellation without owning process shutdown. Lazy evaluation construction uses the same graph-level token factory when evaluation is accessed after boot.
 
 `KeyboardInterrupt` is converted into:
 
@@ -77,7 +77,7 @@ Ctrl+C -> kernel.cancel(user_interrupted) -> graceful shutdown -> finalization p
 
 No KeyboardInterrupt path is expected to bypass shutdown/finalization.
 
-Shutdown also cancels the root token, so later Planner, Model, Command, Sandbox, and Verification entrypoints fail through their cancellation checks instead of accepting new actions.
+Shutdown also cancels the root token, so later Planner, Model, Command, Sandbox, Tool, Protocol, Context, Edit, Review, and Verification entrypoints fail through their cancellation checks instead of accepting new actions.
 
 ## Workspace Lock
 

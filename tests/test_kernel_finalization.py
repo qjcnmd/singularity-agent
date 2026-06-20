@@ -218,6 +218,23 @@ class _Graph:
         self.instruction_runtime = _Runtime()
         self.context_manager = _Runtime()
 
+    def cancellation_targets(self) -> list[tuple[str, object]]:
+        return [
+            ("planner", self.planner),
+            ("model_runtime", self.model_runtime),
+            ("command_runtime", self.command_runtime),
+            ("sandbox_runtime", self.sandbox_runtime),
+            ("verification_runtime", self.verification_runtime),
+            ("review_runtime", self.review_runtime),
+            ("tool_runtime", self.tool_runtime),
+            ("protocol_runtime", self.protocol_runtime),
+            ("context_manager", self.context_manager),
+        ]
+
+    def install_cancellation_tokens(self, token_factory) -> None:
+        for _name, runtime in self.cancellation_targets():
+            setattr(runtime, "cancellation_token", token_factory())
+
 
 class _Lock:
     def __init__(self) -> None:

@@ -85,20 +85,7 @@ class AgentKernel:
             except Exception:
                 pass
         self.interaction_runtime.cancellation_manager = self.cancellation
-        for runtime in (
-            self.graph.planner,
-            self.graph.model_runtime,
-            self.graph.tool_runtime,
-            self.graph.protocol_runtime,
-            self.graph.command_runtime,
-            self.graph.sandbox_runtime,
-            self.graph.verification_runtime,
-            self.graph.review_runtime,
-            self.graph.context_manager,
-            getattr(self.graph, "edit_runtime", None),
-        ):
-            if runtime is not None:
-                setattr(runtime, "cancellation_token", self.cancellation.child_token())
+        self.graph.install_cancellation_tokens(self.cancellation.child_token)
 
     def boot(self) -> "AgentKernel":
         self.context.status = KernelStatus.READY
