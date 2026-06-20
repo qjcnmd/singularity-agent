@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from miniharness.command import (
     CommandDecision,
     CommandPolicy,
     CommandRequest,
-    CommandRisk,
     NetworkMode,
 )
 from miniharness.verification.models import (

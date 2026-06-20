@@ -6,16 +6,11 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
-from uuid import uuid4
 
 from miniharness.model.models import (
-    ModelCapabilities,
-    ModelMessage,
     ModelToolParseStatus,
-    ToolChoiceMode,
-    ToolChoicePolicy,
 )
-from miniharness.tools.models import PermissionLevel, ToolResult, ToolSideEffectKind, ToolSpec
+from miniharness.tools.models import ToolResult
 
 
 def _now() -> str:

@@ -2,8 +2,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from miniharness.policy import Capability, OperationKind, ResourceRef
 from miniharness.tools import (

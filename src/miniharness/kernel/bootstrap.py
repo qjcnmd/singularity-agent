@@ -24,7 +24,6 @@ from miniharness.kernel.health import RuntimeHealthChecker
 from miniharness.kernel.lifecycle import RunLifecycleManager
 from miniharness.kernel.locks import WorkspaceLockManager
 from miniharness.kernel.models import (
-    AgentSession,
     KernelContext,
     KernelStatus,
     RunIdentity,

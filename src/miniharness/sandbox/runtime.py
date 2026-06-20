@@ -9,13 +9,12 @@ from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.policy.config import SecurityMode
 from miniharness.policy.models import PolicyDecision
 from miniharness.sandbox.backends import LocalStagingBackend, SandboxBackend
-from miniharness.sandbox.exceptions import SandboxCapabilityError, SandboxError
+from miniharness.sandbox.exceptions import SandboxCapabilityError
 from miniharness.sandbox.models import (
     SandboxFilesystemMode,
     SandboxNetworkMode,
     SandboxProfileName,
     SandboxRequest,
-    SandboxResourceLimits,
     SandboxResult,
     SandboxStatus,
     default_sandbox_profile,

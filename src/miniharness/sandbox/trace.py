@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from miniharness.sandbox.environment import SandboxEnvironmentBuilder
 from miniharness.sandbox.models import PreparedSandbox, SandboxCapabilities, SandboxRequest, SandboxResult
 
 

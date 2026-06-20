@@ -14,6 +14,7 @@ from miniharness.memory.models import (
     Provenance,
 )
 from miniharness.memory.runtime import MemoryRuntime
+from miniharness.memory.store import MemoryStore
 
 
 runner = CliRunner()
@@ -146,6 +147,51 @@ def test_cli_memory_commands_cover_candidate_lifecycle(monkeypatch, tmp_path: Pa
     assert refresh.exit_code == 0
     assert candidates.exit_code == 0
     assert rules.exit_code == 0
+
+
+def test_cli_read_only_memory_commands_do_not_rebuild_index(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = MemoryRuntime(tmp_path)
+    runtime.start_session(session_id="session_cli", user_goal="cli")
+    runtime.store.upsert_candidate(
+        MemoryCandidate(
+            id="cand_read",
+            scope=MemoryScope.PROJECT,
+            type=MemoryType.LESSON,
+            source=MemorySource.USER,
+            title="Read-only lesson",
+            body="Use miniharness memory list for local inspection.",
+            provenance=Provenance(
+                evidence=[
+                    MemoryEvidenceRef(
+                        source=MemorySource.USER,
+                        ref_id="user_message",
+                        summary="manual candidate",
+                    )
+                ]
+            ),
+        )
+    )
+    runtime.accept_candidate("cand_read")
+
+    def fail_rebuild(_store: MemoryStore) -> dict:
+        raise AssertionError("read-only memory command rebuilt the index")
+
+    monkeypatch.setattr(MemoryStore, "rebuild_index", fail_rebuild)
+    monkeypatch.chdir(tmp_path)
+
+    for command in (
+        ["memory", "list"],
+        ["memory", "candidates"],
+        ["memory", "show", "mem_cand_read"],
+        ["memory", "search", "inspection"],
+        ["memory", "doctor"],
+        ["memory", "rules", "list"],
+    ):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
 
 
 def test_runtime_manual_accept_redacts_and_requires_non_guess_content(tmp_path: Path) -> None:

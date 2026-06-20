@@ -108,14 +108,18 @@ class ContextManager:
         planner_context: dict[str, Any] | None = None,
         phase_id: str | None = None,
         render_policy: ContextRenderPolicy | None = None,
+        persist: bool = True,
+        allow_compression: bool | None = None,
     ) -> list[dict[str, Any]]:
-        if self.assembler.needs_compression(messages=self._messages, tools=tools):
+        should_compress = persist if allow_compression is None else allow_compression
+        if should_compress and self.assembler.needs_compression(messages=self._messages, tools=tools):
             self._compress_if_possible()
         bundle = self.build_bundle(
             tools=tools,
             planner_context=planner_context,
             phase_id=phase_id or self.phase_id,
             render_policy=render_policy,
+            persist=persist,
         )
         return bundle.messages
 
@@ -126,6 +130,7 @@ class ContextManager:
         planner_context: dict[str, Any] | None = None,
         phase_id: str | None = None,
         render_policy: ContextRenderPolicy | None = None,
+        persist: bool = True,
     ) -> Any:
         items = self.store.query_items(run_id=self.run_id)
         if planner_context is not None:
@@ -172,6 +177,12 @@ class ContextManager:
         )
         self.last_budget = bundle.budget
         self.last_bundle = bundle
+        if not persist:
+            return bundle
+        self.persist_bundle(bundle)
+        return bundle
+
+    def persist_bundle(self, bundle: Any) -> None:
         self.store.save_bundle(bundle)
         self._emit_context_event(
             "context.bundle_built",
@@ -194,7 +205,6 @@ class ContextManager:
                 "tool_schema_tokens": bundle.budget.tool_schema_tokens,
             },
         )
-        return bundle
 
     def add_context_item(self, item: ContextItem) -> ContextItem:
         if not item.token_count:

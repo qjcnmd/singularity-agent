@@ -18,6 +18,10 @@ CLI_SECRET_FLAG_RE = re.compile(
     r"(?i)(--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)(?:=|\s+))"
     r"('[^']*'|\"[^\"]*\"|[^\s,\]\}]+)"
 )
+URL_QUERY_SECRET_RE = re.compile(
+    r"(?i)([?&](?:access[_-]?token|api[_-]?key|token|secret|password|signature|sig|auth|key)=)"
+    r"([^&#\s,\]\}]+)"
+)
 JSON_ARG_SECRET_RE = re.compile(
     r"(?i)(\"--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)\"\s*,\s*)"
     r"\"[^\"]*\""
@@ -60,6 +64,7 @@ class TraceRedactor:
         redacted = PRIVATE_KEY_RE.sub("<redacted>", text)
         redacted = ENV_SECRET_RE.sub(lambda match: f"{match.group(1)}=<redacted>", redacted)
         redacted = HEADER_SECRET_RE.sub(lambda match: f"{match.group(1)}: <redacted>", redacted)
+        redacted = URL_QUERY_SECRET_RE.sub(lambda match: f"{match.group(1)}<redacted>", redacted)
         redacted = JSON_ARG_SECRET_RE.sub(lambda match: f'{match.group(1)}"<redacted>"', redacted)
         redacted = CLI_SECRET_FLAG_RE.sub(lambda match: f"{match.group(1)}<redacted>", redacted)
         redacted = TOKEN_VALUE_RE.sub("<redacted>", redacted)

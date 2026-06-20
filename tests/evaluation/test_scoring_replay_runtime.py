@@ -17,7 +17,7 @@ from miniharness.evaluation import (
     WorkspaceSnapshotKind,
 )
 from miniharness.command import CommandDecision, CommandPolicyResult, CommandRisk, SemanticStatus
-from miniharness.observability import TraceEventType, TraceSeverity, TraceRuntime
+from miniharness.observability import TraceEventType, TraceRuntime
 
 
 def _task(task_id: str = "task.eval") -> BenchmarkTask:

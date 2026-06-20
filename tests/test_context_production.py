@@ -109,6 +109,38 @@ def test_messages_respect_budget_and_include_tool_schema_tokens(tmp_path: Path) 
     assert messages[1]["role"] == "user"
 
 
+def test_build_bundle_is_read_only_until_explicitly_persisted(tmp_path: Path) -> None:
+    db_path = tmp_path / "context.sqlite3"
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="user",
+        db_path=db_path,
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+
+    bundle = context.build_bundle(persist=False)
+
+    with sqlite3.connect(db_path) as connection:
+        persisted_count = connection.execute("select count(*) from context_bundles").fetchone()[0]
+    bundle_events = [
+        event
+        for event in context.store.events_for_run(context.run_id)
+        if event["event_type"] == "context.bundle_built"
+    ]
+    assert persisted_count == 0
+    assert bundle_events == []
+
+    context.persist_bundle(bundle)
+
+    with sqlite3.connect(db_path) as connection:
+        persisted_count = connection.execute("select count(*) from context_bundles").fetchone()[0]
+    assert persisted_count == 1
+    assert any(
+        event["event_type"] == "context.bundle_built"
+        for event in context.store.events_for_run(context.run_id)
+    )
+
+
 def test_window_trimming_keeps_tool_call_pairs_or_removes_them_together(
     tmp_path: Path,
 ) -> None:
@@ -162,7 +194,12 @@ def test_compression_creates_summary_with_references_when_history_exceeds_budget
     )
     context.add_assistant_message({"role": "assistant", "content": "history " * 200})
 
-    messages = context.messages()
+    preview_messages = context.messages(persist=False)
+    assert provider.calls == []
+    assert context.store.latest_snapshot(context.run_id) is None
+    assert preview_messages
+
+    messages = context.messages(persist=True)
 
     assert provider.calls
     assert provider.calls[0]["tool_choice"] == ToolChoiceMode.NONE

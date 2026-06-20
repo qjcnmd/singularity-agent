@@ -15,7 +15,6 @@ from miniharness.context.models import (
     ContextItemType,
     ContextLayer,
     ContextRenderPolicy,
-    ContextRuntime,
     ContextSensitivity,
 )
 from miniharness.context.redaction import ContextRedactor

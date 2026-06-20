@@ -59,9 +59,8 @@ class OpenAICompatibleProvider:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            body = response.text[:1000]
             raise RuntimeError(
-                f"Provider returned HTTP {response.status_code}: {body}"
+                f"Provider returned HTTP {response.status_code}."
             ) from exc
 
         return response.json()

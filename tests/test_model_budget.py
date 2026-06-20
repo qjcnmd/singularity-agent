@@ -14,7 +14,7 @@ from miniharness.model import (
 def test_budget_manager_estimates_tokens_and_merges_usage() -> None:
     manager = ModelBudgetManager()
     messages = [
-        ModelMessage(role=ModelRole.USER, content=[ContentBlock.text("hello world")])
+        ModelMessage(role=ModelRole.USER, content=[ContentBlock.from_text("hello world")])
     ]
     usage = manager.estimate_input(messages=messages, tools=[])
 

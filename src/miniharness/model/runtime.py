@@ -15,15 +15,13 @@ from miniharness.model.errors import (
 )
 from miniharness.model.messages import MessageConverter
 from miniharness.model.models import (
-    ContentBlock,
     ModelError,
     ModelErrorKind,
     ModelMessage,
     ModelPreferences,
     ModelPurpose,
-    ModelRole,
     ModelToolCall,
-    ModelToolParseStatus,
+    ModelToolSchema,
     ModelTurnRequest,
     ModelTurnResult,
     ModelTurnStatus,
@@ -181,6 +179,7 @@ class ModelRuntime:
             history_messages = context.messages(
                 tools=provider_tools,
                 planner_context=None,
+                persist=True,
             )[2:]
             messages = [*prompt_bundle.messages, *history_messages]
             for message in messages:
@@ -191,6 +190,7 @@ class ModelRuntime:
             messages = context.messages(
                 tools=provider_tools,
                 planner_context=planner_context,
+                persist=True,
             )
         prompt_metadata = (
             {

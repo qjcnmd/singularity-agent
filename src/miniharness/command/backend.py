@@ -4,7 +4,6 @@ import os
 import queue
 import signal
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass

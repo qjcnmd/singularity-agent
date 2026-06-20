@@ -51,14 +51,23 @@ class MemoryRuntime:
         self.user_goal: str = ""
         self._human_entries: list[MemoryEntry] = []
         self._rules: list[PathScopedRule] = []
+        self._rebuild_index_on_read = True
 
-    def start_session(self, *, session_id: str, user_goal: str = "") -> None:
+    def start_session(
+        self,
+        *,
+        session_id: str,
+        user_goal: str = "",
+        rebuild_index: bool = True,
+    ) -> None:
         self.session_id = session_id
         self.user_goal = user_goal
-        self.store.initialize()
+        self._rebuild_index_on_read = rebuild_index
+        self.store.initialize(rebuild_index=rebuild_index)
         self._human_entries = self._load_human_entries()
         self._rules = load_rules(self.store.layout.rules_dir)
-        self.store.rebuild_index()
+        if rebuild_index:
+            self.store.rebuild_index()
         self._record("memory.session_started", {"session_id": session_id, "user_goal": user_goal})
 
     def ingest_candidate(self, candidate: MemoryCandidate, *, accept: bool = False) -> MemoryCandidate:
@@ -143,7 +152,7 @@ class MemoryRuntime:
         entries = [
             *self._human_entries,
             *self._matching_rule_entries(paths or []),
-            *self.store.load_entries(),
+            *self.store.load_entries(rebuild_index=self._rebuild_index_on_read),
         ]
         return MemoryRetrieval(entries).search(query)
 
@@ -218,11 +227,12 @@ class MemoryRuntime:
         return report
 
     def doctor(self, *, repair: bool = False) -> dict[str, Any]:
-        self.store.initialize()
-        return self.maintenance.doctor(repair=repair)
+        rebuild_index = repair or self._rebuild_index_on_read
+        self.store.initialize(rebuild_index=rebuild_index)
+        return self.maintenance.doctor(repair=repair, rebuild_index=rebuild_index)
 
     def list_rules(self) -> list[dict[str, Any]]:
-        self.store.initialize()
+        self.store.initialize(rebuild_index=self._rebuild_index_on_read)
         self._rules = load_rules(self.store.layout.rules_dir)
         return [rule.to_dict() for rule in self._rules]
 

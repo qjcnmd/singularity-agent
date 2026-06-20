@@ -17,8 +17,6 @@ from miniharness.model import (
     ModelToolCall,
     ModelToolParseStatus,
     MockModelProvider,
-    ToolChoiceMode,
-    ToolChoicePolicy,
 )
 from miniharness.tool_protocol.models import ToolProtocolTurnStatus
 from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime

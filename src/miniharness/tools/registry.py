@@ -10,7 +10,6 @@ from miniharness.tools.models import (
     ToolSideEffectKind,
     ToolSpec,
 )
-from miniharness.tools.policy import ToolPolicy
 
 
 class ToolRegistry:

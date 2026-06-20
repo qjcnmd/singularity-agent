@@ -113,11 +113,16 @@ class MemoryMaintenance:
     def delete(self, entry_id: str, *, reason: str = "deleted") -> MemoryEntry:
         return self.store.tombstone_entry(entry_id, reason=reason)
 
-    def doctor(self, *, repair: bool = False) -> dict[str, Any]:
+    def doctor(
+        self,
+        *,
+        repair: bool = False,
+        rebuild_index: bool = True,
+    ) -> dict[str, Any]:
         issues: list[dict[str, Any]] = []
         try:
-            entries = self.store.load_entries()
-            candidates = self.store.load_candidates()
+            entries = self.store.load_entries(rebuild_index=rebuild_index)
+            candidates = self.store.load_candidates(rebuild_index=rebuild_index)
         except Exception as exc:
             return {
                 "ok": False,

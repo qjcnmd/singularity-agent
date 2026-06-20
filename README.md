@@ -1,6 +1,6 @@
 # MiniHarness v0.1.0
 
-MiniHarness is a production-grade local CLI coding agent harness. The v0.1.0 baseline aligns the CLI, agent orchestration, tool protocol, context ledger, policy enforcement, workspace state, verification, and trace layers behind one production path.
+MiniHarness is a production-grade local CLI coding agent harness. The v0.1.0 baseline aligns the CLI, agent orchestration, tool protocol, context ledger, local memory, policy enforcement, workspace state, verification, and trace layers behind one production path.
 
 The retained compatibility read tools are still available:
 
@@ -24,7 +24,7 @@ CLI
 -> Trace / Audit / FinalReport
 ```
 
-MiniHarness does not implement a Git Runtime, web search, multi-agent execution, remote approval, or a real sandbox security boundary in this release.
+MiniHarness does not implement a Git Runtime, web search, multi-agent execution, remote approval, remote memory sync, or a real sandbox security boundary in this release.
 
 ## Install
 
@@ -34,10 +34,28 @@ pip install -e .
 
 Configure the OpenAI-compatible provider through environment variables. The API key is intentionally not accepted as a CLI flag.
 
-```bash
+PowerShell:
+
+```powershell
+$env:MINIHARNESS_BASE_URL = "https://api.openai.com/v1"
+$env:MINIHARNESS_API_KEY = "..."
+$env:MINIHARNESS_MODEL = "gpt-4.1-mini"
+```
+
+cmd.exe:
+
+```bat
 set MINIHARNESS_BASE_URL=https://api.openai.com/v1
 set MINIHARNESS_API_KEY=...
 set MINIHARNESS_MODEL=gpt-4.1-mini
+```
+
+POSIX shells:
+
+```bash
+export MINIHARNESS_BASE_URL=https://api.openai.com/v1
+export MINIHARNESS_API_KEY=...
+export MINIHARNESS_MODEL=gpt-4.1-mini
 ```
 
 ## CLI
@@ -78,6 +96,31 @@ miniharness trace errors <run_id> --trace-dir work/traces/runs
 miniharness trace artifacts <run_id> --trace-dir work/traces/runs
 ```
 
+Project index commands:
+
+```bash
+miniharness index build --json
+miniharness index refresh --json
+miniharness index explain
+miniharness index relevant "fix command runtime timeout handling"
+miniharness index impact src/miniharness/command/runtime.py
+miniharness index tests src/miniharness/command/runtime.py
+```
+
+Local memory commands:
+
+```bash
+miniharness memory list
+miniharness memory search "pytest temp directory"
+miniharness memory candidates
+miniharness memory accept <candidate_id>
+miniharness memory reject <candidate_id> --reason "not durable"
+miniharness memory delete <memory_id> --reason "superseded"
+miniharness memory doctor
+miniharness memory refresh
+miniharness memory rules list
+```
+
 Evaluation and benchmark commands:
 
 ```bash
@@ -91,6 +134,12 @@ miniharness eval report show work/evaluations/<eval_run_id>/report.md
 ```
 
 `benchmark` is an alias for `eval`. Suite, A/B, and regression commands default to deterministic offline scoring and trace replay; pass `--execute` to run declared hooks/tests through the runtime boundaries. Reports are written to `work/evaluations/<run_id>/` by default. See `docs/evaluation-runtime.md` for the Benchmark Task schema, trace replay semantics, scoring fields, A/B profiles, and regression report format.
+
+Exit code conventions:
+
+- `0`: Command completed successfully.
+- `1`: Main agent or CLI command failed, including provider, policy, validation, or runtime errors.
+- `2`: `eval regression run --block-on-regression` detected a blocking regression.
 
 ## Approval Modes
 
@@ -173,7 +222,7 @@ Current safety boundaries:
 Not implemented in v0.1.0:
 
 - Git Runtime
-- durable long-term memory
+- remote/shared memory synchronization
 - parallel executor
 - remote approval
 - real sandbox isolation such as Docker, Podman, WSL, or kernel-level containment
@@ -188,6 +237,8 @@ Use the repository validation command:
 python -m pytest tests --basetemp work/pytest-tmp
 git diff --check
 ```
+
+The declared development dependency set currently includes `pytest`; no mandatory `ruff` or `mypy` gate is configured in `pyproject.toml`.
 
 Before publishing, verify remote alignment with:
 

@@ -2,8 +2,6 @@ from pathlib import Path
 
 from miniharness.context import ContextManager
 from miniharness.model import (
-    ContentBlock,
-    ContentBlockType,
     MockModelProvider,
     ModelBudget,
     ModelPurpose,

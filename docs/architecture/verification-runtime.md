@@ -206,7 +206,7 @@ Plan creation, check results, and final assessment are each recorded as structur
 
 ## Current Support And Extension
 
-Current project support includes Python/pytest/ruff/mypy/build, Node/TypeScript package scripts, Cargo, Go, Maven, Gradle, Make, and just targets.
+Current discovery support covers common Python, Node/TypeScript, Cargo, Go, Maven, Gradle, Make, and just project markers. A discovered check is only executable when the target repository actually declares the corresponding command or dependency; for this repository, the declared validation baseline is `python -m pytest tests --basetemp work/pytest-tmp` plus `git diff --check`.
 
 To extend support:
 

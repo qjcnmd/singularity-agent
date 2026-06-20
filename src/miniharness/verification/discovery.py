@@ -11,7 +11,6 @@ from miniharness.command import (
     CommandPurpose,
     CommandRequest,
     FilesystemMode,
-    ResourceLimits,
 )
 from miniharness.verification.models import (
     CheckKind,

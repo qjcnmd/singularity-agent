@@ -276,7 +276,7 @@ class PromptCompiler:
 def _message(role: ModelRole, text: str, metadata: dict[str, Any]) -> ModelMessage:
     return ModelMessage(
         role=role,
-        content=[ContentBlock.text(text)],
+        content=[ContentBlock.from_text(text)],
         metadata=metadata,
     )
 

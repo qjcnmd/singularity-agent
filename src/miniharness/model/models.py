@@ -88,7 +88,7 @@ class ContentBlock(SerializableDataclass):
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def text(cls, text: str, **metadata: Any) -> "ContentBlock":
+    def from_text(cls, text: str, **metadata: Any) -> "ContentBlock":
         return cls(type=ContentBlockType.TEXT, text=text, metadata=metadata)
 
 
@@ -102,7 +102,7 @@ class ModelMessage(SerializableDataclass):
 
     @classmethod
     def assistant_text(cls, text: str) -> "ModelMessage":
-        return cls(role=ModelRole.ASSISTANT, content=[ContentBlock.text(text)])
+        return cls(role=ModelRole.ASSISTANT, content=[ContentBlock.from_text(text)])
 
     @property
     def text(self) -> str:

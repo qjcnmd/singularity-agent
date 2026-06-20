@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from miniharness.observability.redaction import TraceRedactor
+
+
+_COMMAND_REDACTOR = TraceRedactor()
+_SECRET_ARG_FLAG_RE = re.compile(
+    r"^--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)$",
+    re.IGNORECASE,
+)
 
 class CommandPurpose(str, Enum):
     READ_ONLY_COMMAND = "READ_ONLY_COMMAND"
@@ -179,6 +189,35 @@ class CommandRequest:
             return json.dumps(self.argv, ensure_ascii=False)
         return self.shell or ""
 
+    def redacted_display_command(self) -> str:
+        return _COMMAND_REDACTOR.redact_text(self.display_command())
+
+    def command_hash(self) -> str:
+        return _hash_text(self.display_command())
+
+    def redacted_argv(self) -> list[str] | None:
+        return _redacted_argv(self.argv)
+
+    def redacted_shell(self) -> str | None:
+        return _COMMAND_REDACTOR.redact_text(self.shell) if self.shell is not None else None
+
+    def safe_metadata(self) -> dict[str, Any]:
+        return {
+            "command_preview": self.redacted_display_command(),
+            "command_hash": self.command_hash(),
+            "argv": self.redacted_argv(),
+            "shell": self.redacted_shell(),
+            "cwd": self.cwd,
+            "network_policy": self.network_mode.value,
+            "filesystem_mode": self.filesystem_mode.value,
+            "timeout": self.resource_limits.timeout_seconds,
+            "long_running": self.purpose == CommandPurpose.LONG_RUNNING,
+            "risk_acceptance_reason": _COMMAND_REDACTOR.redact_text(
+                self.risk_acceptance_reason or ""
+            )
+            or None,
+        }
+
 
 @dataclass(frozen=True)
 class CommandPolicyResult:
@@ -217,8 +256,10 @@ class CommandPlan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "command_id": self.request.command_id,
-            "argv": self.request.argv,
-            "shell": self.request.shell,
+            "command_preview": self.request.redacted_display_command(),
+            "command_hash": self.request.command_hash(),
+            "argv": self.request.redacted_argv(),
+            "shell": self.request.redacted_shell(),
             "cwd": self.cwd,
             "purpose": self.request.purpose.value,
             "backend": self.backend,
@@ -364,8 +405,10 @@ class ProcessSession:
             "command_id": self.command_id,
             "pid": self.pid,
             "status": self.status,
-            "argv": self.argv,
-            "shell": self.shell,
+            "command_preview": _redacted_command(self.argv, self.shell),
+            "command_hash": _command_hash(self.argv, self.shell),
+            "argv": _redacted_argv(self.argv),
+            "shell": _redacted_shell(self.shell),
             "cwd": self.cwd,
             "started_at": self.started_at,
             "ports": self.ports,
@@ -375,6 +418,44 @@ class ProcessSession:
             "exit_code": self.exit_code,
             "error_code": self.error_code,
         }
+
+
+def _redacted_argv(argv: list[str] | None) -> list[str] | None:
+    if argv is None:
+        return None
+    redacted: list[str] = []
+    redact_next = False
+    for item in argv:
+        text = str(item)
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        redacted_item = _COMMAND_REDACTOR.redact_text(text)
+        redacted.append(redacted_item)
+        if _SECRET_ARG_FLAG_RE.match(text):
+            redact_next = True
+    return redacted
+
+
+def _redacted_shell(shell: str | None) -> str | None:
+    return _COMMAND_REDACTOR.redact_text(shell) if shell is not None else None
+
+
+def _redacted_command(argv: list[str] | None, shell: str | None) -> str:
+    if argv is not None:
+        return _COMMAND_REDACTOR.redact_text(json.dumps(argv, ensure_ascii=False))
+    return _COMMAND_REDACTOR.redact_text(shell or "")
+
+
+def _command_hash(argv: list[str] | None, shell: str | None) -> str:
+    if argv is not None:
+        return _hash_text(json.dumps(argv, ensure_ascii=False))
+    return _hash_text(shell or "")
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

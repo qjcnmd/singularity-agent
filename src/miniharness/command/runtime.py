@@ -47,9 +47,8 @@ from miniharness.policy import (
     ResourceRef,
     RuntimeName,
 )
-from miniharness.policy.audit import redact
+from miniharness.policy.audit import redact, redact_resource_identifier
 from miniharness.sandbox import (
-    SandboxFilesystemMode,
     SandboxResult,
     SandboxRuntime,
     SandboxStatus,
@@ -171,7 +170,7 @@ class CommandRuntime:
         self._emit_trace(
             TraceEventType.COMMAND_REQUESTED,
             request,
-            summary=f"Command requested: {request.display_command()}",
+            summary=f"Command requested: {request.redacted_display_command()}",
             tool_call_id=tool_call_id,
             transaction_id=transaction_id,
         )
@@ -285,7 +284,7 @@ class CommandRuntime:
         self._emit_trace(
             TraceEventType.COMMAND_STARTED,
             request,
-            summary=f"Command started: {request.display_command()}",
+            summary=f"Command started: {request.redacted_display_command()}",
             tool_call_id=tool_call_id,
             transaction_id=transaction_id,
         )
@@ -490,7 +489,7 @@ class CommandRuntime:
             exit_code = self.backend.stop(record.running, reason="stopped")
         after_snapshot = self._capture_workspace_snapshot()
         changed_files = self._changed_files(record.before_snapshot, after_snapshot)
-        side_effects = self._record_command_side_effects(
+        self._record_command_side_effects(
             request=CommandRequest(
                 argv=record.session.argv,
                 shell=record.session.shell,
@@ -856,9 +855,11 @@ class CommandRuntime:
                 "command_id": request.command_id,
                 "tool_call_id": tool_call_id,
                 "transaction_id": transaction_id,
-                "argv": request.argv,
-                "shell": request.shell,
-                "cwd": request.cwd,
+                "command_preview": request.redacted_display_command(),
+                "command_hash": request.command_hash(),
+                "argv": request.redacted_argv(),
+                "shell": request.redacted_shell(),
+                "cwd": redact_resource_identifier(request.cwd),
                 "backend": result.backend,
                 "sandbox_id": sandbox.get("sandbox_id"),
                 "policy_decision": result.policy_decision.decision.value,
@@ -914,8 +915,9 @@ class CommandRuntime:
             summary=summary,
             payload=payload
             or {
-                "command": request.display_command(),
-                "cwd": request.cwd,
+                "command_preview": request.redacted_display_command(),
+                "command_hash": request.command_hash(),
+                "cwd": redact_resource_identifier(request.cwd),
                 "purpose": request.purpose.value,
                 "network_mode": request.network_mode.value,
                 "filesystem_mode": request.filesystem_mode.value,
@@ -1185,19 +1187,11 @@ class CommandRuntime:
             capability=capability,
             subject=PolicySubject(subject_type="runtime", name="CommandRuntime"),
             resource=resource,
-            reason=request.display_command(),
+            reason=request.redacted_display_command(),
             proposed_by_model=True,
             metadata={
-                "command": request.display_command(),
-                "argv": request.argv,
-                "shell": request.shell,
-                "cwd": request.cwd,
+                **request.safe_metadata(),
                 "env_policy": request.env_request,
-                "network_policy": request.network_mode.value,
-                "filesystem_mode": request.filesystem_mode.value,
-                "timeout": request.resource_limits.timeout_seconds,
-                "long_running": request.purpose == CommandPurpose.LONG_RUNNING,
-                "risk_acceptance_reason": request.risk_acceptance_reason,
                 "security_mode": self.policy_runtime.config.security_mode.value,
             },
             requires_network=request.network_mode != NetworkMode.DISABLED,
@@ -1251,9 +1245,9 @@ class CommandRuntime:
                 "outcome": decision.outcome.value,
                 "runtime": policy_request.runtime.value,
                 "operation": policy_request.operation.value,
-                "reason": decision.reason,
+                "reason": redact(decision.reason),
                 "risk_level": decision.risk_level.value,
-                "resource": policy_request.resource.identifier,
+                "resource": redact_resource_identifier(policy_request.resource.identifier),
                 "decision_id": decision.decision_id,
             }
         )
@@ -1270,7 +1264,7 @@ class CommandRuntime:
                     "runtime": request.runtime.value,
                     "operation": request.operation.value,
                     "capability": request.capability.value,
-                    "resource": request.resource.identifier,
+                    "resource": redact_resource_identifier(request.resource.identifier),
                     "outcome": decision.outcome.value,
                     "risk_level": decision.risk_level.value,
                     "risk_tags": [
@@ -1299,7 +1293,7 @@ def _relative_or_absolute(path: Path, root: Path) -> str:
 def _command_policy_shape(
     request: CommandRequest,
 ) -> tuple[OperationKind, Capability, ResourceRef]:
-    command = request.display_command()
+    command = request.redacted_display_command()
     if request.purpose == CommandPurpose.PACKAGE_MANAGER and _looks_like_package_manager(request):
         return (
             OperationKind.PACKAGE_INSTALL,

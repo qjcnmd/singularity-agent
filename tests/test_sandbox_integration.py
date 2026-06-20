@@ -1,6 +1,5 @@
 import sys
 from pathlib import Path
-from typing import Any
 
 from miniharness.command import CommandRequest, CommandRuntime, ExecutionStatus, SemanticStatus
 from miniharness.planner import EvidenceLedger, PlannerRuntime, TaskState, TaskStatus

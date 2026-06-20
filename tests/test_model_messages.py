@@ -13,8 +13,8 @@ from miniharness.model import (
 def test_message_converter_preserves_tool_call_id_and_developer_fallback() -> None:
     converter = MessageConverter()
     messages = [
-        ModelMessage(role=ModelRole.SYSTEM, content=[ContentBlock.text("system")]),
-        ModelMessage(role=ModelRole.DEVELOPER, content=[ContentBlock.text("dev")]),
+        ModelMessage(role=ModelRole.SYSTEM, content=[ContentBlock.from_text("system")]),
+        ModelMessage(role=ModelRole.DEVELOPER, content=[ContentBlock.from_text("dev")]),
         ModelMessage(
             role=ModelRole.TOOL,
             content=[ContentBlock(type=ContentBlockType.TOOL_RESULT, text="result")],
@@ -54,7 +54,7 @@ def test_legacy_chat_adapter_applies_developer_fallback_without_metadata_leak() 
             request_id="req",
             purpose="plan_next_action",
             messages=[
-                ModelMessage(role=ModelRole.DEVELOPER, content=[ContentBlock.text("dev")])
+                ModelMessage(role=ModelRole.DEVELOPER, content=[ContentBlock.from_text("dev")])
             ],
         )
     )

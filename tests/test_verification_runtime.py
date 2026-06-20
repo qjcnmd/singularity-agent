@@ -1,7 +1,6 @@
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
 from miniharness.command import (
     CommandDecision,
@@ -16,7 +15,6 @@ from miniharness.command.models import CommandResult
 from miniharness.context import ContextManager
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.tools.command import register_command_tools
-from miniharness.tools.models import ToolResult
 from miniharness.tools.verification import register_verification_tools
 from miniharness.trace import TraceWriter
 from miniharness.verification import (
@@ -36,8 +34,8 @@ from miniharness.verification import (
     VerificationRuntime,
     WorkspaceKind,
 )
-from miniharness.verification.models import VerificationPlan
 from miniharness.review import ReviewRuntime
+from miniharness.verification.models import DiscoveredCommand, VerificationCheck, VerificationPlan
 from tests.tool_runtime_helpers import runtime_default_policy_runtime
 
 
@@ -154,6 +152,39 @@ testpaths = ["tests"]
     assert "pytest" in profile.test_frameworks
     assert any(command.kind == CheckKind.UNIT_TEST for command in commands)
     assert any(command.kind == CheckKind.LINT for command in commands)
+
+
+def test_verification_command_serialization_redacts_sensitive_arguments() -> None:
+    request = CommandRequest(
+        argv=[
+            "curl",
+            "https://example.test/check?api_key=sk-secret-url",
+            "--token",
+            "sk-secret-arg",
+        ]
+    )
+    discovered = DiscoveredCommand(
+        name="custom",
+        kind=CheckKind.CUSTOM,
+        request=request,
+        source="test",
+    )
+    check = VerificationCheck(
+        kind=CheckKind.CUSTOM,
+        command=request,
+        scope="workspace",
+        required=True,
+        timeout=30.0,
+        risk_tags=["custom"],
+        failure_policy="fail_fast",
+    )
+
+    for payload in (discovered.to_dict(), check.to_dict()):
+        serialized = json.dumps(payload, sort_keys=True)
+        assert "sk-secret" not in serialized
+        assert "<redacted>" in serialized
+        assert payload["command_hash"]
+        assert payload["argv"][-1] == "<redacted>"
 
 
 def test_impact_analysis_handles_docs_source_and_high_risk_files(tmp_path: Path) -> None:

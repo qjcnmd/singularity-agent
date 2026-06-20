@@ -20,8 +20,8 @@ console = Console()
 def memory_list(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
 ) -> None:
-    runtime = _runtime()
-    entries = [entry.to_dict() for entry in runtime.store.load_entries()]
+    runtime = _runtime(read_only=True)
+    entries = [entry.to_dict() for entry in runtime.store.load_entries(rebuild_index=False)]
     _print(entries, json_output=json_output, title="memory entries")
 
 
@@ -29,8 +29,11 @@ def memory_list(
 def memory_candidates(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
 ) -> None:
-    runtime = _runtime()
-    candidates = [candidate.to_dict() for candidate in runtime.store.load_candidates()]
+    runtime = _runtime(read_only=True)
+    candidates = [
+        candidate.to_dict()
+        for candidate in runtime.store.load_candidates(rebuild_index=False)
+    ]
     _print(candidates, json_output=json_output, title="memory candidates")
 
 
@@ -39,8 +42,8 @@ def memory_show(
     memory_id: Annotated[str, typer.Argument(help="Memory entry id.")],
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
 ) -> None:
-    runtime = _runtime()
-    entry = runtime.store.get_entry(memory_id)
+    runtime = _runtime(read_only=True)
+    entry = runtime.store.get_entry(memory_id, rebuild_index=False)
     _print(entry.to_dict(), json_output=json_output, title=f"memory {memory_id}")
 
 
@@ -49,7 +52,7 @@ def memory_search(
     query: Annotated[str, typer.Argument(help="Goal/query text.")],
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
 ) -> None:
-    runtime = _runtime()
+    runtime = _runtime(read_only=True)
     results = [result.to_dict() for result in runtime.retrieve(goal=query)]
     _print(results, json_output=json_output, title="memory search")
 
@@ -86,7 +89,7 @@ def memory_doctor(
     repair: Annotated[bool, typer.Option("--repair", help="Repair refreshable memory issues.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
 ) -> None:
-    runtime = _runtime()
+    runtime = _runtime(read_only=not repair)
     report = runtime.doctor(repair=repair)
     _print(report, json_output=json_output, title="memory doctor")
 
@@ -104,14 +107,18 @@ def memory_refresh(
 def memory_rules_list(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
 ) -> None:
-    runtime = _runtime()
+    runtime = _runtime(read_only=True)
     rules = runtime.list_rules()
     _print(rules, json_output=json_output, title="memory rules")
 
 
-def _runtime() -> MemoryRuntime:
+def _runtime(*, read_only: bool = False) -> MemoryRuntime:
     runtime = MemoryRuntime(Path.cwd())
-    runtime.start_session(session_id="memory_cli", user_goal="memory cli")
+    runtime.start_session(
+        session_id="memory_cli",
+        user_goal="memory cli",
+        rebuild_index=not read_only,
+    )
     return runtime
 
 

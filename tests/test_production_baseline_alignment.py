@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
 from typer.testing import CliRunner
 
 from miniharness.cli import app

@@ -12,7 +12,6 @@ from miniharness.memory.models import (
     MemoryCandidate,
     MemoryEntry,
     MemoryStatus,
-    MemoryType,
     _now,
 )
 
@@ -50,7 +49,7 @@ class MemoryStore:
             rules_dir=self.workspace_root / ".miniharness" / "rules",
         )
 
-    def initialize(self) -> None:
+    def initialize(self, *, rebuild_index: bool = True) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.layout.auto_dir.mkdir(parents=True, exist_ok=True)
         self.layout.human_dir.mkdir(parents=True, exist_ok=True)
@@ -71,25 +70,30 @@ class MemoryStore:
             and _is_template_only(preferences.read_text(encoding="utf-8"))
         ):
             _atomic_write(preferences, legacy_preferences.read_text(encoding="utf-8"))
-        if not self.layout.index_json.exists():
+        if rebuild_index and not self.layout.index_json.exists():
             self.rebuild_index()
 
-    def load_entries(self) -> list[MemoryEntry]:
-        self.initialize()
+    def load_entries(self, *, rebuild_index: bool = True) -> list[MemoryEntry]:
+        self.initialize(rebuild_index=rebuild_index)
         return [MemoryEntry.from_dict(item) for item in _read_jsonl(self.layout.entries_jsonl)]
 
-    def load_candidates(self) -> list[MemoryCandidate]:
-        self.initialize()
+    def load_candidates(self, *, rebuild_index: bool = True) -> list[MemoryCandidate]:
+        self.initialize(rebuild_index=rebuild_index)
         return [MemoryCandidate.from_dict(item) for item in _read_jsonl(self.layout.candidates_jsonl)]
 
-    def get_entry(self, entry_id: str) -> MemoryEntry:
-        for entry in self.load_entries():
+    def get_entry(self, entry_id: str, *, rebuild_index: bool = True) -> MemoryEntry:
+        for entry in self.load_entries(rebuild_index=rebuild_index):
             if entry.id == entry_id:
                 return entry
         raise KeyError(entry_id)
 
-    def get_candidate(self, candidate_id: str) -> MemoryCandidate:
-        for candidate in self.load_candidates():
+    def get_candidate(
+        self,
+        candidate_id: str,
+        *,
+        rebuild_index: bool = True,
+    ) -> MemoryCandidate:
+        for candidate in self.load_candidates(rebuild_index=rebuild_index):
             if candidate.id == candidate_id:
                 return candidate
         raise KeyError(candidate_id)

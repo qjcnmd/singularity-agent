@@ -9,7 +9,6 @@ from miniharness.edit.models import (
     EditOperation,
     EditOperationKind,
     EditPlan,
-    EditStrategyKind,
     PatchCandidate,
 )
 from miniharness.workspace.operations import (

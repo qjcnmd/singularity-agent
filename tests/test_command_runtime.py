@@ -355,11 +355,14 @@ def test_destructive_command_is_denied(tmp_path: Path) -> None:
 
 def test_long_running_process_can_start_read_stop_and_list(tmp_path: Path) -> None:
     runtime = compat_command_runtime(tmp_path)
+    secret = "process-secret-value"
     request = CommandRequest(
         argv=[
             sys.executable,
             "-c",
             "import sys, time; print('ready'); sys.stdout.flush(); time.sleep(20)",
+            "--token",
+            secret,
         ],
         cwd=".",
         purpose=CommandPurpose.LONG_RUNNING,
@@ -375,11 +378,16 @@ def test_long_running_process_can_start_read_stop_and_list(tmp_path: Path) -> No
             output = runtime.read_process_output(session.process_id).combined_output
 
         listed = runtime.list_processes()
+        session_payload = session.to_dict()
+        listed_payload = [item.to_dict() for item in listed]
 
         assert session.process_id
         assert session.status == "running"
         assert "ready" in output
         assert any(item.process_id == session.process_id for item in listed)
+        assert secret not in json.dumps(session_payload)
+        assert secret not in json.dumps(listed_payload)
+        assert session_payload["argv"][-1] == "<redacted>"
     finally:
         stopped = runtime.stop_process(session.process_id)
 
@@ -458,6 +466,8 @@ def test_command_trace_records_full_audit_event(tmp_path: Path) -> None:
     assert audit["command_id"] == result.command_id
     assert audit["tool_call_id"] == "call_audit"
     assert audit["transaction_id"] == "tx_audit"
+    assert audit["command_preview"]
+    assert audit["command_hash"]
     assert audit["argv"] == [sys.executable, "-c", "print('audit')"]
     assert audit["backend"] == "local_process"
     assert audit["policy_decision"] == "allow"
@@ -470,6 +480,39 @@ def test_command_trace_records_full_audit_event(tmp_path: Path) -> None:
     assert audit["isolation_report"]["network_isolation_enforced"] is False
     assert "git_before" in audit
     assert "git_after" in audit
+
+
+def test_command_trace_redacts_sensitive_argv_and_url_query(tmp_path: Path) -> None:
+    trace = TraceWriter.create(tmp_path)
+    runtime = compat_command_runtime(tmp_path, trace=trace)
+    secret = "plain-secret-value"
+    query_secret = "query-secret-value"
+
+    result = runtime.run(
+        CommandRequest(
+            argv=[
+                sys.executable,
+                "-c",
+                "pass",
+                "--token",
+                secret,
+                f"https://example.test/callback?api_key={query_secret}",
+            ],
+            cwd=".",
+            purpose=CommandPurpose.READ_ONLY_COMMAND,
+        ),
+        tool_call_id="call_secret_args",
+    )
+
+    assert result.exit_code == 0
+    trace_text = trace.path.read_text(encoding="utf-8")
+    assert secret not in trace_text
+    assert query_secret not in trace_text
+    events = [json.loads(line) for line in trace_text.splitlines()]
+    audit = [event for event in events if event["event"] == "command"][-1]["data"]
+    assert audit["argv"][4] == "<redacted>"
+    assert "api_key=<redacted>" in audit["argv"][5]
+    assert audit["command_hash"]
 
 
 def test_run_command_tool_is_registered_and_uses_command_runtime(tmp_path: Path) -> None:

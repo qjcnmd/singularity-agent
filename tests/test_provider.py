@@ -1,5 +1,6 @@
 from typing import Any
 
+import httpx
 import pytest
 
 from miniharness.config import Settings
@@ -40,6 +41,28 @@ class FakeClient:
         return FakeResponse()
 
 
+class FakeErrorResponse:
+    status_code = 401
+    text = '{"error":"OPENAI_API_KEY=sk-secret-provider-body"}'
+
+    def raise_for_status(self) -> None:
+        request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+        response = httpx.Response(self.status_code, text=self.text, request=request)
+        raise httpx.HTTPStatusError("auth failed", request=request, response=response)
+
+
+class FakeErrorClient(FakeClient):
+    def post(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, Any],
+    ) -> FakeErrorResponse:
+        self.payloads.append(json)
+        return FakeErrorResponse()
+
+
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
@@ -66,3 +89,25 @@ def test_provider_chat_passes_tool_choice(
     provider.chat(messages=[{"role": "user", "content": "hi"}], tools=[], tool_choice=mode)
 
     assert FakeClient.payloads[0]["tool_choice"] == expected
+
+
+def test_provider_http_error_does_not_echo_response_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeErrorClient.payloads = []
+    monkeypatch.setattr("miniharness.provider.httpx.Client", FakeErrorClient)
+    provider = OpenAICompatibleProvider(
+        Settings(
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            model="test-model",
+        )
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        provider.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    message = str(exc.value)
+    assert "HTTP 401" in message
+    assert "sk-secret-provider-body" not in message
+    assert "OPENAI_API_KEY" not in message

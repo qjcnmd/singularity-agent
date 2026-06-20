@@ -64,7 +64,7 @@ class MessageConverter:
         role = ModelRole(payload.get("role") or ModelRole.USER.value)
         return ModelMessage(
             role=role,
-            content=[ContentBlock.text("" if content is None else str(content))],
+            content=[ContentBlock.from_text("" if content is None else str(content))],
             name=payload.get("name"),
             tool_call_id=payload.get("tool_call_id"),
             metadata={key: value for key, value in payload.items() if key not in {"role", "content", "name", "tool_call_id"}},

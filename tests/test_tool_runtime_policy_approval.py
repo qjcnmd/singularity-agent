@@ -9,7 +9,6 @@ from miniharness.policy import (
     ApprovalGate,
     ApprovalGrant,
     ApprovalMode,
-    Capability,
     DecisionOutcome,
     PolicyConfig,
     PolicyDecision,

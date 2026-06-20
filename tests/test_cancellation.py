@@ -13,7 +13,6 @@ from miniharness.kernel.exceptions import CancellationError
 from miniharness.kernel.models import CancellationReason
 from miniharness.model import MockModelProvider, ModelRuntime, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResult, ModelTurnStatus
 from miniharness.planner import PlannerRuntime
-from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime
 from miniharness.review import ReviewRuntime
 from miniharness.sandbox import SandboxRuntime
 from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime

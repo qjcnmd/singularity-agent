@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 from typing import Iterable
 
 from miniharness.memory.models import (
-    Confidence,
     MemoryAuthorType,
     MemoryEntry,
     MemoryQuery,

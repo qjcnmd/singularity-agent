@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from miniharness.context import ContextManager
-from miniharness.model import ModelCapabilities, ModelMessage, ModelRole, ModelTurnResult, ModelTurnStatus
+from miniharness.model import ModelCapabilities, ModelRole, ModelTurnResult
 from miniharness.observability.models import TraceSeverity
 from miniharness.planner import PlannerRuntime
 from miniharness.policy import PolicyRuntime
@@ -14,7 +14,6 @@ from miniharness.tool_protocol.models import (
     ToolCallEnvelope,
     ToolCallFailureKind,
     ToolCallPhase,
-    ToolExecutionMode,
     ToolExecutionPlan,
     ToolProtocolResultEnvelope,
     ToolProtocolTurnResult,
@@ -576,7 +575,7 @@ class ToolCallingProtocolRuntime:
         *,
         content_digest: str | None = None,
     ) -> bool:
-        for message in context.messages():
+        for message in context.messages(persist=False):
             if message.get("role") != "tool" or message.get("tool_call_id") != tool_call_id:
                 continue
             if content_digest is None:

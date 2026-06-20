@@ -108,7 +108,7 @@ def test_openai_compatible_model_provider_serializes_runtime_request(
             messages=[
                 ModelMessage(
                     role=ModelRole.USER,
-                    content=[ContentBlock.text("hi")],
+                    content=[ContentBlock.from_text("hi")],
                 )
             ],
             tool_choice=ToolChoicePolicy(mode=ToolChoiceMode.NONE),
@@ -144,7 +144,7 @@ def test_openai_provider_error_does_not_include_response_body(
                 messages=[
                     ModelMessage(
                         role=ModelRole.USER,
-                        content=[ContentBlock.text("hi")],
+                        content=[ContentBlock.from_text("hi")],
                     )
                 ],
             )

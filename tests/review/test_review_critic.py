@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from miniharness.model import ModelMessage, ModelTurnResult, ModelTurnStatus
-from miniharness.review import ModelCritic, ReviewCategory, ReviewFinding, ReviewReport, ReviewStage, ReviewTarget
+from miniharness.review import ModelCritic, ReviewCategory, ReviewReport, ReviewStage, ReviewTarget
 
 
 class FakeModelRuntime:

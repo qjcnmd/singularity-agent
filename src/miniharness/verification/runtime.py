@@ -14,8 +14,6 @@ from miniharness.command import (
     CommandPolicyResult,
     CommandRisk,
     ExecutionStatus,
-    FilesystemMode,
-    ResourceLimits,
     SemanticStatus,
 )
 from miniharness.policy import (
@@ -469,7 +467,8 @@ class VerificationRuntime:
                 "verification_plan_id": plan.id,
                 "verification_check_id": check.id,
                 "check_kind": check.kind.value,
-                "command": check.command.display_command(),
+                "command": check.command.redacted_display_command(),
+                "command_hash": check.command.command_hash(),
                 "transaction_id": plan.transaction_id,
                 "changeset_id": plan.changeset_id,
             },
@@ -548,7 +547,7 @@ class VerificationRuntime:
         plan: VerificationPlan,
         check: VerificationCheck,
     ) -> PolicyRequest:
-        command = check.command.display_command() if check.command else check.kind.value
+        command = check.command.redacted_display_command() if check.command else check.kind.value
         return PolicyRequest(
             session_id=getattr(self.planner, "session_id", "verification_session"),
             task_id=getattr(self.planner, "task_id", "verification_task"),
@@ -580,7 +579,7 @@ class VerificationRuntime:
     ) -> VerificationResult:
         evidence = VerificationEvidence(
             command_id=None,
-            command=check.command.display_command() if check.command else None,
+            command=check.command.redacted_display_command() if check.command else None,
             exit_code=None,
             output_excerpt=decision.reason,
             artifact_path=None,
@@ -680,7 +679,7 @@ class VerificationRuntime:
         status = self._status_from_command(command_result, failure_type)
         evidence = VerificationEvidence(
             command_id=command_result.command_id,
-            command=check.command.display_command() if check.command else None,
+            command=check.command.redacted_display_command() if check.command else None,
             exit_code=command_result.exit_code,
             output_excerpt=_excerpt(output),
             artifact_path=command_result.artifact_path,
@@ -759,7 +758,7 @@ class VerificationRuntime:
     def _blocked_result(self, check: VerificationCheck) -> VerificationResult:
         evidence = VerificationEvidence(
             command_id=None,
-            command=check.command.display_command() if check.command else None,
+            command=check.command.redacted_display_command() if check.command else None,
             exit_code=None,
             output_excerpt=check.skip_reason or "Check blocked.",
             artifact_path=None,

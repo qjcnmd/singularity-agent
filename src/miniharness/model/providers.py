@@ -65,7 +65,7 @@ class ProviderResponse:
         content = message_payload.get("content")
         message = ModelMessage(
             role=ModelRole.ASSISTANT,
-            content=[ContentBlock.text("" if content is None else str(content))],
+            content=[ContentBlock.from_text("" if content is None else str(content))],
             metadata={
                 key: value
                 for key, value in message_payload.items()

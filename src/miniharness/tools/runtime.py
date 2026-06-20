@@ -19,7 +19,6 @@ from miniharness.policy import (
     Capability,
     DecisionOutcome,
     OperationKind,
-    PolicyConfig,
     PolicyDecision,
     PolicyRequest,
     PolicyRuntime,

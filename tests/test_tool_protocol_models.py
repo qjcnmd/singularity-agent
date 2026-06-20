@@ -8,7 +8,6 @@ from miniharness.tool_protocol.models import (
     ToolExecutionMode,
     ToolExecutionPlan,
     ToolProtocolRecoveryReport,
-    ToolProtocolResultEnvelope,
     ToolProtocolTurnResult,
     ToolProtocolTurnStatus,
     ToolProtocolValidationResult,

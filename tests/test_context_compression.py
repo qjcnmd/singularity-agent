@@ -151,4 +151,4 @@ def test_context_manager_rejects_invalid_compression_response(tmp_path) -> None:
     context.add_assistant_message({"role": "assistant", "content": "history " * 200})
 
     with pytest.raises(ContextSummaryValidationError):
-        context.messages()
+        context.messages(persist=True)
