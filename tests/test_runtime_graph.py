@@ -4,6 +4,7 @@ from pathlib import Path
 
 from miniharness.config import ProductionRuntimeConfig
 from miniharness.kernel.graph import RuntimeFactory, RuntimeGraph
+from miniharness.kernel.health import RuntimeHealthChecker
 from miniharness.kernel.models import RuntimeComponentName, RuntimeComponentState, RunIdentity
 from miniharness.observability import TraceRuntime
 
@@ -41,6 +42,7 @@ def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, 
         RuntimeComponentName.TOOL_PROTOCOL,
         RuntimeComponentName.VERIFICATION,
         RuntimeComponentName.REVIEW,
+        RuntimeComponentName.EVALUATION,
         RuntimeComponentName.INSTRUCTIONS,
         RuntimeComponentName.MODEL,
         RuntimeComponentName.CONTEXT,
@@ -53,9 +55,29 @@ def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, 
     assert graph.components_for_health()["memory"] is graph.memory_runtime
     assert graph.edit_runtime is not None
     assert graph.review_runtime is not None
+    assert graph.evaluation_runtime is not None
     assert graph.edit_runtime.review_runtime is graph.review_runtime
     assert graph.verification_runtime.review_runtime is graph.review_runtime
     assert graph.review_runtime.memory_runtime is graph.memory_runtime
     assert graph.verification_runtime.memory_runtime is graph.memory_runtime
+    assert graph.evaluation_runtime.verification_runtime is graph.verification_runtime
+    assert graph.evaluation_runtime.memory_runtime is graph.memory_runtime
+    assert graph.evaluation_runtime.planner_runtime is graph.planner
+    assert graph.components_for_health()["evaluation"] is graph.evaluation_runtime
     assert graph.model_runtime is not None
     assert graph.tool_runtime is not None
+
+
+def test_runtime_health_reports_missing_evaluation_as_critical() -> None:
+    components = {component.value: object() for component in RuntimeComponentName}
+    components[RuntimeComponentName.EVALUATION.value] = None
+
+    report = RuntimeHealthChecker().check(components)
+
+    assert report.ok is False
+    assert report.summary["evaluation"] == "missing"
+    assert {
+        "component": "evaluation",
+        "status": "missing",
+        "critical": True,
+    } in report.diagnostics

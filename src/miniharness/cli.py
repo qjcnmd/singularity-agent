@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -9,12 +10,22 @@ from rich.panel import Panel
 
 from miniharness.code_index import ProjectIndexRuntime
 from miniharness.config import ProductionRuntimeConfig
+from miniharness.evaluation import (
+    EvaluationProfile,
+    EvaluationRuntime,
+    GoldenTaskStore,
+    RegressionDetector,
+    TraceReplayRuntime,
+)
 from miniharness.interaction import RichCliRenderer
 from miniharness.kernel import CancellationError, KernelBootstrap
 from miniharness.memory.cli import memory_app
 from miniharness.observability import TraceRedactor, TraceRuntime, TraceStore
-from miniharness.policy import ApprovalMode, SecurityMode
+from miniharness.command import CommandRuntime
+from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
 from miniharness.planner import PlannerRuntime
+from miniharness.sandbox import SandboxRuntime
+from miniharness.verification import VerificationRuntime
 from miniharness.workspace_state import (
     WorkspaceHealthReport,
 )
@@ -27,9 +38,24 @@ app = typer.Typer(
 )
 trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
 index_app = typer.Typer(add_completion=False, no_args_is_help=True)
+eval_app = typer.Typer(add_completion=False, no_args_is_help=True)
+eval_task_app = typer.Typer(add_completion=False, no_args_is_help=True)
+eval_suite_app = typer.Typer(add_completion=False, no_args_is_help=True)
+eval_trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
+eval_ab_app = typer.Typer(add_completion=False, no_args_is_help=True)
+eval_regression_app = typer.Typer(add_completion=False, no_args_is_help=True)
+eval_report_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 app.add_typer(index_app, name="index")
 app.add_typer(memory_app, name="memory")
+app.add_typer(eval_app, name="eval")
+app.add_typer(eval_app, name="benchmark")
+eval_app.add_typer(eval_task_app, name="task")
+eval_app.add_typer(eval_suite_app, name="suite")
+eval_app.add_typer(eval_trace_app, name="trace")
+eval_app.add_typer(eval_ab_app, name="ab")
+eval_app.add_typer(eval_regression_app, name="regression")
+eval_app.add_typer(eval_report_app, name="report")
 console = Console()
 _REDACTOR = TraceRedactor()
 
@@ -374,9 +400,374 @@ def index_tests(
 def _print_index_payload(payload: object, *, json_output: bool, title: str) -> None:
     text = json_dumps(payload)
     if json_output:
-        console.print(text)
+        _write_stdout(text)
         return
     console.print(Panel(text, title=title, border_style="cyan"))
+
+
+@eval_task_app.command("validate")
+def eval_task_validate(
+    task_set: Annotated[Path, typer.Argument(help="Golden task set JSON/YAML path.")],
+    version: Annotated[str | None, typer.Option("--version", help="Only validate this task version.")] = None,
+    tag: Annotated[
+        list[str] | None,
+        typer.Option("--tag", help="Require a tag; repeat for multiple tags."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    """Validate a local Golden Task Set document."""
+
+    tasks = GoldenTaskStore(task_set).load(version=version, tags=tag or None)
+    payload = {"task_count": len(tasks), "task_ids": [task.task_id for task in tasks]}
+    _print_eval_payload(payload, json_output=json_output, title="evaluation task validation")
+
+
+@eval_task_app.command("list")
+def eval_task_list(
+    task_set: Annotated[Path, typer.Argument(help="Golden task set JSON/YAML path.")],
+    version: Annotated[str | None, typer.Option("--version", help="Only list this task version.")] = None,
+    tag: Annotated[
+        list[str] | None,
+        typer.Option("--tag", help="Require a tag; repeat for multiple tags."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    """List Golden Task Set tasks with optional version/tag filters."""
+
+    tasks = GoldenTaskStore(task_set).load(version=version, tags=tag or None)
+    payload = {
+        "tasks": [
+            {
+                "task_id": task.task_id,
+                "version": task.version,
+                "title": task.title,
+                "tags": task.tags,
+            }
+            for task in tasks
+        ]
+    }
+    _print_eval_payload(payload, json_output=json_output, title="evaluation tasks")
+
+
+@eval_suite_app.command("run")
+def eval_suite_run(
+    task_set: Annotated[Path, typer.Argument(help="Golden task set JSON/YAML path.")],
+    profile_json: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--profile-json",
+            help="EvaluationProfile JSON object; repeat for A/B or multi-profile runs.",
+        ),
+    ] = None,
+    trace_run_dir: Annotated[
+        Path | None,
+        typer.Option("--trace-run-dir", help="Existing trace run directory to replay."),
+    ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Evaluation output root; defaults to work/evaluations."),
+    ] = None,
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Stable evaluation run id.")] = None,
+    execute: Annotated[
+        bool,
+        typer.Option(
+            "--execute/--no-execute",
+            help=(
+                "Run executable hooks/tests through CommandRuntime and "
+                "VerificationRuntime. Defaults to deterministic offline scoring."
+            ),
+        ),
+    ] = False,
+    version: Annotated[str | None, typer.Option("--version", help="Only run this task version.")] = None,
+    tag: Annotated[
+        list[str] | None,
+        typer.Option("--tag", help="Require a tag; repeat for multiple tags."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print report JSON.")] = False,
+) -> None:
+    """Run a benchmark suite against one or more fixed profiles."""
+
+    tasks = GoldenTaskStore(task_set).load(version=version, tags=tag or None)
+    profiles = _profiles_from_cli(profile_json)
+    runtime = _evaluation_runtime_from_cli(
+        project_root=Path.cwd(),
+        output_root=output_dir,
+        run_id=run_id,
+        execute=execute,
+    )
+    report = runtime.run_suite(
+        tasks=tasks,
+        profiles=profiles,
+        trace_run_dir=trace_run_dir,
+        run_id=run_id,
+        write_report=True,
+        execute=execute,
+    )
+    _print_report(report, json_output=json_output)
+
+
+@eval_trace_app.command("replay")
+def eval_trace_replay(
+    trace_run_dir: Annotated[Path, typer.Argument(help="Existing trace run directory.")],
+    profile_json: Annotated[
+        str | None,
+        typer.Option("--profile-json", help="EvaluationProfile JSON object."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    """Replay a stored trace deterministically under a fixed evaluation profile."""
+
+    profile = _profiles_from_cli([profile_json] if profile_json else None)[0]
+    result = TraceReplayRuntime(project_root=Path.cwd()).replay(trace_run_dir, profile=profile)
+    _print_eval_payload(result.to_dict(), json_output=json_output, title="trace replay")
+
+
+@eval_ab_app.command("run")
+def eval_ab_run(
+    task_set: Annotated[Path, typer.Argument(help="Golden task set JSON/YAML path.")],
+    baseline_profile_json: Annotated[
+        str,
+        typer.Option("--baseline-profile-json", help="Baseline EvaluationProfile JSON object."),
+    ],
+    candidate_profile_json: Annotated[
+        str,
+        typer.Option("--candidate-profile-json", help="Candidate EvaluationProfile JSON object."),
+    ],
+    trace_run_dir: Annotated[
+        Path | None,
+        typer.Option("--trace-run-dir", help="Existing trace run directory to replay."),
+    ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Evaluation output root; defaults to work/evaluations."),
+    ] = None,
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Stable evaluation run id.")] = None,
+    execute: Annotated[
+        bool,
+        typer.Option(
+            "--execute/--no-execute",
+            help=(
+                "Run executable hooks/tests through CommandRuntime and "
+                "VerificationRuntime. Defaults to deterministic offline scoring."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print report JSON.")] = False,
+) -> None:
+    """Run an A/B evaluation for model, prompt, memory, or tool-policy profiles."""
+
+    import json
+
+    baseline = EvaluationProfile.from_dict(json.loads(baseline_profile_json))
+    candidate = EvaluationProfile.from_dict(json.loads(candidate_profile_json))
+    runtime = _evaluation_runtime_from_cli(
+        project_root=Path.cwd(),
+        output_root=output_dir,
+        run_id=run_id,
+        execute=execute,
+    )
+    report = runtime.run_ab(
+        tasks=GoldenTaskStore(task_set).load(),
+        baseline=baseline,
+        candidate=candidate,
+        trace_run_dir=trace_run_dir,
+        run_id=run_id,
+        write_report=True,
+        execute=execute,
+    )
+    _print_report(report, json_output=json_output)
+
+
+@eval_regression_app.command("run")
+def eval_regression_run(
+    task_set: Annotated[Path, typer.Argument(help="Golden task set JSON/YAML path.")],
+    baseline_profile_json: Annotated[
+        str,
+        typer.Option("--baseline-profile-json", help="Baseline EvaluationProfile JSON object."),
+    ],
+    candidate_profile_json: Annotated[
+        str,
+        typer.Option("--candidate-profile-json", help="Candidate EvaluationProfile JSON object."),
+    ],
+    trace_run_dir: Annotated[
+        Path | None,
+        typer.Option("--trace-run-dir", help="Existing trace run directory to replay."),
+    ] = None,
+    threshold: Annotated[
+        float,
+        typer.Option("--threshold", min=0.0, max=1.0, help="Regression threshold."),
+    ] = 0.05,
+    block_on_regression: Annotated[
+        bool,
+        typer.Option("--block-on-regression", help="Exit non-zero if regressions exceed threshold."),
+    ] = False,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Evaluation output root; defaults to work/evaluations."),
+    ] = None,
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Stable evaluation run id.")] = None,
+    execute: Annotated[
+        bool,
+        typer.Option(
+            "--execute/--no-execute",
+            help=(
+                "Run executable hooks/tests through CommandRuntime and "
+                "VerificationRuntime. Defaults to deterministic offline scoring."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print regression report JSON.")] = False,
+) -> None:
+    """Compare a candidate profile against a baseline benchmark report."""
+
+    import json
+
+    baseline = EvaluationProfile.from_dict(json.loads(baseline_profile_json))
+    candidate = EvaluationProfile.from_dict(json.loads(candidate_profile_json))
+    runtime = _evaluation_runtime_from_cli(
+        project_root=Path.cwd(),
+        output_root=output_dir,
+        run_id=run_id,
+        execute=execute,
+    )
+    report = runtime.run_ab(
+        tasks=GoldenTaskStore(task_set).load(),
+        baseline=baseline,
+        candidate=candidate,
+        trace_run_dir=trace_run_dir,
+        run_id=run_id,
+        write_report=True,
+        execute=execute,
+    )
+    regression = RegressionDetector().compare(
+        report.profile_reports[0],
+        report.profile_reports[1],
+        threshold=threshold,
+        block_on_regression=block_on_regression,
+    )
+    runtime.write_regression_report(run_id=report.run_id, regression=regression)
+    _print_eval_payload(
+        regression.to_dict() if json_output else regression.to_markdown(),
+        json_output=json_output,
+        title="regression report",
+    )
+    if regression.blocking:
+        raise typer.Exit(2)
+
+
+@eval_report_app.command("show")
+def eval_report_show(
+    report_path: Annotated[Path, typer.Argument(help="Evaluation report JSON or Markdown path.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print raw JSON for JSON reports.")] = False,
+) -> None:
+    """Show an evaluation report generated by a suite, A/B, or regression run."""
+
+    if report_path.suffix.lower() == ".json":
+        text = report_path.read_text(encoding="utf-8")
+        if json_output:
+            _write_stdout(text)
+            return
+        console.print(Panel(text, title="evaluation report", border_style="cyan"))
+        return
+    console.print(report_path.read_text(encoding="utf-8"))
+
+
+def _profiles_from_cli(profile_json: list[str] | None) -> list[EvaluationProfile]:
+    import json
+
+    if not profile_json:
+        return [
+            EvaluationProfile(
+                name="baseline",
+                model="default",
+                prompt_profile="default",
+                memory_enabled=True,
+                allowed_tools=[],
+                tool_policy="read_write",
+            )
+        ]
+    return [EvaluationProfile.from_dict(json.loads(item)) for item in profile_json if item]
+
+
+class _NoopTrace:
+    def emit(self, *args, **kwargs) -> None:
+        return None
+
+    def record(self, *args, **kwargs) -> None:
+        return None
+
+    def append(self, *args, **kwargs) -> None:
+        return None
+
+
+def _evaluation_runtime_from_cli(
+    *,
+    project_root: Path,
+    output_root: Path | None,
+    run_id: str | None,
+    execute: bool,
+) -> EvaluationRuntime:
+    if not execute:
+        return EvaluationRuntime(project_root=project_root, output_root=output_root)
+    root = output_root or (project_root / "work" / "evaluations")
+    audit_root = root / (run_id or "cli_execute")
+    policy_runtime = PolicyRuntime(
+        PolicyConfig(
+            workspace_root=project_root,
+            approval_mode=ApprovalMode.NON_INTERACTIVE,
+            security_mode=SecurityMode.STRICT,
+            audit_log_path=audit_root / "policy-audit.jsonl",
+        )
+    )
+    sandbox_runtime = SandboxRuntime(
+        project_root,
+        trace=_NoopTrace(),
+        security_mode=SecurityMode.STRICT,
+    )
+    command_runtime = CommandRuntime(
+        project_root,
+        trace=None,
+        policy_runtime=policy_runtime,
+        sandbox_runtime=sandbox_runtime,
+    )
+    verification_runtime = VerificationRuntime(
+        project_root,
+        command_runtime=command_runtime,
+        trace=None,
+        policy_runtime=policy_runtime,
+    )
+    return EvaluationRuntime(
+        project_root=project_root,
+        output_root=output_root,
+        verification_runtime=verification_runtime,
+        command_runtime=command_runtime,
+    )
+
+
+def _print_report(report, *, json_output: bool) -> None:
+    if json_output:
+        _write_stdout(report.to_json())
+        return
+    console.print(report.to_markdown())
+    if report.output_dir is not None:
+        console.print(f"report: {report.output_dir}")
+
+
+def _print_eval_payload(payload: object, *, json_output: bool, title: str) -> None:
+    if isinstance(payload, str):
+        text = payload
+    else:
+        text = json_dumps(payload)
+    if json_output:
+        _write_stdout(text)
+        return
+    console.print(Panel(text, title=title, border_style="cyan"))
+
+
+def _write_stdout(text: str) -> None:
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
 
 
 @trace_app.command("list")

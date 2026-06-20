@@ -10,6 +10,7 @@ from miniharness.code_index import ProjectIndexRuntime
 from miniharness.edit import EditRuntime
 from miniharness.agent import SYSTEM_PROMPT
 from miniharness.context import ContextManager
+from miniharness.evaluation import EvaluationRuntime
 from miniharness.instructions import InstructionRuntime
 from miniharness.interaction import InteractionMode, InteractionRuntime
 from miniharness.model import (
@@ -61,6 +62,7 @@ RUNTIME_INITIALIZATION_ORDER = [
     RuntimeComponentName.TOOL_PROTOCOL,
     RuntimeComponentName.VERIFICATION,
     RuntimeComponentName.REVIEW,
+    RuntimeComponentName.EVALUATION,
     RuntimeComponentName.INSTRUCTIONS,
     RuntimeComponentName.MODEL,
     RuntimeComponentName.CONTEXT,
@@ -85,6 +87,7 @@ class RuntimeGraph:
     tools: ToolRegistry
     verification_runtime: VerificationRuntime
     review_runtime: ReviewRuntime
+    evaluation_runtime: EvaluationRuntime
     instruction_runtime: InstructionRuntime
     model_runtime: ModelRuntime
     context_manager: ContextManager
@@ -124,6 +127,7 @@ class RuntimeGraph:
             "tool_protocol": self.protocol_runtime,
             "verification": self.verification_runtime,
             "review": self.review_runtime,
+            "evaluation": self.evaluation_runtime,
             "instructions": self.instruction_runtime,
             "model": self.model_runtime,
             "context": self.context_manager,
@@ -281,6 +285,18 @@ class RuntimeFactory:
             verification_runtime.memory_runtime = memory_runtime
             mark(RuntimeComponentName.REVIEW)
 
+            evaluation_runtime = EvaluationRuntime(
+                project_root=project_root,
+                trace_runtime=trace,
+                verification_runtime=verification_runtime,
+                memory_runtime=memory_runtime,
+                planner_runtime=None,
+                tool_runtime=tool_runtime,
+                command_runtime=command_runtime,
+                mutation_runtime=mutation_runtime,
+            )
+            mark(RuntimeComponentName.EVALUATION)
+
             instruction_runtime = InstructionRuntime(workspace_root=project_root, trace=trace)
             mark(RuntimeComponentName.INSTRUCTIONS)
 
@@ -338,6 +354,7 @@ class RuntimeFactory:
             verification_runtime.planner = planner
             edit_runtime.planner = planner
             review_runtime.planner = planner
+            evaluation_runtime.planner_runtime = planner
             tool_runtime.planner = planner
             index_observation = project_index_runtime.observation_for_goal(user_goal)
             context_manager.add_project_index(index_observation)
@@ -357,6 +374,7 @@ class RuntimeFactory:
                 verification_runtime,
                 edit_runtime,
                 review_runtime,
+                evaluation_runtime,
                 tool_runtime,
                 protocol_runtime,
                 context_manager,
@@ -380,6 +398,7 @@ class RuntimeFactory:
                 tools=tools,
                 verification_runtime=verification_runtime,
                 review_runtime=review_runtime,
+                evaluation_runtime=evaluation_runtime,
                 instruction_runtime=instruction_runtime,
                 model_runtime=model_runtime,
                 context_manager=context_manager,

@@ -70,6 +70,7 @@ class RuntimeComponentName(str, Enum):
     TOOL_PROTOCOL = "tool_protocol"
     VERIFICATION = "verification"
     REVIEW = "review"
+    EVALUATION = "evaluation"
     INSTRUCTIONS = "instructions"
     MODEL = "model"
     CONTEXT = "context"

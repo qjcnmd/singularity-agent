@@ -24,6 +24,7 @@ DEFAULT_HEALTH_COMPONENTS = [
     RuntimeComponentName.TOOL_PROTOCOL,
     RuntimeComponentName.VERIFICATION,
     RuntimeComponentName.REVIEW,
+    RuntimeComponentName.EVALUATION,
     RuntimeComponentName.INSTRUCTIONS,
     RuntimeComponentName.MODEL,
     RuntimeComponentName.CONTEXT,
