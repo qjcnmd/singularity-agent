@@ -78,6 +78,20 @@ miniharness trace errors <run_id> --trace-dir work/traces/runs
 miniharness trace artifacts <run_id> --trace-dir work/traces/runs
 ```
 
+Evaluation and benchmark commands:
+
+```bash
+miniharness eval task validate golden.json --json
+miniharness eval task list golden.json --version v1 --tag tool-heavy
+miniharness eval trace replay work/traces/runs/<run_id>
+miniharness eval suite run golden.json --trace-run-dir work/traces/runs/<run_id>
+miniharness eval ab run golden.json --baseline-profile-json "{}" --candidate-profile-json "{}"
+miniharness eval regression run golden.json --baseline-profile-json "{}" --candidate-profile-json "{}"
+miniharness eval report show work/evaluations/<eval_run_id>/report.md
+```
+
+`benchmark` is an alias for `eval`. Suite, A/B, and regression commands default to deterministic offline scoring and trace replay; pass `--execute` to run declared hooks/tests through the runtime boundaries. Reports are written to `work/evaluations/<run_id>/` by default. See `docs/evaluation-runtime.md` for the Benchmark Task schema, trace replay semantics, scoring fields, A/B profiles, and regression report format.
+
 ## Approval Modes
 
 `PolicyRuntime` is the only runtime permission decision source. `ApprovalGate` resolves decisions that require local review.
@@ -107,6 +121,8 @@ The CLI assembles `PlannerRuntime`, `ModelRuntime`, `ToolRuntime`, `ToolCallingP
 `ToolRuntime` requires the session `PolicyRuntime`. It validates schemas and runtime boundaries, enforces policy decisions, resolves local approval grants, blocks dry-run side effects, executes the registered handler only after those gates pass, and records redacted structured trace events.
 
 Mutation, command, and verification tools are registered through their dedicated runtimes. Verification command discovery uses `python -m pytest tests --basetemp work/pytest-tmp` for this repository shape.
+
+`EvaluationRuntime` is an orchestration runtime for local benchmark management, trace replay classification, scoring, A/B evaluation, regression detection, and report writing. It only runs executable hooks/tests or materializes inline snapshots when explicitly requested, and those actions remain behind `CommandRuntime`, `VerificationRuntime`, `MutationRuntime`, `ToolRuntime`, `MemoryRuntime`, `PlannerRuntime`, and trace boundaries.
 
 ## Protocol, Context, And Trace State
 
@@ -149,6 +165,7 @@ Current safety boundaries:
 - Commands must go through `CommandRuntime`.
 - Verification must go through `VerificationRuntime`.
 - Workspace state is tracked by `WorkspaceStateRuntime`.
+- Evaluation outputs are local files under `work/evaluations/` unless explicitly redirected.
 - Dry-run blocks real side effects before handlers run.
 - Strict mode tightens schema and protocol expectations.
 - Secret-like content is not rendered into model context and is not written as raw trace/artifact payload.
