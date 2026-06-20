@@ -9,6 +9,7 @@ PolicyRuntime
   -> sandbox_required decision and constraints
   -> CommandRuntime
   -> SandboxRuntime
+  -> DockerSandboxBackend when available and required
   -> LocalStagingBackend
   -> copy-on-write workspace
   -> filtered environment
@@ -18,7 +19,9 @@ PolicyRuntime
   -> CommandResult / VerificationEvidence / Planner evidence / FinalReport
 ```
 
-This slice does not implement Git Runtime, Docker, Podman, WSL, remote approval, persistent sandbox sessions, hard network isolation, hard memory limits, or automatic import of sandbox changes.
+Docker is the preferred hard-isolation backend when the Docker CLI and daemon are available. Docker is not a required development dependency: if it is unavailable, Miniharness keeps `LocalStagingBackend` for copy-on-write execution. If policy requires hard network isolation, memory limits, or process limits and no capable backend is available, the runtime returns `backend_unavailable` and does not fall back to real local execution.
+
+This slice does not implement Git Runtime, Podman, WSL, remote approval, persistent sandbox sessions, host allowlist enforcement inside Docker, or automatic import of sandbox changes.
 
 ## Runtime Contract
 
@@ -41,9 +44,28 @@ cleanup_failed
 
 `backend_unavailable` means the current backend cannot enforce the required policy. It is not downgraded to normal local execution.
 
+## Backend Selection
+
+`SandboxRuntime` builds the default backend list as:
+
+```txt
+DockerSandboxBackend, LocalStagingBackend   when docker info succeeds
+LocalStagingBackend                         when Docker CLI or daemon is unavailable
+```
+
+For each request, the runtime picks the first available backend whose declared `SandboxCapabilities` satisfy the request profile. Capability mismatches are fail-closed: unsupported hard network isolation, memory limits, or process limits return `backend_unavailable`.
+
+## DockerSandboxBackend
+
+`DockerSandboxBackend` reuses the same staged workspace, redacted environment, timeout, output limit, artifact capture, and change detection contract as `LocalStagingBackend`. It runs `docker run --rm` with the staged workspace mounted at `/workspace`. Network is set to `--network none` unless the sandbox profile explicitly allows network. Memory and process limits are mapped to Docker CLI flags when requested.
+
+Docker output, artifacts, and changed files are collected from the staged workspace only. Sandbox changes are not imported into the real workspace.
+
+Real Docker integration tests are skipped when the Docker CLI or daemon is unavailable; mock CLI tests still cover command construction and fail-closed behavior.
+
 ## LocalStagingBackend
 
-The only implemented backend is `LocalStagingBackend`.
+`LocalStagingBackend` remains the default fallback backend.
 
 It guarantees:
 
@@ -70,7 +92,7 @@ filesystem isolation against malicious OS-level escape attempts
 container-like security boundaries
 ```
 
-Its capabilities explicitly report `network_isolation=False`, `memory_limit=False`, and `process_limit=False`. If policy requires hard network isolation or unsupported limits, the backend returns `backend_unavailable`.
+Its capabilities explicitly report `network_isolation=False`, `memory_limit=False`, and `process_limit=False`. If policy requires hard network isolation or unsupported limits and Docker is unavailable, the runtime returns `backend_unavailable`.
 
 ## Filesystem
 
@@ -153,7 +175,7 @@ long_running_service    copy-on-write, network denied, timeout lease, process cl
 `CommandRuntime` evaluates `PolicyRuntime` first. If the decision requires sandbox, it resolves cwd inside the real workspace, builds a `SandboxRequest`, and calls `SandboxRuntime.run(...)`. The returned `SandboxResult` is mapped into `CommandResult` with:
 
 ```txt
-backend=local_staging
+backend=docker | local_staging
 isolation_report.sandbox
 metadata.sandbox_id
 metadata.sandbox_backend
@@ -196,7 +218,7 @@ Sandbox trace is append-only JSONL:
 .miniharness/sandbox/trace.jsonl
 ```
 
-Each entry records sandbox id, session, task, action, backend, profile, capabilities, command summary, cwd, workspace root, sandbox root, filesystem mode, network mode, redaction flag, time/output limits, status, exit code, duration, artifacts, changed-file count, violations, cleanup status, and policy decision id.
+Each entry records sandbox id, session, task, action, backend, profile, capabilities, command summary, cwd handle, workspace handle, sandbox handle, filesystem mode, network mode, redaction flag, time/output limits, status, exit code, duration, artifacts, changed-file count, violations, cleanup status, and policy decision id. Absolute sandbox paths stay internal to the backend.
 
 Sensitive values are redacted before trace write.
 
@@ -209,6 +231,7 @@ tests/test_sandbox_models.py
 tests/test_sandbox_environment.py
 tests/test_sandbox_filesystem.py
 tests/test_sandbox_backend_local.py
+tests/test_sandbox_backend_docker.py
 tests/test_sandbox_runtime.py
 tests/test_sandbox_integration.py
 ```

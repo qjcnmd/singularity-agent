@@ -120,13 +120,16 @@ passed, failed, skipped, blocked, flaky, timeout, inconclusive
 `VerificationEvidence` records:
 
 ```txt
-command_id, command, exit_code, output_excerpt, artifact_path,
+command_id, command, exit_code, output_excerpt, artifact_ref,
 parsed_failures, duration_ms, timestamp,
 sandbox_id, sandbox_backend, sandbox_status,
-sandbox_artifacts, sandbox_changed_files, sandbox_violations
+sandbox_artifacts, sandbox_changed_files, sandbox_violations,
+capability_summary
 ```
 
-Only bounded excerpts enter observations. Full stdout/stderr remains owned by CommandRuntime artifacts.
+Only bounded excerpts enter observations. Full stdout/stderr remains owned by CommandRuntime artifacts. `artifact_path` remains accepted as a legacy compatibility field, but new observations and trace payloads prefer opaque `artifact_ref` values.
+
+`capability_summary` records safe facts only: provider capability booleans/limits, command runtime enforcement facts, and sandbox backend availability. It does not include raw provider payloads, raw command payloads, absolute paths, or secret-like values.
 
 Failure parsers currently cover:
 
@@ -193,9 +196,10 @@ check_kind
 status
 failure_type
 parsed_failures
-evidence_artifact
+artifact_ref
 sandbox_id
 sandbox_status
+capability_summary
 duration_ms
 confidence_impact
 repair_hints

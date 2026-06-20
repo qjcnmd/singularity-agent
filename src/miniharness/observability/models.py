@@ -324,12 +324,13 @@ class TraceArtifact:
     def to_dict(self) -> dict[str, Any]:
         return {
             "artifact_id": self.artifact_id,
+            "artifact_ref": self.artifact_id,
             "run_id": self.run_id,
             "session_id": self.session_id,
             "task_id": self.task_id,
             "kind": self.kind.value,
-            "path": str(self.path),
             "relative_path": self.relative_path,
+            "relative_handle": self.relative_path,
             "size_bytes": self.size_bytes,
             "sha256": self.sha256,
             "content_type": self.content_type,
@@ -341,7 +342,12 @@ class TraceArtifact:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "TraceArtifact":
-        return cls(**payload)
+        data = dict(payload)
+        data.pop("artifact_ref", None)
+        data.pop("relative_handle", None)
+        if "path" not in data:
+            data["path"] = data.get("relative_path") or data.get("artifact_id")
+        return cls(**data)
 
 
 @dataclass(frozen=True)

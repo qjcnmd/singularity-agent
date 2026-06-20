@@ -97,17 +97,17 @@ class ProjectDetector:
             ".eslintrc.js",
             "eslint.config.js",
         }
-        evidence = [
-            path.relative_to(self.workspace_root).as_posix()
-            for path in self.workspace_root.rglob("*")
-            if path.is_file()
-            and (
-                path.name in names
-                or path.relative_to(self.workspace_root).as_posix().startswith(
-                    ".github/workflows/"
-                )
-            )
-        ]
+        evidence = []
+        for path in self.workspace_root.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(self.workspace_root).as_posix()
+            if path.name in names or relative.startswith(".github/workflows/"):
+                evidence.append(relative)
+        for name in names:
+            path = self.workspace_root / name
+            if path.is_file() and name not in evidence:
+                evidence.append(name)
         return sorted(evidence)
 
     def _languages(self, evidence: list[str]) -> list[ProjectLanguage]:

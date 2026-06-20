@@ -853,7 +853,7 @@ def trace_artifacts(
     for artifact in store.artifacts():
         console.print(
             f"{artifact.artifact_id} {artifact.kind.value} "
-            f"{artifact.size_bytes} bytes {artifact.relative_path}"
+            f"{artifact.size_bytes} bytes handle={artifact.relative_path}"
         )
 
 

@@ -15,9 +15,11 @@ from miniharness.model.errors import (
 )
 from miniharness.model.messages import MessageConverter
 from miniharness.model.models import (
+    ContentBlock,
     ModelError,
     ModelErrorKind,
     ModelMessage,
+    ModelRole,
     ModelPreferences,
     ModelPurpose,
     ModelToolCall,
@@ -269,11 +271,9 @@ class ModelRuntime:
                 request.model_preferences,
                 purpose=request.purpose,
             )
-            self.registry.check_capabilities(
+            request, capability_adjustments = self._apply_provider_capability_adjustments(
+                request,
                 provider,
-                requires_tools=bool(request.tools),
-                requires_streaming=request.model_preferences.stream,
-                requires_json_mode=request.model_preferences.json_mode,
             )
             estimated_usage = self.budget_manager.check_budget(
                 messages=request.messages,  # type: ignore[arg-type]
@@ -318,7 +318,7 @@ class ModelRuntime:
             event_ids.extend(self._emit_response_received(request, provider_response, raw_ref))
             for tool_call in tool_calls:
                 event_ids.extend(self._emit_tool_call(request, tool_call, provider))
-            return ModelTurnResult(
+            result = ModelTurnResult(
                 request_id=request.request_id,
                 response_id=provider_response.response_id,
                 status=ModelTurnStatus.SUCCESS,
@@ -333,6 +333,9 @@ class ModelRuntime:
                 trace_event_ids=event_ids,
                 raw_response_ref=raw_ref,
             )
+            if capability_adjustments:
+                result.metadata["capability_adjustments"] = capability_adjustments
+            return result
         except (ModelBudgetExceeded, ModelContextTooLong) as exc:
             kind = (
                 ModelErrorKind.CONTEXT_LENGTH_EXCEEDED
@@ -409,6 +412,111 @@ class ModelRuntime:
         return controller.run(
             operation,
             initial_model=request.model_preferences.model_name,
+        )
+
+    def _apply_provider_capability_adjustments(
+        self,
+        request: ModelTurnRequest,
+        provider: ModelProvider,
+    ) -> tuple[ModelTurnRequest, dict[str, Any]]:
+        capabilities = provider.capabilities()
+        downgraded: list[str] = []
+        blocked: list[str] = []
+        if request.tools and not capabilities.supports_tools:
+            blocked.append("tools")
+        if blocked:
+            raise ModelError(
+                kind=ModelErrorKind.UNSUPPORTED_CAPABILITY,
+                message=f"Provider {provider.name()} does not support required capabilities: {', '.join(blocked)}.",
+                retryable=False,
+                provider_name=provider.name(),
+                model_name=request.model_preferences.model_name,
+                metadata={
+                    "capability": blocked[0],
+                    "blocked": blocked,
+                    "provider_capabilities": self.registry.provider_capability_summary(provider),
+                },
+            )
+
+        preferences = request.model_preferences
+        if preferences.json_mode and not capabilities.supports_json_mode:
+            preferences = ModelPreferences.from_dict(
+                {**preferences.to_dict(), "json_mode": False}
+            )
+            downgraded.append("json_mode")
+        if preferences.stream and not capabilities.supports_streaming:
+            preferences = ModelPreferences.from_dict(
+                {**preferences.to_dict(), "stream": False}
+            )
+            downgraded.append("streaming")
+
+        tool_choice = request.tool_choice
+        if (
+            tool_choice.max_tool_calls > 1
+            and not capabilities.supports_parallel_tool_calls
+        ):
+            tool_choice = ToolChoicePolicy.from_dict(
+                {**tool_choice.to_dict(), "max_tool_calls": 1}
+            )
+            downgraded.append("parallel_tool_calls")
+
+        messages = [
+            self._fold_developer_message(message, capabilities)
+            for message in request.messages
+        ]
+        if any(
+            isinstance(original, ModelMessage)
+            and isinstance(adjusted, ModelMessage)
+            and original.role == ModelRole.DEVELOPER
+            and adjusted.role != ModelRole.DEVELOPER
+            for original, adjusted in zip(request.messages, messages, strict=False)
+        ):
+            downgraded.append("developer_message")
+
+        adjusted_request = ModelTurnRequest.from_dict(
+            {
+                **request.to_dict(),
+                "messages": [
+                    message.to_dict() if isinstance(message, ModelMessage) else message
+                    for message in messages
+                ],
+                "model_preferences": preferences.to_dict(),
+                "tool_choice": tool_choice.to_dict(),
+            }
+        )
+        adjustment = {
+            "provider": provider.name(),
+            "downgraded": downgraded,
+            "blocked": blocked,
+            "provider_capabilities": self.registry.provider_capability_summary(provider),
+        }
+        if not downgraded and not blocked:
+            return adjusted_request, {}
+        adjusted_request.trace_metadata = {
+            **adjusted_request.trace_metadata,
+            "capability_adjustments": adjustment,
+        }
+        return adjusted_request, adjustment
+
+    @staticmethod
+    def _fold_developer_message(
+        message: ModelMessage | dict[str, Any],
+        capabilities: Any,
+    ) -> ModelMessage | dict[str, Any]:
+        if not isinstance(message, ModelMessage):
+            return message
+        if message.role != ModelRole.DEVELOPER or capabilities.supports_developer_message:
+            return message
+        role = ModelRole.SYSTEM if capabilities.supports_system_message else ModelRole.USER
+        return ModelMessage(
+            role=role,
+            content=[
+                ContentBlock.from_dict(block.to_dict())
+                for block in message.content
+            ],
+            name=message.name,
+            tool_call_id=message.tool_call_id,
+            metadata={**message.metadata, "developer_fallback": role.value},
         )
 
     def _stream_provider_response(

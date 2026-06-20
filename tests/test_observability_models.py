@@ -13,6 +13,7 @@ from miniharness.observability.models import (
     TraceStatus,
     TraceSummary,
 )
+from miniharness.sandbox.models import SandboxArtifact
 
 
 def test_trace_models_round_trip_with_stable_serialization() -> None:
@@ -104,7 +105,10 @@ def test_trace_models_round_trip_with_stable_serialization() -> None:
 
     assert TraceEvent.from_dict(event.to_dict()) == event
     assert TraceSpan.from_dict(span.to_dict()) == span
-    assert TraceArtifact.from_dict(artifact.to_dict()) == artifact
+    artifact_round_trip = TraceArtifact.from_dict(artifact.to_dict())
+    assert artifact_round_trip.artifact_id == artifact.artifact_id
+    assert artifact_round_trip.relative_path == artifact.relative_path
+    assert "path" not in artifact.to_dict()
     assert TraceSummary.from_dict(summary.to_dict()) == summary
     assert event.to_json() == TraceEvent.from_json(event.to_json()).to_json()
 
@@ -187,3 +191,73 @@ def test_required_event_types_are_available() -> None:
     }
 
     assert required <= {item.value for item in TraceEventType}
+
+
+def test_trace_artifact_to_dict_uses_opaque_reference_and_keeps_internal_path() -> None:
+    artifact = TraceArtifact(
+        artifact_id="artifact_1",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        kind=TraceArtifactKind.STDOUT,
+        path=Path("C:/absolute/work/traces/runs/run_1/artifacts/artifact_1.txt"),
+        relative_path="artifacts/artifact_1.txt",
+        size_bytes=12,
+        sha256="abc",
+        content_type="text/plain",
+        redacted=True,
+        sensitive=False,
+        summary="stdout",
+        metadata={},
+    )
+
+    payload = artifact.to_dict()
+
+    assert artifact.path == Path("C:/absolute/work/traces/runs/run_1/artifacts/artifact_1.txt")
+    assert "path" not in payload
+    assert payload["artifact_ref"] == "artifact_1"
+    assert payload["relative_handle"] == "artifacts/artifact_1.txt"
+    assert "C:/absolute" not in str(payload)
+
+
+def test_sandbox_artifact_to_dict_uses_opaque_reference() -> None:
+    artifact = SandboxArtifact(
+        artifact_id="sandbox_artifact_1",
+        sandbox_id="sandbox_1",
+        path=Path("C:/absolute/work/sandboxes/sandbox_1/artifacts/stdout.log"),
+        relative_path="artifacts/stdout.log",
+        size_bytes=7,
+        kind="stdout",
+        sha256="abc",
+    )
+
+    payload = artifact.to_dict()
+
+    assert "path" not in payload
+    assert payload["artifact_ref"] == "sandbox_artifact_1"
+    assert payload["relative_handle"] == "artifacts/stdout.log"
+    assert "C:/absolute" not in str(payload)
+
+
+def test_trace_artifact_from_dict_accepts_legacy_path_payload() -> None:
+    artifact = TraceArtifact.from_dict(
+        {
+            "artifact_id": "artifact_1",
+            "run_id": "run_1",
+            "session_id": "session_1",
+            "task_id": "task_1",
+            "kind": "stdout",
+            "path": "C:/absolute/work/traces/runs/run_1/artifacts/artifact_1.txt",
+            "relative_path": "artifacts/artifact_1.txt",
+            "size_bytes": 12,
+            "sha256": "abc",
+            "content_type": "text/plain",
+            "redacted": True,
+            "sensitive": False,
+            "summary": "stdout",
+            "metadata": {},
+        }
+    )
+
+    assert artifact.path == Path("C:/absolute/work/traces/runs/run_1/artifacts/artifact_1.txt")
+    assert artifact.to_dict()["artifact_ref"] == "artifact_1"

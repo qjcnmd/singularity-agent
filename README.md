@@ -24,7 +24,7 @@ CLI
 -> Trace / Audit / FinalReport
 ```
 
-MiniHarness does not implement a Git Runtime, web search, multi-agent execution, remote approval, remote memory sync, or a real sandbox security boundary in this release.
+MiniHarness does not implement a Git Runtime, web search, multi-agent execution, remote approval, or remote memory sync in this release. Sandbox execution prefers Docker as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps the local copy-on-write staging backend. Requests that require hard isolation fail closed when no capable backend is available.
 
 ## Install
 
@@ -201,7 +201,7 @@ Pending approvals are recoverable through protocol recovery reports. MiniHarness
 
 Policy, planner, mutation, command, verification, and workspace-state observations use structured context items. Secrets are redacted before storage and rendering.
 
-Trace records use structured events, hashes, digests, artifact ids, and compact summaries. Trace and context do not store raw tool args, raw tool results, or secret content. Raw model response artifacts are disabled by default; when enabled, artifacts are still redacted before writing.
+Trace records use structured events, hashes, digests, opaque artifact ids/handles, and compact summaries. Trace and context do not store raw tool args, raw tool results, secret content, or internal absolute artifact paths. Raw model response artifacts are disabled by default; when enabled, artifacts are still redacted before writing and resolved through the local artifact store.
 
 ## Safety Boundaries
 
@@ -213,6 +213,7 @@ Current safety boundaries:
 - Workspace writes must go through `MutationRuntime`.
 - Commands must go through `CommandRuntime`.
 - Verification must go through `VerificationRuntime`.
+- Sandbox-required commands must go through `SandboxRuntime`; Docker is used first for real sandbox isolation when available, otherwise local staging is used only for requests that do not require hard isolation.
 - Workspace state is tracked by `WorkspaceStateRuntime`.
 - Evaluation outputs are local files under `work/evaluations/` unless explicitly redirected.
 - Dry-run blocks real side effects before handlers run.
@@ -225,7 +226,7 @@ Not implemented in v0.1.0:
 - remote/shared memory synchronization
 - parallel executor
 - remote approval
-- real sandbox isolation such as Docker, Podman, WSL, or kernel-level containment
+- Podman, WSL, or kernel-level containment beyond Docker CLI integration
 - web search
 - multi-agent orchestration
 

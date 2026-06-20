@@ -521,7 +521,7 @@ def _new_run_id() -> str:
 
 def _legacy_artifacts(data: dict[str, Any]) -> list[str]:
     refs: list[str] = []
-    for key in ("artifact_id", "artifact_path", "evidence_artifact"):
+    for key in ("artifact_ref", "artifact_id", "artifact_path", "evidence_artifact"):
         if data.get(key):
             refs.append(str(data[key]))
     return refs

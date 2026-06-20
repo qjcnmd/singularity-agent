@@ -325,6 +325,7 @@ class CommandResult:
                 "side_effects": self.side_effects,
                 "truncated": self.output_truncated,
                 "artifact": self.artifact_path,
+                "artifact_ref": self.artifact_path,
                 "error_code": self.error_code,
                 "isolation_report": self.isolation_report,
                 "metadata": self.metadata,

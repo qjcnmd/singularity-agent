@@ -299,9 +299,10 @@ class SandboxArtifact:
     def to_dict(self) -> dict[str, Any]:
         return {
             "artifact_id": self.artifact_id,
+            "artifact_ref": self.artifact_id,
             "sandbox_id": self.sandbox_id,
-            "path": str(self.path),
             "relative_path": self.relative_path,
+            "relative_handle": self.relative_path,
             "size_bytes": self.size_bytes,
             "kind": self.kind,
             "sha256": self.sha256,

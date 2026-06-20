@@ -1,5 +1,11 @@
 from miniharness.sandbox.artifacts import SandboxArtifactCollector
-from miniharness.sandbox.backends import LocalStagingBackend, SandboxBackend
+from miniharness.sandbox.backends import (
+    DockerSandboxBackend,
+    LocalStagingBackend,
+    SandboxBackend,
+    default_sandbox_backends,
+    docker_backend_available,
+)
 from miniharness.sandbox.environment import SandboxEnvironmentBuilder
 from miniharness.sandbox.exceptions import (
     SandboxCapabilityError,
@@ -35,6 +41,7 @@ from miniharness.sandbox.runtime import SandboxRuntime
 from miniharness.sandbox.trace import SandboxTraceWriter
 
 __all__ = [
+    "DockerSandboxBackend",
     "LocalStagingBackend",
     "PreparedSandbox",
     "SandboxArtifact",
@@ -67,4 +74,6 @@ __all__ = [
     "SandboxViolation",
     "SandboxViolationError",
     "default_sandbox_profile",
+    "default_sandbox_backends",
+    "docker_backend_available",
 ]

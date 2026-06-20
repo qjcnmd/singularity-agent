@@ -236,6 +236,10 @@ def test_large_output_is_truncated_and_saved_as_artifact(tmp_path: Path) -> None
     assert len(result.stdout_preview) <= 40
     assert result.artifact_path is not None
     assert (tmp_path / result.artifact_path).exists()
+    observation = result.to_observation()["command_result"]
+    assert observation["artifact_ref"] == result.artifact_path
+    assert "artifact_path" not in observation
+    assert str(tmp_path) not in str(observation)
     assert result.error_code == "output_limit_exceeded"
 
 
@@ -307,6 +311,31 @@ def test_project_verification_nonzero_is_semantic_test_failure(tmp_path: Path) -
     assert result.execution_status == ExecutionStatus.COMPLETED
     assert result.semantic_status == SemanticStatus.TESTS_FAILED
     assert result.error_code == "semantic_failure"
+
+
+def test_compat_verification_does_not_use_docker_when_available(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "miniharness.sandbox.backends.docker_backend_available",
+        lambda: True,
+    )
+    runtime = compat_command_runtime(tmp_path)
+
+    result = runtime.run(
+        CommandRequest(
+            argv=[sys.executable, "-c", "print('local verification')"],
+            cwd=".",
+            purpose=CommandPurpose.PROJECT_VERIFICATION,
+        )
+    )
+
+    assert result.execution_status == ExecutionStatus.COMPLETED
+    assert result.semantic_status == SemanticStatus.SUCCEEDED
+    assert result.backend == "local_process"
+    assert result.metadata["sandbox_availability"]["registered_backends"][0] == "docker"
+    assert result.metadata["sandbox_availability"]["selected_backend"] is None
 
 
 def test_command_policy_classifies_pytest_and_package_manager_commands(tmp_path: Path) -> None:
@@ -513,6 +542,47 @@ def test_command_trace_redacts_sensitive_argv_and_url_query(tmp_path: Path) -> N
     assert audit["argv"][4] == "<redacted>"
     assert "api_key=<redacted>" in audit["argv"][5]
     assert audit["command_hash"]
+
+
+def test_command_result_records_safe_capability_summary(tmp_path: Path) -> None:
+    runtime = compat_command_runtime(tmp_path)
+
+    result = runtime.run(
+        CommandRequest(
+            argv=[sys.executable, "-c", "print('ok')"],
+            cwd=".",
+        )
+    )
+
+    assert result.metadata["command_capabilities"]["backend"] == "local_process"
+    assert "available_backends" in result.metadata["sandbox_availability"]
+    assert str(tmp_path) not in json.dumps(result.metadata, sort_keys=True)
+
+
+def test_sandbox_availability_summary_ignores_unavailable_backends(tmp_path: Path) -> None:
+    from miniharness.sandbox import DockerSandboxBackend, LocalStagingBackend, SandboxRuntime
+
+    docker = DockerSandboxBackend()
+    docker.is_available = lambda: False  # type: ignore[method-assign]
+    runtime = compat_command_runtime(
+        tmp_path,
+        sandbox_runtime=SandboxRuntime(
+            tmp_path,
+            backends=[docker, LocalStagingBackend()],
+        ),
+    )
+
+    result = runtime.run(
+        CommandRequest(
+            argv=[sys.executable, "-c", "print('ok')"],
+            cwd=".",
+        )
+    )
+
+    sandbox = result.metadata["sandbox_availability"]
+    assert sandbox["registered_backends"] == ["docker", "local_staging"]
+    assert sandbox["available_backends"] == ["local_staging"]
+    assert sandbox["hard_isolation_available"] is False
 
 
 def test_run_command_tool_is_registered_and_uses_command_runtime(tmp_path: Path) -> None:

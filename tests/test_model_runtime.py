@@ -4,6 +4,10 @@ from miniharness.context import ContextManager
 from miniharness.model import (
     MockModelProvider,
     ModelBudget,
+    ModelCapabilities,
+    ModelErrorKind,
+    ModelMessage,
+    ModelRole,
     ModelPurpose,
     ModelRuntime,
     ModelRuntimeConfig,
@@ -183,3 +187,112 @@ def test_model_runtime_respects_empty_allowed_tools_from_context(tmp_path: Path)
     assert result.status == ModelTurnStatus.INVALID
     assert result.validation is not None
     assert "unknown_tool" in result.validation.errors
+
+
+def test_model_runtime_downgrades_json_stream_and_parallel_tool_preferences(
+    tmp_path: Path,
+) -> None:
+    provider = MockModelProvider(
+        text="ok",
+        capabilities=ModelCapabilities(
+            supports_tools=True,
+            supports_streaming=False,
+            supports_json_mode=False,
+            supports_parallel_tool_calls=False,
+            supports_developer_message=True,
+        ),
+    )
+    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    request = ModelTurnRequest(
+        request_id="req_1",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        action_id="action_1",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        messages=[ModelMessage.assistant_text("context")],
+        tools=[],
+        tool_choice=ToolChoicePolicy(mode=ToolChoiceMode.AUTO, max_tool_calls=4),
+    )
+    request.model_preferences.json_mode = True
+    request.model_preferences.stream = True
+
+    result = runtime.run_turn(request)
+
+    assert result.status == ModelTurnStatus.SUCCESS
+    sent = provider.requests[0]
+    assert sent.preferences.json_mode is False
+    assert sent.preferences.stream is False
+    assert sent.tool_choice.max_tool_calls == 1
+    assert result.metadata["capability_adjustments"]["downgraded"] == [
+        "json_mode",
+        "streaming",
+        "parallel_tool_calls",
+    ]
+
+
+def test_model_runtime_returns_structured_capability_error_when_tools_required(
+    tmp_path: Path,
+) -> None:
+    provider = MockModelProvider(
+        text="ok",
+        capabilities=ModelCapabilities(supports_tools=False),
+    )
+    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    request = ModelTurnRequest(
+        request_id="req_1",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        action_id="action_1",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        messages=[],
+        tools=runtime.tool_renderer.render(allowed_tool_names=["read_file"]),
+        tool_choice=ToolChoicePolicy(mode=ToolChoiceMode.REQUIRED),
+    )
+
+    result = runtime.run_turn(request)
+
+    assert result.status == ModelTurnStatus.FAILED
+    assert provider.complete_calls == 0
+    assert result.error is not None
+    assert result.error.kind == ModelErrorKind.UNSUPPORTED_CAPABILITY
+    assert result.error.metadata["capability"] == "tools"
+
+
+def test_model_runtime_folds_developer_messages_for_provider_without_support(
+    tmp_path: Path,
+) -> None:
+    provider = MockModelProvider(
+        text="ok",
+        capabilities=ModelCapabilities(
+            supports_tools=True,
+            supports_system_message=True,
+            supports_developer_message=False,
+        ),
+    )
+    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    request = ModelTurnRequest(
+        request_id="req_1",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        action_id="action_1",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        messages=[
+            ModelMessage(
+                role=ModelRole.DEVELOPER,
+                content=[],
+            )
+        ],
+    )
+
+    result = runtime.run_turn(request)
+
+    assert result.status == ModelTurnStatus.SUCCESS
+    sent_message = provider.requests[0].messages[0]
+    assert sent_message.role == ModelRole.SYSTEM
+    assert sent_message.metadata["developer_fallback"] == "system"

@@ -326,6 +326,7 @@ class VerificationEvidence:
     sandbox_artifacts: list[dict[str, Any]] = field(default_factory=list)
     sandbox_changed_files: dict[str, Any] = field(default_factory=dict)
     sandbox_violations: list[dict[str, Any]] = field(default_factory=list)
+    capability_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -333,6 +334,7 @@ class VerificationEvidence:
             "command": self.command,
             "exit_code": self.exit_code,
             "output_excerpt": self.output_excerpt,
+            "artifact_ref": self.artifact_path,
             "artifact_path": self.artifact_path,
             "parsed_failures": [
                 failure.to_dict() for failure in self.parsed_failures
@@ -345,6 +347,7 @@ class VerificationEvidence:
             "sandbox_artifacts": self.sandbox_artifacts,
             "sandbox_changed_files": self.sandbox_changed_files,
             "sandbox_violations": self.sandbox_violations,
+            "capability_summary": self.capability_summary,
         }
 
 

@@ -38,9 +38,11 @@ class SandboxTraceWriter:
             "profile": profile.name.value if profile else None,
             "capabilities": capabilities.to_dict() if capabilities else None,
             "command_summary": _command_summary(request.command if request else None),
-            "cwd": str(request.cwd) if request else None,
-            "workspace_root": str(request.workspace_root) if request else None,
-            "sandbox_root": str(prepared.sandbox_root) if prepared else None,
+            "cwd_handle": _relative_handle(request.cwd, request.workspace_root) if request else None,
+            "workspace_handle": ".",
+            "sandbox_handle": _relative_handle(prepared.sandbox_root, request.workspace_root)
+            if prepared and request
+            else None,
             "filesystem_mode": profile.filesystem.mode.value if profile else None,
             "network_mode": profile.network.mode.value if profile else None,
             "env_redaction_enabled": True,
@@ -89,3 +91,10 @@ def _redact_text(text: str) -> str:
         if marker.lower() in redacted.lower():
             return "[REDACTED]"
     return redacted
+
+
+def _relative_handle(path: Path, root: Path) -> str:
+    try:
+        return path.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix() or "."
+    except ValueError:
+        return path.name

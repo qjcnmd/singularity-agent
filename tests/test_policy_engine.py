@@ -164,5 +164,7 @@ def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: P
 
     assert verification.outcome == DecisionOutcome.SANDBOX_REQUIRED
     assert verification.constraints.sandbox_required is True
+    assert verification.constraints.hard_isolation_required is True
     assert verification.constraints.filesystem_mode == "copy_on_write_workspace"
     assert generated.outcome == DecisionOutcome.SANDBOX_REQUIRED
+    assert generated.constraints.hard_isolation_required is True

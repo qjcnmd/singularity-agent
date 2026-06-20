@@ -265,6 +265,65 @@ def test_runtime_executes_checks_through_command_runtime_and_records_trace(tmp_p
     }
 
 
+def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path) -> None:
+    request = CommandRequest(argv=[sys.executable, "-c", "print('ok')"])
+    result = command_result(
+        request,
+        command_id="cmd_ok",
+        exit_code=0,
+        semantic_status=SemanticStatus.SUCCEEDED,
+        output="ok",
+    )
+    result.metadata.update(
+        {
+            "provider_capabilities": {
+                "provider": "mock",
+                "supports_streaming": False,
+                "raw_payload": {"secret": "must-not-leak"},
+            },
+            "command_capabilities": {
+                "backend": "local_process",
+                "timeout": True,
+                "raw_command": ["python", "-c", "print('ok')"],
+            },
+            "sandbox_availability": {
+                "available_backends": ["local_staging"],
+                "selected_backend": "local_staging",
+                "hard_isolation_available": False,
+                "absolute_path": str(tmp_path),
+            },
+        }
+    )
+    fake = FakeCommandRuntime([result])
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "echo ok"}}),
+        encoding="utf-8",
+    )
+    runtime = VerificationRuntime(tmp_path, command_runtime=fake)
+
+    plan = runtime.plan_verification(changed_files=["src/app.js"], task_intent="code")
+    observation = runtime.run_plan(plan.id)
+    evidence = next(
+        result["evidence"]
+        for result in observation["verification"]["results"]
+        if result["evidence"]["command_id"] == "cmd_ok"
+    )
+
+    assert "artifact_ref" in evidence
+    assert evidence["capability_summary"] == {
+        "provider": {"provider": "mock", "supports_streaming": False},
+        "command": {"backend": "local_process", "timeout": True},
+        "sandbox": {
+            "available_backends": ["local_staging"],
+            "selected_backend": "local_staging",
+            "hard_isolation_available": False,
+        },
+    }
+    serialized = json.dumps(evidence, sort_keys=True)
+    assert "must-not-leak" not in serialized
+    assert str(tmp_path) not in serialized
+
+
 def test_failure_parsers_extract_pytest_tsc_and_eslint_failures() -> None:
     output = """
 FAILED tests/test_app.py::test_thing - AssertionError: nope
@@ -451,6 +510,7 @@ def test_repair_budget_blocks_repeated_same_failure() -> None:
         "command": "pytest",
         "exit_code": 1,
         "output_excerpt": "failed",
+        "artifact_ref": None,
         "artifact_path": None,
         "parsed_failures": [],
         "duration_ms": 1,

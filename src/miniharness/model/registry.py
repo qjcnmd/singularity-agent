@@ -62,3 +62,18 @@ class ModelProviderRegistry:
             raise ModelCapabilityError(
                 f"Provider {provider.name()} does not support JSON mode."
             )
+
+    @staticmethod
+    def provider_capability_summary(provider: ModelProvider) -> dict[str, object]:
+        capabilities = provider.capabilities()
+        return {
+            "provider": provider.name(),
+            "supports_tools": capabilities.supports_tools,
+            "supports_parallel_tool_calls": capabilities.supports_parallel_tool_calls,
+            "supports_streaming": capabilities.supports_streaming,
+            "supports_json_mode": capabilities.supports_json_mode,
+            "supports_system_message": capabilities.supports_system_message,
+            "supports_developer_message": capabilities.supports_developer_message,
+            "max_context_tokens": capabilities.max_context_tokens,
+            "max_output_tokens": capabilities.max_output_tokens,
+        }

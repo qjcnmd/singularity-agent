@@ -71,3 +71,18 @@ def test_register_file_artifact_copies_and_events_only_need_artifact_id(tmp_path
     event_payload = {"artifact_refs": [artifact.artifact_id]}
     assert event_payload == {"artifact_refs": [artifact.artifact_id]}
     assert "large output" not in str(event_payload)
+
+
+def test_artifact_store_resolves_by_opaque_artifact_id(tmp_path: Path) -> None:
+    store = TraceArtifactStore(tmp_path, run_id="run_1", session_id="session_1")
+    artifact = store.write_text_artifact(
+        kind=TraceArtifactKind.REPORT,
+        text="hello",
+        summary="report",
+    )
+
+    payload = artifact.to_dict()
+
+    assert payload["artifact_ref"] == artifact.artifact_id
+    assert "path" not in payload
+    assert store.read_artifact(artifact.artifact_id) == b"hello"

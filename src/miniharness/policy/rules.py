@@ -164,21 +164,7 @@ class DefaultLocalPolicyRules:
                 "sandbox_generated_code",
                 constraints=PolicyConstraints(
                     sandbox_required=True,
-                    filesystem_mode="copy_on_write_workspace",
-                    network_allowed=False,
-                    max_duration_seconds=request.metadata.get("timeout"),
-                    max_output_chars=request.metadata.get("max_output_chars"),
-                    env_redaction=True,
-                ),
-            )
-
-        if operation == OperationKind.VERIFICATION:
-            return RuleResult(
-                DecisionOutcome.SANDBOX_REQUIRED,
-                "Verification command execution requires an isolated sandbox.",
-                "sandbox_verification",
-                constraints=PolicyConstraints(
-                    sandbox_required=True,
+                    hard_isolation_required=True,
                     filesystem_mode="copy_on_write_workspace",
                     network_allowed=False,
                     max_duration_seconds=request.metadata.get("timeout"),
@@ -192,6 +178,22 @@ class DefaultLocalPolicyRules:
                 DecisionOutcome.ALLOW,
                 "Plain local command allowed by compat security mode.",
                 "compat_local_command_allow",
+            )
+
+        if operation == OperationKind.VERIFICATION:
+            return RuleResult(
+                DecisionOutcome.SANDBOX_REQUIRED,
+                "Verification command execution requires an isolated sandbox.",
+                "sandbox_verification",
+                constraints=PolicyConstraints(
+                    sandbox_required=True,
+                    hard_isolation_required=True,
+                    filesystem_mode="copy_on_write_workspace",
+                    network_allowed=False,
+                    max_duration_seconds=request.metadata.get("timeout"),
+                    max_output_chars=request.metadata.get("max_output_chars"),
+                    env_redaction=True,
+                ),
             )
 
         if config.approval_mode == ApprovalMode.AUTO_SAFE and _auto_safe_runtime_allow(request, risk):
@@ -290,9 +292,13 @@ def _auto_safe_runtime_allow(request: PolicyRequest, risk: RiskAssessment) -> bo
 def _compat_local_command_allow(request: PolicyRequest, risk: RiskAssessment) -> bool:
     if request.runtime.value != "command":
         return False
-    if request.operation != OperationKind.EXECUTE_COMMAND:
-        return False
-    if request.capability != Capability.EXECUTE_COMMAND:
+    if request.operation == OperationKind.VERIFICATION:
+        if request.capability != Capability.EXECUTE_PROJECT_CODE:
+            return False
+    elif request.operation == OperationKind.EXECUTE_COMMAND:
+        if request.capability != Capability.EXECUTE_COMMAND:
+            return False
+    else:
         return False
     if request.requires_network or request.touches_workspace or request.touches_secrets:
         return False
@@ -310,11 +316,12 @@ def _compat_local_command_allow(request: PolicyRequest, risk: RiskAssessment) ->
         RiskTag.MUTATES_FILES,
         RiskTag.MUTATES_CONFIG,
         RiskTag.MUTATES_LOCKFILE,
-        RiskTag.EXECUTES_PROJECT_CODE,
         RiskTag.EXECUTES_GENERATED_CODE,
         RiskTag.SECRET_ACCESS,
         RiskTag.SECRETS_EXFILTRATION,
     }
+    if request.operation != OperationKind.VERIFICATION:
+        blocked_tags.add(RiskTag.EXECUTES_PROJECT_CODE)
     return not (set(risk.tags) & blocked_tags)
 
 

@@ -204,6 +204,27 @@ def test_trace_cli_show_and_timeline(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert "command.completed" in timeline.output
 
 
+def test_trace_artifacts_cli_shows_handle_not_absolute_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    trace = TraceRuntime.create(tmp_path, run_id="run_artifacts", session_id="session")
+    artifact = trace.write_artifact(
+        kind="report",
+        text="artifact body",
+        summary="report",
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["trace", "artifacts", "run_artifacts"])
+
+    assert result.exit_code == 0
+    assert artifact.artifact_id in result.output
+    assert "handle=artifacts/" in result.output
+    assert str(tmp_path) not in result.output
+
+
 def test_sandbox_runtime_emits_unified_trace_when_trace_runtime_is_used(tmp_path: Path) -> None:
     trace = TraceRuntime.create(tmp_path, run_id="run_sandbox", session_id="session")
     runtime = SandboxRuntime(tmp_path, trace=trace)

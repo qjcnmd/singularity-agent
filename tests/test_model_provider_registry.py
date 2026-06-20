@@ -43,6 +43,33 @@ def test_registry_selects_default_provider_and_checks_capabilities() -> None:
         registry.get("missing")
 
 
+def test_registry_summarizes_provider_capabilities_without_private_payload() -> None:
+    provider = MockModelProvider(
+        provider_name="mock",
+        capabilities=ModelCapabilities(
+            supports_tools=False,
+            supports_streaming=False,
+            supports_json_mode=False,
+            supports_parallel_tool_calls=False,
+            supports_developer_message=False,
+        ),
+    )
+
+    summary = ModelProviderRegistry.provider_capability_summary(provider)
+
+    assert summary == {
+        "provider": "mock",
+        "supports_tools": False,
+        "supports_parallel_tool_calls": False,
+        "supports_streaming": False,
+        "supports_json_mode": False,
+        "supports_system_message": True,
+        "supports_developer_message": False,
+        "max_context_tokens": 128000,
+        "max_output_tokens": 4096,
+    }
+
+
 class _FakeResponse:
     status_code = 200
     text = "{}"

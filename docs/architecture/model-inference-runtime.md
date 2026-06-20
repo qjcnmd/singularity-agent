@@ -46,7 +46,19 @@ All core objects expose `to_dict()` / `from_dict()` so request/result records ca
 
 `providers.py` defines `ModelProvider`, `ProviderRequest`, `ProviderResponse`, `MockModelProvider`, a legacy chat adapter, and an OpenAI-compatible provider implementation.
 
-`registry.py` owns provider registration, default selection, and capability checks. Capability checks are explicit for tools, streaming, JSON mode, developer messages, parallel tool calls, and context/output limits.
+`registry.py` owns provider registration, default selection, capability checks, and safe provider capability summaries. Capability checks are explicit for tools, streaming, JSON mode, developer messages, parallel tool calls, and context/output limits.
+
+Before a provider call, `ModelRuntime` projects the internal request onto the selected provider's declared capabilities:
+
+```txt
+developer messages -> system or user role when developer role is unsupported
+json_mode          -> disabled when unsupported
+streaming          -> disabled when unsupported
+parallel tools     -> max_tool_calls=1 when unsupported
+tools required      -> structured unsupported_capability failure when tools are unsupported
+```
+
+Safe downgrades are recorded as `capability_adjustments` on the model result and trace metadata. Unsafe downgrades return a structured `ModelError(kind=unsupported_capability)` instead of sending a request the provider cannot satisfy.
 
 The old `src/miniharness/provider.py` remains the compatibility surface for callers and tests that still use `Provider.chat(messages, tools, tool_choice=...)`.
 
@@ -115,6 +127,8 @@ model.output.rejected
 Default trace payloads store counts, hashes, schema hash, usage, finish reason, tool-call metadata, and optional artifact refs. Raw prompt/response storage is disabled by default. When enabled, responses are written as redacted `TraceArtifactKind.MODEL_MESSAGE` text artifacts.
 
 API keys, base URLs with credentials, raw secret-like content, `.env` content, and full prompts are not written to trace by the model runtime. `ContextExportPolicy` blocks secret-like or env-like context from being sent to a remote provider by default.
+
+Provider capability summaries contain booleans and limits only. They do not include raw provider payloads, API responses, prompts, or credentials.
 
 ## Final Reports
 

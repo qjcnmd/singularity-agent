@@ -643,6 +643,12 @@ class CommandRuntime:
             secret_redactions=output.secret_redactions,
             git_before=git_before,
             git_after=git_after,
+            metadata={
+                "command_capabilities": self._command_capability_summary(
+                    request.resource_limits
+                ),
+                "sandbox_availability": self._sandbox_availability_summary(None),
+            },
         )
 
     def _result_from_sandbox(
@@ -743,6 +749,12 @@ class CommandRuntime:
                 "sandbox_artifacts": [artifact.to_dict() for artifact in sandbox_result.artifacts],
                 "sandbox_changed_files": sandbox_result.filesystem_changes.to_dict(),
                 "sandbox_violations": [violation.to_dict() for violation in sandbox_result.violations],
+                "command_capabilities": self._command_capability_summary(
+                    request.resource_limits
+                ),
+                "sandbox_availability": self._sandbox_availability_summary(
+                    sandbox_result.backend_name
+                ),
             },
         )
 
@@ -881,7 +893,7 @@ class CommandRuntime:
                 "stdout_bytes": result.stdout_bytes,
                 "stderr_bytes": result.stderr_bytes,
                 "output_digest": result.output_digest,
-                "artifact_path": result.artifact_path,
+                "artifact_ref": result.artifact_path,
                 "changed_files": result.changed_files,
                 "side_effects": result.side_effects,
                 "secret_redactions": result.secret_redactions,
@@ -1148,6 +1160,35 @@ class CommandRuntime:
             "resource_limits_unsupported": unsupported,
         }
 
+    def _command_capability_summary(self, limits: ResourceLimits) -> dict[str, Any]:
+        isolation = self._isolation_report(limits)
+        return {
+            "backend": self.backend.name,
+            "timeout": True,
+            "idle_timeout": True,
+            "output_limit": True,
+            "process_tree_kill": True,
+            "network_mode": isolation["network_isolation_enforced"],
+            "filesystem_mode": isolation["filesystem_isolation"],
+        }
+
+    def _sandbox_availability_summary(
+        self,
+        selected_backend: str | None,
+    ) -> dict[str, Any]:
+        backends = list(getattr(self.sandbox_runtime, "backends", []) or [])
+        available = [backend for backend in backends if _sandbox_backend_available(backend)]
+        capabilities = [backend.capabilities() for backend in available]
+        return {
+            "registered_backends": [backend.name() for backend in backends],
+            "available_backends": [backend.name() for backend in available],
+            "selected_backend": selected_backend,
+            "hard_isolation_available": any(item.network_isolation for item in capabilities),
+            "network_isolation_available": any(item.network_isolation for item in capabilities),
+            "memory_limit_available": any(item.memory_limit for item in capabilities),
+            "process_limit_available": any(item.process_limit for item in capabilities),
+        }
+
     def _git_state_summary(self) -> dict[str, Any]:
         git_dir = self.workspace_root / ".git"
         if not git_dir.exists():
@@ -1288,6 +1329,15 @@ def _relative_or_absolute(path: Path, root: Path) -> str:
         return path.relative_to(root).as_posix() or "."
     except ValueError:
         return str(path)
+
+
+def _sandbox_backend_available(backend: Any) -> bool:
+    if not hasattr(backend, "is_available"):
+        return True
+    try:
+        return bool(backend.is_available())
+    except Exception:
+        return False
 
 
 def _command_policy_shape(

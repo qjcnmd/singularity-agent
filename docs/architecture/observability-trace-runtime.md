@@ -49,7 +49,7 @@ work/traces/runs/<run_id>/
 
 Writes are append-only JSONL and are flushed after every append. `spans.jsonl` may contain multiple records for the same span id; the latest record is the current state. This preserves append-only history while exposing `latest_spans()` and `recover_incomplete_spans()` for normal readers.
 
-Large stdout, stderr, diffs, reports, model messages, sandbox logs, and generic binary data must be written to `TraceArtifactStore`. Events only keep artifact ids or existing relative artifact references.
+Large stdout, stderr, diffs, reports, model messages, sandbox logs, and generic binary data must be written to `TraceArtifactStore`. Events only keep `artifact_id` / `artifact_ref` or relative handles. Absolute artifact paths remain internal to the store and are resolved through `TraceArtifactStore.read_artifact(...)`.
 
 ## Redaction
 
@@ -75,9 +75,9 @@ Tool integration records validation start/failure and dispatch start/completion/
 
 Policy and approval integration records policy requested/decided/blocked and approval requested/granted/denied. Full policy audit remains in `.miniharness/policy/audit.jsonl`; structured trace stores decision ids and redacted summaries.
 
-Command integration records command requested/started/completed/failed/timeout/killed. Existing command output artifacts remain under `.miniharness/artifacts/commands/` when generated, and events reference artifact paths instead of embedding full output.
+Command integration records command requested/started/completed/failed/timeout/killed. Existing command output artifacts remain under `.miniharness/artifacts/commands/` when generated, and events reference artifact handles instead of embedding full output.
 
-Sandbox integration records sandbox requested/prepared/started/completed/violation/cleaned/capability_failed when `TraceRuntime` is passed in. Legacy `.miniharness/sandbox/trace.jsonl` remains supported when `SandboxTraceWriter` is used directly.
+Sandbox integration records sandbox requested/prepared/started/completed/violation/cleaned/capability_failed when `TraceRuntime` is passed in. Legacy `.miniharness/sandbox/trace.jsonl` remains supported when `SandboxTraceWriter` is used directly; it records cwd/workspace/sandbox handles rather than absolute sandbox roots.
 
 Mutation integration records mutation transaction start, applied file operations, failures, and rollback completion. Diff bodies stay in diff artifacts.
 
@@ -99,7 +99,7 @@ miniharness trace errors <run_id>
 miniharness trace artifacts <run_id>
 ```
 
-These commands read the local append-only store. They do not replay actions or contact remote telemetry systems.
+`trace artifacts` shows artifact id, kind, size, summary-level metadata, and a relative handle. It does not print the internal absolute artifact path. These commands read the local append-only store. They do not replay actions or contact remote telemetry systems.
 
 ## Reserved Extensions
 

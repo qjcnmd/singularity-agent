@@ -692,6 +692,7 @@ class VerificationRuntime:
             sandbox_artifacts=list(command_result.metadata.get("sandbox_artifacts") or []),
             sandbox_changed_files=dict(command_result.metadata.get("sandbox_changed_files") or {}),
             sandbox_violations=list(command_result.metadata.get("sandbox_violations") or []),
+            capability_summary=_capability_summary(command_result.metadata),
         )
         repair_hints = (
             []
@@ -877,9 +878,10 @@ class VerificationRuntime:
                 "verification_plan_id": plan.id,
                 "verification_check_id": check.id,
                 "command_id": result.evidence.command_id,
-                "artifact_path": result.evidence.artifact_path,
+                "artifact_ref": result.evidence.artifact_path,
                 "status": result.status.value,
                 "failure_type": result.failure_type.value if result.failure_type else None,
+                "capability_summary": result.evidence.capability_summary,
             },
             severity=TraceSeverity.WARNING
             if result.status.value in {"failed", "blocked", "timeout", "flaky"}
@@ -915,6 +917,8 @@ class VerificationRuntime:
                     failure.to_dict() for failure in result.evidence.parsed_failures
                 ],
                 "evidence_artifact": result.evidence.artifact_path,
+                "artifact_ref": result.evidence.artifact_path,
+                "capability_summary": result.evidence.capability_summary,
                 "duration_ms": result.duration_ms,
                 "confidence_impact": result.confidence_impact,
                 "repair_hints": [hint.to_dict() for hint in result.repair_hints],
@@ -1054,3 +1058,58 @@ def _max_risk(left: str, right: str) -> str:
     left = left if left in order else "medium"
     right = right if right in order else "medium"
     return order[max(order.index(left), order.index(right))]
+
+
+def _capability_summary(metadata: dict[str, Any]) -> dict[str, Any]:
+    provider = _safe_subset(
+        metadata.get("provider_capabilities"),
+        {
+            "provider",
+            "supports_tools",
+            "supports_parallel_tool_calls",
+            "supports_streaming",
+            "supports_json_mode",
+            "supports_system_message",
+            "supports_developer_message",
+            "max_context_tokens",
+            "max_output_tokens",
+        },
+    )
+    command = _safe_subset(
+        metadata.get("command_capabilities"),
+        {
+            "backend",
+            "timeout",
+            "idle_timeout",
+            "output_limit",
+            "process_tree_kill",
+            "network_mode",
+            "filesystem_mode",
+        },
+    )
+    sandbox = _safe_subset(
+        metadata.get("sandbox_availability"),
+        {
+            "available_backends",
+            "registered_backends",
+            "selected_backend",
+            "hard_isolation_available",
+            "network_isolation_available",
+            "memory_limit_available",
+            "process_limit_available",
+        },
+    )
+    summary: dict[str, Any] = {}
+    if provider:
+        summary["provider"] = provider
+    if command:
+        summary["command"] = command
+    if sandbox:
+        summary["sandbox"] = sandbox
+    return summary
+
+
+def _safe_subset(value: Any, allowed: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {key: value[key] for key in sorted(allowed) if key in value}

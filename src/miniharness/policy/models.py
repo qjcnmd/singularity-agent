@@ -142,6 +142,7 @@ class PolicyConstraints:
     allowed_hosts: list[str] = field(default_factory=list)
     env_redaction: bool = True
     sandbox_required: bool = False
+    hard_isolation_required: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -154,6 +155,7 @@ class PolicyConstraints:
             "allowed_hosts": self.allowed_hosts,
             "env_redaction": self.env_redaction,
             "sandbox_required": self.sandbox_required,
+            "hard_isolation_required": self.hard_isolation_required,
         }
 
 

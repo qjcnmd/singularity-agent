@@ -8,7 +8,7 @@ from typing import Any
 from miniharness.observability.models import TraceEventType, TraceSeverity
 from miniharness.policy.config import SecurityMode
 from miniharness.policy.models import PolicyDecision
-from miniharness.sandbox.backends import LocalStagingBackend, SandboxBackend
+from miniharness.sandbox.backends import SandboxBackend, default_sandbox_backends
 from miniharness.sandbox.exceptions import SandboxCapabilityError
 from miniharness.sandbox.models import (
     SandboxFilesystemMode,
@@ -33,25 +33,27 @@ class SandboxRuntime:
         security_mode: SecurityMode | str = SecurityMode.COMPAT,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
-        self.backends = backends or [LocalStagingBackend()]
+        self.backends = backends if backends is not None else default_sandbox_backends()
         self.trace = trace or SandboxTraceWriter.create(self.workspace_root)
         self.security_mode = _security_mode(security_mode)
 
     def run(self, request: SandboxRequest) -> SandboxResult:
         self._throw_if_cancelled()
         started = time.perf_counter()
-        backend = self.backends[0] if self.backends else None
+        backend: SandboxBackend | None = None
         prepared = None
         self._emit_trace(
             TraceEventType.SANDBOX_REQUESTED,
             request=request,
             summary=f"Sandbox requested for {request.sandbox_id}.",
         )
-        if backend is None:
-            result = self._unavailable(request, "No sandbox backend is registered.", started)
-            self._record_trace(prepared=prepared, result=result, capabilities=None, request=request)
-            return result
         try:
+            self._apply_policy_constraints(request)
+            backend = self._select_backend(request)
+            if backend is None:
+                result = self._unavailable(request, "No sandbox backend is registered.", started)
+                self._record_trace(prepared=prepared, result=result, capabilities=None, request=request)
+                return result
             self.ensure_capabilities(request, backend)
             self._throw_if_cancelled()
             prepared = backend.prepare(request)
@@ -61,7 +63,14 @@ class SandboxRuntime:
                 request=request,
                 result=None,
                 summary=f"Sandbox prepared with {backend.name()}.",
-                payload={"sandbox_root": str(prepared.sandbox_root)},
+                payload={
+                    "sandbox_id": prepared.sandbox_id,
+                    "backend": prepared.backend_name,
+                    "sandbox_handle": _relative_handle(
+                        prepared.sandbox_root,
+                        self.workspace_root,
+                    ),
+                },
             )
             self._emit_trace(
                 TraceEventType.SANDBOX_STARTED,
@@ -92,7 +101,12 @@ class SandboxRuntime:
             )
             return result
         except SandboxCapabilityError as exc:
-            result = self._unavailable(request, str(exc), started, backend_name=backend.name())
+            result = self._unavailable(
+                request,
+                str(exc),
+                started,
+                backend_name=backend.name() if backend is not None else "unavailable",
+            )
             self._emit_trace(
                 TraceEventType.SANDBOX_CAPABILITY_FAILED,
                 request=request,
@@ -103,7 +117,7 @@ class SandboxRuntime:
             self._record_trace(
                 prepared=prepared,
                 result=result,
-                capabilities=backend.capabilities(),
+                capabilities=backend.capabilities() if backend is not None else None,
                 request=request,
             )
             return result
@@ -117,7 +131,7 @@ class SandboxRuntime:
                 raise
             result = SandboxResult(
                 sandbox_id=request.sandbox_id,
-                backend_name=backend.name(),
+                backend_name=backend.name() if backend is not None else "unavailable",
                 status=SandboxStatus.SETUP_FAILED,
                 exit_code=None,
                 stdout="",
@@ -131,7 +145,7 @@ class SandboxRuntime:
             self._record_trace(
                 prepared=prepared,
                 result=result,
-                capabilities=backend.capabilities(),
+                capabilities=backend.capabilities() if backend is not None else None,
                 request=request,
             )
             return result
@@ -148,6 +162,36 @@ class SandboxRuntime:
             raise SandboxCapabilityError("Backend cannot enforce memory limits.")
         if request.profile.resources.max_processes is not None and not capabilities.process_limit:
             raise SandboxCapabilityError("Backend cannot enforce process limits.")
+        request_checker = getattr(backend, "ensure_request_supported", None)
+        if callable(request_checker):
+            request_checker(request)
+
+    @staticmethod
+    def _apply_policy_constraints(request: SandboxRequest) -> None:
+        constraints = request.policy_constraints
+        if constraints is None:
+            return
+        if getattr(constraints, "hard_isolation_required", False):
+            request.profile.network.require_hard_isolation = True
+
+    def _select_backend(self, request: SandboxRequest) -> SandboxBackend | None:
+        first_capability_error: SandboxCapabilityError | None = None
+        for backend in self.backends:
+            if hasattr(backend, "is_available"):
+                try:
+                    if not backend.is_available():
+                        continue
+                except Exception:
+                    continue
+            try:
+                self.ensure_capabilities(request, backend)
+            except SandboxCapabilityError as exc:
+                first_capability_error = first_capability_error or exc
+                continue
+            return backend
+        if first_capability_error is not None:
+            raise first_capability_error
+        return None
 
     def shutdown(self) -> None:
         return None
@@ -185,6 +229,8 @@ class SandboxRuntime:
             profile.filesystem.detect_changes = True
         if constraints.network_allowed:
             profile.network.mode = SandboxNetworkMode.ALLOWED
+        elif getattr(constraints, "hard_isolation_required", False):
+            profile.network.require_hard_isolation = True
         elif (
             self.security_mode == SecurityMode.STRICT
             and constraints.sandbox_required
@@ -352,3 +398,10 @@ def _security_mode(value: SecurityMode | str) -> SecurityMode:
         return SecurityMode[str(value).upper()]
     except KeyError:
         return SecurityMode(str(value))
+
+
+def _relative_handle(path: Path, root: Path) -> str:
+    try:
+        return path.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix() or "."
+    except ValueError:
+        return path.name
