@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -87,7 +88,6 @@ class RuntimeGraph:
     tools: ToolRegistry
     verification_runtime: VerificationRuntime
     review_runtime: ReviewRuntime
-    evaluation_runtime: EvaluationRuntime
     instruction_runtime: InstructionRuntime
     model_runtime: ModelRuntime
     context_manager: ContextManager
@@ -98,6 +98,11 @@ class RuntimeGraph:
         default_factory=lambda: list(RUNTIME_INITIALIZATION_ORDER)
     )
     components: dict[RuntimeComponentName, RuntimeComponentState] = field(default_factory=dict)
+    _evaluation_runtime: EvaluationRuntime | None = field(default=None, repr=False)
+    _evaluation_runtime_factory: Callable[[], EvaluationRuntime] | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.components:
@@ -108,6 +113,29 @@ class RuntimeGraph:
 
     def state(self, component: RuntimeComponentName) -> RuntimeComponentState:
         return self.components.get(component, RuntimeComponentState.PENDING)
+
+    @property
+    def evaluation_runtime(self) -> EvaluationRuntime:
+        if self._evaluation_runtime is not None:
+            return self._evaluation_runtime
+        if self._evaluation_runtime_factory is None:
+            raise RuntimeInitializationError(
+                "Evaluation runtime is not available.",
+                code="evaluation_runtime_unavailable",
+            )
+        try:
+            runtime = self._evaluation_runtime_factory()
+        except Exception as exc:
+            self.components[RuntimeComponentName.EVALUATION] = RuntimeComponentState.FAILED
+            raise RuntimeInitializationError(
+                "Evaluation runtime initialization failed.",
+                code="evaluation_runtime_failed",
+                details={"error_type": type(exc).__name__, "message": str(exc)},
+            ) from exc
+        runtime.planner_runtime = self.planner
+        self._evaluation_runtime = runtime
+        self._evaluation_runtime_factory = None
+        return runtime
 
     def components_for_health(self) -> dict[str, Any]:
         return {
@@ -127,7 +155,7 @@ class RuntimeGraph:
             "tool_protocol": self.protocol_runtime,
             "verification": self.verification_runtime,
             "review": self.review_runtime,
-            "evaluation": self.evaluation_runtime,
+            "evaluation": self._evaluation_runtime or self._evaluation_runtime_factory,
             "instructions": self.instruction_runtime,
             "model": self.model_runtime,
             "context": self.context_manager,
@@ -285,16 +313,6 @@ class RuntimeFactory:
             verification_runtime.memory_runtime = memory_runtime
             mark(RuntimeComponentName.REVIEW)
 
-            evaluation_runtime = EvaluationRuntime(
-                project_root=project_root,
-                trace_runtime=trace,
-                verification_runtime=verification_runtime,
-                memory_runtime=memory_runtime,
-                planner_runtime=None,
-                tool_runtime=tool_runtime,
-                command_runtime=command_runtime,
-                mutation_runtime=mutation_runtime,
-            )
             mark(RuntimeComponentName.EVALUATION)
 
             instruction_runtime = InstructionRuntime(workspace_root=project_root, trace=trace)
@@ -355,7 +373,6 @@ class RuntimeFactory:
             verification_runtime.planner = planner
             edit_runtime.planner = planner
             review_runtime.planner = planner
-            evaluation_runtime.planner_runtime = planner
             tool_runtime.planner = planner
             index_observation = project_index_runtime.observation_for_goal(user_goal)
             context_manager.add_project_index(index_observation)
@@ -375,13 +392,26 @@ class RuntimeFactory:
                 verification_runtime,
                 edit_runtime,
                 review_runtime,
-                evaluation_runtime,
                 tool_runtime,
                 protocol_runtime,
                 context_manager,
             ):
                 setattr(runtime, "cancellation_token", None)
             mark(RuntimeComponentName.PLANNER)
+
+            def build_evaluation_runtime() -> EvaluationRuntime:
+                runtime = EvaluationRuntime(
+                    project_root=project_root,
+                    trace_runtime=trace,
+                    verification_runtime=verification_runtime,
+                    memory_runtime=memory_runtime,
+                    planner_runtime=planner,
+                    tool_runtime=tool_runtime,
+                    command_runtime=command_runtime,
+                    mutation_runtime=mutation_runtime,
+                )
+                setattr(runtime, "cancellation_token", None)
+                return runtime
 
             return RuntimeGraph(
                 config=config,
@@ -399,7 +429,6 @@ class RuntimeFactory:
                 tools=tools,
                 verification_runtime=verification_runtime,
                 review_runtime=review_runtime,
-                evaluation_runtime=evaluation_runtime,
                 instruction_runtime=instruction_runtime,
                 model_runtime=model_runtime,
                 context_manager=context_manager,
@@ -407,6 +436,7 @@ class RuntimeFactory:
                 protocol_runtime=protocol_runtime,
                 planner=planner,
                 components=components,
+                _evaluation_runtime_factory=build_evaluation_runtime,
             )
         except Exception as exc:
             for component, state in list(components.items()):

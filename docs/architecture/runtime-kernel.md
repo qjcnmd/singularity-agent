@@ -32,19 +32,27 @@ Supported CLI inputs still flow through the config object:
 
 1. Configuration
 2. Observability
-3. WorkspaceState
-4. Policy
-5. Sandbox
-6. Command
-7. Mutation
-8. Tools
-9. Verification
-10. Instructions
-11. Model
-12. Context
-13. Planner
+3. Interaction
+4. WorkspaceState
+5. ProjectIndex
+6. Memory
+7. Policy
+8. Sandbox
+9. Command
+10. Mutation
+11. Edit
+12. Tools
+13. ToolRuntime
+14. ToolProtocol
+15. Verification
+16. Review
+17. Evaluation
+18. Instructions
+19. Model
+20. Context
+21. Planner
 
-Each component is recorded as `runtime.initialized` in trace. The graph creates `ContextManager` before Planner, then `AgentKernel` passes that context into `MiniAgent`. Command, Mutation, Tool, and Verification runtimes are wired back to the session PlannerRuntime after Planner creation so execution evidence still lands in the existing planner ledger.
+Each component is recorded as `runtime.initialized` in trace when its boot-time boundary is ready. The evaluation boundary is registered during boot but the full `EvaluationRuntime` object is created only when evaluation functionality is actually accessed, so normal agent runs do not pay for benchmark scoring, replay, and artifact-writer setup. The graph creates `ContextManager` before Planner, then `AgentKernel` passes that context into `MiniAgent`. Command, Mutation, Tool, Review, Evaluation, and Verification runtimes are wired back to the session PlannerRuntime after Planner creation so execution evidence still lands in the existing planner ledger.
 
 ## Lifecycle
 
@@ -89,7 +97,7 @@ Behavior:
 
 ## Health Check
 
-`RuntimeHealthChecker` checks config, trace, workspace, policy, sandbox, command, mutation, tools, verification, instructions, model, and planner. Missing components become diagnostics; critical missing components fail closed. Results are written to trace as `runtime.health_checked` and included in `FinalReport.runtime_health_summary`.
+`RuntimeHealthChecker` checks the runtime graph components, including deferred components such as evaluation, without forcing lazy runtimes to instantiate. Missing components become diagnostics; critical missing components fail closed. Results are written to trace as `runtime.health_checked` and included in `FinalReport.runtime_health_summary`.
 
 ## Shutdown
 

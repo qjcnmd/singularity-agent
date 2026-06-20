@@ -63,9 +63,44 @@ def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, 
     assert graph.evaluation_runtime.verification_runtime is graph.verification_runtime
     assert graph.evaluation_runtime.memory_runtime is graph.memory_runtime
     assert graph.evaluation_runtime.planner_runtime is graph.planner
-    assert graph.components_for_health()["evaluation"] is graph.evaluation_runtime
+    assert graph.components_for_health()["evaluation"] is not None
     assert graph.model_runtime is not None
     assert graph.tool_runtime is not None
+
+
+def test_runtime_graph_defers_evaluation_runtime_until_used(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINIHARNESS_API_KEY", "test")
+    monkeypatch.setenv("MINIHARNESS_BASE_URL", "http://localhost/v1")
+    monkeypatch.setenv("MINIHARNESS_MODEL", "test-model")
+    constructed: list[dict[str, object]] = []
+
+    class FakeEvaluationRuntime:
+        def __init__(self, **kwargs) -> None:
+            constructed.append(kwargs)
+            self.__dict__.update(kwargs)
+
+    monkeypatch.setattr("miniharness.kernel.graph.EvaluationRuntime", FakeEvaluationRuntime)
+    config = ProductionRuntimeConfig.from_cli(project_root=tmp_path, dry_run=True)
+    trace = TraceRuntime.create(tmp_path, trace_dir=tmp_path / "traces")
+
+    graph = RuntimeFactory().build(
+        project_root=tmp_path,
+        config=config,
+        trace=trace,
+        identity=RunIdentity.new(run_id=trace.run_id, session_id=trace.session_id, task_id=trace.run_id),
+        user_goal="Implement kernel",
+    )
+
+    assert constructed == []
+    assert graph.components_for_health()["evaluation"] is not None
+    assert constructed == []
+
+    evaluation_runtime = graph.evaluation_runtime
+
+    assert len(constructed) == 1
+    assert evaluation_runtime.verification_runtime is graph.verification_runtime
+    assert evaluation_runtime.memory_runtime is graph.memory_runtime
+    assert evaluation_runtime.planner_runtime is graph.planner
 
 
 def test_runtime_health_reports_missing_evaluation_as_critical() -> None:
