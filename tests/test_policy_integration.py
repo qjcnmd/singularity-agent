@@ -8,7 +8,18 @@ from pydantic import BaseModel
 from miniharness.command import CommandRequest, CommandRuntime, ExecutionStatus
 from miniharness.planner import EvidenceLedger, PlannerRuntime, TaskStatus, TaskState
 from miniharness.planner.finalizer import Finalizer
-from miniharness.policy import DecisionOutcome, PolicyConfig, PolicyRuntime
+from miniharness.policy import (
+    Capability,
+    DecisionOutcome,
+    OperationKind,
+    PolicyConfig,
+    PolicyRequest,
+    PolicyRuntime,
+    PolicySubject,
+    ResourceRef,
+    RuntimeName,
+    SecurityMode,
+)
 from miniharness.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
 from miniharness.verification import VerificationRuntime
 from miniharness.workspace import CreateFile, MutationRuntime
@@ -20,7 +31,7 @@ class EmptyInput(BaseModel):
 
 class CountingPolicyRuntime(PolicyRuntime):
     def __init__(self, tmp_path: Path) -> None:
-        super().__init__(PolicyConfig(workspace_root=tmp_path))
+        super().__init__(PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT))
         self.calls: list[str] = []
 
     def enforce(self, request):  # type: ignore[no-untyped-def]
@@ -97,6 +108,39 @@ def test_command_runtime_calls_policy_before_execute(tmp_path: Path) -> None:
 
     assert result.execution_status == ExecutionStatus.COMPLETED
     assert any(call.startswith("command:execute_command") for call in policy.calls)
+
+
+def test_policy_compat_allows_plain_local_command_without_review(tmp_path: Path) -> None:
+    request = PolicyRequest(
+        session_id="session",
+        task_id="task",
+        phase_id="command",
+        action_id="cmd",
+        runtime=RuntimeName.COMMAND,
+        operation=OperationKind.EXECUTE_COMMAND,
+        capability=Capability.EXECUTE_COMMAND,
+        subject=PolicySubject(subject_type="runtime", name="CommandRuntime"),
+        resource=ResourceRef("command", f"{sys.executable} -c \"print('ok')\""),
+        reason=f"{sys.executable} -c \"print('ok')\"",
+        proposed_by_model=True,
+        metadata={
+            "command": f"{sys.executable} -c \"print('ok')\"",
+            "network_policy": "DISABLED",
+            "filesystem_mode": "READ_ONLY_WORKSPACE",
+            "security_mode": "compat",
+        },
+        workspace_root=str(tmp_path),
+    )
+
+    strict = PolicyRuntime(
+        PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.STRICT)
+    )
+    compat = PolicyRuntime(
+        PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT)
+    )
+
+    assert strict.enforce(request).outcome == DecisionOutcome.REQUIRE_REVIEW
+    assert compat.enforce(request).outcome == DecisionOutcome.ALLOW
 
 
 def test_verification_runtime_does_not_bypass_policy(tmp_path: Path) -> None:

@@ -121,7 +121,7 @@ class TraceRuntime:
             warning = {
                 "warning": "trace_write_failed",
                 "type": type(exc).__name__,
-                "message": str(exc),
+                "message": self.redactor.redact_text(str(exc)),
             }
             print(f"[miniharness trace warning] {warning}", file=sys.stderr)
             return warning
@@ -149,7 +149,7 @@ class TraceRuntime:
             warning = {
                 "warning": "interaction_sink_failed",
                 "type": type(exc).__name__,
-                "message": str(exc),
+                "message": self.redactor.redact_text(str(exc)),
             }
             print(f"[miniharness trace warning] {warning}", file=sys.stderr)
 

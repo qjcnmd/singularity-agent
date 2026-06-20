@@ -12,6 +12,7 @@ from miniharness.command.models import (
     FilesystemMode,
     NetworkMode,
 )
+from miniharness.policy.config import SecurityMode
 
 
 READ_ONLY_GIT = {
@@ -59,9 +60,34 @@ LINTERS = {"eslint", "flake8", "ruff"}
 TYPECHECKERS = {"mypy", "pyright", "tsc"}
 BUILD_TOOLS = {"make", "tsc"}
 TEST_TOOLS = {"pytest", "tox", "nox"}
+READ_ONLY_PROGRAM_ALLOWLIST = {
+    "git",
+    "pwd",
+    "whoami",
+    "where",
+    "which",
+}
+INTERPRETERS = {
+    "bash",
+    "cmd",
+    "deno",
+    "node",
+    "perl",
+    "powershell",
+    "pwsh",
+    "py",
+    "python",
+    "python3",
+    "ruby",
+    "sh",
+    "zsh",
+}
 
 
 class CommandPolicy:
+    def __init__(self, *, security_mode: SecurityMode | str = SecurityMode.STRICT) -> None:
+        self.security_mode = _security_mode(security_mode)
+
     def evaluate(
         self,
         request: CommandRequest,
@@ -142,6 +168,17 @@ class CommandPolicy:
                 redaction_rules=redaction_rules,
                 error_code="review_required",
             )
+        strict_issue = self._strict_local_execution_issue(request, risk_tags)
+        if strict_issue is not None:
+            return CommandPolicyResult(
+                decision=CommandDecision.REQUIRE_REVIEW,
+                reasons=[strict_issue],
+                risk_tags=sorted_risks({*risk_tags, CommandRisk.UNKNOWN}),
+                required_network=request.network_mode,
+                required_filesystem=request.filesystem_mode,
+                redaction_rules=redaction_rules,
+                error_code="review_required",
+            )
         if CommandRisk.VCS_MUTATION in risk_tags:
             return CommandPolicyResult(
                 decision=CommandDecision.REQUIRE_REVIEW,
@@ -198,6 +235,39 @@ class CommandPolicy:
             required_filesystem=request.filesystem_mode,
             redaction_rules=redaction_rules,
         )
+
+    def _strict_local_execution_issue(
+        self,
+        request: CommandRequest,
+        risk_tags: list[CommandRisk],
+    ) -> str | None:
+        if self.security_mode == SecurityMode.COMPAT:
+            return None
+        if request.argv is None:
+            return None
+        program = _program_name(request.argv)
+        lowered = [part.lower() for part in request.argv]
+        if CommandRisk.VCS_READ in risk_tags and _is_git_read(program, lowered):
+            return None
+        if request.purpose in {
+            CommandPurpose.PROJECT_VERIFICATION,
+            CommandPurpose.LINT,
+            CommandPurpose.TYPECHECK,
+            CommandPurpose.FORMAT_CHECK,
+            CommandPurpose.BUILD,
+        }:
+            return None
+        if request.filesystem_mode == FilesystemMode.READ_ONLY_WORKSPACE:
+            if program in INTERPRETERS and _has_inline_execution(program, lowered):
+                return "Strict security mode requires review before local inline interpreter execution."
+            if (
+                CommandRisk.READ_ONLY_COMMAND in risk_tags
+                and program not in READ_ONLY_PROGRAM_ALLOWLIST
+            ):
+                return "Strict security mode only auto-allows known read-only local commands."
+            if CommandRisk.UNKNOWN in risk_tags:
+                return "Strict security mode requires review before unknown local command execution."
+        return None
 
     def classify(self, request: CommandRequest) -> list[CommandRisk]:
         tags: set[CommandRisk] = set()
@@ -269,6 +339,9 @@ class CommandPolicy:
             tags.add(CommandRisk.UNKNOWN)
         return sorted_risks(tags)
 
+    def requires_verification_runtime(self, request: CommandRequest) -> bool:
+        return _is_verification_like_request(request)
+
     @staticmethod
     def _cwd_error(workspace_root: Path, cwd: str) -> str | None:
         root = workspace_root.expanduser().resolve(strict=False)
@@ -289,6 +362,15 @@ def sorted_risks(tags: set[CommandRisk]) -> list[CommandRisk]:
     return sorted(tags, key=lambda tag: tag.value)
 
 
+def _security_mode(value: SecurityMode | str) -> SecurityMode:
+    if isinstance(value, SecurityMode):
+        return value
+    try:
+        return SecurityMode[str(value).upper()]
+    except KeyError:
+        return SecurityMode(str(value))
+
+
 def is_secret_env_name(name: str) -> bool:
     upper = name.upper()
     return (
@@ -302,12 +384,69 @@ def is_secret_env_name(name: str) -> bool:
     )
 
 
+def _is_verification_like_request(request: CommandRequest) -> bool:
+    if request.purpose in {
+        CommandPurpose.PROJECT_VERIFICATION,
+        CommandPurpose.BUILD,
+        CommandPurpose.LINT,
+        CommandPurpose.TYPECHECK,
+        CommandPurpose.FORMAT_CHECK,
+    }:
+        return True
+    argv = request.argv or []
+    if not argv:
+        return False
+    program = _program_name(argv)
+    lowered = [part.lower() for part in argv]
+    joined = " ".join(lowered)
+    if program in {
+        "pytest",
+        "tox",
+        "nox",
+        "jest",
+        "vitest",
+        "tsc",
+        "eslint",
+        "mypy",
+        "pyright",
+    }:
+        return True
+    if program in {"python", "python3", "py"} and len(lowered) >= 3:
+        return lowered[1:3] in (
+            ["-m", "pytest"],
+            ["-m", "mypy"],
+            ["-m", "ruff"],
+            ["-m", "build"],
+        )
+    if program in {"npm", "pnpm", "yarn"}:
+        return any(part in {"test", "lint", "build", "typecheck", "type-check"} for part in lowered[1:3])
+    if program == "cargo":
+        return any(part in {"test", "build", "clippy", "check"} for part in lowered[1:3])
+    if program == "go":
+        return any(part in {"test", "build"} for part in lowered[1:3])
+    if program in {"make", "just"}:
+        return any(part in {"test", "lint", "build", "typecheck"} for part in lowered[1:3])
+    return " pytest" in joined or " npm test" in joined or " pnpm test" in joined
+
+
 def _program_name(argv: list[str]) -> str:
     program = Path(argv[0]).name.lower()
     for suffix in (".exe", ".cmd", ".bat", ".ps1"):
         if program.endswith(suffix):
             program = program[: -len(suffix)]
     return program
+
+
+def _has_inline_execution(program: str, lowered: list[str]) -> bool:
+    if program in {"python", "python3", "py", "node", "deno", "ruby", "perl"}:
+        return any(part in {"-c", "-e"} for part in lowered[1:])
+    if program in {"powershell", "pwsh"}:
+        return any(part in {"-command", "-encodedcommand", "-enc"} for part in lowered[1:])
+    if program == "cmd":
+        return any(part in {"/c", "/k"} for part in lowered[1:])
+    if program in {"bash", "sh", "zsh"}:
+        return any(part in {"-c"} for part in lowered[1:])
+    return False
 
 
 def _is_test_command(program: str, lowered: list[str]) -> bool:

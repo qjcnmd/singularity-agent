@@ -11,13 +11,20 @@ from miniharness.policy import (
     PolicyConstraints,
     PolicyDecision,
     PolicyRuntime,
+    SecurityMode,
 )
 from miniharness.verification import FailureType, VerificationRuntime
 
 
 class SandboxRequiredPolicy(PolicyRuntime):
-    def __init__(self, root: Path, *, hard_network: bool = False) -> None:
-        super().__init__(PolicyConfig(workspace_root=root))
+    def __init__(
+        self,
+        root: Path,
+        *,
+        hard_network: bool = False,
+        security_mode: SecurityMode = SecurityMode.STRICT,
+    ) -> None:
+        super().__init__(PolicyConfig(workspace_root=root, security_mode=security_mode))
         self.hard_network = hard_network
 
     def enforce(self, request):  # type: ignore[no-untyped-def]
@@ -39,7 +46,10 @@ class SandboxRequiredPolicy(PolicyRuntime):
 def test_command_runtime_routes_sandbox_required_command_without_real_workspace_write(tmp_path: Path) -> None:
     runtime = CommandRuntime(
         tmp_path,
-        policy_runtime=SandboxRequiredPolicy(tmp_path),
+        policy_runtime=SandboxRequiredPolicy(
+            tmp_path,
+            security_mode=SecurityMode.COMPAT,
+        ),
     )
 
     result = runtime.run(
@@ -60,6 +70,24 @@ def test_command_runtime_routes_sandbox_required_command_without_real_workspace_
     assert result.changed_files == ["only-sandbox.txt"]
 
 
+def test_strict_sandbox_required_command_fails_closed_without_hard_isolation(tmp_path: Path) -> None:
+    runtime = CommandRuntime(
+        tmp_path,
+        policy_runtime=SandboxRequiredPolicy(tmp_path),
+    )
+
+    result = runtime.run(
+        CommandRequest(
+            argv=[sys.executable, "-c", "print('ok')"],
+            cwd=".",
+        )
+    )
+
+    assert result.execution_status == ExecutionStatus.BACKEND_ERROR
+    assert result.error_code == "sandbox_unavailable"
+    assert result.isolation_report["sandbox"]["status"] == "backend_unavailable"
+
+
 def test_verification_evidence_records_sandbox_metadata(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text(
         """
@@ -76,12 +104,18 @@ testpaths = ["tests"]
     (tests_dir / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
     command_runtime = CommandRuntime(
         tmp_path,
-        policy_runtime=SandboxRequiredPolicy(tmp_path),
+        policy_runtime=SandboxRequiredPolicy(
+            tmp_path,
+            security_mode=SecurityMode.COMPAT,
+        ),
     )
     runtime = VerificationRuntime(
         tmp_path,
         command_runtime=command_runtime,
-        policy_runtime=SandboxRequiredPolicy(tmp_path),
+        policy_runtime=SandboxRequiredPolicy(
+            tmp_path,
+            security_mode=SecurityMode.COMPAT,
+        ),
     )
 
     plan = runtime.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")

@@ -183,8 +183,10 @@ class ToolRuntime:
         self._cache = ToolResultCache()
         self._ledger = IdempotencyLedger()
         self._redactor = TraceRedactor()
+        self.cancellation_token: Any | None = None
 
     def execute_tool_call(self, tool_call: dict[str, Any]) -> ToolResult:
+        self._throw_if_cancelled()
         started_at = datetime.now(UTC).isoformat()
         started = time.perf_counter()
         tool_call_id = tool_call.get("id")
@@ -198,6 +200,7 @@ class ToolRuntime:
         result: ToolResult
 
         try:
+            self._throw_if_cancelled()
             spec = self.registry.get(tool_name)
             if spec is None or not spec.enabled:
                 result = ToolResult.failure(
@@ -326,6 +329,7 @@ class ToolRuntime:
             if planner_decision is not None and planner_decision.action is not None:
                 planner_action_id = planner_decision.action.action_id
 
+            self._throw_if_cancelled()
             cache_key = self._cache_key(spec, validated_args)
             cache_policy = spec.cache_policy
             if self._should_cache(spec):
@@ -361,7 +365,9 @@ class ToolRuntime:
                 },
                 ids={"action_id": planner_action_id or tool_call_id},
             )
+            self._throw_if_cancelled()
             result, output_digest = self._execute_handler(spec, validated)
+            self._throw_if_cancelled()
             if approval_grant_id:
                 result.metadata["approval_grant_id"] = approval_grant_id
             if policy_decision_id:
@@ -385,6 +391,8 @@ class ToolRuntime:
             self._remember_replay(tool_call_id, args_fingerprint, spec, result)
             return result
         except Exception as exc:
+            if _is_cancellation_error(exc):
+                raise
             result = ToolResult.failure(
                 code="internal_error",
                 message=self._redactor.redact_text(str(exc)),
@@ -416,6 +424,11 @@ class ToolRuntime:
 
     def invalidate_paths(self, paths: list[str]) -> None:
         self._cache.invalidate_paths(paths)
+
+    def _throw_if_cancelled(self) -> None:
+        token = getattr(self, "cancellation_token", None)
+        if token is not None and hasattr(token, "throw_if_cancelled"):
+            token.throw_if_cancelled()
 
     def _authorize_with_planner(
         self,
@@ -1097,6 +1110,13 @@ def _command_identifier(args: dict[str, Any]) -> str:
     if args.get("argv"):
         return " ".join(str(part) for part in args["argv"])
     return ""
+
+
+def _is_cancellation_error(exc: BaseException) -> bool:
+    return (
+        getattr(exc, "code", None) == "cancelled"
+        or exc.__class__.__name__ == "CancellationError"
+    )
 
 
 def _policy_error_code(outcome: DecisionOutcome) -> str:

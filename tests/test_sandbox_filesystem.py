@@ -12,6 +12,14 @@ from miniharness.sandbox import (
 def test_copy_on_write_copies_regular_files_and_excludes_heavy_dirs(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-test-secret\n", encoding="utf-8")
+    (tmp_path / ".env.local").write_text("OPENAI_API_KEY=sk-local-secret\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("OPENAI_API_KEY=sk-prod-secret\n", encoding="utf-8")
+    (tmp_path / "service-token.json").write_text("secret", encoding="utf-8")
+    (tmp_path / "certificate.pem").write_text("private", encoding="utf-8")
+    (tmp_path / "client.pfx").write_text("private", encoding="utf-8")
+    (tmp_path / "signing.p12").write_text("private", encoding="utf-8")
+    (tmp_path / "id_rsa").write_text("private", encoding="utf-8")
     for ignored in [".git", "node_modules", "venv", ".pytest_cache"]:
         (tmp_path / ignored).mkdir()
         (tmp_path / ignored / "ignored.txt").write_text("ignored", encoding="utf-8")
@@ -30,6 +38,14 @@ def test_copy_on_write_copies_regular_files_and_excludes_heavy_dirs(tmp_path: Pa
     assert (prepared.workspace_copy_root / "src" / "app.py").exists()
     assert not (prepared.workspace_copy_root / ".git").exists()
     assert not (prepared.workspace_copy_root / "node_modules").exists()
+    assert not (prepared.workspace_copy_root / ".env").exists()
+    assert not (prepared.workspace_copy_root / ".env.local").exists()
+    assert not (prepared.workspace_copy_root / ".env.production").exists()
+    assert not (prepared.workspace_copy_root / "service-token.json").exists()
+    assert not (prepared.workspace_copy_root / "certificate.pem").exists()
+    assert not (prepared.workspace_copy_root / "client.pfx").exists()
+    assert not (prepared.workspace_copy_root / "signing.p12").exists()
+    assert not (prepared.workspace_copy_root / "id_rsa").exists()
     assert prepared.execution_cwd == prepared.workspace_copy_root / "src"
 
 

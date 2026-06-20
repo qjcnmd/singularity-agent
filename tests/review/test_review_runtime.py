@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from miniharness.model import ModelMessage, ModelTurnResult, ModelTurnStatus
 from miniharness.observability import TraceRuntime
 from miniharness.review import ReviewDecisionAction, ReviewRuntime
 
@@ -80,3 +81,101 @@ def test_review_runtime_sends_structured_reports_to_memory(tmp_path: Path) -> No
     )
 
     assert calls == [report]
+
+
+def test_review_runtime_memory_ingest_failure_is_fail_open(tmp_path: Path) -> None:
+    class BrokenMemoryRuntime:
+        def ingest_review_report(self, report):
+            raise RuntimeError("memory unavailable")
+
+    runtime = ReviewRuntime(tmp_path, enable_model_critic=False)
+    runtime.memory_runtime = BrokenMemoryRuntime()
+
+    report = runtime.post_verification_review(
+        verification={
+            "completion_assessment": {"status": "failed", "remaining_risks": ["tests failed"]},
+            "failed_checks": [{"check_id": "check_1", "status": "failed"}],
+        }
+    )
+
+    assert report.decision.action == ReviewDecisionAction.REPAIR
+    assert any(item.source == "memory_ingest" for item in report.evidence)
+
+
+def test_review_runtime_model_critic_request_inherits_run_identifiers(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRuntime:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id="resp_critic",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    class Planner:
+        session_id = "session_critic"
+        task_id = "task_critic"
+        state = type("State", (), {"current_phase": "review_phase"})()
+
+    trace = TraceRuntime.create(tmp_path, trace_dir=tmp_path / "traces")
+    runtime = ReviewRuntime(
+        tmp_path,
+        trace=trace,
+        planner=Planner(),
+        model_runtime=FakeModelRuntime(),
+        enable_model_critic=True,
+    )
+
+    report = runtime.post_verification_review(
+        verification={
+            "plan": {"verification_plan_id": "verify_1"},
+            "completion_assessment": {"status": "ready"},
+        }
+    )
+
+    assert report.model_critic_status == "ok"
+    assert requests
+    request = requests[0]
+    assert request.run_id == trace.run_id
+    assert request.session_id == "session_critic"
+    assert request.task_id == "task_critic"
+    assert request.phase_id == "review_phase"
+    assert request.action_id == "verify_1"
+
+
+def test_review_runtime_model_critic_bad_json_is_non_blocking(tmp_path: Path) -> None:
+    class BadJsonModelRuntime:
+        def run_turn(self, request):
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id="resp_bad",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text("not json"),
+            )
+
+    runtime = ReviewRuntime(tmp_path, model_runtime=BadJsonModelRuntime(), enable_model_critic=True)
+
+    report = runtime.post_verification_review(
+        verification={"completion_assessment": {"status": "ready"}}
+    )
+
+    assert report.model_critic_status == "model_critic_invalid"
+    assert any(finding.source == "model_critic" for finding in report.findings)
+
+
+def test_review_runtime_model_critic_exception_is_non_blocking(tmp_path: Path) -> None:
+    class RaisingModelRuntime:
+        def run_turn(self, request):
+            raise RuntimeError("critic down")
+
+    runtime = ReviewRuntime(tmp_path, model_runtime=RaisingModelRuntime(), enable_model_critic=True)
+
+    report = runtime.post_verification_review(
+        verification={"completion_assessment": {"status": "ready"}}
+    )
+
+    assert report.model_critic_status == "model_critic_unavailable"
+    assert report.model_critic_error == "critic down"

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from miniharness.observability.redaction import TraceRedactor
 from miniharness.sandbox.artifacts import SandboxArtifactCollector
 from miniharness.sandbox.environment import SandboxEnvironmentBuilder
 from miniharness.sandbox.exceptions import SandboxCapabilityError
@@ -44,6 +45,7 @@ class LocalStagingBackend:
         self.filesystem = SandboxFilesystemManager()
         self.environment = SandboxEnvironmentBuilder()
         self.artifacts = SandboxArtifactCollector()
+        self.redactor = TraceRedactor()
 
     def name(self) -> str:
         return "local_staging"
@@ -115,10 +117,9 @@ class LocalStagingBackend:
             except subprocess.TimeoutExpired:
                 timed_out = True
                 error_code = "timeout"
-                _kill_process_tree(process)
-                raw_stdout, raw_stderr = process.communicate(timeout=2)
-            stdout = raw_stdout.decode("utf-8", errors="replace")
-            stderr = raw_stderr.decode("utf-8", errors="replace")
+                raw_stdout, raw_stderr = _communicate_after_kill(process)
+            stdout = self.redactor.redact_text(raw_stdout.decode("utf-8", errors="replace"))
+            stderr = self.redactor.redact_text(raw_stderr.decode("utf-8", errors="replace"))
             max_output = request.profile.resources.max_output_chars
             if max_output is not None:
                 combined = len(stdout) + len(stderr)
@@ -132,15 +133,15 @@ class LocalStagingBackend:
             status = SandboxStatus.TIMEOUT if timed_out else SandboxStatus.SUCCESS if exit_code == 0 else SandboxStatus.FAILED
         except FileNotFoundError as exc:
             error_code = "command_not_found"
-            stderr = str(exc)
+            stderr = self.redactor.redact_text(str(exc))
             status = SandboxStatus.FAILED
         except PermissionError as exc:
             error_code = "permission_error"
-            stderr = str(exc)
+            stderr = self.redactor.redact_text(str(exc))
             status = SandboxStatus.FAILED
         except Exception as exc:
             error_code = "sandbox_execution_error"
-            stderr = str(exc)
+            stderr = self.redactor.redact_text(str(exc))
             status = SandboxStatus.FAILED
         changes = (
             self.filesystem.detect_changes(prepared.workspace_copy_root, prepared.baseline)
@@ -243,3 +244,19 @@ def _kill_process_tree(process: subprocess.Popen[bytes]) -> None:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
         except Exception:
             process.kill()
+
+
+def _communicate_after_kill(process: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
+    _kill_process_tree(process)
+    try:
+        return process.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            if process.poll() is None:
+                process.kill()
+        except Exception:
+            pass
+        try:
+            return process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            return b"", b""

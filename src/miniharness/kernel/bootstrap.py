@@ -154,6 +154,7 @@ class KernelBootstrap:
                     "max_turns": config.max_turns,
                     "profile": config.profile,
                     "approval_mode": config.approval_mode.value,
+                    "security_mode": config.security_mode.value,
                     "interaction_mode": config.interaction_mode.value,
                     "strict": config.strict,
                     "dry_run": config.dry_run,

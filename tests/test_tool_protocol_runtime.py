@@ -25,9 +25,11 @@ from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
 from miniharness.tool_protocol.state import ToolProtocolStateStore
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.tools.command import register_command_tools
-from miniharness.tools.models import ToolExecutionFailure, ToolSpec
+from miniharness.tools.models import PermissionLevel, ToolExecutionFailure, ToolSideEffectKind, ToolSpec
 from miniharness.trace import TraceWriter
 from tests.tool_runtime_helpers import make_test_policy_runtime
+from tests.test_tool_runtime_policy_approval import SequencedPolicyRuntime
+from miniharness.policy import DecisionOutcome
 
 
 def _make_request(tmp_path: Path) -> tuple[ModelTurnRequest, ContextManager]:
@@ -269,6 +271,64 @@ def test_protocol_runtime_appends_tool_message_when_tool_runtime_fails(tmp_path:
     assert payload["ok"] is False
     assert payload["error_code"] == "boom"
     assert "super-secret" not in tool_message["content"]
+
+
+def test_protocol_runtime_blocks_side_effect_replay_without_calling_handler(tmp_path: Path) -> None:
+    calls = []
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="write_file",
+            description="write",
+            input_model=_EmptyInput,
+            handler=lambda _args: calls.append("called") or {"ok": True},
+            permission_level=PermissionLevel.READ_ONLY,
+            side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
+            idempotent=False,
+        )
+    )
+    context = ContextManager(system_prompt="system", user_goal="mutate")
+    tool_runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.coding_agent(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_runtime=SequencedPolicyRuntime([DecisionOutcome.ALLOW]),  # type: ignore[arg-type]
+    )
+    protocol_runtime = ToolCallingProtocolRuntime(
+        registry=registry,
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    first_call = ModelToolCall(
+        tool_call_id="call_write",
+        tool_name="write_file",
+        arguments={},
+        raw_arguments="{}",
+        parse_status=ModelToolParseStatus.VALID,
+    )
+
+    first = protocol_runtime.handle_model_turn_result(
+        _tool_result(first_call, response_id="resp_write_1"),
+        context=context,
+        tool_runtime=tool_runtime,
+        planner=None,
+        policy_runtime=None,
+    )
+    calls.clear()
+    replay = protocol_runtime.handle_model_turn_result(
+        _tool_result(first_call, response_id="resp_write_2"),
+        context=context,
+        tool_runtime=tool_runtime,
+        planner=None,
+        policy_runtime=None,
+    )
+
+    assert first.executed_count == 1
+    assert replay.rejected_count == 1
+    assert calls == []
+    tool_payload = json.loads([message for message in context.messages() if message["role"] == "tool"][-1]["content"])
+    assert tool_payload["error_code"] == "side_effect_replay"
 
 
 def test_protocol_runtime_appends_policy_and_sandbox_results_to_context(tmp_path: Path) -> None:

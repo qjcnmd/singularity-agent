@@ -1,6 +1,6 @@
 from miniharness.policy.approval import ApprovalGate
 from miniharness.policy.audit import PolicyAuditWriter
-from miniharness.policy.config import ApprovalMode, PolicyConfig
+from miniharness.policy.config import ApprovalMode, PolicyConfig, SecurityMode
 from miniharness.policy.engine import PolicyRuntime
 from miniharness.policy.exceptions import (
     ApprovalDenied,
@@ -60,4 +60,5 @@ __all__ = [
     "RiskTag",
     "RuntimeName",
     "SandboxRequired",
+    "SecurityMode",
 ]

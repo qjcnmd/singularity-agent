@@ -17,7 +17,7 @@ class WriteInput(BaseModel):
     path: str
 
 
-def test_validator_builds_parallel_readonly_batch(tmp_path) -> None:
+def test_validator_builds_readonly_batch_but_schedules_sequentially(tmp_path) -> None:
     validator = ToolProtocolValidator(ToolRegistry(tmp_path))
     assistant_message = {
         "role": "assistant",
@@ -54,7 +54,9 @@ def test_validator_builds_parallel_readonly_batch(tmp_path) -> None:
         "read_file",
         "search_text",
     ]
-    assert validator.schedule(result.batch).execution_mode == ToolExecutionMode.PARALLEL_READONLY
+    plan = validator.schedule(result.batch)
+    assert plan.execution_mode == ToolExecutionMode.SEQUENTIAL
+    assert plan.parallel_groups == []
 
 
 def test_validator_schedules_mutation_calls_sequentially(tmp_path) -> None:

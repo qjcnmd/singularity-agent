@@ -16,6 +16,7 @@ from miniharness.tools.models import ToolExecutionBackendKind, ToolResult, ToolS
 from pydantic import BaseModel
 from miniharness.workspace import CreateFile, MutationRuntime
 from miniharness.command import CommandRequest, CommandRuntime
+from miniharness.policy import PolicyConfig, PolicyRuntime, SecurityMode
 from miniharness.verification import VerificationRuntime
 
 
@@ -331,7 +332,13 @@ def test_mutation_runtime_observer_updates_planner_with_rich_result(tmp_path: Pa
 def test_command_runtime_observer_updates_planner_with_rich_result(tmp_path: Path) -> None:
     planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Run command")
-    runtime = CommandRuntime(tmp_path, planner=planner)
+    runtime = CommandRuntime(
+        tmp_path,
+        planner=planner,
+        policy_runtime=PolicyRuntime(
+            PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT)
+        ),
+    )
 
     result = runtime.run(CommandRequest(argv=["python", "-c", "print('ok')"]), tool_call_id="call_cmd")
 

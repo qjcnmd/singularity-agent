@@ -52,6 +52,38 @@ LONG_RUNNING_MARKERS = {
     "uvicorn",
 }
 SHELL_EXPANSION_PATTERNS = ("|", ">", "<", "&&", "||", ";", "$(", "`")
+INLINE_WRITE_MARKERS = (
+    ".write_text(",
+    ".write_bytes(",
+    ".open(",
+    "open(",
+    "touch(",
+    "unlink(",
+    "rename(",
+    "replace(",
+    "remove(",
+    "rmdir(",
+    "mkdir(",
+    "makedirs(",
+    "shutil.copy",
+    "shutil.move",
+    "writefilesync(",
+    "appendfilesync(",
+    "rm(",
+    "mkdirsync(",
+)
+INLINE_WRITE_MODE_MARKERS = (
+    '"w"',
+    "'w'",
+    '"a"',
+    "'a'",
+    '"x"',
+    "'x'",
+    '"w+"',
+    "'w+'",
+    '"a+"',
+    "'a+'",
+)
 
 
 @dataclass(frozen=True)
@@ -91,10 +123,12 @@ class RiskClassifier:
                 or request.metadata.get("shell")
                 or request.resource.identifier
             )
+            argv = _metadata_argv(request.metadata.get("argv"))
             command_level, command_tags, command_reasons = self._classify_command(
                 command,
                 operation=request.operation,
                 capability=request.capability,
+                argv=argv,
             )
             level = max_level(level, command_level)
             tags.update(command_tags)
@@ -182,11 +216,12 @@ class RiskClassifier:
         *,
         operation: OperationKind,
         capability: Capability,
+        argv: list[str] | None = None,
     ) -> tuple[RiskLevel, set[RiskTag], list[str]]:
         tags: set[RiskTag] = set()
         reasons: list[str] = []
         lowered = command.lower()
-        argv = _split_command(command)
+        argv = argv or _split_command(command)
         program = Path(argv[0]).name.lower() if argv else ""
         for suffix in (".exe", ".cmd", ".bat", ".ps1"):
             if program.endswith(suffix):
@@ -203,6 +238,10 @@ class RiskClassifier:
             tags.add(RiskTag.SHELL_EXPANSION)
             level = max_level(level, RiskLevel.MEDIUM)
             reasons.append("Command uses shell expansion.")
+        if _has_inline_workspace_write(program, lowered, argv):
+            tags.add(RiskTag.MUTATES_FILES)
+            level = max_level(level, RiskLevel.MEDIUM)
+            reasons.append("Inline interpreter code appears to write files.")
         if _is_destructive_command(program, lowered, argv):
             tags.update({RiskTag.DESTRUCTIVE, RiskTag.IRREVERSIBLE, RiskTag.MUTATES_FILES})
             level = RiskLevel.CRITICAL
@@ -268,6 +307,12 @@ def _split_command(command: str) -> list[str]:
         return command.split()
 
 
+def _metadata_argv(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    return [str(item) for item in value]
+
+
 def _is_verification(program: str, lowered: str, argv: list[str]) -> bool:
     if program in {"pytest", "tox", "nox", "jest", "vitest", "tsc", "eslint", "mypy", "pyright"}:
         return True
@@ -287,6 +332,34 @@ def _is_package_manager(program: str, argv: list[str]) -> bool:
     if program not in PACKAGE_PROGRAMS:
         return False
     return any(part in {"add", "install", "sync", "update", "upgrade"} for part in lowered[1:])
+
+
+def _has_inline_workspace_write(program: str, lowered: str, argv: list[str]) -> bool:
+    inline_code = _inline_code(program, argv)
+    if inline_code is None:
+        return False
+    code = inline_code.lower()
+    if any(marker in code for marker in INLINE_WRITE_MARKERS):
+        return True
+    return "open(" in code and any(marker in code for marker in INLINE_WRITE_MODE_MARKERS)
+
+
+def _inline_code(program: str, argv: list[str]) -> str | None:
+    if program in {"python", "python3", "py", "node", "deno", "ruby", "perl"}:
+        flags = {"-c", "-e"}
+    elif program in {"bash", "sh", "zsh"}:
+        flags = {"-c"}
+    elif program in {"powershell", "pwsh"}:
+        flags = {"-command", "-encodedcommand", "-enc"}
+    elif program == "cmd":
+        flags = {"/c", "/k"}
+    else:
+        return None
+    lowered = [part.lower() for part in argv]
+    for index, part in enumerate(lowered[1:], start=1):
+        if part in flags and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
 
 
 def _is_destructive_command(program: str, lowered: str, argv: list[str]) -> bool:

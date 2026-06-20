@@ -66,6 +66,8 @@ class RuntimeComponentName(str, Enum):
     MUTATION = "mutation"
     EDIT = "edit"
     TOOLS = "tools"
+    TOOL_RUNTIME = "tool_runtime"
+    TOOL_PROTOCOL = "tool_protocol"
     VERIFICATION = "verification"
     REVIEW = "review"
     INSTRUCTIONS = "instructions"

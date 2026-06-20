@@ -20,6 +20,21 @@ dev = [
 [project.scripts]
 miniharness = "miniharness.cli:app"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    ".git",
+    ".miniharness",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".test-tmp",
+    ".venv",
+    "__pycache__",
+    "outputs",
+    "work",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

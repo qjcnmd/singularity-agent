@@ -57,6 +57,8 @@ RUNTIME_INITIALIZATION_ORDER = [
     RuntimeComponentName.MUTATION,
     RuntimeComponentName.EDIT,
     RuntimeComponentName.TOOLS,
+    RuntimeComponentName.TOOL_RUNTIME,
+    RuntimeComponentName.TOOL_PROTOCOL,
     RuntimeComponentName.VERIFICATION,
     RuntimeComponentName.REVIEW,
     RuntimeComponentName.INSTRUCTIONS,
@@ -118,10 +120,13 @@ class RuntimeGraph:
             "mutation": self.mutation_runtime,
             "edit": self.edit_runtime,
             "tools": self.tools,
+            "tool_runtime": self.tool_runtime,
+            "tool_protocol": self.protocol_runtime,
             "verification": self.verification_runtime,
             "review": self.review_runtime,
             "instructions": self.instruction_runtime,
             "model": self.model_runtime,
+            "context": self.context_manager,
             "planner": self.planner,
         }
 
@@ -196,7 +201,11 @@ class RuntimeFactory:
             )
             mark(RuntimeComponentName.POLICY)
 
-            sandbox_runtime = SandboxRuntime(project_root, trace=trace)
+            sandbox_runtime = SandboxRuntime(
+                project_root,
+                trace=trace,
+                security_mode=config.security_mode,
+            )
             mark(RuntimeComponentName.SANDBOX)
 
             command_runtime = CommandRuntime(
@@ -234,6 +243,18 @@ class RuntimeFactory:
             register_workspace_state_tools(tools, state_runtime)
             register_code_index_tools(tools, project_index_runtime)
             mark(RuntimeComponentName.TOOLS)
+
+            tool_runtime = ToolRuntime(
+                registry=tools,
+                policy=ToolPolicy.coding_agent(),
+                trace=trace,
+                workspace_root=project_root,
+                planner=None,
+                policy_runtime=policy_runtime,
+                approval_gate=approval_gate,
+                dry_run=config.dry_run,
+            )
+            mark(RuntimeComponentName.TOOL_RUNTIME)
 
             verification_runtime = VerificationRuntime(
                 project_root,
@@ -302,6 +323,7 @@ class RuntimeFactory:
                 state_store=ToolProtocolStateStore(trace.store.run_dir / "tool_protocol.sqlite3"),
                 workspace_state_hook=_workspace_state_context_hook(state_runtime),
             )
+            mark(RuntimeComponentName.TOOL_PROTOCOL)
 
             planner = _create_or_resume_planner(
                 workspace_root=project_root,
@@ -316,6 +338,7 @@ class RuntimeFactory:
             verification_runtime.planner = planner
             edit_runtime.planner = planner
             review_runtime.planner = planner
+            tool_runtime.planner = planner
             index_observation = project_index_runtime.observation_for_goal(user_goal)
             context_manager.add_project_index(index_observation)
             planner.record_project_index_observation(index_observation)
@@ -334,20 +357,12 @@ class RuntimeFactory:
                 verification_runtime,
                 edit_runtime,
                 review_runtime,
+                tool_runtime,
+                protocol_runtime,
+                context_manager,
             ):
                 setattr(runtime, "cancellation_token", None)
             mark(RuntimeComponentName.PLANNER)
-
-            tool_runtime = ToolRuntime(
-                registry=tools,
-                policy=ToolPolicy.coding_agent(),
-                trace=trace,
-                workspace_root=project_root,
-                planner=planner,
-                policy_runtime=policy_runtime,
-                approval_gate=approval_gate,
-                dry_run=config.dry_run,
-            )
 
             return RuntimeGraph(
                 config=config,

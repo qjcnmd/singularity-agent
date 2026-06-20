@@ -204,12 +204,7 @@ class LocalProcessBackend(ExecutionBackend):
         process = running.process
         if process is None:
             return None
-        self.supervisor.kill_process_tree(process, reason=reason)
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.supervisor.kill_process_tree(process, reason="force_kill")
-            process.wait(timeout=2)
+        self._terminate_and_wait(process, reason=reason)
         self.poll_output(running)
         return process.returncode
 
@@ -259,12 +254,11 @@ class LocalProcessBackend(ExecutionBackend):
                 break
             time.sleep(0.02)
 
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
+        if process.poll() is None:
             killed_reason = killed_reason or "force_kill"
-            self.supervisor.kill_process_tree(process, reason=killed_reason)
-            process.wait(timeout=2)
+            self._terminate_and_wait(process, reason=killed_reason)
+        else:
+            process.wait(timeout=0)
         self._drain_until_threads_quiet(running)
         return_code = process.returncode
         process_signal = -return_code if return_code is not None and return_code < 0 else None
@@ -295,6 +289,27 @@ class LocalProcessBackend(ExecutionBackend):
                 break
             time.sleep(0.01)
         self._drain_available_output(running)
+
+    def _terminate_and_wait(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        reason: str,
+    ) -> int | None:
+        self.supervisor.kill_process_tree(process, reason=reason)
+        try:
+            return process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            if process.poll() is None:
+                process.kill()
+        except Exception:
+            pass
+        try:
+            return process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return process.returncode
 
 
 class ProcessSupervisor:

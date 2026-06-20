@@ -17,12 +17,14 @@ from miniharness.command import (
     ResourceLimits,
     SemanticStatus,
 )
+from miniharness.policy import ApprovalMode, DecisionOutcome, PolicyConfig, PolicyRuntime, SecurityMode
 from miniharness.context import ContextManager
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from miniharness.tools.command import register_command_tools
 from miniharness.tools.models import ToolResult
 from miniharness.trace import TraceWriter
 from tests.tool_runtime_helpers import runtime_default_policy_runtime
+from tests.test_tool_runtime_policy_approval import SequencedPolicyRuntime
 
 
 class SimpleTokenCounter:
@@ -41,8 +43,42 @@ def tool_call(name: str, arguments: dict, *, tool_call_id: str = "call_command")
     }
 
 
-def test_argv_command_executes_and_returns_structured_result(tmp_path: Path) -> None:
+def compat_command_runtime(tmp_path: Path, **kwargs) -> CommandRuntime:
+    return CommandRuntime(
+        tmp_path,
+        policy_runtime=PolicyRuntime(
+            PolicyConfig(
+                workspace_root=tmp_path,
+                approval_mode=ApprovalMode.AUTO_SAFE,
+                security_mode=SecurityMode.COMPAT,
+            )
+        ),
+        **kwargs,
+    )
+
+
+def test_strict_mode_blocks_inline_interpreter_readonly_command(tmp_path: Path) -> None:
     runtime = CommandRuntime(tmp_path)
+
+    result = runtime.run(
+        CommandRequest(
+            argv=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('x').write_text('bad', encoding='utf-8')",
+            ],
+            cwd=".",
+            purpose=CommandPurpose.READ_ONLY_COMMAND,
+        )
+    )
+
+    assert result.execution_status == ExecutionStatus.REVIEW_REQUIRED
+    assert result.error_code == "review_required"
+    assert not (tmp_path / "x").exists()
+
+
+def test_compat_mode_preserves_legacy_inline_interpreter_execution(tmp_path: Path) -> None:
+    runtime = compat_command_runtime(tmp_path)
 
     result = runtime.run(
         CommandRequest(
@@ -62,8 +98,28 @@ def test_argv_command_executes_and_returns_structured_result(tmp_path: Path) -> 
     assert result.output_digest
 
 
+def test_compat_mode_requires_review_for_inline_interpreter_workspace_write(tmp_path: Path) -> None:
+    runtime = compat_command_runtime(tmp_path)
+
+    result = runtime.run(
+        CommandRequest(
+            argv=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('x').write_text('bad', encoding='utf-8')",
+            ],
+            cwd=".",
+            purpose=CommandPurpose.READ_ONLY_COMMAND,
+        )
+    )
+
+    assert result.execution_status == ExecutionStatus.REVIEW_REQUIRED
+    assert result.error_code == "review_required"
+    assert not (tmp_path / "x").exists()
+
+
 def test_command_runtime_can_build_command_plan(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
     request = CommandRequest(
         argv=[sys.executable, "-c", "print('plan')"],
         cwd=".",
@@ -113,7 +169,7 @@ def test_cwd_outside_workspace_is_rejected(tmp_path: Path) -> None:
 
 
 def test_env_secret_is_not_passed_and_output_is_redacted(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
     code = (
         "import os; "
         "print(os.getenv('OPENAI_API_KEY', 'missing')); "
@@ -140,7 +196,7 @@ def test_env_secret_is_not_passed_and_output_is_redacted(tmp_path: Path) -> None
 
 
 def test_stdout_stderr_are_collected_separately(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
     code = (
         "import sys, time; "
         "print('out', flush=True); "
@@ -162,7 +218,7 @@ def test_stdout_stderr_are_collected_separately(tmp_path: Path) -> None:
 
 
 def test_large_output_is_truncated_and_saved_as_artifact(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
 
     result = runtime.run(
         CommandRequest(
@@ -184,7 +240,7 @@ def test_large_output_is_truncated_and_saved_as_artifact(tmp_path: Path) -> None
 
 
 def test_timeout_marks_result_and_does_not_become_internal_error(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
 
     result = runtime.run(
         CommandRequest(
@@ -202,7 +258,7 @@ def test_timeout_marks_result_and_does_not_become_internal_error(tmp_path: Path)
 
 
 def test_idle_timeout_marks_result(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
 
     result = runtime.run(
         CommandRequest(
@@ -221,7 +277,7 @@ def test_idle_timeout_marks_result(tmp_path: Path) -> None:
 
 
 def test_nonzero_exit_is_not_an_internal_error(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
 
     result = runtime.run(
         CommandRequest(
@@ -238,7 +294,7 @@ def test_nonzero_exit_is_not_an_internal_error(tmp_path: Path) -> None:
 
 
 def test_project_verification_nonzero_is_semantic_test_failure(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
 
     result = runtime.run(
         CommandRequest(
@@ -298,7 +354,7 @@ def test_destructive_command_is_denied(tmp_path: Path) -> None:
 
 
 def test_long_running_process_can_start_read_stop_and_list(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
     request = CommandRequest(
         argv=[
             sys.executable,
@@ -333,7 +389,7 @@ def test_long_running_process_can_start_read_stop_and_list(tmp_path: Path) -> No
 
 def test_workspace_side_effects_are_tracked(tmp_path: Path) -> None:
     trace = TraceWriter.create(tmp_path)
-    runtime = CommandRuntime(tmp_path, trace=trace)
+    runtime = compat_command_runtime(tmp_path, trace=trace)
 
     result = runtime.run(
         CommandRequest(
@@ -356,7 +412,7 @@ def test_workspace_side_effects_are_tracked(tmp_path: Path) -> None:
 
 
 def test_command_result_observation_is_compact_for_context_manager(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
+    runtime = compat_command_runtime(tmp_path)
     result = runtime.run(
         CommandRequest(
             argv=[sys.executable, "-c", "print('X' * 5000)"],
@@ -384,7 +440,7 @@ def test_command_result_observation_is_compact_for_context_manager(tmp_path: Pat
 
 def test_command_trace_records_full_audit_event(tmp_path: Path) -> None:
     trace = TraceWriter.create(tmp_path)
-    runtime = CommandRuntime(tmp_path, trace=trace)
+    runtime = compat_command_runtime(tmp_path, trace=trace)
 
     result = runtime.run(
         CommandRequest(
@@ -418,7 +474,7 @@ def test_command_trace_records_full_audit_event(tmp_path: Path) -> None:
 
 def test_run_command_tool_is_registered_and_uses_command_runtime(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    register_command_tools(registry, CommandRuntime(tmp_path))
+    register_command_tools(registry, compat_command_runtime(tmp_path))
     runtime = ToolRuntime(
         registry=registry,
         policy=ToolPolicy.coding_agent(),
@@ -441,3 +497,47 @@ def test_run_command_tool_is_registered_and_uses_command_runtime(tmp_path: Path)
     assert result.ok is True
     assert result.content["command_result"]["status"] == "completed"
     assert "tool command" in result.content["command_result"]["key_output"]
+
+
+def test_start_process_rejects_verification_like_command(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    register_command_tools(registry, compat_command_runtime(tmp_path))
+    runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.coding_agent(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_runtime=SequencedPolicyRuntime([DecisionOutcome.ALLOW]),  # type: ignore[arg-type]
+    )
+
+    result = runtime.execute_tool_call(
+        tool_call(
+            "start_process",
+            {
+                "argv": [sys.executable, "-m", "pytest"],
+                "cwd": ".",
+                "purpose": "PROJECT_VERIFICATION",
+                "risk_acceptance_reason": "long process owner",
+            },
+        )
+    )
+
+    assert result.ok is False
+    assert result.error_code == "verification_runtime_required"
+
+
+def test_command_runtime_start_process_rejects_verification_like_command(tmp_path: Path) -> None:
+    runtime = compat_command_runtime(tmp_path)
+
+    session = runtime.start_process(
+        CommandRequest(
+            argv=[sys.executable, "-m", "pytest"],
+            cwd=".",
+            purpose=CommandPurpose.PROJECT_VERIFICATION,
+            risk_acceptance_reason="long process owner",
+        )
+    )
+
+    assert session.status == "policy_denied"
+    assert session.error_code == "verification_runtime_required"
+    assert session.pid is None

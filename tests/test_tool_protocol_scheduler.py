@@ -45,7 +45,7 @@ def _batch(calls: list[ToolCallEnvelope]) -> ToolCallBatch:
     return batch
 
 
-def test_scheduler_keeps_read_only_calls_parallel_and_mutations_sequential() -> None:
+def test_scheduler_keeps_read_only_calls_and_mutations_sequential() -> None:
     read_call = _call("call_read", "read_file")
     write_call = _call("call_write", "write_file")
 
@@ -68,15 +68,17 @@ def test_scheduler_preserves_mixed_batch_model_order_except_verification() -> No
     assert [call.tool_call_id for call in plan.ordered_calls] == ["call_write", "call_read"]
 
 
-def test_scheduler_groups_multiple_read_only_idempotent_calls_as_parallel(tmp_path) -> None:
+def test_scheduler_runs_multiple_read_only_idempotent_calls_sequentially(tmp_path) -> None:
     registry = ToolRegistry(tmp_path)
     read_one = _call("call_list", "list_files")
     read_two = _call("call_read", "read_file")
 
     plan = ToolProtocolScheduler(registry).schedule(_batch([read_one, read_two]))
 
-    assert plan.execution_mode == ToolExecutionMode.PARALLEL_READONLY
-    assert plan.parallel_groups == [[read_one, read_two]]
+    assert plan.execution_mode == ToolExecutionMode.SEQUENTIAL
+    assert plan.parallel_groups == []
+    assert [call.tool_call_id for call in plan.ordered_calls] == ["call_list", "call_read"]
+    assert "read_only_tools_run_sequentially" in plan.reasons
 
 
 def test_scheduler_forces_command_and_verification_after_mutation(tmp_path) -> None:

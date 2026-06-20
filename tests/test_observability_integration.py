@@ -27,6 +27,7 @@ from miniharness.policy import (
 )
 from miniharness.policy.approval import ApprovalGate
 from miniharness.policy.config import ApprovalMode
+from miniharness.policy import SecurityMode
 from miniharness.policy.exceptions import ApprovalRequired
 from miniharness.policy.models import DecisionOutcome
 from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
@@ -46,6 +47,12 @@ from miniharness.sandbox import (
 )
 from miniharness.verification import VerificationRuntime
 from tests.tool_runtime_helpers import make_test_policy_runtime
+
+
+def _compat_policy_runtime(tmp_path: Path) -> PolicyRuntime:
+    return PolicyRuntime(
+        PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT)
+    )
 
 
 def _event_values(trace: TraceRuntime) -> list[str]:
@@ -134,7 +141,12 @@ def test_command_mutation_planner_context_and_final_report_trace(tmp_path: Path)
         created_by="test",
         tool_call_id="call_mutation",
     )
-    command = CommandRuntime(tmp_path, trace=trace, planner=planner)
+    command = CommandRuntime(
+        tmp_path,
+        trace=trace,
+        planner=planner,
+        policy_runtime=_compat_policy_runtime(tmp_path),
+    )
     command_result = command.run(
         CommandRequest(
             argv=[sys.executable, "-c", "print('ok')"],

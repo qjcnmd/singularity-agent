@@ -63,17 +63,23 @@ class CommandToolHandlers:
         self.runtime = runtime
 
     def run_command(self, args: RunCommandInput) -> dict[str, Any]:
-        if _requires_verification_runtime(args):
+        request = self._request(args)
+        if self.runtime.policy.requires_verification_runtime(request):
             raise ToolExecutionFailure(
                 "Verification-like commands must use VerificationRuntime tools.",
                 code="verification_runtime_required",
                 details={"suggested_tool": "run_verification"},
             )
-        request = self._request(args)
         return self.runtime.run(request).to_observation()
 
     def start_process(self, args: RunCommandInput) -> dict[str, Any]:
         request = self._request(args)
+        if self.runtime.policy.requires_verification_runtime(request):
+            raise ToolExecutionFailure(
+                "Verification-like commands must use VerificationRuntime tools.",
+                code="verification_runtime_required",
+                details={"suggested_tool": "run_verification"},
+            )
         session = self.runtime.start_process(request)
         return {"process_session": session.to_dict()}
 
@@ -110,43 +116,6 @@ class CommandToolHandlers:
             expected_outputs=args.expected_outputs,
             risk_acceptance_reason=args.risk_acceptance_reason,
         )
-
-
-def _requires_verification_runtime(args: RunCommandInput) -> bool:
-    verification_purposes = {
-        "PROJECT_VERIFICATION",
-        "BUILD",
-        "LINT",
-        "TYPECHECK",
-        "FORMAT_CHECK",
-    }
-    if args.purpose in verification_purposes:
-        return True
-    argv = [str(part).lower() for part in (args.argv or [])]
-    if not argv:
-        return False
-    joined = " ".join(argv)
-    program = argv[0].rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-    if program.endswith((".exe", ".cmd", ".bat")):
-        program = program.rsplit(".", 1)[0]
-    if program in {"pytest", "tox", "nox", "jest", "vitest", "tsc", "eslint", "mypy", "pyright"}:
-        return True
-    if program in {"python", "python3", "py"} and len(argv) >= 3:
-        return argv[1:3] in (
-            ["-m", "pytest"],
-            ["-m", "mypy"],
-            ["-m", "ruff"],
-            ["-m", "build"],
-        )
-    if program in {"npm", "pnpm", "yarn"}:
-        return any(part in {"test", "lint", "build", "typecheck", "type-check"} for part in argv[1:3])
-    if program == "cargo":
-        return any(part in {"test", "build", "clippy", "check"} for part in argv[1:3])
-    if program == "go":
-        return any(part in {"test", "build"} for part in argv[1:3])
-    if program in {"make", "just"}:
-        return any(part in {"test", "lint", "build", "typecheck"} for part in argv[1:3])
-    return " pytest" in joined or " npm test" in joined or " pnpm test" in joined
 
 
 def _command_identifier(args: dict[str, Any]) -> str:

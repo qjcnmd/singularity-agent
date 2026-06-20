@@ -42,6 +42,7 @@ class ReviewRuntime:
         self.enable_model_critic = enable_model_critic
         self.finding_collector = RuleFindingCollector()
         self.decision_engine = ReviewDecisionEngine()
+        self.cancellation_token: Any | None = None
 
     def pre_edit_review(
         self,
@@ -218,7 +219,9 @@ class ReviewRuntime:
         evidence: list[ReviewEvidence],
         context: dict[str, Any],
     ) -> ReviewReport:
+        self._throw_if_cancelled()
         started_ids = self._emit_started(target=target, evidence=evidence)
+        self._throw_if_cancelled()
         findings = self.finding_collector.collect(target=target, evidence=evidence, context=context)
         rule_decision = self.decision_engine.decide(target=target, findings=findings, context=context)
         report = ReviewReport(
@@ -231,8 +234,14 @@ class ReviewRuntime:
             trace_event_ids=started_ids,
         )
         if self.enable_model_critic:
+            self._throw_if_cancelled()
             critic = ModelCritic(self.model_runtime)
-            outcome = critic.review(report, bundle={"target": target.model_dump(mode="json"), "context": context})
+            outcome = critic.review(
+                report,
+                bundle={"target": target.model_dump(mode="json"), "context": context},
+                request_context=self._critic_request_context(target),
+            )
+            self._throw_if_cancelled()
             report.model_critic_status = outcome.status
             report.model_critic_error = outcome.error
             if outcome.status != "ok":
@@ -411,7 +420,41 @@ class ReviewRuntime:
     def _record_memory(self, report: ReviewReport) -> None:
         if self.memory_runtime is None or not hasattr(self.memory_runtime, "ingest_review_report"):
             return
-        self.memory_runtime.ingest_review_report(report)
+        try:
+            self.memory_runtime.ingest_review_report(report)
+        except Exception as exc:
+            report.evidence.append(
+                ReviewEvidence(
+                    source="memory_ingest",
+                    summary="Memory ingest failed; review result was preserved.",
+                    payload={"type": type(exc).__name__, "message": str(exc)},
+                    payload_hash=_stable_review_hash(
+                        {"type": type(exc).__name__, "message": str(exc)}
+                    ),
+                    trust_level="trusted_runtime",
+                )
+            )
+            self._emit(
+                TraceEventType.REVIEW_FINDING,
+                summary="Review memory ingest failed open.",
+                payload={"type": type(exc).__name__, "message": str(exc)},
+                severity=TraceSeverity.WARNING,
+                target=report.target,
+            )
+
+    def _throw_if_cancelled(self) -> None:
+        token = getattr(self, "cancellation_token", None)
+        if token is not None and hasattr(token, "throw_if_cancelled"):
+            token.throw_if_cancelled()
+
+    def _critic_request_context(self, target: ReviewTarget) -> dict[str, Any]:
+        return {
+            "run_id": getattr(self.trace, "run_id", None),
+            "session_id": _planner_attr(self.planner, "session_id"),
+            "task_id": target.task_id or _planner_attr(self.planner, "task_id"),
+            "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None) or target.stage.value,
+            "action_id": target.edit_result_id or target.patch_id or target.verification_id,
+        }
 
 
 def _severity(finding: ReviewFinding) -> TraceSeverity:

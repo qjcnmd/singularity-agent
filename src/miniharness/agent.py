@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from rich.console import Console
@@ -38,6 +40,47 @@ warnings or remaining risks.
 Do not claim that you browsed the web, stored memory, or contacted other agents.
 When you have enough information, answer the user directly.
 """
+
+
+class MiniAgentRunStatus(str, Enum):
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    MAX_TURNS_EXCEEDED = "max_turns_exceeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, eq=False)
+class MiniAgentRunResult:
+    status: MiniAgentRunStatus
+    final_answer: str
+    turn: int
+    error_code: str | None = None
+    diagnostics: dict[str, Any] | None = None
+
+    def __str__(self) -> str:
+        return self.final_answer
+
+    def __contains__(self, value: object) -> bool:
+        return str(value) in self.final_answer
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.final_answer == other
+        if isinstance(other, MiniAgentRunResult):
+            return self.to_dict() == other.to_dict()
+        return False
+
+    def startswith(self, prefix: str, *args: Any) -> bool:
+        return self.final_answer.startswith(prefix, *args)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "final_answer": self.final_answer,
+            "turn": self.turn,
+            "error_code": self.error_code,
+            "diagnostics": self.diagnostics or {},
+        }
 
 
 class MiniAgent:
@@ -90,7 +133,7 @@ class MiniAgent:
         self.context_db_path = context_db_path
         self.strict = strict
 
-    def run(self, user_goal: str) -> str:
+    def run(self, user_goal: str) -> MiniAgentRunResult:
         planner = self.planner
         if planner.state is None:
             planner.start_task(user_goal)
@@ -156,19 +199,29 @@ class MiniAgent:
                 self.trace.record(
                     "final_answer", {"turn": turn, "content": final_answer}
                 )
-                return final_answer
+                return MiniAgentRunResult(
+                    status=MiniAgentRunStatus.FAILED,
+                    final_answer=final_answer,
+                    turn=turn,
+                    error_code="model_runtime_failed",
+                    diagnostics={"model_status": result.status.value},
+                )
 
             assistant_message = self._assistant_message_from_result(result)
             if not result.tool_calls:
                 context.add_assistant_message(assistant_message)
-                final_answer = self._planner_final_answer(
+                final_answer, final_status = self._planner_final_answer(
                     planner,
                     model_answer=assistant_message.get("content") or "",
                 )
                 self.trace.record(
                     "final_answer", {"turn": turn, "content": final_answer}
                 )
-                return final_answer
+                return MiniAgentRunResult(
+                    status=final_status,
+                    final_answer=final_answer,
+                    turn=turn,
+                )
 
             protocol_result = protocol_runtime.process_model_turn(
                 request=request,
@@ -180,34 +233,47 @@ class MiniAgent:
                 policy_runtime=self.policy_runtime,
             )
             if protocol_result.next_action == "finalize":
-                final_answer = self._planner_final_answer(
+                final_answer, final_status = self._planner_final_answer(
                     planner,
                     model_answer=assistant_message.get("content") or "",
                 )
                 self.trace.record(
                     "final_answer", {"turn": turn, "content": final_answer}
                 )
-                return final_answer
+                return MiniAgentRunResult(
+                    status=final_status,
+                    final_answer=final_answer,
+                    turn=turn,
+                )
 
         message = f"Stopped after max_turns={self.max_turns}; the model did not produce a final answer."
         self.trace.record("error", {"type": "MaxTurnsExceeded", "message": message})
         self.trace.record("final_answer", {"turn": self.max_turns, "content": message})
-        return message
+        return MiniAgentRunResult(
+            status=MiniAgentRunStatus.MAX_TURNS_EXCEEDED,
+            final_answer=message,
+            turn=self.max_turns,
+            error_code="max_turns_exceeded",
+        )
 
     @staticmethod
-    def _planner_final_answer(planner: PlannerRuntime, *, model_answer: str) -> str:
+    def _planner_final_answer(
+        planner: PlannerRuntime,
+        *,
+        model_answer: str,
+    ) -> tuple[str, MiniAgentRunStatus]:
         assessment = planner.assess_completion()
         if assessment["status"] != TaskStatus.COMPLETED.value:
             return (
                 "Planner blocked finalization because completion criteria are unmet: "
                 + ", ".join(assessment["unmet"])
-            )
+            ), MiniAgentRunStatus.BLOCKED
         if (
             planner.state is not None
             and not planner.state.completion_criteria.required_changes_applied
             and not planner.state.completion_criteria.required_verifications_passed
         ):
-            return model_answer
+            return model_answer, MiniAgentRunStatus.COMPLETED
         report = planner.finalize()
         return "\n".join(
             [
@@ -217,7 +283,7 @@ class MiniAgent:
                 f"unresolved_issues: {len(report.unresolved_issues)}",
                 f"risks: {len(report.risks)}",
             ]
-        )
+        ), MiniAgentRunStatus.COMPLETED
 
     def _context_db_path(self) -> Any:
         if hasattr(self.trace, "store"):

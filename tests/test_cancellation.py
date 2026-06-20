@@ -4,17 +4,24 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
 from miniharness.command import CommandPurpose, CommandRequest, CommandRuntime
+from miniharness.context import ContextManager
 from miniharness.kernel.cancellation import CancellationManager, CancellationToken
 from miniharness.kernel.exceptions import CancellationError
 from miniharness.kernel.models import CancellationReason
-from miniharness.model import MockModelProvider, ModelRuntime, ModelTurnRequest
+from miniharness.model import MockModelProvider, ModelRuntime, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResult, ModelTurnStatus
 from miniharness.planner import PlannerRuntime
+from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime
+from miniharness.review import ReviewRuntime
 from miniharness.sandbox import SandboxRuntime
-from miniharness.tools import ToolRegistry
+from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
+from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from miniharness.tools.models import PermissionLevel, ToolResult, ToolSpec
 from miniharness.verification import VerificationRuntime
 from tests.test_sandbox_runtime import sandbox_request
+from tests.tool_runtime_helpers import make_test_policy_runtime
 
 
 def test_cancellation_token_raises_after_cancel() -> None:
@@ -100,6 +107,100 @@ def test_verification_runtime_checks_cancellation_before_running_plan(tmp_path: 
 
     with pytest.raises(CancellationError):
         runtime.run_plan(plan.id)
+
+
+def test_tool_runtime_checks_cancellation_before_handler(tmp_path: Path) -> None:
+    calls = []
+
+    class EmptyInput(BaseModel):
+        pass
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="read",
+            description="read",
+            input_model=EmptyInput,
+            handler=lambda _args: calls.append("called") or ToolResult.success(content={"ok": True}),
+            permission_level=PermissionLevel.READ_ONLY,
+        )
+    )
+    runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
+    )
+    runtime.cancellation_token = _cancelled_token()
+
+    with pytest.raises(CancellationError):
+        runtime.execute_tool_call(
+            {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+        )
+
+    assert calls == []
+
+
+def test_tool_protocol_runtime_checks_cancellation_before_tool_handler(tmp_path: Path) -> None:
+    calls = []
+
+    class EmptyInput(BaseModel):
+        pass
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="read",
+            description="read",
+            input_model=EmptyInput,
+            handler=lambda _args: calls.append("called") or ToolResult.success(content={"ok": True}),
+            permission_level=PermissionLevel.READ_ONLY,
+        )
+    )
+    tool_runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
+    )
+    protocol = ToolCallingProtocolRuntime(registry=registry, trace=None)
+    protocol.cancellation_token = _cancelled_token()
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    result = ModelTurnResult(
+        request_id="req_1",
+        response_id="resp_1",
+        status=ModelTurnStatus.SUCCESS,
+        tool_calls=[
+            ModelToolCall(
+                tool_call_id="call_1",
+                tool_name="read",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            )
+        ],
+    )
+
+    with pytest.raises(CancellationError):
+        protocol.handle_model_turn_result(
+            result,
+            context=context,
+            tool_runtime=tool_runtime,
+            planner=None,
+            policy_runtime=None,
+        )
+
+    assert calls == []
+
+
+def test_review_runtime_checks_cancellation_before_review(tmp_path: Path) -> None:
+    runtime = ReviewRuntime(tmp_path, enable_model_critic=False)
+    runtime.cancellation_token = _cancelled_token()
+
+    with pytest.raises(CancellationError):
+        runtime.post_verification_review(verification={"completion_assessment": {"status": "ready"}})
 
 
 def _cancelled_token() -> CancellationToken:

@@ -49,6 +49,7 @@ class ToolCallingProtocolRuntime:
         self.result_builder = result_builder or ToolProtocolResultBuilder()
         self.recovery_manager = ToolProtocolRecoveryManager(self.state_store)
         self.workspace_state_hook = workspace_state_hook
+        self.cancellation_token: Any | None = None
 
     def process_model_turn(
         self,
@@ -80,6 +81,7 @@ class ToolCallingProtocolRuntime:
         planner: PlannerRuntime | None,
         policy_runtime: PolicyRuntime | None,
     ) -> ToolProtocolTurnResult:
+        self._throw_if_cancelled()
         _ = policy_runtime
         assistant_message = self._assistant_message_from_model_result(model_result)
         if assistant_message is None:
@@ -106,6 +108,7 @@ class ToolCallingProtocolRuntime:
             )
 
         self.state_store.save_batch(batch)
+        self._throw_if_cancelled()
         self.trace.emit(
             "tool_protocol.batch_created",
             summary="Tool protocol batch created.",
@@ -131,6 +134,7 @@ class ToolCallingProtocolRuntime:
             )
 
         plan = self.build_execution_plan(batch, validation=validation)
+        self._throw_if_cancelled()
         self.trace.emit(
             "tool_protocol.plan_built",
             summary="Tool protocol execution plan built.",
@@ -151,6 +155,7 @@ class ToolCallingProtocolRuntime:
             planner=planner,
             policy_runtime=policy_runtime,
         )
+        self._throw_if_cancelled()
         if self.workspace_state_hook is not None:
             self._inject_workspace_state(
                 context,
@@ -204,6 +209,7 @@ class ToolCallingProtocolRuntime:
         planner: PlannerRuntime | None,
         policy_runtime: PolicyRuntime | None,
     ) -> ToolProtocolTurnResult:
+        self._throw_if_cancelled()
         _ = planner, policy_runtime
         executed_count = 0
         failed_count = 0
@@ -222,14 +228,11 @@ class ToolCallingProtocolRuntime:
             assistant_message={"role": "assistant", "content": None, "tool_calls": []},
         )
         ordered_calls = plan.ordered_calls
-        groups = (
-            plan.parallel_groups
-            if plan.execution_mode == ToolExecutionMode.PARALLEL_READONLY and plan.parallel_groups
-            else [ordered_calls]
-        )
+        groups = [ordered_calls]
 
         for group in groups:
             for call in group:
+                self._throw_if_cancelled()
                 last_tool_call_id = call.tool_call_id
                 call.metadata = dict(call.metadata)
                 call.metadata.setdefault("batch_id", batch.batch_id)
@@ -300,11 +303,54 @@ class ToolCallingProtocolRuntime:
                     continue
 
                 spec = self.registry.get(call.tool_name)
-                replay = self.state_store.resolve_replay(
+                replay_decision = self.state_store.check_replay(
                     call,
                     side_effects=spec.side_effects if spec is not None else None,
                     idempotent=spec.idempotent if spec is not None else True,
                 )
+                if not replay_decision.allowed and replay_decision.status in {
+                    "side_effect_replay",
+                    ToolCallFailureKind.conflicting_replay.value,
+                }:
+                    rejected_count += 1
+                    synthetic = self._synthetic_result(
+                        call,
+                        error_kind=(
+                            ToolCallFailureKind.conflicting_replay
+                            if replay_decision.status == ToolCallFailureKind.conflicting_replay.value
+                            else ToolCallFailureKind.replay_detected
+                        ),
+                        message=replay_decision.message,
+                        error_code=replay_decision.status,
+                    )
+                    self.state_store.transition(
+                        call.tool_call_id,
+                        ToolCallPhase.REJECTED,
+                        error_kind=synthetic.error_kind,
+                        error_message=replay_decision.message,
+                        tool_result_digest=synthetic.content_digest,
+                    )
+                    self.state_store.bind_result(
+                        record.record_id,
+                        result=synthetic,
+                        raw_result_ref=synthetic.raw_result_ref,
+                    )
+                    observation_id = self._append_result(context, record, synthetic)
+                    appended_tool_message_count += 1 if observation_id else 0
+                    self.trace.emit(
+                        "tool_protocol.replay_blocked",
+                        summary="Replay blocked for non-idempotent or conflicting tool call.",
+                        payload={
+                            "tool_call_id": call.tool_call_id,
+                            "tool_name": call.tool_name,
+                            "replay_status": replay_decision.status,
+                            "argument_digest": call.argument_digest,
+                        },
+                        ids=self._trace_ids(batch, call=call),
+                        severity=TraceSeverity.WARNING,
+                    )
+                    continue
+                replay = replay_decision.previous_result
                 if replay is not None:
                     self.state_store.transition(
                         call.tool_call_id,
@@ -354,7 +400,9 @@ class ToolCallingProtocolRuntime:
                     },
                     ids=self._trace_ids(batch, call=call),
                 )
+                self._throw_if_cancelled()
                 tool_result = tool_runtime.execute_tool_call(call.to_provider_tool_call())
+                self._throw_if_cancelled()
                 protocol_result = self.result_builder.build(
                     envelope=call,
                     result=tool_result,
@@ -437,6 +485,11 @@ class ToolCallingProtocolRuntime:
             metadata={"last_tool_call_id": last_tool_call_id, "execution_mode": plan.execution_mode.value},
         )
 
+    def _throw_if_cancelled(self) -> None:
+        token = getattr(self, "cancellation_token", None)
+        if token is not None and hasattr(token, "throw_if_cancelled"):
+            token.throw_if_cancelled()
+
     def append_results_to_context(
         self,
         context: ContextManager,
@@ -445,7 +498,11 @@ class ToolCallingProtocolRuntime:
         result: ToolProtocolResultEnvelope,
     ) -> str | None:
         record = self.state_store.record_by_tool_call_id(envelope.tool_call_id)
-        if self._context_has_tool_message(context, envelope.tool_call_id):
+        if self._context_has_tool_message(
+            context,
+            envelope.tool_call_id,
+            content_digest=result.content_digest,
+        ):
             return None
         observation = context.add_tool_protocol_result(result)
         self.state_store.mark_result_appended(
@@ -512,9 +569,23 @@ class ToolCallingProtocolRuntime:
         assistant_message = self._assistant_message_from_model_result(model_result)
         return assistant_message or {"role": "assistant", "content": None, "tool_calls": []}
 
-    def _context_has_tool_message(self, context: ContextManager, tool_call_id: str) -> bool:
+    def _context_has_tool_message(
+        self,
+        context: ContextManager,
+        tool_call_id: str,
+        *,
+        content_digest: str | None = None,
+    ) -> bool:
         for message in context.messages():
-            if message.get("role") == "tool" and message.get("tool_call_id") == tool_call_id:
+            if message.get("role") != "tool" or message.get("tool_call_id") != tool_call_id:
+                continue
+            if content_digest is None:
+                return True
+            try:
+                payload = json.loads(str(message.get("content") or "{}"))
+            except json.JSONDecodeError:
+                return True
+            if payload.get("content_digest") == content_digest:
                 return True
         return False
 

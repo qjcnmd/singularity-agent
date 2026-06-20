@@ -128,7 +128,6 @@ class CommandRuntime:
         sandbox_runtime: SandboxRuntime | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)
-        self.policy = policy or CommandPolicy()
         self.backend = backend or LocalProcessBackend()
         self.trace = trace
         self.env_policy = env_policy or EnvPolicy()
@@ -137,9 +136,13 @@ class CommandRuntime:
         self.policy_runtime = policy_runtime or PolicyRuntime(
             PolicyConfig.runtime_default(self.workspace_root)
         )
+        self.policy = policy or CommandPolicy(
+            security_mode=self.policy_runtime.config.security_mode
+        )
         self.sandbox_runtime = sandbox_runtime or SandboxRuntime(
             self.workspace_root,
             trace=trace if trace is not None and hasattr(trace, "emit") else None,
+            security_mode=self.policy_runtime.config.security_mode,
         )
         self._sessions: dict[str, _SessionRecord] = {}
 
@@ -202,7 +205,9 @@ class CommandRuntime:
             self._notify_planner_policy(request, policy_request, policy_decision)
             return result
         decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
-        if decision.decision != CommandDecision.ALLOW:
+        if decision.decision == CommandDecision.DENY or (
+            decision.decision != CommandDecision.ALLOW and not sandbox_required
+        ):
             result = self._blocked_result(
                 request,
                 decision=decision,
@@ -335,6 +340,19 @@ class CommandRuntime:
     ) -> ProcessSession:
         self._throw_if_cancelled()
         started_at = _now()
+        if self.policy.requires_verification_runtime(request):
+            return ProcessSession(
+                process_id=request.command_id,
+                command_id=request.command_id,
+                pid=None,
+                status="policy_denied",
+                argv=request.argv,
+                shell=request.shell,
+                cwd=request.cwd,
+                started_at=started_at,
+                owner_transaction=transaction_id,
+                error_code="verification_runtime_required",
+            )
         decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
         policy_request = self._policy_request(request)
         policy_decision = self.policy_runtime.enforce(policy_request)
@@ -1171,6 +1189,8 @@ class CommandRuntime:
             proposed_by_model=True,
             metadata={
                 "command": request.display_command(),
+                "argv": request.argv,
+                "shell": request.shell,
                 "cwd": request.cwd,
                 "env_policy": request.env_request,
                 "network_policy": request.network_mode.value,
@@ -1178,6 +1198,7 @@ class CommandRuntime:
                 "timeout": request.resource_limits.timeout_seconds,
                 "long_running": request.purpose == CommandPurpose.LONG_RUNNING,
                 "risk_acceptance_reason": request.risk_acceptance_reason,
+                "security_mode": self.policy_runtime.config.security_mode.value,
             },
             requires_network=request.network_mode != NetworkMode.DISABLED,
             touches_workspace=request.filesystem_mode != FilesystemMode.READ_ONLY_WORKSPACE,

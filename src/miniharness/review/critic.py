@@ -21,7 +21,13 @@ class ModelCritic:
     def __init__(self, model_runtime: Any | None) -> None:
         self.model_runtime = model_runtime
 
-    def review(self, report: ReviewReport, *, bundle: dict[str, Any]) -> ModelCriticOutcome:
+    def review(
+        self,
+        report: ReviewReport,
+        *,
+        bundle: dict[str, Any],
+        request_context: dict[str, Any] | None = None,
+    ) -> ModelCriticOutcome:
         if self.model_runtime is None:
             return ModelCriticOutcome(
                 status="model_critic_unavailable",
@@ -31,11 +37,23 @@ class ModelCritic:
         try:
             from miniharness.model.models import ModelPurpose, ModelTurnRequest, ModelTurnStatus
 
-            request = ModelTurnRequest.simple(
+            ids = dict(request_context or {})
+            request_id = str(ids.get("request_id") or f"critic_{report.review_id}")
+            request = ModelTurnRequest(
+                request_id=request_id,
+                run_id=str(ids.get("run_id") or report.review_id),
+                session_id=str(ids.get("session_id") or report.review_id),
+                task_id=str(ids.get("task_id") or report.target.task_id or report.review_id),
+                phase_id=str(ids.get("phase_id") or report.target.stage.value),
+                action_id=str(ids.get("action_id") or report.target.verification_id or report.target.patch_id or report.review_id),
                 purpose=ModelPurpose.CLASSIFY_ERROR,
                 messages=[
                     {"role": "user", "content": _critic_prompt(report, bundle)}
                 ],
+                context_metadata={
+                    "review_id": report.review_id,
+                    "review_stage": report.target.stage.value,
+                },
             )
             result = self.model_runtime.run_turn(request)
             if getattr(result, "status", None) != ModelTurnStatus.SUCCESS:

@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from miniharness.observability.redaction import TraceRedactor
 from miniharness.policy.config import PolicyConfig
 from miniharness.policy.models import (
     ApprovalGrant,
@@ -27,6 +28,7 @@ SENSITIVE_PATH_RE = re.compile(
     r"credentials?|credential|token|secret|api[_-]?key|password|\.pem$|\.pfx$|\.p12$|\.key$)",
     re.IGNORECASE,
 )
+_TRACE_REDACTOR = TraceRedactor()
 
 
 class PolicyAuditWriter:
@@ -100,5 +102,6 @@ def redact(value: Any) -> Any:
     if isinstance(value, list):
         return [redact(item) for item in value]
     if isinstance(value, str):
-        return SECRET_VALUE_RE.sub(lambda match: (match.group(1) if match.group(1) else "") + "[REDACTED]", value)
+        redacted = _TRACE_REDACTOR.redact_text(value)
+        return SECRET_VALUE_RE.sub(lambda match: (match.group(1) if match.group(1) else "") + "[REDACTED]", redacted)
     return value

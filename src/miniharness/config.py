@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from miniharness.interaction.models import InteractionMode
-from miniharness.policy.config import ApprovalMode, PolicyConfig
+from miniharness.policy.config import ApprovalMode, PolicyConfig, SecurityMode
 
 if TYPE_CHECKING:
     from miniharness.model.config import ModelRuntimeConfig
@@ -55,6 +55,7 @@ class ProductionRuntimeConfig:
     max_turns: int = 8
     profile: str | None = None
     approval_mode: ApprovalMode = ApprovalMode.AUTO_SAFE
+    security_mode: SecurityMode = SecurityMode.STRICT
     interaction_mode: InteractionMode = InteractionMode.INTERACTIVE
     strict: bool = False
     dry_run: bool = False
@@ -79,6 +80,7 @@ class ProductionRuntimeConfig:
         max_turns: int = 8,
         profile: str | None = None,
         approval_mode: ApprovalMode | str = ApprovalMode.AUTO_SAFE,
+        security_mode: SecurityMode | str = SecurityMode.STRICT,
         interaction_mode: InteractionMode | str = InteractionMode.INTERACTIVE,
         strict: bool = False,
         dry_run: bool = False,
@@ -100,6 +102,7 @@ class ProductionRuntimeConfig:
             max_turns=max_turns,
             profile=profile,
             approval_mode=_approval_mode(approval_mode),
+            security_mode=_security_mode(security_mode),
             interaction_mode=_interaction_mode(interaction_mode),
             strict=strict,
             dry_run=dry_run,
@@ -121,6 +124,7 @@ class ProductionRuntimeConfig:
         return PolicyConfig(
             workspace_root=self.project_root,
             approval_mode=self.approval_mode,
+            security_mode=self.security_mode,
         )
 
     def to_model_runtime_config(self) -> "ModelRuntimeConfig":
@@ -171,3 +175,12 @@ def _interaction_mode(value: InteractionMode | str) -> InteractionMode:
         return InteractionMode[str(value).upper()]
     except KeyError:
         return InteractionMode(str(value))
+
+
+def _security_mode(value: SecurityMode | str) -> SecurityMode:
+    if isinstance(value, SecurityMode):
+        return value
+    try:
+        return SecurityMode[str(value).upper()]
+    except KeyError:
+        return SecurityMode(str(value))

@@ -13,7 +13,15 @@ SECRET_KEY_RE = re.compile(
 ENV_SECRET_RE = re.compile(
     r"(?im)^([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD)|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|NPM_TOKEN)\s*=\s*([^\r\n]+)"
 )
-HEADER_SECRET_RE = re.compile(r"(?im)^(Authorization|Cookie)\s*:\s*(.+)$")
+HEADER_SECRET_RE = re.compile(r"(?im)\b(Authorization|Cookie)\s*:\s*([^\r\n,\]]+)")
+CLI_SECRET_FLAG_RE = re.compile(
+    r"(?i)(--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)(?:=|\s+))"
+    r"('[^']*'|\"[^\"]*\"|[^\s,\]\}]+)"
+)
+JSON_ARG_SECRET_RE = re.compile(
+    r"(?i)(\"--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)\"\s*,\s*)"
+    r"\"[^\"]*\""
+)
 PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
     re.IGNORECASE | re.DOTALL,
@@ -52,6 +60,8 @@ class TraceRedactor:
         redacted = PRIVATE_KEY_RE.sub("<redacted>", text)
         redacted = ENV_SECRET_RE.sub(lambda match: f"{match.group(1)}=<redacted>", redacted)
         redacted = HEADER_SECRET_RE.sub(lambda match: f"{match.group(1)}: <redacted>", redacted)
+        redacted = JSON_ARG_SECRET_RE.sub(lambda match: f'{match.group(1)}"<redacted>"', redacted)
+        redacted = CLI_SECRET_FLAG_RE.sub(lambda match: f"{match.group(1)}<redacted>", redacted)
         redacted = TOKEN_VALUE_RE.sub("<redacted>", redacted)
         if len(redacted) > self.output_limit_chars:
             return f"{redacted[: self.output_limit_chars]}[truncated]"

@@ -89,6 +89,7 @@ def test_state_store_persists_batch_records_events_and_results(tmp_path: Path) -
         "succeeded",
         "result_appended",
     ]
+    assert all(event.tool_call_id == "call_1" for event in store.events_for_batch(batch.batch_id))
 
 
 def test_state_store_replay_protection_and_conflicts(tmp_path: Path) -> None:
@@ -143,6 +144,24 @@ def test_state_store_replay_protection_and_conflicts(tmp_path: Path) -> None:
     )
     assert side_effect_decision.allowed is False
     assert side_effect_decision.status == "side_effect_replay"
+
+
+def test_state_store_result_appended_preserves_waiting_approval_phase(tmp_path: Path) -> None:
+    store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
+    batch = store.create_batch(make_batch())
+    record = store.upsert_record(batch.tool_calls[0], phase=ToolCallPhase.WAITING_APPROVAL)
+    result = ToolProtocolResultBuilder().build(
+        envelope=record.envelope,
+        result=ToolResult.failure(code="approval_required", message="needs approval"),
+    )
+    store.bind_result(record.record_id, result=result)
+    store.transition(record.envelope.tool_call_id, ToolCallPhase.WAITING_APPROVAL)
+
+    store.mark_result_appended(record.record_id, context_message_id="tool_msg_approval")
+
+    recovered = store.get_record(record.record_id)
+    assert recovered.phase == ToolCallPhase.WAITING_APPROVAL
+    assert recovered.context_message_id == "tool_msg_approval"
 
 
 def test_state_store_queries_pending_by_run_session_task_and_batch_by_assistant_message(tmp_path: Path) -> None:

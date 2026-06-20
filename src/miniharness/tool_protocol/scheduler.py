@@ -47,31 +47,25 @@ class ToolProtocolScheduler:
                 other_sequential_calls.append(call)
                 side_effect_count += 1
 
-        if len(readonly_calls) == len(original_order) and len(readonly_calls) > 1:
-            reasons.append("read_only_tools_can_run_in_parallel")
-            ordered_calls = original_order
-            parallel_groups = [original_order]
-            execution_mode = ToolExecutionMode.PARALLEL_READONLY
+        ordered_calls = original_order
+        if verification_calls and (mutation_calls or command_calls or other_sequential_calls):
+            verification_ids = {call.tool_call_id for call in verification_calls}
+            ordered_calls = [
+                call for call in original_order if call.tool_call_id not in verification_ids
+            ] + [
+                call for call in original_order if call.tool_call_id in verification_ids
+            ]
+            reasons.append("verification_after_mutation")
+        if mutation_calls or command_calls or other_sequential_calls:
+            reasons.append("mutation_or_command_tools_run_sequentially")
+        elif len(original_order) == 1:
+            reasons.append("single_tool_call_runs_sequentially")
+        elif readonly_calls:
+            reasons.append("read_only_tools_run_sequentially")
         else:
-            ordered_calls = original_order
-            if verification_calls and (mutation_calls or command_calls or other_sequential_calls):
-                verification_ids = {call.tool_call_id for call in verification_calls}
-                ordered_calls = [
-                    call for call in original_order if call.tool_call_id not in verification_ids
-                ] + [
-                    call for call in original_order if call.tool_call_id in verification_ids
-                ]
-                reasons.append("verification_after_mutation")
-            if mutation_calls or command_calls or other_sequential_calls:
-                reasons.append("mutation_or_command_tools_run_sequentially")
-            elif len(original_order) == 1:
-                reasons.append("single_tool_call_runs_sequentially")
-            elif readonly_calls:
-                reasons.append("mixed_batch_preserves_model_order")
-            else:
-                reasons.append("sequential_tools_run_in_input_order")
-            parallel_groups = []
-            execution_mode = ToolExecutionMode.SEQUENTIAL
+            reasons.append("sequential_tools_run_in_input_order")
+        parallel_groups = []
+        execution_mode = ToolExecutionMode.SEQUENTIAL
 
         return ToolExecutionPlan(
             plan_id=f"tool_plan_{uuid4().hex[:12]}",

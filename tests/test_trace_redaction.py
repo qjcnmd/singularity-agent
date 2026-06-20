@@ -49,6 +49,25 @@ def test_redacts_env_style_text_and_auth_headers() -> None:
     assert "abc123" not in redacted
 
 
+def test_redacts_cli_secret_flags_and_json_argv_values() -> None:
+    redactor = TraceRedactor(output_limit_chars=1000)
+    text = "\n".join(
+        [
+            "tool --password hunter2 --token=abc123",
+            '["curl", "-H", "Authorization: Bearer opaque", "--api-key", "plain-key"]',
+        ]
+    )
+
+    redacted = redactor.redact_text(text)
+
+    assert "hunter2" not in redacted
+    assert "abc123" not in redacted
+    assert "opaque" not in redacted
+    assert "plain-key" not in redacted
+    assert "--password <redacted>" in redacted
+    assert "--token=<redacted>" in redacted
+
+
 def test_redacts_long_text_and_payload_hash_is_stable() -> None:
     redactor = TraceRedactor(output_limit_chars=24)
     payload = {"safe": "x" * 100, "token": "secret-token"}

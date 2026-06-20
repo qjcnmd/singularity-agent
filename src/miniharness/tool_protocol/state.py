@@ -359,8 +359,16 @@ class ToolProtocolStateStore:
                 where record_id = ?
                 """,
                 (
-                    ToolCallPhase.RESULT_APPENDED.value,
-                    row["phase"],
+                    (
+                        row["phase"]
+                        if row["phase"] == ToolCallPhase.WAITING_APPROVAL.value
+                        else ToolCallPhase.RESULT_APPENDED.value
+                    ),
+                    (
+                        row["previous_phase"]
+                        if row["phase"] == ToolCallPhase.WAITING_APPROVAL.value
+                        else row["phase"]
+                    ),
                     context_message_id,
                     _now(),
                     record_id,
@@ -405,13 +413,14 @@ class ToolProtocolStateStore:
             self._connection.execute(
                 """
                 insert into tool_protocol_events(
-                    batch_id, record_id, run_id, event_type, payload, created_at
+                    batch_id, record_id, tool_call_id, run_id, event_type, payload, created_at
                 )
-                values(?, ?, ?, ?, ?, ?)
+                values(?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch_id,
                     record_id,
+                    event.tool_call_id,
                     run_id,
                     event_type,
                     json.dumps(event.payload, ensure_ascii=False, default=str),
@@ -580,13 +589,6 @@ class ToolProtocolStateStore:
                 )
         if resolved_idempotent is None:
             resolved_idempotent = True
-        if not resolved_idempotent or _is_side_effectful(resolved_side_effects):
-            return ToolProtocolReplayDecision(
-                status="side_effect_replay",
-                allowed=False,
-                previous_result=None,
-                message="side_effect_replay",
-            )
         row = self._record_row(call.run_id, call.tool_call_id)
         if row is None:
             return ToolProtocolReplayDecision(
@@ -595,13 +597,6 @@ class ToolProtocolStateStore:
                 previous_result=None,
                 message="no_previous_result",
             )
-        if str(row["argument_digest"]) != call.argument_digest:
-            return ToolProtocolReplayDecision(
-                status=ToolCallFailureKind.conflicting_replay.value,
-                allowed=False,
-                previous_result=None,
-                message=ToolCallFailureKind.conflicting_replay.value,
-            )
         binding = self._binding_row(row["record_id"])
         if binding is None:
             return ToolProtocolReplayDecision(
@@ -609,6 +604,20 @@ class ToolProtocolStateStore:
                 allowed=False,
                 previous_result=None,
                 message="no_previous_result",
+            )
+        if not resolved_idempotent or _is_side_effectful(resolved_side_effects):
+            return ToolProtocolReplayDecision(
+                status="side_effect_replay",
+                allowed=False,
+                previous_result=None,
+                message="side_effect_replay",
+            )
+        if str(row["argument_digest"]) != call.argument_digest:
+            return ToolProtocolReplayDecision(
+                status=ToolCallFailureKind.conflicting_replay.value,
+                allowed=False,
+                previous_result=None,
+                message=ToolCallFailureKind.conflicting_replay.value,
             )
         return ToolProtocolReplayDecision(
             status="read_only_replay",
@@ -688,6 +697,7 @@ class ToolProtocolStateStore:
                 event_id integer primary key autoincrement,
                 batch_id text not null,
                 record_id text,
+                tool_call_id text,
                 run_id text not null,
                 event_type text not null,
                 payload text not null,
@@ -708,9 +718,18 @@ class ToolProtocolStateStore:
                 updated_at text not null,
                 metadata text not null
             );
-            """
+        """
         )
+        self._ensure_column("tool_protocol_events", "tool_call_id", "text")
         self._connection.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute(f"pragma table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self._connection.execute(f"alter table {table} add column {column} {definition}")
 
     def _records_for_states(
         self,
@@ -893,7 +912,7 @@ class ToolProtocolStateStore:
             event_id=str(row["event_id"]),
             run_id=row["run_id"],
             batch_id=row["batch_id"],
-            tool_call_id=row["record_id"],
+            tool_call_id=row["tool_call_id"] or self._tool_call_id_for_record(row["record_id"]),
             event_type=row["event_type"],
             payload=json.loads(row["payload"] or "{}"),
             created_at=row["created_at"],

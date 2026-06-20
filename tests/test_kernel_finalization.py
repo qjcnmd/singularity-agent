@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from miniharness.config import ProductionRuntimeConfig
+from miniharness.agent import MiniAgentRunResult, MiniAgentRunStatus
 from miniharness.kernel import CancellationError
 from miniharness.kernel.cancellation import CancellationManager
 from miniharness.kernel.finalization import KernelFinalizer
@@ -15,6 +16,7 @@ from miniharness.kernel.models import (
     KernelStatus,
     CancellationReason,
     RunIdentity,
+    RunStatus,
     ShutdownReason,
 )
 from miniharness.kernel.runtime import AgentKernel
@@ -85,6 +87,52 @@ def test_agent_kernel_finalizes_failed_run_before_reraising(
     report = kernel.final_report()
     assert report.shutdown_reason == ShutdownReason.ERROR.value
     assert report.diagnostics_count == 1
+
+
+def test_agent_kernel_maps_blocked_agent_result_to_failed_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    kernel, _trace = _build_kernel(tmp_path)
+
+    def blocked_run(*args, **kwargs):
+        return MiniAgentRunResult(
+            status=MiniAgentRunStatus.BLOCKED,
+            final_answer="Planner blocked finalization",
+            turn=1,
+            error_code="completion_blocked",
+        )
+
+    monkeypatch.setattr("miniharness.kernel.runtime.MiniAgent.run", blocked_run)
+
+    result = kernel.run_task("Build kernel")
+
+    assert result.status == RunStatus.FAILED
+    assert kernel.context.run.status == RunStatus.FAILED
+    assert kernel.final_report().shutdown_reason == ShutdownReason.ERROR.value
+
+
+def test_agent_kernel_maps_max_turns_to_failed_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    kernel, _trace = _build_kernel(tmp_path)
+
+    def max_turns_run(*args, **kwargs):
+        return MiniAgentRunResult(
+            status=MiniAgentRunStatus.MAX_TURNS_EXCEEDED,
+            final_answer="Stopped after max_turns=1",
+            turn=1,
+            error_code="max_turns_exceeded",
+        )
+
+    monkeypatch.setattr("miniharness.kernel.runtime.MiniAgent.run", max_turns_run)
+
+    result = kernel.run_task("Build kernel")
+
+    assert result.status == RunStatus.FAILED
+    assert kernel.context.run.status == RunStatus.FAILED
+    assert kernel.final_report().shutdown_reason == ShutdownReason.ERROR.value
 
 
 def test_agent_kernel_shutdown_writes_final_report_during_shutdown_step(tmp_path: Path) -> None:
@@ -161,12 +209,14 @@ class _Graph:
         self.command_runtime = _Runtime()
         self.sandbox_runtime = _Runtime()
         self.verification_runtime = _Runtime()
+        self.review_runtime = _Runtime()
         self.mutation_runtime = _Runtime()
         self.tools = _Runtime()
         self.policy_runtime = _Runtime()
         self.tool_runtime = _Runtime()
         self.protocol_runtime = _Runtime()
         self.instruction_runtime = _Runtime()
+        self.context_manager = _Runtime()
 
 
 class _Lock:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from miniharness.policy.config import ApprovalMode, PolicyConfig
+from miniharness.policy.config import ApprovalMode, PolicyConfig, SecurityMode
 from miniharness.policy.models import (
     Capability,
     DecisionOutcome,
@@ -16,6 +16,8 @@ from miniharness.policy.models import (
     policy_context_summary,
 )
 from miniharness.policy.risk import RiskAssessment
+
+READ_ONLY_FILESYSTEM_MODES = {"READ_ONLY_WORKSPACE", "read_only", "read_only_workspace"}
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,13 @@ class DefaultLocalPolicyRules:
                 ),
             )
 
+        if config.security_mode == SecurityMode.COMPAT and _compat_local_command_allow(request, risk):
+            return RuleResult(
+                DecisionOutcome.ALLOW,
+                "Plain local command allowed by compat security mode.",
+                "compat_local_command_allow",
+            )
+
         if config.approval_mode == ApprovalMode.AUTO_SAFE and _auto_safe_runtime_allow(request, risk):
             return RuleResult(DecisionOutcome.ALLOW, "Low-risk runtime action allowed by auto_safe mode.", "auto_safe_runtime_allow")
 
@@ -251,6 +260,12 @@ def _auto_safe_runtime_allow(request: PolicyRequest, risk: RiskAssessment) -> bo
         return bool(request.metadata.get("risk_acceptance_reason"))
     if risk.level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
         return False
+    if (
+        request.operation in {OperationKind.EXECUTE_COMMAND, OperationKind.EXECUTE_PROJECT_CODE}
+        and RiskTag.MUTATES_FILES in risk.tags
+        and request.metadata.get("filesystem_mode") in READ_ONLY_FILESYSTEM_MODES
+    ):
+        return False
     if request.operation in {
         OperationKind.DELETE_FILE,
         OperationKind.PACKAGE_INSTALL,
@@ -270,6 +285,37 @@ def _auto_safe_runtime_allow(request: PolicyRequest, risk: RiskAssessment) -> bo
         OperationKind.EXECUTE_PROJECT_CODE,
         OperationKind.VERIFICATION,
     }
+
+
+def _compat_local_command_allow(request: PolicyRequest, risk: RiskAssessment) -> bool:
+    if request.runtime.value != "command":
+        return False
+    if request.operation != OperationKind.EXECUTE_COMMAND:
+        return False
+    if request.capability != Capability.EXECUTE_COMMAND:
+        return False
+    if request.requires_network or request.touches_workspace or request.touches_secrets:
+        return False
+    if request.destructive or request.long_running:
+        return False
+    if risk.level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
+        return False
+    blocked_tags = {
+        RiskTag.NETWORK,
+        RiskTag.PACKAGE_MANAGER,
+        RiskTag.SUPPLY_CHAIN,
+        RiskTag.LONG_RUNNING,
+        RiskTag.DESTRUCTIVE,
+        RiskTag.IRREVERSIBLE,
+        RiskTag.MUTATES_FILES,
+        RiskTag.MUTATES_CONFIG,
+        RiskTag.MUTATES_LOCKFILE,
+        RiskTag.EXECUTES_PROJECT_CODE,
+        RiskTag.EXECUTES_GENERATED_CODE,
+        RiskTag.SECRET_ACCESS,
+        RiskTag.SECRETS_EXFILTRATION,
+    }
+    return not (set(risk.tags) & blocked_tags)
 
 
 def _review_kind(request: PolicyRequest) -> str:

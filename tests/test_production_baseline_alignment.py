@@ -24,7 +24,7 @@ from miniharness.model import (
 from miniharness.observability import TraceRuntime
 from miniharness.observability.artifacts import TraceArtifactStore
 from miniharness.observability.models import TraceArtifactKind
-from miniharness.policy import ApprovalMode, DecisionOutcome
+from miniharness.policy import ApprovalMode, DecisionOutcome, SecurityMode
 from miniharness.tool_protocol.models import (
     ToolCallEnvelope,
     ToolCallPhase,
@@ -72,6 +72,7 @@ def test_cli_help_exposes_production_baseline_options_without_legacy_copy() -> N
         "--resume",
         "--dry-run",
         "--strict",
+        "--security-mode",
     ]:
         assert option in output
 
@@ -82,6 +83,7 @@ def test_production_runtime_config_maps_cli_policy_and_model_overrides(tmp_path:
         max_turns=3,
         profile="local-dev",
         approval_mode="read_only",
+        security_mode="compat",
         strict=True,
         dry_run=True,
         trace_dir=tmp_path / "traces",
@@ -95,6 +97,7 @@ def test_production_runtime_config_maps_cli_policy_and_model_overrides(tmp_path:
     assert config.max_turns == 3
     assert config.profile == "local-dev"
     assert config.approval_mode == ApprovalMode.READ_ONLY
+    assert config.security_mode == SecurityMode.COMPAT
     assert config.strict is True
     assert config.dry_run is True
     assert config.trace_dir == tmp_path / "traces"
@@ -104,6 +107,7 @@ def test_production_runtime_config_maps_cli_policy_and_model_overrides(tmp_path:
     assert config.raw_artifacts is False
     assert config.resume_session == "session_1"
     assert config.to_policy_config().approval_mode == ApprovalMode.READ_ONLY
+    assert config.to_policy_config().security_mode == SecurityMode.COMPAT
     model_config = config.to_model_runtime_config()
     assert model_config.default_model == "override-model"
     assert model_config.providers["openai_compatible"]["base_url"] == "https://example.test/v1"

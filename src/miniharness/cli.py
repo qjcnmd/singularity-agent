@@ -12,8 +12,8 @@ from miniharness.config import ProductionRuntimeConfig
 from miniharness.interaction import RichCliRenderer
 from miniharness.kernel import CancellationError, KernelBootstrap
 from miniharness.memory.cli import memory_app
-from miniharness.observability import TraceRuntime, TraceStore
-from miniharness.policy import ApprovalMode
+from miniharness.observability import TraceRedactor, TraceRuntime, TraceStore
+from miniharness.policy import ApprovalMode, SecurityMode
 from miniharness.planner import PlannerRuntime
 from miniharness.workspace_state import (
     WorkspaceHealthReport,
@@ -31,6 +31,7 @@ app.add_typer(trace_app, name="trace")
 app.add_typer(index_app, name="index")
 app.add_typer(memory_app, name="memory")
 console = Console()
+_REDACTOR = TraceRedactor()
 
 
 @app.command()
@@ -90,6 +91,14 @@ def main(
             help="Runtime approval mode: interactive, review_all, auto_safe, read_only, or non_interactive.",
         ),
     ] = ApprovalMode.AUTO_SAFE,
+    security_mode: Annotated[
+        SecurityMode,
+        typer.Option(
+            "--security-mode",
+            case_sensitive=False,
+            help="Runtime security mode: strict fails closed by default; compat preserves legacy local execution behavior.",
+        ),
+    ] = SecurityMode.STRICT,
     trace_dir: Annotated[
         Path | None,
         typer.Option(
@@ -148,6 +157,7 @@ def main(
         max_turns=max_turns,
         profile=profile,
         approval_mode=approval_mode,
+        security_mode=security_mode,
         strict=strict,
         dry_run=dry_run,
         trace_dir=trace_dir,
@@ -177,6 +187,7 @@ def main(
                 "profile": runtime_config.profile,
                 "resume_session": runtime_config.resume_session,
                 "approval_mode": runtime_config.approval_mode.value,
+                "security_mode": runtime_config.security_mode.value,
                 "strict": runtime_config.strict,
                 "dry_run": runtime_config.dry_run,
                 "raw_artifacts": runtime_config.raw_artifacts,
@@ -202,9 +213,9 @@ def main(
         final_health = kernel.graph.workspace_state.get_workspace_health()
     except Exception as exc:
         if isinstance(exc, CancellationError):
-            console.print(f"[yellow]cancelled[/yellow] {exc}")
+            console.print(f"[yellow]cancelled[/yellow] {_REDACTOR.redact_text(str(exc))}")
         else:
-            console.print(f"[red]error[/red] {exc}")
+            console.print(f"[red]error[/red] {_REDACTOR.redact_text(str(exc))}")
         report = getattr(exc, "final_report", None)
         if report is not None:
             renderer.render_final_report(report, border_style="yellow")
@@ -220,7 +231,10 @@ def main(
                     border_style="yellow",
                 )
             except Exception as report_exc:
-                console.print(f"[yellow]final report unavailable[/yellow] {report_exc}")
+                console.print(
+                    "[yellow]final report unavailable[/yellow] "
+                    + _REDACTOR.redact_text(str(report_exc))
+                )
         raise typer.Exit(1) from exc
 
     console.print(Panel(final_answer, title="final answer", border_style="green"))

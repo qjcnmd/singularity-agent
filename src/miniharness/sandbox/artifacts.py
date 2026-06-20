@@ -81,8 +81,8 @@ class SandboxArtifactCollector:
     ) -> SandboxArtifact:
         root.mkdir(parents=True, exist_ok=True)
         path = root / relative_path
-        path.write_text(text, encoding="utf-8")
-        data = path.read_bytes()
+        data = text.encode("utf-8")
+        path.write_bytes(data)
         return SandboxArtifact(
             artifact_id=f"artifact_{uuid4().hex[:12]}",
             sandbox_id=sandbox_id,

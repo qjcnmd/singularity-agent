@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from miniharness.tool_protocol.models import (
     ToolCallBatch,
@@ -15,12 +14,6 @@ from miniharness.tool_protocol.recovery import ToolProtocolRecoveryManager
 from miniharness.tool_protocol.result import ToolProtocolResultBuilder
 from miniharness.tool_protocol.state import ToolProtocolStateStore
 from miniharness.tools.models import ToolResult
-
-
-def _workspace_tmp(name: str) -> Path:
-    path = Path("work/pytest-tmp") / f"{name}-{uuid4().hex}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def _envelope(assistant_message_id: str = "assistant_1") -> ToolCallEnvelope:
@@ -56,8 +49,8 @@ def _batch() -> ToolCallBatch:
 
 
 def test_recovery_reports_pending_running_succeeded_and_missing_tool_messages(
+    tmp_path: Path,
 ) -> None:
-    tmp_path = _workspace_tmp("tool-protocol-recovery")
     store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
     batch = store.create_batch(_batch())
     envelope = batch.tool_calls[0]

@@ -6,6 +6,7 @@ from typing import Any
 from rich.console import Console
 
 from miniharness.agent import MiniAgent
+from miniharness.agent import MiniAgentRunStatus
 from miniharness.interaction import (
     ControlCommand,
     FinalReport as InteractionFinalReport,
@@ -87,9 +88,13 @@ class AgentKernel:
         for runtime in (
             self.graph.planner,
             self.graph.model_runtime,
+            self.graph.tool_runtime,
+            self.graph.protocol_runtime,
             self.graph.command_runtime,
             self.graph.sandbox_runtime,
             self.graph.verification_runtime,
+            self.graph.review_runtime,
+            self.graph.context_manager,
             getattr(self.graph, "edit_runtime", None),
         ):
             if runtime is not None:
@@ -120,16 +125,34 @@ class AgentKernel:
                 context_db_path=self.graph.config.context_db_path(self.graph.trace.store.run_dir),
                 strict=self.graph.config.strict,
             )
-            final_answer = agent.run(user_goal)
+            agent_result = agent.run(user_goal)
+            final_answer = str(agent_result.final_answer)
             self.graph.workspace_state.record_external_changes()
-            self.lifecycle.mark_completed(final_answer)
-            self.shutdown(ShutdownReason.NORMAL)
+            if agent_result.status == MiniAgentRunStatus.COMPLETED:
+                self.lifecycle.mark_completed(final_answer)
+                shutdown_reason = ShutdownReason.NORMAL
+                result_status = RunStatus.COMPLETED
+            else:
+                self.lifecycle.mark_failed(
+                    f"{agent_result.status.value}: {agent_result.error_code or final_answer}"
+                )
+                self.context.diagnostics.append(
+                    {
+                        "type": "MiniAgentRunStatus",
+                        "status": agent_result.status.value,
+                        "error_code": agent_result.error_code,
+                        "message": final_answer,
+                    }
+                )
+                shutdown_reason = ShutdownReason.ERROR
+                result_status = RunStatus.FAILED
+            self.shutdown(shutdown_reason)
             report = self.final_report()
             interaction_report = self.interaction_final_report()
             return AgentRunResult(
                 final_answer=final_answer,
                 final_report=report,
-                status=RunStatus.COMPLETED,
+                status=result_status,
                 interaction_report=interaction_report,
             )
         except KeyboardInterrupt:
@@ -259,6 +282,7 @@ class AgentKernel:
                 "max_turns": self.graph.config.max_turns,
                 "profile": self.graph.config.profile,
                 "approval_mode": self.graph.config.approval_mode.value,
+                "security_mode": self.graph.config.security_mode.value,
                 "interaction_mode": self.graph.config.interaction_mode.value,
                 "strict": self.graph.config.strict,
                 "dry_run": self.graph.config.dry_run,

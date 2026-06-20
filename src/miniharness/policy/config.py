@@ -13,6 +13,11 @@ class ApprovalMode(str, Enum):
     NON_INTERACTIVE = "non_interactive"
 
 
+class SecurityMode(str, Enum):
+    STRICT = "strict"
+    COMPAT = "compat"
+
+
 @dataclass(frozen=True)
 class PolicyConfig:
     approval_mode: ApprovalMode | str = ApprovalMode.INTERACTIVE
@@ -27,9 +32,11 @@ class PolicyConfig:
     max_auto_read_bytes: int = 200_000
     default_command_timeout_seconds: int = 30
     audit_log_path: Path | str | None = None
+    security_mode: SecurityMode | str = SecurityMode.STRICT
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "approval_mode", _mode(self.approval_mode))
+        object.__setattr__(self, "security_mode", _security_mode(self.security_mode))
         root = Path(self.workspace_root).expanduser().resolve(strict=False)
         object.__setattr__(self, "workspace_root", root)
         if self.audit_log_path is None:
@@ -53,3 +60,12 @@ def _mode(value: ApprovalMode | str) -> ApprovalMode:
         return ApprovalMode[str(value).upper()]
     except KeyError:
         return ApprovalMode(str(value))
+
+
+def _security_mode(value: SecurityMode | str) -> SecurityMode:
+    if isinstance(value, SecurityMode):
+        return value
+    try:
+        return SecurityMode[str(value).upper()]
+    except KeyError:
+        return SecurityMode(str(value))

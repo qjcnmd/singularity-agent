@@ -20,10 +20,13 @@ DEFAULT_HEALTH_COMPONENTS = [
     RuntimeComponentName.MUTATION,
     RuntimeComponentName.EDIT,
     RuntimeComponentName.TOOLS,
+    RuntimeComponentName.TOOL_RUNTIME,
+    RuntimeComponentName.TOOL_PROTOCOL,
     RuntimeComponentName.VERIFICATION,
     RuntimeComponentName.REVIEW,
     RuntimeComponentName.INSTRUCTIONS,
     RuntimeComponentName.MODEL,
+    RuntimeComponentName.CONTEXT,
     RuntimeComponentName.PLANNER,
 ]
 

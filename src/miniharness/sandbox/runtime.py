@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from miniharness.observability.models import TraceEventType, TraceSeverity
+from miniharness.policy.config import SecurityMode
 from miniharness.policy.models import PolicyDecision
 from miniharness.sandbox.backends import LocalStagingBackend, SandboxBackend
 from miniharness.sandbox.exceptions import SandboxCapabilityError, SandboxError
@@ -30,10 +31,12 @@ class SandboxRuntime:
         *,
         backends: list[SandboxBackend] | None = None,
         trace: SandboxTraceWriter | None = None,
+        security_mode: SecurityMode | str = SecurityMode.COMPAT,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.backends = backends or [LocalStagingBackend()]
         self.trace = trace or SandboxTraceWriter.create(self.workspace_root)
+        self.security_mode = _security_mode(security_mode)
 
     def run(self, request: SandboxRequest) -> SandboxResult:
         self._throw_if_cancelled()
@@ -183,6 +186,11 @@ class SandboxRuntime:
             profile.filesystem.detect_changes = True
         if constraints.network_allowed:
             profile.network.mode = SandboxNetworkMode.ALLOWED
+        elif (
+            self.security_mode == SecurityMode.STRICT
+            and constraints.sandbox_required
+        ):
+            profile.network.require_hard_isolation = True
         if constraints.allowed_hosts:
             profile.network.allowed_hosts = constraints.allowed_hosts
         if "hard-network-required" in constraints.allowed_hosts:
@@ -336,3 +344,12 @@ def _now() -> str:
 
 def _is_cancellation_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "CancellationError" and getattr(exc, "code", None) == "cancelled"
+
+
+def _security_mode(value: SecurityMode | str) -> SecurityMode:
+    if isinstance(value, SecurityMode):
+        return value
+    try:
+        return SecurityMode[str(value).upper()]
+    except KeyError:
+        return SecurityMode(str(value))
