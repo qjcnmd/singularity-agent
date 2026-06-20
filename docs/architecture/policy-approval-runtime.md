@@ -32,6 +32,7 @@ allow, deny, require_review, ask_user, escalate, sandbox_required
 It also records risk level, risk tags, user-facing reason, constraints, rule ids, optional approval requirement, audit severity, and compact context summary.
 
 `ApprovalGrant` is a scoped approval, not a boolean. The current CLI gate only creates single-use, session-only grants from a local user action. The grant scope contains capabilities, path globs, command patterns, network hosts, duration limits, file limits, and single-use/session-only flags. Model text such as "the user approved" is never accepted as approval.
+Grant consumption is owned by `PolicyRuntime`, so a local approval is converted into one audited allow decision without re-running the same policy request through risk classification and rules.
 
 `PolicyAuditWriter` writes append-only JSONL to:
 

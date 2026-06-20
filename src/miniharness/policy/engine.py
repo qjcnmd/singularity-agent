@@ -98,6 +98,33 @@ class PolicyRuntime:
                 )
         return decision
 
+    def consume_grant(
+        self,
+        request: PolicyRequest,
+        decision: PolicyDecision,
+        grant: ApprovalGrant,
+    ) -> PolicyDecision:
+        allowed = decision.model_copy_with(
+            outcome=DecisionOutcome.ALLOW,
+            reason="Action allowed by matching ApprovalGrant.",
+            approval_grant_id=grant.grant_id,
+            required_approval=None,
+        )
+        grant.consume()
+        self.audit.append(
+            request=request,
+            decision=allowed,
+            grant=grant,
+            user_decision="approved",
+        )
+        self._emit_policy_trace(
+            TraceEventType.APPROVAL_GRANTED,
+            request=request,
+            decision=allowed,
+            approval_grant_id=grant.grant_id,
+        )
+        return allowed
+
     def register_grant(self, grant: ApprovalGrant) -> None:
         self._grants.append(grant)
 

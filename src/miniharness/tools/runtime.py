@@ -7,7 +7,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pydantic import ValidationError
@@ -98,7 +98,11 @@ class ToolResultCache:
     def invalidate_paths(self, paths: list[str]) -> None:
         normalized = {Path(path).as_posix() for path in paths}
         for key, entry in list(self._entries.items()):
-            if normalized.intersection(entry.touched_paths):
+            if any(
+                _paths_overlap(changed, touched)
+                for changed in normalized
+                for touched in entry.touched_paths
+            ):
                 self._entries.pop(key, None)
 
     def clear(self) -> None:
@@ -524,6 +528,10 @@ class ToolRuntime:
                 return self._policy_failure(request, decision), None, decision.decision_id
             if hasattr(self.policy_runtime, "register_grant"):
                 self.policy_runtime.register_grant(grant)
+            if hasattr(self.policy_runtime, "consume_grant"):
+                second = self.policy_runtime.consume_grant(request, decision, grant)
+                self._record_policy_trace(request, second)
+                return None, grant.grant_id, second.decision_id
             second = self.policy_runtime.enforce(request)
             self._record_policy_trace(request, second)
             if second.outcome == DecisionOutcome.ALLOW:
@@ -722,38 +730,29 @@ class ToolRuntime:
             if validated_args is not None
             else None
         )
-        self.trace.record(
-            "tool_call",
-            {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "argument_summary": args_summary,
-                "permission_level": spec.permission_level.value if spec is not None else None,
-                "risk_tags": list(spec.risk_tags) if spec is not None else [],
-                "start": started_at,
-                "end": ended_at,
-                "duration_seconds": duration_seconds,
-                "status": "ok" if result.ok else "error",
-                "error_code": result.error_code,
-                "truncated": result.truncated,
-                "output_digest": output_digest,
-                "cache_hit": cache_hit,
-                "backend": spec.execution_backend.value if spec is not None else None,
-            },
-        )
+        payload = {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "argument_summary": args_summary,
+            "permission_level": spec.permission_level.value if spec is not None else None,
+            "risk_tags": list(spec.risk_tags) if spec is not None else [],
+            "start": started_at,
+            "end": ended_at,
+            "duration_seconds": duration_seconds,
+            "status": "ok" if result.ok else "error",
+            "error_code": result.error_code,
+            "truncated": result.truncated,
+            "output_digest": output_digest,
+            "cache_hit": cache_hit,
+            "backend": spec.execution_backend.value if spec is not None else None,
+        }
+        if not hasattr(self.trace, "emit"):
+            self.trace.record("tool_call", payload)
+            return
         self._emit_trace(
             TraceEventType.TOOL_DISPATCH_COMPLETED if result.ok else TraceEventType.TOOL_DISPATCH_FAILED,
             summary=f"Tool {tool_name} {'completed' if result.ok else 'failed'}.",
-            payload={
-                "tool_name": tool_name,
-                "tool_call_id": tool_call_id,
-                "status": "ok" if result.ok else "error",
-                "error_code": result.error_code,
-                "truncated": result.truncated,
-                "output_digest": output_digest,
-                "cache_hit": cache_hit,
-                "backend": spec.execution_backend.value if spec is not None else None,
-            },
+            payload=payload,
             ids={"action_id": tool_call_id},
             severity=TraceSeverity.INFO if result.ok else TraceSeverity.ERROR,
         )
@@ -1115,6 +1114,16 @@ def _is_cancellation_error(exc: BaseException) -> bool:
     return (
         getattr(exc, "code", None) == "cancelled"
         or exc.__class__.__name__ == "CancellationError"
+    )
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    left_parts = PurePosixPath(Path(left).as_posix()).parts
+    right_parts = PurePosixPath(Path(right).as_posix()).parts
+    return (
+        left_parts == right_parts
+        or left_parts[: len(right_parts)] == right_parts
+        or right_parts[: len(left_parts)] == left_parts
     )
 
 

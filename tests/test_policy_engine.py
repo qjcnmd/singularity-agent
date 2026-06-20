@@ -140,6 +140,39 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
     assert grant.consumed is True
 
 
+def test_consume_grant_allows_without_reevaluating_policy(tmp_path: Path) -> None:
+    audit_path = tmp_path / "policy.jsonl"
+    runtime = PolicyRuntime(
+        PolicyConfig(workspace_root=tmp_path, audit_log_path=audit_path)
+    )
+    request = req(
+        tmp_path,
+        operation=OperationKind.EXECUTE_COMMAND,
+        capability=Capability.EXECUTE_COMMAND,
+        resource_type="command",
+        identifier="python -c print(1)",
+    )
+    pending = runtime.evaluate(request)
+    grant = ApprovalGrant(
+        decision_id=pending.decision_id,
+        request_id=request.request_id,
+        approved_by="local-cli-user",
+        scope=ApprovalScope(
+            capabilities=[Capability.EXECUTE_COMMAND],
+            command_patterns=["python -c print(1)"],
+            single_use=True,
+        ),
+    )
+    audit_path.unlink()
+
+    allowed = runtime.consume_grant(request, pending, grant)
+
+    assert allowed.outcome == DecisionOutcome.ALLOW
+    assert allowed.approval_grant_id == grant.grant_id
+    assert grant.consumed is True
+    assert len(audit_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: Path) -> None:
     runtime = PolicyRuntime(PolicyConfig(workspace_root=tmp_path))
 

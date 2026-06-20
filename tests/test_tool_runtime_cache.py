@@ -11,6 +11,7 @@ from miniharness.tools import (
     ToolRuntime,
     ToolSpec,
 )
+from miniharness.policy import ResourceRef
 from miniharness.trace import TraceWriter
 from tests.tool_runtime_helpers import make_test_policy_runtime
 
@@ -179,6 +180,48 @@ def test_cache_can_be_invalidated_by_path(tmp_path: Path) -> None:
     )
 
     assert result.content["content"] == "second"
+    assert result.metadata["cache_hit"] is False
+
+
+def test_file_invalidation_evicts_parent_directory_cache_entry(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    class DirInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        path: str
+
+    def handler(args: DirInput) -> dict[str, int]:
+        calls.append(1)
+        return {"count": len(calls)}
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="scan_dir",
+            description="scan dir",
+            input_model=DirInput,
+            handler=handler,
+            cache_policy=ToolCachePolicy(cacheable=True),
+            resource_resolver=lambda args, _root: [
+                ResourceRef("directory", args["path"], workspace_relative=True)
+            ],
+        )
+    )
+    runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=TraceWriter.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
+    )
+
+    runtime.execute_tool_call(make_tool_call("scan_dir", {"path": "src"}, tool_call_id="call_scan_1"))
+    runtime.invalidate_paths(["src/app.py"])
+    result = runtime.execute_tool_call(
+        make_tool_call("scan_dir", {"path": "src"}, tool_call_id="call_scan_2")
+    )
+
+    assert result.content["count"] == 2
     assert result.metadata["cache_hit"] is False
 
 

@@ -82,6 +82,7 @@ def test_tool_runtime_dispatch_emits_structured_trace(tmp_path: Path) -> None:
     assert TraceEventType.TOOL_VALIDATION_STARTED.value in values
     assert TraceEventType.TOOL_DISPATCH_STARTED.value in values
     assert TraceEventType.TOOL_DISPATCH_COMPLETED.value in values
+    assert values.count(TraceEventType.TOOL_DISPATCH_COMPLETED.value) == 1
 
 
 def test_policy_runtime_and_approval_gate_emit_trace(tmp_path: Path) -> None:
