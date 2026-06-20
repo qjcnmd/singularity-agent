@@ -151,7 +151,7 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("miniharness.cli.KernelBootstrap", FakeBootstrap)
 
-    result = runner.invoke(app, ["main", "hello", "--dry-run"])
+    result = runner.invoke(app, ["hello", "--dry-run"])
 
     assert result.exit_code == 0
     assert ("boot", {"goal": "hello"}) in calls

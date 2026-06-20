@@ -7,6 +7,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from typer.core import _click
 
 from miniharness.code_index import ProjectIndexRuntime
 from miniharness.config import ProductionRuntimeConfig
@@ -24,6 +25,16 @@ from miniharness.observability import TraceRedactor, TraceRuntime, TraceStore
 from miniharness.command import CommandRuntime
 from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
 from miniharness.planner import PlannerRuntime, create_or_resume_planner as _create_or_resume_planner
+from miniharness.release.doctor import run_doctor
+from miniharness.release.init import initialize_runtime
+from miniharness.release.metadata import version_info
+from miniharness.release.migrations import apply_migrations
+from miniharness.release.paths import resolve_runtime_paths
+from miniharness.release.repair import (
+    export_user_data,
+    repair_runtime,
+    uninstall_runtime,
+)
 from miniharness.sandbox import SandboxRuntime
 from miniharness.verification import VerificationRuntime
 from miniharness.workspace_state import (
@@ -31,7 +42,18 @@ from miniharness.workspace_state import (
 )
 
 
+class _MiniHarnessGroup(typer.core.TyperGroup):
+    def resolve_command(self, ctx, args):
+        try:
+            return super().resolve_command(ctx, args)
+        except _click.exceptions.UsageError:
+            if args and not str(args[0]).startswith("-"):
+                return super().resolve_command(ctx, ["run", *args])
+            raise
+
+
 app = typer.Typer(
+    cls=_MiniHarnessGroup,
     add_completion=False,
     no_args_is_help=True,
     help="production-grade local CLI coding agent harness",
@@ -45,11 +67,13 @@ eval_trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_ab_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_regression_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_report_app = typer.Typer(add_completion=False, no_args_is_help=True)
+system_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 app.add_typer(index_app, name="index")
 app.add_typer(memory_app, name="memory")
 app.add_typer(eval_app, name="eval")
 app.add_typer(eval_app, name="benchmark")
+app.add_typer(system_app, name="system")
 eval_app.add_typer(eval_task_app, name="task")
 eval_app.add_typer(eval_suite_app, name="suite")
 eval_app.add_typer(eval_trace_app, name="trace")
@@ -60,8 +84,9 @@ console = Console()
 _REDACTOR = TraceRedactor()
 
 
-@app.command()
-def main(
+@app.command("run")
+@app.command("main", hidden=True)
+def run_goal(
     goal: Annotated[
         str,
         typer.Argument(help="User goal for the production-grade local CLI coding agent harness."),
@@ -269,6 +294,175 @@ def main(
         border_style="green",
     )
     console.print(_workspace_health_panel(final_health))
+
+
+@app.command("version")
+def version_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override runtime root for this command."),
+    ] = None,
+) -> None:
+    """Print MiniHarness version and installation information."""
+
+    paths = resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd())
+    info = version_info(paths)
+    if json_output:
+        _write_stdout(json_dumps(info.to_dict()))
+        return
+    console.print(f"MiniHarness {info.version}")
+    console.print(f"Python {info.python_version}")
+    console.print(f"platform: {info.platform}")
+    console.print(f"install_path: {info.install_path}")
+    console.print(f"runtime_dir: {info.runtime_dir}")
+    console.print(f"config_dir: {info.config_dir}")
+
+
+@app.command("doctor")
+def doctor_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override runtime root for this command."),
+    ] = None,
+) -> None:
+    """Diagnose installed CLI and runtime directory health without modifying data."""
+
+    report = run_doctor(resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()))
+    if json_output:
+        _write_stdout(report.to_json())
+        return
+    for check in report.checks:
+        console.print(f"{check.status.upper()} {check.name}: {check.message}")
+        if check.suggestion:
+            console.print(f"  suggestion: {check.suggestion}")
+    if not report.ok:
+        raise typer.Exit(1)
+
+
+@system_app.command("init")
+def system_init(
+    force: Annotated[bool, typer.Option("--force", help="Overwrite default config and manifest.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override runtime root for this command."),
+    ] = None,
+) -> None:
+    """Initialize user-level MiniHarness runtime directories and defaults."""
+
+    result = initialize_runtime(
+        resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()),
+        force=force,
+    )
+    _print_release_payload(result, json_output=json_output, title="runtime initialized")
+
+
+@system_app.command("migrate")
+def system_migrate(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override runtime root for this command."),
+    ] = None,
+) -> None:
+    """Apply pending release/runtime migrations with backup and rollback."""
+
+    result = {
+        "applied": apply_migrations(resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()))
+    }
+    _print_release_payload(result, json_output=json_output, title="migrations")
+
+
+@system_app.command("repair")
+def system_repair(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override runtime root for this command."),
+    ] = None,
+) -> None:
+    """Repair missing runtime directories and default files without overwriting data."""
+
+    result = repair_runtime(resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()))
+    _print_release_payload(result, json_output=json_output, title="repair")
+
+
+@system_app.command("uninstall")
+def system_uninstall(
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="List paths without deleting.")] = False,
+    purge_user_data: Annotated[
+        bool,
+        typer.Option("--purge-user-data", help="Allow deletion of memory, traces, eval data, and logs."),
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Confirm destructive purge.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override runtime root for this command."),
+    ] = None,
+) -> None:
+    """Remove MiniHarness runtime-managed files with protected user data defaults."""
+
+    if purge_user_data and not dry_run and not yes:
+        confirmed = typer.confirm("Delete MiniHarness user data including memory, traces, eval data, and logs?")
+        if not confirmed:
+            raise typer.Abort()
+    result = uninstall_runtime(
+        resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()),
+        dry_run=dry_run,
+        purge_user_data=purge_user_data,
+    )
+    _print_release_payload(result, json_output=json_output, title="uninstall")
+    if result.get("blocked") and not dry_run:
+        raise typer.Exit(2)
+
+
+@system_app.command("export")
+def system_export(
+    output: Annotated[Path, typer.Option("--output", help="Output zip file path.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override runtime root for this command."),
+    ] = None,
+) -> None:
+    """Export MiniHarness user data into a portable zip archive."""
+
+    result = export_user_data(
+        resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()),
+        output,
+    )
+    _print_release_payload(result, json_output=json_output, title="export")
 
 
 def workspace_health_summary(health: WorkspaceHealthReport) -> str:
@@ -765,6 +959,14 @@ def _write_stdout(text: str) -> None:
         sys.stdout.write("\n")
 
 
+def _print_release_payload(payload: object, *, json_output: bool, title: str) -> None:
+    text = json_dumps(payload)
+    if json_output:
+        _write_stdout(text)
+        return
+    console.print(Panel(text, title=title, border_style="cyan"))
+
+
 @trace_app.command("list")
 def trace_list(
     trace_dir: Annotated[
@@ -858,5 +1060,9 @@ def json_dumps(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
 
 
-if __name__ == "__main__":
+def main() -> None:
     app()
+
+
+if __name__ == "__main__":
+    main()
