@@ -25,7 +25,8 @@ from miniharness.observability import TraceRedactor, TraceRuntime, TraceStore
 from miniharness.command import CommandRuntime
 from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
 from miniharness.planner import PlannerRuntime, create_or_resume_planner as _create_or_resume_planner
-from miniharness.release.doctor import run_doctor
+from miniharness.diagnostics import DoctorEngine, RepairEngine
+from miniharness.diagnostics.render import render_diagnostic_result, render_repair_plan
 from miniharness.release.init import initialize_runtime
 from miniharness.release.metadata import version_info
 from miniharness.release.migrations import apply_migrations
@@ -326,6 +327,18 @@ def version_command(
 @app.command("doctor")
 def doctor_command(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    check_id: Annotated[
+        str | None,
+        typer.Option("--check", help="Run one stable diagnostic check id."),
+    ] = None,
+    group: Annotated[
+        str | None,
+        typer.Option("--group", help="Run one diagnostic group."),
+    ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", help="Show technical detail and suggested fixes."),
+    ] = False,
     mode: Annotated[
         str | None,
         typer.Option("--mode", help="Runtime mode: user, development, or portable."),
@@ -337,15 +350,74 @@ def doctor_command(
 ) -> None:
     """Diagnose installed CLI and runtime directory health without modifying data."""
 
-    report = run_doctor(resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()))
+    project_root = Path.cwd()
+    report = DoctorEngine.default().run(
+        paths=resolve_runtime_paths(mode=mode, home=home, project_root=project_root),
+        project_root=project_root,
+        check_id=check_id,
+        group=group,
+    )
     if json_output:
         _write_stdout(report.to_json())
-        return
-    for check in report.checks:
-        console.print(f"{check.status.upper()} {check.name}: {check.message}")
-        if check.suggestion:
-            console.print(f"  suggestion: {check.suggestion}")
+    else:
+        render_diagnostic_result(console, report, verbose=verbose)
     if not report.ok:
+        raise typer.Exit(1)
+
+
+@app.command("repair")
+def repair_command(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show repair actions without changing local state."),
+    ] = False,
+    apply_changes: Annotated[
+        bool,
+        typer.Option("--apply", help="Apply low-risk repair actions."),
+    ] = False,
+    check_id: Annotated[
+        str | None,
+        typer.Option("--check", help="Only repair findings from one stable check id."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override runtime root for this command."),
+    ] = None,
+) -> None:
+    """Plan or apply safe local runtime repairs."""
+
+    if dry_run and apply_changes:
+        raise typer.BadParameter("Use either --dry-run or --apply, not both.")
+    project_root = Path.cwd()
+    paths = resolve_runtime_paths(mode=mode, home=home, project_root=project_root)
+    before = DoctorEngine.default().run(paths=paths, project_root=project_root, check_id=check_id)
+    plan = RepairEngine().run(before, paths=paths, project_root=project_root, apply=apply_changes)
+    if not apply_changes:
+        payload = _repair_result_payload(plan.to_dict(), after=None, ok=True)
+        if json_output:
+            _write_stdout(json_dumps(payload))
+        else:
+            render_repair_plan(console, payload)
+        return
+
+    after = DoctorEngine.default().run(paths=paths, project_root=project_root, check_id=check_id)
+    action_failed = any(action.status == "failed" for action in plan.actions)
+    payload = _repair_result_payload(
+        plan.to_dict(),
+        after=after.to_dict(),
+        ok=after.ok and not action_failed,
+    )
+    if json_output:
+        _write_stdout(json_dumps(payload))
+    else:
+        render_repair_plan(console, payload)
+        render_diagnostic_result(console, after, verbose=True)
+    if not payload["ok"]:
         raise typer.Exit(1)
 
 
@@ -965,6 +1037,20 @@ def _print_release_payload(payload: object, *, json_output: bool, title: str) ->
         _write_stdout(text)
         return
     console.print(Panel(text, title=title, border_style="cyan"))
+
+
+def _repair_result_payload(
+    repair: dict[str, object],
+    *,
+    after: dict[str, object] | None,
+    ok: bool,
+) -> dict[str, object]:
+    return {
+        "schema_version": "repair-result/v1",
+        "ok": ok,
+        "repair": repair,
+        "after": after,
+    }
 
 
 @trace_app.command("list")

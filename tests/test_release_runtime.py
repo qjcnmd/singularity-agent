@@ -59,7 +59,10 @@ def test_doctor_json_reports_runtime_health_without_real_home(
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
+    assert payload["schema_version"] == "diagnostic-result/v1"
     assert payload["ok"] is True
+    finding_ids = {finding["check_id"] for finding in payload["findings"]}
+    assert {"environment.python", "config.file", "schema.migrations"} <= finding_ids
     check_names = {check["name"] for check in payload["checks"]}
     assert {"python_version", "config_schema", "migrations", "optional_dependencies"} <= check_names
 
