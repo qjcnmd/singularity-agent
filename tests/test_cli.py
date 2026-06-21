@@ -260,6 +260,64 @@ def test_cli_eval_task_validate_and_list_filter_tags(tmp_path: Path) -> None:
     assert "task.cli" in listed.output
 
 
+def test_cli_plugin_lifecycle_json_does_not_import_disabled_plugin(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    plugin_dir = tmp_path / ".miniharness" / "plugins" / "cli_plugin"
+    plugin_dir.mkdir(parents=True)
+    sentinel = tmp_path / "imported.txt"
+    _write_plugin_manifest(plugin_dir)
+    (plugin_dir / "plugin.py").write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('imported')\n"
+        "def register(host):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    listed = runner.invoke(app, ["plugin", "list", "--json"])
+    inspected = runner.invoke(app, ["plugin", "inspect", "cli_plugin", "--json"])
+    checked = runner.invoke(app, ["plugin", "check", "cli_plugin", "--json"])
+    enabled = runner.invoke(app, ["plugin", "enable", "cli_plugin", "--json"])
+    disabled = runner.invoke(app, ["plugin", "disable", "cli_plugin", "--json"])
+
+    assert listed.exit_code == 0
+    assert inspected.exit_code == 0
+    assert checked.exit_code == 0
+    assert enabled.exit_code == 0
+    assert disabled.exit_code == 0
+    assert json.loads(listed.output)["plugins"][0]["id"] == "cli_plugin"
+    assert json.loads(inspected.output)["manifest"]["id"] == "cli_plugin"
+    assert json.loads(enabled.output)["ok"] is True
+    assert json.loads(disabled.output)["status"]["enabled"] is False
+    assert not sentinel.exists()
+
+
+def _write_plugin_manifest(plugin_dir: Path) -> None:
+    (plugin_dir / "plugin.toml").write_text(
+        """
+id = "cli_plugin"
+name = "CLI Plugin"
+version = "0.1.0"
+api_version = "1"
+entrypoint = "plugin.py:register"
+type = "tool"
+capabilities = ["echo"]
+permissions = ["read_workspace"]
+
+[activation]
+mode = "manual"
+
+[compatibility]
+min_python = "3.11"
+
+[config_schema]
+type = "object"
+additionalProperties = false
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _cli_eval_task(task_id: str = "task.cli.suite") -> BenchmarkTask:
     return BenchmarkTask(
         task_id=task_id,

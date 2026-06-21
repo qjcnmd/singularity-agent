@@ -22,6 +22,7 @@ from miniharness.interaction import RichCliRenderer
 from miniharness.kernel import CancellationError, KernelBootstrap
 from miniharness.memory.cli import memory_app
 from miniharness.observability import TraceRedactor, TraceRuntime, TraceStore
+from miniharness.plugins.cli import plugin_app
 from miniharness.command import CommandRuntime
 from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
 from miniharness.planner import PlannerRuntime, create_or_resume_planner as _create_or_resume_planner
@@ -72,6 +73,7 @@ system_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 app.add_typer(index_app, name="index")
 app.add_typer(memory_app, name="memory")
+app.add_typer(plugin_app, name="plugin")
 app.add_typer(eval_app, name="eval")
 app.add_typer(eval_app, name="benchmark")
 app.add_typer(system_app, name="system")

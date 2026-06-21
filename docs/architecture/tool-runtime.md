@@ -21,6 +21,8 @@ The compatibility fields `cacheable` and `idempotent` still work, but runtime be
 
 The old `dispatch()` convenience path now fails closed because it created a temporary runtime and could bypass the caller's policy, approval, trace, and planner configuration. Tests can use `dispatch_for_tests(..., runtime=...)` with an explicit runtime.
 
+Local tool plugins enter the system at this boundary. `PluginRuntime` activates enabled plugins after built-in tools are registered and before `ToolRuntime` is constructed. A plugin can only call `PluginHost.register_tool()`, which converts the declaration into a `ToolSpec` named `<plugin_id>__<tool_name>` and registers it through `ToolRegistry`. The plugin does not receive `ToolRegistry`, `ToolRuntime`, policy, approval, command, sandbox, trace store, or planner objects.
+
 ## Runtime Pipeline
 
 `ToolRuntime.execute_tool_call()` follows a fixed sequence:
@@ -47,6 +49,8 @@ trace/audit record
 ```
 
 `ToolRuntime` does not create its own session policy runtime. CLI and tests must inject the active `PolicyRuntime`; construction fails if it is missing. The runtime also does not mutate files directly, run commands directly, choose verification commands, or implement a Git runtime. Those behaviors remain delegated to Workspace Mutation Runtime, Command Runtime, and Verification Runtime.
+
+Plugin-provided tools are not a bypass. Once registered, they follow the same `ToolRuntime.execute_tool_call()` pipeline as built-in tools. High-risk plugin tools must still declare valid `ToolSpec` backend metadata, and registry admission rejects write or shell tools that do not delegate to the appropriate runtime.
 
 ## Policy, Approval, Planner
 

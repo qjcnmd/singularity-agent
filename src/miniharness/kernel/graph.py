@@ -22,6 +22,7 @@ from miniharness.model import (
 from miniharness.memory import MemoryRuntime
 from miniharness.observability import TraceRuntime
 from miniharness.policy import ApprovalGate, ApprovalMode, PolicyRuntime
+from miniharness.plugins import PluginRuntime
 from miniharness.planner import PlannerRuntime, create_or_resume_planner
 from miniharness.review import ReviewRuntime
 from miniharness.sandbox import SandboxRuntime
@@ -59,6 +60,7 @@ RUNTIME_INITIALIZATION_ORDER = [
     RuntimeComponentName.MUTATION,
     RuntimeComponentName.EDIT,
     RuntimeComponentName.TOOLS,
+    RuntimeComponentName.PLUGINS,
     RuntimeComponentName.TOOL_RUNTIME,
     RuntimeComponentName.TOOL_PROTOCOL,
     RuntimeComponentName.VERIFICATION,
@@ -109,6 +111,7 @@ class _ExecutionCoreRuntimes:
 @dataclass(frozen=True)
 class _ToolProtocolRuntimes:
     tools: ToolRegistry
+    plugin_runtime: PluginRuntime
     tool_runtime: ToolRuntime
     protocol_runtime: ToolCallingProtocolRuntime
 
@@ -141,6 +144,7 @@ class RuntimeGraph:
     mutation_runtime: MutationRuntime
     edit_runtime: EditRuntime
     tools: ToolRegistry
+    plugin_runtime: PluginRuntime
     verification_runtime: VerificationRuntime
     review_runtime: ReviewRuntime
     instruction_runtime: InstructionRuntime
@@ -238,6 +242,7 @@ class RuntimeGraph:
             "mutation": self.mutation_runtime,
             "edit": self.edit_runtime,
             "tools": self.tools,
+            "plugins": self.plugin_runtime,
             "tool_runtime": self.tool_runtime,
             "tool_protocol": self.protocol_runtime,
             "verification": self.verification_runtime,
@@ -361,6 +366,7 @@ class RuntimeFactory:
                 mutation_runtime=execution_core.mutation_runtime,
                 edit_runtime=execution_core.edit_runtime,
                 tools=tool_protocol.tools,
+                plugin_runtime=tool_protocol.plugin_runtime,
                 verification_runtime=verification_review.verification_runtime,
                 review_runtime=verification_review.review_runtime,
                 instruction_runtime=model_context.instruction_runtime,
@@ -536,6 +542,13 @@ class RuntimeFactory:
         register_code_index_tools(tools, infra.project_index_runtime)
         marker.mark(RuntimeComponentName.TOOLS)
 
+        plugin_runtime = PluginRuntime(project_root, trace=trace)
+        plugin_runtime.activate(
+            registry=tools,
+            policy_runtime=policy_sandbox.policy_runtime,
+        )
+        marker.mark(RuntimeComponentName.PLUGINS)
+
         tool_runtime = ToolRuntime(
             registry=tools,
             policy=ToolPolicy.coding_agent(),
@@ -558,6 +571,7 @@ class RuntimeFactory:
 
         return _ToolProtocolRuntimes(
             tools=tools,
+            plugin_runtime=plugin_runtime,
             tool_runtime=tool_runtime,
             protocol_runtime=protocol_runtime,
         )

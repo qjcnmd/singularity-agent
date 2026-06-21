@@ -27,6 +27,7 @@ def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, 
         RuntimeComponentName.MUTATION,
         RuntimeComponentName.EDIT,
         RuntimeComponentName.TOOLS,
+        RuntimeComponentName.PLUGINS,
         RuntimeComponentName.TOOL_RUNTIME,
         RuntimeComponentName.TOOL_PROTOCOL,
         RuntimeComponentName.VERIFICATION,
@@ -55,6 +56,8 @@ def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, 
     assert graph.components_for_health()["evaluation"] is not None
     assert graph.model_runtime is not None
     assert graph.tool_runtime is not None
+    assert graph.plugin_runtime is not None
+    assert graph.components_for_health()["plugins"] is graph.plugin_runtime
 
 
 def test_runtime_graph_records_initialization_trace_in_declared_order(

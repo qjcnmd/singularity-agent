@@ -42,17 +42,18 @@ Supported CLI inputs still flow through the config object:
 10. Mutation
 11. Edit
 12. Tools
-13. ToolRuntime
-14. ToolProtocol
-15. Verification
-16. Review
-17. Evaluation
-18. Instructions
-19. Model
-20. Context
-21. Planner
+13. Plugins
+14. ToolRuntime
+15. ToolProtocol
+16. Verification
+17. Review
+18. Evaluation
+19. Instructions
+20. Model
+21. Context
+22. Planner
 
-Each component is recorded as `runtime.initialized` in trace when its boot-time boundary is ready. `RuntimeFactory.build()` assembles the graph in explicit phases: infra, policy/sandbox, execution core, tools/protocol, verification/review, model/context, then planner wiring. The evaluation boundary is registered during boot but the full `EvaluationRuntime` object is created only when evaluation functionality is actually accessed, so normal agent runs do not pay for benchmark scoring, replay, and artifact-writer setup. The graph creates `ContextManager` before Planner, then `AgentKernel` passes that context into `MiniAgent`. Command, Mutation, Tool, Review, Evaluation, and Verification runtimes are wired back to the session PlannerRuntime after Planner creation so execution evidence still lands in the existing planner ledger.
+Each component is recorded as `runtime.initialized` in trace when its boot-time boundary is ready. `RuntimeFactory.build()` assembles the graph in explicit phases: infra, policy/sandbox, execution core, tools/plugins/protocol, verification/review, model/context, then planner wiring. The plugin boundary runs after built-in tools are registered and before `ToolRuntime` / `ToolCallingProtocolRuntime` are created, so enabled local tool plugins become ordinary `ToolSpec` entries and still execute through the same policy, approval, sandbox, trace, and protocol layers. The evaluation boundary is registered during boot but the full `EvaluationRuntime` object is created only when evaluation functionality is actually accessed, so normal agent runs do not pay for benchmark scoring, replay, and artifact-writer setup. The graph creates `ContextManager` before Planner, then `AgentKernel` passes that context into `MiniAgent`. Command, Mutation, Tool, Review, Evaluation, and Verification runtimes are wired back to the session PlannerRuntime after Planner creation so execution evidence still lands in the existing planner ledger.
 
 ## Lifecycle
 
@@ -97,7 +98,7 @@ Behavior:
 
 ## Health Check
 
-`RuntimeHealthChecker` checks the runtime graph components, including deferred components such as evaluation, without forcing lazy runtimes to instantiate. Missing components become diagnostics; critical missing components fail closed. Results are written to trace as `runtime.health_checked` and included in `FinalReport.runtime_health_summary`.
+`RuntimeHealthChecker` checks the runtime graph components, including plugins and deferred components such as evaluation, without forcing lazy runtimes to instantiate. Missing components become diagnostics; critical missing components fail closed. Results are written to trace as `runtime.health_checked` and included in `FinalReport.runtime_health_summary`.
 
 ## Shutdown
 
