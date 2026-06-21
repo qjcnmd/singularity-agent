@@ -43,6 +43,10 @@ class WorkspaceStateStore:
     def connection(self) -> sqlite3.Connection:
         return self._connection
 
+    def close(self) -> None:
+        with self._lock:
+            self._connection.close()
+
     def session_dir(self, session_id: str) -> Path:
         path = self.sessions_root / session_id
         path.mkdir(parents=True, exist_ok=True)

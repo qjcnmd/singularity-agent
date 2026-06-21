@@ -101,6 +101,9 @@ class ContextManager:
         self._persist_initial_messages()
         self._persist_initial_items(system_prompt=system_prompt, user_goal=user_goal)
 
+    def close(self) -> None:
+        self.store.close()
+
     def messages(
         self,
         *,

@@ -287,14 +287,22 @@ def run_goal(
                     "[yellow]final report unavailable[/yellow] "
                     + _REDACTOR.redact_text(str(report_exc))
                 )
+        close_resources = getattr(kernel, "close_resources", None) if kernel is not None else None
+        if callable(close_resources):
+            close_resources()
         raise typer.Exit(1) from exc
 
-    console.print(Panel(final_answer, title="final answer", border_style="green"))
-    renderer.render_final_report(
-        getattr(result, "interaction_report", None) or final_report,
-        border_style="green",
-    )
-    console.print(_workspace_health_panel(final_health))
+    try:
+        console.print(Panel(final_answer, title="final answer", border_style="green"))
+        renderer.render_final_report(
+            getattr(result, "interaction_report", None) or final_report,
+            border_style="green",
+        )
+        console.print(_workspace_health_panel(final_health))
+    finally:
+        close_resources = getattr(kernel, "close_resources", None) if kernel is not None else None
+        if callable(close_resources):
+            close_resources()
 
 
 @app.command("version")

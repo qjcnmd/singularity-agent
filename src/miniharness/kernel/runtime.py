@@ -74,6 +74,7 @@ class AgentKernel:
         self._final_report: FinalReport | None = None
         self._interaction_report: InteractionFinalReport | None = None
         self._finalizing_during_shutdown = False
+        self._resources_closed = False
         self.interaction_runtime = getattr(self.graph, "interaction_runtime", None)
         if self.interaction_runtime is None:
             self.interaction_runtime = InteractionRuntime(
@@ -223,6 +224,32 @@ class AgentKernel:
         self._final_report = None
         self.final_report()
         return self.shutdown_summary
+
+    def close_resources(self) -> None:
+        if self._resources_closed:
+            return
+        shutdown_reason = self.shutdown_summary.reason if self.shutdown_summary else None
+        session_status = "closed" if shutdown_reason == ShutdownReason.NORMAL else "interrupted"
+        for name, runtime in (
+            ("workspace_state", self.graph.workspace_state),
+            ("context_manager", self.graph.context_manager),
+            ("protocol_runtime", self.graph.protocol_runtime),
+        ):
+            try:
+                if name == "workspace_state" and hasattr(runtime, "close_session"):
+                    runtime.close_session(status=session_status)
+                close = getattr(runtime, "close", None)
+                if callable(close):
+                    close()
+            except Exception as exc:
+                self.context.diagnostics.append(
+                    {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "stage": f"{name}_close",
+                    }
+                )
+        self._resources_closed = True
 
     def recover_previous_run(self) -> RecoveryReport:
         report = CrashRecoveryManager(

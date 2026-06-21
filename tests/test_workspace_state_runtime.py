@@ -1,6 +1,9 @@
 import json
+import sqlite3
 import sys
 from pathlib import Path
+
+import pytest
 
 from miniharness.command import (
     CommandPurpose,
@@ -45,6 +48,8 @@ def test_session_start_creates_persistent_baseline_and_skips_protected_dirs(tmp_
     (tmp_path / ".git" / "HEAD").write_text("ref: main\n", encoding="utf-8")
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "pkg.js").write_text("ignored\n", encoding="utf-8")
+    (tmp_path / "work").mkdir()
+    (tmp_path / "work" / "pytest-output.txt").write_text("ignored\n", encoding="utf-8")
 
     runtime = LocalWorkspaceStateRuntime(tmp_path)
     baseline = runtime.begin_session(task_id="task_1", session_id="session_1")
@@ -54,6 +59,7 @@ def test_session_start_creates_persistent_baseline_and_skips_protected_dirs(tmp_
     assert "src/app.py" in baseline.snapshots
     assert ".git/HEAD" not in baseline.snapshots
     assert "node_modules/pkg.js" not in baseline.snapshots
+    assert "work/pytest-output.txt" not in baseline.snapshots
     assert (tmp_path / ".miniharness" / "sessions" / "session_1" / "journal.jsonl").exists()
     assert (tmp_path / ".miniharness" / "workspace_state.sqlite3").exists()
 
@@ -266,3 +272,13 @@ def test_workspace_health_tool_refreshes_external_changes(tmp_path: Path) -> Non
     assert workspace_state["status"] == WorkspaceHealthStatus.CONFLICTED.value
     assert workspace_state["external_changes"] == ["app.py"]
     assert "journal" not in json.dumps(result, ensure_ascii=False).lower()
+
+
+def test_workspace_state_runtime_closes_sqlite_store(tmp_path: Path) -> None:
+    state = LocalWorkspaceStateRuntime(tmp_path)
+    state.begin_session(task_id="task_1")
+
+    state.close()
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        state.store.connection.execute("select 1")

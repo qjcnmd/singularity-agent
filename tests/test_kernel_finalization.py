@@ -163,6 +163,18 @@ def test_agent_kernel_shutdown_rejects_late_runtime_actions(tmp_path: Path) -> N
             runtime.cancellation_token.throw_if_cancelled()
 
 
+def test_agent_kernel_close_resources_closes_stateful_runtimes(tmp_path: Path) -> None:
+    kernel, _trace = _build_kernel(tmp_path)
+
+    kernel.shutdown(ShutdownReason.NORMAL)
+    kernel.close_resources()
+
+    assert kernel.graph.workspace_state.closed is True
+    assert kernel.graph.workspace_state.closed_session_status == "closed"
+    assert kernel.graph.context_manager.closed is True
+    assert kernel.graph.protocol_runtime.closed is True
+
+
 class _Trace:
     def __init__(self, tmp_path: Path) -> None:
         self.events: list[tuple[str, dict]] = []
@@ -180,11 +192,20 @@ class _Trace:
 
 
 class _WorkspaceState:
+    closed = False
+    closed_session_status = None
+
     def record_external_changes(self) -> None:
         pass
 
     def get_workspace_health(self) -> WorkspaceHealthReport:
         return WorkspaceHealthReport(status=WorkspaceHealthStatus.CLEAN)
+
+    def close_session(self, *, status: str = "closed") -> None:
+        self.closed_session_status = status
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _Planner:
@@ -197,6 +218,14 @@ class _Planner:
 
 class _Runtime:
     pass
+
+
+class _ClosableRuntime:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _Graph:
@@ -214,9 +243,9 @@ class _Graph:
         self.tools = _Runtime()
         self.policy_runtime = _Runtime()
         self.tool_runtime = _Runtime()
-        self.protocol_runtime = _Runtime()
+        self.protocol_runtime = _ClosableRuntime()
         self.instruction_runtime = _Runtime()
-        self.context_manager = _Runtime()
+        self.context_manager = _ClosableRuntime()
 
     def cancellation_targets(self) -> list[tuple[str, object]]:
         return [

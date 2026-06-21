@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from miniharness.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
@@ -260,3 +262,12 @@ def test_state_store_exposes_independent_tables(tmp_path: Path) -> None:
         "tool_protocol_events",
         "tool_result_bindings",
     }.issubset(table_names)
+
+
+def test_state_store_close_releases_sqlite_connection(tmp_path: Path) -> None:
+    store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
+
+    store.close()
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.connection.execute("select 1")

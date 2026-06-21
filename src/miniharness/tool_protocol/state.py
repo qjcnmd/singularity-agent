@@ -57,6 +57,10 @@ class ToolProtocolStateStore:
     def connection(self) -> sqlite3.Connection:
         return self._connection
 
+    def close(self) -> None:
+        with self._lock:
+            self._connection.close()
+
     def create_batch(self, batch: ToolCallBatch | dict[str, Any]) -> ToolCallBatch:
         batch_obj = batch if isinstance(batch, ToolCallBatch) else ToolCallBatch.from_dict(batch)
         with self._lock:

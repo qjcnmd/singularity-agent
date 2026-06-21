@@ -50,6 +50,9 @@ class ToolCallingProtocolRuntime:
         self.workspace_state_hook = workspace_state_hook
         self.cancellation_token: Any | None = None
 
+    def close(self) -> None:
+        self.state_store.close()
+
     def process_model_turn(
         self,
         *,

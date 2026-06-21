@@ -103,11 +103,15 @@ class KernelBootstrap:
                 read_only=config.approval_mode == ApprovalMode.READ_ONLY,
             )
             context.workspace_lock_status = "acquired"
-            recovery = CrashRecoveryManager(
-                trace=trace,
-                workspace_lock=self.workspace_lock,
-                workspace_state=LocalWorkspaceStateRuntime(self.project_root, trace=trace),
-            ).recover()
+            recovery_workspace_state = LocalWorkspaceStateRuntime(self.project_root, trace=trace)
+            try:
+                recovery = CrashRecoveryManager(
+                    trace=trace,
+                    workspace_lock=self.workspace_lock,
+                    workspace_state=recovery_workspace_state,
+                ).recover()
+            finally:
+                recovery_workspace_state.close()
             context.recovered_previous_run = recovery.recovered
             graph = self.runtime_factory.build(
                 project_root=self.project_root,

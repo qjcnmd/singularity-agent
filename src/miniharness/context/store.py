@@ -56,6 +56,10 @@ class ObservationStore:
     def connection(self) -> sqlite3.Connection:
         return self._connection
 
+    def close(self) -> None:
+        with self._lock:
+            self._connection.close()
+
     def append_message(self, *, run_id: str, message: dict[str, Any]) -> None:
         with self._lock:
             self._ensure_run(run_id)

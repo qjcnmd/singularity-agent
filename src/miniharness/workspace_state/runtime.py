@@ -78,6 +78,7 @@ class WorkspaceStatePolicy:
             "node_modules",
             "outputs",
             "venv",
+            "work",
         }
     )
     max_snapshot_bytes: int = 1_000_000
@@ -201,6 +202,9 @@ class LocalWorkspaceStateRuntime:
             status=status,
             closed_at=_now(),
         )
+
+    def close(self) -> None:
+        self.store.close()
 
     def create_baseline(self, *, task_id: str | None = None) -> WorkspaceBaseline:
         session_id = self._ensure_session()

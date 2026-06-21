@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -245,3 +246,12 @@ def test_pin_item_updates_priority_without_marking_item_obsolete(tmp_path: Path)
     assert loaded.pinned is True
     assert loaded.freshness == ContextFreshness.CURRENT
     assert "context.item_pinned" in events
+
+
+def test_store_close_releases_sqlite_connection(tmp_path: Path) -> None:
+    store = ObservationStore(tmp_path / "context.sqlite3")
+
+    store.close()
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.connection.execute("select 1")
