@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ class MemoryStore:
             human_dir=self.root / "human",
             rules_dir=self.workspace_root / ".miniharness" / "rules",
         )
+        self._lock_path = self.root / "auto" / ".memory.lock"
 
     def initialize(self, *, rebuild_index: bool = True) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -99,78 +101,93 @@ class MemoryStore:
         raise KeyError(candidate_id)
 
     def upsert_entry(self, entry: MemoryEntry) -> MemoryEntry:
-        entries = self.load_entries()
-        updated = False
-        for index, existing in enumerate(entries):
-            if existing.id == entry.id:
-                entries[index] = entry
-                updated = True
-                break
-        if not updated:
-            entries.append(entry)
-        self._write_entries(entries)
+        with _file_lock(self._lock_path):
+            entries = self.load_entries()
+            updated = False
+            for index, existing in enumerate(entries):
+                if existing.id == entry.id:
+                    entries[index] = entry
+                    updated = True
+                    break
+            if not updated:
+                entries.append(entry)
+            self._write_entries(entries)
         return entry
 
     def upsert_candidate(self, candidate: MemoryCandidate) -> MemoryCandidate:
-        candidates = self.load_candidates()
-        updated = False
-        for index, existing in enumerate(candidates):
-            if existing.id == candidate.id:
-                candidates[index] = candidate
-                updated = True
-                break
-        if not updated:
-            candidates.append(candidate)
-        self._write_candidates(candidates)
+        with _file_lock(self._lock_path):
+            candidates = self.load_candidates()
+            updated = False
+            for index, existing in enumerate(candidates):
+                if existing.id == candidate.id:
+                    candidates[index] = candidate
+                    updated = True
+                    break
+            if not updated:
+                candidates.append(candidate)
+            self._write_candidates(candidates)
         return candidate
 
     def accept_candidate(self, candidate_id: str) -> MemoryEntry:
-        candidate = self.get_candidate(candidate_id)
-        accepted = candidate.with_status(MemoryStatus.ACTIVE, reason="accepted")
-        entry = accepted.to_entry()
-        entries = self.load_entries()
-        existing = next((item for item in entries if item.id == entry.id), None)
-        if existing is not None and existing.status == MemoryStatus.TOMBSTONED:
-            raise ValueError(f"Cannot restore tombstoned memory entry: {entry.id}")
-        tombstoned_match = next(
-            (
-                item
-                for item in entries
-                if item.status == MemoryStatus.TOMBSTONED and item.content_hash == entry.content_hash
-            ),
-            None,
-        )
-        if tombstoned_match is not None:
-            raise ValueError(f"Cannot restore tombstoned memory entry: {tombstoned_match.id}")
-        self.upsert_candidate(accepted)
-        return self.upsert_entry(entry)
+        with _file_lock(self._lock_path):
+            candidates = self.load_candidates()
+            candidate = _find_candidate(candidates, candidate_id)
+            accepted = candidate.with_status(MemoryStatus.ACTIVE, reason="accepted")
+            entry = accepted.to_entry()
+            entries = self.load_entries()
+            existing = next((item for item in entries if item.id == entry.id), None)
+            if existing is not None and existing.status == MemoryStatus.TOMBSTONED:
+                raise ValueError(f"Cannot restore tombstoned memory entry: {entry.id}")
+            tombstoned_match = next(
+                (
+                    item
+                    for item in entries
+                    if item.status == MemoryStatus.TOMBSTONED and item.content_hash == entry.content_hash
+                ),
+                None,
+            )
+            if tombstoned_match is not None:
+                raise ValueError(f"Cannot restore tombstoned memory entry: {tombstoned_match.id}")
+            _upsert_candidate(candidates, accepted)
+            _upsert_entry(entries, entry)
+            self._write_candidates(candidates)
+            self._write_entries(entries)
+            return entry
 
     def reject_candidate(self, candidate_id: str, *, reason: str = "rejected") -> MemoryCandidate:
-        rejected = self.get_candidate(candidate_id).with_status(MemoryStatus.REJECTED, reason=reason)
-        self.upsert_candidate(rejected)
-        return rejected
+        with _file_lock(self._lock_path):
+            candidates = self.load_candidates()
+            rejected = _find_candidate(candidates, candidate_id).with_status(MemoryStatus.REJECTED, reason=reason)
+            _upsert_candidate(candidates, rejected)
+            self._write_candidates(candidates)
+            return rejected
 
     def tombstone_entry(self, entry_id: str, *, reason: str = "deleted") -> MemoryEntry:
-        entry = self.get_entry(entry_id)
-        payload = entry.to_dict()
-        payload["status"] = MemoryStatus.TOMBSTONED.value
-        payload["tombstone_reason"] = reason
-        payload["updated_at"] = _now()
-        tombstone = MemoryEntry.from_dict(payload)
-        self.upsert_entry(tombstone)
-        return tombstone
+        with _file_lock(self._lock_path):
+            entries = self.load_entries()
+            entry = _find_entry(entries, entry_id)
+            payload = entry.to_dict()
+            payload["status"] = MemoryStatus.TOMBSTONED.value
+            payload["tombstone_reason"] = reason
+            payload["updated_at"] = _now()
+            tombstone = MemoryEntry.from_dict(payload)
+            _upsert_entry(entries, tombstone)
+            self._write_entries(entries)
+            return tombstone
 
     def replace_entries(self, entries: list[MemoryEntry], *, rebuild: bool = True) -> None:
-        if rebuild:
-            self._write_entries(entries)
-            return
-        _write_jsonl(self.layout.entries_jsonl, [entry.to_dict() for entry in entries])
+        with _file_lock(self._lock_path):
+            if rebuild:
+                self._write_entries(entries)
+                return
+            _write_jsonl(self.layout.entries_jsonl, [entry.to_dict() for entry in entries])
 
     def replace_candidates(self, candidates: list[MemoryCandidate], *, rebuild: bool = True) -> None:
-        if rebuild:
-            self._write_candidates(candidates)
-            return
-        _write_jsonl(self.layout.candidates_jsonl, [candidate.to_dict() for candidate in candidates])
+        with _file_lock(self._lock_path):
+            if rebuild:
+                self._write_candidates(candidates)
+                return
+            _write_jsonl(self.layout.candidates_jsonl, [candidate.to_dict() for candidate in candidates])
 
     def rebuild_index(self) -> dict[str, Any]:
         entries = (
@@ -300,6 +317,71 @@ def _write_jsonl(path: Path, items: list[dict[str, Any]]) -> None:
         for item in items
     )
     _atomic_write(path, text)
+
+
+def _find_entry(entries: list[MemoryEntry], entry_id: str) -> MemoryEntry:
+    for entry in entries:
+        if entry.id == entry_id:
+            return entry
+    raise KeyError(entry_id)
+
+
+def _find_candidate(candidates: list[MemoryCandidate], candidate_id: str) -> MemoryCandidate:
+    for candidate in candidates:
+        if candidate.id == candidate_id:
+            return candidate
+    raise KeyError(candidate_id)
+
+
+def _upsert_entry(entries: list[MemoryEntry], entry: MemoryEntry) -> None:
+    for index, existing in enumerate(entries):
+        if existing.id == entry.id:
+            entries[index] = entry
+            return
+    entries.append(entry)
+
+
+def _upsert_candidate(candidates: list[MemoryCandidate], candidate: MemoryCandidate) -> None:
+    for index, existing in enumerate(candidates):
+        if existing.id == candidate.id:
+            candidates[index] = candidate
+            return
+    candidates.append(candidate)
+
+
+@contextmanager
+def _file_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        _lock_file(handle)
+        try:
+            yield
+        finally:
+            _unlock_file(handle)
+
+
+def _lock_file(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _atomic_write(path: Path, text: str) -> None:

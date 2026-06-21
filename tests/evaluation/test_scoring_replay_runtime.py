@@ -275,8 +275,11 @@ def test_runtime_blocks_archive_snapshot_execution_without_direct_unpack(tmp_pat
 
 
 class _StubCommandRuntime:
+    def __init__(self) -> None:
+        self.requests = []
+
     def run(self, request):
-        _ = request
+        self.requests.append(request)
 
         class Result:
             semantic_status = SemanticStatus.SUCCEEDED
@@ -289,6 +292,24 @@ class _StubCommandRuntime:
                 reasons=[],
                 risk_tags=[CommandRisk.PROJECT_VERIFICATION],
             )
+
+        return Result()
+
+
+class _TimeoutRecordingCommandRuntime:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def run(self, request):
+        self.requests.append(request)
+
+        class Result:
+            semantic_status = SemanticStatus.RUNTIME_FAILED
+            exit_code = None
+            error_code = "timeout"
+            duration_ms = int((request.timeout_seconds or 0) * 1000)
+            combined_output_preview = "timeout"
+            policy_decision = None
 
         return Result()
 
@@ -325,6 +346,113 @@ def test_score_adjustment_hook_changes_final_score_only_when_executed(tmp_path: 
 
     assert offline.profile_reports[0].task_results[0].scoring.score == 0.4
     assert executed.profile_reports[0].task_results[0].scoring.score == 0.65
+
+
+def test_evaluation_hook_args_and_timeout_are_used_for_execution(tmp_path: Path) -> None:
+    command = _TimeoutRecordingCommandRuntime()
+    task = BenchmarkTask(
+        task_id="task.hook_timeout",
+        version="v1",
+        title="Hook timeout",
+        input_prompt="Evaluate hook timeout.",
+        workspace_snapshot=WorkspaceSnapshot(kind=WorkspaceSnapshotKind.GIT_REF, git_ref="HEAD"),
+        expected_outcomes=[
+            ExpectedOutcome(kind=ExpectedOutcomeKind.HEURISTIC, weight=1.0, heuristic="custom", metadata={"score": 0.5})
+        ],
+        evaluation_hooks=[
+            EvaluationHook(
+                name="adjust",
+                stage="score_adjustment",
+                command="adjust",
+                args={"score_delta": 0.25},
+                timeout_seconds=3,
+            )
+        ],
+        tags=["easy"],
+    )
+
+    result = EvaluationRuntime(
+        project_root=tmp_path,
+        command_runtime=command,
+    ).run_suite(
+        tasks=[task],
+        profiles=[EvaluationProfile(name="baseline", model="gpt-a")],
+        execute=True,
+    ).profile_reports[0].task_results[0]
+
+    assert command.requests[0].timeout_seconds == 3
+    assert result.execution_evidence["hook_results"][0]["args"] == {"score_delta": 0.25}
+    assert "timeout" in result.scoring.failure_reasons
+
+
+def test_evaluation_hook_args_are_executed_as_stable_argv(tmp_path: Path) -> None:
+    command = _StubCommandRuntime()
+    task = BenchmarkTask(
+        task_id="task.hook_args",
+        version="v1",
+        title="Hook args",
+        input_prompt="Evaluate hook args.",
+        workspace_snapshot=WorkspaceSnapshot(kind=WorkspaceSnapshotKind.GIT_REF, git_ref="HEAD"),
+        expected_outcomes=[
+            ExpectedOutcome(kind=ExpectedOutcomeKind.HEURISTIC, weight=1.0, heuristic="custom", metadata={"score": 0.5})
+        ],
+        evaluation_hooks=[
+            EvaluationHook(
+                name="adjust",
+                stage="score_adjustment",
+                module="hooks.adjust",
+                args={"name": "two words", "retries": 2, "enabled": True, "skip": False},
+                timeout_seconds=5,
+            )
+        ],
+        tags=["easy"],
+    )
+
+    EvaluationRuntime(
+        project_root=tmp_path,
+        command_runtime=command,
+    ).run_suite(
+        tasks=[task],
+        profiles=[EvaluationProfile(name="baseline", model="gpt-a")],
+        execute=True,
+    )
+
+    assert command.requests[0].argv == [
+        "python",
+        "-m",
+        "hooks.adjust",
+        "--name",
+        "two words",
+        "--retries",
+        "2",
+        "--enabled",
+    ]
+    assert command.requests[0].shell is None
+    assert command.requests[0].timeout_seconds == 5
+
+
+def test_evaluation_profiles_do_not_share_runtime_overrides(tmp_path: Path) -> None:
+    task = _task()
+    baseline = EvaluationProfile(name="baseline", model="gpt-a", tool_policy="read_write")
+    candidate = EvaluationProfile(
+        name="candidate",
+        model="gpt-b",
+        memory_enabled=False,
+        allowed_tools=["read_file"],
+        tool_policy="read_only",
+    )
+
+    report = EvaluationRuntime(project_root=tmp_path).run_suite(
+        tasks=[task],
+        profiles=[baseline, candidate],
+        execute=False,
+    )
+
+    baseline_overrides = report.profile_reports[0].task_results[0].runtime_overrides
+    candidate_overrides = report.profile_reports[1].task_results[0].runtime_overrides
+    assert baseline_overrides == baseline.to_runtime_overrides()
+    assert candidate_overrides == candidate.to_runtime_overrides()
+    assert baseline_overrides is not candidate_overrides
 
 
 def test_scoring_marks_failed_policy_and_verification_as_failure() -> None:

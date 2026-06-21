@@ -85,6 +85,7 @@ class ApprovalGate:
                 decision_id=decision.decision_id,
                 request_id=request.request_id,
                 approved_by=user_decision.decided_by,
+                session_id=request.session_id,
                 scope=requirement.scope if requirement else approval_scope_for_request(request),
                 single_use=True,
                 reason=user_decision.reason or "approved once via interaction runtime",

@@ -32,6 +32,7 @@ class PolicyConfig:
     max_auto_read_bytes: int = 200_000
     default_command_timeout_seconds: int = 30
     audit_log_path: Path | str | None = None
+    approval_grants_path: Path | str | None = None
     security_mode: SecurityMode | str = SecurityMode.STRICT
 
     def __post_init__(self) -> None:
@@ -40,13 +41,22 @@ class PolicyConfig:
         root = Path(self.workspace_root).expanduser().resolve(strict=False)
         object.__setattr__(self, "workspace_root", root)
         if self.audit_log_path is None:
+            policy_dir = root / ".miniharness" / "policy"
             object.__setattr__(
                 self,
                 "audit_log_path",
-                root / ".miniharness" / "policy" / "audit.jsonl",
+                policy_dir / "audit.jsonl",
             )
         else:
             object.__setattr__(self, "audit_log_path", Path(self.audit_log_path))
+        if self.approval_grants_path is None:
+            object.__setattr__(
+                self,
+                "approval_grants_path",
+                root / ".miniharness" / "policy" / "approval_grants.jsonl",
+            )
+        else:
+            object.__setattr__(self, "approval_grants_path", Path(self.approval_grants_path))
 
     @classmethod
     def runtime_default(cls, workspace_root: Path | str) -> "PolicyConfig":

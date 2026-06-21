@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+import pickle
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -62,6 +64,53 @@ class _ReplayEntry:
     args_fingerprint: str
     result: ToolResult
     replay_allowed: bool
+
+
+def _tool_process_entrypoint(handler: Any, validated_args: Any, conn: Any) -> None:
+    try:
+        output = handler(validated_args)
+        _send_tool_process_payload(conn, {"status": "success", "output": output})
+    except ToolExecutionFailure as exc:
+        _send_tool_process_payload(
+            conn,
+            {
+                "status": "tool_failure",
+                "code": exc.code,
+                "message": exc.message,
+                "details": _json_safe_process_value(exc.details),
+            },
+        )
+    except Exception as exc:
+        _send_tool_process_payload(
+            conn,
+            {
+                "status": "exception",
+                "message": str(exc),
+                "type": type(exc).__name__,
+            },
+        )
+    finally:
+        conn.close()
+
+
+def _send_tool_process_payload(conn: Any, payload: dict[str, Any]) -> None:
+    try:
+        conn.send(payload)
+    except Exception as exc:
+        try:
+            conn.send(
+                {
+                    "status": "exception",
+                    "message": f"Tool process could not return result: {exc}",
+                    "type": type(exc).__name__,
+                }
+            )
+        except Exception:
+            pass
+
+
+def _json_safe_process_value(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
 class ToolResultCache:
@@ -654,6 +703,100 @@ class ToolRuntime:
         return spec.execution_backend == ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNTIME
 
     def _execute_handler(self, spec: ToolSpec, validated_args: Any) -> tuple[ToolResult, str]:
+        if (
+            spec.execution_backend == ToolExecutionBackendKind.IN_PROCESS
+            and self._handler_can_run_in_process(spec.handler, validated_args)
+        ):
+            return self._execute_handler_in_process(spec, validated_args)
+        return self._execute_handler_in_thread(spec, validated_args)
+
+    @staticmethod
+    def _handler_can_run_in_process(handler: Any, validated_args: Any) -> bool:
+        try:
+            pickle.dumps((handler, validated_args))
+        except Exception:
+            return False
+        return True
+
+    def _execute_handler_in_process(
+        self, spec: ToolSpec, validated_args: Any
+    ) -> tuple[ToolResult, str]:
+        context = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_tool_process_entrypoint,
+            args=(spec.handler, validated_args, child_conn),
+        )
+        try:
+            process.start()
+        except Exception as exc:
+            parent_conn.close()
+            child_conn.close()
+            result = ToolResult.failure(
+                code="execution_error",
+                message=self._redactor.redact_text(f"Tool process failed to start: {exc}"),
+                details={"type": type(exc).__name__},
+                metadata={
+                    "backend": spec.execution_backend.value,
+                    "handler_isolation": "process",
+                },
+            )
+            return result, self._result_digest(result)
+        child_conn.close()
+
+        try:
+            process.join(spec.timeout_seconds)
+            if process.is_alive():
+                process.terminate()
+                process.join(1)
+                killed = False
+                if process.is_alive():
+                    kill = getattr(process, "kill", None)
+                    if kill is not None:
+                        kill()
+                        killed = True
+                        process.join(1)
+                still_alive = process.is_alive()
+                result = ToolResult.failure(
+                    code="timeout",
+                    message=f"Tool timed out after {spec.timeout_seconds} seconds.",
+                    metadata={
+                        "backend": spec.execution_backend.value,
+                        "handler_isolation": "process",
+                        "timeout_type": "execution",
+                        "timeout_terminated": not still_alive,
+                        "timeout_killed": killed,
+                        "timeout_untrusted_state": still_alive,
+                        "process_exitcode": process.exitcode,
+                    },
+                )
+                return result, self._result_digest(result)
+
+            if not parent_conn.poll():
+                result = ToolResult.failure(
+                    code="execution_error",
+                    message="Tool process exited without returning a result.",
+                    details={"process_exitcode": process.exitcode},
+                    metadata={
+                        "backend": spec.execution_backend.value,
+                        "handler_isolation": "process",
+                    },
+                )
+                return result, self._result_digest(result)
+
+            payload = parent_conn.recv()
+        finally:
+            parent_conn.close()
+            try:
+                process.close()
+            except ValueError:
+                pass
+
+        return self._process_payload_to_result(spec, payload)
+
+    def _execute_handler_in_thread(
+        self, spec: ToolSpec, validated_args: Any
+    ) -> tuple[ToolResult, str]:
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(spec.handler, validated_args)
         try:
@@ -665,6 +808,7 @@ class ToolRuntime:
                 message=f"Tool timed out after {spec.timeout_seconds} seconds.",
                 metadata={
                     "backend": spec.execution_backend.value,
+                    "handler_isolation": "thread",
                     "timeout_type": "execution",
                     "timeout_untrusted_state": True,
                 },
@@ -675,7 +819,10 @@ class ToolRuntime:
                 code=exc.code,
                 message=self._redactor.redact_text(exc.message),
                 details=self._redactor.redact_value(exc.details),
-                metadata={"backend": spec.execution_backend.value},
+                metadata={
+                    "backend": spec.execution_backend.value,
+                    "handler_isolation": "thread",
+                },
             )
             return result, self._result_digest(result)
         except Exception as exc:
@@ -683,12 +830,57 @@ class ToolRuntime:
                 code="execution_error",
                 message=self._redactor.redact_text(str(exc)),
                 details={"type": type(exc).__name__},
-                metadata={"backend": spec.execution_backend.value},
+                metadata={
+                    "backend": spec.execution_backend.value,
+                    "handler_isolation": "thread",
+                },
             )
             return result, self._result_digest(result)
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
+        return self._handler_output_to_result(spec, output, handler_isolation="thread")
+
+    def _process_payload_to_result(
+        self, spec: ToolSpec, payload: dict[str, Any]
+    ) -> tuple[ToolResult, str]:
+        status = payload.get("status")
+        if status == "success":
+            return self._handler_output_to_result(
+                spec,
+                payload.get("output"),
+                handler_isolation="process",
+            )
+        if status == "tool_failure":
+            result = ToolResult.failure(
+                code=str(payload.get("code") or "execution_error"),
+                message=self._redactor.redact_text(str(payload.get("message") or "")),
+                details=self._redactor.redact_value(payload.get("details")),
+                metadata={
+                    "backend": spec.execution_backend.value,
+                    "handler_isolation": "process",
+                },
+            )
+            return result, self._result_digest(result)
+
+        result = ToolResult.failure(
+            code="execution_error",
+            message=self._redactor.redact_text(str(payload.get("message") or "Tool failed.")),
+            details={"type": payload.get("type") or "Exception"},
+            metadata={
+                "backend": spec.execution_backend.value,
+                "handler_isolation": "process",
+            },
+        )
+        return result, self._result_digest(result)
+
+    def _handler_output_to_result(
+        self,
+        spec: ToolSpec,
+        output: Any,
+        *,
+        handler_isolation: str,
+    ) -> tuple[ToolResult, str]:
         if spec.output_model is not None:
             try:
                 output = spec.output_model.model_validate(output).model_dump(mode="json")
@@ -697,14 +889,21 @@ class ToolRuntime:
                     code="output_validation_error",
                     message="Tool output failed validation.",
                     details=self._redactor.redact_value(exc.errors()),
-                    metadata={"backend": spec.execution_backend.value},
+                    metadata={
+                        "backend": spec.execution_backend.value,
+                        "handler_isolation": handler_isolation,
+                    },
                 )
                 return result, self._result_digest(result)
         content, truncated, metadata, digest = self._limit_output(output, spec.max_output_chars)
         result = ToolResult.success(
             content=self._redactor.redact_value(content),
             truncated=truncated,
-            metadata={**metadata, "backend": spec.execution_backend.value},
+            metadata={
+                **metadata,
+                "backend": spec.execution_backend.value,
+                "handler_isolation": handler_isolation,
+            },
         )
         result.metadata["output_digest"] = digest
         return result, digest

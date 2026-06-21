@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -176,6 +177,7 @@ class TraceStore:
             with path.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n")
                 file.flush()
+                os.fsync(file.fileno())
         except OSError as exc:
             raise TraceStoreError(str(exc)) from exc
 
@@ -207,7 +209,14 @@ class TraceStore:
             "created_at": datetime.now(UTC).isoformat(),
         }
         if not self.index_path.exists():
-            self.index_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            self._atomic_write_json(self.index_path, payload)
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as file:
+            file.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, path)

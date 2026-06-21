@@ -35,17 +35,34 @@ def _envelope(assistant_message_id: str = "assistant_1") -> ToolCallEnvelope:
     )
 
 
-def _batch() -> ToolCallBatch:
+def _batch(
+    *,
+    batch_id: str = "batch_1",
+    run_id: str = "run_1",
+    session_id: str = "session_1",
+    task_id: str = "task_1",
+    tool_call_id: str = "call_1",
+) -> ToolCallBatch:
     return ToolCallBatch(
-        batch_id="batch_1",
-        run_id="run_1",
-        session_id="session_1",
-        task_id="task_1",
+        batch_id=batch_id,
+        run_id=run_id,
+        session_id=session_id,
+        task_id=task_id,
         phase_id="phase_1",
         model_request_id="req_1",
         model_response_id="resp_1",
         assistant_message={"id": "assistant_1", "role": "assistant", "content": None},
-        tool_calls=[_envelope()],
+        tool_calls=[
+            ToolCallEnvelope(
+                **{
+                    **_envelope().to_dict(),
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "tool_call_id": tool_call_id,
+                }
+            )
+        ],
     )
 
 
@@ -106,3 +123,19 @@ def test_recovery_reports_bound_approval_result_as_pending_approval(tmp_path: Pa
     assert report.next_action == "resume_pending_approval"
     assert report.pending_approval_count == 1
     assert "pending approval: call_1" in report.recovery_report["warnings"]
+
+
+def test_recovery_filters_by_session_and_task_scope(tmp_path: Path) -> None:
+    store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
+    first = store.create_batch(_batch(batch_id="batch_1", session_id="session_a", task_id="task_a", tool_call_id="call_a"))
+    second = store.create_batch(_batch(batch_id="batch_2", session_id="session_b", task_id="task_b", tool_call_id="call_b"))
+    store.upsert_record(first.tool_calls[0], batch_id=first.batch_id, phase=ToolCallPhase.PROPOSED)
+    store.upsert_record(second.tool_calls[0], batch_id=second.batch_id, phase=ToolCallPhase.PROPOSED)
+
+    report = ToolProtocolRecoveryManager(store).recover(
+        run_id="run_1",
+        session_id="session_b",
+        task_id="task_b",
+    )
+
+    assert report.recovery_report["pending_call_ids"] == ["call_b"]

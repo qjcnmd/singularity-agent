@@ -66,6 +66,20 @@ def test_store_writes_jsonl_and_markdown_projection(tmp_path: Path) -> None:
     assert "<!-- memory:id=mem_1" not in lessons
 
 
+def test_store_upserts_merge_existing_entries_from_other_store(tmp_path: Path) -> None:
+    first = MemoryStore(tmp_path)
+    second = MemoryStore(tmp_path)
+    first.initialize()
+    first.upsert_entry(make_entry("mem_first"))
+
+    second.upsert_entry(make_entry("mem_second"))
+
+    assert {entry.id for entry in MemoryStore(tmp_path).load_entries()} == {
+        "mem_first",
+        "mem_second",
+    }
+
+
 def test_store_migrates_legacy_root_jsonl_to_auto_layout(tmp_path: Path) -> None:
     legacy_root = tmp_path / ".miniharness" / "memory"
     legacy_root.mkdir(parents=True)

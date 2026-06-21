@@ -276,6 +276,7 @@ class ApprovalGrant:
     request_id: str
     approved_by: str
     scope: ApprovalScope
+    session_id: str | None = None
     approved_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     grant_id: str = field(default_factory=lambda: f"grant_{uuid4().hex[:12]}")
     expires_at: str | None = None
@@ -288,6 +289,8 @@ class ApprovalGrant:
             return False
         if self.expires_at and datetime.fromisoformat(self.expires_at) < datetime.now(UTC):
             return False
+        if self.scope.session_only and self.session_id != request.session_id:
+            return False
         if request.capability not in self.scope.capabilities:
             return False
         if request.resource.resource_type == "command":
@@ -297,7 +300,7 @@ class ApprovalGrant:
             return _matches_any(host, self.scope.network_hosts)
         if request.resource.resource_type in {"file", "directory", "workspace", "config"}:
             normalized = _resource_path_for_match(request, workspace_root)
-            return _matches_any(normalized, self.scope.path_globs)
+            return _matches_any(normalized, _normalized_path_globs(self.scope.path_globs, workspace_root))
         return True
 
     def consume(self) -> None:
@@ -310,6 +313,7 @@ class ApprovalGrant:
             "decision_id": self.decision_id,
             "request_id": self.request_id,
             "approved_by": self.approved_by,
+            "session_id": self.session_id,
             "approved_at": self.approved_at,
             "scope": self.scope.to_dict(),
             "expires_at": self.expires_at,
@@ -317,6 +321,31 @@ class ApprovalGrant:
             "consumed": self.consumed,
             "reason": self.reason,
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ApprovalGrant":
+        return cls(
+            decision_id=str(payload["decision_id"]),
+            request_id=str(payload["request_id"]),
+            approved_by=str(payload["approved_by"]),
+            session_id=payload.get("session_id"),
+            approved_at=str(payload.get("approved_at") or datetime.now(UTC).isoformat()),
+            grant_id=str(payload.get("grant_id") or f"grant_{uuid4().hex[:12]}"),
+            scope=ApprovalScope(
+                capabilities=payload.get("scope", {}).get("capabilities") or [],
+                path_globs=payload.get("scope", {}).get("path_globs") or [],
+                command_patterns=payload.get("scope", {}).get("command_patterns") or [],
+                network_hosts=payload.get("scope", {}).get("network_hosts") or [],
+                max_duration_seconds=payload.get("scope", {}).get("max_duration_seconds"),
+                max_files=payload.get("scope", {}).get("max_files"),
+                session_only=bool(payload.get("scope", {}).get("session_only", True)),
+                single_use=bool(payload.get("scope", {}).get("single_use", True)),
+            ),
+            expires_at=payload.get("expires_at"),
+            single_use=bool(payload.get("single_use", True)),
+            consumed=bool(payload.get("consumed", False)),
+            reason=str(payload.get("reason") or ""),
+        )
 
 
 @dataclass(frozen=True)
@@ -513,6 +542,18 @@ def _value(value: Any) -> Any:
 
 def _matches_any(value: str, patterns: list[str]) -> bool:
     return bool(patterns) and any(fnmatch.fnmatchcase(value, pattern) for pattern in patterns)
+
+
+def _normalized_path_globs(patterns: list[str], workspace_root: Path | str | None) -> list[str]:
+    if workspace_root is None:
+        return patterns
+    root = Path(workspace_root).resolve(strict=False)
+    normalized: list[str] = []
+    for pattern in patterns:
+        raw = Path(pattern)
+        candidate = raw if raw.is_absolute() else root / raw
+        normalized.append(os.path.normcase(os.path.normpath(str(candidate.resolve(strict=False)))))
+    return normalized
 
 
 def _resource_path_for_match(

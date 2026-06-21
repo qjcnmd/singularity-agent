@@ -45,6 +45,7 @@ def test_policy_request_decision_and_grant_serialize(tmp_path: Path) -> None:
         decision_id=decision.decision_id,
         request_id=request.request_id,
         approved_by="local-cli-user",
+        session_id=request.session_id,
         scope=ApprovalScope(
             capabilities=[Capability.EXECUTE_COMMAND],
             command_patterns=["python -m pytest"],

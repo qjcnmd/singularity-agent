@@ -74,9 +74,35 @@ def test_strict_mode_blocks_inline_interpreter_readonly_command(tmp_path: Path) 
         )
     )
 
-    assert result.execution_status == ExecutionStatus.REVIEW_REQUIRED
-    assert result.error_code == "review_required"
+    assert result.execution_status == ExecutionStatus.BACKEND_ERROR
+    assert result.error_code == "sandbox_unavailable"
+    assert result.backend != "local_process"
     assert not (tmp_path / "x").exists()
+
+
+def test_strict_auto_safe_command_requires_sandbox_instead_of_local_process(tmp_path: Path) -> None:
+    runtime = CommandRuntime(
+        tmp_path,
+        policy_runtime=PolicyRuntime(
+            PolicyConfig(
+                workspace_root=tmp_path,
+                approval_mode=ApprovalMode.AUTO_SAFE,
+                security_mode=SecurityMode.STRICT,
+            )
+        ),
+    )
+
+    result = runtime.run(
+        CommandRequest(
+            argv=[sys.executable, "-c", "print('strict')"],
+            cwd=".",
+            purpose=CommandPurpose.READ_ONLY_COMMAND,
+        )
+    )
+
+    assert result.backend != "local_process"
+    assert result.error_code in {"sandbox_unavailable", None}
+    assert result.isolation_report["filesystem_isolation"] != "workspace_cwd_advisory"
 
 
 def test_compat_mode_preserves_legacy_inline_interpreter_execution(tmp_path: Path) -> None:
@@ -148,9 +174,9 @@ def test_shell_string_is_marked_high_risk_and_requires_review(tmp_path: Path) ->
         )
     )
 
-    assert result.execution_status == ExecutionStatus.REVIEW_REQUIRED
-    assert result.error_code == "review_required"
-    assert result.policy_decision.decision == CommandDecision.REQUIRE_REVIEW
+    assert result.execution_status == ExecutionStatus.BACKEND_ERROR
+    assert result.error_code == "sandbox_unavailable"
+    assert result.backend != "local_process"
     assert CommandRisk.UNKNOWN in result.risk_tags
 
 

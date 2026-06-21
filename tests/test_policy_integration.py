@@ -36,10 +36,12 @@ class CountingPolicyRuntime(PolicyRuntime):
 
     def enforce(self, request):  # type: ignore[no-untyped-def]
         self.calls.append(f"{request.runtime.value}:{request.operation.value}:{request.resource.identifier}")
-        decision = super().enforce(request)
-        if decision.outcome == DecisionOutcome.REQUIRE_REVIEW:
-            return decision.model_copy_with(outcome=DecisionOutcome.ALLOW, reason="test grant")
-        return decision
+        decision = super().evaluate(request)
+        return decision.model_copy_with(
+            outcome=DecisionOutcome.ALLOW,
+            reason="test policy allows after recording",
+            required_approval=None,
+        )
 
 
 def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -139,7 +141,7 @@ def test_policy_compat_allows_plain_local_command_without_review(tmp_path: Path)
         PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT)
     )
 
-    assert strict.enforce(request).outcome == DecisionOutcome.REQUIRE_REVIEW
+    assert strict.enforce(request).outcome == DecisionOutcome.SANDBOX_REQUIRED
     assert compat.enforce(request).outcome == DecisionOutcome.ALLOW
 
 

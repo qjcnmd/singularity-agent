@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -101,19 +102,21 @@ class ProjectIndexRuntime:
             files = self.scanner.scan()
             project_roots, entrypoints, config_facts, symbols, dependencies, references, call_edges, tests, docs = self._extract_facts(files)
             dependencies = self._resolve_dependency_paths(dependencies, files)
-            self.store.reset()
-            self.store.upsert_files(files)
-            self.store.upsert_project_roots(project_roots)
-            self.store.upsert_entrypoints(entrypoints)
-            self.store.upsert_config_facts(config_facts)
-            self.store.upsert_symbols(symbols)
-            self.store.upsert_dependencies(dependencies)
-            self.store.upsert_references(references)
-            self.store.upsert_call_edges(call_edges)
-            self.store.upsert_test_mappings(tests)
-            self.store.upsert_doc_sections(docs)
-            self.store.set_metadata("schema_version", SCHEMA_VERSION)
-            self.store.set_metadata("plugin_versions", {plugin.name: plugin.version for plugin in self.plugins})
+            build_store = self._temporary_build_store()
+            build_store.reset()
+            build_store.upsert_files(files)
+            build_store.upsert_project_roots(project_roots)
+            build_store.upsert_entrypoints(entrypoints)
+            build_store.upsert_config_facts(config_facts)
+            build_store.upsert_symbols(symbols)
+            build_store.upsert_dependencies(dependencies)
+            build_store.upsert_references(references)
+            build_store.upsert_call_edges(call_edges)
+            build_store.upsert_test_mappings(tests)
+            build_store.upsert_doc_sections(docs)
+            build_store.set_metadata("schema_version", SCHEMA_VERSION)
+            build_store.set_metadata("plugin_versions", {plugin.name: plugin.version for plugin in self.plugins})
+            self._promote_build_store(build_store)
             summary = self.store.load_summary()
             self._bootstrapped = True
             self._emit(
@@ -138,6 +141,16 @@ class ProjectIndexRuntime:
                 severity=TraceSeverity.WARNING,
             )
             raise
+
+    def _temporary_build_store(self) -> ProjectIndexStore:
+        tmp_path = self.db_path.with_name(f".{self.db_path.name}.{uuid4().hex}.tmp")
+        if tmp_path.exists():
+            tmp_path.unlink()
+        return ProjectIndexStore(tmp_path)
+
+    def _promote_build_store(self, build_store: ProjectIndexStore) -> None:
+        os.replace(build_store.path, self.db_path)
+        self.store = ProjectIndexStore(self.db_path)
 
     def refresh(self, *, reason: str = "manual") -> IndexSummary:
         current = {file.path: file for file in self.scanner.scan()}

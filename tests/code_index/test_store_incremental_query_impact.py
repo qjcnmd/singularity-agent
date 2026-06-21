@@ -75,3 +75,24 @@ def test_runtime_incremental_query_and_impact_use_structured_facts(tmp_path: Pat
 
     assert "src/service.py" in result.rebuilt_files
     assert result.summary["file_count"] >= 3
+
+
+def test_full_index_rebuild_failure_preserves_previous_index(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "service.py").write_text("def calculate():\n    return 1\n", encoding="utf-8")
+    runtime = ProjectIndexRuntime(tmp_path)
+    initial = runtime.build_full_index(reason="initial")
+
+    def fail_extract(_files):
+        raise RuntimeError("extract failed")
+
+    runtime._extract_facts = fail_extract  # type: ignore[method-assign]
+    try:
+        runtime.build_full_index(reason="failing")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("index rebuild failure was swallowed")
+
+    assert runtime.store.load_summary().file_count == initial.file_count
+    assert runtime.store.files_by_path(["src/service.py"])

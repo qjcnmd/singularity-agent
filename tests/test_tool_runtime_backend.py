@@ -22,6 +22,10 @@ class EmptyInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def picklable_delegated_handler(_args: EmptyInput) -> dict[str, str]:
+    return {"ran": "handler"}
+
+
 def make_tool_call(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "id": f"call_{name}",
@@ -137,4 +141,34 @@ def test_delegated_backend_contract_does_not_require_legacy_boolean(tmp_path: Pa
     assert result.ok is False
     assert result.error_code == "delegated_backend_unavailable"
     assert called is False
+
+
+def test_delegated_backend_does_not_use_process_isolation(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="delegated_picklable_command",
+            description="delegated",
+            input_model=EmptyInput,
+            handler=picklable_delegated_handler,
+            permission_level=PermissionLevel.SHELL,
+            capabilities=(Capability.EXECUTE_COMMAND,),
+            operation=OperationKind.EXECUTE_COMMAND,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
+            uses_command_runtime=True,
+        )
+    )
+    runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.coding_agent(),
+        trace=TraceWriter.create(tmp_path),
+        workspace_root=tmp_path,
+        standalone_can_execute=True,
+        policy_runtime=runtime_default_policy_runtime(tmp_path),
+    )
+
+    result = runtime.execute_tool_call(make_tool_call("delegated_picklable_command"))
+
+    assert result.metadata["backend"] == "delegated_command_runtime"
+    assert result.metadata["handler_isolation"] == "thread"
 

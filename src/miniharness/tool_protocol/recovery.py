@@ -24,8 +24,14 @@ class ToolProtocolRecoveryManager:
     def __init__(self, store: ToolProtocolStateStore | Path) -> None:
         self.store = store if isinstance(store, ToolProtocolStateStore) else ToolProtocolStateStore(store)
 
-    def recover(self, *, run_id: str) -> ToolProtocolTurnResult:
-        batches = self._batches_for_run(run_id)
+    def recover(
+        self,
+        *,
+        run_id: str,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> ToolProtocolTurnResult:
+        batches = self._batches_for_run(run_id, session_id=session_id, task_id=task_id)
         pending_call_ids: list[str] = []
         running_call_ids: list[str] = []
         pending_approval_call_ids: list[str] = []
@@ -98,14 +104,25 @@ class ToolProtocolRecoveryManager:
         session_id: str | None = None,
         task_id: str | None = None,
     ) -> ToolProtocolRecoveryReport:
-        _ = session_id, task_id
-        return self._report_for_run(run_id or "")
+        return self._report_for_run(run_id or "", session_id=session_id, task_id=task_id)
 
-    def _report_for_run(self, run_id: str) -> ToolProtocolRecoveryReport:
-        return self._build_turn_result(run_id).recovery_report
+    def _report_for_run(
+        self,
+        run_id: str,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> ToolProtocolRecoveryReport:
+        return self._build_turn_result(run_id, session_id=session_id, task_id=task_id).recovery_report
 
-    def _build_turn_result(self, run_id: str) -> ToolProtocolTurnResult:
-        batches = self._batches_for_run(run_id)
+    def _build_turn_result(
+        self,
+        run_id: str,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> ToolProtocolTurnResult:
+        batches = self._batches_for_run(run_id, session_id=session_id, task_id=task_id)
         pending_call_ids: list[str] = []
         running_call_ids: list[str] = []
         pending_approval_call_ids: list[str] = []
@@ -171,10 +188,24 @@ class ToolProtocolRecoveryManager:
             recovery_report=report.to_dict(),
         )
 
-    def _batches_for_run(self, run_id: str) -> list[Any]:
+    def _batches_for_run(
+        self,
+        run_id: str,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[Any]:
+        clauses = ["run_id = ?"]
+        params: list[Any] = [run_id]
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
         rows = self.store.connection.execute(
-            "select * from tool_call_batches where run_id = ? order by created_at, batch_id",
-            (run_id,),
+            f"select * from tool_call_batches where {' and '.join(clauses)} order by created_at, batch_id",
+            tuple(params),
         ).fetchall()
         return [self.store._batch_from_row(row) for row in rows]
 

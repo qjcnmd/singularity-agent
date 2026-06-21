@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -308,13 +310,19 @@ class EvaluationTaskExecutor:
                 "error_code": "execution_disabled",
             }
         if hook.command:
-            result = self._run_command(hook.command, purpose=CommandPurpose.PROJECT_VERIFICATION)
+            command = _append_shell_args(hook.command, hook.args)
+            result = self._run_command(
+                command,
+                purpose=CommandPurpose.PROJECT_VERIFICATION,
+                timeout_seconds=hook.timeout_seconds,
+            )
             result.update({"name": hook.name, "stage": hook.stage, "args": hook.args})
             return result
         if hook.module:
             result = self._run_command(
-                f"python -m {hook.module}",
+                argv=["python", "-m", hook.module, *_hook_args_to_argv(hook.args)],
                 purpose=CommandPurpose.PROJECT_VERIFICATION,
+                timeout_seconds=hook.timeout_seconds,
             )
             result.update({"name": hook.name, "stage": hook.stage, "args": hook.args})
             return result
@@ -365,19 +373,22 @@ class EvaluationTaskExecutor:
 
     def _run_command(
         self,
-        command: str,
+        command: str | None = None,
         *,
         purpose: CommandPurpose,
+        timeout_seconds: int | None = None,
+        argv: list[str] | None = None,
     ) -> dict[str, Any]:
         if self.command_runtime is None:
             return {"status": "blocked", "error_code": "command_runtime_unavailable"}
         result = self.command_runtime.run(
             CommandRequest(
-                shell=command,
+                argv=argv,
+                shell=command if argv is None else None,
                 cwd=".",
                 purpose=purpose,
                 filesystem_mode=FilesystemMode.READ_WRITE_WORKSPACE,
-                timeout_seconds=120,
+                timeout_seconds=timeout_seconds or 120,
             )
         )
         return {
@@ -554,6 +565,32 @@ def _diff_summary(before: dict[str, str], after: dict[str, str]) -> list[dict[st
             }
         )
     return summary
+
+
+def _append_shell_args(command: str, args: dict[str, Any]) -> str:
+    argv = _hook_args_to_argv(args)
+    if not argv:
+        return command
+    if os.name == "nt":
+        return command + " " + subprocess.list2cmdline(argv)
+    return command + " " + " ".join(shlex.quote(item) for item in argv)
+
+
+def _hook_args_to_argv(args: dict[str, Any]) -> list[str]:
+    argv: list[str] = []
+    for key, value in args.items():
+        flag = "--" + str(key).replace("_", "-")
+        if value is None or value is False:
+            continue
+        if value is True:
+            argv.append(flag)
+            continue
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                argv.extend([flag, str(item)])
+            continue
+        argv.extend([flag, str(value)])
+    return argv
 
 
 def _patch_quality_proxy(diff_summary: list[dict[str, Any]], verification: dict[str, Any]) -> float:

@@ -79,6 +79,10 @@ class DefaultLocalPolicyRules:
         operation = request.operation
         capability = request.capability
 
+        disabled = _disabled_by_config(request, config)
+        if disabled is not None:
+            return disabled
+
         if RiskTag.SECRETS_EXFILTRATION in tags or (
             RiskTag.SECRET_ACCESS in tags and RiskTag.NETWORK in tags
         ):
@@ -178,6 +182,22 @@ class DefaultLocalPolicyRules:
                 DecisionOutcome.ALLOW,
                 "Plain local command allowed by compat security mode.",
                 "compat_local_command_allow",
+            )
+
+        if config.security_mode == SecurityMode.STRICT and _strict_command_requires_sandbox(request):
+            return RuleResult(
+                DecisionOutcome.SANDBOX_REQUIRED,
+                "Strict security mode requires command execution through an isolated sandbox.",
+                "strict_command_sandbox_required",
+                constraints=PolicyConstraints(
+                    sandbox_required=True,
+                    hard_isolation_required=True,
+                    filesystem_mode="copy_on_write_workspace",
+                    network_allowed=False,
+                    max_duration_seconds=request.metadata.get("timeout"),
+                    max_output_chars=request.metadata.get("max_output_chars"),
+                    env_redaction=True,
+                ),
             )
 
         if operation == OperationKind.VERIFICATION:
@@ -289,6 +309,53 @@ def _auto_safe_runtime_allow(request: PolicyRequest, risk: RiskAssessment) -> bo
     }
 
 
+def _disabled_by_config(
+    request: PolicyRequest,
+    config: PolicyConfig,
+) -> RuleResult | None:
+    operation = request.operation
+    capability = request.capability
+    if (
+        not config.allow_workspace_reads
+        and operation in {OperationKind.READ_FILE, OperationKind.LIST_DIRECTORY, OperationKind.SEARCH}
+        and capability in {Capability.READ_WORKSPACE, Capability.LIST_DIRECTORY}
+    ):
+        return RuleResult(DecisionOutcome.DENY, "Workspace reads are disabled by policy config.", "config_deny_workspace_read")
+    if (
+        not config.allow_workspace_mutation_with_review
+        and operation in {
+            OperationKind.MUTATE_FILE,
+            OperationKind.CREATE_FILE,
+            OperationKind.DELETE_FILE,
+            OperationKind.ROLLBACK,
+        }
+    ):
+        return RuleResult(DecisionOutcome.DENY, "Workspace mutation review is disabled by policy config.", "config_deny_workspace_mutation")
+    if (
+        not config.allow_command_with_review
+        and operation in {
+            OperationKind.EXECUTE_COMMAND,
+            OperationKind.EXECUTE_PROJECT_CODE,
+            OperationKind.START_LONG_PROCESS,
+            OperationKind.KILL_PROCESS,
+            OperationKind.VERIFICATION,
+        }
+    ):
+        return RuleResult(DecisionOutcome.DENY, "Command execution review is disabled by policy config.", "config_deny_command")
+    if (
+        not config.allow_network_with_review
+        and (
+            operation == OperationKind.NETWORK_ACCESS
+            or request.requires_network
+            or capability == Capability.NETWORK_ACCESS
+        )
+    ):
+        return RuleResult(DecisionOutcome.DENY, "Network access review is disabled by policy config.", "config_deny_network")
+    if not config.allow_package_install_with_review and operation == OperationKind.PACKAGE_INSTALL:
+        return RuleResult(DecisionOutcome.DENY, "Package install review is disabled by policy config.", "config_deny_package_install")
+    return None
+
+
 def _compat_local_command_allow(request: PolicyRequest, risk: RiskAssessment) -> bool:
     if request.runtime.value != "command":
         return False
@@ -323,6 +390,17 @@ def _compat_local_command_allow(request: PolicyRequest, risk: RiskAssessment) ->
     if request.operation != OperationKind.VERIFICATION:
         blocked_tags.add(RiskTag.EXECUTES_PROJECT_CODE)
     return not (set(risk.tags) & blocked_tags)
+
+
+def _strict_command_requires_sandbox(request: PolicyRequest) -> bool:
+    if request.runtime.value != "command":
+        return False
+    return request.operation in {
+        OperationKind.EXECUTE_COMMAND,
+        OperationKind.EXECUTE_PROJECT_CODE,
+        OperationKind.START_LONG_PROCESS,
+        OperationKind.VERIFICATION,
+    }
 
 
 def _review_kind(request: PolicyRequest) -> str:

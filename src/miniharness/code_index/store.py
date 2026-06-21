@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, TypeVar
+from typing import Any, Iterable, Iterator, TypeVar
 
 from miniharness.code_index.exceptions import IndexStoreError
 from miniharness.code_index.models import (
@@ -548,13 +549,18 @@ class ProjectIndexStore:
             rows = db.execute(sql, args).fetchall()
         return [_loads(row["payload_json"], cls) for row in rows]
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         try:
             db = sqlite3.connect(self.path)
             db.row_factory = sqlite3.Row
-            return db
         except sqlite3.Error as exc:
             raise IndexStoreError(str(exc), code="index_store_connect_failed") from exc
+        try:
+            yield db
+            db.commit()
+        finally:
+            db.close()
 
     def _init_schema(self) -> None:
         with self._connect() as db:

@@ -9,6 +9,7 @@ from miniharness.command import (
     FilesystemMode,
 )
 from miniharness.context import ContextManager
+from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
 from miniharness.tools.models import ToolResult
 from miniharness.tools.workspace_state import WorkspaceHealthInput, WorkspaceHealthToolHandlers
 from miniharness.trace import TraceWriter
@@ -131,7 +132,17 @@ def test_mutation_runtime_records_agent_owned_changes_in_state_journal_and_trace
 def test_command_runtime_records_side_effect_ownership_by_command_purpose(tmp_path: Path) -> None:
     state = LocalWorkspaceStateRuntime(tmp_path)
     state.begin_session(task_id="task_1")
-    runtime = CommandRuntime(tmp_path, state_runtime=state)
+    runtime = CommandRuntime(
+        tmp_path,
+        state_runtime=state,
+        policy_runtime=PolicyRuntime(
+            PolicyConfig(
+                workspace_root=tmp_path,
+                approval_mode=ApprovalMode.AUTO_SAFE,
+                security_mode=SecurityMode.COMPAT,
+            )
+        ),
+    )
 
     result = runtime.run(
         CommandRequest(

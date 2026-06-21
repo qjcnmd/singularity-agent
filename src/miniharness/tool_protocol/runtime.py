@@ -542,8 +542,14 @@ class ToolCallingProtocolRuntime:
         session_id: str | None = None,
         task_id: str | None = None,
     ) -> ToolProtocolTurnResult:
-        _ = context, session_id, task_id
-        return self.recovery_manager.recover(run_id=run_id or "")
+        resolved_run_id = run_id or (context.run_id if context is not None else "")
+        resolved_session_id = session_id or (context.session_id if context is not None else None)
+        resolved_task_id = task_id or (context.task_id if context is not None else None)
+        return self.recovery_manager.recover(
+            run_id=resolved_run_id,
+            session_id=resolved_session_id,
+            task_id=resolved_task_id,
+        )
 
     def _inject_workspace_state(
         self,

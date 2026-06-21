@@ -43,6 +43,30 @@ class ModelBudgetManager:
             raise ModelContextTooLong("Model context length exceeded.")
 
     @staticmethod
+    def check_response_budget(
+        usage: ModelUsage,
+        *,
+        budget: ModelBudget,
+        latency_ms: int | None = None,
+    ) -> None:
+        if budget.max_output_tokens is not None and usage.output_tokens > budget.max_output_tokens:
+            raise ModelBudgetExceeded("Model output token budget exceeded.")
+        if budget.max_total_tokens is not None and usage.total_tokens > budget.max_total_tokens:
+            raise ModelBudgetExceeded("Model total token budget exceeded.")
+        if (
+            budget.max_cost_estimate is not None
+            and usage.cost_estimate is not None
+            and usage.cost_estimate > budget.max_cost_estimate
+        ):
+            raise ModelBudgetExceeded("Model cost budget exceeded.")
+        if (
+            budget.max_latency_ms is not None
+            and latency_ms is not None
+            and latency_ms > budget.max_latency_ms
+        ):
+            raise ModelBudgetExceeded("Model latency budget exceeded.")
+
+    @staticmethod
     def merge_usage(*usages: ModelUsage) -> ModelUsage:
         cost_values = [usage.cost_estimate for usage in usages if usage.cost_estimate is not None]
         return ModelUsage(

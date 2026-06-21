@@ -145,6 +145,16 @@ class EmptyInput(BaseModel):
     pass
 
 
+class TimeoutWriteInput(BaseModel):
+    path: str
+
+
+def slow_process_write_handler(args: TimeoutWriteInput) -> str:
+    time.sleep(0.2)
+    Path(args.path).write_text("late", encoding="utf-8")
+    return "done"
+
+
 def test_runtime_timeout_returns_timeout_error(tmp_path: Path) -> None:
     def slow_handler(_args: EmptyInput) -> str:
         time.sleep(0.2)
@@ -211,7 +221,41 @@ def test_runtime_timeout_waits_for_started_in_process_handler_to_settle(tmp_path
 
     assert result.error_code == "timeout"
     assert time.perf_counter() - started >= 0.05
-    assert marker.read_text(encoding="utf-8") == "settled"
+    assert marker.exists()
+    assert result.metadata["timeout_untrusted_state"] is True
+
+
+def test_runtime_timeout_terminates_process_isolated_handler(tmp_path: Path) -> None:
+    marker = tmp_path / "late-process.txt"
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="slow_process_read",
+            version="0.0.1",
+            description="Slow process-isolated read.",
+            input_model=TimeoutWriteInput,
+            handler=slow_process_write_handler,
+            permission_level=PermissionLevel.READ_ONLY,
+            risk_tags=("read",),
+            timeout_seconds=0.01,
+        )
+    )
+    runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=TraceWriter.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
+    )
+
+    result = runtime.execute_tool_call(make_tool_call("slow_process_read", {"path": str(marker)}))
+    time.sleep(0.25)
+
+    assert result.error_code == "timeout"
+    assert marker.exists() is False
+    assert result.metadata["handler_isolation"] == "process"
+    assert result.metadata["timeout_terminated"] is True
+    assert result.metadata["timeout_untrusted_state"] is False
 
 
 def test_runtime_truncates_oversized_output_with_head_and_tail(tmp_path: Path) -> None:

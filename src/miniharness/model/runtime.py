@@ -296,6 +296,12 @@ class ModelRuntime:
                 capabilities=provider.capabilities(),
             )
             if not validation.valid:
+                latency_ms = _latency_ms(started)
+                self.budget_manager.check_response_budget(
+                    provider_response.usage,
+                    budget=request.budget,
+                    latency_ms=latency_ms,
+                )
                 event_ids.extend(
                     self._emit_output_rejected(request, provider_response, validation.errors)
                 )
@@ -310,7 +316,7 @@ class ModelRuntime:
                     validation=validation,
                     provider_name=provider.name(),
                     model_name=provider_response.model_name,
-                    latency_ms=_latency_ms(started),
+                    latency_ms=latency_ms,
                     trace_event_ids=event_ids,
                     raw_response_ref=self._write_raw_artifact(request, provider_response),
                 )
@@ -318,6 +324,12 @@ class ModelRuntime:
             event_ids.extend(self._emit_response_received(request, provider_response, raw_ref))
             for tool_call in tool_calls:
                 event_ids.extend(self._emit_tool_call(request, tool_call, provider))
+            latency_ms = _latency_ms(started)
+            self.budget_manager.check_response_budget(
+                provider_response.usage,
+                budget=request.budget,
+                latency_ms=latency_ms,
+            )
             result = ModelTurnResult(
                 request_id=request.request_id,
                 response_id=provider_response.response_id,
@@ -329,7 +341,7 @@ class ModelRuntime:
                 validation=validation,
                 provider_name=provider.name(),
                 model_name=provider_response.model_name,
-                latency_ms=_latency_ms(started),
+                latency_ms=latency_ms,
                 trace_event_ids=event_ids,
                 raw_response_ref=raw_ref,
             )
