@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://miniharness.local/schemas/memory-item.schema.json",
+  "title": "MiniHarness Memory Item",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "scope",
+    "type",
+    "source",
+    "title",
+    "body",
+    "confidence",
+    "status",
+    "provenance",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "scope": {
+      "type": "string",
+      "enum": ["session", "workspace", "project", "user_preference", "tool_runtime"]
+    },
+    "type": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "title": { "type": "string" },
+    "body": { "type": "string" },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "verified"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["candidate", "active", "quarantined", "rejected", "tombstoned", "expired"]
+    },
+    "conflict_status": {
+      "type": "string",
+      "enum": ["none", "conflicted", "manual_review_required", "superseded"]
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["evidence", "created_by"],
+      "properties": {
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["source", "ref_id", "summary"],
+            "properties": {
+              "source": { "type": "string" },
+              "ref_id": { "type": "string" },
+              "summary": { "type": "string" },
+              "event_id": { "type": ["string", "null"] },
+              "artifact_ref": { "type": ["string", "null"] },
+              "path": { "type": ["string", "null"] }
+            },
+            "additionalProperties": true
+          }
+        },
+        "created_by": { "type": "string" },
+        "source_run_id": { "type": ["string", "null"] },
+        "source_session_id": { "type": ["string", "null"] },
+        "source_task_id": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "ttl": { "type": "object" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "last_verified_at": { "type": ["string", "null"], "format": "date-time" },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "metadata": { "type": "object" }
+  },
+  "additionalProperties": true
+}

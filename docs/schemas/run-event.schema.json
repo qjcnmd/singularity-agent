@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://miniharness.local/schemas/run-event.schema.json",
+  "title": "MiniHarness Run Event",
+  "type": "object",
+  "required": [
+    "event_id",
+    "event_type",
+    "schema_version",
+    "run_id",
+    "runtime",
+    "severity",
+    "timestamp",
+    "sequence",
+    "summary",
+    "redaction_applied"
+  ],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "event_type": { "type": "string", "minLength": 1 },
+    "schema_version": { "type": "string", "const": "1.0" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": ["string", "null"] },
+    "task_id": { "type": ["string", "null"] },
+    "phase_id": { "type": ["string", "null"] },
+    "action_id": { "type": ["string", "null"] },
+    "runtime": { "type": "string", "minLength": 1 },
+    "severity": {
+      "type": "string",
+      "enum": ["debug", "info", "warning", "error", "critical"]
+    },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "summary": { "type": "string" },
+    "payload": { "type": "object" },
+    "artifact_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "redaction_applied": { "type": "boolean" }
+  },
+  "additionalProperties": true
+}

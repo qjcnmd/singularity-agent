@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://miniharness.local/schemas/session-state.schema.json",
+  "title": "MiniHarness Session State",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "session_id",
+    "run_id",
+    "task_id",
+    "status",
+    "created_at",
+    "components",
+    "workspace_state",
+    "next_action"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "session_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": "string", "minLength": 1 },
+    "status": {
+      "type": "string",
+      "enum": ["created", "active", "closing", "closed", "failed", "cancelled", "recovered"]
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": ["string", "null"], "format": "date-time" },
+    "components": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "enum": ["pending", "initialized", "ready", "failed", "stopped"]
+      }
+    },
+    "pending_approvals": {
+      "type": "array",
+      "items": { "$ref": "approval.schema.json" }
+    },
+    "workspace_state": { "type": "object" },
+    "recovery": { "type": "object" },
+    "last_sequence": { "type": "integer", "minimum": 0 },
+    "next_action": { "type": "string" }
+  },
+  "additionalProperties": true
+}

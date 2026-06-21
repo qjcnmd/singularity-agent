@@ -2,6 +2,21 @@
 
 MiniHarness is a production-grade local CLI coding agent harness. The v0.1.0 baseline aligns the CLI, agent orchestration, tool protocol, context ledger, local memory, policy enforcement, workspace state, verification, and trace layers behind one production path.
 
+v0.1.x is the CLI runtime baseline. The next architecture phase is Desktop Transition Runtime: a local RuntimeHost/daemon boundary around the existing Python runtime, not another round of CLI-only feature accumulation. The target product architecture is Rust Core + Tauri Desktop + TypeScript UI + Python Plugin Runtime, introduced in stages without deleting the current Python runtime.
+
+Documentation Runtime is the contract entrypoint for that transition:
+
+- `docs/architecture/runtime-map.md`
+- `docs/architecture/boundary-contracts.md`
+- `docs/architecture/state-model.md`
+- `docs/architecture/event-model.md`
+- `docs/architecture/tool-protocol.md`
+- `docs/architecture/policy-approval.md`
+- `docs/architecture/trace-audit.md`
+- `docs/architecture/migration-to-desktop.md`
+- `docs/adr/`
+- `docs/schemas/`
+
 The retained compatibility read tools are still available:
 
 - `list_files`
@@ -23,6 +38,39 @@ CLI
 -> WorkspaceStateRuntime
 -> Trace / Audit / FinalReport
 ```
+
+Runtime names tracked by Documentation Runtime:
+
+<!-- runtime-names:start -->
+- `CLI`
+- `KernelBootstrap`
+- `AgentKernel`
+- `MiniAgent`
+- `PlannerRuntime`
+- `ContextRuntime`
+- `InstructionRuntime`
+- `ModelRuntime`
+- `ToolCallingProtocolRuntime`
+- `ToolRuntime`
+- `ToolRegistry`
+- `PluginRuntime`
+- `PolicyRuntime`
+- `ApprovalGate`
+- `MutationRuntime`
+- `CommandRuntime`
+- `VerificationRuntime`
+- `SandboxRuntime`
+- `WorkspaceStateRuntime`
+- `TraceRuntime`
+- `Audit`
+- `MemoryRuntime`
+- `ProjectIndexRuntime`
+- `EditRuntime`
+- `ReviewRuntime`
+- `EvaluationRuntime`
+- `FinalReport`
+- `DocumentationRuntime`
+<!-- runtime-names:end -->
 
 MiniHarness does not implement a Git Runtime, web search, multi-agent execution, remote approval, or remote memory sync in this release. Sandbox execution prefers Docker as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps the local copy-on-write staging backend. Requests that require hard isolation fail closed when no capable backend is available.
 

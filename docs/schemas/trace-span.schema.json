@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://miniharness.local/schemas/trace-span.schema.json",
+  "title": "MiniHarness Trace Span",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "span_id",
+    "run_id",
+    "session_id",
+    "name",
+    "runtime",
+    "started_at",
+    "status"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "span_id": { "type": "string", "minLength": 1 },
+    "parent_span_id": { "type": ["string", "null"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": ["string", "null"] },
+    "phase_id": { "type": ["string", "null"] },
+    "action_id": { "type": ["string", "null"] },
+    "name": { "type": "string", "minLength": 1 },
+    "runtime": { "type": "string", "minLength": 1 },
+    "started_at": { "type": "string", "format": "date-time" },
+    "ended_at": { "type": ["string", "null"], "format": "date-time" },
+    "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "status": {
+      "type": "string",
+      "enum": ["running", "success", "failed", "cancelled", "timeout", "skipped", "blocked"]
+    },
+    "error_type": { "type": ["string", "null"] },
+    "error_message": { "type": ["string", "null"] },
+    "attributes": { "type": "object" },
+    "artifact_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": true
+}

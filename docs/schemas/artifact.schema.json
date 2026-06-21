@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://miniharness.local/schemas/artifact.schema.json",
+  "title": "MiniHarness Artifact",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "artifact_id",
+    "run_id",
+    "session_id",
+    "kind",
+    "size_bytes",
+    "sha256",
+    "content_type",
+    "redacted",
+    "sensitive",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "artifact_id": { "type": "string", "minLength": 1 },
+    "artifact_ref": { "type": ["string", "null"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": ["string", "null"] },
+    "kind": { "type": "string", "minLength": 1 },
+    "relative_handle": { "type": ["string", "null"] },
+    "size_bytes": { "type": "integer", "minimum": 0 },
+    "sha256": { "type": "string", "minLength": 1 },
+    "content_type": { "type": "string", "minLength": 1 },
+    "redacted": { "type": "boolean" },
+    "sensitive": { "type": "boolean" },
+    "summary": { "type": "string" },
+    "metadata": { "type": "object" }
+  },
+  "additionalProperties": true
+}
