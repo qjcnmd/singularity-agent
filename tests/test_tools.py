@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from miniharness.trace import TraceWriter
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.trace import TraceWriter
 from tests.tool_runtime_helpers import make_test_policy_runtime
 
 
@@ -40,7 +40,7 @@ def test_openai_tools_strict_schema_marks_functions_strict(tmp_path: Path) -> No
 
 def test_read_file_reads_project_file(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
-    readme.write_text("hello from miniharness", encoding="utf-8")
+    readme.write_text("hello from singularity", encoding="utf-8")
     registry = ToolRegistry(tmp_path)
     runtime = ToolRuntime(
         registry=registry,
@@ -57,7 +57,7 @@ def test_read_file_reads_project_file(tmp_path: Path) -> None:
 
     assert result["ok"] is True
     assert result["content"]["path"] == "README.md"
-    assert result["content"]["content"] == "hello from miniharness"
+    assert result["content"]["content"] == "hello from singularity"
     assert result["truncated"] is False
 
 

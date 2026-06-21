@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from miniharness.context import ObservationStore, ReferenceResolver
-from miniharness.context.models import ContextFreshness, ContextReference
+from singularity.context import ObservationStore, ReferenceResolver
+from singularity.context.models import ContextFreshness, ContextReference
 
 
 def test_reference_resolver_handles_file_transaction_policy_and_verification_refs(

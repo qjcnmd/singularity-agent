@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from miniharness.kernel.models import ShutdownReason
-from miniharness.kernel.shutdown import ShutdownManager
+from singularity.kernel.models import ShutdownReason
+from singularity.kernel.shutdown import ShutdownManager
 
 
 class Component:

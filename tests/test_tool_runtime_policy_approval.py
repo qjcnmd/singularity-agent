@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from miniharness.policy import (
+from singularity.policy import (
     ApprovalGate,
     ApprovalGrant,
     ApprovalMode,
@@ -15,9 +15,9 @@ from miniharness.policy import (
     PolicyRequest,
     RiskLevel,
 )
-from miniharness.interaction import InteractionRuntime, UserDecision
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
-from miniharness.trace import TraceWriter
+from singularity.interaction import InteractionRuntime, UserDecision
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
+from singularity.trace import TraceWriter
 
 
 class EmptyInput(BaseModel):

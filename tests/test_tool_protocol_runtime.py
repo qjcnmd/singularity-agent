@@ -6,8 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from miniharness.context import ContextManager
-from miniharness.model import (
+from singularity.context import ContextManager
+from singularity.model import (
     ModelMessage,
     ModelPurpose,
     ModelRuntime,
@@ -18,17 +18,17 @@ from miniharness.model import (
     ModelToolParseStatus,
     MockModelProvider,
 )
-from miniharness.tool_protocol.models import ToolProtocolTurnStatus
-from miniharness.tool_protocol.models import ToolCallFailureKind, ToolCallPhase
-from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
-from miniharness.tool_protocol.state import ToolProtocolStateStore
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from miniharness.tools.command import register_command_tools
-from miniharness.tools.models import PermissionLevel, ToolExecutionFailure, ToolSideEffectKind, ToolSpec
-from miniharness.trace import TraceWriter
+from singularity.tool_protocol.models import ToolProtocolTurnStatus
+from singularity.tool_protocol.models import ToolCallFailureKind, ToolCallPhase
+from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
+from singularity.tool_protocol.state import ToolProtocolStateStore
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.tools.command import register_command_tools
+from singularity.tools.models import PermissionLevel, ToolExecutionFailure, ToolSideEffectKind, ToolSpec
+from singularity.trace import TraceWriter
 from tests.tool_runtime_helpers import make_test_policy_runtime
 from tests.test_tool_runtime_policy_approval import SequencedPolicyRuntime
-from miniharness.policy import DecisionOutcome
+from singularity.policy import DecisionOutcome
 
 
 def _make_request(tmp_path: Path) -> tuple[ModelTurnRequest, ContextManager]:
@@ -95,7 +95,7 @@ def _tool_result(call: ModelToolCall, *, response_id: str = "resp_tool") -> Mode
 
 def test_protocol_runtime_executes_tool_call_and_appends_tool_message(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
-    readme.write_text("MiniHarness README content", encoding="utf-8")
+    readme.write_text("Singularity README content", encoding="utf-8")
     request, context = _make_request(tmp_path)
     response = ModelTurnResult(
         request_id=request.request_id,
@@ -131,7 +131,7 @@ def test_protocol_runtime_executes_tool_call_and_appends_tool_message(tmp_path: 
     assert payload["tool_call_id"] == "call_readme"
     assert payload["tool_name"] == "read_file"
     assert payload["ok"] is True
-    assert "MiniHarness README content" in payload["content_preview"]
+    assert "Singularity README content" in payload["content_preview"]
     assert context.tool_observations[-1].turn == 1
 
 

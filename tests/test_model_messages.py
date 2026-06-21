@@ -1,4 +1,4 @@
-from miniharness.model import (
+from singularity.model import (
     ChatProviderModelProvider,
     ContentBlock,
     ContentBlockType,
@@ -8,7 +8,7 @@ from miniharness.model import (
     ProviderRequest,
     ModelRole,
 )
-from miniharness.model.providers import _model_messages_to_openai
+from singularity.model.providers import _model_messages_to_openai
 
 
 def test_message_converter_preserves_tool_call_id_and_developer_fallback() -> None:

@@ -4,13 +4,13 @@ Status: Accepted
 
 ## Context
 
-MiniHarness is a production-grade local coding agent harness. It operates on a user's workspace, may execute commands, may mutate files, and stores trace, context, protocol, policy, workspace state, and memory locally.
+Singularity is a production-grade local coding agent runtime. It operates on a user's workspace, may execute commands, may mutate files, and stores trace, context, protocol, policy, workspace state, and memory locally.
 
 Future desktop work should not turn the product into a remote-control cloud agent by accident.
 
 ## Decision
 
-MiniHarness is local-first:
+Singularity is local-first:
 
 - runtime state is local by default
 - approvals are local by default

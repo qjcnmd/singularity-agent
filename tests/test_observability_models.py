@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from miniharness.observability.models import (
+from singularity.observability.models import (
     TraceArtifact,
     TraceArtifactKind,
     TraceEvent,
@@ -13,7 +13,7 @@ from miniharness.observability.models import (
     TraceStatus,
     TraceSummary,
 )
-from miniharness.sandbox.models import SandboxArtifact
+from singularity.sandbox.models import SandboxArtifact
 
 
 def test_trace_models_round_trip_with_stable_serialization() -> None:

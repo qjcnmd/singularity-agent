@@ -3,8 +3,8 @@ from typing import Any
 import httpx
 import pytest
 
-from miniharness.config import Settings
-from miniharness.provider import OpenAICompatibleProvider, ToolChoiceMode
+from singularity.config import Settings
+from singularity.provider import OpenAICompatibleProvider, ToolChoiceMode
 
 
 class FakeResponse:
@@ -77,7 +77,7 @@ def test_provider_chat_passes_tool_choice(
     expected: str,
 ) -> None:
     FakeClient.payloads = []
-    monkeypatch.setattr("miniharness.provider.httpx.Client", FakeClient)
+    monkeypatch.setattr("singularity.provider.httpx.Client", FakeClient)
     provider = OpenAICompatibleProvider(
         Settings(
             base_url="https://example.test/v1",
@@ -95,7 +95,7 @@ def test_provider_http_error_does_not_echo_response_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     FakeErrorClient.payloads = []
-    monkeypatch.setattr("miniharness.provider.httpx.Client", FakeErrorClient)
+    monkeypatch.setattr("singularity.provider.httpx.Client", FakeErrorClient)
     provider = OpenAICompatibleProvider(
         Settings(
             base_url="https://example.test/v1",

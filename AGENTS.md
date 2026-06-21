@@ -1,4 +1,4 @@
-# Harness Agent Instructions
+# Singularity Agent Instructions
 
 ## Repo Map First
 
@@ -29,7 +29,7 @@ When source files are added, removed, or renamed, refresh the repo map locally b
 Do not read these paths unless the task specifically concerns runtime state, caches, artifacts, or environment setup:
 
 - `.git/`
-- `.miniharness/`
+- `.singularity/`
 - `.venv/`
 - `.pytest_cache/`
 - `.ruff_cache/`

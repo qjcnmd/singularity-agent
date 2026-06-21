@@ -2,12 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.interaction import (
+from singularity.interaction import (
     InteractionMode,
     InteractionRuntime,
     UserDecision,
 )
-from miniharness.policy import (
+from singularity.policy import (
     ApprovalGate,
     ApprovalMode,
     ApprovalRequired,
@@ -78,7 +78,7 @@ def test_interactive_approve_once_generates_single_use_grant(tmp_path: Path) -> 
 
 
 def test_interactive_reject_raises_approval_denied(tmp_path: Path) -> None:
-    from miniharness.policy import ApprovalDenied
+    from singularity.policy import ApprovalDenied
 
     request, decision = review_decision(tmp_path)
     interaction = InteractionRuntime(provider=FakeProvider("reject"))
@@ -91,7 +91,7 @@ def test_interactive_reject_raises_approval_denied(tmp_path: Path) -> None:
 
 
 def test_interactive_revise_raises_policy_ask_user(tmp_path: Path) -> None:
-    from miniharness.policy import PolicyAskUserRequired
+    from singularity.policy import PolicyAskUserRequired
 
     request, decision = review_decision(tmp_path)
     interaction = InteractionRuntime(provider=FakeProvider("revise"))
@@ -104,7 +104,7 @@ def test_interactive_revise_raises_policy_ask_user(tmp_path: Path) -> None:
 
 
 def test_interactive_abort_raises_approval_denied(tmp_path: Path) -> None:
-    from miniharness.policy import ApprovalDenied
+    from singularity.policy import ApprovalDenied
 
     request, decision = review_decision(tmp_path)
     interaction = InteractionRuntime(provider=FakeProvider("abort"))

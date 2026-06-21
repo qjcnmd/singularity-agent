@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from miniharness.model import MockModelProvider, ModelRuntime
-from miniharness.planner import PlannerRuntime
-from miniharness.tools import ToolRegistry
+from singularity.model import MockModelProvider, ModelRuntime
+from singularity.planner import PlannerRuntime
+from singularity.tools import ToolRegistry
 from tests.agent_runtime_helpers import make_agent_session
 
 

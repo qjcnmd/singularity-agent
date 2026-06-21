@@ -1,7 +1,7 @@
 [project]
-name = "miniharness"
+name = "singularity-agent"
 version = "0.1.0"
-description = "A production-grade local CLI coding agent harness."
+description = "A production-grade local coding agent runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -37,13 +37,14 @@ release = [
 ]
 
 [project.scripts]
-miniharness = "miniharness.cli:main"
+singularity-agent = "singularity.cli:main"
+sg = "singularity.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = [
     ".git",
-    ".miniharness",
+    ".singularity",
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
@@ -53,6 +54,9 @@ norecursedirs = [
     "outputs",
     "work",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/singularity"]
 
 [build-system]
 requires = ["hatchling", "editables>=0.5"]

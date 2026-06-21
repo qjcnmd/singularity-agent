@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miniharness.kernel.recovery import CrashRecoveryManager
+from singularity.kernel.recovery import CrashRecoveryManager
 
 
 class TraceStore:
@@ -66,7 +66,7 @@ class Command:
 
 
 def test_crash_recovery_collects_and_cleans_mutation_sandbox_and_process_records(tmp_path: Path) -> None:
-    journal = tmp_path / ".miniharness" / "journals" / "tx_journal" / "journal.jsonl"
+    journal = tmp_path / ".singularity" / "journals" / "tx_journal" / "journal.jsonl"
     journal.parent.mkdir(parents=True)
     journal.write_text('{"transaction_id":"tx_journal"}\n', encoding="utf-8")
     sandbox_root = tmp_path / "work" / "sandboxes" / "sandbox_leftover"

@@ -5,8 +5,8 @@ import inspect
 from pathlib import Path
 from typing import Any
 
-from miniharness.agent import MiniAgent
-from miniharness.trace import TraceWriter
+from singularity.agent import SingularityAgent
+from singularity.trace import TraceWriter
 from tests.agent_runtime_helpers import make_agent_session
 
 
@@ -24,7 +24,7 @@ class MockProvider:
 
 def test_agent_delegates_tool_call_processing_to_protocol_runtime(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
-    readme.write_text("MiniHarness README content", encoding="utf-8")
+    readme.write_text("Singularity README content", encoding="utf-8")
     provider = MockProvider(
         {
             "choices": [
@@ -129,7 +129,7 @@ def test_agent_delegates_tool_call_processing_to_protocol_runtime(tmp_path: Path
 
 
 def test_agent_run_does_not_manually_loop_tool_calls() -> None:
-    source = inspect.getsource(MiniAgent.run)
+    source = inspect.getsource(SingularityAgent.run)
 
     assert "for tool_call in tool_calls" not in source
     assert ".execute_tool_call(tool_call)" not in source

@@ -1,4 +1,4 @@
-from miniharness.model import (
+from singularity.model import (
     ModelError,
     ModelErrorKind,
     ModelRetryController,

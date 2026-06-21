@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from miniharness.trace import TraceWriter
+from singularity.trace import TraceWriter
 
 
 def test_trace_writer_creates_jsonl_trace(tmp_path: Path) -> None:
@@ -10,7 +10,7 @@ def test_trace_writer_creates_jsonl_trace(tmp_path: Path) -> None:
     trace.record("user_goal", {"goal": "learn the loop"})
     trace.record("final_answer", {"content": "done"})
 
-    assert trace.path.parent == tmp_path / ".miniharness" / "runs"
+    assert trace.path.parent == tmp_path / ".singularity" / "runs"
     assert trace.path.exists()
 
     lines = trace.path.read_text(encoding="utf-8").splitlines()

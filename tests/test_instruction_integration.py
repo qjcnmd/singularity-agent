@@ -1,17 +1,17 @@
 from pathlib import Path
 
-from miniharness.context import ContextManager
-from miniharness.instructions import InstructionRuntime
-from miniharness.model import (
+from singularity.context import ContextManager
+from singularity.instructions import InstructionRuntime
+from singularity.model import (
     ModelCapabilities,
     MockModelProvider,
     ModelPurpose,
     ModelRuntime,
     ModelTurnStatus,
 )
-from miniharness.observability import TraceRuntime
-from miniharness.planner import PlannerRuntime, TaskStatus
-from miniharness.tools import ToolRegistry
+from singularity.observability import TraceRuntime
+from singularity.planner import PlannerRuntime, TaskStatus
+from singularity.tools import ToolRegistry
 
 
 def test_model_runtime_build_request_uses_instruction_runtime_bundle(tmp_path: Path) -> None:

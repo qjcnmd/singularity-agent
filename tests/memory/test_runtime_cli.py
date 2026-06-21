@@ -4,8 +4,8 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from miniharness.cli import app
-from miniharness.memory.models import (
+from singularity.cli import app
+from singularity.memory.models import (
     MemoryCandidate,
     MemoryEvidenceRef,
     MemoryScope,
@@ -13,8 +13,8 @@ from miniharness.memory.models import (
     MemoryType,
     Provenance,
 )
-from miniharness.memory.runtime import MemoryRuntime
-from miniharness.memory.store import MemoryStore
+from singularity.memory.runtime import MemoryRuntime
+from singularity.memory.store import MemoryStore
 
 
 runner = CliRunner()
@@ -49,8 +49,8 @@ def test_runtime_start_session_ingests_candidates_and_retrieves_context(tmp_path
 
 
 def test_runtime_loads_human_memory_and_path_scoped_rules(tmp_path: Path) -> None:
-    memory_root = tmp_path / ".miniharness" / "memory" / "human"
-    rules_root = tmp_path / ".miniharness" / "rules"
+    memory_root = tmp_path / ".singularity" / "memory" / "human"
+    rules_root = tmp_path / ".singularity" / "rules"
     memory_root.mkdir(parents=True)
     rules_root.mkdir(parents=True)
     memory_root.joinpath("commands.md").write_text(
@@ -77,7 +77,7 @@ def test_runtime_loads_human_memory_and_path_scoped_rules(tmp_path: Path) -> Non
     )
     unmatched = runtime.context_block(
         goal="pytest memory policy",
-        paths=["src/miniharness/agent.py"],
+        paths=["src/singularity/agent.py"],
         max_items=5,
         token_budget=120,
     )
@@ -109,7 +109,7 @@ def test_cli_memory_commands_cover_candidate_lifecycle(monkeypatch, tmp_path: Pa
         type=MemoryType.LESSON,
         source=MemorySource.USER,
         title="CLI lesson",
-        body="Use miniharness memory doctor locally.",
+        body="Use singularity memory doctor locally.",
         provenance=Provenance(
             evidence=[
                 MemoryEvidenceRef(
@@ -138,7 +138,7 @@ def test_cli_memory_commands_cover_candidate_lifecycle(monkeypatch, tmp_path: Pa
     assert "accepted" in accept.output
     assert "CLI lesson" in listed.output
     assert "CLI lesson" in searched.output
-    assert "Use miniharness memory doctor locally." in shown.output
+    assert "Use singularity memory doctor locally." in shown.output
     assert doctor.exit_code == 0
     assert "ok" in doctor.output
     assert deleted.exit_code == 0
@@ -162,7 +162,7 @@ def test_cli_read_only_memory_commands_do_not_rebuild_index(
             type=MemoryType.LESSON,
             source=MemorySource.USER,
             title="Read-only lesson",
-            body="Use miniharness memory list for local inspection.",
+            body="Use singularity memory list for local inspection.",
             provenance=Provenance(
                 evidence=[
                     MemoryEvidenceRef(

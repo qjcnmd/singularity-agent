@@ -1,7 +1,7 @@
 import pytest
 
-from miniharness.context.assembler import ContextAssembler, ContextOverflowError
-from miniharness.context.models import (
+from singularity.context.assembler import ContextAssembler, ContextOverflowError
+from singularity.context.models import (
     ContextAuthority,
     ContextItem,
     ContextItemType,
@@ -9,7 +9,7 @@ from miniharness.context.models import (
     ContextRuntime,
     ContextSensitivity,
 )
-from miniharness.context.tokens import TokenCounter
+from singularity.context.tokens import TokenCounter
 
 
 def system_item(text: str) -> ContextItem:

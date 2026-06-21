@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 
-from miniharness.diagnostics import DoctorEngine, RepairEngine
-from miniharness.release.init import initialize_runtime
-from miniharness.release.models import atomic_write_json
-from miniharness.release.paths import resolve_runtime_paths
+from singularity.diagnostics import DoctorEngine, RepairEngine
+from singularity.release.init import initialize_runtime
+from singularity.release.models import atomic_write_json
+from singularity.release.paths import resolve_runtime_paths
 
 
 def test_repair_dry_run_does_not_create_runtime_files(tmp_path):
@@ -38,7 +38,7 @@ def test_repair_apply_creates_missing_dirs_and_audit_log(tmp_path):
 def test_unfiltered_repair_apply_does_not_create_workspace_suggestions(tmp_path):
     paths = resolve_runtime_paths(home=tmp_path / "runtime")
     initialize_runtime(paths)
-    workspace_state = tmp_path / ".miniharness"
+    workspace_state = tmp_path / ".singularity"
 
     result = DoctorEngine.default().run(paths=paths, project_root=tmp_path)
     plan = RepairEngine().run(result, paths=paths, project_root=tmp_path, apply=True)
@@ -64,7 +64,7 @@ def test_repair_apply_fills_missing_config_fields_without_overwriting_custom(tmp
     assert plan.applied is True
     assert config["runtime"]["mode"] == "custom"
     assert config["policy"]["approval_mode"] == "auto_safe"
-    assert config["provider"]["api_key_env"] == "MINIHARNESS_API_KEY"
+    assert config["provider"]["api_key_env"] == "SINGULARITY_API_KEY"
 
 
 def test_repair_apply_rebuilds_missing_trace_index(tmp_path):
@@ -83,7 +83,7 @@ def test_repair_apply_rebuilds_missing_trace_index(tmp_path):
 def test_repair_does_not_delete_broken_user_data(tmp_path):
     paths = resolve_runtime_paths(home=tmp_path / "runtime")
     initialize_runtime(paths)
-    broken_memory = tmp_path / ".miniharness" / "memory" / "auto" / "entries.jsonl"
+    broken_memory = tmp_path / ".singularity" / "memory" / "auto" / "entries.jsonl"
     broken_trace = paths.traces_dir / "run_1" / "events.jsonl"
     broken_eval = paths.eval_dir / "report.json"
     for path in (broken_memory, broken_trace, broken_eval):

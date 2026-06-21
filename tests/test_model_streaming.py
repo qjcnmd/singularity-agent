@@ -1,4 +1,4 @@
-from miniharness.model import (
+from singularity.model import (
     ModelToolParseStatus,
     ProviderStreamEvent,
     ProviderStreamEventType,
@@ -10,8 +10,8 @@ from miniharness.model import (
     ToolChoicePolicy,
     ToolChoiceMode,
 )
-from miniharness.tools import ToolRegistry
-from miniharness.observability import TraceRuntime
+from singularity.tools import ToolRegistry
+from singularity.observability import TraceRuntime
 
 
 def test_streaming_accumulator_buffers_text_and_tool_calls_without_executing() -> None:

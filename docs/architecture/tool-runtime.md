@@ -1,6 +1,6 @@
 # Tool Runtime Architecture
 
-Miniharness v0.0.16 makes the tool layer a production boundary without rewriting the agent loop or context manager. The model still proposes OpenAI-style `tool_calls`; `agent.py` still forwards each call to `ToolRuntime.execute_tool_call`; `ContextManager` still stores the returned `ToolResult` as an observation.
+Singularity v0.0.16 makes the tool layer a production boundary without rewriting the agent loop or context manager. The model still proposes OpenAI-style `tool_calls`; `agent.py` still forwards each call to `ToolRuntime.execute_tool_call`; `ContextManager` still stores the returned `ToolResult` as an observation.
 
 ## Contract
 

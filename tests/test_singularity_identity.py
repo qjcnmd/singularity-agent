@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+import importlib
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_singularity_package_and_cli_module_are_primary_identity() -> None:
+    module = importlib.import_module("singularity")
+    assert module.__name__ == "singularity"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "singularity.cli", "--help"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "Singularity" in result.stdout
+
+
+def test_pyproject_exposes_only_singularity_console_scripts() -> None:
+    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert data["project"]["name"] == "singularity-agent"
+    assert data["project"]["scripts"] == {
+        "singularity-agent": "singularity.cli:main",
+        "sg": "singularity.cli:main",
+    }
+
+
+def test_tracked_files_do_not_use_retired_project_identity() -> None:
+    retired_terms = [bytes.fromhex(value).decode("ascii") for value in [
+        "4d696e694861726e657373",
+        "4d696e696861726e657373",
+        "6d696e696861726e657373",
+        "4d494e494841524e455353",
+        "2e6d696e696861726e657373",
+        "4d696e694167656e74",
+        "6d696e696167656e74",
+        "782d6d696e696861726e657373",
+        "5f6d696e696861726e657373",
+    ]]
+    files = subprocess.run(
+        ["git", "ls-files", "README.md", "pyproject.toml", "src", "tests", "docs"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.splitlines()
+
+    offenders: list[str] = []
+    for name in files:
+        path = ROOT / name
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for term in retired_terms:
+            if term in text:
+                offenders.append(f"{name}: {term}")
+
+    assert offenders == []

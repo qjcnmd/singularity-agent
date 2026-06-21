@@ -13,7 +13,7 @@ CLI is a client of the runtime, not the core.
 The core runtime boundary is:
 
 ```text
-RuntimeHost -> KernelBootstrap -> AgentKernel -> RuntimeGraph -> MiniAgent
+RuntimeHost -> KernelBootstrap -> AgentKernel -> RuntimeGraph -> SingularityAgent
 ```
 
 CLI may:

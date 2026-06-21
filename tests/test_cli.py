@@ -3,9 +3,9 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from miniharness.cli import app
-from miniharness.cli import create_or_resume_planner, workspace_health_summary
-from miniharness.evaluation import (
+from singularity.cli import app
+from singularity.cli import create_or_resume_planner, workspace_health_summary
+from singularity.evaluation import (
     BenchmarkTask,
     ExpectedOutcome,
     ExpectedOutcomeKind,
@@ -13,12 +13,12 @@ from miniharness.evaluation import (
     WorkspaceSnapshot,
     WorkspaceSnapshotKind,
 )
-from miniharness.observability import TraceEventType, TraceRuntime
-from miniharness.kernel import CancellationError
-from miniharness.kernel.finalization import FinalReport
-from miniharness.kernel.models import RunStatus
-from miniharness.planner import PlannerRuntime, TaskStatus
-from miniharness.workspace_state import WorkspaceHealthReport, WorkspaceHealthStatus
+from singularity.observability import TraceEventType, TraceRuntime
+from singularity.kernel import CancellationError
+from singularity.kernel.finalization import FinalReport
+from singularity.kernel.models import RunStatus
+from singularity.planner import PlannerRuntime, TaskStatus
+from singularity.workspace_state import WorkspaceHealthReport, WorkspaceHealthStatus
 
 
 runner = CliRunner()
@@ -149,7 +149,7 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
             return FakeKernel()
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("miniharness.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
 
     result = runner.invoke(app, ["hello", "--dry-run"])
 
@@ -220,7 +220,7 @@ def test_cli_converts_kernel_cancellation_to_exit(monkeypatch, tmp_path: Path) -
             return FakeKernel()
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("miniharness.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
 
     result = runner.invoke(app, ["main", "hello", "--dry-run"])
 
@@ -262,7 +262,7 @@ def test_cli_eval_task_validate_and_list_filter_tags(tmp_path: Path) -> None:
 
 def test_cli_plugin_lifecycle_json_does_not_import_disabled_plugin(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    plugin_dir = tmp_path / ".miniharness" / "plugins" / "cli_plugin"
+    plugin_dir = tmp_path / ".singularity" / "plugins" / "cli_plugin"
     plugin_dir.mkdir(parents=True)
     sentinel = tmp_path / "imported.txt"
     _write_plugin_manifest(plugin_dir)
@@ -361,7 +361,7 @@ def _write_cli_trace(root: Path) -> Path:
     return trace.store.run_dir
 
 
-def test_cli_eval_suite_run_writes_report_without_miniharness_state(tmp_path: Path, monkeypatch) -> None:
+def test_cli_eval_suite_run_writes_report_without_singularity_state(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     task_set = tmp_path / "golden.json"
     output_dir = tmp_path / "evals"
@@ -385,7 +385,7 @@ def test_cli_eval_suite_run_writes_report_without_miniharness_state(tmp_path: Pa
     assert result.exit_code == 0
     assert (output_dir / "suite_cli" / "report.json").exists()
     assert (output_dir / "suite_cli" / "report.md").exists()
-    assert not (tmp_path / ".miniharness").exists()
+    assert not (tmp_path / ".singularity").exists()
     payload = json.loads((output_dir / "suite_cli" / "report.json").read_text(encoding="utf-8"))
     assert payload["run_id"] == "suite_cli"
     assert payload["profile_reports"][0]["task_results"][0]["runtime_overrides"]["model"] == "default"

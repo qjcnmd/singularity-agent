@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from miniharness.review import (
+from singularity.review import (
     ReviewCategory,
     ReviewDecision,
     ReviewDecisionAction,

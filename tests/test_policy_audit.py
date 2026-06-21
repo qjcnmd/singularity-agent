@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from miniharness.policy import (
+from singularity.policy import (
     Capability,
     DecisionOutcome,
     OperationKind,

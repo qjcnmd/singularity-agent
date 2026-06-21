@@ -1,5 +1,5 @@
-from miniharness.context import ContextManager
-from miniharness.memory.models import MemoryContextBlock
+from singularity.context import ContextManager
+from singularity.memory.models import MemoryContextBlock
 
 
 def test_context_manager_initializes_system_and_user_messages() -> None:

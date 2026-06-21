@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from miniharness.policy import Capability, OperationKind
-from miniharness.tools import (
+from singularity.policy import Capability, OperationKind
+from singularity.tools import (
     PermissionLevel,
     ToolExecutionBackendKind,
     ToolRegistry,
@@ -200,6 +200,6 @@ def test_openai_schema_includes_safe_metadata(tmp_path: Path) -> None:
 
     tool = registry.to_openai_tools(strict=True)[0]["function"]
 
-    assert tool["x-miniharness-tool-version"] == "1.2.3"
-    assert tool["x-miniharness-capabilities"] == ["READ_WORKSPACE"]
+    assert tool["x-singularity-tool-version"] == "1.2.3"
+    assert tool["x-singularity-capabilities"] == ["READ_WORKSPACE"]
     assert "policy" not in tool

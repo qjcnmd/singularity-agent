@@ -2,7 +2,7 @@ import json
 import sys
 from pathlib import Path
 
-from miniharness.command import (
+from singularity.command import (
     CommandDecision,
     CommandPolicy,
     CommandPolicyResult,
@@ -11,13 +11,13 @@ from miniharness.command import (
     ExecutionStatus,
     SemanticStatus,
 )
-from miniharness.command.models import CommandResult
-from miniharness.context import ContextManager
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from miniharness.tools.command import register_command_tools
-from miniharness.tools.verification import register_verification_tools
-from miniharness.trace import TraceWriter
-from miniharness.verification import (
+from singularity.command.models import CommandResult
+from singularity.context import ContextManager
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.tools.command import register_command_tools
+from singularity.tools.verification import register_verification_tools
+from singularity.trace import TraceWriter
+from singularity.verification import (
     CheckKind,
     CheckStatus,
     CommandDiscovery,
@@ -34,8 +34,8 @@ from miniharness.verification import (
     VerificationRuntime,
     WorkspaceKind,
 )
-from miniharness.review import ReviewRuntime
-from miniharness.verification.models import DiscoveredCommand, VerificationCheck, VerificationPlan
+from singularity.review import ReviewRuntime
+from singularity.verification.models import DiscoveredCommand, VerificationCheck, VerificationPlan
 from tests.tool_runtime_helpers import runtime_default_policy_runtime
 
 
@@ -197,7 +197,7 @@ def test_impact_analysis_handles_docs_source_and_high_risk_files(tmp_path: Path)
         project_profile=profile,
     )
     source = analyzer.analyze(
-        changed_files=["src/miniharness/app.py"],
+        changed_files=["src/singularity/app.py"],
         task_intent="code",
         project_profile=profile,
     )
@@ -527,7 +527,7 @@ def test_repair_budget_blocks_repeated_same_failure() -> None:
         "duration_ms": 1,
         "attempts": [],
     }
-    from miniharness.verification.models import VerificationEvidence, VerificationResult
+    from singularity.verification.models import VerificationEvidence, VerificationResult
 
     model = VerificationResult(
         check_id=result["check_id"],

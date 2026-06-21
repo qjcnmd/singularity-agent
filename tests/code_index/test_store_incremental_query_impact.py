@@ -1,19 +1,19 @@
 from pathlib import Path
 
-from miniharness.code_index import (
+from singularity.code_index import (
     ContextCandidate,
     ProjectIndexRuntime,
     ProjectIndexStore,
     WorkspaceScanner,
 )
-from miniharness.code_index.models import Evidence, FreshnessStatus, SymbolKind, SymbolRecord
+from singularity.code_index.models import Evidence, FreshnessStatus, SymbolKind, SymbolRecord
 
 
 def test_store_upsert_query_stale_and_delete(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_text("def main(): pass\n", encoding="utf-8")
     record = WorkspaceScanner(tmp_path).scan()[0]
-    store = ProjectIndexStore(tmp_path / ".miniharness" / "index.sqlite")
+    store = ProjectIndexStore(tmp_path / ".singularity" / "index.sqlite")
     store.upsert_files([record])
     store.upsert_symbols(
         [

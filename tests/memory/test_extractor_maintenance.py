@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from miniharness.memory.extractor import MemoryExtractor
-from miniharness.memory.maintenance import MemoryMaintenance
-from miniharness.memory.models import (
+from singularity.memory.extractor import MemoryExtractor
+from singularity.memory.maintenance import MemoryMaintenance
+from singularity.memory.models import (
     ConflictStatus,
     MemoryEntry,
     MemoryEvidenceRef,
@@ -16,8 +16,8 @@ from miniharness.memory.models import (
     Provenance,
     TTL,
 )
-from miniharness.memory.store import MemoryStore
-from miniharness.review import (
+from singularity.memory.store import MemoryStore
+from singularity.review import (
     ReviewCategory,
     ReviewFinding,
     ReviewReport,
@@ -44,7 +44,7 @@ def test_extractor_handles_trace_final_report_review_verification_and_rollback()
         {
             "user_goal": "Implement memory",
             "verification_summary": {"status": "ready", "passed_checks": ["pytest"]},
-            "files_changed": ["src/miniharness/memory/runtime.py"],
+            "files_changed": ["src/singularity/memory/runtime.py"],
         }
     )
     review_candidates = extractor.from_review_report(
@@ -78,8 +78,8 @@ def test_extractor_handles_trace_final_report_review_verification_and_rollback()
         {
             "rollback_id": "rollback_1",
             "error_code": "patch_conflict",
-            "message": "Rollback required because patch conflict touched src/miniharness/memory/store.py",
-            "conflicts": ["src/miniharness/memory/store.py"],
+            "message": "Rollback required because patch conflict touched src/singularity/memory/store.py",
+            "conflicts": ["src/singularity/memory/store.py"],
         }
     )
 

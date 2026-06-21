@@ -1,16 +1,16 @@
 # Runtime Kernel / Session Lifecycle Runtime
 
-MiniHarness now has a runtime kernel layer in `src/miniharness/kernel/`. The kernel is the process-level control plane: it owns boot, runtime graph assembly, run/session lifecycle, workspace locking, cancellation, shutdown, crash recovery, health checks, and final report aggregation. PlannerRuntime remains focused on task planning and completion evidence; it no longer owns system lifecycle.
+Singularity now has a runtime kernel layer in `src/singularity/kernel/`. The kernel is the process-level control plane: it owns boot, runtime graph assembly, run/session lifecycle, workspace locking, cancellation, shutdown, crash recovery, health checks, and final report aggregation. PlannerRuntime remains focused on task planning and completion evidence; it no longer owns system lifecycle.
 
 ## CLI Entry
 
 The CLI path is:
 
 ```text
-CLI -> KernelBootstrap -> AgentKernel -> MiniAgent -> PlannerRuntime
+CLI -> KernelBootstrap -> AgentKernel -> SingularityAgent -> PlannerRuntime
 ```
 
-`src/miniharness/cli.py` still parses user flags into `ProductionRuntimeConfig`, but runtime construction is delegated to `KernelBootstrap`. The CLI then calls `AgentKernel.run_task()` and prints both the model final answer and the kernel `FinalReport`.
+`src/singularity/cli.py` still parses user flags into `ProductionRuntimeConfig`, but runtime construction is delegated to `KernelBootstrap`. The CLI then calls `AgentKernel.run_task()` and prints both the model final answer and the kernel `FinalReport`.
 
 Supported CLI inputs still flow through the config object:
 
@@ -53,7 +53,7 @@ Supported CLI inputs still flow through the config object:
 21. Context
 22. Planner
 
-Each component is recorded as `runtime.initialized` in trace when its boot-time boundary is ready. `RuntimeFactory.build()` assembles the graph in explicit phases: infra, policy/sandbox, execution core, tools/plugins/protocol, verification/review, model/context, then planner wiring. The plugin boundary runs after built-in tools are registered and before `ToolRuntime` / `ToolCallingProtocolRuntime` are created, so enabled local tool plugins become ordinary `ToolSpec` entries and still execute through the same policy, approval, sandbox, trace, and protocol layers. The evaluation boundary is registered during boot but the full `EvaluationRuntime` object is created only when evaluation functionality is actually accessed, so normal agent runs do not pay for benchmark scoring, replay, and artifact-writer setup. The graph creates `ContextManager` before Planner, then `AgentKernel` passes that context into `MiniAgent`. Command, Mutation, Tool, Review, Evaluation, and Verification runtimes are wired back to the session PlannerRuntime after Planner creation so execution evidence still lands in the existing planner ledger.
+Each component is recorded as `runtime.initialized` in trace when its boot-time boundary is ready. `RuntimeFactory.build()` assembles the graph in explicit phases: infra, policy/sandbox, execution core, tools/plugins/protocol, verification/review, model/context, then planner wiring. The plugin boundary runs after built-in tools are registered and before `ToolRuntime` / `ToolCallingProtocolRuntime` are created, so enabled local tool plugins become ordinary `ToolSpec` entries and still execute through the same policy, approval, sandbox, trace, and protocol layers. The evaluation boundary is registered during boot but the full `EvaluationRuntime` object is created only when evaluation functionality is actually accessed, so normal agent runs do not pay for benchmark scoring, replay, and artifact-writer setup. The graph creates `ContextManager` before Planner, then `AgentKernel` passes that context into `SingularityAgent`. Command, Mutation, Tool, Review, Evaluation, and Verification runtimes are wired back to the session PlannerRuntime after Planner creation so execution evidence still lands in the existing planner ledger.
 
 ## Lifecycle
 
@@ -85,7 +85,7 @@ Shutdown also cancels the root token, so later Planner, Model, Command, Sandbox,
 `WorkspaceLockManager` stores its default lock at:
 
 ```text
-.miniharness/locks/workspace.lock
+.singularity/locks/workspace.lock
 ```
 
 Behavior:

@@ -5,15 +5,15 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from miniharness.tools import (
+from singularity.tools import (
     PermissionLevel,
     ToolPolicy,
     ToolRegistry,
     ToolRuntime,
     ToolSpec,
 )
-from miniharness.edit import EditRuntime
-from miniharness.planner import (
+from singularity.edit import EditRuntime
+from singularity.planner import (
     ActionKind,
     AgentAction,
     AuthorizationDecision,
@@ -21,9 +21,9 @@ from miniharness.planner import (
     RiskLevel,
     TaskStatus,
 )
-from miniharness.tools.edit import register_edit_tools
-from miniharness.trace import TraceWriter
-from miniharness.workspace import MutationRuntime
+from singularity.tools.edit import register_edit_tools
+from singularity.trace import TraceWriter
+from singularity.workspace import MutationRuntime
 from tests.tool_runtime_helpers import runtime_default_policy_runtime, make_test_policy_runtime
 
 

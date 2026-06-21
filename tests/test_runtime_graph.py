@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miniharness.config import ApprovalMode
-from miniharness.config import ProductionRuntimeConfig
-from miniharness.kernel.graph import RuntimeFactory, RuntimeGraph
-from miniharness.kernel.health import RuntimeHealthChecker
-from miniharness.kernel.models import RuntimeComponentName, RuntimeComponentState, RunIdentity
-from miniharness.observability import TraceRuntime
+from singularity.config import ApprovalMode
+from singularity.config import ProductionRuntimeConfig
+from singularity.kernel.graph import RuntimeFactory, RuntimeGraph
+from singularity.kernel.health import RuntimeHealthChecker
+from singularity.kernel.models import RuntimeComponentName, RuntimeComponentState, RunIdentity
+from singularity.observability import TraceRuntime
 
 
 def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, monkeypatch) -> None:
@@ -86,7 +86,7 @@ def test_runtime_graph_exposes_stable_health_components_without_forcing_lazy_eva
             constructed.append(kwargs)
             self.__dict__.update(kwargs)
 
-    monkeypatch.setattr("miniharness.kernel.graph.EvaluationRuntime", FakeEvaluationRuntime)
+    monkeypatch.setattr("singularity.kernel.graph.EvaluationRuntime", FakeEvaluationRuntime)
 
     graph = _build_graph(tmp_path, monkeypatch)
     health_components = graph.components_for_health()
@@ -150,7 +150,7 @@ def test_runtime_graph_installs_cancellation_tokens_without_forcing_lazy_evaluat
             constructed.append(kwargs)
             self.__dict__.update(kwargs)
 
-    monkeypatch.setattr("miniharness.kernel.graph.EvaluationRuntime", FakeEvaluationRuntime)
+    monkeypatch.setattr("singularity.kernel.graph.EvaluationRuntime", FakeEvaluationRuntime)
 
     graph = _build_graph(tmp_path, monkeypatch)
     tokens: list[object] = []
@@ -182,7 +182,7 @@ def test_runtime_graph_defers_evaluation_runtime_until_used(tmp_path: Path, monk
             constructed.append(kwargs)
             self.__dict__.update(kwargs)
 
-    monkeypatch.setattr("miniharness.kernel.graph.EvaluationRuntime", FakeEvaluationRuntime)
+    monkeypatch.setattr("singularity.kernel.graph.EvaluationRuntime", FakeEvaluationRuntime)
 
     graph = _build_graph(tmp_path, monkeypatch, user_goal="Implement kernel")
 
@@ -219,9 +219,9 @@ def _build_graph(
     *,
     user_goal: str = "Implement kernel",
 ) -> RuntimeGraph:
-    monkeypatch.setenv("MINIHARNESS_API_KEY", "test")
-    monkeypatch.setenv("MINIHARNESS_BASE_URL", "http://localhost/v1")
-    monkeypatch.setenv("MINIHARNESS_MODEL", "test-model")
+    monkeypatch.setenv("SINGULARITY_API_KEY", "test")
+    monkeypatch.setenv("SINGULARITY_BASE_URL", "http://localhost/v1")
+    monkeypatch.setenv("SINGULARITY_MODEL", "test-model")
     config = ProductionRuntimeConfig.from_cli(
         project_root=tmp_path,
         dry_run=True,

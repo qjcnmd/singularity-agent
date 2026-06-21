@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from miniharness.tool_protocol.models import (
+from singularity.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
     ToolCallFailureKind,
@@ -13,7 +13,7 @@ from miniharness.tool_protocol.models import (
     ToolProtocolValidationResult,
     envelope_from_tool_result,
 )
-from miniharness.tools.models import ToolResult
+from singularity.tools.models import ToolResult
 
 
 def test_tool_protocol_envelope_round_trips_and_derives_digest() -> None:

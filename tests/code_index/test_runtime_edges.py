@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from miniharness.code_index import ProjectIndexRuntime
-from miniharness.verification import CheckKind, VerificationRuntime
-from miniharness.workspace import MutationRuntime, ReplaceText
+from singularity.code_index import ProjectIndexRuntime
+from singularity.verification import CheckKind, VerificationRuntime
+from singularity.workspace import MutationRuntime, ReplaceText
 
 
 def test_verification_runtime_uses_project_index_targeted_test_mapping(tmp_path: Path) -> None:

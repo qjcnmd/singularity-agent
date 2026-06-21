@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from miniharness.context import (
+from singularity.context import (
     ContextManager,
     ContextVersionConflict,
     ObservationStore,
@@ -13,7 +13,7 @@ from miniharness.context import (
     ReferenceResolver,
     TokenCounter,
 )
-from miniharness.provider import ToolChoiceMode
+from singularity.provider import ToolChoiceMode
 
 
 def tool_call(call_id: str, name: str = "read_file") -> dict[str, Any]:

@@ -2,13 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.instructions import (
+from singularity.instructions import (
     InstructionRuntime,
     InstructionRuntimeConfig,
     PromptBudgetExceeded,
 )
-from miniharness.model import ModelPurpose, ModelRole
-from miniharness.observability import TraceRuntime
+from singularity.model import ModelPurpose, ModelRole
+from singularity.observability import TraceRuntime
 
 
 def test_instruction_runtime_builds_bundle_and_writes_trace(tmp_path: Path) -> None:

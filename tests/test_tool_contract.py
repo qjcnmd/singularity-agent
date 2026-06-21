@@ -4,8 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from miniharness.policy import Capability, OperationKind, ResourceRef
-from miniharness.tools import (
+from singularity.policy import Capability, OperationKind, ResourceRef
+from singularity.tools import (
     PermissionLevel,
     ToolCachePolicy,
     ToolExecutionBackendKind,
@@ -18,8 +18,8 @@ from miniharness.tools import (
     ToolSideEffectKind,
     ToolSpec,
 )
-from miniharness.tools.policy import ToolPolicy
-from miniharness.trace import TraceWriter
+from singularity.tools.policy import ToolPolicy
+from singularity.trace import TraceWriter
 from tests.tool_runtime_helpers import make_test_policy_runtime
 
 

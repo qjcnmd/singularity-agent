@@ -3,11 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.context import ContextManager
-from miniharness.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
-from miniharness.tools.models import ToolResult
-from miniharness.trace import TraceWriter
-from miniharness.workspace import (
+from singularity.context import ContextManager
+from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
+from singularity.tools.models import ToolResult
+from singularity.trace import TraceWriter
+from singularity.workspace import (
     CreateFile,
     MutationError,
     MutationRuntime,
@@ -17,7 +17,7 @@ from miniharness.workspace import (
     WorkspacePolicy,
 )
 from tests.tool_runtime_helpers import runtime_default_policy_runtime
-from miniharness.tools.mutation import register_mutation_tools
+from singularity.tools.mutation import register_mutation_tools
 
 
 def tool_call(name: str, arguments: dict, *, tool_call_id: str = "call_1") -> dict:
@@ -74,13 +74,13 @@ def test_policy_denies_secret_and_git_internal_paths(tmp_path: Path) -> None:
     assert not (tmp_path / ".env").exists()
 
 
-def test_policy_denies_miniharness_state_dir(tmp_path: Path) -> None:
+def test_policy_denies_singularity_state_dir(tmp_path: Path) -> None:
     runtime = MutationRuntime(tmp_path)
 
     result = runtime.apply_operations(
         [
             CreateFile(
-                path=".miniharness/sessions/x/tamper.json",
+                path=".singularity/sessions/x/tamper.json",
                 content='{"bad": true}\n',
             )
         ],
@@ -90,7 +90,7 @@ def test_policy_denies_miniharness_state_dir(tmp_path: Path) -> None:
 
     assert result.ok is False
     assert result.error_code == "path_denied"
-    assert not (tmp_path / ".miniharness" / "sessions" / "x" / "tamper.json").exists()
+    assert not (tmp_path / ".singularity" / "sessions" / "x" / "tamper.json").exists()
 
 
 def test_replace_text_generates_changeset_diff_apply_and_trace(tmp_path: Path) -> None:

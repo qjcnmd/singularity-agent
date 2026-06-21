@@ -1,6 +1,6 @@
 # Verification Runtime
 
-Miniharness v0.0.8 adds a Verification Runtime so validation is not reduced to a hard-coded `run_tests` command. In v0.0.12, executable verification checks also run through the Sandbox Runtime when policy requires isolation. A production coding harness needs to know what changed, how the project is structured, which checks are available, which checks are risky, what a failure means, what the next repair observation should say, whether sandbox isolation was enforced, and whether the task is ready to hand back.
+Singularity v0.0.8 adds a Verification Runtime so validation is not reduced to a hard-coded `run_tests` command. In v0.0.12, executable verification checks also run through the Sandbox Runtime when policy requires isolation. A production coding runtime needs to know what changed, how the project is structured, which checks are available, which checks are risky, what a failure means, what the next repair observation should say, whether sandbox isolation was enforced, and whether the task is ready to hand back.
 
 The compact boundary is:
 

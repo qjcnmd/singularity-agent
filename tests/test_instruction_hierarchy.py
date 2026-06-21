@@ -1,4 +1,4 @@
-from miniharness.instructions import (
+from singularity.instructions import (
     InstructionHierarchy,
     InstructionPriority,
     InstructionScope,

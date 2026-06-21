@@ -1,12 +1,12 @@
 from pathlib import Path
 from typing import Any
 
-from miniharness.planner import PlannerRuntime
-from miniharness.tools import ToolRegistry
-from miniharness.tools.mutation import register_mutation_tools
-from miniharness.trace import TraceWriter
-from miniharness.workspace import MutationRuntime
-from miniharness.workspace_state import LocalWorkspaceStateRuntime
+from singularity.planner import PlannerRuntime
+from singularity.tools import ToolRegistry
+from singularity.tools.mutation import register_mutation_tools
+from singularity.trace import TraceWriter
+from singularity.workspace import MutationRuntime
+from singularity.workspace_state import LocalWorkspaceStateRuntime
 from tests.agent_runtime_helpers import make_agent_session
 
 
@@ -50,8 +50,8 @@ def test_agent_returns_final_answer_without_tool_calls(tmp_path: Path) -> None:
 
 def test_agent_runs_complete_tool_call_loop(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
-    readme.write_text("MiniHarness README content", encoding="utf-8")
-    final_response = "README says this is MiniHarness."
+    readme.write_text("Singularity README content", encoding="utf-8")
+    final_response = "README says this is Singularity."
     provider = MockProvider(
         {
             "choices": [
@@ -93,12 +93,12 @@ def test_agent_runs_complete_tool_call_loop(tmp_path: Path) -> None:
     second_messages = provider.calls[1]["messages"]
     tool_messages = [message for message in second_messages if message["role"] == "tool"]
     assert len(tool_messages) == 1
-    assert "MiniHarness README content" in tool_messages[0]["content"]
+    assert "Singularity README content" in tool_messages[0]["content"]
 
 
 def test_agent_injects_workspace_state_observation_after_tool_call(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
-    readme.write_text("MiniHarness README content", encoding="utf-8")
+    readme.write_text("Singularity README content", encoding="utf-8")
     trace = TraceWriter.create(tmp_path)
     state = LocalWorkspaceStateRuntime(tmp_path, trace=trace)
     state.begin_session(task_id="task_1", session_id="session_1")

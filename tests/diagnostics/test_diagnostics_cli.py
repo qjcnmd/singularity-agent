@@ -4,15 +4,15 @@ import json
 
 from typer.testing import CliRunner
 
-from miniharness.cli import app
-from miniharness.release.paths import resolve_runtime_paths
+from singularity.cli import app
+from singularity.release.paths import resolve_runtime_paths
 
 
 runner = CliRunner()
 
 
 def test_doctor_cli_json_uses_diagnostic_result_schema(monkeypatch, tmp_path):
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
     assert runner.invoke(app, ["system", "init"]).exit_code == 0
 
     result = runner.invoke(app, ["doctor", "--json", "--check", "environment.python"])
@@ -25,7 +25,7 @@ def test_doctor_cli_json_uses_diagnostic_result_schema(monkeypatch, tmp_path):
 
 
 def test_repair_cli_defaults_to_dry_run(monkeypatch, tmp_path):
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
 
     result = runner.invoke(app, ["repair", "--json"])
     paths = resolve_runtime_paths()
@@ -41,7 +41,7 @@ def test_repair_cli_defaults_to_dry_run(monkeypatch, tmp_path):
 
 
 def test_repair_cli_apply_runs_then_reports_remaining_errors(monkeypatch, tmp_path):
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
 
     result = runner.invoke(app, ["repair", "--apply", "--check", "filesystem.runtime_dirs", "--json"])
 
@@ -55,10 +55,10 @@ def test_repair_cli_apply_runs_then_reports_remaining_errors(monkeypatch, tmp_pa
 
 
 def test_repair_cli_apply_returns_nonzero_when_action_fails(monkeypatch, tmp_path):
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["system", "init"]).exit_code == 0
-    broken_entries = tmp_path / ".miniharness" / "memory" / "auto" / "entries.jsonl"
+    broken_entries = tmp_path / ".singularity" / "memory" / "auto" / "entries.jsonl"
     broken_entries.parent.mkdir(parents=True)
     broken_entries.write_text("{broken", encoding="utf-8")
 

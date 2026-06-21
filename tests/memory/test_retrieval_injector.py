@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from miniharness.memory.injector import MemoryInjector
-from miniharness.memory.models import (
+from singularity.memory.injector import MemoryInjector
+from singularity.memory.models import (
     Confidence,
     ConflictStatus,
     MemoryAuthorType,
@@ -14,7 +14,7 @@ from miniharness.memory.models import (
     MemoryType,
     Provenance,
 )
-from miniharness.memory.retrieval import MemoryRetrieval
+from singularity.memory.retrieval import MemoryRetrieval
 
 
 def entry(entry_id: str, title: str, body: str, **kwargs) -> MemoryEntry:

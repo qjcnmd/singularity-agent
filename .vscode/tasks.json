@@ -2,12 +2,12 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Miniharness: help",
+      "label": "Singularity: help",
       "type": "shell",
       "command": ".\\.venv\\Scripts\\python.exe",
       "args": [
         "-m",
-        "miniharness.cli",
+        "singularity.cli",
         "--help"
       ],
       "options": {
@@ -16,7 +16,7 @@
       "problemMatcher": []
     },
     {
-      "label": "Miniharness: compile",
+      "label": "Singularity: compile",
       "type": "shell",
       "command": ".\\.venv\\Scripts\\python.exe",
       "args": [

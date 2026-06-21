@@ -8,14 +8,14 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from miniharness.cli import app
-from miniharness.command import CommandRequest, CommandRuntime
-from miniharness.context.manager import ContextManager
-from miniharness.observability.models import TraceEventType
-from miniharness.observability.runtime import TraceRuntime
-from miniharness.planner import PlannerRuntime, TaskStatus
-from miniharness.planner.finalizer import Finalizer
-from miniharness.policy import (
+from singularity.cli import app
+from singularity.command import CommandRequest, CommandRuntime
+from singularity.context.manager import ContextManager
+from singularity.observability.models import TraceEventType
+from singularity.observability.runtime import TraceRuntime
+from singularity.planner import PlannerRuntime, TaskStatus
+from singularity.planner.finalizer import Finalizer
+from singularity.policy import (
     Capability,
     OperationKind,
     PolicyConfig,
@@ -25,27 +25,27 @@ from miniharness.policy import (
     ResourceRef,
     RuntimeName,
 )
-from miniharness.policy.approval import ApprovalGate
-from miniharness.policy.config import ApprovalMode
-from miniharness.policy import SecurityMode
-from miniharness.policy.exceptions import ApprovalRequired
-from miniharness.policy.models import DecisionOutcome
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from miniharness.workspace import CreateFile, MutationRuntime
-from miniharness.command import (
+from singularity.policy.approval import ApprovalGate
+from singularity.policy.config import ApprovalMode
+from singularity.policy import SecurityMode
+from singularity.policy.exceptions import ApprovalRequired
+from singularity.policy.models import DecisionOutcome
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.workspace import CreateFile, MutationRuntime
+from singularity.command import (
     CommandPolicyResult,
     CommandDecision,
     CommandRisk,
     ExecutionStatus,
     SemanticStatus,
 )
-from miniharness.sandbox import (
+from singularity.sandbox import (
     SandboxRuntime,
     SandboxProfileName,
     SandboxRequest,
     default_sandbox_profile,
 )
-from miniharness.verification import VerificationRuntime
+from singularity.verification import VerificationRuntime
 from tests.tool_runtime_helpers import make_test_policy_runtime
 
 
@@ -291,7 +291,7 @@ def test_verification_runtime_emits_check_evidence_and_repair_trace(tmp_path: Pa
 
 class _FakeCommandRuntime:
     def __init__(self, results: list[Any]) -> None:
-        from miniharness.command import CommandPolicy
+        from singularity.command import CommandPolicy
 
         self.policy = CommandPolicy()
         self.results = results
@@ -309,7 +309,7 @@ def _command_result(
     output: str,
     error_code: str | None,
 ) -> Any:
-    from miniharness.command import CommandResult
+    from singularity.command import CommandResult
 
     return CommandResult(
         command_id=command_id,

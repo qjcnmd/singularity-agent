@@ -3,12 +3,12 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from miniharness.model import ModelCapabilities, ToolChoiceMode, ToolChoicePolicy
-from miniharness.tool_protocol.errors import ToolProtocolValidationError
-from miniharness.tool_protocol.models import ToolCallPhase, ToolExecutionMode
-from miniharness.tool_protocol.validator import ToolProtocolValidator
-from miniharness.tools import ToolRegistry
-from miniharness.tools.models import PermissionLevel, ToolSpec
+from singularity.model import ModelCapabilities, ToolChoiceMode, ToolChoicePolicy
+from singularity.tool_protocol.errors import ToolProtocolValidationError
+from singularity.tool_protocol.models import ToolCallPhase, ToolExecutionMode
+from singularity.tool_protocol.validator import ToolProtocolValidator
+from singularity.tools import ToolRegistry
+from singularity.tools.models import PermissionLevel, ToolSpec
 
 
 class WriteInput(BaseModel):

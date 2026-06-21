@@ -1,11 +1,11 @@
 # Planner / Task Execution Runtime
 
-Miniharness v0.0.10 adds `PlannerRuntime` as the task execution controller. It is not a natural-language checklist. It is a runtime layer that records task state, decides the current phase, restricts allowed actions and tools, tracks evidence, reacts to failures, enforces budgets, escalates risk, and produces a final report from structured facts.
+Singularity v0.0.10 adds `PlannerRuntime` as the task execution controller. It is not a natural-language checklist. It is a runtime layer that records task state, decides the current phase, restricts allowed actions and tools, tracks evidence, reacts to failures, enforces budgets, escalates risk, and produces a final report from structured facts.
 
 The compact boundary is:
 
 ```txt
-MiniAgent
+SingularityAgent
   -> PlannerRuntime
   -> TaskState + TaskPlan + AgentAction
   -> ToolRuntime action gate
@@ -19,7 +19,7 @@ MiniAgent
 
 ## Why It Is Not A Natural-Language Plan
 
-A natural-language plan is useful for humans, but it is not enough for a production local coding harness. It cannot reliably answer whether a tool is allowed in the current phase, whether the same failure repeated too many times, whether verification evidence is missing, or whether final output is based on real runtime facts.
+A natural-language plan is useful for humans, but it is not enough for a production local coding runtime. It cannot reliably answer whether a tool is allowed in the current phase, whether the same failure repeated too many times, whether verification evidence is missing, or whether final output is based on real runtime facts.
 
 `PlannerRuntime` stores a structured `TaskPlan`, not only prose. Each `TaskPhase` defines:
 
@@ -164,7 +164,7 @@ For read-only goals, completion criteria do not require mutation or verification
 Planner state is stored under:
 
 ```txt
-.miniharness/planner/<session_id>/
+.singularity/planner/<session_id>/
   state.json
   plan.json
   evidence.json

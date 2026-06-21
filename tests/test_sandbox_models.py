@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from miniharness.sandbox import (
+from singularity.sandbox import (
     SandboxArtifact,
     SandboxCapabilities,
     SandboxFilesystemMode,

@@ -34,9 +34,9 @@ Client forbidden behavior:
 - parse raw trace files as the only integration contract
 - treat model text as policy or approval
 
-## MiniAgent Boundary
+## SingularityAgent Boundary
 
-`MiniAgent` is an orchestration adapter inside the runtime host. It may call:
+`SingularityAgent` is an orchestration adapter inside the runtime host. It may call:
 
 - `planner.step()`
 - `context.build_bundle()`

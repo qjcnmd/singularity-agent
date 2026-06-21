@@ -1,6 +1,6 @@
 # Upgrade And Migration
 
-MiniHarness stores release/runtime upgrade state in:
+Singularity stores release/runtime upgrade state in:
 
 ```text
 state/runtime-manifest.json
@@ -24,25 +24,25 @@ The manifest records:
 Migrations are versioned, idempotent, and run through:
 
 ```bash
-miniharness system migrate
+singularity-agent system migrate
 ```
 
-Before each migration, MiniHarness copies `config/` and `state/` into `backups/`. Migration writes use atomic replace. If a migration fails, MiniHarness restores the pre-migration backup.
+Before each migration, Singularity copies `config/` and `state/` into `backups/`. Migration writes use atomic replace. If a migration fails, Singularity restores the pre-migration backup.
 
 Migrations do not delete old `traces/`, `memory/`, or `eval/` data by default.
 
 ## Doctor
 
-`miniharness doctor` checks for pending migrations without changing files:
+`singularity-agent doctor` checks for pending migrations without changing files:
 
 ```bash
-miniharness doctor --json
+singularity-agent doctor --json
 ```
 
 If a migration is pending, run:
 
 ```bash
-miniharness system migrate
+singularity-agent system migrate
 ```
 
 ## Repair
@@ -50,7 +50,7 @@ miniharness system migrate
 Use repair for missing directories or missing default files:
 
 ```bash
-miniharness system repair
+singularity-agent system repair
 ```
 
 Repair is conservative. It recreates missing runtime-owned structure and reports permission problems, but it does not silently overwrite user data.
@@ -69,17 +69,17 @@ logs/
 Preview removals first:
 
 ```bash
-miniharness system uninstall --dry-run
+singularity-agent system uninstall --dry-run
 ```
 
 Export before destructive cleanup:
 
 ```bash
-miniharness system export --output miniharness-user-data.zip
+singularity-agent system export --output singularity-user-data.zip
 ```
 
 Delete protected user data only when explicitly requested:
 
 ```bash
-miniharness system uninstall --purge-user-data --yes
+singularity-agent system uninstall --purge-user-data --yes
 ```

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miniharness.evaluation import (
+from singularity.evaluation import (
     BenchmarkTask,
     EvaluationHook,
     EvaluationProfile,
@@ -16,8 +16,8 @@ from miniharness.evaluation import (
     WorkspaceSnapshot,
     WorkspaceSnapshotKind,
 )
-from miniharness.command import CommandDecision, CommandPolicyResult, CommandRisk, SemanticStatus
-from miniharness.observability import TraceEventType, TraceRuntime
+from singularity.command import CommandDecision, CommandPolicyResult, CommandRisk, SemanticStatus
+from singularity.observability import TraceEventType, TraceRuntime
 
 
 def _task(task_id: str = "task.eval") -> BenchmarkTask:

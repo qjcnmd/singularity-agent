@@ -1,14 +1,14 @@
 from pathlib import Path
 
-from miniharness.context import ContextManager
-from miniharness.context.models import (
+from singularity.context import ContextManager
+from singularity.context.models import (
     CommandObservation,
     MutationEvidence,
     PlannerState,
     PolicyObservation,
     VerificationEvidence,
 )
-from miniharness.context.tokens import TokenCounter
+from singularity.context.tokens import TokenCounter
 
 
 def test_context_manager_records_structured_runtime_observations(
@@ -54,7 +54,7 @@ def test_context_manager_records_structured_runtime_observations(
     context.add_mutation_evidence(
         MutationEvidence(
             transaction_id="tx_1",
-            files_changed=["src/miniharness/context/manager.py"],
+            files_changed=["src/singularity/context/manager.py"],
             diff_summary="updated context manager",
             rollback_ref="rollback_1",
             status="applied",
@@ -70,7 +70,7 @@ def test_context_manager_records_structured_runtime_observations(
             "ok": True,
             "patch_candidate_id": "patch_1",
             "patch_digest": "digest_1",
-            "changed_files": ["src/miniharness/context/manager.py"],
+            "changed_files": ["src/singularity/context/manager.py"],
             "changeset_id": "change_1",
             "transaction_id": "tx_1",
             "validation": {"ok": True, "requires_review": False, "issues": []},
@@ -102,7 +102,7 @@ def test_context_manager_records_structured_runtime_observations(
         )
     )
     context.add_workspace_state(
-        {"status": "dirty", "changed_files": ["src/miniharness/context/manager.py"]}
+        {"status": "dirty", "changed_files": ["src/singularity/context/manager.py"]}
     )
 
     rendered = "\n".join(str(message.get("content")) for message in context.messages())

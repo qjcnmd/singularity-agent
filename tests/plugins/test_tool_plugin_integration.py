@@ -3,17 +3,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from miniharness.observability import TraceRuntime
-from miniharness.plugins.discovery import discover_plugins
-from miniharness.plugins.runtime import PluginRuntime
-from miniharness.plugins.status import PluginStatusStore
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.observability import TraceRuntime
+from singularity.plugins.discovery import discover_plugins
+from singularity.plugins.runtime import PluginRuntime
+from singularity.plugins.status import PluginStatusStore
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
 
 from tests.tool_runtime_helpers import make_test_policy_runtime
 
 
 def test_enabled_tool_plugin_registers_exports_executes_and_traces(tmp_path: Path) -> None:
-    plugin_dir = tmp_path / ".miniharness" / "plugins" / "echo_plugin"
+    plugin_dir = tmp_path / ".singularity" / "plugins" / "echo_plugin"
     plugin_dir.mkdir(parents=True)
     _write_manifest(plugin_dir, require_prefix=True)
     (plugin_dir / "plugin.py").write_text(
@@ -84,7 +84,7 @@ def register(host):
 
 
 def test_plugin_host_custom_trace_event_uses_stable_trace_type(tmp_path: Path) -> None:
-    plugin_dir = tmp_path / ".miniharness" / "plugins" / "trace_plugin"
+    plugin_dir = tmp_path / ".singularity" / "plugins" / "trace_plugin"
     plugin_dir.mkdir(parents=True)
     _write_manifest(plugin_dir, plugin_id="trace_plugin")
     (plugin_dir / "plugin.py").write_text(

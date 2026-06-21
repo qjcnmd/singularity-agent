@@ -1,11 +1,11 @@
 # Model / Inference Runtime
 
-Miniharness v0.0.14 adds `src/miniharness/model/` as the model protocol boundary. The goal is to keep model calls auditable, validated, budget-aware, and policy-aware without moving tool execution into the model layer.
+Singularity v0.0.14 adds `src/singularity/model/` as the model protocol boundary. The goal is to keep model calls auditable, validated, budget-aware, and policy-aware without moving tool execution into the model layer.
 
 The compact boundary is:
 
 ```txt
-MiniAgent
+SingularityAgent
   -> PlannerRuntime.step()
   -> ContextManager.messages()
   -> ModelRuntime.build_request_from_context()
@@ -60,7 +60,7 @@ tools required      -> structured unsupported_capability failure when tools are 
 
 Safe downgrades are recorded as `capability_adjustments` on the model result and trace metadata. Unsafe downgrades return a structured `ModelError(kind=unsupported_capability)` instead of sending a request the provider cannot satisfy.
 
-The old `src/miniharness/provider.py` remains the compatibility surface for callers and tests that still use `Provider.chat(messages, tools, tool_choice=...)`.
+The old `src/singularity/provider.py` remains the compatibility surface for callers and tests that still use `Provider.chat(messages, tools, tool_choice=...)`.
 
 ## Messages
 

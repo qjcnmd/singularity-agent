@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miniharness.memory.models import (
+from singularity.memory.models import (
     Confidence,
     MemoryCandidate,
     MemoryEntry,
@@ -13,7 +13,7 @@ from miniharness.memory.models import (
     MemoryType,
     Provenance,
 )
-from miniharness.memory.store import MemoryStore
+from singularity.memory.store import MemoryStore
 
 
 def make_entry(entry_id: str = "mem_1") -> MemoryEntry:
@@ -41,14 +41,14 @@ def test_store_creates_runtime_local_memory_layout(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path)
     store.initialize()
 
-    assert (tmp_path / ".miniharness" / "memory" / "auto" / "entries.jsonl").exists()
-    assert (tmp_path / ".miniharness" / "memory" / "auto" / "candidates.jsonl").exists()
-    assert (tmp_path / ".miniharness" / "memory" / "auto" / "index.json").exists()
-    assert (tmp_path / ".miniharness" / "memory" / "human" / "project.md").exists()
-    assert (tmp_path / ".miniharness" / "memory" / "human" / "commands.md").exists()
-    assert (tmp_path / ".miniharness" / "memory" / "human" / "preferences.md").exists()
-    assert (tmp_path / ".miniharness" / "memory" / "human" / "lessons.md").exists()
-    assert (tmp_path / ".miniharness" / "rules").exists()
+    assert (tmp_path / ".singularity" / "memory" / "auto" / "entries.jsonl").exists()
+    assert (tmp_path / ".singularity" / "memory" / "auto" / "candidates.jsonl").exists()
+    assert (tmp_path / ".singularity" / "memory" / "auto" / "index.json").exists()
+    assert (tmp_path / ".singularity" / "memory" / "human" / "project.md").exists()
+    assert (tmp_path / ".singularity" / "memory" / "human" / "commands.md").exists()
+    assert (tmp_path / ".singularity" / "memory" / "human" / "preferences.md").exists()
+    assert (tmp_path / ".singularity" / "memory" / "human" / "lessons.md").exists()
+    assert (tmp_path / ".singularity" / "rules").exists()
 
 
 def test_store_writes_jsonl_and_markdown_projection(tmp_path: Path) -> None:
@@ -81,7 +81,7 @@ def test_store_upserts_merge_existing_entries_from_other_store(tmp_path: Path) -
 
 
 def test_store_migrates_legacy_root_jsonl_to_auto_layout(tmp_path: Path) -> None:
-    legacy_root = tmp_path / ".miniharness" / "memory"
+    legacy_root = tmp_path / ".singularity" / "memory"
     legacy_root.mkdir(parents=True)
     legacy_entry = make_entry("mem_legacy")
     legacy_root.joinpath("entries.jsonl").write_text(
@@ -99,7 +99,7 @@ def test_store_migrates_legacy_root_jsonl_to_auto_layout(tmp_path: Path) -> None
 
 
 def test_store_migrates_legacy_user_preferences_markdown(tmp_path: Path) -> None:
-    human_root = tmp_path / ".miniharness" / "memory" / "human"
+    human_root = tmp_path / ".singularity" / "memory" / "human"
     human_root.mkdir(parents=True)
     human_root.joinpath("user_preferences.md").write_text(
         "# Old Preferences\n\nPrefer concise Chinese replies.\n",

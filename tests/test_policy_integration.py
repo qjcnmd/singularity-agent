@@ -5,10 +5,10 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from miniharness.command import CommandRequest, CommandRuntime, ExecutionStatus
-from miniharness.planner import EvidenceLedger, PlannerRuntime, TaskStatus, TaskState
-from miniharness.planner.finalizer import Finalizer
-from miniharness.policy import (
+from singularity.command import CommandRequest, CommandRuntime, ExecutionStatus
+from singularity.planner import EvidenceLedger, PlannerRuntime, TaskStatus, TaskState
+from singularity.planner.finalizer import Finalizer
+from singularity.policy import (
     Capability,
     DecisionOutcome,
     OperationKind,
@@ -20,9 +20,9 @@ from miniharness.policy import (
     RuntimeName,
     SecurityMode,
 )
-from miniharness.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
-from miniharness.verification import VerificationRuntime
-from miniharness.workspace import CreateFile, MutationRuntime
+from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
+from singularity.verification import VerificationRuntime
+from singularity.workspace import CreateFile, MutationRuntime
 
 
 class EmptyInput(BaseModel):

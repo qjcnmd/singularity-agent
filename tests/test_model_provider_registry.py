@@ -1,8 +1,8 @@
 import pytest
 import httpx
 
-from miniharness.config import Settings
-from miniharness.model import (
+from singularity.config import Settings
+from singularity.model import (
     MockModelProvider,
     ModelCapabilities,
     ModelCapabilityError,
@@ -123,7 +123,7 @@ def test_openai_compatible_model_provider_serializes_runtime_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _FakeClient.payloads = []
-    monkeypatch.setattr("miniharness.model.providers.httpx.Client", _FakeClient)
+    monkeypatch.setattr("singularity.model.providers.httpx.Client", _FakeClient)
     provider = OpenAICompatibleModelProvider(
         Settings(base_url="https://example.test/v1", api_key="test-key", model="test-model")
     )
@@ -158,7 +158,7 @@ def test_openai_compatible_provider_keeps_parallel_tool_compatibility() -> None:
 def test_openai_provider_error_does_not_include_response_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("miniharness.model.providers.httpx.Client", _FakeErrorClient)
+    monkeypatch.setattr("singularity.model.providers.httpx.Client", _FakeErrorClient)
     provider = OpenAICompatibleModelProvider(
         Settings(base_url="https://example.test/v1", api_key="test-key", model="test-model")
     )

@@ -2,10 +2,10 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Miniharness: run sample goal",
+      "name": "Singularity: run sample goal",
       "type": "debugpy",
       "request": "launch",
-      "module": "miniharness.cli",
+      "module": "singularity.cli",
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}\\.env",
       "args": [

@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from miniharness.context import ContextManager
-from miniharness.model import (
+from singularity.context import ContextManager
+from singularity.model import (
     MockModelProvider,
     ModelBudget,
     ModelCapabilities,
@@ -18,8 +18,8 @@ from miniharness.model import (
     ToolChoiceMode,
     ToolChoicePolicy,
 )
-from miniharness.observability import TraceRuntime
-from miniharness.tools import ToolRegistry
+from singularity.observability import TraceRuntime
+from singularity.tools import ToolRegistry
 
 
 def test_model_runtime_success_tool_call_trace_and_budget(tmp_path: Path) -> None:

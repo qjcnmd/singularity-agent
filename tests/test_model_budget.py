@@ -1,6 +1,6 @@
 import pytest
 
-from miniharness.model import (
+from singularity.model import (
     ContentBlock,
     ModelBudget,
     ModelBudgetExceeded,

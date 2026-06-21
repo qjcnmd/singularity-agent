@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://miniharness.local/schemas/session-state.schema.json",
-  "title": "MiniHarness Session State",
+  "$id": "https://singularity.local/schemas/session-state.schema.json",
+  "title": "Singularity Session State",
   "type": "object",
   "required": [
     "schema_version",

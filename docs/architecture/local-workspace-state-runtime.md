@@ -1,6 +1,6 @@
 # Local Workspace State Runtime
 
-Miniharness targets a local CLI coding agent. Even when Git is unavailable, disabled, or intentionally out of scope, the agent still needs a trustworthy model of the workspace. `LocalWorkspaceStateRuntime` is the non-Git state layer that records what the workspace looked like at session start, which changes belong to the agent, which changes came from commands, and whether a user or external process changed files while the agent was working.
+Singularity targets a local CLI coding agent. Even when Git is unavailable, disabled, or intentionally out of scope, the agent still needs a trustworthy model of the workspace. `LocalWorkspaceStateRuntime` is the non-Git state layer that records what the workspace looked like at session start, which changes belong to the agent, which changes came from commands, and whether a user or external process changed files while the agent was working.
 
 This runtime does not implement branches, commits, staging, push, pull, or pull requests. Git can still be inspected by other read-only paths, but local workspace state and rollback do not depend on Git.
 
@@ -42,15 +42,15 @@ encoding, line_ending, is_binary, is_symlink, symlink_target,
 file_class, permissions, captured_at
 ```
 
-Path resolution reuses `WorkspacePathResolver`; containment is not checked with plain string prefix matching. The scan skips protected or noisy directories such as `.git`, `.miniharness`, `node_modules`, `venv`, `.venv`, `dist`, `build`, `__pycache__`, test/cache directories, generated outputs, and large artifacts.
+Path resolution reuses `WorkspacePathResolver`; containment is not checked with plain string prefix matching. The scan skips protected or noisy directories such as `.git`, `.singularity`, `node_modules`, `venv`, `.venv`, `dist`, `build`, `__pycache__`, test/cache directories, generated outputs, and large artifacts.
 
 ## Journal, Store, And Artifacts
 
 State is not memory-only.
 
-- JSONL journal: `.miniharness/sessions/<session_id>/journal.jsonl`
-- SQLite query index: `.miniharness/workspace_state.sqlite3`
-- Artifacts: `.miniharness/sessions/<session_id>/artifacts/`
+- JSONL journal: `.singularity/sessions/<session_id>/journal.jsonl`
+- SQLite query index: `.singularity/workspace_state.sqlite3`
+- Artifacts: `.singularity/sessions/<session_id>/artifacts/`
 
 Journal events include baseline creation, file snapshot capture, agent mutations, command side effects, created/deleted files, external changes, rollback events, artifacts, session recovery, and session close. Events carry correlation ids when available:
 
@@ -67,7 +67,7 @@ artifact_id, kind, path, digest, size, created_at,
 linked_command_id, linked_transaction_id, linked_verification_id
 ```
 
-The `.miniharness` directory is protected by workspace policy and excluded from normal model mutation and state scans.
+The `.singularity` directory is protected by workspace policy and excluded from normal model mutation and state scans.
 
 ## Ownership
 
@@ -131,7 +131,7 @@ recommended_next_action
 
 Context integration uses `WorkspaceHealthReport.to_observation()`. Full journals and artifacts stay out of model messages; the model sees a compact observation with status, changed files, side effects, rollback availability, conflicts, and warnings.
 
-The `workspace_health` tool is the internal entrypoint for this observation. It can refresh external changes before reporting health, then returns only the compact `workspace_state` object. `MiniAgent` injects the same observation after non-health tool calls so the next model turn knows whether it must re-read files before continuing. CLI runs print a final workspace state panel after the final answer, but the panel is not merged into the model-authored answer.
+The `workspace_health` tool is the internal entrypoint for this observation. It can refresh external changes before reporting health, then returns only the compact `workspace_state` object. `SingularityAgent` injects the same observation after non-health tool calls so the next model turn knows whether it must re-read files before continuing. CLI runs print a final workspace state panel after the final answer, but the panel is not merged into the model-authored answer.
 
 ## Trace Integration
 

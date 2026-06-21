@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import os
 
-from miniharness.diagnostics import DoctorEngine
-from miniharness.release.init import default_config, initialize_runtime
-from miniharness.release.models import atomic_write_json
-from miniharness.release.paths import resolve_runtime_paths
+from singularity.diagnostics import DoctorEngine
+from singularity.release.init import default_config, initialize_runtime
+from singularity.release.models import atomic_write_json
+from singularity.release.paths import resolve_runtime_paths
 
 
 def test_filesystem_check_reports_missing_runtime_dirs_as_repairable(tmp_path):
@@ -41,7 +41,7 @@ def test_filesystem_check_reports_unwritable_directory(monkeypatch, tmp_path):
 
 
 def test_config_check_reports_missing_fields_without_leaking_api_key(monkeypatch, tmp_path):
-    monkeypatch.setenv("MINIHARNESS_API_KEY", "sk-secret-value")
+    monkeypatch.setenv("SINGULARITY_API_KEY", "sk-secret-value")
     paths = resolve_runtime_paths(home=tmp_path / "runtime")
     initialize_runtime(paths)
     atomic_write_json(paths.config_file, {"schema_version": 1, "runtime": {"mode": "user"}})
@@ -54,14 +54,14 @@ def test_config_check_reports_missing_fields_without_leaking_api_key(monkeypatch
     assert schema.auto_repairable is True
     assert "missing policy section" in schema.technical_detail
     assert provider.status == "failed"
-    assert "MINIHARNESS_API_KEY" in provider.technical_detail
+    assert "SINGULARITY_API_KEY" in provider.technical_detail
     assert "sk-secret-value" not in payload
 
 
 def test_data_integrity_reports_broken_memory_jsonl_as_non_destructive(tmp_path):
     paths = resolve_runtime_paths(home=tmp_path / "runtime")
     initialize_runtime(paths)
-    memory_entries = tmp_path / ".miniharness" / "memory" / "auto" / "entries.jsonl"
+    memory_entries = tmp_path / ".singularity" / "memory" / "auto" / "entries.jsonl"
     memory_entries.parent.mkdir(parents=True)
     memory_entries.write_text("{broken json\n", encoding="utf-8")
 

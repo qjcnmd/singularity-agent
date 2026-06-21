@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.kernel.exceptions import WorkspaceLockError
-from miniharness.kernel.locks import WorkspaceLockManager
+from singularity.kernel.exceptions import WorkspaceLockError
+from singularity.kernel.locks import WorkspaceLockManager
 
 
 def test_workspace_lock_blocks_second_writer(tmp_path: Path) -> None:
@@ -22,7 +22,7 @@ def test_workspace_lock_blocks_second_writer(tmp_path: Path) -> None:
         second.acquire_lock(run_id="run_2", read_only=False)
 
     first.release_lock()
-    assert not (tmp_path / ".miniharness" / "locks" / "workspace.lock").exists()
+    assert not (tmp_path / ".singularity" / "locks" / "workspace.lock").exists()
 
 
 def test_workspace_lock_allows_read_only_shared_locks(tmp_path: Path) -> None:
@@ -32,7 +32,7 @@ def test_workspace_lock_allows_read_only_shared_locks(tmp_path: Path) -> None:
     first.acquire_lock(run_id="run_1", read_only=True)
     second.acquire_lock(run_id="run_2", read_only=True)
 
-    payload = json.loads((tmp_path / ".miniharness" / "locks" / "workspace.lock").read_text())
+    payload = json.loads((tmp_path / ".singularity" / "locks" / "workspace.lock").read_text())
     assert sorted(holder["run_id"] for holder in payload["holders"]) == ["run_1", "run_2"]
 
     second.release_lock()
@@ -40,7 +40,7 @@ def test_workspace_lock_allows_read_only_shared_locks(tmp_path: Path) -> None:
 
 
 def test_workspace_lock_detects_and_replaces_stale_lock(tmp_path: Path) -> None:
-    lock_path = tmp_path / ".miniharness" / "locks" / "workspace.lock"
+    lock_path = tmp_path / ".singularity" / "locks" / "workspace.lock"
     lock_path.parent.mkdir(parents=True)
     stale_time = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     lock_path.write_text(
@@ -74,7 +74,7 @@ def test_workspace_lock_detects_and_replaces_stale_lock(tmp_path: Path) -> None:
 
 
 def test_workspace_lock_remembers_stale_lock_removed_during_acquire(tmp_path: Path) -> None:
-    lock_path = tmp_path / ".miniharness" / "locks" / "workspace.lock"
+    lock_path = tmp_path / ".singularity" / "locks" / "workspace.lock"
     lock_path.parent.mkdir(parents=True)
     stale_time = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     lock_path.write_text(

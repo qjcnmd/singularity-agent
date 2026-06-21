@@ -4,7 +4,7 @@ Status: Accepted
 
 ## Context
 
-MiniHarness already has a Python plugin runtime. Python is also the current main runtime. The desktop migration should avoid mixing plugin compatibility with core process ownership.
+Singularity already has a Python plugin runtime. Python is also the current main runtime. The desktop migration should avoid mixing plugin compatibility with core process ownership.
 
 ## Decision
 

@@ -1,19 +1,19 @@
 import json
 from pathlib import Path
 
-from miniharness.planner import (
+from singularity.planner import (
     ActionKind,
     PlannerRuntime,
     ReplanDecisionKind,
     RiskDecisionKind,
     TaskStatus,
 )
-from miniharness.tools.models import ToolExecutionBackendKind, ToolResult, ToolSpec, PermissionLevel
+from singularity.tools.models import ToolExecutionBackendKind, ToolResult, ToolSpec, PermissionLevel
 from pydantic import BaseModel
-from miniharness.workspace import CreateFile, MutationRuntime
-from miniharness.command import CommandRequest, CommandRuntime
-from miniharness.policy import PolicyConfig, PolicyRuntime, SecurityMode
-from miniharness.verification import VerificationRuntime
+from singularity.workspace import CreateFile, MutationRuntime
+from singularity.command import CommandRequest, CommandRuntime
+from singularity.policy import PolicyConfig, PolicyRuntime, SecurityMode
+from singularity.verification import VerificationRuntime
 
 
 class EmptyInput(BaseModel):
@@ -58,8 +58,8 @@ def test_start_task_builds_state_plan_and_persists(tmp_path: Path) -> None:
         "repairing_failures",
         "finalizing",
     ]
-    assert (tmp_path / ".miniharness" / "planner" / "session_1" / "state.json").exists()
-    assert (tmp_path / ".miniharness" / "planner" / "session_1" / "planner_events.jsonl").exists()
+    assert (tmp_path / ".singularity" / "planner" / "session_1" / "state.json").exists()
+    assert (tmp_path / ".singularity" / "planner" / "session_1" / "planner_events.jsonl").exists()
 
 
 def test_phase_policy_allows_read_tools_before_mutation_and_blocks_write(tmp_path: Path) -> None:
@@ -225,7 +225,7 @@ def test_final_report_is_generated_from_evidence(tmp_path: Path) -> None:
     assert report.status == TaskStatus.COMPLETED
     assert report.files_changed == ["README.md"]
     assert report.verification_summary["status"] == "ready"
-    assert (tmp_path / ".miniharness" / "planner" / "session_1" / "final_report.json").exists()
+    assert (tmp_path / ".singularity" / "planner" / "session_1" / "final_report.json").exists()
 
 
 def test_replanner_maps_required_failures(tmp_path: Path) -> None:
@@ -295,7 +295,7 @@ def test_planner_trace_records_phase_action_budget_and_risk(tmp_path: Path) -> N
 
     events = [
         json.loads(line)
-        for line in (tmp_path / ".miniharness" / "planner" / "session_1" / "planner_events.jsonl")
+        for line in (tmp_path / ".singularity" / "planner" / "session_1" / "planner_events.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]

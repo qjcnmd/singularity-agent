@@ -6,19 +6,19 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from miniharness.command import CommandPurpose, CommandRequest, CommandRuntime
-from miniharness.context import ContextManager
-from miniharness.kernel.cancellation import CancellationManager, CancellationToken
-from miniharness.kernel.exceptions import CancellationError
-from miniharness.kernel.models import CancellationReason
-from miniharness.model import MockModelProvider, ModelRuntime, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResult, ModelTurnStatus
-from miniharness.planner import PlannerRuntime
-from miniharness.review import ReviewRuntime
-from miniharness.sandbox import SandboxRuntime
-from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from miniharness.tools.models import PermissionLevel, ToolResult, ToolSpec
-from miniharness.verification import VerificationRuntime
+from singularity.command import CommandPurpose, CommandRequest, CommandRuntime
+from singularity.context import ContextManager
+from singularity.kernel.cancellation import CancellationManager, CancellationToken
+from singularity.kernel.exceptions import CancellationError
+from singularity.kernel.models import CancellationReason
+from singularity.model import MockModelProvider, ModelRuntime, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResult, ModelTurnStatus
+from singularity.planner import PlannerRuntime
+from singularity.review import ReviewRuntime
+from singularity.sandbox import SandboxRuntime
+from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.tools.models import PermissionLevel, ToolResult, ToolSpec
+from singularity.verification import VerificationRuntime
 from tests.test_sandbox_runtime import sandbox_request
 from tests.tool_runtime_helpers import make_test_policy_runtime
 

@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.observability.artifacts import TraceArtifactStore
-from miniharness.observability.exceptions import TraceArtifactError
-from miniharness.observability.models import TraceArtifactKind
+from singularity.observability.artifacts import TraceArtifactStore
+from singularity.observability.exceptions import TraceArtifactError
+from singularity.observability.models import TraceArtifactKind
 
 
 def test_text_and_bytes_artifacts_are_written_with_sha256(tmp_path: Path) -> None:

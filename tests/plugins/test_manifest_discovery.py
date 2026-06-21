@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.plugins.diagnostics import check_entrypoint_path
-from miniharness.plugins.discovery import discover_plugins
+from singularity.plugins.diagnostics import check_entrypoint_path
+from singularity.plugins.discovery import discover_plugins
 
 
 def test_manifest_discovery_reads_toml_without_importing_plugin(tmp_path: Path) -> None:
@@ -27,7 +27,7 @@ def test_manifest_discovery_supports_both_manifest_names(tmp_path: Path) -> None
     first = _plugin_dir(tmp_path, "first_plugin")
     second = _plugin_dir(tmp_path, "second_plugin")
     _write_manifest(first, plugin_id="first_plugin", filename="plugin.toml")
-    _write_manifest(second, plugin_id="second_plugin", filename="miniharness-plugin.toml")
+    _write_manifest(second, plugin_id="second_plugin", filename="singularity-plugin.toml")
 
     discovered = discover_plugins(tmp_path)
 
@@ -43,7 +43,7 @@ def test_manifest_discovery_order_project_env_user(tmp_path: Path, monkeypatch: 
     _write_manifest(project_plugin, plugin_id="project_plugin")
     _write_manifest(env_plugin, plugin_id="env_plugin")
     _write_manifest(user_plugin, plugin_id="user_plugin")
-    monkeypatch.setenv("MINIHARNESS_PLUGIN_PATH", str(env_root))
+    monkeypatch.setenv("SINGULARITY_PLUGIN_PATH", str(env_root))
 
     discovered = discover_plugins(tmp_path, home=user_home)
 
@@ -60,7 +60,7 @@ def test_duplicate_plugin_ids_are_diagnostic(tmp_path: Path, monkeypatch: pytest
     env_plugin = env_root / "demo_env"
     _write_manifest(project_plugin, plugin_id="demo_plugin")
     _write_manifest(env_plugin, plugin_id="demo_plugin")
-    monkeypatch.setenv("MINIHARNESS_PLUGIN_PATH", str(env_root))
+    monkeypatch.setenv("SINGULARITY_PLUGIN_PATH", str(env_root))
 
     discovered = discover_plugins(tmp_path)
 
@@ -97,7 +97,7 @@ def test_symlink_entrypoint_escape_is_rejected_when_supported(tmp_path: Path) ->
 
 
 def _plugin_dir(root: Path, name: str) -> Path:
-    path = root / ".miniharness" / "plugins" / name
+    path = root / ".singularity" / "plugins" / name
     path.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from miniharness.trace import TraceWriter
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.trace import TraceWriter
 from tests.tool_runtime_helpers import make_test_policy_runtime
 
 

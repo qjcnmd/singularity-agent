@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.code_index import FileRole, LanguageId, WorkspaceScanner
-from miniharness.code_index.exceptions import PathOutsideWorkspaceError
+from singularity.code_index import FileRole, LanguageId, WorkspaceScanner
+from singularity.code_index.exceptions import PathOutsideWorkspaceError
 
 
 def test_scanner_respects_ignore_roles_hash_binary_and_path_safety(tmp_path: Path) -> None:

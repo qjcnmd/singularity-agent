@@ -2,7 +2,7 @@ import json
 import sys
 from pathlib import Path
 
-from miniharness.sandbox import (
+from singularity.sandbox import (
     DockerSandboxBackend,
     LocalStagingBackend,
     SandboxArtifactCollector,
@@ -16,7 +16,7 @@ from miniharness.sandbox import (
     SandboxStatus,
     default_sandbox_profile,
 )
-from miniharness.policy import SecurityMode
+from singularity.policy import SecurityMode
 
 
 def sandbox_request(tmp_path: Path) -> SandboxRequest:
@@ -42,7 +42,7 @@ def test_runtime_selects_local_backend_and_writes_trace(tmp_path: Path) -> None:
 
     assert result.status == SandboxStatus.SUCCESS
     assert result.backend_name == "local_staging"
-    trace_path = tmp_path / ".miniharness" / "sandbox" / "trace.jsonl"
+    trace_path = tmp_path / ".singularity" / "sandbox" / "trace.jsonl"
     events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert events[-1]["sandbox_id"] == "sandbox_runtime"
     assert events[-1]["status"] == "success"
@@ -56,7 +56,7 @@ def test_runtime_defaults_to_docker_when_available(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr("miniharness.sandbox.backends.docker_backend_available", lambda: True)
+    monkeypatch.setattr("singularity.sandbox.backends.docker_backend_available", lambda: True)
 
     runtime = SandboxRuntime(tmp_path)
 
@@ -68,7 +68,7 @@ def test_runtime_falls_back_to_local_when_docker_unavailable(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr("miniharness.sandbox.backends.docker_backend_available", lambda: False)
+    monkeypatch.setattr("singularity.sandbox.backends.docker_backend_available", lambda: False)
 
     runtime = SandboxRuntime(tmp_path)
 
@@ -172,7 +172,7 @@ def test_runtime_returns_backend_unavailable_when_capability_missing(tmp_path: P
     assert result.exit_code is None
     assert result.metadata["error_code"] == "sandbox_unavailable"
 
-    trace_path = tmp_path / ".miniharness" / "sandbox" / "trace.jsonl"
+    trace_path = tmp_path / ".singularity" / "sandbox" / "trace.jsonl"
     events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert events[-1]["session_id"] == "session"
     assert events[-1]["task_id"] == "task"

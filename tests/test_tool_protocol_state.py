@@ -5,16 +5,16 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.tool_protocol.models import (
+from singularity.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
     ToolCallFailureKind,
     ToolCallPhase,
     ToolProtocolResultEnvelope,
 )
-from miniharness.tool_protocol.result import ToolProtocolResultBuilder
-from miniharness.tool_protocol.state import ToolProtocolStateStore
-from miniharness.tools.models import ToolResult, ToolSideEffectKind
+from singularity.tool_protocol.result import ToolProtocolResultBuilder
+from singularity.tool_protocol.state import ToolProtocolStateStore
+from singularity.tools.models import ToolResult, ToolSideEffectKind
 
 
 def make_envelope(

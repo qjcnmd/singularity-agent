@@ -1,4 +1,4 @@
-from miniharness.sandbox import SandboxEnvironmentBuilder, SandboxEnvPolicy
+from singularity.sandbox import SandboxEnvironmentBuilder, SandboxEnvPolicy
 
 
 def test_default_env_does_not_leak_api_key() -> None:
@@ -40,8 +40,8 @@ def test_case_insensitive_secret_env_key_is_filtered() -> None:
 def test_extra_env_can_inject_non_sensitive_values() -> None:
     builder = SandboxEnvironmentBuilder()
     env = builder.build_env(
-        SandboxEnvPolicy(extra_env={"MINIHARNESS_SANDBOX": "1"}),
+        SandboxEnvPolicy(extra_env={"SINGULARITY_SANDBOX": "1"}),
         {},
     )
 
-    assert env["MINIHARNESS_SANDBOX"] == "1"
+    assert env["SINGULARITY_SANDBOX"] == "1"

@@ -1,4 +1,4 @@
-from miniharness.instructions import (
+from singularity.instructions import (
     InstructionFrame,
     InstructionPriority,
     InstructionScope,
@@ -9,7 +9,7 @@ from miniharness.instructions import (
     PromptSection,
     TrustLevel,
 )
-from miniharness.model import ModelMessage, ModelRole
+from singularity.model import ModelMessage, ModelRole
 
 
 def test_instruction_models_construct_and_serialize() -> None:
@@ -75,6 +75,6 @@ def test_instruction_models_construct_and_serialize() -> None:
 
 
 def test_priority_comparison_is_stable() -> None:
-    assert InstructionPriority.SYSTEM_INVARIANT > InstructionPriority.HARNESS_DEVELOPER
+    assert InstructionPriority.SYSTEM_INVARIANT > InstructionPriority.SINGULARITY_DEVELOPER
     assert InstructionPriority.USER_TASK > InstructionPriority.PROJECT_INSTRUCTION
     assert InstructionPriority.RETRIEVED_CONTENT > InstructionPriority.MODEL_GENERATED

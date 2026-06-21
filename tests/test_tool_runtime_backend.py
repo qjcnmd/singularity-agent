@@ -5,8 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from miniharness.policy import Capability, OperationKind
-from miniharness.tools import (
+from singularity.policy import Capability, OperationKind
+from singularity.tools import (
     PermissionLevel,
     ToolExecutionBackendKind,
     ToolPolicy,
@@ -14,7 +14,7 @@ from miniharness.tools import (
     ToolRuntime,
     ToolSpec,
 )
-from miniharness.trace import TraceWriter
+from singularity.trace import TraceWriter
 from tests.tool_runtime_helpers import runtime_default_policy_runtime, make_test_policy_runtime
 
 

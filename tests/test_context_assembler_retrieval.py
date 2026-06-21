@@ -1,5 +1,5 @@
-from miniharness.context.assembler import ContextAssembler
-from miniharness.context.models import (
+from singularity.context.assembler import ContextAssembler
+from singularity.context.models import (
     ContextAuthority,
     ContextBundle,
     ContextItem,
@@ -10,7 +10,7 @@ from miniharness.context.models import (
     ContextRuntime,
     ContextSensitivity,
 )
-from miniharness.context.tokens import TokenCounter
+from singularity.context.tokens import TokenCounter
 
 
 def item(

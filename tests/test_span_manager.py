@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from miniharness.observability.models import TraceStatus
-from miniharness.observability.runtime import TraceRuntime
+from singularity.observability.models import TraceStatus
+from singularity.observability.runtime import TraceRuntime
 
 
 def test_span_manager_start_end_and_context_manager_success(tmp_path) -> None:

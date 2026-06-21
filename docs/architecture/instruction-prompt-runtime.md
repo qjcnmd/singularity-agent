@@ -1,6 +1,6 @@
 # Instruction / Prompt Runtime
 
-Miniharness v0.0.15 adds a dedicated instruction and prompt compilation layer. The goal is not a larger system prompt string; it is a runtime boundary that turns typed instruction sources into a provider-ready `PromptBundle` and a trace-safe `PromptManifest`.
+Singularity v0.0.15 adds a dedicated instruction and prompt compilation layer. The goal is not a larger system prompt string; it is a runtime boundary that turns typed instruction sources into a provider-ready `PromptBundle` and a trace-safe `PromptManifest`.
 
 ## Boundary
 
@@ -11,7 +11,7 @@ It does not execute tools, call models, approve policy decisions, mutate files, 
 The model-call path is:
 
 ```txt
-MiniAgent
+SingularityAgent
   -> ContextManager exports compact observations with source metadata
   -> InstructionRuntime builds PromptBundle and PromptManifest
   -> ModelRuntime receives PromptBundle.messages
@@ -22,17 +22,17 @@ MiniAgent
 
 Instruction sources are represented by `InstructionSource` with:
 
-- `source_type`: system, harness, user message, project instruction file, project file, README, tool output, command output, verification evidence, policy observation, sandbox observation, trace summary, model output, or context summary.
-- `priority`: system invariant, harness developer, user session, user task, project instruction, runtime observation, retrieved content, or model generated.
-- `trust_level`: trusted system, trusted harness, trusted user, project declared, runtime observation, untrusted content, or model generated.
+- `source_type`: system, Singularity, user message, project instruction file, project file, README, tool output, command output, verification evidence, policy observation, sandbox observation, trace summary, model output, or context summary.
+- `priority`: system invariant, Singularity developer, user session, user task, project instruction, runtime observation, retrieved content, or model generated.
+- `trust_level`: trusted system, trusted Singularity, trusted user, project declared, runtime observation, untrusted content, or model generated.
 - `scope`: runtime, purpose, path, tool, session-only, and task-only filters.
 - `content`, `metadata`, `source_hash`, and redaction status.
 
 `ProjectInstructionLoader` loads only these filenames inside the workspace root:
 
 - `AGENTS.md`
-- `.miniharness/instructions.md`
-- `.miniharness/AGENTS.md`
+- `.singularity/instructions.md`
+- `.singularity/AGENTS.md`
 
 Paths are canonicalized and workspace escapes are rejected. Files are byte-limited and truncated with metadata when needed. Project instructions are `project_declared`, not trusted user instructions.
 
@@ -42,7 +42,7 @@ Priority is deterministic:
 
 ```txt
 system_invariant
-> harness_developer
+> singularity_developer
 > user_session
 > user_task
 > project_instruction
@@ -51,7 +51,7 @@ system_invariant
 > model_generated
 ```
 
-Lower-priority content cannot override higher-priority instructions. Project instructions cannot override user task/session, harness, or system rules. Tool output, command output, project files, README content, model output, and summaries are data unless a higher-trust runtime classifies them otherwise.
+Lower-priority content cannot override higher-priority instructions. Project instructions cannot override user task/session, Singularity, or system rules. Tool output, command output, project files, README content, model output, and summaries are data unless a higher-trust runtime classifies them otherwise.
 
 When a lower-priority source appears to conflict with a higher source, `InstructionResolver` creates `InstructionConflict`. The lower source is retained as data and can be shown to the model inside a fenced section, but it is not promoted to an executable instruction.
 
@@ -76,7 +76,7 @@ By default warnings are recorded and isolated, not automatically denied. `fail_o
 `PromptCompiler` creates provider-independent model messages:
 
 - system: system invariants, hierarchy notice, hard boundaries
-- developer: harness behavior, tool protocol, evidence/reporting rules, trusted runtime summaries
+- developer: Singularity behavior, tool protocol, evidence/reporting rules, trusted runtime summaries
 - user: current user task/session instruction
 - context data: runtime observations, project instruction data, retrieved content, tool output, command output, summaries
 

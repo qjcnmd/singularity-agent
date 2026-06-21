@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from miniharness.context import ContextManager, RecoveryManager
-from miniharness.context.models import MutationEvidence, PolicyObservation, RecoveredContext
-from miniharness.context.tokens import TokenCounter
+from singularity.context import ContextManager, RecoveryManager
+from singularity.context.models import MutationEvidence, PolicyObservation, RecoveredContext
+from singularity.context.tokens import TokenCounter
 
 
 def test_recovery_reports_pending_tool_calls_without_reexecuting_completed(

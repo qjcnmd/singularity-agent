@@ -1,11 +1,11 @@
 import json
 import sqlite3
 
-from miniharness.context import ContextManager
-from miniharness.context.models import ContextSensitivity
-from miniharness.context.redaction import ContextRedactor, SensitivityClassifier
-from miniharness.context.tokens import TokenCounter
-from miniharness.provider import ToolChoiceMode
+from singularity.context import ContextManager
+from singularity.context.models import ContextSensitivity
+from singularity.context.redaction import ContextRedactor, SensitivityClassifier
+from singularity.context.tokens import TokenCounter
+from singularity.provider import ToolChoiceMode
 
 
 def test_context_redactor_classifies_and_redacts_secret_patterns() -> None:

@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from miniharness.model import ModelMessage, ModelTurnResult, ModelTurnStatus
-from miniharness.observability import TraceRuntime
-from miniharness.review import ReviewDecisionAction, ReviewRuntime
+from singularity.model import ModelMessage, ModelTurnResult, ModelTurnStatus
+from singularity.observability import TraceRuntime
+from singularity.review import ReviewDecisionAction, ReviewRuntime
 
 
 def test_pre_edit_review_emits_trace_and_blocks_validation_review(tmp_path: Path) -> None:

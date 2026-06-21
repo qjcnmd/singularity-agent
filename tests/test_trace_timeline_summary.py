@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from miniharness.observability.models import TraceEventType, TraceSeverity
-from miniharness.observability.runtime import TraceRuntime
+from singularity.observability.models import TraceEventType, TraceSeverity
+from singularity.observability.runtime import TraceRuntime
 
 
 def test_timeline_and_summary_correlate_runtime_events(tmp_path) -> None:

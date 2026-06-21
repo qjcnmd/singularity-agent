@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from miniharness.interaction import (
+from singularity.interaction import (
     ClarificationAnswer,
     ClarificationRequest,
     ControlCommand,
@@ -19,9 +19,9 @@ from miniharness.interaction import (
     RuntimeEvent,
     UserDecision,
 )
-from miniharness.kernel.cancellation import CancellationManager
-from miniharness.observability import TraceEventType, TraceRuntime
-from miniharness.planner import PlannerRuntime
+from singularity.kernel.cancellation import CancellationManager
+from singularity.observability import TraceEventType, TraceRuntime
+from singularity.planner import PlannerRuntime
 
 
 class FakeProvider:

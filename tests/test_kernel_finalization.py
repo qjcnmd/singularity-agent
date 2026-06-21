@@ -4,13 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.config import ProductionRuntimeConfig
-from miniharness.agent import MiniAgentRunResult, MiniAgentRunStatus
-from miniharness.kernel import CancellationError
-from miniharness.kernel.cancellation import CancellationManager
-from miniharness.kernel.finalization import KernelFinalizer
-from miniharness.kernel.lifecycle import RunLifecycleManager
-from miniharness.kernel.models import (
+from singularity.config import ProductionRuntimeConfig
+from singularity.agent import SingularityAgentRunResult, SingularityAgentRunStatus
+from singularity.kernel import CancellationError
+from singularity.kernel.cancellation import CancellationManager
+from singularity.kernel.finalization import KernelFinalizer
+from singularity.kernel.lifecycle import RunLifecycleManager
+from singularity.kernel.models import (
     AgentRun,
     KernelContext,
     KernelStatus,
@@ -19,9 +19,9 @@ from miniharness.kernel.models import (
     RunStatus,
     ShutdownReason,
 )
-from miniharness.kernel.runtime import AgentKernel
-from miniharness.kernel.shutdown import ShutdownSummary
-from miniharness.workspace_state import WorkspaceHealthReport, WorkspaceHealthStatus
+from singularity.kernel.runtime import AgentKernel
+from singularity.kernel.shutdown import ShutdownSummary
+from singularity.workspace_state import WorkspaceHealthReport, WorkspaceHealthStatus
 
 
 def test_kernel_finalizer_builds_safe_final_report(tmp_path) -> None:
@@ -77,7 +77,7 @@ def test_agent_kernel_finalizes_failed_run_before_reraising(
     def fail_run(*args, **kwargs):
         raise RuntimeError("planner failed")
 
-    monkeypatch.setattr("miniharness.kernel.runtime.MiniAgent.run", fail_run)
+    monkeypatch.setattr("singularity.kernel.runtime.SingularityAgent.run", fail_run)
 
     with pytest.raises(RuntimeError, match="planner failed"):
         kernel.run_task("Build kernel")
@@ -96,14 +96,14 @@ def test_agent_kernel_maps_blocked_agent_result_to_failed_run(
     kernel, _trace = _build_kernel(tmp_path)
 
     def blocked_run(*args, **kwargs):
-        return MiniAgentRunResult(
-            status=MiniAgentRunStatus.BLOCKED,
+        return SingularityAgentRunResult(
+            status=SingularityAgentRunStatus.BLOCKED,
             final_answer="Planner blocked finalization",
             turn=1,
             error_code="completion_blocked",
         )
 
-    monkeypatch.setattr("miniharness.kernel.runtime.MiniAgent.run", blocked_run)
+    monkeypatch.setattr("singularity.kernel.runtime.SingularityAgent.run", blocked_run)
 
     result = kernel.run_task("Build kernel")
 
@@ -119,14 +119,14 @@ def test_agent_kernel_maps_max_turns_to_failed_run(
     kernel, _trace = _build_kernel(tmp_path)
 
     def max_turns_run(*args, **kwargs):
-        return MiniAgentRunResult(
-            status=MiniAgentRunStatus.MAX_TURNS_EXCEEDED,
+        return SingularityAgentRunResult(
+            status=SingularityAgentRunStatus.MAX_TURNS_EXCEEDED,
             final_answer="Stopped after max_turns=1",
             turn=1,
             error_code="max_turns_exceeded",
         )
 
-    monkeypatch.setattr("miniharness.kernel.runtime.MiniAgent.run", max_turns_run)
+    monkeypatch.setattr("singularity.kernel.runtime.SingularityAgent.run", max_turns_run)
 
     result = kernel.run_task("Build kernel")
 

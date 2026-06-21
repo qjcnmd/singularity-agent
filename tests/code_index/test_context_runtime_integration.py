@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from miniharness.context import ContextManager
-from miniharness.planner import PlannerRuntime
-from miniharness.code_index import ProjectIndexRuntime
+from singularity.context import ContextManager
+from singularity.planner import PlannerRuntime
+from singularity.code_index import ProjectIndexRuntime
 
 
 class FakeTrace:

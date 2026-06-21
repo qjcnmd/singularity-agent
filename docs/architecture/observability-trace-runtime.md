@@ -1,6 +1,6 @@
 # Observability / Trace Runtime
 
-Miniharness v0.0.13 adds `src/miniharness/observability/` as the local trace backbone. This is not print logging. It is an append-only, structured event system for runtime facts, spans, artifacts, timelines, context summaries, and final report summaries.
+Singularity v0.0.13 adds `src/singularity/observability/` as the local trace backbone. This is not print logging. It is an append-only, structured event system for runtime facts, spans, artifacts, timelines, context summaries, and final report summaries.
 
 The compact boundary is:
 
@@ -73,11 +73,11 @@ Planner integration records task start, action results, replans, completion asse
 
 Tool integration records validation start/failure and dispatch start/completion/failure. Tool arguments are redacted and hashed. Oversized tool results remain bounded by `ToolRuntime`; future large result promotion should use `TraceArtifactStore`.
 
-Policy and approval integration records policy requested/decided/blocked and approval requested/granted/denied. Full policy audit remains in `.miniharness/policy/audit.jsonl`; structured trace stores decision ids and redacted summaries.
+Policy and approval integration records policy requested/decided/blocked and approval requested/granted/denied. Full policy audit remains in `.singularity/policy/audit.jsonl`; structured trace stores decision ids and redacted summaries.
 
-Command integration records command requested/started/completed/failed/timeout/killed. Existing command output artifacts remain under `.miniharness/artifacts/commands/` when generated, and events reference artifact handles instead of embedding full output.
+Command integration records command requested/started/completed/failed/timeout/killed. Existing command output artifacts remain under `.singularity/artifacts/commands/` when generated, and events reference artifact handles instead of embedding full output.
 
-Sandbox integration records sandbox requested/prepared/started/completed/violation/cleaned/capability_failed when `TraceRuntime` is passed in. Legacy `.miniharness/sandbox/trace.jsonl` remains supported when `SandboxTraceWriter` is used directly; it records cwd/workspace/sandbox handles rather than absolute sandbox roots.
+Sandbox integration records sandbox requested/prepared/started/completed/violation/cleaned/capability_failed when `TraceRuntime` is passed in. Legacy `.singularity/sandbox/trace.jsonl` remains supported when `SandboxTraceWriter` is used directly; it records cwd/workspace/sandbox handles rather than absolute sandbox roots.
 
 Mutation integration records mutation transaction start, applied file operations, failures, and rollback completion. Diff bodies stay in diff artifacts.
 
@@ -92,11 +92,11 @@ Final reports include `execution_trace_summary` with actions, failed actions, to
 The trace CLI is intentionally small:
 
 ```powershell
-miniharness trace list
-miniharness trace show <run_id>
-miniharness trace timeline <run_id>
-miniharness trace errors <run_id>
-miniharness trace artifacts <run_id>
+singularity trace list
+singularity trace show <run_id>
+singularity trace timeline <run_id>
+singularity trace errors <run_id>
+singularity trace artifacts <run_id>
 ```
 
 `trace artifacts` shows artifact id, kind, size, summary-level metadata, and a relative handle. It does not print the internal absolute artifact path. These commands read the local append-only store. They do not replay actions or contact remote telemetry systems.

@@ -1,6 +1,6 @@
 # Sandbox / Isolation Runtime
 
-Miniharness v0.0.12 adds a local Sandbox Runtime. It turns policy outcomes such as `sandbox_required` and `PolicyConstraints.sandbox_required=True` into an actual isolated execution path instead of treating sandbox as a placeholder.
+Singularity v0.0.12 adds a local Sandbox Runtime. It turns policy outcomes such as `sandbox_required` and `PolicyConstraints.sandbox_required=True` into an actual isolated execution path instead of treating sandbox as a placeholder.
 
 The compact boundary is:
 
@@ -19,7 +19,7 @@ PolicyRuntime
   -> CommandResult / VerificationEvidence / Planner evidence / FinalReport
 ```
 
-Docker is the preferred hard-isolation backend when the Docker CLI and daemon are available. Docker is not a required development dependency: if it is unavailable, Miniharness keeps `LocalStagingBackend` for copy-on-write execution. If policy requires hard network isolation, memory limits, or process limits and no capable backend is available, the runtime returns `backend_unavailable` and does not fall back to real local execution.
+Docker is the preferred hard-isolation backend when the Docker CLI and daemon are available. Docker is not a required development dependency: if it is unavailable, Singularity keeps `LocalStagingBackend` for copy-on-write execution. If policy requires hard network isolation, memory limits, or process limits and no capable backend is available, the runtime returns `backend_unavailable` and does not fall back to real local execution.
 
 This slice does not implement Git Runtime, Podman, WSL, remote approval, persistent sandbox sessions, host allowlist enforcement inside Docker, or automatic import of sandbox changes.
 
@@ -71,7 +71,7 @@ It guarantees:
 
 ```txt
 copy-on-write workspace staging
-default exclusion of .git, node_modules, venv, caches, build outputs, and harness sandboxes
+default exclusion of .git, node_modules, venv, caches, build outputs, and runtime sandboxes
 cwd mapping only when the original cwd is inside the workspace
 filtered and redacted environment
 timeout and output preview limits
@@ -130,7 +130,7 @@ build
 coverage
 .coverage
 work/sandboxes
-.miniharness/sandboxes
+.singularity/sandboxes
 ```
 
 The runtime records a baseline before execution and compares it afterward. Changes are returned as `SandboxChangeSummary` only. They are not written back to the real workspace. Future import must go through `MutationRuntime` and `PolicyRuntime`.
@@ -215,7 +215,7 @@ imported_changes_count
 Sandbox trace is append-only JSONL:
 
 ```txt
-.miniharness/sandbox/trace.jsonl
+.singularity/sandbox/trace.jsonl
 ```
 
 Each entry records sandbox id, session, task, action, backend, profile, capabilities, command summary, cwd handle, workspace handle, sandbox handle, filesystem mode, network mode, redaction flag, time/output limits, status, exit code, duration, artifacts, changed-file count, violations, cleanup status, and policy decision id. Absolute sandbox paths stay internal to the backend.

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from miniharness.memory.models import (
+from singularity.memory.models import (
     Confidence,
     MemoryCandidate,
     MemoryEvidenceRef,
@@ -9,7 +9,7 @@ from miniharness.memory.models import (
     MemoryType,
     Provenance,
 )
-from miniharness.memory.policy import AdmissionAction, MemoryPolicy
+from singularity.memory.policy import AdmissionAction, MemoryPolicy
 
 
 def candidate(

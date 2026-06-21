@@ -3,15 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from miniharness.edit import (
+from singularity.edit import (
     EditIntent,
     EditOperation,
     EditRuntime,
     EditScope,
     EditStrategyKind,
 )
-from miniharness.workspace import MutationRuntime
-from miniharness.review import (
+from singularity.workspace import MutationRuntime
+from singularity.review import (
     ReviewDecision,
     ReviewDecisionAction,
     ReviewReport,

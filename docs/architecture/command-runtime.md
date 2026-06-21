@@ -1,6 +1,6 @@
 # Command Runtime
 
-Miniharness routes process execution through a Command Runtime. A shell is not a normal tool: it can execute project code, mutate the workspace, leak environment secrets, access the network, start background processes, and leave child processes behind. The runtime makes those effects explicit before a command is started and keeps the result auditable afterward.
+Singularity routes process execution through a Command Runtime. A shell is not a normal tool: it can execute project code, mutate the workspace, leak environment secrets, access the network, start background processes, and leave child processes behind. The runtime makes those effects explicit before a command is started and keeps the result auditable afterward.
 
 The compact production boundary is:
 
@@ -227,7 +227,7 @@ The collector:
 - Truncates stdout, stderr, and combined previews independently.
 - Marks `output_truncated`.
 - Computes an output digest.
-- Saves large output artifacts under `.miniharness/artifacts/commands/`.
+- Saves large output artifacts under `.singularity/artifacts/commands/`.
 
 Context Manager receives a compact `command_result` observation with status, exit code, semantic status, duration, summary, key output, changed files, truncation state, artifact path, and error code. Full stdout/stderr are not appended to messages.
 
@@ -250,7 +250,7 @@ This is the path for dev servers such as Vite, `npm run dev`, Uvicorn, Django ru
 
 ## Workspace Side Effects
 
-The command runtime captures a workspace snapshot before and after execution. It skips VCS internals, harness artifacts, caches, virtual environments, `node_modules`, and bytecode directories.
+The command runtime captures a workspace snapshot before and after execution. It skips VCS internals, runtime artifacts, caches, virtual environments, `node_modules`, and bytecode directories.
 
 `CommandResult.changed_files` reports files created, removed, or changed by the command. These changes are command side effects, not agent-authored mutation transactions.
 

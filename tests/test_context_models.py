@@ -1,4 +1,4 @@
-from miniharness.context.models import (
+from singularity.context.models import (
     ContextAuthority,
     ContextFreshness,
     ContextItem,

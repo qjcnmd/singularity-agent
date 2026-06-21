@@ -1,6 +1,6 @@
 # Policy / Approval Runtime
 
-Miniharness v0.0.11 adds a unified local `PolicyRuntime`. It is the permission, risk, approval, and audit boundary for runtime actions. The model and planner can propose actions, but they do not own execution permission.
+Singularity v0.0.11 adds a unified local `PolicyRuntime`. It is the permission, risk, approval, and audit boundary for runtime actions. The model and planner can propose actions, but they do not own execution permission.
 
 The compact boundary is:
 
@@ -17,7 +17,7 @@ ToolRuntime / MutationRuntime / CommandRuntime / VerificationRuntime
   -> FinalReport Policy & Approval Summary
 ```
 
-Git policy, remote approval, persistent approval profiles, and container sandbox backends are intentionally not implemented in this slice. Miniharness v0.0.12 adds a local staging sandbox backend, but it is not a Docker/Podman/WSL or kernel-level security boundary.
+Git policy, remote approval, persistent approval profiles, and container sandbox backends are intentionally not implemented in this slice. Singularity v0.0.12 adds a local staging sandbox backend, but it is not a Docker/Podman/WSL or kernel-level security boundary.
 
 ## Core Objects
 
@@ -37,7 +37,7 @@ Grant consumption is owned by `PolicyRuntime`, so a local approval is converted 
 `PolicyAuditWriter` writes append-only JSONL to:
 
 ```txt
-.miniharness/policy/audit.jsonl
+.singularity/policy/audit.jsonl
 ```
 
 The audit log redacts token, API key, Authorization, password, and secret-like content before writing.

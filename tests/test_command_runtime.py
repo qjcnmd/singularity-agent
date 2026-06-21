@@ -4,8 +4,8 @@ import sys
 import time
 from pathlib import Path
 
-from miniharness.command.backend import RunningProcess
-from miniharness.command import (
+from singularity.command.backend import RunningProcess
+from singularity.command import (
     CommandDecision,
     CommandPlan,
     CommandPolicy,
@@ -19,12 +19,12 @@ from miniharness.command import (
     ResourceLimits,
     SemanticStatus,
 )
-from miniharness.policy import ApprovalMode, DecisionOutcome, PolicyConfig, PolicyRuntime, SecurityMode
-from miniharness.context import ContextManager
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from miniharness.tools.command import register_command_tools
-from miniharness.tools.models import ToolResult
-from miniharness.trace import TraceWriter
+from singularity.policy import ApprovalMode, DecisionOutcome, PolicyConfig, PolicyRuntime, SecurityMode
+from singularity.context import ContextManager
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.tools.command import register_command_tools
+from singularity.tools.models import ToolResult
+from singularity.trace import TraceWriter
 from tests.tool_runtime_helpers import runtime_default_policy_runtime
 from tests.test_tool_runtime_policy_approval import SequencedPolicyRuntime
 
@@ -346,7 +346,7 @@ def test_compat_verification_does_not_use_docker_when_available(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "miniharness.sandbox.backends.docker_backend_available",
+        "singularity.sandbox.backends.docker_backend_available",
         lambda: True,
     )
     runtime = compat_command_runtime(tmp_path)
@@ -621,7 +621,7 @@ def test_command_result_records_safe_capability_summary(tmp_path: Path) -> None:
 
 
 def test_sandbox_availability_summary_ignores_unavailable_backends(tmp_path: Path) -> None:
-    from miniharness.sandbox import DockerSandboxBackend, LocalStagingBackend, SandboxRuntime
+    from singularity.sandbox import DockerSandboxBackend, LocalStagingBackend, SandboxRuntime
 
     docker = DockerSandboxBackend()
     docker.is_available = lambda: False  # type: ignore[method-assign]

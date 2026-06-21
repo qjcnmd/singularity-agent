@@ -1,6 +1,6 @@
 # Evaluation Runtime
 
-MiniHarness includes a local-first Evaluation/Benchmark Runtime for replayable benchmark suites, trace replay, A/B profile comparison, regression detection, and report generation. It is an orchestration layer: executable hooks, test checks, and workspace materialization go through the existing command, verification, mutation, trace, memory, and planner boundaries when execution is explicitly enabled.
+Singularity includes a local-first Evaluation/Benchmark Runtime for replayable benchmark suites, trace replay, A/B profile comparison, regression detection, and report generation. It is an orchestration layer: executable hooks, test checks, and workspace materialization go through the existing command, verification, mutation, trace, memory, and planner boundaries when execution is explicitly enabled.
 
 ## Benchmark Task Schema
 
@@ -69,28 +69,28 @@ Each task must use one difficulty tag: `easy`, `medium`, or `hard`. Optional wor
 
 Evaluation hooks are declarative. Command hooks are intended to run through `CommandRuntime` or `VerificationRuntime` when integrated into a real execution pipeline; the evaluation CLI does not bypass those runtimes.
 
-`archive_path` is accepted in the schema, but execution is fail-closed until MiniHarness has a controlled archive restore adapter that stages files and applies them through `MutationRuntime`.
+`archive_path` is accepted in the schema, but execution is fail-closed until Singularity has a controlled archive restore adapter that stages files and applies them through `MutationRuntime`.
 
 ## CLI
 
 Validate and list a Golden Task Set:
 
 ```bash
-miniharness eval task validate golden.json --json
-miniharness eval task list golden.json --version v1 --tag tool-heavy
+singularity eval task validate golden.json --json
+singularity eval task list golden.json --version v1 --tag tool-heavy
 ```
 
 Replay a trace with a fixed profile:
 
 ```bash
-miniharness eval trace replay work/traces/runs/run_123 \
+singularity eval trace replay work/traces/runs/run_123 \
   --profile-json "{\"name\":\"baseline\",\"model\":\"gpt-test\",\"prompt_profile\":\"default\",\"memory_enabled\":true,\"allowed_tools\":[\"read_file\"],\"tool_policy\":\"read_only\"}"
 ```
 
 Run a suite:
 
 ```bash
-miniharness eval suite run golden.json \
+singularity eval suite run golden.json \
   --trace-run-dir work/traces/runs/run_123 \
   --profile-json "{\"name\":\"baseline\",\"model\":\"gpt-a\",\"memory_enabled\":true,\"allowed_tools\":[\"read_file\",\"run_verification\"],\"tool_policy\":\"read_write\"}"
 ```
@@ -100,11 +100,11 @@ Suite, A/B, and regression commands default to deterministic offline scoring and
 Run A/B or regression checks:
 
 ```bash
-miniharness eval ab run golden.json \
+singularity eval ab run golden.json \
   --baseline-profile-json "{\"name\":\"baseline\",\"model\":\"gpt-a\",\"memory_enabled\":true,\"allowed_tools\":[\"read_file\",\"run_verification\"],\"tool_policy\":\"read_write\"}" \
   --candidate-profile-json "{\"name\":\"candidate\",\"model\":\"gpt-b\",\"prompt_profile\":\"compact\",\"memory_enabled\":false,\"allowed_tools\":[\"read_file\"],\"tool_policy\":\"read_only\"}"
 
-miniharness eval regression run golden.json \
+singularity eval regression run golden.json \
   --baseline-profile-json "{\"name\":\"baseline\",\"model\":\"gpt-a\",\"memory_enabled\":true,\"allowed_tools\":[\"read_file\",\"run_verification\"],\"tool_policy\":\"read_write\"}" \
   --candidate-profile-json "{\"name\":\"candidate\",\"model\":\"gpt-b\",\"prompt_profile\":\"compact\",\"memory_enabled\":false,\"allowed_tools\":[\"read_file\"],\"tool_policy\":\"read_only\"}" \
   --threshold 0.05 --block-on-regression

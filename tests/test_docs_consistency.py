@@ -16,6 +16,9 @@ REQUIRED_ARCHITECTURE_DOCS = [
     "policy-approval.md",
     "trace-audit.md",
     "migration-to-desktop.md",
+    "desktop-architecture-strategy.md",
+    "runtime-host-transition.md",
+    "naming.md",
 ]
 
 REQUIRED_ADRS = [
@@ -24,6 +27,10 @@ REQUIRED_ADRS = [
     "0003-rust-core-tauri-desktop.md",
     "0004-python-as-plugin-runtime.md",
     "0005-mcp-through-tool-broker.md",
+    "0006-singularity-project-identity.md",
+    "0007-adopt-rust-core-tauri-desktop-strategy.md",
+    "0008-runtimehost-as-product-core-boundary.md",
+    "0009-python-as-plugin-runtime.md",
 ]
 
 REQUIRED_SCHEMAS = [
@@ -61,6 +68,13 @@ def test_documentation_runtime_schema_files_exist_and_parse() -> None:
         assert schema["$schema"].startswith("https://json-schema.org/")
         assert schema["type"] == "object"
         assert schema["title"]
+
+
+def test_readme_uses_singularity_identity() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert text.startswith("# Singularity")
+    assert "Singularity" in text
 
 
 def test_readme_runtime_names_match_runtime_map() -> None:

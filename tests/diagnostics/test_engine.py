@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 
-from miniharness.diagnostics import (
+from singularity.diagnostics import (
     DiagnosticCheck,
     DiagnosticContext,
     DiagnosticFinding,
     DiagnosticSeverity,
     DoctorEngine,
 )
-from miniharness.release.paths import resolve_runtime_paths
+from singularity.release.paths import resolve_runtime_paths
 
 
 def test_doctor_engine_filters_and_converts_crashing_check_to_finding(tmp_path):

@@ -2,12 +2,12 @@ import json
 
 import pytest
 
-from miniharness.context.compression import (
+from singularity.context.compression import (
     ContextCompressor,
     ContextSummaryValidationError,
 )
-from miniharness.context import ContextManager
-from miniharness.context.models import (
+from singularity.context import ContextManager
+from singularity.context.models import (
     ContextAuthority,
     ContextItem,
     ContextItemType,

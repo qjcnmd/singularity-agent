@@ -3,8 +3,8 @@ import sqlite3
 
 import pytest
 
-from miniharness.context import ContextVersionConflict, ObservationStore
-from miniharness.context.models import (
+from singularity.context import ContextVersionConflict, ObservationStore
+from singularity.context.models import (
     ContextAuthority,
     ContextFreshness,
     ContextItem,

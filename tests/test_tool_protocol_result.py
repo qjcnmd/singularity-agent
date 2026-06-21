@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miniharness.tool_protocol.models import ToolCallEnvelope
-from miniharness.tool_protocol.result import ToolProtocolResultBuilder
-from miniharness.tools.models import ToolResult
+from singularity.tool_protocol.models import ToolCallEnvelope
+from singularity.tool_protocol.result import ToolProtocolResultBuilder
+from singularity.tools.models import ToolResult
 
 
 def test_result_builder_redacts_and_references_raw_result(tmp_path) -> None:

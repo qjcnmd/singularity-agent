@@ -1,8 +1,16 @@
-# MiniHarness v0.1.0
+# Singularity v0.1.0
 
-MiniHarness is a production-grade local CLI coding agent harness. The v0.1.0 baseline aligns the CLI, agent orchestration, tool protocol, context ledger, local memory, policy enforcement, workspace state, verification, and trace layers behind one production path.
+Singularity is a production-grade local coding agent runtime. The v0.1.0 baseline ships the Python CLI runtime while the project prepares the Desktop Transition Runtime.
 
 v0.1.x is the CLI runtime baseline. The next architecture phase is Desktop Transition Runtime: a local RuntimeHost/daemon boundary around the existing Python runtime, not another round of CLI-only feature accumulation. The target product architecture is Rust Core + Tauri Desktop + TypeScript UI + Python Plugin Runtime, introduced in stages without deleting the current Python runtime.
+
+Project identity:
+
+- product name: `Singularity`
+- Python package: `singularity`
+- CLI names: `singularity-agent` and `sg`
+- environment prefix: `SINGULARITY_`
+- project runtime directory: `.singularity/`
 
 Documentation Runtime is the contract entrypoint for that transition:
 
@@ -13,7 +21,10 @@ Documentation Runtime is the contract entrypoint for that transition:
 - `docs/architecture/tool-protocol.md`
 - `docs/architecture/policy-approval.md`
 - `docs/architecture/trace-audit.md`
+- `docs/architecture/desktop-architecture-strategy.md`
 - `docs/architecture/migration-to-desktop.md`
+- `docs/architecture/runtime-host-transition.md`
+- `docs/architecture/naming.md`
 - `docs/adr/`
 - `docs/schemas/`
 
@@ -27,7 +38,7 @@ They execute through the same production chain as every other tool call:
 
 ```text
 CLI
--> MiniAgent
+-> SingularityAgent
 -> PlannerRuntime
 -> ContextRuntime
 -> ModelRuntime
@@ -45,7 +56,7 @@ Runtime names tracked by Documentation Runtime:
 - `CLI`
 - `KernelBootstrap`
 - `AgentKernel`
-- `MiniAgent`
+- `SingularityAgent`
 - `PlannerRuntime`
 - `ContextRuntime`
 - `InstructionRuntime`
@@ -72,7 +83,7 @@ Runtime names tracked by Documentation Runtime:
 - `DocumentationRuntime`
 <!-- runtime-names:end -->
 
-MiniHarness does not implement a Git Runtime, web search, multi-agent execution, remote approval, or remote memory sync in this release. Sandbox execution prefers Docker as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps the local copy-on-write staging backend. Requests that require hard isolation fail closed when no capable backend is available.
+Singularity does not implement a Git Runtime, web search, multi-agent execution, remote approval, or remote memory sync in this release. Sandbox execution prefers Docker as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps the local copy-on-write staging backend. Requests that require hard isolation fail closed when no capable backend is available.
 
 ## Install
 
@@ -82,34 +93,40 @@ pip install -e .
 
 Configure the OpenAI-compatible provider through environment variables. The API key is intentionally not accepted as a CLI flag.
 
+Runtime configuration precedence is:
+
+```text
+explicit CLI flag > SINGULARITY_* > config file > defaults
+```
+
 PowerShell:
 
 ```powershell
-$env:MINIHARNESS_BASE_URL = "https://api.openai.com/v1"
-$env:MINIHARNESS_API_KEY = "..."
-$env:MINIHARNESS_MODEL = "gpt-4.1-mini"
+$env:SINGULARITY_BASE_URL = "https://api.openai.com/v1"
+$env:SINGULARITY_API_KEY = "..."
+$env:SINGULARITY_MODEL = "gpt-4.1-mini"
 ```
 
 cmd.exe:
 
 ```bat
-set MINIHARNESS_BASE_URL=https://api.openai.com/v1
-set MINIHARNESS_API_KEY=...
-set MINIHARNESS_MODEL=gpt-4.1-mini
+set SINGULARITY_BASE_URL=https://api.openai.com/v1
+set SINGULARITY_API_KEY=...
+set SINGULARITY_MODEL=gpt-4.1-mini
 ```
 
 POSIX shells:
 
 ```bash
-export MINIHARNESS_BASE_URL=https://api.openai.com/v1
-export MINIHARNESS_API_KEY=...
-export MINIHARNESS_MODEL=gpt-4.1-mini
+export SINGULARITY_BASE_URL=https://api.openai.com/v1
+export SINGULARITY_API_KEY=...
+export SINGULARITY_MODEL=gpt-4.1-mini
 ```
 
 ## CLI
 
 ```bash
-miniharness "inspect the current project" \
+singularity-agent "inspect the current project" \
   --max-turns 8 \
   --approval-mode auto_safe \
   --trace-dir work/traces/runs \
@@ -127,8 +144,8 @@ Supported session options:
 - `--approval-mode`: One of `interactive`, `review_all`, `auto_safe`, `read_only`, or `non_interactive`.
 - `--trace-dir`: Directory that contains per-run trace directories.
 - `--context-db`: Exact ContextStore SQLite path. Defaults to `<trace-run-dir>/context.sqlite3`.
-- `--model`: Overrides `MINIHARNESS_MODEL` for this session.
-- `--base-url`: Overrides `MINIHARNESS_BASE_URL` for this session.
+- `--model`: Overrides `SINGULARITY_MODEL` for this session.
+- `--base-url`: Overrides `SINGULARITY_BASE_URL` for this session.
 - `--raw-artifacts / --no-raw-artifacts`: Controls redacted raw model response artifacts. Raw payloads are never stored without redaction.
 - `--resume`: Resumes a session by id. `--resume-session` remains as a compatibility alias.
 - `--dry-run`: Blocks mutation, command, verification, and other side-effect tools before their handlers run.
@@ -137,48 +154,48 @@ Supported session options:
 Trace inspection commands:
 
 ```bash
-miniharness trace list --trace-dir work/traces/runs
-miniharness trace show <run_id> --trace-dir work/traces/runs
-miniharness trace timeline <run_id> --trace-dir work/traces/runs
-miniharness trace errors <run_id> --trace-dir work/traces/runs
-miniharness trace artifacts <run_id> --trace-dir work/traces/runs
+singularity-agent trace list --trace-dir work/traces/runs
+singularity-agent trace show <run_id> --trace-dir work/traces/runs
+singularity-agent trace timeline <run_id> --trace-dir work/traces/runs
+singularity-agent trace errors <run_id> --trace-dir work/traces/runs
+singularity-agent trace artifacts <run_id> --trace-dir work/traces/runs
 ```
 
 Project index commands:
 
 ```bash
-miniharness index build --json
-miniharness index refresh --json
-miniharness index explain
-miniharness index relevant "fix command runtime timeout handling"
-miniharness index impact src/miniharness/command/runtime.py
-miniharness index tests src/miniharness/command/runtime.py
+singularity-agent index build --json
+singularity-agent index refresh --json
+singularity-agent index explain
+singularity-agent index relevant "fix command runtime timeout handling"
+singularity-agent index impact src/singularity/command/runtime.py
+singularity-agent index tests src/singularity/command/runtime.py
 ```
 
 Local memory commands:
 
 ```bash
-miniharness memory list
-miniharness memory search "pytest temp directory"
-miniharness memory candidates
-miniharness memory accept <candidate_id>
-miniharness memory reject <candidate_id> --reason "not durable"
-miniharness memory delete <memory_id> --reason "superseded"
-miniharness memory doctor
-miniharness memory refresh
-miniharness memory rules list
+singularity-agent memory list
+singularity-agent memory search "pytest temp directory"
+singularity-agent memory candidates
+singularity-agent memory accept <candidate_id>
+singularity-agent memory reject <candidate_id> --reason "not durable"
+singularity-agent memory delete <memory_id> --reason "superseded"
+singularity-agent memory doctor
+singularity-agent memory refresh
+singularity-agent memory rules list
 ```
 
 Evaluation and benchmark commands:
 
 ```bash
-miniharness eval task validate golden.json --json
-miniharness eval task list golden.json --version v1 --tag tool-heavy
-miniharness eval trace replay work/traces/runs/<run_id>
-miniharness eval suite run golden.json --trace-run-dir work/traces/runs/<run_id>
-miniharness eval ab run golden.json --baseline-profile-json "{}" --candidate-profile-json "{}"
-miniharness eval regression run golden.json --baseline-profile-json "{}" --candidate-profile-json "{}"
-miniharness eval report show work/evaluations/<eval_run_id>/report.md
+singularity-agent eval task validate golden.json --json
+singularity-agent eval task list golden.json --version v1 --tag tool-heavy
+singularity-agent eval trace replay work/traces/runs/<run_id>
+singularity-agent eval suite run golden.json --trace-run-dir work/traces/runs/<run_id>
+singularity-agent eval ab run golden.json --baseline-profile-json "{}" --candidate-profile-json "{}"
+singularity-agent eval regression run golden.json --baseline-profile-json "{}" --candidate-profile-json "{}"
+singularity-agent eval report show work/evaluations/<eval_run_id>/report.md
 ```
 
 `benchmark` is an alias for `eval`. Suite, A/B, and regression commands default to deterministic offline scoring and trace replay; pass `--execute` to run declared hooks/tests through the runtime boundaries. Reports are written to `work/evaluations/<run_id>/` by default. See `docs/evaluation-runtime.md` for the Benchmark Task schema, trace replay semantics, scoring fields, A/B profiles, and regression report format.
@@ -203,7 +220,7 @@ Exit code conventions:
 
 ## Runtime Boundaries
 
-`MiniAgent` only orchestrates the session:
+`SingularityAgent` only orchestrates the session:
 
 - `planner.step()`
 - `context.build_bundle()`
@@ -213,7 +230,7 @@ Exit code conventions:
 
 The agent does not execute tools directly, construct tool result messages by hand, make policy decisions, write raw tool trace records, or own protocol state.
 
-The CLI assembles `PlannerRuntime`, `ModelRuntime`, `ToolRuntime`, `ToolCallingProtocolRuntime`, `InstructionRuntime`, `PolicyRuntime`, and `ApprovalGate` before creating `MiniAgent`. Direct `MiniAgent` construction must inject those runtime dependencies instead of relying on a private fallback loop.
+The CLI assembles `PlannerRuntime`, `ModelRuntime`, `ToolRuntime`, `ToolCallingProtocolRuntime`, `InstructionRuntime`, `PolicyRuntime`, and `ApprovalGate` before creating `SingularityAgent`. Direct `SingularityAgent` construction must inject those runtime dependencies instead of relying on a private fallback loop.
 
 `ToolRuntime` requires the session `PolicyRuntime`. It validates schemas and runtime boundaries, enforces policy decisions, resolves local approval grants, blocks dry-run side effects, executes the registered handler only after those gates pass, and records redacted structured trace events.
 
@@ -243,7 +260,7 @@ All model tool calls flow through `ToolCallingProtocolRuntime`. Invalid tool cal
 - `side_effect_replay`
 - `conflicting_replay`
 
-Pending approvals are recoverable through protocol recovery reports. MiniHarness reports `pending_approval_count` and a resume action, but does not implement remote approval.
+Pending approvals are recoverable through protocol recovery reports. Singularity reports `pending_approval_count` and a resume action, but does not implement remote approval.
 
 `ContextItem` and `ContextBundle` are the primary context state. `_messages` is only the provider projection cache. Tool results enter context through `add_tool_protocol_result()`; `add_tool_result()` remains as a compatibility adapter. Workspace health enters context through `add_workspace_state()` and is rendered as structured runtime context, not as a synthetic `workspace_health` tool result.
 
@@ -253,7 +270,7 @@ Trace records use structured events, hashes, digests, opaque artifact ids/handle
 
 ## Safety Boundaries
 
-MiniHarness is local-first. It does not send telemetry to a remote trace backend. Local trace, context, protocol, workspace, and policy files are intended for debugging and recovery, not for unfiltered archival of raw model or tool payloads.
+Singularity is local-first. It does not send telemetry to a remote trace backend. Local trace, context, protocol, workspace, and policy files are intended for debugging and recovery, not for unfiltered archival of raw model or tool payloads.
 
 Current safety boundaries:
 

@@ -33,6 +33,7 @@ Exit criteria:
 
 - README and runtime-map agree on runtime names
 - required docs/ADRs/schemas exist
+- README names Singularity as the active project identity
 - current tests remain green
 
 ## Phase 1: Desktop Transition Runtime
@@ -93,6 +94,7 @@ Rules:
 - Tauri invokes RuntimeHost/daemon commands, not Python internals
 - TypeScript UI subscribes to run events and snapshots
 - UI never edits trace, context, protocol, policy, or workspace-state files directly
+- desktop clients use `singularity-agent` or `sg` commands for installed CLI interop, never bare `singularity`
 
 ## Phase 4: Rust Core Candidate
 
@@ -142,3 +144,50 @@ Rules:
 - runtime state is resumable
 - every side effect has one owning runtime
 - every phase leaves a runnable test behind
+
+## Naming And Package
+
+Names:
+
+- product: Singularity
+- Python package: `singularity`
+- primary CLI: `singularity-agent`
+- short CLI alias: `sg`
+
+Rules:
+
+- the package directory is `src/singularity`
+- the installed commands are `singularity-agent` and `sg`
+- do not add a bare `singularity` command because it conflicts with existing container tooling
+- new Python imports use `singularity.*`
+
+## Environment
+
+Precedence:
+
+```text
+explicit CLI flag > SINGULARITY_* > config file > defaults
+```
+
+Required variables:
+
+- `SINGULARITY_BASE_URL`
+- `SINGULARITY_API_KEY`
+- `SINGULARITY_MODEL`
+- `SINGULARITY_HOME`
+- `SINGULARITY_MODE`
+- `SINGULARITY_PLUGIN_PATH`
+
+Secrets must not be copied into config files.
+
+## Config, State, And Cache
+
+User directories on Linux-style systems:
+
+```text
+~/.config/singularity/
+~/.local/share/singularity/
+~/.cache/singularity/
+```
+
+Project-local runtime data uses `.singularity/`. RuntimeHost should expose state and artifacts by stable ids instead of requiring UI clients to parse local paths directly.

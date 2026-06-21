@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from miniharness.observability.models import (
+from singularity.observability.models import (
     TraceArtifact,
     TraceArtifactKind,
     TraceEvent,
@@ -12,7 +12,7 @@ from miniharness.observability.models import (
     TraceSpan,
     TraceStatus,
 )
-from miniharness.observability.store import TraceStore
+from singularity.observability.store import TraceStore
 
 
 def _event(

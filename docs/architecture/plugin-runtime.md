@@ -1,6 +1,6 @@
 # Plugin Runtime Architecture
 
-MiniHarness supports local-only plugins through `miniharness.plugins`. The runtime is manifest-first, host-controlled, permission-gated, compatible with the current API version, and traceable. It does not implement a Git runtime, a remote plugin marketplace, remote updates, or automatic dependency installation.
+Singularity supports local-only plugins through `singularity.plugins`. The runtime is manifest-first, host-controlled, permission-gated, compatible with the current API version, and traceable. It does not implement a Git runtime, a remote plugin marketplace, remote updates, or automatic dependency installation.
 
 ## Lifecycle
 
@@ -11,30 +11,30 @@ discover manifest
 -> validate manifest schema
 -> check enabled status
 -> check manifest hash and path
--> check API/MiniHarness/Python compatibility
+-> check API/Singularity/Python compatibility
 -> validate permissions and config
 -> policy gate local plugin load
 -> import entrypoint from the discovered plugin directory
 -> call register(host)
--> register declared contributions into MiniHarness registries
+-> register declared contributions into Singularity registries
 -> write lock/status and trace events
 ```
 
-Discovery only reads `plugin.toml` or `miniharness-plugin.toml`. It never imports plugin code. Import happens only in `PluginLoader` after an enabled plugin passes validation and policy gates.
+Discovery only reads `plugin.toml` or `singularity-plugin.toml`. It never imports plugin code. Import happens only in `PluginLoader` after an enabled plugin passes validation and policy gates.
 
 ## Directories
 
 Discovery order is stable:
 
-1. Project: `.miniharness/plugins/`
-2. Environment: each directory in `MINIHARNESS_PLUGIN_PATH`, split by `os.pathsep`
+1. Project: `.singularity/plugins/`
+2. Environment: each directory in `SINGULARITY_PLUGIN_PATH`, split by `os.pathsep`
 3. User config: `resolve_runtime_paths(...).config_dir / "plugins"`
 
 Project status is stored in:
 
 ```text
-.miniharness/plugin-status.json
-.miniharness/plugin-lock.json
+.singularity/plugin-status.json
+.singularity/plugin-lock.json
 ```
 
 Plugins are disabled by default. Enabling records plugin id, version, normalized path, manifest hash, approved permissions, config, and compatibility status. If the manifest hash or path changes, the enabled record no longer authorizes loading; the plugin must be enabled again after review.
@@ -84,8 +84,8 @@ The enforced boundaries are:
 - default disabled; status must explicitly enable a discovered id/path/hash
 - normalized entrypoint path must stay inside the plugin directory, including symlink resolution
 - absolute paths and `..` entrypoints are rejected
-- API version, MiniHarness version, Python version, permissions, config, and policy are checked before load
-- plugins receive only `PluginHost`, not internal MiniHarness runtime objects
+- API version, Singularity version, Python version, permissions, config, and policy are checked before load
+- plugins receive only `PluginHost`, not internal Singularity runtime objects
 - plugin failures become diagnostics and trace events instead of crashing the runtime graph
 - high-risk tool execution still flows through `ToolRuntime`, `PolicyRuntime`, `ApprovalGate`, `CommandRuntime`, `SandboxRuntime`, and trace
 
@@ -131,21 +131,21 @@ Payloads include safe summaries such as plugin id, version, manifest hash, statu
 ## CLI
 
 ```text
-miniharness plugin list --json
-miniharness plugin inspect local_echo --json
-miniharness plugin check local_echo --json
-miniharness plugin enable local_echo --json
-miniharness plugin disable local_echo --json
+singularity plugin list --json
+singularity plugin inspect local_echo --json
+singularity plugin check local_echo --json
+singularity plugin enable local_echo --json
+singularity plugin disable local_echo --json
 ```
 
-`--mode` and `--home` use the same runtime path resolution as the system commands for user-level discovery. Enabling is project-level and writes `.miniharness/plugin-status.json`.
+`--mode` and `--home` use the same runtime path resolution as the system commands for user-level discovery. Enabling is project-level and writes `.singularity/plugin-status.json`.
 
 ## Minimal Tool Plugin
 
 Directory:
 
 ```text
-.miniharness/plugins/local_echo/
+.singularity/plugins/local_echo/
   plugin.toml
   plugin.py
 ```
@@ -198,7 +198,7 @@ def register(host):
 Enable and check:
 
 ```text
-miniharness plugin check local_echo
-miniharness plugin enable local_echo
-miniharness plugin list
+singularity plugin check local_echo
+singularity plugin enable local_echo
+singularity plugin list
 ```

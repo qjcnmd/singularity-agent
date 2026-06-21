@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miniharness.tool_protocol.models import (
+from singularity.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
     ToolCallFailureKind,
@@ -11,10 +11,10 @@ from miniharness.tool_protocol.models import (
     ToolProtocolRecoveryReport,
     ToolProtocolTurnStatus,
 )
-from miniharness.tool_protocol.recovery import ToolProtocolRecoveryManager
-from miniharness.tool_protocol.result import ToolProtocolResultBuilder
-from miniharness.tool_protocol.state import ToolProtocolStateStore
-from miniharness.tools.models import ToolResult
+from singularity.tool_protocol.recovery import ToolProtocolRecoveryManager
+from singularity.tool_protocol.result import ToolProtocolResultBuilder
+from singularity.tool_protocol.state import ToolProtocolStateStore
+from singularity.tools.models import ToolResult
 
 
 def _envelope(assistant_message_id: str = "assistant_1") -> ToolCallEnvelope:

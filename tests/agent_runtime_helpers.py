@@ -6,14 +6,14 @@ from typing import Any
 
 from rich.console import Console
 
-from miniharness.agent import MiniAgent
-from miniharness.instructions import InstructionRuntime
-from miniharness.model import ModelRuntime
-from miniharness.planner import PlannerRuntime
-from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
-from miniharness.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from miniharness.trace import TraceWriter
-from miniharness.workspace_state import LocalWorkspaceStateRuntime
+from singularity.agent import SingularityAgent
+from singularity.instructions import InstructionRuntime
+from singularity.model import ModelRuntime
+from singularity.planner import PlannerRuntime
+from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
+from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.trace import TraceWriter
+from singularity.workspace_state import LocalWorkspaceStateRuntime
 from tests.tool_runtime_helpers import make_test_policy_runtime
 
 
@@ -34,7 +34,7 @@ def make_agent_session(
     instruction_runtime: InstructionRuntime | None = None,
     context_db_path: Path | None = None,
     strict: bool = False,
-) -> MiniAgent:
+) -> SingularityAgent:
     registry = tools or ToolRegistry(workspace_root)
     resolved_trace = trace or TraceWriter.create(workspace_root)
     resolved_policy = policy_runtime or make_test_policy_runtime(workspace_root)
@@ -69,7 +69,7 @@ def make_agent_session(
         workspace_root=workspace_root,
         trace=resolved_trace,
     )
-    return MiniAgent(
+    return SingularityAgent(
         provider=provider,
         model_runtime=resolved_model_runtime,
         tools=registry,

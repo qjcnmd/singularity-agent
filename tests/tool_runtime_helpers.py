@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime
+from singularity.policy import ApprovalMode, PolicyConfig, PolicyRuntime
 
 
 def make_test_policy_runtime(workspace_root: Path) -> PolicyRuntime:

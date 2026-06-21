@@ -1,11 +1,11 @@
 from pathlib import Path
 
-from miniharness.model import (
+from singularity.model import (
     ModelToolRenderer,
     ModelToolParseStatus,
     ToolCallNormalizer,
 )
-from miniharness.tools import ToolRegistry
+from singularity.tools import ToolRegistry
 
 
 def test_tool_renderer_filters_hashes_and_normalizes_tool_calls(tmp_path: Path) -> None:

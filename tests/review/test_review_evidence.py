@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from miniharness.review.evidence import collect_review_evidence, stable_payload_hash, to_bounded_plain
+from singularity.review.evidence import collect_review_evidence, stable_payload_hash, to_bounded_plain
 
 
 @dataclass

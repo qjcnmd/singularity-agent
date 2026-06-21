@@ -2,26 +2,26 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.instructions import (
+from singularity.instructions import (
     InstructionRuntimeConfig,
     InstructionSourceType,
     ProjectInstructionLoader,
     TrustLevel,
 )
-from miniharness.instructions.exceptions import InstructionSourceError
+from singularity.instructions.exceptions import InstructionSourceError
 
 
-def test_loads_agents_and_miniharness_instruction_files(tmp_path: Path) -> None:
+def test_loads_agents_and_singularity_instruction_files(tmp_path: Path) -> None:
     (tmp_path / "AGENTS.md").write_text("Project rules", encoding="utf-8")
-    (tmp_path / ".miniharness").mkdir()
-    (tmp_path / ".miniharness" / "instructions.md").write_text("Harness rules", encoding="utf-8")
+    (tmp_path / ".singularity").mkdir()
+    (tmp_path / ".singularity" / "instructions.md").write_text("Singularity rules", encoding="utf-8")
     loader = ProjectInstructionLoader(tmp_path)
 
     sources = loader.load()
 
     assert [source.origin for source in sources] == [
         str((tmp_path / "AGENTS.md").resolve()),
-        str((tmp_path / ".miniharness" / "instructions.md").resolve()),
+        str((tmp_path / ".singularity" / "instructions.md").resolve()),
     ]
     assert all(source.trust_level == TrustLevel.PROJECT_DECLARED for source in sources)
     assert all(source.source_type == InstructionSourceType.PROJECT_INSTRUCTION_FILE for source in sources)

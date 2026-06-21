@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from miniharness.memory.models import (
+from singularity.memory.models import (
     Confidence,
     ConflictStatus,
     MemoryAuthorType,
@@ -83,7 +83,7 @@ def test_human_authored_memory_round_trips_explicitly() -> None:
         type=MemoryType.PROJECT_CONVENTION,
         source=MemorySource.HUMAN_FILE,
         title="Project structure",
-        body="Runtime modules live under src/miniharness.",
+        body="Runtime modules live under src/singularity.",
         author_type=MemoryAuthorType.HUMAN,
         provenance=Provenance(
             evidence=[

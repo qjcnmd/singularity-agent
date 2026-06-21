@@ -1,4 +1,4 @@
-# MiniHarness Patch / Edit Strategy Runtime
+# Singularity Patch / Edit Strategy Runtime
 
 `EditRuntime` sits between `PlannerRuntime` and `MutationRuntime`. Agent-facing write intent should enter through `edit_apply`; the edit layer builds an `EditPlan`, selects a strategy, lowers the plan into existing workspace mutation operations, validates the patch, previews it, applies it through `MutationRuntime`, and records bounded trace/context evidence.
 

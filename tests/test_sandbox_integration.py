@@ -1,10 +1,10 @@
 import sys
 from pathlib import Path
 
-from miniharness.command import CommandRequest, CommandRuntime, ExecutionStatus, SemanticStatus
-from miniharness.planner import EvidenceLedger, PlannerRuntime, TaskState, TaskStatus
-from miniharness.planner.finalizer import Finalizer
-from miniharness.policy import (
+from singularity.command import CommandRequest, CommandRuntime, ExecutionStatus, SemanticStatus
+from singularity.planner import EvidenceLedger, PlannerRuntime, TaskState, TaskStatus
+from singularity.planner.finalizer import Finalizer
+from singularity.policy import (
     DecisionOutcome,
     PolicyConfig,
     PolicyConstraints,
@@ -12,7 +12,7 @@ from miniharness.policy import (
     PolicyRuntime,
     SecurityMode,
 )
-from miniharness.verification import FailureType, VerificationRuntime
+from singularity.verification import FailureType, VerificationRuntime
 
 
 class SandboxRequiredPolicy(PolicyRuntime):

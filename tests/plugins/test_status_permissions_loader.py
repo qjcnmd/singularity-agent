@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miniharness.observability import TraceRuntime
-from miniharness.plugins.diagnostics import validate_config
-from miniharness.plugins.discovery import discover_plugins
-from miniharness.plugins.runtime import PluginRuntime
-from miniharness.plugins.status import PluginStatusStore
-from miniharness.tools import ToolRegistry
+from singularity.observability import TraceRuntime
+from singularity.plugins.diagnostics import validate_config
+from singularity.plugins.discovery import discover_plugins
+from singularity.plugins.runtime import PluginRuntime
+from singularity.plugins.status import PluginStatusStore
+from singularity.tools import ToolRegistry
 
 
 def test_disabled_plugin_is_not_loaded(tmp_path: Path) -> None:
@@ -101,7 +101,7 @@ def test_plugin_exception_does_not_crash_runtime(tmp_path: Path) -> None:
 
 
 def _plugin_dir(root: Path, name: str) -> Path:
-    path = root / ".miniharness" / "plugins" / name
+    path = root / ".singularity" / "plugins" / name
     path.mkdir(parents=True, exist_ok=True)
     return path
 

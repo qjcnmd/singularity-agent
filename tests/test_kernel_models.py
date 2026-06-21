@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miniharness.kernel.models import (
+from singularity.kernel.models import (
     AgentRun,
     AgentSession,
     KernelContext,

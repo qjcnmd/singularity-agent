@@ -1,6 +1,6 @@
 # Workspace Mutation Runtime
 
-Miniharness v0.0.6 routes agent-owned workspace edits through a mutation runtime instead of a raw `write_file` handler. The goal is to make every file change explicit, reviewable, auditable, reversible, and safe against path escape or stale snapshots.
+Singularity v0.0.6 routes agent-owned workspace edits through a mutation runtime instead of a raw `write_file` handler. The goal is to make every file change explicit, reviewable, auditable, reversible, and safe against path escape or stale snapshots.
 
 The runtime is intentionally compact, but it establishes the production boundary:
 
@@ -20,11 +20,11 @@ Tool handlers are not allowed to open, write, remove, or rename files directly. 
 
 ## Modules
 
-`src/miniharness/workspace/pathing.py`
+`src/singularity/workspace/pathing.py`
 
 `WorkspaceRoot` and `WorkspacePathResolver` own workspace root handling. Every user path is canonicalized before use. The resolver rejects relative traversal, absolute paths outside the workspace, symlink escape, Windows drive escape, UNC escape, and path comparisons that only look like they are inside the root. Containment uses normalized `os.path.commonpath`, not string `startswith`.
 
-`src/miniharness/workspace/policy.py`
+`src/singularity/workspace/policy.py`
 
 `FileClassifier` classifies paths into:
 
@@ -42,7 +42,7 @@ allow | require_review | deny
 
 The default policy denies secrets, VCS internals, binary files, large artifacts, dependency directories, generated outputs, caches, and virtual environments. Project config, dependency lockfiles, build scripts, deletion, moving, and formatting require review.
 
-`src/miniharness/workspace/snapshot.py`
+`src/singularity/workspace/snapshot.py`
 
 `FileSnapshot` records:
 
@@ -52,7 +52,7 @@ path, sha256, size, mtime, encoding, line_ending, is_binary
 
 `WorkspaceIndex` snapshots files and checks current hashes before apply and rollback. This detects changes made by the user, IDE, another agent, or a command after the agent read the file.
 
-`src/miniharness/workspace/operations.py`
+`src/singularity/workspace/operations.py`
 
 The operation model includes:
 
@@ -64,11 +64,11 @@ FormatFile
 
 The runtime implements the safe text operations plus `CreateFile`, `DeleteFile`, `MoveFile`, and `UpdateJson`. Parser-backed operations that are not implemented yet return `invalid_operation` instead of writing through an unsafe fallback.
 
-`src/miniharness/workspace/diff.py`
+`src/singularity/workspace/diff.py`
 
-`DiffEngine` emits structured `FileDiff` and `DiffHunk` objects with added and removed line counts, binary and rename flags, digest, truncation status, and artifact path. Large diffs are truncated for model-facing output and saved under `.miniharness/artifacts/diffs/`.
+`DiffEngine` emits structured `FileDiff` and `DiffHunk` objects with added and removed line counts, binary and rename flags, digest, truncation status, and artifact path. Large diffs are truncated for model-facing output and saved under `.singularity/artifacts/diffs/`.
 
-`src/miniharness/workspace/runtime.py`
+`src/singularity/workspace/runtime.py`
 
 `MutationRuntime` builds and applies `ChangeSet` objects. A changeset contains:
 
@@ -79,7 +79,7 @@ created_at, created_by, policy decisions, diffs
 
 `MutationJournal` stores before-file artifacts and per-file journal entries before each write. `RollbackManager` can roll back a transaction id without using `git reset`. Rollback checks the current file hash against the transaction's after hash. If the user edited a file after the transaction, rollback returns `rollback_conflict` and does not overwrite that user change.
 
-`src/miniharness/tools/mutation.py`
+`src/singularity/tools/mutation.py`
 
 Registered mutation tools are:
 

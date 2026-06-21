@@ -8,18 +8,18 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from miniharness.cli import app
-from miniharness.release.init import initialize_runtime
-from miniharness.release.migrations import Migration, apply_migrations, load_manifest
-from miniharness.release.models import atomic_write_json, read_json
-from miniharness.release.paths import RuntimeMode, resolve_runtime_paths
+from singularity.cli import app
+from singularity.release.init import initialize_runtime
+from singularity.release.migrations import Migration, apply_migrations, load_manifest
+from singularity.release.models import atomic_write_json, read_json
+from singularity.release.paths import RuntimeMode, resolve_runtime_paths
 
 
 runner = CliRunner()
 
 
-def test_runtime_paths_honor_miniharness_home(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "home"))
+def test_runtime_paths_honor_singularity_home(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "home"))
 
     paths = resolve_runtime_paths()
 
@@ -34,7 +34,7 @@ def test_system_init_is_idempotent_and_does_not_overwrite_config(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
     first = runner.invoke(app, ["system", "init", "--json"])
     paths = resolve_runtime_paths()
     paths.config_file.write_text('{"schema_version": 1, "custom": true}\n', encoding="utf-8")
@@ -52,7 +52,7 @@ def test_doctor_json_reports_runtime_health_without_real_home(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
     assert runner.invoke(app, ["system", "init"]).exit_code == 0
 
     result = runner.invoke(app, ["doctor", "--json"])
@@ -68,7 +68,7 @@ def test_doctor_json_reports_runtime_health_without_real_home(
 
 
 def test_version_json_uses_project_version_in_source_checkout(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
 
     result = runner.invoke(app, ["version", "--json"])
 
@@ -97,7 +97,7 @@ def test_migration_failure_rolls_back_config_and_manifest(tmp_path: Path) -> Non
 
 
 def test_system_repair_restores_missing_defaults(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
     assert runner.invoke(app, ["system", "init"]).exit_code == 0
     paths = resolve_runtime_paths()
     paths.config_file.unlink()
@@ -113,7 +113,7 @@ def test_system_repair_restores_missing_defaults(monkeypatch, tmp_path: Path) ->
 
 
 def test_uninstall_dry_run_preserves_user_data_by_default(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
     assert runner.invoke(app, ["system", "init"]).exit_code == 0
     paths = resolve_runtime_paths()
     (paths.memory_dir / "note.txt").write_text("keep", encoding="utf-8")
@@ -134,7 +134,7 @@ def test_uninstall_blocks_unowned_runtime_home(monkeypatch, tmp_path: Path) -> N
     home = tmp_path / "not-owned"
     (home / "config").mkdir(parents=True)
     (home / "state").mkdir()
-    monkeypatch.setenv("MINIHARNESS_HOME", str(home))
+    monkeypatch.setenv("SINGULARITY_HOME", str(home))
 
     result = runner.invoke(
         app,
@@ -148,7 +148,7 @@ def test_uninstall_blocks_unowned_runtime_home(monkeypatch, tmp_path: Path) -> N
 
 
 def test_system_export_writes_relative_user_data_archive(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
     assert runner.invoke(app, ["system", "init"]).exit_code == 0
     paths = resolve_runtime_paths()
     (paths.memory_dir / "note.txt").write_text("memory", encoding="utf-8")
@@ -164,7 +164,7 @@ def test_system_export_writes_relative_user_data_archive(monkeypatch, tmp_path: 
 
 
 def test_system_export_does_not_include_output_zip_itself(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("MINIHARNESS_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
     assert runner.invoke(app, ["system", "init"]).exit_code == 0
     paths = resolve_runtime_paths()
     output = paths.backups_dir / "self.zip"
@@ -182,7 +182,10 @@ def test_pyproject_console_script_targets_cli_main() -> None:
 
     payload = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
-    assert payload["project"]["scripts"]["miniharness"] == "miniharness.cli:main"
+    assert payload["project"]["scripts"] == {
+        "singularity-agent": "singularity.cli:main",
+        "sg": "singularity.cli:main",
+    }
     assert "platformdirs>=4.2" in payload["project"]["dependencies"]
     assert "eval" in payload["project"]["optional-dependencies"]
     assert "test" in payload["dependency-groups"]

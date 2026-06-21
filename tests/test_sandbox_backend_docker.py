@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.sandbox.backends import DockerSandboxBackend, docker_backend_available
-from miniharness.sandbox.models import (
+from singularity.sandbox.backends import DockerSandboxBackend, docker_backend_available
+from singularity.sandbox.models import (
     SandboxNetworkMode,
     SandboxNetworkPolicy,
     SandboxProfileName,
@@ -59,13 +59,13 @@ def test_docker_backend_builds_cli_command_with_staged_workspace_and_limits(
         completed_commands.append(command)
         return _Completed()
 
-    monkeypatch.setattr("miniharness.sandbox.backends.subprocess.run", fake_run)
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
     request = _request(tmp_path)
     request.profile.network = SandboxNetworkPolicy(
         mode=SandboxNetworkMode.DENIED,
         require_hard_isolation=True,
     )
-    request.profile.env.extra_env["MINIHARNESS_SAFE_VAR"] = "safe-value"
+    request.profile.env.extra_env["SINGULARITY_SAFE_VAR"] = "safe-value"
     request.profile.resources.max_memory_mb = 128
     request.profile.resources.max_processes = 32
     backend = DockerSandboxBackend(image="python:3.13-slim")
@@ -83,11 +83,11 @@ def test_docker_backend_builds_cli_command_with_staged_workspace_and_limits(
     assert "128m" in command
     assert "--pids-limit" in command
     assert "32" in command
-    assert "MINIHARNESS_SAFE_VAR=safe-value" not in command
+    assert "SINGULARITY_SAFE_VAR=safe-value" not in command
     assert "--env-file" in command
     env_file = Path(command[command.index("--env-file") + 1])
     assert env_file.is_file()
-    assert "MINIHARNESS_SAFE_VAR=safe-value" in env_file.read_text(encoding="utf-8")
+    assert "SINGULARITY_SAFE_VAR=safe-value" in env_file.read_text(encoding="utf-8")
     assert f"{prepared.workspace_copy_root}:/workspace" in command
 
 
@@ -98,7 +98,7 @@ def test_docker_backend_marks_missing_cli_as_backend_unavailable(
     def fake_run(command: list[str], **kwargs: object) -> object:
         raise FileNotFoundError("docker")
 
-    monkeypatch.setattr("miniharness.sandbox.backends.subprocess.run", fake_run)
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
     backend = DockerSandboxBackend(image="python:3.13-slim")
     prepared = backend.prepare(_request(tmp_path))
 
@@ -122,7 +122,7 @@ def test_docker_backend_redacts_internal_paths_from_docker_errors(
         completed.stderr = f"docker failed mounting {command[command.index('-v') + 1]}".encode()
         return completed
 
-    monkeypatch.setattr("miniharness.sandbox.backends.subprocess.run", fake_run)
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
     backend = DockerSandboxBackend(image="python:3.13-slim")
     prepared = backend.prepare(_request(tmp_path))
 
@@ -145,9 +145,9 @@ def test_docker_backend_availability_is_cached(monkeypatch: pytest.MonkeyPatch) 
         calls += 1
         return _Completed()
 
-    monkeypatch.setattr("miniharness.sandbox.backends._DOCKER_AVAILABILITY_CACHE", None)
-    monkeypatch.setattr("miniharness.sandbox.backends.shutil.which", lambda name: "docker")
-    monkeypatch.setattr("miniharness.sandbox.backends.subprocess.run", fake_run)
+    monkeypatch.setattr("singularity.sandbox.backends._DOCKER_AVAILABILITY_CACHE", None)
+    monkeypatch.setattr("singularity.sandbox.backends.shutil.which", lambda name: "docker")
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
 
     assert docker_backend_available() is False
     assert docker_backend_available() is False

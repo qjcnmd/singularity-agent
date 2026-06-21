@@ -1,4 +1,4 @@
-.miniharness/
+.singularity/
 .venv/
 .env
 outputs/

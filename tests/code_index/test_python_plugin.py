@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from miniharness.code_index import WorkspaceScanner
-from miniharness.code_index.plugins.python import PythonPlugin
+from singularity.code_index import WorkspaceScanner
+from singularity.code_index.plugins.python import PythonPlugin
 
 
 def test_python_plugin_extracts_symbols_imports_entrypoints_and_pytest_mapping(tmp_path: Path) -> None:

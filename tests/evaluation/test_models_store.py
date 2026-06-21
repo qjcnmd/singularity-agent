@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.evaluation import (
+from singularity.evaluation import (
     BenchmarkTask,
     EvaluationHook,
     ExpectedOutcome,
@@ -14,8 +14,8 @@ from miniharness.evaluation import (
     WorkspaceSnapshot,
     WorkspaceSnapshotKind,
 )
-from miniharness.evaluation.models import SCHEMA_VERSION
-from miniharness.evaluation.store import TASK_SET_SCHEMA_VERSION
+from singularity.evaluation.models import SCHEMA_VERSION
+from singularity.evaluation.store import TASK_SET_SCHEMA_VERSION
 
 
 def _task(task_id: str = "task.schema") -> BenchmarkTask:

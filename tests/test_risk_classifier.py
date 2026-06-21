@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from miniharness.policy import (
+from singularity.policy import (
     Capability,
     OperationKind,
     PolicyRequest,

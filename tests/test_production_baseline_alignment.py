@@ -6,11 +6,11 @@ from typing import Any
 
 from typer.testing import CliRunner
 
-from miniharness.cli import app
-from miniharness.config import ProductionRuntimeConfig
-from miniharness.context import ContextManager
-from miniharness.context.models import ContextItemType, ContextRuntime
-from miniharness.model import (
+from singularity.cli import app
+from singularity.config import ProductionRuntimeConfig
+from singularity.context import ContextManager
+from singularity.context.models import ContextItemType, ContextRuntime
+from singularity.model import (
     ModelMessage,
     ModelPurpose,
     ModelRuntime,
@@ -20,19 +20,19 @@ from miniharness.model import (
     ModelToolParseStatus,
     MockModelProvider,
 )
-from miniharness.observability import TraceRuntime
-from miniharness.observability.artifacts import TraceArtifactStore
-from miniharness.observability.models import TraceArtifactKind
-from miniharness.policy import ApprovalMode, DecisionOutcome, SecurityMode
-from miniharness.tool_protocol.models import (
+from singularity.observability import TraceRuntime
+from singularity.observability.artifacts import TraceArtifactStore
+from singularity.observability.models import TraceArtifactKind
+from singularity.policy import ApprovalMode, DecisionOutcome, SecurityMode
+from singularity.tool_protocol.models import (
     ToolCallEnvelope,
     ToolCallPhase,
     ToolProtocolResultEnvelope,
     ToolProtocolTurnStatus,
 )
-from miniharness.tool_protocol.runtime import ToolCallingProtocolRuntime
-from miniharness.tool_protocol.state import ToolProtocolStateStore
-from miniharness.tools import (
+from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
+from singularity.tool_protocol.state import ToolProtocolStateStore
+from singularity.tools import (
     PermissionLevel,
     ToolExecutionBackendKind,
     ToolPolicy,
@@ -55,7 +55,7 @@ def test_cli_help_exposes_production_baseline_options_without_legacy_copy() -> N
 
     assert result.exit_code == 0
     output = result.output
-    assert "production-grade local CLI coding agent harness" in output
+    assert "production-grade local CLI coding agent runtime" in output
     assert "minimal" not in output.lower()
     assert "read-only agent loop" not in output.lower()
     for option in [
@@ -429,9 +429,10 @@ def test_read_only_tools_still_execute_through_protocol_runtime(tmp_path: Path) 
 def test_readme_documents_v010_production_architecture() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
 
-    assert "# MiniHarness v0.1.0" in readme
-    assert "production-grade local CLI coding agent harness" in readme
-    assert "CLI\n-> MiniAgent\n-> PlannerRuntime\n-> ContextRuntime\n-> ModelRuntime" in readme
+    assert "# Singularity v0.1.0" in readme
+    assert "Project identity:" in readme
+    assert "production-grade local coding agent runtime" in readme
+    assert "CLI\n-> SingularityAgent\n-> PlannerRuntime\n-> ContextRuntime\n-> ModelRuntime" in readme
     assert "ToolCallingProtocolRuntime\n-> ToolRuntime\n-> PolicyRuntime / ApprovalGate" in readme
     assert "list_files" in readme
     assert "read_file" in readme

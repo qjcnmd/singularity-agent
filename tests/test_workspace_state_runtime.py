@@ -5,19 +5,19 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.command import (
+from singularity.command import (
     CommandPurpose,
     CommandRequest,
     CommandRuntime,
     FilesystemMode,
 )
-from miniharness.context import ContextManager
-from miniharness.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
-from miniharness.tools.models import ToolResult
-from miniharness.tools.workspace_state import WorkspaceHealthInput, WorkspaceHealthToolHandlers
-from miniharness.trace import TraceWriter
-from miniharness.workspace import MutationRuntime, ReplaceText
-from miniharness.workspace_state import (
+from singularity.context import ContextManager
+from singularity.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
+from singularity.tools.models import ToolResult
+from singularity.tools.workspace_state import WorkspaceHealthInput, WorkspaceHealthToolHandlers
+from singularity.trace import TraceWriter
+from singularity.workspace import MutationRuntime, ReplaceText
+from singularity.workspace_state import (
     ChangeOwnership,
     LocalWorkspaceStateRuntime,
     RecoveryStatus,
@@ -60,8 +60,8 @@ def test_session_start_creates_persistent_baseline_and_skips_protected_dirs(tmp_
     assert ".git/HEAD" not in baseline.snapshots
     assert "node_modules/pkg.js" not in baseline.snapshots
     assert "work/pytest-output.txt" not in baseline.snapshots
-    assert (tmp_path / ".miniharness" / "sessions" / "session_1" / "journal.jsonl").exists()
-    assert (tmp_path / ".miniharness" / "workspace_state.sqlite3").exists()
+    assert (tmp_path / ".singularity" / "sessions" / "session_1" / "journal.jsonl").exists()
+    assert (tmp_path / ".singularity" / "workspace_state.sqlite3").exists()
 
 
 def test_file_snapshot_records_hash_metadata_encoding_line_endings_symlink_and_class(
@@ -122,7 +122,7 @@ def test_mutation_runtime_records_agent_owned_changes_in_state_journal_and_trace
 
     events = [
         json.loads(line)
-        for line in (tmp_path / ".miniharness" / "sessions" / "session_1" / "journal.jsonl")
+        for line in (tmp_path / ".singularity" / "sessions" / "session_1" / "journal.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]

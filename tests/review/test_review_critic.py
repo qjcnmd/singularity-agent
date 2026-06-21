@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 
-from miniharness.model import ModelMessage, ModelTurnResult, ModelTurnStatus
-from miniharness.review import ModelCritic, ReviewCategory, ReviewReport, ReviewStage, ReviewTarget
+from singularity.model import ModelMessage, ModelTurnResult, ModelTurnStatus
+from singularity.review import ModelCritic, ReviewCategory, ReviewReport, ReviewStage, ReviewTarget
 
 
 class FakeModelRuntime:

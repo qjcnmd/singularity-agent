@@ -15,7 +15,7 @@ Current v0.1.x status:
 CLI
 -> KernelBootstrap
 -> AgentKernel
--> MiniAgent
+-> SingularityAgent
 -> PlannerRuntime
 -> ContextRuntime / ContextManager
 -> InstructionRuntime
@@ -38,7 +38,7 @@ Keep this list in sync with the matching block in `README.md`.
 - `CLI`
 - `KernelBootstrap`
 - `AgentKernel`
-- `MiniAgent`
+- `SingularityAgent`
 - `PlannerRuntime`
 - `ContextRuntime`
 - `InstructionRuntime`
@@ -71,7 +71,7 @@ Keep this list in sync with the matching block in `README.md`.
 | --- | --- | --- |
 | CLI | Argument parsing, local user IO, exit codes, command rendering | Runtime state, policy decisions, tool execution, protocol recovery |
 | KernelBootstrap / AgentKernel | Runtime graph assembly, lifecycle, lock, cancellation, shutdown, recovery, finalization | Tool handler logic, model/tool protocol semantics, UI rendering policy |
-| MiniAgent | Session orchestration across planner, context, model, protocol, and final answer | Direct tool execution, policy decisions, trace schema, storage layout |
+| SingularityAgent | Session orchestration across planner, context, model, protocol, and final answer | Direct tool execution, policy decisions, trace schema, storage layout |
 | PlannerRuntime | Task state, allowed actions, evidence ledger, completion assessment, final report facts | File writes, shell process execution, approval grants, provider calls |
 | ContextRuntime / ContextManager | Structured context items, bundles, references, compression, model projection | Raw secret retention, policy approval, tool execution, workspace mutation |
 | InstructionRuntime | Instruction collection, trust hierarchy, prompt compilation, prompt manifest | Provider calls, tool execution, approvals, workspace writes |

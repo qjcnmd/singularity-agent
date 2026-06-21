@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://miniharness.local/schemas/approval.schema.json",
-  "title": "MiniHarness Approval",
+  "$id": "https://singularity.local/schemas/approval.schema.json",
+  "title": "Singularity Approval",
   "type": "object",
   "required": [
     "schema_version",

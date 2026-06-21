@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from miniharness.kernel.lifecycle import RunLifecycleManager
-from miniharness.kernel.models import RunStatus, SessionStatus
+from singularity.kernel.lifecycle import RunLifecycleManager
+from singularity.kernel.models import RunStatus, SessionStatus
 
 
 class RecordingTrace:

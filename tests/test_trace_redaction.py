@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from miniharness.observability.redaction import TraceRedactor
+from singularity.observability.redaction import TraceRedactor
 
 
 def test_redacts_secret_keys_recursively_without_preserving_secret_parts() -> None:

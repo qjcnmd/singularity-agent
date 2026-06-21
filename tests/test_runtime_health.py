@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from miniharness.kernel.health import DEFAULT_HEALTH_COMPONENTS, RuntimeHealthChecker
-from miniharness.kernel.models import RuntimeComponentName
+from singularity.kernel.health import DEFAULT_HEALTH_COMPONENTS, RuntimeHealthChecker
+from singularity.kernel.models import RuntimeComponentName
 
 
 def test_runtime_health_checker_reports_missing_critical_components() -> None:

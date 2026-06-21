@@ -4,14 +4,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from miniharness.planner import (
+from singularity.planner import (
     ActionKind,
     AgentAction,
     AuthorizationDecision,
     RiskLevel,
 )
-from miniharness.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
-from miniharness.trace import TraceWriter
+from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
+from singularity.trace import TraceWriter
 from tests.tool_runtime_helpers import make_test_policy_runtime
 
 

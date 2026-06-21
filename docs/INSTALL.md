@@ -1,6 +1,6 @@
-# MiniHarness Install
+# Singularity Install
 
-MiniHarness is packaged as a local Python CLI. Install it from a checkout with:
+Singularity is packaged as a local Python CLI. Install it from a checkout with:
 
 ```bash
 python -m pip install .
@@ -15,14 +15,14 @@ pipx install .
 The console script is:
 
 ```bash
-miniharness
+singularity
 ```
 
-It resolves to `miniharness.cli:main`, so installed usage does not depend on running inside the source checkout.
+It resolves to `singularity.cli:main`, so installed usage does not depend on running inside the source checkout.
 
 ## Runtime Home
 
-By default MiniHarness stores user-level runtime data under the platform user data directory, then creates this layout:
+By default Singularity stores user-level runtime data under the platform user data directory, then creates this layout:
 
 ```text
 config/
@@ -39,19 +39,19 @@ tmp/
 Override the runtime root for tests, portable installs, or isolated runs:
 
 ```bash
-MINIHARNESS_HOME=/path/to/miniharness-home miniharness system init
+SINGULARITY_HOME=/path/to/singularity-home singularity-agent system init
 ```
 
 Portable mode keeps the runtime under the current project directory:
 
 ```bash
-miniharness system init --mode portable
+singularity-agent system init --mode portable
 ```
 
-Development mode keeps the runtime under `.miniharness/` in the current checkout:
+Development mode keeps the runtime under `.singularity/` in the current checkout:
 
 ```bash
-miniharness system init --mode development
+singularity-agent system init --mode development
 ```
 
 ## First Run
@@ -59,7 +59,7 @@ miniharness system init --mode development
 Initialize once:
 
 ```bash
-miniharness system init
+singularity-agent system init
 ```
 
 The command is idempotent. Existing config and manifest files are preserved unless `--force` is passed.
@@ -67,15 +67,15 @@ The command is idempotent. Existing config and manifest files are preserved unle
 Check the installation:
 
 ```bash
-miniharness version
-miniharness doctor
+singularity version
+singularity-agent doctor
 ```
 
 Machine-readable variants:
 
 ```bash
-miniharness version --json
-miniharness doctor --json
+singularity version --json
+singularity-agent doctor --json
 ```
 
 ## Optional Features

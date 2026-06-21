@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from miniharness.sandbox import (
+from singularity.sandbox import (
     SandboxFilesystemManager,
     SandboxFilesystemMode,
     SandboxFilesystemPolicy,
