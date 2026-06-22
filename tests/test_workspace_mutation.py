@@ -5,7 +5,8 @@ import pytest
 
 from singularity.context import ContextManager
 from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
-from singularity.tools.models import ToolResult
+from singularity.policy import DecisionOutcome, OperationKind
+from singularity.tools.models import ToolExecutionBackendKind, ToolResult
 from singularity.trace import TraceWriter
 from singularity.workspace import (
     CreateFile,
@@ -18,6 +19,8 @@ from singularity.workspace import (
 )
 from tests.tool_runtime_helpers import runtime_default_policy_runtime
 from singularity.tools.mutation import register_mutation_tools
+from tests.test_tool_runtime_policy_approval import SequencedPolicyRuntime
+from singularity.workspace_state import LocalWorkspaceStateRuntime, WorkspaceHealthStatus
 
 
 def tool_call(name: str, arguments: dict, *, tool_call_id: str = "call_1") -> dict:
@@ -341,3 +344,49 @@ def test_registered_mutation_tool_applies_through_runtime(tmp_path: Path) -> Non
     assert result.ok is True
     assert source.read_text(encoding="utf-8") == "new\n"
     assert result.content["mutation_status"] == "applied"
+
+
+def test_workspace_create_file_tool_keeps_policy_mutation_and_state_path(tmp_path: Path) -> None:
+    trace = TraceWriter.create(tmp_path)
+    state = LocalWorkspaceStateRuntime(tmp_path, trace=trace)
+    state.begin_session(task_id="task_1", session_id="session_1")
+    policy = SequencedPolicyRuntime([DecisionOutcome.ALLOW, DecisionOutcome.ALLOW])
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    register_mutation_tools(
+        registry,
+        MutationRuntime(
+            tmp_path,
+            trace=trace,
+            state_runtime=state,
+            policy_runtime=policy,  # type: ignore[arg-type]
+        ),
+    )
+    runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy(
+            allowed_permissions=frozenset({PermissionLevel.READ_ONLY, PermissionLevel.WRITE}),
+            denied_risk_tags=frozenset(),
+        ),
+        trace=trace,
+        workspace_root=tmp_path,
+        policy_runtime=policy,  # type: ignore[arg-type]
+    )
+
+    result = runtime.execute_tool_call(
+        tool_call(
+            "workspace_create_file",
+            {
+                "path": "created.txt",
+                "content": "hello\n",
+                "intent": "phase 1a regression",
+            },
+        )
+    )
+
+    assert result.ok is True
+    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "hello\n"
+    assert result.metadata["backend"] == ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME.value
+    assert any(request.operation == OperationKind.CREATE_FILE for request in policy.requests)
+    health = state.get_workspace_health()
+    assert health.status == WorkspaceHealthStatus.DIRTY
+    assert health.agent_changes == ["created.txt"]

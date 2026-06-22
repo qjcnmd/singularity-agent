@@ -285,6 +285,14 @@ def test_explicit_smoke_command_records_exit_stdout_and_stderr(tmp_path: Path) -
         task_intent="run explicit smoke",
         smoke_commands=[["python", "quicksort.py"]],
     )
+    smoke_check = next(
+        check for check in plan.required_checks if check.kind == CheckKind.RUNTIME_SMOKE
+    )
+    assert smoke_check.required is True
+    assert smoke_check.source == "input:smoke_commands"
+    assert smoke_check.command is not None
+    assert smoke_check.command.argv == ["python", "quicksort.py"]
+
     observation = runtime.run_plan(plan.id)
     smoke = next(
         result

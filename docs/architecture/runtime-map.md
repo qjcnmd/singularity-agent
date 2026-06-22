@@ -9,6 +9,17 @@ Current v0.1.x status:
 - No Tauri, Electron, Rust rewrite, remote approval, Git Runtime, or remote memory sync is implemented here.
 - The next implementation phase is Desktop Transition Runtime: a RuntimeHost/local-daemon boundary around the existing Python runtime.
 
+## Phase 1A Fixed Behavior Status
+
+| Behavior | Status | Source of truth |
+| --- | --- | --- |
+| Premature completion without required evidence returns `REPLAN_REQUIRED` and continues the agent loop | resolved | `SingularityAgent._attempt_finalize()` plus regression coverage in `tests/test_agent_task_outcome.py` |
+| `ExecutionOutcomeStatus.RETRYABLE` does not directly terminate a task | resolved | `SingularityAgent._terminal_result_from_outcome()` plus malformed tool-call regression coverage |
+| `ExecutionOutcomeStatus.REPLAN_REQUIRED` does not directly terminate a task | resolved | `SingularityAgent._terminal_result_from_outcome()` plus completion-rejection regression coverage |
+| `plan_verification(smoke_commands=...)` creates required `RUNTIME_SMOKE` checks | resolved | `VerificationRuntime._build_plan()` plus `tests/test_verification_runtime.py` |
+| `run_verification(smoke_commands=...)` executes explicit smoke commands through `VerificationRuntime` / `CommandRuntime` | resolved | `VerificationToolHandlers.run_verification()` and smoke evidence regression coverage |
+| `workspace_create_file` still writes through policy, `MutationRuntime`, journal, trace, and workspace state | resolved | mutation tool registration, `MutationRuntime.apply_changeset()`, and workspace-state regression coverage |
+
 ## Current Execution Path
 
 ```text

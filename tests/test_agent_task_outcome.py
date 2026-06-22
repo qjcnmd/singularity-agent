@@ -105,7 +105,11 @@ def test_premature_final_then_quicksort_smoke_completes(tmp_path: Path) -> None:
     assert "status: completed" in result.final_answer
     assert (tmp_path / "quicksort.py").exists()
     assert len(provider.calls) == 6
-    assert planner.evidence.task_outcomes[0]["error_code"] == "completion_rejected"
+    rejected = planner.evidence.task_outcomes[0]
+    assert rejected["status"] == "replan_required"
+    assert rejected["error_code"] == "completion_rejected"
+    assert rejected["next_action"] == "continue"
+    assert rejected["retry_allowed"] is True
     latest = planner.evidence.verification_results[-1]
     smoke = next(item for item in latest["results"] if item["kind"] == "runtime_smoke")
     assert smoke["evidence"]["exit_code"] == 0
@@ -124,8 +128,15 @@ def test_malformed_tool_args_record_retryable_outcome(tmp_path: Path) -> None:
     result = agent.run("inspect then change code")
 
     assert result.status == SingularityAgentRunStatus.MAX_TURNS_EXCEEDED
+    assert len(provider.calls) == 2
+    assert [item["status"] for item in planner.evidence.task_outcomes] == [
+        "retryable",
+        "replan_required",
+    ]
     retryable = next(item for item in planner.evidence.task_outcomes if item["status"] == "retryable")
     assert retryable["error_code"] in {"invalid_json", "bad_arguments_json"}
+    assert retryable["next_action"] == "retry"
+    assert retryable["retry_allowed"] is True
 
 
 def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> None:
@@ -163,7 +174,11 @@ def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> N
     assert planner.state is not None
     assert planner.state.current_phase == "repairing_failures"
     assert planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "failed"
-    assert planner.evidence.task_outcomes[-1]["error_code"] == "completion_rejected"
+    rejected = planner.evidence.task_outcomes[-1]
+    assert rejected["status"] == "replan_required"
+    assert rejected["error_code"] == "completion_rejected"
+    assert rejected["next_action"] == "continue"
+    assert rejected["retry_allowed"] is True
 
 
 def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:
