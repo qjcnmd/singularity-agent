@@ -14,12 +14,14 @@ from singularity.tool_protocol.models import (
     ToolCallEnvelope,
     ToolCallFailureKind,
     ToolCallPhase,
+    ToolExecutionMode,
     ToolExecutionPlan,
     ToolProtocolResultEnvelope,
     ToolProtocolTurnResult,
     ToolProtocolTurnStatus,
     ToolProtocolValidationResult,
 )
+from singularity.tool_protocol.parallel import ParallelToolExecutor
 from singularity.tool_protocol.recovery import ToolProtocolRecoveryManager
 from singularity.tool_protocol.result import ToolProtocolResultBuilder
 from singularity.tool_protocol.scheduler import ToolProtocolScheduler
@@ -38,6 +40,7 @@ class ToolCallingProtocolRuntime:
         state_store: ToolProtocolStateStore | None = None,
         workspace_state_hook: Any | None = None,
         result_builder: ToolProtocolResultBuilder | None = None,
+        parallel_executor: ParallelToolExecutor | None = None,
     ) -> None:
         self.registry = registry
         self.trace = ToolProtocolTrace(trace)
@@ -46,6 +49,7 @@ class ToolCallingProtocolRuntime:
         self.validator = ToolProtocolValidator(registry)
         self.scheduler = ToolProtocolScheduler(registry)
         self.result_builder = result_builder or ToolProtocolResultBuilder()
+        self.parallel_executor = parallel_executor or ParallelToolExecutor()
         self.recovery_manager = ToolProtocolRecoveryManager(self.state_store)
         self.workspace_state_hook = workspace_state_hook
         self.cancellation_token: Any | None = None
@@ -235,6 +239,14 @@ class ToolCallingProtocolRuntime:
         )
         ordered_calls = plan.ordered_calls
         groups = [ordered_calls]
+        if plan.execution_mode == ToolExecutionMode.PARALLEL_READONLY and plan.parallel_groups:
+            return self._execute_parallel_readonly_plan(
+                plan,
+                batch=batch,
+                context=context,
+                tool_runtime=tool_runtime,
+                turn=turn,
+            )
 
         for group in groups:
             for call in group:
@@ -489,6 +501,266 @@ class ToolCallingProtocolRuntime:
             appended_tool_message_count=appended_tool_message_count,
             next_action=next_action,
             metadata={"last_tool_call_id": last_tool_call_id, "execution_mode": plan.execution_mode.value},
+        )
+
+    def _execute_parallel_readonly_plan(
+        self,
+        plan: ToolExecutionPlan,
+        *,
+        batch: ToolCallBatch,
+        context: ContextManager,
+        tool_runtime: ToolRuntime,
+        turn: int,
+    ) -> ToolProtocolTurnResult:
+        executed_count = 0
+        failed_count = 0
+        rejected_count = 0
+        pending_approval_count = 0
+        appended_tool_message_count = 0
+        last_tool_call_id: str | None = None
+        pending_calls: list[ToolCallEnvelope] = []
+        pending_records: dict[str, Any] = {}
+
+        for group in plan.parallel_groups:
+            self.trace.emit(
+                "tool_protocol.parallel_group_started",
+                summary="Parallel read-only tool group started.",
+                payload={
+                    "plan_id": plan.plan_id,
+                    "batch_id": plan.batch_id,
+                    "tool_call_ids": [call.tool_call_id for call in group],
+                },
+                ids=self._trace_ids(batch),
+            )
+            for call in group:
+                self._throw_if_cancelled()
+                last_tool_call_id = call.tool_call_id
+                call.metadata = dict(call.metadata)
+                call.metadata.setdefault("batch_id", batch.batch_id)
+                record = self.state_store.upsert_record(
+                    call,
+                    batch_id=batch.batch_id,
+                    phase=ToolCallPhase.VALIDATED,
+                )
+                self.trace.emit(
+                    "tool_protocol.call_validated",
+                    summary="Tool call validated.",
+                    payload={
+                        "tool_call_id": call.tool_call_id,
+                        "tool_name": call.tool_name,
+                        "argument_digest": call.argument_digest,
+                        "valid": not bool(call.validation_errors),
+                    },
+                    ids=self._trace_ids(batch, call=call),
+                    severity=TraceSeverity.WARNING if call.validation_errors else TraceSeverity.INFO,
+                )
+                if call.validation_errors:
+                    rejected_count += 1
+                    synthetic = self._synthetic_result(
+                        call,
+                        error_kind=_error_kind_from_validation(call.validation_errors),
+                        message="; ".join(call.validation_errors),
+                        error_code=_error_code_from_validation(call.validation_errors),
+                    )
+                    self.state_store.transition(
+                        call.tool_call_id,
+                        ToolCallPhase.REJECTED,
+                        error_kind=synthetic.error_kind,
+                        error_message="; ".join(call.validation_errors),
+                        tool_result_digest=synthetic.content_digest,
+                    )
+                    self.state_store.bind_result(
+                        record.record_id,
+                        result=synthetic,
+                        raw_result_ref=synthetic.raw_result_ref,
+                    )
+                    observation_id = self._append_result(context, record, synthetic, turn=turn)
+                    appended_tool_message_count += 1 if observation_id else 0
+                    continue
+
+                spec = self.registry.get(call.tool_name)
+                replay_decision = self.state_store.check_replay(
+                    call,
+                    side_effects=spec.side_effects if spec is not None else None,
+                    idempotent=spec.idempotent if spec is not None else True,
+                )
+                if not replay_decision.allowed and replay_decision.status in {
+                    "side_effect_replay",
+                    ToolCallFailureKind.conflicting_replay.value,
+                }:
+                    rejected_count += 1
+                    synthetic = self._synthetic_result(
+                        call,
+                        error_kind=(
+                            ToolCallFailureKind.conflicting_replay
+                            if replay_decision.status == ToolCallFailureKind.conflicting_replay.value
+                            else ToolCallFailureKind.replay_detected
+                        ),
+                        message=replay_decision.message,
+                        error_code=replay_decision.status,
+                    )
+                    self.state_store.transition(
+                        call.tool_call_id,
+                        ToolCallPhase.REJECTED,
+                        error_kind=synthetic.error_kind,
+                        error_message=replay_decision.message,
+                        tool_result_digest=synthetic.content_digest,
+                    )
+                    self.state_store.bind_result(
+                        record.record_id,
+                        result=synthetic,
+                        raw_result_ref=synthetic.raw_result_ref,
+                    )
+                    observation_id = self._append_result(context, record, synthetic, turn=turn)
+                    appended_tool_message_count += 1 if observation_id else 0
+                    continue
+                replay = replay_decision.previous_result
+                if replay is not None:
+                    self.state_store.transition(
+                        call.tool_call_id,
+                        ToolCallPhase.RECOVERED,
+                        tool_result_digest=replay.content_digest,
+                        error_kind=replay.error_kind,
+                    )
+                    self.state_store.bind_result(
+                        record.record_id,
+                        result=replay,
+                        raw_result_ref=replay.raw_result_ref,
+                    )
+                    observation_id = self._append_result(context, record, replay, turn=turn)
+                    appended_tool_message_count += 1 if observation_id else 0
+                    continue
+
+                self.state_store.transition(call.tool_call_id, ToolCallPhase.SCHEDULED)
+                self.trace.emit(
+                    "tool_protocol.call_scheduled",
+                    summary="Tool call scheduled.",
+                    payload={
+                        "tool_call_id": call.tool_call_id,
+                        "tool_name": call.tool_name,
+                        "argument_digest": call.argument_digest,
+                    },
+                    ids=self._trace_ids(batch, call=call),
+                )
+                self.state_store.transition(call.tool_call_id, ToolCallPhase.RUNNING)
+                self.trace.emit(
+                    "tool_protocol.call_started",
+                    summary="Tool call started.",
+                    payload={
+                        "tool_call_id": call.tool_call_id,
+                        "tool_name": call.tool_name,
+                        "argument_digest": call.argument_digest,
+                    },
+                    ids=self._trace_ids(batch, call=call),
+                )
+                pending_calls.append(call)
+                pending_records[call.tool_call_id] = record
+
+            for execution in self.parallel_executor.execute(pending_calls, tool_runtime=tool_runtime):
+                self._throw_if_cancelled()
+                call = execution.call
+                record = pending_records[call.tool_call_id]
+                protocol_result = self.result_builder.build(
+                    envelope=call,
+                    result=execution.result,
+                    raw_result_ref=execution.result.metadata.get("output_digest"),
+                    policy_decision_id=execution.result.metadata.get("policy_decision_id"),
+                    approval_grant_id=execution.result.metadata.get("approval_grant_id"),
+                )
+                self.state_store.bind_result(
+                    record.record_id,
+                    result=protocol_result,
+                    raw_result_ref=protocol_result.raw_result_ref,
+                )
+                phase = (
+                    ToolCallPhase.SUCCEEDED
+                    if protocol_result.ok
+                    else (
+                        ToolCallPhase.WAITING_APPROVAL
+                        if protocol_result.error_code == "approval_required"
+                        else ToolCallPhase.FAILED
+                    )
+                )
+                self.state_store.transition(
+                    call.tool_call_id,
+                    phase,
+                    policy_decision_id=protocol_result.policy_decision_id,
+                    approval_grant_id=protocol_result.approval_grant_id,
+                    error_kind=protocol_result.error_kind,
+                    error_message=protocol_result.error_code,
+                    tool_result_digest=protocol_result.content_digest,
+                )
+                executed_count += 1
+                if not protocol_result.ok and protocol_result.error_code == "approval_required":
+                    pending_approval_count += 1
+                elif not protocol_result.ok:
+                    failed_count += 1
+                observation_id = self._append_result(context, record, protocol_result, turn=turn)
+                appended_tool_message_count += 1 if observation_id else 0
+                self.trace.emit(
+                    "tool_protocol.call_completed",
+                    summary="Tool call completed.",
+                    payload={
+                        "tool_call_id": call.tool_call_id,
+                        "tool_name": call.tool_name,
+                        "ok": protocol_result.ok,
+                        "status": protocol_result.status,
+                        "error_code": protocol_result.error_code,
+                        "content_digest": protocol_result.content_digest,
+                    },
+                    ids=self._trace_ids(batch, call=call),
+                    severity=TraceSeverity.INFO if protocol_result.ok else TraceSeverity.WARNING,
+                )
+                self.trace.emit(
+                    "tool_protocol.result_bound",
+                    summary="Tool result bound.",
+                    payload={
+                        "tool_call_id": call.tool_call_id,
+                        "tool_name": call.tool_name,
+                        "content_digest": protocol_result.content_digest,
+                        "observation_id": protocol_result.observation_id,
+                    },
+                    ids=self._trace_ids(batch, call=call),
+                )
+            self.trace.emit(
+                "tool_protocol.parallel_group_completed",
+                summary="Parallel read-only tool group completed.",
+                payload={
+                    "plan_id": plan.plan_id,
+                    "batch_id": plan.batch_id,
+                    "executed_count": executed_count,
+                    "failed_count": failed_count,
+                    "pending_approval_count": pending_approval_count,
+                },
+                ids=self._trace_ids(batch),
+                severity=TraceSeverity.WARNING
+                if failed_count or pending_approval_count
+                else TraceSeverity.INFO,
+            )
+            pending_calls = []
+            pending_records = {}
+
+        status = ToolProtocolTurnStatus.PROCESSED
+        next_action = "continue"
+        if pending_approval_count:
+            status = ToolProtocolTurnStatus.PENDING_APPROVAL
+            next_action = "pending_approval"
+        if rejected_count and executed_count == 0 and not pending_approval_count:
+            status = ToolProtocolTurnStatus.REJECTED
+        return ToolProtocolTurnResult(
+            status=status,
+            batch_id=plan.batch_id,
+            executed_count=executed_count,
+            failed_count=failed_count,
+            rejected_count=rejected_count,
+            pending_approval_count=pending_approval_count,
+            appended_tool_message_count=appended_tool_message_count,
+            next_action=next_action,
+            metadata={
+                "last_tool_call_id": last_tool_call_id,
+                "execution_mode": plan.execution_mode.value,
+                "parallel_group_count": len(plan.parallel_groups),
+            },
         )
 
     def _throw_if_cancelled(self) -> None:

@@ -62,11 +62,15 @@ Invalid cases include:
 
 Default execution is sequential. Read-only parallel execution is allowed only when:
 
+- provider capabilities allow parallel tool calls
 - every tool declares read-only side effects
-- policy allows each call
+- every tool is idempotent
+- each call has passed protocol validation and replay checks
 - the scheduler can preserve deterministic result binding
 
-Side-effect tools are not parallelized by default.
+Side-effect tools are not parallelized. Mutation, command, verification, approval-required, unknown, and non-idempotent tools stay sequential.
+
+When a batch is scheduled as `parallel_readonly`, `ParallelToolExecutor` runs the read-only handlers concurrently and `ToolCallingProtocolRuntime` binds and appends results in the original tool-call order.
 
 ## Pending Approval
 

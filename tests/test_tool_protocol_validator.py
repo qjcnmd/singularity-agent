@@ -17,7 +17,7 @@ class WriteInput(BaseModel):
     path: str
 
 
-def test_validator_builds_readonly_batch_but_schedules_sequentially(tmp_path) -> None:
+def test_validator_builds_readonly_batch_and_schedules_parallel_readonly(tmp_path) -> None:
     validator = ToolProtocolValidator(ToolRegistry(tmp_path))
     assistant_message = {
         "role": "assistant",
@@ -55,8 +55,10 @@ def test_validator_builds_readonly_batch_but_schedules_sequentially(tmp_path) ->
         "search_text",
     ]
     plan = validator.schedule(result.batch)
-    assert plan.execution_mode == ToolExecutionMode.SEQUENTIAL
-    assert plan.parallel_groups == []
+    assert plan.execution_mode == ToolExecutionMode.PARALLEL_READONLY
+    assert [[call.tool_call_id for call in group] for group in plan.parallel_groups] == [
+        ["call_1", "call_2"]
+    ]
 
 
 def test_validator_schedules_mutation_calls_sequentially(tmp_path) -> None:
@@ -397,6 +399,7 @@ def test_validator_enforces_max_tool_calls_and_provider_parallel_capability(tmp_
     assert sequential_result.batch is not None
     assert sequential_result.batch.supports_parallel_execution is False
     assert "provider_parallel_unsupported_forced_sequential" in sequential_result.warnings
+    assert validator.schedule(sequential_result.batch).execution_mode == ToolExecutionMode.SEQUENTIAL
 
 
 def test_validator_rejects_non_list_tool_calls(tmp_path) -> None:

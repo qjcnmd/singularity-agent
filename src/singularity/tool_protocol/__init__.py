@@ -22,6 +22,7 @@ from singularity.tool_protocol.models import (
     ToolCallRecord,
     envelope_from_tool_result,
 )
+from singularity.tool_protocol.parallel import ParallelToolExecutionResult, ParallelToolExecutor
 from singularity.tool_protocol.recovery import ToolProtocolRecovery
 from singularity.tool_protocol.result import ToolProtocolResultBuilder
 from singularity.tool_protocol.scheduler import ToolProtocolScheduler
@@ -53,5 +54,7 @@ __all__ = [
     "ToolProtocolValidator",
     "ToolProtocolVersion",
     "ToolProtocolScheduler",
+    "ParallelToolExecutionResult",
+    "ParallelToolExecutor",
     "envelope_from_tool_result",
 ]

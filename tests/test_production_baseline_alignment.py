@@ -524,6 +524,7 @@ def test_readme_documents_v010_production_architecture() -> None:
     assert "production-oriented local coding agent runtime" in readme
     assert "CLI\n-> SingularityAgent\n-> PlannerRuntime\n-> ContextManager\n-> ModelRuntime" in readme
     assert "ToolCallingProtocolRuntime\n-> ToolRuntime\n-> PolicyRuntime / ApprovalGate" in readme
+    assert "ParallelToolExecutor" in readme
     assert "list_files" in readme
     assert "read_file" in readme
     assert "search_text" in readme

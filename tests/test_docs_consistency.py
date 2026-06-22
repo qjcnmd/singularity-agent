@@ -85,6 +85,7 @@ def test_readme_runtime_names_match_runtime_map() -> None:
     assert "ContextManager" in readme_names
     assert "ContextRuntime" not in readme_names
     assert "DocumentationRuntime" in readme_names
+    assert "ParallelToolExecutor" in readme_names
     assert "GitRuntime" in readme_names
     assert "MemorySyncRuntime" in readme_names
     assert "RemoteApprovalRuntime" in readme_names

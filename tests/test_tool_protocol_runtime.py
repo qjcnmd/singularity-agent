@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from singularity.context import ContextManager
 from singularity.model import (
     ModelMessage,
     ModelPurpose,
+    ModelCapabilities,
     ModelRuntime,
     ModelTurnRequest,
     ModelTurnResult,
@@ -18,7 +20,7 @@ from singularity.model import (
     ModelToolParseStatus,
     MockModelProvider,
 )
-from singularity.tool_protocol.models import ToolProtocolTurnStatus
+from singularity.tool_protocol.models import ToolExecutionMode, ToolProtocolTurnStatus
 from singularity.tool_protocol.models import ToolCallFailureKind, ToolCallPhase
 from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
 from singularity.tool_protocol.state import ToolProtocolStateStore
@@ -133,6 +135,97 @@ def test_protocol_runtime_executes_tool_call_and_appends_tool_message(tmp_path: 
     assert payload["ok"] is True
     assert "Singularity README content" in payload["content_preview"]
     assert context.tool_observations[-1].turn == 1
+
+
+def test_protocol_runtime_executes_parallel_read_only_group_concurrently(tmp_path: Path) -> None:
+    barrier = threading.Barrier(2, timeout=3)
+    calls_started: list[str] = []
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+
+    def make_handler(name: str):
+        def handler(_args: _EmptyInput) -> dict[str, str]:
+            calls_started.append(name)
+            barrier.wait()
+            return {"tool": name}
+
+        return handler
+
+    for name in ("read_one", "read_two"):
+        registry.register(
+            ToolSpec(
+                name=name,
+                description=name,
+                input_model=_EmptyInput,
+                handler=make_handler(name),
+                permission_level=PermissionLevel.READ_ONLY,
+                side_effects=ToolSideEffectKind.READ_WORKSPACE,
+                idempotent=True,
+            )
+        )
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
+    )
+    protocol_runtime = ToolCallingProtocolRuntime(
+        registry=registry,
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    model_result = ModelTurnResult(
+        request_id="req_parallel",
+        response_id="resp_parallel",
+        status=ModelTurnStatus.SUCCESS,
+        assistant_message=ModelMessage.assistant_text(""),
+        tool_calls=[
+            ModelToolCall(
+                tool_call_id="call_read_one",
+                tool_name="read_one",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            ),
+            ModelToolCall(
+                tool_call_id="call_read_two",
+                tool_name="read_two",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            ),
+        ],
+        metadata={
+            "provider_capabilities": ModelCapabilities(
+                supports_parallel_tool_calls=True
+            ).to_dict()
+        },
+    )
+
+    result = protocol_runtime.handle_model_turn_result(
+        model_result,
+        context=context,
+        tool_runtime=tool_runtime,
+        planner=None,
+        policy_runtime=None,
+    )
+
+    assert result.status == ToolProtocolTurnStatus.PROCESSED
+    assert result.executed_count == 2
+    assert result.failed_count == 0
+    assert result.appended_tool_message_count == 2
+    assert result.metadata["execution_mode"] == ToolExecutionMode.PARALLEL_READONLY.value
+    assert sorted(calls_started) == ["read_one", "read_two"]
+    tool_payloads = [
+        json.loads(message["content"])
+        for message in context.messages()
+        if message["role"] == "tool"
+    ]
+    assert [payload["tool_call_id"] for payload in tool_payloads] == [
+        "call_read_one",
+        "call_read_two",
+    ]
 
 
 def test_protocol_runtime_creates_synthetic_result_for_rejected_call(tmp_path: Path) -> None:

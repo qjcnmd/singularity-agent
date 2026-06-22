@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from singularity.tools import ToolRegistry
-from singularity.tools.models import PermissionLevel, ToolExecutionBackendKind, ToolSpec
+from singularity.tools.models import PermissionLevel, ToolExecutionBackendKind, ToolSideEffectKind, ToolSpec
 from singularity.tool_protocol.models import ToolCallBatch, ToolCallEnvelope, ToolExecutionMode
 from singularity.tool_protocol.scheduler import ToolProtocolScheduler
 
@@ -30,7 +30,7 @@ def _call(tool_call_id: str, tool_name: str) -> ToolCallEnvelope:
     )
 
 
-def _batch(calls: list[ToolCallEnvelope]) -> ToolCallBatch:
+def _batch(calls: list[ToolCallEnvelope], *, supports_parallel_execution: bool = False) -> ToolCallBatch:
     batch = ToolCallBatch(
         batch_id="batch_1",
         run_id="run_1",
@@ -41,6 +41,7 @@ def _batch(calls: list[ToolCallEnvelope]) -> ToolCallBatch:
         model_response_id="resp_1",
         assistant_message={"role": "assistant"},
         tool_calls=calls,
+        supports_parallel_execution=supports_parallel_execution,
     )
     return batch
 
@@ -78,6 +79,48 @@ def test_scheduler_runs_multiple_read_only_idempotent_calls_sequentially(tmp_pat
     assert plan.execution_mode == ToolExecutionMode.SEQUENTIAL
     assert plan.parallel_groups == []
     assert [call.tool_call_id for call in plan.ordered_calls] == ["call_list", "call_read"]
+    assert "read_only_tools_run_sequentially" in plan.reasons
+
+
+def test_scheduler_groups_parallel_read_only_calls_when_provider_supports_parallel(tmp_path) -> None:
+    registry = ToolRegistry(tmp_path)
+    read_one = _call("call_list", "list_files")
+    read_two = _call("call_read", "read_file")
+
+    plan = ToolProtocolScheduler(registry).schedule(
+        _batch([read_one, read_two], supports_parallel_execution=True)
+    )
+
+    assert plan.execution_mode == ToolExecutionMode.PARALLEL_READONLY
+    assert [[call.tool_call_id for call in group] for group in plan.parallel_groups] == [
+        ["call_list", "call_read"]
+    ]
+    assert [call.tool_call_id for call in plan.ordered_calls] == ["call_list", "call_read"]
+    assert "read_only_tools_run_parallel" in plan.reasons
+
+
+def test_scheduler_keeps_non_idempotent_read_only_calls_sequential(tmp_path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="read_clock",
+            description="read clock",
+            input_model=EmptyInput,
+            handler=lambda _args: {},
+            permission_level=PermissionLevel.READ_ONLY,
+            side_effects=ToolSideEffectKind.READ_WORKSPACE,
+            idempotent=False,
+        )
+    )
+    read_one = _call("call_clock_1", "read_clock")
+    read_two = _call("call_clock_2", "read_clock")
+
+    plan = ToolProtocolScheduler(registry).schedule(
+        _batch([read_one, read_two], supports_parallel_execution=True)
+    )
+
+    assert plan.execution_mode == ToolExecutionMode.SEQUENTIAL
+    assert plan.parallel_groups == []
     assert "read_only_tools_run_sequentially" in plan.reasons
 
 

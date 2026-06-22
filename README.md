@@ -62,6 +62,7 @@ Runtime names tracked by Documentation Runtime:
 - `InstructionRuntime`
 - `ModelRuntime`
 - `ToolCallingProtocolRuntime`
+- `ParallelToolExecutor`
 - `ToolRuntime`
 - `ToolRegistry`
 - `PluginRuntime`
@@ -97,6 +98,7 @@ Runtime names tracked by Documentation Runtime:
 | `ContextRuntime` enum | implemented | `src/singularity/context/models.py` |
 | `ModelRuntime` | implemented | `src/singularity/model/runtime.py` |
 | `ToolCallingProtocolRuntime` / `ToolRuntime` | implemented | `src/singularity/tool_protocol/runtime.py`, `src/singularity/tools/runtime.py` |
+| `ParallelToolExecutor` | implemented | `src/singularity/tool_protocol/parallel.py`; only read-only idempotent tool groups run concurrently |
 | `PolicyRuntime` / `ApprovalGate` | implemented | `src/singularity/policy/runtime.py`, `src/singularity/policy/approval.py` |
 | `MutationRuntime` / `CommandRuntime` / `VerificationRuntime` | implemented | `src/singularity/workspace/runtime.py`, `src/singularity/command/runtime.py`, `src/singularity/verification/runtime.py` |
 | `SandboxRuntime` | partial | `DockerSandboxBackend` provides hard isolation when available; `LocalStagingBackend` provides soft copy-on-write workspace isolation only |
@@ -106,9 +108,9 @@ Runtime names tracked by Documentation Runtime:
 | `FinalReport` | implemented | kernel: `src/singularity/kernel/finalization.py`; planner: `src/singularity/planner/models.py` |
 | `EvaluationRuntime` | implemented | `src/singularity/evaluation/runtime.py` |
 | Desktop RuntimeHost / Rust Core / Tauri UI | planned | documented in `docs/architecture/runtime-host-transition.md` and ADRs, not implemented in this Python CLI baseline |
-| web search / multi-agent execution / parallel executor | planned | intentionally not implemented in this release |
+| web search / multi-agent execution | planned | intentionally not implemented in this release |
 
-Singularity implements `GitRuntime` as a local-only status/diff/commit wrapper, `RemoteApprovalRuntime` as a file-backed request/grant exchange, and `MemorySyncRuntime` as a file-backed bundle exchange. It still does not implement web search, multi-agent execution, or a parallel executor in this release. Sandbox execution prefers `DockerSandboxBackend` as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps `LocalStagingBackend` for local copy-on-write staging. A request that requires hard isolation fails closed, and the runtime records `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` capability evidence in task state so sandbox downgrade never silently becomes a production isolation claim.
+Singularity implements `GitRuntime` as a local-only status/diff/commit wrapper, `RemoteApprovalRuntime` as a file-backed request/grant exchange, `MemorySyncRuntime` as a file-backed bundle exchange, and `ParallelToolExecutor` for read-only idempotent tool groups. It still does not implement web search or multi-agent execution in this release. Sandbox execution prefers `DockerSandboxBackend` as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps `LocalStagingBackend` for local copy-on-write staging. A request that requires hard isolation fails closed, and the runtime records `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` capability evidence in task state so sandbox downgrade never silently becomes a production isolation claim.
 
 ## Install
 
@@ -276,6 +278,8 @@ Exit code conventions:
 
 Remote approval grants imported through `approval remote import-grant` are still scoped `ApprovalGrant` records consumed by `PolicyRuntime`. The remote file format does not bypass policy evaluation, grant matching, single-use/session-only constraints, or audit logging.
 
+`ParallelToolExecutor` only runs batches scheduled as `parallel_readonly`. The scheduler requires provider parallel-tool support, multiple validated read-only calls, idempotent tool specs, and no mutation, command, verification, or unknown side-effect tools. Results are still bound and appended in original tool-call order.
+
 ## Runtime Boundaries
 
 `SingularityAgent` only orchestrates the session:
@@ -349,7 +353,6 @@ Current safety boundaries:
 
 Not implemented in v0.1.0:
 
-- parallel executor
 - Podman, WSL, or kernel-level containment beyond Docker CLI integration
 - web search
 - multi-agent orchestration

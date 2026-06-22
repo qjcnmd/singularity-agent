@@ -56,16 +56,25 @@ class ToolProtocolScheduler:
                 call for call in original_order if call.tool_call_id in verification_ids
             ]
             reasons.append("verification_after_mutation")
+        parallel_groups = []
+        execution_mode = ToolExecutionMode.SEQUENTIAL
+
         if mutation_calls or command_calls or other_sequential_calls:
             reasons.append("mutation_or_command_tools_run_sequentially")
         elif len(original_order) == 1:
             reasons.append("single_tool_call_runs_sequentially")
         elif readonly_calls:
-            reasons.append("read_only_tools_run_sequentially")
+            if batch.supports_parallel_execution and all(
+                _is_parallel_safe_readonly(call, self.registry.get(call.tool_name) if self.registry else None)
+                for call in readonly_calls
+            ):
+                reasons.append("read_only_tools_run_parallel")
+                parallel_groups = [readonly_calls]
+                execution_mode = ToolExecutionMode.PARALLEL_READONLY
+            else:
+                reasons.append("read_only_tools_run_sequentially")
         else:
             reasons.append("sequential_tools_run_in_input_order")
-        parallel_groups = []
-        execution_mode = ToolExecutionMode.SEQUENTIAL
 
         return ToolExecutionPlan(
             plan_id=f"tool_plan_{uuid4().hex[:12]}",
@@ -93,6 +102,16 @@ def _is_readonly(call: ToolCallEnvelope, spec: ToolSpec | None) -> bool:
     if spec.uses_mutation_runtime or spec.uses_command_runtime:
         return False
     return True
+
+
+def _is_parallel_safe_readonly(call: ToolCallEnvelope, spec: ToolSpec | None) -> bool:
+    if not _is_readonly(call, spec):
+        return False
+    if call.validation_errors:
+        return False
+    if spec is None:
+        return True
+    return bool(spec.idempotent)
 
 
 def _is_mutation(call: ToolCallEnvelope, spec: ToolSpec | None) -> bool:

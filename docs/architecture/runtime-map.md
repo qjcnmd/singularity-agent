@@ -6,7 +6,7 @@ Current v0.1.x status:
 
 - Python remains the production runtime.
 - CLI remains the only shipped client.
-- No Tauri, Electron, Rust rewrite, web search, multi-agent execution, or parallel executor is implemented here.
+- No Tauri, Electron, Rust rewrite, web search, or multi-agent execution is implemented here.
 - The next implementation phase is Desktop Transition Runtime: a RuntimeHost/local-daemon boundary around the existing Python runtime.
 
 ## Phase 1A Fixed Behavior Status
@@ -55,6 +55,7 @@ Keep this list in sync with the matching block in `README.md`.
 - `InstructionRuntime`
 - `ModelRuntime`
 - `ToolCallingProtocolRuntime`
+- `ParallelToolExecutor`
 - `ToolRuntime`
 - `ToolRegistry`
 - `PluginRuntime`
@@ -88,6 +89,7 @@ Keep this list in sync with the matching block in `README.md`.
 | `ContextManager` runtime class | implemented | `src/singularity/context/manager.py` |
 | `ContextRuntime` source-runtime enum | implemented | `src/singularity/context/models.py` |
 | Tool protocol, tool runtime, policy, approval, mutation, command, verification | implemented | `src/singularity/tool_protocol/`, `src/singularity/tools/`, `src/singularity/policy/`, `src/singularity/workspace/`, `src/singularity/command/`, `src/singularity/verification/` |
+| Parallel tool executor | implemented | `src/singularity/tool_protocol/parallel.py` runs validated read-only idempotent tool groups concurrently and binds results in original call order |
 | Sandbox capability state | implemented | `SandboxRuntime.capability_summary()` writes `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` into `TaskState.sandbox_capability` |
 | Sandbox hard isolation | partial | `DockerSandboxBackend` can provide hard network/process/resource isolation when available; `LocalStagingBackend` is soft copy-on-write workspace staging and must not be documented as hard isolation |
 | Git Runtime | implemented | `src/singularity/git_runtime/` provides local-only status, diff, and commit operations; push/PR/branch automation is out of scope |
@@ -95,7 +97,7 @@ Keep this list in sync with the matching block in `README.md`.
 | Remote memory sync | implemented | `src/singularity/memory/sync.py` exports/imports local JSON bundles and imports remote entries as candidates by default |
 | Final reports | implemented | kernel `FinalReport` in `src/singularity/kernel/finalization.py`; planner `FinalReport` in `src/singularity/planner/models.py` |
 | Desktop RuntimeHost, Rust Core, Tauri UI | planned | architecture docs and ADRs only |
-| web search, multi-agent execution, parallel executor | planned | explicitly out of scope for the current Python CLI baseline |
+| web search, multi-agent execution | planned | explicitly out of scope for the current Python CLI baseline |
 
 ## Ownership Map
 
@@ -108,7 +110,8 @@ Keep this list in sync with the matching block in `README.md`.
 | ContextManager | Structured context items, bundles, references, compression, model projection; `ContextRuntime` is only the source-runtime enum used on context items | Raw secret retention, policy approval, tool execution, workspace mutation |
 | InstructionRuntime | Instruction collection, trust hierarchy, prompt compilation, prompt manifest | Provider calls, tool execution, approvals, workspace writes |
 | ModelRuntime | Provider registry, request validation, tool-call normalization, retry, budget, streaming | Tool execution, policy decisions, context storage, raw secret archival |
-| ToolCallingProtocolRuntime | Tool-call validation, scheduling, replay detection, pending approval recovery, result binding | Handler execution, approval UI, direct storage writes outside protocol state |
+| ToolCallingProtocolRuntime | Tool-call validation, scheduling, replay detection, pending approval recovery, result binding | Handler execution for sequential calls, approval UI, direct storage writes outside protocol state |
+| ParallelToolExecutor | Concurrent execution of validated read-only idempotent tool groups | Mutations, commands, verification, approval handling, result ordering decisions |
 | ToolRuntime / ToolRegistry | Tool exposure, schema validation, policy request construction, handler dispatch after gates | Filesystem mutation, command execution, verification planning, Git operations |
 | PolicyRuntime / ApprovalGate | Permission decisions, scoped local approval grants, fail-closed review behavior, audit records | Tool execution, UI layout, command spawning, remote grant file transport |
 | MutationRuntime | Model-authored workspace edits, changesets, atomic apply, rollback metadata | Shell execution, verification command choice, Git commit/push/reset |
