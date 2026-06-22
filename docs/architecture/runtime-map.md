@@ -6,7 +6,7 @@ Current v0.1.x status:
 
 - Python remains the production runtime.
 - CLI remains the only shipped client.
-- No Tauri, Electron, Rust rewrite, remote approval, Git Runtime, or remote memory sync is implemented here.
+- No Tauri, Electron, Rust rewrite, web search, multi-agent execution, or parallel executor is implemented here.
 - The next implementation phase is Desktop Transition Runtime: a RuntimeHost/local-daemon boundary around the existing Python runtime.
 
 ## Phase 1A Fixed Behavior Status
@@ -65,9 +65,12 @@ Keep this list in sync with the matching block in `README.md`.
 - `VerificationRuntime`
 - `SandboxRuntime`
 - `WorkspaceStateRuntime`
+- `GitRuntime`
 - `TraceRuntime`
 - `Audit`
 - `MemoryRuntime`
+- `MemorySyncRuntime`
+- `RemoteApprovalRuntime`
 - `ProjectIndexRuntime`
 - `EditRuntime`
 - `ReviewRuntime`
@@ -87,9 +90,12 @@ Keep this list in sync with the matching block in `README.md`.
 | Tool protocol, tool runtime, policy, approval, mutation, command, verification | implemented | `src/singularity/tool_protocol/`, `src/singularity/tools/`, `src/singularity/policy/`, `src/singularity/workspace/`, `src/singularity/command/`, `src/singularity/verification/` |
 | Sandbox capability state | implemented | `SandboxRuntime.capability_summary()` writes `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` into `TaskState.sandbox_capability` |
 | Sandbox hard isolation | partial | `DockerSandboxBackend` can provide hard network/process/resource isolation when available; `LocalStagingBackend` is soft copy-on-write workspace staging and must not be documented as hard isolation |
+| Git Runtime | implemented | `src/singularity/git_runtime/` provides local-only status, diff, and commit operations; push/PR/branch automation is out of scope |
+| Remote approval | implemented | `src/singularity/policy/remote.py` exports policy request/decision JSON and imports scoped approval grants; no network approval service is implied |
+| Remote memory sync | implemented | `src/singularity/memory/sync.py` exports/imports local JSON bundles and imports remote entries as candidates by default |
 | Final reports | implemented | kernel `FinalReport` in `src/singularity/kernel/finalization.py`; planner `FinalReport` in `src/singularity/planner/models.py` |
 | Desktop RuntimeHost, Rust Core, Tauri UI | planned | architecture docs and ADRs only |
-| Git Runtime, web search, multi-agent execution, remote approval, remote memory sync | planned | explicitly out of scope for the current Python CLI baseline |
+| web search, multi-agent execution, parallel executor | planned | explicitly out of scope for the current Python CLI baseline |
 
 ## Ownership Map
 
@@ -104,14 +110,17 @@ Keep this list in sync with the matching block in `README.md`.
 | ModelRuntime | Provider registry, request validation, tool-call normalization, retry, budget, streaming | Tool execution, policy decisions, context storage, raw secret archival |
 | ToolCallingProtocolRuntime | Tool-call validation, scheduling, replay detection, pending approval recovery, result binding | Handler execution, approval UI, direct storage writes outside protocol state |
 | ToolRuntime / ToolRegistry | Tool exposure, schema validation, policy request construction, handler dispatch after gates | Filesystem mutation, command execution, verification planning, Git operations |
-| PolicyRuntime / ApprovalGate | Permission decisions, scoped local approval grants, fail-closed review behavior, audit records | Tool execution, UI layout, command spawning, persistent remote approval |
+| PolicyRuntime / ApprovalGate | Permission decisions, scoped local approval grants, fail-closed review behavior, audit records | Tool execution, UI layout, command spawning, remote grant file transport |
 | MutationRuntime | Model-authored workspace edits, changesets, atomic apply, rollback metadata | Shell execution, verification command choice, Git commit/push/reset |
 | CommandRuntime | Process planning, env policy, resource limits, command output, side-effect ownership | Model-authored file edits, test selection, policy bypass, hard sandbox fallback |
 | VerificationRuntime | Project detection, check planning, impact analysis, result classification, repair hints | Direct subprocess calls, mutation writes, approval grants |
 | SandboxRuntime | Isolated execution backend choice, capability checks, staged workspace, sandbox artifacts | Safety re-decision, importing sandbox writes into real workspace |
 | WorkspaceStateRuntime | Baseline snapshots, ownership journal, health report, artifact handles, recovery facts | Authoring changes, hiding external edits, replacing trace/audit |
+| GitRuntime | Local Git status, diff statistics, scoped staging, local commit creation | Push, pull, reset, remote branches, pull requests, workspace rollback authority |
 | TraceRuntime / Audit | Append-only events, spans, artifact refs, redaction, timeline and summary | Storing raw secrets, deciding policy, mutating workspace |
-| MemoryRuntime | Local memory candidates, accepted memory entries, evidence refs, retrieval block | Remote sync, private secret storage, replacing context or trace |
+| MemoryRuntime | Local memory candidates, accepted memory entries, evidence refs, retrieval block | Trusting remote memory without review, private secret storage, replacing context or trace |
+| MemorySyncRuntime | JSON bundle export/import, digest validation, candidate-first import policy | Network transport, hidden sync daemon, remote memory as direct local truth |
+| RemoteApprovalRuntime | File-backed policy request export and scoped grant import | Remote server transport, model-authored approval, policy bypass |
 | ProjectIndexRuntime | Read-only code intelligence, symbol/import facts, test and impact hints | Running code, changing files, owning verification or mutation |
 | EditRuntime / ReviewRuntime / EvaluationRuntime | Patch strategy, review evidence, benchmark/replay orchestration | Runtime graph boot, policy bypass, command execution outside runtime gates |
 | PluginRuntime | Local manifest discovery, enablement status, host API, plugin tool registration | Marketplace, dependency install, direct access to core runtime objects |

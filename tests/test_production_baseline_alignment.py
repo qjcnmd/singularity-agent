@@ -527,7 +527,9 @@ def test_readme_documents_v010_production_architecture() -> None:
     assert "list_files" in readme
     assert "read_file" in readme
     assert "search_text" in readme
-    assert "does not implement a Git Runtime" in readme
+    assert "GitRuntime" in readme
+    assert "RemoteApprovalRuntime" in readme
+    assert "MemorySyncRuntime" in readme
     assert "approval modes" in readme.lower()
     assert "<trace-run-dir>/context.sqlite3" in readme
     assert "<trace-run-dir>/tool_protocol.sqlite3" in readme

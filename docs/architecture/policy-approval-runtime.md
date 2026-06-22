@@ -17,7 +17,7 @@ ToolRuntime / MutationRuntime / CommandRuntime / VerificationRuntime
   -> FinalReport Policy & Approval Summary
 ```
 
-Git policy, remote approval, persistent approval profiles, and container sandbox backends are intentionally not implemented in this slice. Singularity v0.0.12 adds a local staging sandbox backend, but it is not a Docker/Podman/WSL or kernel-level security boundary.
+Remote approval is implemented as an explicit file-backed control-plane adapter. `RemoteApprovalRuntime` can export a `PolicyRequest` / `PolicyDecision` pair to JSON and import a scoped `ApprovalGrant` JSON after external review. It does not open a network listener, poll a remote service, or accept model-authored approval text. Persistent approval profiles and Git-specific policy are still future extension points. Singularity v0.0.12 adds a local staging sandbox backend, but it is not a Docker/Podman/WSL or kernel-level security boundary.
 
 ## Core Objects
 
@@ -33,6 +33,8 @@ It also records risk level, risk tags, user-facing reason, constraints, rule ids
 
 `ApprovalGrant` is a scoped approval, not a boolean. The current CLI gate only creates single-use, session-only grants from a local user action. The grant scope contains capabilities, path globs, command patterns, network hosts, duration limits, file limits, and single-use/session-only flags. Model text such as "the user approved" is never accepted as approval.
 Grant consumption is owned by `PolicyRuntime`, so a local approval is converted into one audited allow decision without re-running the same policy request through risk classification and rules.
+
+File-backed remote grants use the same `ApprovalGrant` object and are registered into `PolicyRuntime` through `approval remote import-grant`. Import validates the request id, decision id, grant shape, and reviewer identity before persisting the grant. The next matching policy request still consumes the grant through the normal single-use/session-only matching path and writes the same audit trail as a local approval.
 
 `PolicyAuditWriter` writes append-only JSONL to:
 
@@ -146,8 +148,7 @@ user policy file
 session policy
 persistent approval profile
 container or VM sandbox backend
-remote approval workflow
 GitRuntime-specific policy
 ```
 
-Those are reserved extension points, not hidden behavior in this release.
+Those are reserved extension points, not hidden behavior in this release. The implemented remote approval workflow is intentionally limited to explicit JSON request/grant files.

@@ -72,9 +72,12 @@ Runtime names tracked by Documentation Runtime:
 - `VerificationRuntime`
 - `SandboxRuntime`
 - `WorkspaceStateRuntime`
+- `GitRuntime`
 - `TraceRuntime`
 - `Audit`
 - `MemoryRuntime`
+- `MemorySyncRuntime`
+- `RemoteApprovalRuntime`
 - `ProjectIndexRuntime`
 - `EditRuntime`
 - `ReviewRuntime`
@@ -97,12 +100,15 @@ Runtime names tracked by Documentation Runtime:
 | `PolicyRuntime` / `ApprovalGate` | implemented | `src/singularity/policy/runtime.py`, `src/singularity/policy/approval.py` |
 | `MutationRuntime` / `CommandRuntime` / `VerificationRuntime` | implemented | `src/singularity/workspace/runtime.py`, `src/singularity/command/runtime.py`, `src/singularity/verification/runtime.py` |
 | `SandboxRuntime` | partial | `DockerSandboxBackend` provides hard isolation when available; `LocalStagingBackend` provides soft copy-on-write workspace isolation only |
+| `GitRuntime` | implemented | local-only status, diff, and commit wrapper in `src/singularity/git_runtime/`; no push, PR, or remote branch automation |
+| `RemoteApprovalRuntime` | implemented | file-backed request/grant exchange in `src/singularity/policy/remote.py`; no hidden network service |
+| `MemorySyncRuntime` | implemented | file-backed memory bundle export/import in `src/singularity/memory/sync.py`; remote entries import as reviewable candidates by default |
 | `FinalReport` | implemented | kernel: `src/singularity/kernel/finalization.py`; planner: `src/singularity/planner/models.py` |
 | `EvaluationRuntime` | implemented | `src/singularity/evaluation/runtime.py` |
 | Desktop RuntimeHost / Rust Core / Tauri UI | planned | documented in `docs/architecture/runtime-host-transition.md` and ADRs, not implemented in this Python CLI baseline |
-| Git Runtime / web search / multi-agent execution / remote approval / remote memory sync | planned | intentionally not implemented in this release |
+| web search / multi-agent execution / parallel executor | planned | intentionally not implemented in this release |
 
-Singularity does not implement a Git Runtime, web search, multi-agent execution, remote approval, or remote memory sync in this release. Sandbox execution prefers `DockerSandboxBackend` as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps `LocalStagingBackend` for local copy-on-write staging. A request that requires hard isolation fails closed, and the runtime records `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` capability evidence in task state so sandbox downgrade never silently becomes a production isolation claim.
+Singularity implements `GitRuntime` as a local-only status/diff/commit wrapper, `RemoteApprovalRuntime` as a file-backed request/grant exchange, and `MemorySyncRuntime` as a file-backed bundle exchange. It still does not implement web search, multi-agent execution, or a parallel executor in this release. Sandbox execution prefers `DockerSandboxBackend` as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps `LocalStagingBackend` for local copy-on-write staging. A request that requires hard isolation fails closed, and the runtime records `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` capability evidence in task state so sandbox downgrade never silently becomes a production isolation claim.
 
 ## Install
 
@@ -194,6 +200,17 @@ singularity-agent index impact src/singularity/command/runtime.py
 singularity-agent index tests src/singularity/command/runtime.py
 ```
 
+Local Git commands:
+
+```bash
+singularity-agent git status --json
+singularity-agent git diff --json
+singularity-agent git diff --staged --json
+singularity-agent git commit --message "local checkpoint" --path src/example.py --json
+```
+
+`GitRuntime` is local-only. It never pushes, opens pull requests, resets branches, or shells out through a user-provided command string.
+
 Local memory commands:
 
 ```bash
@@ -206,7 +223,20 @@ singularity-agent memory delete <memory_id> --reason "superseded"
 singularity-agent memory doctor
 singularity-agent memory refresh
 singularity-agent memory rules list
+singularity-agent memory sync export memory-bundle.json --json
+singularity-agent memory sync import memory-bundle.json --json
 ```
+
+Memory sync uses a local JSON bundle. Imported active entries become candidates unless `--trust-entries` is explicit.
+
+Remote approval file exchange:
+
+```bash
+singularity-agent approval remote export-request request.json decision.json --output approval-request.json --json
+singularity-agent approval remote import-grant approval-grant.json --json
+```
+
+Remote approval is a file-backed control-plane adapter. Operators can move request/grant JSON through a trusted channel, but Singularity does not run a remote approval server or accept model text as approval.
 
 Evaluation and benchmark commands:
 
@@ -244,6 +274,8 @@ Exit code conventions:
 
 `ToolPolicy` remains as a registration sanity check and legacy compatibility surface. It is not the runtime allow/deny/review authority.
 
+Remote approval grants imported through `approval remote import-grant` are still scoped `ApprovalGrant` records consumed by `PolicyRuntime`. The remote file format does not bypass policy evaluation, grant matching, single-use/session-only constraints, or audit logging.
+
 ## Runtime Boundaries
 
 `SingularityAgent` only orchestrates the session:
@@ -261,6 +293,8 @@ The CLI assembles `PlannerRuntime`, `ModelRuntime`, `ToolRuntime`, `ToolCallingP
 `ToolRuntime` requires the session `PolicyRuntime`. It validates schemas and runtime boundaries, enforces policy decisions, resolves local approval grants, blocks dry-run side effects, executes the registered handler only after those gates pass, and records redacted structured trace events.
 
 Mutation, command, and verification tools are registered through their dedicated runtimes. Verification command discovery uses `python -m pytest tests --basetemp work/pytest-tmp` for this repository shape.
+
+`GitRuntime` owns local Git status, diff statistics, and local commits. It is intentionally separate from `LocalWorkspaceStateRuntime`, which remains the non-Git ownership, rollback, and recovery source of truth.
 
 `EvaluationRuntime` is an orchestration runtime for local benchmark management, trace replay classification, scoring, A/B evaluation, regression detection, and report writing. It only runs executable hooks/tests or materializes inline snapshots when explicitly requested, and those actions remain behind `CommandRuntime`, `VerificationRuntime`, `MutationRuntime`, `ToolRuntime`, `MemoryRuntime`, `PlannerRuntime`, and trace boundaries.
 
@@ -286,7 +320,7 @@ All model tool calls flow through `ToolCallingProtocolRuntime`. Invalid tool cal
 - `side_effect_replay`
 - `conflicting_replay`
 
-Pending approvals are recoverable through protocol recovery reports. Singularity reports `pending_approval_count` and a resume action, but does not implement remote approval.
+Pending approvals are recoverable through protocol recovery reports. Singularity reports `pending_approval_count` and a resume action. Remote approval export/import is file-backed; the protocol recovery path does not contact a remote service.
 
 `ContextItem` and `ContextBundle` are the primary context state. `_messages` is only the provider projection cache. Tool results enter context through `add_tool_protocol_result()`; `add_tool_result()` remains as a compatibility adapter. Workspace health enters context through `add_workspace_state()` and is rendered as structured runtime context, not as a synthetic `workspace_health` tool result.
 
@@ -306,6 +340,8 @@ Current safety boundaries:
 - Verification must go through `VerificationRuntime`.
 - Sandbox-required commands must go through `SandboxRuntime`; Docker is used first for real sandbox isolation when available, otherwise local staging is used only for requests that do not require hard isolation.
 - Workspace state is tracked by `WorkspaceStateRuntime`.
+- Local Git status, diff, and commit operations are routed through `GitRuntime`; push and PR automation are intentionally absent.
+- Remote approval and memory sync are explicit JSON file exchanges, not background network services.
 - Evaluation outputs are local files under `work/evaluations/` unless explicitly redirected.
 - Dry-run blocks real side effects before handlers run.
 - Strict mode tightens schema and protocol expectations.
@@ -313,10 +349,7 @@ Current safety boundaries:
 
 Not implemented in v0.1.0:
 
-- Git Runtime
-- remote/shared memory synchronization
 - parallel executor
-- remote approval
 - Podman, WSL, or kernel-level containment beyond Docker CLI integration
 - web search
 - multi-agent orchestration

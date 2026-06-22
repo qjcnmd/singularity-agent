@@ -23,6 +23,7 @@ from singularity.memory.retrieval import MemoryRetrieval
 from singularity.memory.rules import PathScopedRule
 from singularity.memory.runtime import MemoryRuntime
 from singularity.memory.store import MemoryStore
+from singularity.memory.sync import MemorySyncExport, MemorySyncImport, MemorySyncRuntime
 
 __all__ = [
     "AdmissionAction",
@@ -46,6 +47,9 @@ __all__ = [
     "MemorySource",
     "MemoryStatus",
     "MemoryStore",
+    "MemorySyncExport",
+    "MemorySyncImport",
+    "MemorySyncRuntime",
     "MemoryType",
     "PathScopedRule",
     "Provenance",

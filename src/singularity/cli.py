@@ -20,6 +20,7 @@ from singularity.evaluation import (
     RegressionDetector,
     TraceReplayRuntime,
 )
+from singularity.git_runtime.cli import git_app
 from singularity.interaction import RichCliRenderer
 from singularity.kernel import CancellationError, KernelBootstrap
 from singularity.kernel.models import RunStatus
@@ -28,6 +29,7 @@ from singularity.observability import TraceRedactor, TraceRuntime, TraceStore
 from singularity.plugins.cli import plugin_app
 from singularity.command import CommandRuntime
 from singularity.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
+from singularity.policy.cli import approval_app
 from singularity.planner import PlannerRuntime, create_or_resume_planner as _create_or_resume_planner
 from singularity.diagnostics import DoctorEngine, RepairEngine
 from singularity.diagnostics.render import render_diagnostic_result, render_repair_plan
@@ -81,6 +83,8 @@ eval_live_app = typer.Typer(add_completion=False, no_args_is_help=True)
 system_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 app.add_typer(index_app, name="index")
+app.add_typer(git_app, name="git")
+app.add_typer(approval_app, name="approval")
 app.add_typer(memory_app, name="memory")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(eval_app, name="eval")

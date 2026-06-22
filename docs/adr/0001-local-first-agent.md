@@ -17,11 +17,12 @@ Singularity is local-first:
 - trace, audit, workspace state, and memory are local stores
 - remote model providers are allowed, but only through `ModelRuntime`
 - no remote telemetry backend is required
-- no remote memory sync is part of v0.1.x
+- file-backed remote approval and memory sync may exist as explicit operator-mediated JSON exchanges
+- no remote approval server, background memory sync daemon, or remote telemetry backend is required
 
 ## Consequences
 
 - Desktop Transition Runtime should start as a local RuntimeHost/daemon.
 - Local state must be resumable and recoverable.
 - Secret handling and redaction happen before local persistence and before provider calls.
-- Remote collaboration, remote approval, and shared memory require separate ADRs.
+- Remote collaboration, networked approval services, and shared-memory servers require separate ADRs.

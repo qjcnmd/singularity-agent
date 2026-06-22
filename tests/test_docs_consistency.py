@@ -85,7 +85,9 @@ def test_readme_runtime_names_match_runtime_map() -> None:
     assert "ContextManager" in readme_names
     assert "ContextRuntime" not in readme_names
     assert "DocumentationRuntime" in readme_names
-    assert "GitRuntime" not in readme_names
+    assert "GitRuntime" in readme_names
+    assert "MemorySyncRuntime" in readme_names
+    assert "RemoteApprovalRuntime" in readme_names
 
 
 def test_readme_runtime_status_table_has_source_or_planned_mapping() -> None:

@@ -2,7 +2,7 @@
 
 Singularity targets a local CLI coding agent. Even when Git is unavailable, disabled, or intentionally out of scope, the agent still needs a trustworthy model of the workspace. `LocalWorkspaceStateRuntime` is the non-Git state layer that records what the workspace looked like at session start, which changes belong to the agent, which changes came from commands, and whether a user or external process changed files while the agent was working.
 
-This runtime does not implement branches, commits, staging, push, pull, or pull requests. Git can still be inspected by other read-only paths, but local workspace state and rollback do not depend on Git.
+This runtime does not implement branches, commits, staging, push, pull, or pull requests. `GitRuntime` is a separate local-only control plane for status, diff statistics, scoped staging, and local commits. Local workspace state and rollback do not depend on Git and `GitRuntime` does not replace ownership journaling, external-change detection, or hash-checked rollback.
 
 ## Runtime Boundary
 
@@ -162,4 +162,4 @@ Reserved extension points:
 - Richer partial-journal corruption repair.
 - More granular incomplete transaction detection.
 - Dedicated CLI rollback approval commands.
-- Future GitRuntime integration that remains separate from local state.
+- Richer GitRuntime integration that remains separate from local state.

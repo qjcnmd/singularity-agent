@@ -2,7 +2,7 @@
 
 The Release Runtime makes Singularity usable as an installed local CLI instead of a source-directory-only tool.
 
-It owns package metadata, user runtime directories, initialization, version output, health checks, repair, export, and safe uninstall. It does not implement a Git Runtime and has no branch, commit, PR, or push commands.
+It owns package metadata, user runtime directories, initialization, version output, health checks, repair, export, and safe uninstall. Git commands live in `GitRuntime`, not Release Runtime. Release Runtime has no branch, commit, PR, or push commands.
 
 ## Modules
 

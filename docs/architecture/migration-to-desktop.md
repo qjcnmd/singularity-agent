@@ -8,9 +8,9 @@ The target architecture is Rust Core + Tauri Desktop + TypeScript UI + Python Pl
 - no Electron
 - no Rust rewrite
 - no deletion of the existing Python runtime
-- no remote approval
-- no remote memory sync
-- no new Git Runtime
+- no remote approval server
+- no background remote memory sync daemon
+- no Git push, pull request, or branch automation
 
 ## Phase 0: Documentation Runtime
 

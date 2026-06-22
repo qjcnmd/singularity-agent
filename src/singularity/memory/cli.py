@@ -8,11 +8,14 @@ from rich.console import Console
 from rich.panel import Panel
 
 from singularity.memory.runtime import MemoryRuntime
+from singularity.memory.sync import MemorySyncRuntime
 
 
 memory_app = typer.Typer(add_completion=False, no_args_is_help=True)
 rules_app = typer.Typer(add_completion=False, no_args_is_help=True)
+sync_app = typer.Typer(add_completion=False, no_args_is_help=True)
 memory_app.add_typer(rules_app, name="rules")
+memory_app.add_typer(sync_app, name="sync")
 console = Console()
 
 
@@ -112,6 +115,36 @@ def memory_rules_list(
     _print(rules, json_output=json_output, title="memory rules")
 
 
+@sync_app.command("export")
+def memory_sync_export(
+    output_path: Annotated[Path, typer.Argument(help="Output memory sync bundle JSON path.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    runtime = _runtime(read_only=True)
+    result = MemorySyncRuntime(runtime.store).export_bundle(output_path)
+    _print(result.to_dict(), json_output=json_output, title="memory sync export")
+
+
+@sync_app.command("import")
+def memory_sync_import(
+    bundle_path: Annotated[Path, typer.Argument(help="Memory sync bundle JSON path.")],
+    trust_entries: Annotated[
+        bool,
+        typer.Option(
+            "--trust-entries",
+            help="Import active entries directly instead of reviewable candidates.",
+        ),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    runtime = _runtime(read_only=False)
+    result = MemorySyncRuntime(runtime.store).import_bundle(
+        bundle_path,
+        trust_entries=trust_entries,
+    )
+    _print(result.to_dict(), json_output=json_output, title="memory sync import")
+
+
 def _runtime(*, read_only: bool = False) -> MemoryRuntime:
     runtime = MemoryRuntime(Path.cwd())
     runtime.start_session(
@@ -127,6 +160,6 @@ def _print(payload: object, *, json_output: bool, title: str) -> None:
 
     text = json_dumps(payload)
     if json_output:
-        console.print(text)
+        typer.echo(text)
         return
     console.print(Panel(text, title=title, border_style="cyan"))

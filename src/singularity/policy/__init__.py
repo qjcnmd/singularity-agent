@@ -29,6 +29,7 @@ from singularity.policy.models import (
     RuntimeName,
 )
 from singularity.policy.risk import RiskAssessment, RiskClassifier
+from singularity.policy.remote import RemoteApprovalExport, RemoteApprovalRuntime
 
 __all__ = [
     "ApprovalDenied",
@@ -59,6 +60,8 @@ __all__ = [
     "RiskLevel",
     "RiskTag",
     "RuntimeName",
+    "RemoteApprovalExport",
+    "RemoteApprovalRuntime",
     "SandboxRequired",
     "SecurityMode",
 ]

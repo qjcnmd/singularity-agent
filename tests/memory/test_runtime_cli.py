@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -192,6 +193,11 @@ def test_cli_read_only_memory_commands_do_not_rebuild_index(
     ):
         result = runner.invoke(app, command)
         assert result.exit_code == 0, result.output
+
+    listed_json = runner.invoke(app, ["memory", "list", "--json"])
+
+    assert listed_json.exit_code == 0
+    assert json.loads(listed_json.output)[0]["title"] == "Read-only lesson"
 
 
 def test_runtime_manual_accept_redacts_and_requires_non_guess_content(tmp_path: Path) -> None:
