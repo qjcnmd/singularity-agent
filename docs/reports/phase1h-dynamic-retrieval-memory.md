@@ -101,8 +101,16 @@ Note: the standard `--basetemp work\pytest-tmp` path remains avoided because the
 
 Publish proof:
 
+```powershell
+git push origin main
+git rev-list --left-right --count origin/main...HEAD
+```
+
+Result:
+
 ```text
-Pending commit and push.
+57ed708 feat: add dynamic retrieval memory learning
+origin/main...HEAD = 0 0
 ```
 
 ## Risks
