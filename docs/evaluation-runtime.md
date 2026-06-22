@@ -105,22 +105,22 @@ It covers:
 Validate and list a Golden Task Set:
 
 ```bash
-singularity eval task validate golden.json --json
-singularity eval task list golden.json --version v1 --tag tool-heavy
-singularity eval task validate docs/evaluation/phase1j-golden-tasks.json --json
+singularity-agent eval task validate golden.json --json
+singularity-agent eval task list golden.json --version v1 --tag tool-heavy
+singularity-agent eval task validate docs/evaluation/phase1j-golden-tasks.json --json
 ```
 
 Replay a trace with a fixed profile:
 
 ```bash
-singularity eval trace replay work/traces/runs/run_123 \
+singularity-agent eval trace replay work/traces/runs/run_123 \
   --profile-json "{\"name\":\"baseline\",\"model\":\"gpt-test\",\"prompt_profile\":\"default\",\"memory_enabled\":true,\"allowed_tools\":[\"read_file\"],\"tool_policy\":\"read_only\"}"
 ```
 
 Run a suite:
 
 ```bash
-singularity eval suite run golden.json \
+singularity-agent eval suite run golden.json \
   --trace-run-dir work/traces/runs/run_123 \
   --profile-json "{\"name\":\"baseline\",\"model\":\"gpt-a\",\"memory_enabled\":true,\"allowed_tools\":[\"read_file\",\"run_verification\"],\"tool_policy\":\"read_write\"}"
 ```
@@ -138,11 +138,11 @@ This command creates a controlled workspace under `work/evaluations-live/`, boot
 Run A/B or regression checks:
 
 ```bash
-singularity eval ab run golden.json \
+singularity-agent eval ab run golden.json \
   --baseline-profile-json "{\"name\":\"baseline\",\"model\":\"gpt-a\",\"memory_enabled\":true,\"allowed_tools\":[\"read_file\",\"run_verification\"],\"tool_policy\":\"read_write\"}" \
   --candidate-profile-json "{\"name\":\"candidate\",\"model\":\"gpt-b\",\"prompt_profile\":\"compact\",\"memory_enabled\":false,\"allowed_tools\":[\"read_file\"],\"tool_policy\":\"read_only\"}"
 
-singularity eval regression run golden.json \
+singularity-agent eval regression run golden.json \
   --baseline-profile-json "{\"name\":\"baseline\",\"model\":\"gpt-a\",\"memory_enabled\":true,\"allowed_tools\":[\"read_file\",\"run_verification\"],\"tool_policy\":\"read_write\"}" \
   --candidate-profile-json "{\"name\":\"candidate\",\"model\":\"gpt-b\",\"prompt_profile\":\"compact\",\"memory_enabled\":false,\"allowed_tools\":[\"read_file\"],\"tool_policy\":\"read_only\"}" \
   --threshold 0.05 --block-on-regression

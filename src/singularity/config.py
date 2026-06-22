@@ -50,8 +50,61 @@ class Settings(BaseModel):
         )
 
 
+BASE_DEFAULT_MAX_TURNS = 8
+MEDIUM_TASK_DEFAULT_MAX_TURNS = 12
+LONG_TASK_DEFAULT_MAX_TURNS = 16
+
+_LONG_TASK_MARKERS = (
+    "refactor",
+    "architecture",
+    "benchmark",
+    "e2e",
+    "end-to-end",
+    "implement",
+    "integration",
+    "phase",
+    "roadmap",
+    "complete",
+    "report",
+    "commit",
+    "push",
+    "merge",
+    "重构",
+    "架构",
+    "基准",
+    "端到端",
+    "实现",
+    "集成",
+    "阶段",
+    "清单",
+    "全部",
+    "完成",
+    "报告",
+    "提交",
+    "合并",
+    "修复",
+    "测试",
+)
+
+
+def adaptive_default_max_turns(goal: str | None) -> int:
+    text = (goal or "").strip()
+    if not text:
+        return BASE_DEFAULT_MAX_TURNS
+
+    lowered = text.lower()
+    marker_hits = sum(1 for marker in _LONG_TASK_MARKERS if marker in lowered)
+    char_count = len(text)
+
+    if char_count >= 240 or marker_hits >= 5 or text.count("\n") >= 2:
+        return LONG_TASK_DEFAULT_MAX_TURNS
+    if char_count >= 120 or marker_hits >= 2:
+        return MEDIUM_TASK_DEFAULT_MAX_TURNS
+    return BASE_DEFAULT_MAX_TURNS
+
+
 _CONFIG_DEFAULTS: dict[str, Any] = {
-    "max_turns": 8,
+    "max_turns": BASE_DEFAULT_MAX_TURNS,
     "profile": None,
     "approval_mode": ApprovalMode.AUTO_SAFE,
     "security_mode": SecurityMode.STRICT,
@@ -76,7 +129,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
 @dataclass(frozen=True)
 class ProductionRuntimeConfig:
     project_root: Path
-    max_turns: int = 8
+    max_turns: int = BASE_DEFAULT_MAX_TURNS
     profile: str | None = None
     approval_mode: ApprovalMode = ApprovalMode.AUTO_SAFE
     security_mode: SecurityMode = SecurityMode.STRICT
@@ -124,6 +177,7 @@ class ProductionRuntimeConfig:
         project_index_max_total_bytes: int | None = None,
         config_file: Path | str | None = None,
         cli_overrides: set[str] | None = None,
+        default_max_turns: int | None = None,
     ) -> "ProductionRuntimeConfig":
         root = Path(project_root).expanduser().resolve(strict=False)
         resolved_config_file = (
@@ -198,7 +252,13 @@ class ProductionRuntimeConfig:
             "project_index_max_file_size": "SINGULARITY_PROJECT_INDEX_MAX_FILE_SIZE",
             "project_index_max_total_bytes": "SINGULARITY_PROJECT_INDEX_MAX_TOTAL_BYTES",
         }
-        for name, default in _CONFIG_DEFAULTS.items():
+        defaults = dict(_CONFIG_DEFAULTS)
+        default_sources: dict[str, str] = {}
+        if default_max_turns is not None:
+            defaults["max_turns"] = max(1, int(default_max_turns))
+            default_sources["max_turns"] = "default:adaptive"
+
+        for name, default in defaults.items():
             raw_value, source = _resolve_config_value(
                 name=name,
                 cli_value=cli_values[name],
@@ -208,6 +268,8 @@ class ProductionRuntimeConfig:
                 config_source=config_source,
                 default=default,
             )
+            if source == "default" and name in default_sources:
+                source = default_sources[name]
             values[name] = converters[name](raw_value)
             sources[name] = source
         return cls(

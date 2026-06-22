@@ -1,6 +1,6 @@
 # Singularity v0.1.0
 
-Singularity is a production-grade local coding agent runtime. The v0.1.0 baseline ships the Python CLI runtime while the project prepares the Desktop Transition Runtime.
+Singularity is a production-oriented local coding agent runtime. The v0.1.0 baseline ships the Python CLI runtime while the project prepares the Desktop Transition Runtime.
 
 v0.1.x is the CLI runtime baseline. The next architecture phase is Desktop Transition Runtime: a local RuntimeHost/daemon boundary around the existing Python runtime, not another round of CLI-only feature accumulation. The target product architecture is Rust Core + Tauri Desktop + TypeScript UI + Python Plugin Runtime, introduced in stages without deleting the current Python runtime.
 
@@ -118,7 +118,7 @@ Runtime configuration precedence is:
 explicit CLI flag > SINGULARITY_* > .singularity/config.toml > defaults
 ```
 
-The optional `.singularity/config.toml` file may define non-secret runtime settings such as `max_turns`, `approval_mode`, `security_mode`, `model`, `base_url`, `raw_artifacts`, and `[project_index]` options. The API key remains environment-only. Boot trace records an effective config event with a redacted value summary and config source map; final reports include the same effective config summary.
+The optional `.singularity/config.toml` file may define non-secret runtime settings such as `max_turns`, `approval_mode`, `security_mode`, `model`, `base_url`, `raw_artifacts`, and `[project_index]` options. When `max_turns` is not set by CLI, environment, or config, the CLI derives an adaptive default from the goal length and long-task markers. The API key remains environment-only. Boot trace records an effective config event with a redacted value summary and config source map; final reports include the same effective config summary.
 
 PowerShell:
 
@@ -149,7 +149,7 @@ export SINGULARITY_MODEL=gpt-4.1-mini
 ```bash
 singularity-agent "inspect the current project" \
   --project-root . \
-  --max-turns 8 \
+  --max-turns 12 \
   --approval-mode auto_safe \
   --trace-dir work/traces/runs \
   --context-db work/traces/runs/session/context.sqlite3 \
@@ -162,7 +162,7 @@ singularity-agent "inspect the current project" \
 
 Supported session options:
 
-- `--max-turns`: Maximum model turns before the session stops.
+- `--max-turns`: Maximum model turns before the session stops. If omitted, CLI runs use an adaptive default based on the goal shape; explicit CLI, environment, and config values still take precedence.
 - `--approval-mode`: One of `interactive`, `review_all`, `auto_safe`, `read_only`, or `non_interactive`.
 - `--trace-dir`: Directory that contains per-run trace directories.
 - `--context-db`: Exact ContextStore SQLite path. Defaults to `<trace-run-dir>/context.sqlite3`.

@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from singularity.code_index import ProjectIndexRuntime
-from singularity.config import ProductionRuntimeConfig
+from singularity.config import ProductionRuntimeConfig, adaptive_default_max_turns
 from singularity.evaluation import (
     EvaluationProfile,
     EvaluationRuntime,
@@ -66,7 +66,7 @@ app = typer.Typer(
     cls=_SingularityGroup,
     add_completion=False,
     no_args_is_help=True,
-    help="production-grade local CLI coding agent runtime",
+    help="production-oriented local CLI coding agent runtime",
 )
 trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
 index_app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -124,7 +124,7 @@ def _cli_overrides(names: list[str]) -> set[str] | None:
 def run_goal(
     goal: Annotated[
         str,
-        typer.Argument(help="User goal for the production-grade local CLI coding agent runtime."),
+        typer.Argument(help="User goal for the production-oriented local CLI coding agent runtime."),
     ],
     max_turns: Annotated[
         int | None,
@@ -133,7 +133,7 @@ def run_goal(
             "-t",
             min=1,
             max=20,
-            help="Maximum number of model turns before stopping.",
+            help="Maximum number of model turns before stopping; overrides the adaptive default.",
         ),
     ] = None,
     profile: Annotated[
@@ -242,7 +242,7 @@ def run_goal(
         ),
     ] = None,
 ) -> None:
-    """Run the production-grade local CLI coding agent runtime."""
+    """Run the production-oriented local CLI coding agent runtime."""
 
     project_root = (project_root or Path.cwd()).expanduser().resolve(strict=False)
     runtime_config = ProductionRuntimeConfig.from_cli(
@@ -262,6 +262,7 @@ def run_goal(
         project_index_enabled=project_index_enabled,
         project_index_db=project_index_db,
         project_index_build_on_boot=project_index_build_on_boot,
+        default_max_turns=adaptive_default_max_turns(goal),
         cli_overrides=_cli_overrides(
             [
                 "max_turns",

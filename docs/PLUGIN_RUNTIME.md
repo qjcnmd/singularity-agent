@@ -5,11 +5,11 @@ Singularity plugins are local project or user extensions. They are disabled by d
 Use:
 
 ```text
-singularity plugin list --json
-singularity plugin inspect <id> --json
-singularity plugin check [id] --json
-singularity plugin enable <id> --json
-singularity plugin disable <id> --json
+singularity-agent plugin list --json
+singularity-agent plugin inspect <id> --json
+singularity-agent plugin check [id] --json
+singularity-agent plugin enable <id> --json
+singularity-agent plugin disable <id> --json
 ```
 
 Place project plugins under:

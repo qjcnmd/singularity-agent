@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 
 from singularity.agent import SingularityAgentRunStatus
 from singularity.cli import app
-from singularity.config import ProductionRuntimeConfig
+from singularity.config import ProductionRuntimeConfig, adaptive_default_max_turns
 from singularity.context import ContextManager
 from singularity.context.models import ContextItemType, ContextRuntime
 from singularity.model import (
@@ -56,7 +56,7 @@ def test_cli_help_exposes_production_baseline_options_without_legacy_copy() -> N
 
     assert result.exit_code == 0
     output = result.output
-    assert "production-grade local CLI coding agent runtime" in output
+    assert "production-oriented local CLI coding agent runtime" in output
     assert "minimal" not in output.lower()
     assert "read-only agent loop" not in output.lower()
     for option in [
@@ -174,6 +174,33 @@ def test_production_runtime_config_reports_custom_config_file_source(tmp_path: P
     assert config.max_turns == 9
     assert effective["config_file"] == "runtime.toml"
     assert effective["sources"]["max_turns"] == "config:runtime.toml"
+
+
+def test_adaptive_default_turn_budget_scales_long_tasks(tmp_path: Path) -> None:
+    assert adaptive_default_max_turns("inspect README") == 8
+    assert (
+        adaptive_default_max_turns(
+            "Implement the integration fix, run tests, update the report, and commit the result."
+        )
+        == 12
+    )
+    assert (
+        adaptive_default_max_turns(
+            "根据清单按阶段完成实现、测试、报告、提交、push、合并，并在每个阶段验证结果。"
+            "This is an end-to-end roadmap task with benchmark, architecture, integration, and report work."
+        )
+        == 16
+    )
+
+    config = ProductionRuntimeConfig.from_cli(
+        project_root=tmp_path,
+        default_max_turns=adaptive_default_max_turns(
+            "根据清单按阶段完成实现、测试、报告、提交、push、合并，并在每个阶段验证结果。"
+        ),
+    )
+
+    assert config.max_turns == 16
+    assert config.effective_config()["sources"]["max_turns"] == "default:adaptive"
 
 
 def test_tool_policy_is_not_runtime_permission_decider(tmp_path: Path) -> None:
@@ -494,7 +521,7 @@ def test_readme_documents_v010_production_architecture() -> None:
 
     assert "# Singularity v0.1.0" in readme
     assert "Project identity:" in readme
-    assert "production-grade local coding agent runtime" in readme
+    assert "production-oriented local coding agent runtime" in readme
     assert "CLI\n-> SingularityAgent\n-> PlannerRuntime\n-> ContextManager\n-> ModelRuntime" in readme
     assert "ToolCallingProtocolRuntime\n-> ToolRuntime\n-> PolicyRuntime / ApprovalGate" in readme
     assert "list_files" in readme

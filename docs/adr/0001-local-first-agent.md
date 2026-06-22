@@ -4,7 +4,7 @@ Status: Accepted
 
 ## Context
 
-Singularity is a production-grade local coding agent runtime. It operates on a user's workspace, may execute commands, may mutate files, and stores trace, context, protocol, policy, workspace state, and memory locally.
+Singularity is a production-oriented local coding agent runtime. It operates on a user's workspace, may execute commands, may mutate files, and stores trace, context, protocol, policy, workspace state, and memory locally.
 
 Future desktop work should not turn the product into a remote-control cloud agent by accident.
 

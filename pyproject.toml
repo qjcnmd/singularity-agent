@@ -1,7 +1,7 @@
 [project]
 name = "singularity-agent"
 version = "0.1.0"
-description = "A production-grade local coding agent runtime."
+description = "A production-oriented local coding agent runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

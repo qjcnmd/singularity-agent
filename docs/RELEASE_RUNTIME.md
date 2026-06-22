@@ -43,7 +43,7 @@ tmp/
 ## CLI
 
 ```bash
-singularity version [--json]
+singularity-agent version [--json]
 singularity-agent doctor [--json]
 singularity-agent system init [--force]
 singularity-agent system migrate

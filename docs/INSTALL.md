@@ -15,7 +15,8 @@ pipx install .
 The console script is:
 
 ```bash
-singularity
+singularity-agent
+sg
 ```
 
 It resolves to `singularity.cli:main`, so installed usage does not depend on running inside the source checkout.
@@ -67,14 +68,14 @@ The command is idempotent. Existing config and manifest files are preserved unle
 Check the installation:
 
 ```bash
-singularity version
+singularity-agent version
 singularity-agent doctor
 ```
 
 Machine-readable variants:
 
 ```bash
-singularity version --json
+singularity-agent version --json
 singularity-agent doctor --json
 ```
 

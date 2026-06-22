@@ -131,11 +131,11 @@ Payloads include safe summaries such as plugin id, version, manifest hash, statu
 ## CLI
 
 ```text
-singularity plugin list --json
-singularity plugin inspect local_echo --json
-singularity plugin check local_echo --json
-singularity plugin enable local_echo --json
-singularity plugin disable local_echo --json
+singularity-agent plugin list --json
+singularity-agent plugin inspect local_echo --json
+singularity-agent plugin check local_echo --json
+singularity-agent plugin enable local_echo --json
+singularity-agent plugin disable local_echo --json
 ```
 
 `--mode` and `--home` use the same runtime path resolution as the system commands for user-level discovery. Enabling is project-level and writes `.singularity/plugin-status.json`.
@@ -198,7 +198,7 @@ def register(host):
 Enable and check:
 
 ```text
-singularity plugin check local_echo
-singularity plugin enable local_echo
-singularity plugin list
+singularity-agent plugin check local_echo
+singularity-agent plugin enable local_echo
+singularity-agent plugin list
 ```

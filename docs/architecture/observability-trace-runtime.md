@@ -92,11 +92,11 @@ Final reports include `execution_trace_summary` with actions, failed actions, to
 The trace CLI is intentionally small:
 
 ```powershell
-singularity trace list
-singularity trace show <run_id>
-singularity trace timeline <run_id>
-singularity trace errors <run_id>
-singularity trace artifacts <run_id>
+singularity-agent trace list
+singularity-agent trace show <run_id>
+singularity-agent trace timeline <run_id>
+singularity-agent trace errors <run_id>
+singularity-agent trace artifacts <run_id>
 ```
 
 `trace artifacts` shows artifact id, kind, size, summary-level metadata, and a relative handle. It does not print the internal absolute artifact path. These commands read the local append-only store. They do not replay actions or contact remote telemetry systems.

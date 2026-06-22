@@ -76,12 +76,12 @@ Before mutation apply, `MutationRuntime` asks the index for impact. Config, entr
 ## CLI
 
 ```text
-singularity index build
-singularity index refresh
-singularity index explain
-singularity index relevant "goal"
-singularity index impact <paths...>
-singularity index tests <paths...>
+singularity-agent index build
+singularity-agent index refresh
+singularity-agent index explain
+singularity-agent index relevant "goal"
+singularity-agent index impact <paths...>
+singularity-agent index tests <paths...>
 ```
 
 All commands support `--json`. Index CLI commands build or query the index only; they do not run project code.
