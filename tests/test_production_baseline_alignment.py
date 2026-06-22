@@ -6,6 +6,7 @@ from typing import Any
 
 from typer.testing import CliRunner
 
+from singularity.agent import SingularityAgentRunStatus
 from singularity.cli import app
 from singularity.config import ProductionRuntimeConfig
 from singularity.context import ContextManager
@@ -362,9 +363,9 @@ def test_min_agent_uses_injected_protocol_and_tool_runtime(tmp_path: Path) -> No
         protocol_runtime=protocol_runtime,
     )
 
-    answer = agent.run("inspect")
+    result = agent.run("inspect")
 
-    assert "Planner blocked finalization" in answer
+    assert result.status == SingularityAgentRunStatus.MAX_TURNS_EXCEEDED
     assert protocol_runtime.calls == 1
     assert protocol_runtime.tool_runtime_ids == [id(tool_runtime)]
 

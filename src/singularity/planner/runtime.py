@@ -36,6 +36,7 @@ from singularity.planner.risk import RiskEscalator
 from singularity.planner.store import PlannerStore
 from singularity.tools.models import ToolResult, ToolSpec
 from singularity.trace import TraceWriter
+from singularity.execution_outcome import ExecutionOutcome
 
 
 class PlannerRuntime:
@@ -497,6 +498,59 @@ class PlannerRuntime:
             extra={"instruction_prompt_observation": payload},
         )
 
+    def record_execution_outcome(self, outcome: ExecutionOutcome | dict[str, Any]) -> None:
+        self._throw_if_cancelled()
+        payload = outcome.to_dict() if hasattr(outcome, "to_dict") else dict(outcome)
+        if payload not in self.evidence.task_outcomes:
+            self.evidence.task_outcomes.append(payload)
+        for item in payload.get("missing_evidence") or []:
+            self._append_unique(self.evidence.missing_evidence, item)
+        status = str(payload.get("status") or "")
+        if status in {"fatal", "blocked"}:
+            self.evidence.unresolved_failures.append({"execution_outcome": payload})
+        state = self._state()
+        if status == "replan_required":
+            self._route_after_missing_evidence(payload.get("missing_evidence") or [])
+            self.replan({"error_code": payload.get("error_code") or "task_outcome_replan"})
+            return
+        if status == "retryable" and state.status == TaskStatus.BLOCKED:
+            state.status = TaskStatus.RECOVERING
+            state.current_phase = self._plan().current_phase
+        elif status == "approval_required":
+            state.status = TaskStatus.NEEDS_REVIEW
+        elif status == "user_input_required":
+            state.status = TaskStatus.BLOCKED
+        elif status in {"fatal", "blocked"}:
+            state.status = TaskStatus.FAILED if status == "fatal" else TaskStatus.BLOCKED
+        state.touch()
+        self._persist()
+        self._record_event(
+            decision="execution_outcome",
+            reason=str(payload.get("reason") or "Execution outcome recorded."),
+            extra={"execution_outcome": payload},
+        )
+
+    def _route_after_missing_evidence(self, missing: list[Any]) -> None:
+        names = {str(item) for item in missing}
+        state = self._state()
+        plan = self._plan()
+        if "required_files_inspected" in names:
+            state.status = TaskStatus.INSPECTING_WORKSPACE
+            state.current_phase = "inspecting_workspace"
+            plan.current_phase = "inspecting_workspace"
+        elif "required_changes_applied" in names:
+            state.status = TaskStatus.APPLYING_CHANGES
+            state.current_phase = "applying_changes"
+            plan.current_phase = "applying_changes"
+        elif "unresolved_failures_empty" in names:
+            state.status = TaskStatus.REPAIRING_FAILURES
+            state.current_phase = "repairing_failures"
+            plan.current_phase = "repairing_failures"
+        elif "required_verifications_passed" in names:
+            state.status = TaskStatus.RUNNING_VERIFICATION
+            state.current_phase = "running_verification"
+            plan.current_phase = "running_verification"
+
     def record_project_index_observation(self, observation: dict[str, Any]) -> None:
         self._throw_if_cancelled()
         payload = {
@@ -669,7 +723,7 @@ class PlannerRuntime:
         )
         return decision
 
-    def assess_completion(self) -> dict[str, Any]:
+    def assess_completion(self, *, mark_blocked: bool = True) -> dict[str, Any]:
         self._throw_if_cancelled()
         state = self._state()
         unmet: list[str] = []
@@ -691,7 +745,7 @@ class PlannerRuntime:
             unmet.append("risks_acknowledged")
         status = TaskStatus.COMPLETED if not unmet else TaskStatus.BLOCKED
         assessment = {"status": status.value, "unmet": unmet}
-        if unmet:
+        if unmet and mark_blocked:
             state.status = TaskStatus.BLOCKED
             state.blocked_reasons = sorted(set([*state.blocked_reasons, *unmet]))
         self._persist()

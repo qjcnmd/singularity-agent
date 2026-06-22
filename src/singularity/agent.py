@@ -8,6 +8,7 @@ from typing import Any
 from rich.console import Console
 
 from singularity.context import ContextManager
+from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.instructions import InstructionRuntime
 from singularity.interaction import InteractionRuntime, ProgressEvent
 from singularity.model import ModelPurpose, ModelRuntime, ModelTurnStatus
@@ -188,41 +189,28 @@ class SingularityAgent:
             result = model_runtime.run_turn(request)
             if result.status != ModelTurnStatus.SUCCESS:
                 self._record_model_failure(planner, result, turn=turn)
-                final_answer = (
-                    "Model turn did not produce a valid response: "
-                    + (
-                        result.error.message
-                        if result.error is not None
-                        else ", ".join(result.validation.errors if result.validation else [])
-                    )
-                )
-                self.trace.record(
-                    "final_answer", {"turn": turn, "content": final_answer}
-                )
-                return SingularityAgentRunResult(
-                    status=SingularityAgentRunStatus.FAILED,
-                    final_answer=final_answer,
-                    turn=turn,
-                    error_code="model_runtime_failed",
-                    diagnostics={"model_status": result.status.value},
-                )
+                outcome = self._outcome_from_model_failure(result)
+                planner.record_execution_outcome(outcome)
+                self._record_outcome_context(context, planner, outcome)
+                terminal = self._terminal_result_from_outcome(outcome, turn=turn)
+                if terminal is not None:
+                    return terminal
+                continue
 
             assistant_message = self._assistant_message_from_result(result)
             if not result.tool_calls:
                 context.add_assistant_message(assistant_message)
-                final_answer, final_status = self._planner_final_answer(
+                final = self._attempt_finalize(
                     planner,
+                    context=context,
+                    turn=turn,
                     model_answer=assistant_message.get("content") or "",
                 )
-                self.trace.record(
-                    "final_answer", {"turn": turn, "content": final_answer}
-                )
-                return SingularityAgentRunResult(
-                    status=final_status,
-                    final_answer=final_answer,
-                    turn=turn,
-                )
+                if final is not None:
+                    return final
+                continue
 
+            observation_start = len(context.tool_observations)
             protocol_result = protocol_runtime.process_model_turn(
                 request=request,
                 result=result,
@@ -233,18 +221,27 @@ class SingularityAgent:
                 policy_runtime=self.policy_runtime,
             )
             if protocol_result.next_action == "finalize":
-                final_answer, final_status = self._planner_final_answer(
+                final = self._attempt_finalize(
                     planner,
+                    context=context,
+                    turn=turn,
                     model_answer=assistant_message.get("content") or "",
                 )
-                self.trace.record(
-                    "final_answer", {"turn": turn, "content": final_answer}
-                )
-                return SingularityAgentRunResult(
-                    status=final_status,
-                    final_answer=final_answer,
-                    turn=turn,
-                )
+                if final is not None:
+                    return final
+                continue
+
+            outcome = self._reduce_protocol_result(
+                protocol_result,
+                context=context,
+                observation_start=observation_start,
+            )
+            if outcome is not None:
+                planner.record_execution_outcome(outcome)
+                self._record_outcome_context(context, planner, outcome)
+                terminal = self._terminal_result_from_outcome(outcome, turn=turn)
+                if terminal is not None:
+                    return terminal
 
         message = f"Stopped after max_turns={self.max_turns}; the model did not produce a final answer."
         self.trace.record("error", {"type": "MaxTurnsExceeded", "message": message})
@@ -256,26 +253,56 @@ class SingularityAgent:
             error_code="max_turns_exceeded",
         )
 
-    @staticmethod
-    def _planner_final_answer(
+    def _attempt_finalize(
+        self,
         planner: PlannerRuntime,
         *,
+        context: ContextManager,
+        turn: int,
         model_answer: str,
-    ) -> tuple[str, SingularityAgentRunStatus]:
-        assessment = planner.assess_completion()
+    ) -> SingularityAgentRunResult | None:
+        assessment = planner.assess_completion(mark_blocked=False)
         if assessment["status"] != TaskStatus.COMPLETED.value:
-            return (
-                "Planner blocked finalization because completion criteria are unmet: "
-                + ", ".join(assessment["unmet"])
-            ), SingularityAgentRunStatus.BLOCKED
+            outcome = ExecutionOutcome(
+                status=ExecutionOutcomeStatus.REPLAN_REQUIRED,
+                source="completion",
+                reason="completion_rejected",
+                error_code="completion_rejected",
+                missing_evidence=list(assessment["unmet"]),
+                next_action="continue",
+                observation_summary=(
+                    "Completion rejected because evidence is missing: "
+                    + ", ".join(assessment["unmet"])
+                ),
+                retry_allowed=True,
+                metadata={"assessment": assessment},
+            )
+            planner.record_execution_outcome(outcome)
+            self._record_outcome_context(context, planner, outcome)
+            return None
         if (
             planner.state is not None
             and not planner.state.completion_criteria.required_changes_applied
             and not planner.state.completion_criteria.required_verifications_passed
         ):
-            return model_answer, SingularityAgentRunStatus.COMPLETED
+            outcome = ExecutionOutcome(
+                status=ExecutionOutcomeStatus.SUCCESS,
+                source="completion",
+                reason="completion_ready",
+                next_action="finalize",
+                observation_summary="Completion evidence satisfied.",
+                retry_allowed=False,
+            )
+            planner.record_execution_outcome(outcome)
+            self._record_outcome_context(context, planner, outcome)
+            self.trace.record("final_answer", {"turn": turn, "content": model_answer})
+            return SingularityAgentRunResult(
+                status=SingularityAgentRunStatus.COMPLETED,
+                final_answer=model_answer,
+                turn=turn,
+            )
         report = planner.finalize()
-        return "\n".join(
+        final_answer = "\n".join(
             [
                 f"status: {report.status.value}",
                 f"files_changed: {', '.join(report.files_changed) if report.files_changed else '-'}",
@@ -283,7 +310,228 @@ class SingularityAgent:
                 f"unresolved_issues: {len(report.unresolved_issues)}",
                 f"risks: {len(report.risks)}",
             ]
-        ), SingularityAgentRunStatus.COMPLETED
+        )
+        outcome = ExecutionOutcome(
+            status=ExecutionOutcomeStatus.SUCCESS,
+            source="completion",
+            reason="completion_ready",
+            next_action="finalize",
+            observation_summary="Completion evidence satisfied.",
+            retry_allowed=False,
+            metadata={"verification_summary": report.verification_summary},
+        )
+        planner.record_execution_outcome(outcome)
+        self._record_outcome_context(context, planner, outcome)
+        self.trace.record("final_answer", {"turn": turn, "content": final_answer})
+        return SingularityAgentRunResult(
+            status=SingularityAgentRunStatus.COMPLETED,
+            final_answer=final_answer,
+            turn=turn,
+        )
+
+    def _reduce_protocol_result(
+        self,
+        protocol_result: Any,
+        *,
+        context: ContextManager,
+        observation_start: int,
+    ) -> ExecutionOutcome | None:
+        observations = context.tool_observations[observation_start:]
+        error_codes = [
+            str(observation.error_code)
+            for observation in observations
+            if getattr(observation, "error_code", None)
+        ]
+        next_action = str(getattr(protocol_result, "next_action", "") or "continue")
+        status = str(getattr(getattr(protocol_result, "status", None), "value", getattr(protocol_result, "status", "")))
+        failed_count = int(getattr(protocol_result, "failed_count", 0) or 0)
+        rejected_count = int(getattr(protocol_result, "rejected_count", 0) or 0)
+        pending_count = int(getattr(protocol_result, "pending_approval_count", 0) or 0)
+        summary = self._observation_summary(observations, protocol_result)
+
+        if pending_count or next_action == "pending_approval" or "approval_required" in error_codes:
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.APPROVAL_REQUIRED,
+                source="protocol",
+                reason="Tool execution is waiting for approval.",
+                error_code="approval_required",
+                next_action="wait_for_approval",
+                observation_summary=summary,
+                retry_allowed=False,
+            )
+        if "policy_ask_user_required" in error_codes:
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
+                source="tool",
+                reason="Policy requires user input.",
+                error_code="policy_ask_user_required",
+                next_action="ask_user",
+                observation_summary=summary,
+                retry_allowed=False,
+            )
+        blocked_codes = {
+            "policy_denied",
+            "approval_denied",
+            "action_not_allowed",
+            "risk_escalated",
+            "sandbox_required",
+            "policy_escalation_required",
+        }
+        if any(code in blocked_codes for code in error_codes):
+            code = next(code for code in error_codes if code in blocked_codes)
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.BLOCKED,
+                source="tool",
+                reason=f"Tool execution blocked: {code}.",
+                error_code=code,
+                next_action="blocked",
+                observation_summary=summary,
+                retry_allowed=False,
+            )
+        replan_codes = {
+            "snapshot_mismatch",
+            "external_change_detected",
+            "file_changed",
+            "rollback_conflict",
+            "semantic_failure",
+            "verification_failed",
+            "blocked_by_verification",
+            "command_not_found",
+            "timeout",
+        }
+        if any(code in replan_codes for code in error_codes):
+            code = next(code for code in error_codes if code in replan_codes)
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.REPLAN_REQUIRED,
+                source="tool",
+                reason=f"Tool result requires replanning: {code}.",
+                error_code=code,
+                next_action="replan",
+                observation_summary=summary,
+                retry_allowed=True,
+            )
+        retryable_codes = {
+            "bad_arguments_json",
+            "invalid_json",
+            "arguments_not_object",
+            "validation_error",
+            "schema_mismatch",
+            "unknown_tool",
+            "tool_not_found",
+            "disallowed_tool",
+            "protocol_violation",
+            "internal_error",
+        }
+        if any(code in retryable_codes for code in error_codes):
+            code = next(code for code in error_codes if code in retryable_codes)
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.RETRYABLE,
+                source="protocol" if "json" in code or "schema" in code else "tool",
+                reason=f"Tool call can be retried after correction: {code}.",
+                error_code=code,
+                next_action="retry",
+                observation_summary=summary,
+                retry_allowed=True,
+            )
+        if next_action == "fail_safe" or status in {"failed", "invalid_assistant"}:
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.RETRYABLE,
+                source="protocol",
+                reason="Protocol fail-safe requested another model turn.",
+                error_code=str((getattr(protocol_result, "metadata", {}) or {}).get("reason") or "protocol_fail_safe"),
+                next_action="retry",
+                observation_summary=summary,
+                retry_allowed=True,
+            )
+        if failed_count or rejected_count or next_action == "recover":
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.RETRYABLE,
+                source="protocol",
+                reason="Protocol reported recoverable tool failure.",
+                error_code=error_codes[0] if error_codes else "tool_failure",
+                next_action="retry",
+                observation_summary=summary,
+                retry_allowed=True,
+            )
+        return None
+
+    def _outcome_from_model_failure(self, result: Any) -> ExecutionOutcome:
+        message = (
+            result.error.message
+            if result.error is not None
+            else ", ".join(result.validation.errors if result.validation else [])
+        )
+        retryable = bool(getattr(result.error, "retryable", False)) if result.error else True
+        error_code = "model_runtime_failed"
+        lowered = message.lower()
+        if "invalid_json" in lowered or "invalid json" in lowered:
+            error_code = "invalid_json"
+        elif "unknown_tool" in lowered or "unknown tool" in lowered:
+            error_code = "unknown_tool"
+        elif "schema" in lowered:
+            error_code = "schema_mismatch"
+        return ExecutionOutcome(
+            status=ExecutionOutcomeStatus.RETRYABLE if retryable else ExecutionOutcomeStatus.FATAL,
+            source="model",
+            reason=f"Model turn did not produce a valid response: {message}",
+            error_code=error_code,
+            next_action="retry" if retryable else "abort",
+            observation_summary=message,
+            retry_allowed=retryable,
+            metadata={"model_status": result.status.value},
+        )
+
+    def _terminal_result_from_outcome(
+        self,
+        outcome: ExecutionOutcome,
+        *,
+        turn: int,
+    ) -> SingularityAgentRunResult | None:
+        if outcome.status in {ExecutionOutcomeStatus.RETRYABLE, ExecutionOutcomeStatus.REPLAN_REQUIRED}:
+            return None
+        status = (
+            SingularityAgentRunStatus.FAILED
+            if outcome.status == ExecutionOutcomeStatus.FATAL
+            else SingularityAgentRunStatus.BLOCKED
+        )
+        final_answer = outcome.observation_summary or outcome.reason
+        self.trace.record("final_answer", {"turn": turn, "content": final_answer})
+        return SingularityAgentRunResult(
+            status=status,
+            final_answer=final_answer,
+            turn=turn,
+            error_code=outcome.error_code,
+            diagnostics={"outcome": outcome.to_dict()},
+        )
+
+    def _record_outcome_context(
+        self,
+        context: ContextManager,
+        planner: PlannerRuntime,
+        outcome: ExecutionOutcome,
+    ) -> None:
+        self.trace.record("execution_outcome", outcome.to_dict())
+        context.add_planner_state(
+            {
+                "current_phase": planner.state.current_phase if planner.state else "unknown",
+                "status": planner.state.status.value if planner.state else "unknown",
+                "execution_outcome": outcome.to_dict(),
+            }
+        )
+
+    @staticmethod
+    def _observation_summary(observations: list[Any], protocol_result: Any) -> str:
+        if observations:
+            parts = []
+            for observation in observations[-3:]:
+                status = "ok" if observation.ok else (observation.error_code or "failed")
+                preview = str(observation.preview or "").replace("\n", " ")[:160]
+                parts.append(f"{observation.tool_name}:{status}:{preview}")
+            return "; ".join(parts)
+        return (
+            f"protocol next_action={getattr(protocol_result, 'next_action', None)} "
+            f"status={getattr(getattr(protocol_result, 'status', None), 'value', getattr(protocol_result, 'status', None))}"
+        )
 
     def _context_db_path(self) -> Any:
         if hasattr(self.trace, "store"):
@@ -303,9 +551,7 @@ class SingularityAgent:
             "error": result.error.to_dict() if result.error else None,
             "validation": result.validation.to_dict() if result.validation else None,
         }
-        planner.evidence.unresolved_failures.append({"model_turn": details})
-        if planner.state is not None:
-            planner.state.blocked_reasons.append("model_runtime_failed")
+        self.trace.record("model_failure", details)
 
     def _publish_progress(self, turn: int) -> None:
         if self.interaction_runtime is None:

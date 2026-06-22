@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from singularity.agent import SingularityAgent
+from singularity.agent import SingularityAgentRunStatus
 from singularity.trace import TraceWriter
 from tests.agent_runtime_helpers import make_agent_session
 
@@ -110,13 +111,13 @@ def test_agent_delegates_tool_call_processing_to_protocol_runtime(tmp_path: Path
         tmp_path,
         provider=provider,  # type: ignore[arg-type]
         trace=trace,
-        max_turns=3,
+        max_turns=2,
         protocol_runtime=FakeProtocolRuntime(),
     )
 
     answer = agent.run("read the README")
 
-    assert answer.startswith("Planner blocked finalization")
+    assert answer.status == SingularityAgentRunStatus.MAX_TURNS_EXCEEDED
     assert len(calls) == 1
     assert hasattr(calls[0]["context"], "add_tool_protocol_result")
     assert hasattr(calls[0]["tool_runtime"], "execute_tool_call")

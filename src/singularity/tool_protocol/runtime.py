@@ -476,7 +476,7 @@ class ToolCallingProtocolRuntime:
         next_action = "continue"
         if pending_approval_count:
             status = ToolProtocolTurnStatus.PENDING_APPROVAL
-            next_action = "recover"
+            next_action = "pending_approval"
         if rejected_count and executed_count == 0 and not pending_approval_count:
             status = ToolProtocolTurnStatus.REJECTED
         return ToolProtocolTurnResult(

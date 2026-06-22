@@ -265,6 +265,40 @@ def test_runtime_executes_checks_through_command_runtime_and_records_trace(tmp_p
     }
 
 
+def test_explicit_smoke_command_records_exit_stdout_and_stderr(tmp_path: Path) -> None:
+    request = CommandRequest(argv=["python", "quicksort.py"])
+    fake = FakeCommandRuntime(
+        [
+            command_result(
+                request,
+                command_id="cmd_smoke",
+                exit_code=0,
+                semantic_status=SemanticStatus.SUCCEEDED,
+                output="ok",
+            )
+        ]
+    )
+    runtime = VerificationRuntime(tmp_path, command_runtime=fake)
+
+    plan = runtime.plan_verification(
+        changed_files=[],
+        task_intent="run explicit smoke",
+        smoke_commands=[["python", "quicksort.py"]],
+    )
+    observation = runtime.run_plan(plan.id)
+    smoke = next(
+        result
+        for result in observation["verification"]["results"]
+        if result["kind"] == CheckKind.RUNTIME_SMOKE.value
+    )
+
+    assert fake.calls[0].argv == ["python", "quicksort.py"]
+    assert smoke["evidence"]["exit_code"] == 0
+    assert smoke["evidence"]["stdout_excerpt"] == "ok"
+    assert smoke["evidence"]["stderr_excerpt"] == ""
+    assert observation["verification"]["completion_assessment"]["status"] == CompletionStatus.READY.value
+
+
 def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path) -> None:
     request = CommandRequest(argv=[sys.executable, "-c", "print('ok')"])
     result = command_result(

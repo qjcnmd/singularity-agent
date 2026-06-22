@@ -346,6 +346,7 @@ class EvidenceLedger:
     edit_plans: list[dict[str, Any]] = field(default_factory=list)
     edit_results: list[dict[str, Any]] = field(default_factory=list)
     review_results: list[dict[str, Any]] = field(default_factory=list)
+    task_outcomes: list[dict[str, Any]] = field(default_factory=list)
 
     def add_unique_file(self, path: str) -> None:
         if path and path not in self.inspected_files:
@@ -373,6 +374,7 @@ class EvidenceLedger:
             "edit_plans": self.edit_plans,
             "edit_results": self.edit_results,
             "review_results": self.review_results,
+            "task_outcomes": self.task_outcomes,
         }
 
     @classmethod
@@ -398,6 +400,7 @@ class EvidenceLedger:
             edit_plans=list(payload.get("edit_plans") or []),
             edit_results=list(payload.get("edit_results") or []),
             review_results=list(payload.get("review_results") or []),
+            task_outcomes=list(payload.get("task_outcomes") or []),
         )
 
 

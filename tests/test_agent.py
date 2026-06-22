@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any
 
+from singularity.agent import SingularityAgentRunStatus
 from singularity.planner import PlannerRuntime
 from singularity.tools import ToolRegistry
 from singularity.tools.mutation import register_mutation_tools
@@ -265,5 +266,6 @@ def test_agent_blocks_final_answer_when_completion_evidence_is_missing(tmp_path:
 
     answer = agent.run("change code")
 
-    assert "Planner blocked finalization" in answer
-    assert "required_changes_applied" in answer
+    assert answer.status == SingularityAgentRunStatus.MAX_TURNS_EXCEEDED
+    assert planner.evidence.task_outcomes[-1]["error_code"] == "completion_rejected"
+    assert "required_changes_applied" in planner.evidence.missing_evidence
