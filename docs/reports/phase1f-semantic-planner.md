@@ -80,7 +80,24 @@ Result:
 646 passed, 4 skipped
 ```
 
-Remote alignment is recorded after final publish for this phase.
+Publish proof:
+
+```powershell
+git push origin main
+```
+
+Direct GitHub access timed out on port 443, so the push was retried with a command-scoped proxy:
+
+```powershell
+git -c http.proxy=http://127.0.0.1:7897 -c https.proxy=http://127.0.0.1:7897 push origin main
+```
+
+Result:
+
+```text
+d94b33b feat: add semantic rolling planner
+origin/main...HEAD = 0 0
+```
 
 ## Risks
 
