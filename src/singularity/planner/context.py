@@ -26,6 +26,7 @@ class PlannerContextRenderer:
                 "risk_level": state.risk_level.value,
                 "allowed_tools": plan.phase(state.current_phase).allowed_tools,
                 "task_contract": self._contract_summary(state.task_contract),
+                "rolling_plan": self._rolling_plan_summary(state.rolling_plan),
                 "evidence": {
                     "inspected_files": evidence.inspected_files[-20:],
                     "changed_files": self._changed_files(evidence),
@@ -71,6 +72,16 @@ class PlannerContextRenderer:
             "verification_requirements": contract.get("verification_requirements") or [],
             "report_requirements": contract.get("report_requirements") or [],
             "evidence_requirements": contract.get("evidence_requirements") or [],
+        }
+
+    @staticmethod
+    def _rolling_plan_summary(rolling_plan: dict) -> dict:
+        if not rolling_plan:
+            return {}
+        return {
+            "plan_id": rolling_plan.get("plan_id"),
+            "current_step_id": rolling_plan.get("current_step_id"),
+            "steps": rolling_plan.get("steps") or [],
         }
 
     @staticmethod

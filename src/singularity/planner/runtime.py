@@ -35,6 +35,7 @@ from singularity.planner.policy import (
 )
 from singularity.planner.replanner import Replanner
 from singularity.planner.risk import RiskEscalator
+from singularity.planner.semantic import RollingPlan, SemanticPlannerRuntime
 from singularity.planner.store import PlannerStore
 from singularity.tools.models import ToolResult, ToolSpec
 from singularity.trace import TraceWriter
@@ -58,6 +59,7 @@ class PlannerRuntime:
         self.store = store or PlannerStore(self.workspace_root)
         self.policy = PlannerPolicy()
         self.contract_builder = TaskContractBuilder()
+        self.semantic_planner = SemanticPlannerRuntime()
         self.risk = RiskEscalator()
         self.replanner = Replanner()
         self.renderer = PlannerContextRenderer()
@@ -79,6 +81,7 @@ class PlannerRuntime:
         self._throw_if_cancelled()
         normalized_goal = " ".join(user_goal.split())
         contract = self.contract_builder.build(normalized_goal)
+        rolling_plan = self.semantic_planner.initial_plan(contract)
         self.state = TaskState(
             task_id=self.task_id,
             session_id=self.session_id,
@@ -90,6 +93,7 @@ class PlannerRuntime:
             status=TaskStatus.UNDERSTANDING_TASK,
             current_phase="understanding_task",
             task_contract=contract.to_dict(),
+            rolling_plan=rolling_plan.to_dict(),
         )
         if self._is_read_only_goal(user_goal):
             self.state.completion_criteria.required_files_inspected = (
@@ -383,6 +387,11 @@ class PlannerRuntime:
                     for existing in self.evidence.failure_analyses
                 ):
                     self.evidence.failure_analyses.append(analysis)
+                if self.state and self.state.task_contract:
+                    self.state.rolling_plan = self.semantic_planner.repair_plan(
+                        analysis,
+                        task_contract=self.state.task_contract,
+                    ).to_dict()
         repair_plan = verification.get("repair_plan")
         if isinstance(repair_plan, dict):
             plan_id = repair_plan.get("plan_id")
@@ -942,11 +951,29 @@ class PlannerRuntime:
     def filtered_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         self._throw_if_cancelled()
         allowed = set(self._plan().phase(self._state().current_phase).allowed_tools)
+        current_step = self.semantic_rolling_plan().current_step()
+        if current_step is not None:
+            allowed.update(current_step.allowed_capabilities)
         return [
             tool
             for tool in tools
             if tool.get("function", {}).get("name") in allowed
         ]
+
+    def semantic_rolling_plan(self) -> RollingPlan:
+        state = self._state()
+        if state.rolling_plan:
+            return RollingPlan.from_dict(state.rolling_plan)
+        contract = self._contract()
+        if contract is not None:
+            plan = self.semantic_planner.initial_plan(contract)
+        else:
+            plan = self.semantic_planner.initial_plan(
+                {"user_goal": state.normalized_goal, "acceptance_criteria": []}
+            )
+        state.rolling_plan = plan.to_dict()
+        self._persist()
+        return plan
 
     def _maybe_advance_after_tool(self, tool_name: str) -> None:
         state = self._state()

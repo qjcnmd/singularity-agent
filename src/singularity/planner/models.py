@@ -138,6 +138,7 @@ class TaskState:
     final_assessment: dict[str, Any] = field(default_factory=dict)
     task_contract: dict[str, Any] = field(default_factory=dict)
     lifecycle_status: str = "created"
+    rolling_plan: dict[str, Any] = field(default_factory=dict)
 
     def touch(self) -> None:
         self.updated_at = _now()
@@ -166,6 +167,7 @@ class TaskState:
             "final_assessment": self.final_assessment,
             "task_contract": self.task_contract,
             "lifecycle_status": self.lifecycle_status,
+            "rolling_plan": self.rolling_plan,
         }
 
     @classmethod
@@ -195,6 +197,7 @@ class TaskState:
             final_assessment=dict(payload.get("final_assessment") or {}),
             task_contract=dict(payload.get("task_contract") or {}),
             lifecycle_status=str(payload.get("lifecycle_status") or "created"),
+            rolling_plan=dict(payload.get("rolling_plan") or {}),
         )
 
 

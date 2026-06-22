@@ -30,6 +30,14 @@ from singularity.planner.contract import (
     VerificationRequirement,
 )
 from singularity.planner.runtime import PlannerRuntime, create_or_resume_planner
+from singularity.planner.semantic import (
+    ExpectedEvidence,
+    FallbackStep,
+    PlanDependency,
+    PlanStep,
+    RollingPlan,
+    SemanticPlannerRuntime,
+)
 from singularity.planner.store import PlannerStore
 
 __all__ = [
@@ -44,8 +52,12 @@ __all__ = [
     "EvidenceRequirement",
     "EvidenceLedger",
     "ExecutionBudget",
+    "ExpectedEvidence",
+    "FallbackStep",
     "FinalReport",
     "PLANNER_ERROR_CODES",
+    "PlanDependency",
+    "PlanStep",
     "PlannerRuntime",
     "PlannerStore",
     "ReportRequirement",
@@ -55,6 +67,8 @@ __all__ = [
     "RiskDecisionKind",
     "RiskEscalation",
     "RiskLevel",
+    "RollingPlan",
+    "SemanticPlannerRuntime",
     "TaskPhase",
     "TaskPlan",
     "TaskContract",
