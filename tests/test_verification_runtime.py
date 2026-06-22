@@ -13,6 +13,7 @@ from singularity.command import (
 )
 from singularity.command.models import CommandResult
 from singularity.context import ContextManager
+from singularity.planner import PlannerRuntime
 from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
 from singularity.tools.command import register_command_tools
 from singularity.tools.verification import register_verification_tools
@@ -305,6 +306,38 @@ def test_explicit_smoke_command_records_exit_stdout_and_stderr(tmp_path: Path) -
     assert smoke["evidence"]["stdout_excerpt"] == "ok"
     assert smoke["evidence"]["stderr_excerpt"] == ""
     assert observation["verification"]["completion_assessment"]["status"] == CompletionStatus.READY.value
+
+
+def test_plan_verification_uses_contract_smoke_commands_when_missing(tmp_path: Path) -> None:
+    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner.start_task("Create quicksort.py and run smoke verification")
+    request = CommandRequest(argv=["python", "quicksort.py"])
+    fake = FakeCommandRuntime(
+        [
+            command_result(
+                request,
+                command_id="cmd_contract_smoke",
+                exit_code=0,
+                semantic_status=SemanticStatus.SUCCEEDED,
+                output="ok",
+            )
+        ]
+    )
+    runtime = VerificationRuntime(tmp_path, command_runtime=fake, planner=planner)
+
+    plan = runtime.plan_verification(changed_files=[], task_intent="verify contract")
+    observation = runtime.run_plan(plan.id)
+    smoke = next(
+        result
+        for result in observation["verification"]["results"]
+        if result["kind"] == CheckKind.RUNTIME_SMOKE.value
+    )
+
+    smoke_check = next(check for check in plan.required_checks if check.kind == CheckKind.RUNTIME_SMOKE)
+    assert smoke_check.command is not None
+    assert smoke_check.command.argv == ["python", "quicksort.py"]
+    assert fake.calls[0].argv == ["python", "quicksort.py"]
+    assert smoke["evidence"]["exit_code"] == 0
 
 
 def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path) -> None:

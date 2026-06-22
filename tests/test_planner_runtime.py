@@ -6,6 +6,9 @@ from singularity.planner import (
     PlannerRuntime,
     ReplanDecisionKind,
     RiskDecisionKind,
+    TaskContract,
+    TaskContractBuilder,
+    TaskContractSchemaError,
     TaskStatus,
 )
 from singularity.tools.models import ToolExecutionBackendKind, ToolResult, ToolSpec, PermissionLevel
@@ -60,6 +63,114 @@ def test_start_task_builds_state_plan_and_persists(tmp_path: Path) -> None:
     ]
     assert (tmp_path / ".singularity" / "planner" / "session_1" / "state.json").exists()
     assert (tmp_path / ".singularity" / "planner" / "session_1" / "planner_events.jsonl").exists()
+
+
+def test_task_contract_builder_extracts_create_file_smoke_contract() -> None:
+    contract = TaskContractBuilder().build("Create quicksort.py and run smoke verification")
+
+    assert contract.deliverables[0].path == "quicksort.py"
+    assert contract.acceptance_criteria[0].criterion_id == "deliver_quicksort_py"
+    assert contract.acceptance_criteria[1].criterion_id == "verify_quicksort_py"
+    assert contract.smoke_commands() == [["python", "quicksort.py"]]
+
+
+def test_task_contract_builder_records_report_obligations() -> None:
+    contract = TaskContractBuilder().build("生成一份实验报告，包含修改、验证和风险")
+
+    assert contract.deliverables[0].kind == "report"
+    assert contract.report_requirements
+    assert {"goal", "requirements", "changes", "verification", "risks"} <= set(
+        contract.report_requirements[0].sections
+    )
+
+
+def test_task_contract_accepts_model_structured_output() -> None:
+    contract = TaskContractBuilder().build(
+        "fallback",
+        structured_output={
+            "user_goal": "model goal",
+            "acceptance_criteria": [
+                {
+                    "criterion_id": "model_criterion",
+                    "description": "model criterion",
+                    "evidence": ["inspected_files"],
+                }
+            ],
+            "deliverables": [{"kind": "file", "description": "file", "path": "a.py"}],
+        },
+    )
+
+    assert contract.source == "model"
+    assert contract.user_goal == "model goal"
+    assert contract.acceptance_criteria[0].criterion_id == "model_criterion"
+
+
+def test_task_contract_schema_validation_rejects_unverifiable_required_criteria() -> None:
+    try:
+        TaskContract.validate_payload(
+            {
+                "user_goal": "model goal",
+                "acceptance_criteria": [
+                    {
+                        "criterion_id": "bad",
+                        "description": "missing evidence",
+                        "evidence": [],
+                    }
+                ],
+            }
+        )
+    except TaskContractSchemaError:
+        pass
+    else:
+        raise AssertionError("invalid contract schema should fail validation")
+
+    fallback = TaskContractBuilder().build(
+        "Create fallback.py and run smoke verification",
+        structured_output={
+            "acceptance_criteria": [
+                {
+                    "criterion_id": "bad",
+                    "description": "missing evidence",
+                    "evidence": [],
+                }
+            ]
+        },
+    )
+
+    assert fallback.source == "rules"
+    assert fallback.deliverables[0].path == "fallback.py"
+    assert fallback.smoke_commands() == [["python", "fallback.py"]]
+
+
+def test_planner_injects_contract_and_completion_reports_missing_smoke_evidence(tmp_path: Path) -> None:
+    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner.start_task("Create quicksort.py and run smoke verification")
+    planner.evidence.inspected_files.append("README.md")
+    planner.evidence.applied_changes.append(
+        {"changed_files": ["quicksort.py"], "transaction_id": "tx_1"}
+    )
+
+    context = json.loads(planner.planner_context_message()["content"])["planner"]
+    assessment = planner.assess_completion(mark_blocked=False)
+
+    assert context["task_contract"]["deliverables"][0]["path"] == "quicksort.py"
+    assert planner.contract_smoke_commands() == [["python", "quicksort.py"]]
+    assert "contract:verify_quicksort_py" in assessment["unmet"]
+    assert assessment["criteria"]["deliver_quicksort_py"]["satisfied"] is True
+    assert assessment["criteria"]["verify_quicksort_py"]["satisfied"] is False
+
+    planner.evidence.verification_results.append(
+        {
+            "completion_assessment": {"status": "ready"},
+            "check_status": [{"check_id": "check_1", "status": "passed"}],
+        }
+    )
+    planner.state.final_assessment = {"status": "ready"}
+
+    ready = planner.assess_completion(mark_blocked=False)
+
+    assert "contract:verify_quicksort_py" not in ready["unmet"]
+    assert ready["criteria"]["verify_quicksort_py"]["satisfied"] is True
 
 
 def test_phase_policy_allows_read_tools_before_mutation_and_blocks_write(tmp_path: Path) -> None:

@@ -24,6 +24,7 @@ class PlannerContextRenderer:
                 "status": state.status.value,
                 "risk_level": state.risk_level.value,
                 "allowed_tools": plan.phase(state.current_phase).allowed_tools,
+                "task_contract": self._contract_summary(state.task_contract),
                 "evidence": {
                     "inspected_files": evidence.inspected_files[-20:],
                     "changed_files": self._changed_files(evidence),
@@ -55,6 +56,19 @@ class PlannerContextRenderer:
             }
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+    @staticmethod
+    def _contract_summary(contract: dict) -> dict:
+        if not contract:
+            return {}
+        return {
+            "source": contract.get("source"),
+            "acceptance_criteria": contract.get("acceptance_criteria") or [],
+            "deliverables": contract.get("deliverables") or [],
+            "verification_requirements": contract.get("verification_requirements") or [],
+            "report_requirements": contract.get("report_requirements") or [],
+            "evidence_requirements": contract.get("evidence_requirements") or [],
+        }
 
     @staticmethod
     def _changed_files(evidence: EvidenceLedger) -> list[str]:

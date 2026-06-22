@@ -18,6 +18,17 @@ from singularity.planner.models import (
     TaskState,
     TaskStatus,
 )
+from singularity.planner.contract import (
+    AcceptanceCriterion,
+    Constraint,
+    Deliverable,
+    EvidenceRequirement,
+    ReportRequirement,
+    TaskContract,
+    TaskContractBuilder,
+    TaskContractSchemaError,
+    VerificationRequirement,
+)
 from singularity.planner.runtime import PlannerRuntime, create_or_resume_planner
 from singularity.planner.store import PlannerStore
 
@@ -25,14 +36,19 @@ __all__ = [
     "ActionKind",
     "ActionStatus",
     "AgentAction",
+    "AcceptanceCriterion",
     "AuthorizationDecision",
     "CompletionCriteria",
+    "Constraint",
+    "Deliverable",
+    "EvidenceRequirement",
     "EvidenceLedger",
     "ExecutionBudget",
     "FinalReport",
     "PLANNER_ERROR_CODES",
     "PlannerRuntime",
     "PlannerStore",
+    "ReportRequirement",
     "create_or_resume_planner",
     "ReplanDecision",
     "ReplanDecisionKind",
@@ -41,6 +57,10 @@ __all__ = [
     "RiskLevel",
     "TaskPhase",
     "TaskPlan",
+    "TaskContract",
+    "TaskContractBuilder",
+    "TaskContractSchemaError",
     "TaskState",
     "TaskStatus",
+    "VerificationRequirement",
 ]

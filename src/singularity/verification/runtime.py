@@ -95,6 +95,7 @@ class VerificationRuntime:
         changeset_id: str | None = None,
     ) -> VerificationPlan:
         self._throw_if_cancelled()
+        resolved_smoke_commands = smoke_commands or self._contract_smoke_commands()
         profile = ProjectDetector(self.workspace_root).detect()
         impact = ImpactAnalyzer().analyze(
             changed_files=changed_files,
@@ -107,7 +108,7 @@ class VerificationRuntime:
         plan = self._build_plan(
             profile=profile,
             impact=impact,
-            smoke_commands=smoke_commands or [],
+            smoke_commands=resolved_smoke_commands,
             transaction_id=transaction_id,
             changeset_id=changeset_id,
         )
@@ -126,6 +127,14 @@ class VerificationRuntime:
             },
         )
         return plan
+
+    def _contract_smoke_commands(self) -> list[list[str]]:
+        if self.planner is None or not hasattr(self.planner, "contract_smoke_commands"):
+            return []
+        try:
+            return [list(command) for command in self.planner.contract_smoke_commands()]
+        except Exception:
+            return []
 
     def run_plan(
         self,

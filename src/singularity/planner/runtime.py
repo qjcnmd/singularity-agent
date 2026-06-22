@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from singularity.planner.budget import BudgetController
+from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.context import PlannerContextRenderer
 from singularity.planner.finalizer import Finalizer
 from singularity.planner.models import (
@@ -56,6 +57,7 @@ class PlannerRuntime:
         self.trace = trace
         self.store = store or PlannerStore(self.workspace_root)
         self.policy = PlannerPolicy()
+        self.contract_builder = TaskContractBuilder()
         self.risk = RiskEscalator()
         self.replanner = Replanner()
         self.renderer = PlannerContextRenderer()
@@ -76,6 +78,7 @@ class PlannerRuntime:
     ) -> TaskState:
         self._throw_if_cancelled()
         normalized_goal = " ".join(user_goal.split())
+        contract = self.contract_builder.build(normalized_goal)
         self.state = TaskState(
             task_id=self.task_id,
             session_id=self.session_id,
@@ -86,6 +89,7 @@ class PlannerRuntime:
             assumptions=assumptions or [],
             status=TaskStatus.UNDERSTANDING_TASK,
             current_phase="understanding_task",
+            task_contract=contract.to_dict(),
         )
         if self._is_read_only_goal(user_goal):
             self.state.completion_criteria.required_files_inspected = (
@@ -99,6 +103,10 @@ class PlannerRuntime:
         self._persist()
         self._record_event(decision="start_task", reason="Task initialized.")
         return self.state
+
+    def contract_smoke_commands(self) -> list[list[str]]:
+        contract = self._contract()
+        return contract.smoke_commands() if contract is not None else []
 
     def record_clarification_answer(self, request: Any, answer: Any) -> TaskState:
         self._throw_if_cancelled()
@@ -775,8 +783,12 @@ class PlannerRuntime:
             unmet.append("workspace_health_acceptable")
         if self.evidence.risks and state.risk_level != RiskLevel.LOW:
             unmet.append("risks_acknowledged")
+        criteria = self._contract_criterion_status()
+        for criterion_id, criterion in criteria.items():
+            if criterion["required"] and not criterion["satisfied"]:
+                unmet.append(f"contract:{criterion_id}")
         status = TaskStatus.COMPLETED if not unmet else TaskStatus.BLOCKED
-        assessment = {"status": status.value, "unmet": unmet}
+        assessment = {"status": status.value, "unmet": unmet, "criteria": criteria}
         if unmet and mark_blocked:
             state.status = TaskStatus.BLOCKED
             state.blocked_reasons = sorted(set([*state.blocked_reasons, *unmet]))
@@ -787,6 +799,44 @@ class PlannerRuntime:
             completion_assessment=assessment,
         )
         return assessment
+
+    def _contract(self) -> TaskContract | None:
+        state = self._state()
+        if not state.task_contract:
+            return None
+        return TaskContract.from_dict(state.task_contract)
+
+    def _contract_criterion_status(self) -> dict[str, dict[str, Any]]:
+        contract = self._contract()
+        if contract is None:
+            return {}
+        status: dict[str, dict[str, Any]] = {}
+        for criterion in contract.acceptance_criteria:
+            satisfied = all(self._contract_evidence_satisfied(item) for item in criterion.evidence)
+            status[criterion.criterion_id] = {
+                "description": criterion.description,
+                "required": criterion.required,
+                "evidence": criterion.evidence,
+                "satisfied": satisfied,
+                "missing_evidence": [
+                    item for item in criterion.evidence if not self._contract_evidence_satisfied(item)
+                ],
+            }
+        return status
+
+    def _contract_evidence_satisfied(self, evidence_key: str) -> bool:
+        if evidence_key == "task_contract":
+            return bool(self._state().task_contract)
+        if evidence_key == "inspected_files":
+            return bool(self.evidence.inspected_files)
+        if evidence_key == "applied_changes":
+            return bool(self.evidence.applied_changes)
+        if evidence_key == "verification_results":
+            return self._state().final_assessment.get("status") in {"ready", "ready_with_warnings"}
+        if evidence_key == "final_report_ready":
+            return bool(self._state().completion_criteria.final_report_ready)
+        value = getattr(self.evidence, evidence_key, None)
+        return bool(value)
 
     def finalize(self) -> FinalReport:
         self._throw_if_cancelled()
