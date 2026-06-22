@@ -5,6 +5,7 @@ description = "A production-grade local coding agent runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "click>=8.0",
     "httpx>=0.27",
     "platformdirs>=4.2",
     "pydantic>=2.7",

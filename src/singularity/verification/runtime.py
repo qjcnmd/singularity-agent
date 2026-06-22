@@ -90,6 +90,7 @@ class VerificationRuntime:
         *,
         changed_files: list[str],
         task_intent: str,
+        smoke_commands: list[list[str]] | None = None,
         transaction_id: str | None = None,
         changeset_id: str | None = None,
     ) -> VerificationPlan:
@@ -106,6 +107,7 @@ class VerificationRuntime:
         plan = self._build_plan(
             profile=profile,
             impact=impact,
+            smoke_commands=smoke_commands or [],
             transaction_id=transaction_id,
             changeset_id=changeset_id,
         )
@@ -212,6 +214,7 @@ class VerificationRuntime:
         *,
         profile: ProjectProfile,
         impact: ImpactAnalysis,
+        smoke_commands: list[list[str]],
         transaction_id: str | None,
         changeset_id: str | None,
     ) -> VerificationPlan:
@@ -225,6 +228,23 @@ class VerificationRuntime:
             and impact.risk_level == "low"
             and "Only documentation-like files changed." in impact.risk_reasons
         )
+        explicit_smoke = bool(smoke_commands)
+        for index, argv in enumerate(smoke_commands, start=1):
+            required.append(
+                self._check(
+                    kind=CheckKind.RUNTIME_SMOKE,
+                    command=CommandRequest(
+                        argv=[str(item) for item in argv],
+                        cwd=".",
+                        purpose=CommandPurpose.PROJECT_VERIFICATION,
+                        timeout_seconds=60,
+                    ),
+                    scope=f"explicit_smoke_{index}",
+                    required=True,
+                    source="input:smoke_commands",
+                    risk_tags=["runtime_smoke", "explicit"],
+                )
+            )
         python_sources = [
             path for path in impact.changed_files if path.endswith(".py")
         ]
@@ -298,7 +318,7 @@ class VerificationRuntime:
             unit_command = self._command_for(profile, CheckKind.UNIT_TEST)
             if unit_command is not None:
                 required.append(self._check_from_command(unit_command, required=True, scope="project"))
-            else:
+            elif not explicit_smoke:
                 blocked.append(
                     self._check(
                         kind=CheckKind.UNIT_TEST,
@@ -307,6 +327,17 @@ class VerificationRuntime:
                         required=True,
                         source="impact:source-change",
                         skip_reason="No unit test command was discovered.",
+                    )
+                )
+            else:
+                skipped.append(
+                    self._check(
+                        kind=CheckKind.UNIT_TEST,
+                        command=None,
+                        scope="project",
+                        required=False,
+                        source="input:smoke_commands",
+                        skip_reason="Explicit smoke command provided; no unit test command was discovered.",
                     )
                 )
 
@@ -329,7 +360,7 @@ class VerificationRuntime:
         if impact.requires_typecheck:
             if typecheck_command is not None:
                 required.append(self._check_from_command(typecheck_command, required=True, scope="project"))
-            else:
+            elif not explicit_smoke:
                 blocked.append(
                     self._check(
                         kind=CheckKind.TYPECHECK,
@@ -338,6 +369,17 @@ class VerificationRuntime:
                         required=True,
                         source="impact:typecheck-required",
                         skip_reason="Typecheck is required but no command was discovered.",
+                    )
+                )
+            else:
+                skipped.append(
+                    self._check(
+                        kind=CheckKind.TYPECHECK,
+                        command=None,
+                        scope="project",
+                        required=False,
+                        source="input:smoke_commands",
+                        skip_reason="Explicit smoke command provided; no typecheck command was discovered.",
                     )
                 )
         elif typecheck_command is not None:
@@ -686,6 +728,8 @@ class VerificationRuntime:
             parsed_failures=parsed,
             duration_ms=command_result.duration_ms,
             timestamp=_now(),
+            stdout_excerpt=_excerpt(command_result.stdout_preview),
+            stderr_excerpt=_excerpt(command_result.stderr_preview),
             sandbox_id=command_result.metadata.get("sandbox_id"),
             sandbox_backend=command_result.metadata.get("sandbox_backend"),
             sandbox_status=command_result.metadata.get("sandbox_status"),

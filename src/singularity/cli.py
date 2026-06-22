@@ -4,10 +4,10 @@ import sys
 from pathlib import Path
 from typing import Annotated
 
+import click
 import typer
 from rich.console import Console
 from rich.panel import Panel
-from typer.core import _click
 
 from singularity.code_index import ProjectIndexRuntime
 from singularity.config import ProductionRuntimeConfig
@@ -47,8 +47,13 @@ from singularity.workspace_state import (
 class _SingularityGroup(typer.core.TyperGroup):
     def resolve_command(self, ctx, args):
         try:
-            return super().resolve_command(ctx, args)
-        except _click.exceptions.UsageError:
+            command_name, command, remaining = super().resolve_command(ctx, args)
+            if command is None and args and not str(args[0]).startswith("-"):
+                return super().resolve_command(ctx, ["run", *args])
+            return command_name, command, remaining
+        except Exception as exc:
+            if not _is_click_usage_error(exc):
+                raise
             if args and not str(args[0]).startswith("-"):
                 return super().resolve_command(ctx, ["run", *args])
             raise
@@ -85,6 +90,13 @@ eval_app.add_typer(eval_regression_app, name="regression")
 eval_app.add_typer(eval_report_app, name="report")
 console = Console()
 _REDACTOR = TraceRedactor()
+
+
+def _is_click_usage_error(exc: Exception) -> bool:
+    if isinstance(exc, click.UsageError):
+        return True
+    cls = type(exc)
+    return cls.__name__ in {"UsageError", "NoSuchCommand"} and "click" in cls.__module__
 
 
 @app.command("run")

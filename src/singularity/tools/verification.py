@@ -23,6 +23,7 @@ class PlanVerificationInput(BaseModel):
 
     changed_files: list[str] = Field(default_factory=list)
     task_intent: str = ""
+    smoke_commands: list[list[str]] = Field(default_factory=list)
     transaction_id: str | None = None
     changeset_id: str | None = None
 
@@ -33,6 +34,7 @@ class RunVerificationInput(BaseModel):
     plan_id: str | None = None
     changed_files: list[str] = Field(default_factory=list)
     task_intent: str = ""
+    smoke_commands: list[list[str]] = Field(default_factory=list)
     transaction_id: str | None = None
     changeset_id: str | None = None
 
@@ -58,6 +60,7 @@ class VerificationToolHandlers:
         plan = self.runtime.plan_verification(
             changed_files=args.changed_files,
             task_intent=args.task_intent,
+            smoke_commands=args.smoke_commands,
             transaction_id=args.transaction_id,
             changeset_id=args.changeset_id,
         )
@@ -69,6 +72,7 @@ class VerificationToolHandlers:
             plan = self.runtime.plan_verification(
                 changed_files=args.changed_files,
                 task_intent=args.task_intent,
+                smoke_commands=args.smoke_commands,
                 transaction_id=args.transaction_id,
                 changeset_id=args.changeset_id,
             )

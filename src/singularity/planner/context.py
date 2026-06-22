@@ -33,6 +33,8 @@ class PlannerContextRenderer:
                         else None
                     ),
                     "unresolved_failures": evidence.unresolved_failures[-10:],
+                    "missing_evidence": evidence.missing_evidence[-10:],
+                    "task_outcomes": evidence.task_outcomes[-10:],
                     "risks": evidence.risks[-10:],
                     "external_changes": evidence.external_changes[-20:],
                     "policy_observations": [

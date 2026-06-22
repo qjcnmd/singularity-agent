@@ -273,6 +273,64 @@ def test_protocol_runtime_appends_tool_message_when_tool_runtime_fails(tmp_path:
     assert "super-secret" not in tool_message["content"]
 
 
+def test_protocol_runtime_marks_pending_approval_next_action(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="review_tool",
+            description="requires review",
+            input_model=_EmptyInput,
+            handler=lambda _args: {"ok": True},
+        )
+    )
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.coding_agent(),
+        trace=TraceWriter.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_runtime=SequencedPolicyRuntime([DecisionOutcome.REQUIRE_REVIEW]),
+    )
+    protocol_runtime = ToolCallingProtocolRuntime(
+        registry=registry,
+        trace=TraceWriter.create(tmp_path),
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    runtime = ModelRuntime.with_mock_provider(
+        MockModelProvider(text="ok"),
+        tool_registry=registry,
+    )
+    request = runtime.build_request_from_context(
+        context,
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        action_id="action_1",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        allowed_tool_names=["review_tool"],
+    )
+
+    result = protocol_runtime.process_model_turn(
+        request=request,
+        result=_tool_result(
+            ModelToolCall(
+                tool_call_id="call_review",
+                tool_name="review_tool",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            )
+        ),
+        turn=1,
+        context=context,
+        tool_runtime=tool_runtime,
+    )
+
+    assert result.status == ToolProtocolTurnStatus.PENDING_APPROVAL
+    assert result.next_action == "pending_approval"
+
+
 def test_protocol_runtime_marks_existing_context_tool_message_as_appended(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path)
     context = ContextManager(system_prompt="system", user_goal="inspect")

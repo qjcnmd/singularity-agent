@@ -320,6 +320,8 @@ class VerificationEvidence:
     parsed_failures: list[ParsedFailure]
     duration_ms: int
     timestamp: str
+    stdout_excerpt: str = ""
+    stderr_excerpt: str = ""
     sandbox_id: str | None = None
     sandbox_backend: str | None = None
     sandbox_status: str | None = None
@@ -334,6 +336,8 @@ class VerificationEvidence:
             "command": self.command,
             "exit_code": self.exit_code,
             "output_excerpt": self.output_excerpt,
+            "stdout_excerpt": self.stdout_excerpt,
+            "stderr_excerpt": self.stderr_excerpt,
             "artifact_ref": self.artifact_path,
             "artifact_path": self.artifact_path,
             "parsed_failures": [
