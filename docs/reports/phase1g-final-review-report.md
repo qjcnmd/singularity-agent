@@ -84,7 +84,19 @@ Result:
 
 Note: the standard `--basetemp work\pytest-tmp` path was retried and failed before test execution for later tests with Windows `PermissionError: [WinError 5]` while pytest attempted to remove the existing temp root. The same full suite passed with a fresh basetemp directory.
 
-Remote alignment is recorded after final publish for this phase.
+Publish proof:
+
+```powershell
+git push origin main
+git rev-list --left-right --count origin/main...HEAD
+```
+
+Result:
+
+```text
+b1a61a3 feat: require final review reports
+origin/main...HEAD = 0 0
+```
 
 ## Risks
 
