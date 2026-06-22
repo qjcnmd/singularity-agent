@@ -33,10 +33,18 @@ class ExpectedOutcomeKind(str, Enum):
 
 
 VALID_DIFFICULTY_TAGS = {item.value for item in TaskDifficulty}
-VALID_RUNTIME_TAGS = {"memory-heavy", "tool-heavy"}
+VALID_RUNTIME_TAGS = {"memory-heavy", "tool-heavy", "phase1j-golden"}
 VALID_TAGS = VALID_DIFFICULTY_TAGS | VALID_RUNTIME_TAGS
 VALID_TASK_VERSIONS = {"v1", "v2"}
 VALID_HOOK_STAGES = {"before_run", "after_run", "score_adjustment"}
+GOLDEN_CONTRACT_FIELDS = {
+    "scenario",
+    "expected_files",
+    "expected_commands",
+    "expected_evidence",
+    "expected_report_sections",
+    "required_trace_artifacts",
+}
 
 
 @dataclass(frozen=True)
@@ -198,6 +206,58 @@ class EvaluationHook:
 
 
 @dataclass(frozen=True)
+class GoldenTaskContract:
+    scenario: str
+    expected_files: list[str] = field(default_factory=list)
+    expected_commands: list[str] = field(default_factory=list)
+    expected_evidence: list[str] = field(default_factory=list)
+    expected_report_sections: list[str] = field(default_factory=list)
+    required_trace_artifacts: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.scenario.strip():
+            raise ValueError("golden_contract.scenario is required.")
+        for field_name in sorted(GOLDEN_CONTRACT_FIELDS - {"scenario"}):
+            values = getattr(self, field_name)
+            if not values:
+                raise ValueError(f"golden_contract.{field_name} requires at least one item.")
+            object.__setattr__(self, field_name, [str(item) for item in values])
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "scenario": self.scenario,
+            "expected_files": list(self.expected_files),
+            "expected_commands": list(self.expected_commands),
+            "expected_evidence": list(self.expected_evidence),
+            "expected_report_sections": list(self.expected_report_sections),
+            "required_trace_artifacts": list(self.required_trace_artifacts),
+        }
+        if self.metadata:
+            payload["metadata"] = _copy_jsonish(self.metadata)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "GoldenTaskContract":
+        missing = sorted(field for field in GOLDEN_CONTRACT_FIELDS if field not in payload)
+        if missing:
+            raise ValueError(f"golden_contract missing fields: {', '.join(missing)}")
+        return cls(
+            scenario=str(payload.get("scenario", "")),
+            expected_files=[str(item) for item in payload.get("expected_files") or []],
+            expected_commands=[str(item) for item in payload.get("expected_commands") or []],
+            expected_evidence=[str(item) for item in payload.get("expected_evidence") or []],
+            expected_report_sections=[
+                str(item) for item in payload.get("expected_report_sections") or []
+            ],
+            required_trace_artifacts=[
+                str(item) for item in payload.get("required_trace_artifacts") or []
+            ],
+            metadata=_dict(payload.get("metadata")),
+        )
+
+
+@dataclass(frozen=True)
 class BenchmarkTask:
     task_id: str
     version: str
@@ -208,6 +268,7 @@ class BenchmarkTask:
     evaluation_hooks: list[EvaluationHook | dict[str, Any]] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     profiles: dict[str, Any] = field(default_factory=dict)
+    golden_contract: GoldenTaskContract | dict[str, Any] | None = None
     description: str = ""
     owner: str | None = None
     created_at: str | None = None
@@ -227,6 +288,7 @@ class BenchmarkTask:
         evaluation_hooks: list[EvaluationHook | dict[str, Any]] | None = None,
         tags: list[str] | None = None,
         profiles: dict[str, Any] | None = None,
+        golden_contract: GoldenTaskContract | dict[str, Any] | None = None,
         description: str = "",
         owner: str | None = None,
         created_at: str | None = None,
@@ -251,6 +313,7 @@ class BenchmarkTask:
         )
         object.__setattr__(self, "tags", list(tags or []))
         object.__setattr__(self, "profiles", _dict(profiles))
+        object.__setattr__(self, "golden_contract", _golden_contract(golden_contract))
         object.__setattr__(self, "description", description)
         object.__setattr__(self, "owner", owner)
         object.__setattr__(self, "created_at", created_at)
@@ -302,6 +365,8 @@ class BenchmarkTask:
             payload["evaluation_hooks"] = [item.to_dict() for item in self.evaluation_hooks]
         if self.profiles:
             payload["profiles"] = _copy_jsonish(self.profiles)
+        if self.golden_contract is not None:
+            payload["golden_contract"] = self.golden_contract.to_dict()
         if self.owner:
             payload["owner"] = self.owner
         if self.created_at:
@@ -322,6 +387,7 @@ class BenchmarkTask:
             evaluation_hooks=list(payload.get("evaluation_hooks") or []),
             tags=list(payload.get("tags") or []),
             profiles=_dict(payload.get("profiles")),
+            golden_contract=payload.get("golden_contract"),
             description=str(payload.get("description", "")),
             owner=payload.get("owner"),
             created_at=payload.get("created_at"),
@@ -485,6 +551,16 @@ def _hook(value: EvaluationHook | dict[str, Any]) -> EvaluationHook:
     if isinstance(value, EvaluationHook):
         return value
     return EvaluationHook.from_dict(value)
+
+
+def _golden_contract(
+    value: GoldenTaskContract | dict[str, Any] | None,
+) -> GoldenTaskContract | None:
+    if value is None:
+        return None
+    if isinstance(value, GoldenTaskContract):
+        return value
+    return GoldenTaskContract.from_dict(value)
 
 
 def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:

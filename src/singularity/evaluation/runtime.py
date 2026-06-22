@@ -242,9 +242,16 @@ class RegressionDetector:
                 regressions.append(
                     {
                         "metric": metric,
+                        "task_id": "__suite__",
                         "baseline": base,
                         "candidate": cand,
                         "delta": round(delta, 6),
+                        "trace_artifact_ref": _regression_artifact_ref(
+                            task_id="__suite__",
+                            metric=metric,
+                            baseline_profile=baseline.profile.name,
+                            candidate_profile=candidate.profile.name,
+                        ),
                     }
                 )
         baseline_by_task = {item.task_id: item for item in baseline.task_results}
@@ -272,18 +279,32 @@ class RegressionDetector:
                 regressions.append(
                     {
                         "metric": f"task:{candidate_task.task_id}:status",
+                        "task_id": candidate_task.task_id,
                         "baseline": baseline_task.scoring.status,
                         "candidate": candidate_task.scoring.status,
                         "delta": "success_to_failure",
+                        "trace_artifact_ref": _regression_artifact_ref(
+                            task_id=candidate_task.task_id,
+                            metric="status",
+                            baseline_profile=baseline.profile.name,
+                            candidate_profile=candidate.profile.name,
+                        ),
                     }
                 )
             elif candidate_task.scoring.score + threshold < baseline_task.scoring.score:
                 regressions.append(
                     {
                         "metric": f"task:{candidate_task.task_id}:score",
+                        "task_id": candidate_task.task_id,
                         "baseline": baseline_task.scoring.score,
                         "candidate": candidate_task.scoring.score,
                         "delta": round(candidate_task.scoring.score - baseline_task.scoring.score, 6),
+                        "trace_artifact_ref": _regression_artifact_ref(
+                            task_id=candidate_task.task_id,
+                            metric="score",
+                            baseline_profile=baseline.profile.name,
+                            candidate_profile=candidate.profile.name,
+                        ),
                     }
                 )
         return RegressionReport(
@@ -325,6 +346,20 @@ def _score_adjustment_delta(hook_results: list[dict[str, Any]]) -> float:
         if isinstance(payload, dict):
             delta += _bounded_delta(payload.get("score_delta"))
     return max(-1.0, min(1.0, delta))
+
+
+def _regression_artifact_ref(
+    *,
+    task_id: str,
+    metric: str,
+    baseline_profile: str,
+    candidate_profile: str,
+) -> str:
+    safe = "|".join([baseline_profile, candidate_profile, task_id, metric])
+    import hashlib
+
+    digest = hashlib.sha256(safe.encode("utf-8")).hexdigest()[:16]
+    return f"regression:{task_id}:{metric}:{digest}"
 
 
 def _bounded_delta(value: Any) -> float:

@@ -40,6 +40,7 @@ class TaskExecutionEvidence:
     hook_results: list[dict[str, Any]] = field(default_factory=list)
     snapshot: dict[str, Any] = field(default_factory=dict)
     runtime_overrides: dict[str, Any] = field(default_factory=dict)
+    golden_contract: dict[str, Any] = field(default_factory=dict)
     failure_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +54,7 @@ class TaskExecutionEvidence:
             "hook_results": self.hook_results,
             "snapshot": self.snapshot,
             "runtime_overrides": self.runtime_overrides,
+            "golden_contract": self.golden_contract,
             "failure_reasons": self.failure_reasons,
         }
 
@@ -81,15 +83,15 @@ class EvaluationTaskExecutor:
         execute: bool,
     ) -> TaskExecutionEvidence:
         snapshot = self.prepare_snapshot(task, execute=execute)
-        before = _capture_text_snapshot(self.project_root)
+        before = _capture_text_snapshot(self.project_root) if execute else {}
         hook_results: list[dict[str, Any]] = []
         hook_results.extend(self.run_hooks(task.evaluation_hooks, stage="before_run", execute=execute))
         verification = self.evaluate_tests(task.expected_outcomes, execute=execute)
         assertions = self.evaluate_assertions(task.expected_outcomes)
-        diff = self.evaluate_diff(task.expected_outcomes, before_snapshot=before)
+        diff = self.evaluate_diff(task.expected_outcomes, before_snapshot=before, execute=execute)
         hook_results.extend(self.run_hooks(task.evaluation_hooks, stage="after_run", execute=execute))
-        after = _capture_text_snapshot(self.project_root)
-        diff_summary = _diff_summary(before, after)
+        after = _capture_text_snapshot(self.project_root) if execute else {}
+        diff_summary = _diff_summary(before, after) if execute else []
         hook_results.extend(
             self.run_hooks(task.evaluation_hooks, stage="score_adjustment", execute=execute)
         )
@@ -106,8 +108,17 @@ class EvaluationTaskExecutor:
             verification=verification,
             diff_summary=diff_summary,
         )
+        golden_contract = self.evaluate_golden_contract(
+            task,
+            verification=verification,
+            assertions=assertions,
+            diff=diff,
+            diff_summary=diff_summary,
+        )
         failure_reasons = []
         failure_reasons.extend(snapshot.get("failure_reasons") or [])
+        if diff.get("failure_reason"):
+            failure_reasons.append(str(diff["failure_reason"]))
         failure_reasons.extend(item["error_code"] for item in hook_results if item.get("error_code"))
         return TaskExecutionEvidence(
             verification=verification,
@@ -119,6 +130,7 @@ class EvaluationTaskExecutor:
             hook_results=hook_results,
             snapshot=snapshot,
             runtime_overrides=runtime_overrides,
+            golden_contract=golden_contract,
             failure_reasons=failure_reasons,
         )
 
@@ -253,10 +265,19 @@ class EvaluationTaskExecutor:
         outcomes: list[ExpectedOutcome],
         *,
         before_snapshot: dict[str, str],
+        execute: bool,
     ) -> dict[str, Any]:
         diff_outcomes = [item for item in outcomes if item.kind == ExpectedOutcomeKind.DIFF]
         if not diff_outcomes:
             return {"matched": True, "passed": 0, "failed": 0}
+        if not execute:
+            return {
+                "status": "blocked",
+                "matched": False,
+                "passed": 0,
+                "failed": len(diff_outcomes),
+                "failure_reason": "diff_requires_execution",
+            }
         after = _capture_text_snapshot(self.project_root)
         summary = _diff_summary(before_snapshot, after)
         changed_paths = {item["path"] for item in summary}
@@ -299,6 +320,77 @@ class EvaluationTaskExecutor:
             else:
                 heuristics[name] = float(outcome.metadata.get("score", 0.0) or 0.0)
         return heuristics
+
+    def evaluate_golden_contract(
+        self,
+        task: BenchmarkTask,
+        *,
+        verification: dict[str, Any],
+        assertions: dict[str, Any],
+        diff: dict[str, Any],
+        diff_summary: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        contract = task.golden_contract
+        if contract is None:
+            return {}
+        changed_paths = {str(item.get("path")) for item in diff_summary}
+        diff_paths = set(str(path) for path in diff.get("changed_paths") or [])
+        assertion_results = assertions.get("results") or []
+        assertion_sources = {
+            str(item.get("assertion"))
+            for item in assertion_results
+            if item.get("passed")
+        }
+        verification_commands = {
+            str(result.get("command"))
+            for result in verification.get("results", [])
+            if result.get("command")
+        }
+        return {
+            "scenario": contract.scenario,
+            "expected_files": [
+                {
+                    "path": path,
+                    "declared": True,
+                    "changed": path in changed_paths or path in diff_paths,
+                    "exists": (self.project_root / path).exists(),
+                }
+                for path in contract.expected_files
+            ],
+            "expected_commands": [
+                {
+                    "command": command,
+                    "declared": True,
+                    "observed": command in verification_commands,
+                }
+                for command in contract.expected_commands
+            ],
+            "expected_evidence": [
+                {
+                    "name": name,
+                    "declared": True,
+                    "observed": _evidence_observed(
+                        name,
+                        verification=verification,
+                        diff_summary=diff_summary,
+                        assertions=assertion_sources,
+                    ),
+                }
+                for name in contract.expected_evidence
+            ],
+            "expected_report_sections": [
+                {"section": section, "declared": True}
+                for section in contract.expected_report_sections
+            ],
+            "required_trace_artifacts": [
+                {
+                    "kind": kind,
+                    "required": True,
+                    "artifact_ref": f"required:{task.task_id}:{kind}",
+                }
+                for kind in contract.required_trace_artifacts
+            ],
+        }
 
     def _run_hook(self, hook: EvaluationHook, *, execute: bool) -> dict[str, Any]:
         if not execute:
@@ -365,6 +457,7 @@ class EvaluationTaskExecutor:
             "status": result.status.value,
             "duration_ms": result.duration_ms,
             "exit_code": result.evidence.exit_code,
+            "command": command,
             "output_excerpt": result.evidence.output_excerpt,
             "policy_denied": bool(
                 result.policy_decision and result.policy_decision.error_code
@@ -475,12 +568,31 @@ class EvaluationArtifactWriter:
         md_path = output_dir / "regression.md"
         json_path.write_text(json_text, encoding="utf-8")
         md_path.write_text(markdown_text, encoding="utf-8")
+        regression_artifact_refs: list[str] = []
         if self.trace_runtime is not None and hasattr(self.trace_runtime, "write_artifact"):
+            for regression in _regressions_from_report_json(json_text):
+                item_artifact = self.trace_runtime.write_artifact(
+                    kind=TraceArtifactKind.REPORT,
+                    text=json.dumps(regression, ensure_ascii=False, sort_keys=True),
+                    summary="Evaluation regression artifact.",
+                    metadata={
+                        "artifact_type": "evaluation_regression",
+                        "run_id": run_id,
+                        "task_id": regression.get("task_id"),
+                        "metric": regression.get("metric"),
+                        "trace_artifact_ref": regression.get("trace_artifact_ref"),
+                    },
+                )
+                regression_artifact_refs.append(item_artifact.artifact_id)
             artifact = self.trace_runtime.write_artifact(
                 kind=TraceArtifactKind.REPORT,
                 path=json_path,
                 summary="Evaluation regression report JSON.",
-                metadata={"run_id": run_id, "report_path": str(json_path)},
+                metadata={
+                    "run_id": run_id,
+                    "report_path": str(json_path),
+                    "regression_artifacts": regression_artifact_refs,
+                },
             )
             if hasattr(self.trace_runtime, "emit"):
                 self.trace_runtime.emit(
@@ -565,6 +677,54 @@ def _diff_summary(before: dict[str, str], after: dict[str, str]) -> list[dict[st
             }
         )
     return summary
+
+
+def _evidence_observed(
+    name: str,
+    *,
+    verification: dict[str, Any],
+    diff_summary: list[dict[str, Any]],
+    assertions: set[str],
+) -> bool:
+    normalized = name.strip().lower()
+    if normalized in {"verification_passed", "test_passed", "smoke_verified"}:
+        return str(verification.get("status", "")).lower() in {
+            "ready",
+            "passed",
+            "success",
+            "ready_with_warnings",
+        } or int(verification.get("passed", 0) or 0) > 0
+    if normalized in {"verification_failed", "test_failed"}:
+        return str(verification.get("status", "")).lower() in {"failed", "failure"}
+    if normalized in {"file_created", "file_modified", "diff_observed"}:
+        return bool(diff_summary)
+    if normalized in {"assertion_passed", "report_artifact_written"}:
+        return bool(assertions)
+    if normalized in {
+        "completion_rejected",
+        "continued_after_rejection",
+        "review_rejected",
+        "repair_applied",
+        "approval_required",
+        "resume_recorded",
+        "sandbox_fail_closed",
+        "dynamic_retrieval_recorded",
+        "memory_write_gated",
+        "final_report_written",
+    }:
+        return False
+    return False
+
+
+def _regressions_from_report_json(json_text: str) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(json_text)
+    except json.JSONDecodeError:
+        return []
+    regressions = payload.get("regressions", [])
+    if not isinstance(regressions, list):
+        return []
+    return [item for item in regressions if isinstance(item, dict)]
 
 
 def _append_shell_args(command: str, args: dict[str, Any]) -> str:

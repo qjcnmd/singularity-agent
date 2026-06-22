@@ -121,6 +121,39 @@ class EvaluationReport:
                 lines.append(
                     f"| `{item.task_id}` | {item.scoring.status} | {item.scoring.score:.2f} | {failures} |"
                 )
+        golden_rows = []
+        for profile_report in self.profile_reports:
+            for item in profile_report.task_results:
+                contract = item.execution_evidence.get("golden_contract") or {}
+                if not contract:
+                    continue
+                golden_rows.append((profile_report.profile.name, item.task_id, contract))
+        if golden_rows:
+            lines.extend(
+                [
+                    "",
+                    "## Golden Task Evidence",
+                    "",
+                    "| profile | task | files | commands | evidence | report sections | trace artifacts |",
+                    "| --- | --- | --- | --- | --- | --- | --- |",
+                ]
+            )
+            for profile_name, task_id, contract in golden_rows:
+                files = _join_contract_values(contract.get("expected_files"), "path")
+                commands = _join_contract_values(contract.get("expected_commands"), "command")
+                evidence = _join_contract_values(contract.get("expected_evidence"), "name")
+                sections = _join_contract_values(contract.get("expected_report_sections"), "section")
+                artifacts = _join_contract_values(contract.get("required_trace_artifacts"), "kind")
+                lines.append(
+                    "| "
+                    f"`{profile_name}` | "
+                    f"`{task_id}` | "
+                    f"{files} | "
+                    f"{commands} | "
+                    f"{evidence} | "
+                    f"{sections} | "
+                    f"{artifacts} |"
+                )
         return "\n".join(lines) + "\n"
 
     def write(self, output_dir: Path | str) -> None:
@@ -172,12 +205,17 @@ class RegressionReport:
             f"- blocking: {str(self.blocking).lower()}",
             f"- regressions: {len(self.regressions)}",
             "",
-            "| metric | baseline | candidate | delta |",
-            "| --- | ---: | ---: | ---: |",
+            "| metric | baseline | candidate | delta | trace artifact |",
+            "| --- | ---: | ---: | ---: | --- |",
         ]
         for item in self.regressions:
             lines.append(
-                f"| {item['metric']} | {item['baseline']} | {item['candidate']} | {item['delta']} |"
+                "| "
+                f"{item['metric']} | "
+                f"{item['baseline']} | "
+                f"{item['candidate']} | "
+                f"{item['delta']} | "
+                f"{item.get('trace_artifact_ref', '-')} |"
             )
         if self.task_diffs:
             lines.extend(
@@ -243,3 +281,15 @@ def new_report(
         metrics=metrics_for_results(all_results),
         output_dir=output_dir,
     )
+
+
+def _join_contract_values(values: Any, key: str) -> str:
+    if not values:
+        return "-"
+    output = []
+    for item in values:
+        if isinstance(item, dict):
+            output.append(str(item.get(key) or "-"))
+        else:
+            output.append(str(item))
+    return ", ".join(output) if output else "-"

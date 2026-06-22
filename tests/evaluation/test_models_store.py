@@ -17,6 +17,9 @@ from singularity.evaluation import (
 from singularity.evaluation.models import SCHEMA_VERSION
 from singularity.evaluation.store import TASK_SET_SCHEMA_VERSION
 
+ROOT = Path(__file__).resolve().parents[2]
+PHASE1J_TASK_SET = ROOT / "docs" / "evaluation" / "phase1j-golden-tasks.json"
+
 
 def _task(task_id: str = "task.schema") -> BenchmarkTask:
     return BenchmarkTask(
@@ -58,6 +61,61 @@ def test_benchmark_task_round_trips_and_validates_required_schema() -> None:
     assert restored.workspace_snapshot.kind == WorkspaceSnapshotKind.INLINE_FILES
     assert restored.expected_outcomes[0].kind == ExpectedOutcomeKind.TEST
     assert restored.tags == ["easy", "memory-heavy"]
+
+
+def test_benchmark_task_round_trips_golden_contract() -> None:
+    payload = _task("task.contract").to_dict()
+    payload["golden_contract"] = {
+        "scenario": "create_file_smoke_verify",
+        "expected_files": ["quicksort.py", "tests/test_quicksort.py"],
+        "expected_commands": ["python -m pytest tests/test_quicksort.py"],
+        "expected_evidence": ["file_created", "verification_passed"],
+        "expected_report_sections": ["Goal", "Changes", "Verification", "Risks"],
+        "required_trace_artifacts": ["diff", "verification", "report"],
+    }
+
+    restored = BenchmarkTask.from_dict(payload)
+    round_tripped = restored.to_dict()
+
+    assert "golden_contract" in round_tripped
+    assert round_tripped["golden_contract"]["scenario"] == "create_file_smoke_verify"
+    assert round_tripped["golden_contract"]["expected_files"] == [
+        "quicksort.py",
+        "tests/test_quicksort.py",
+    ]
+    assert round_tripped["golden_contract"]["required_trace_artifacts"] == [
+        "diff",
+        "verification",
+        "report",
+    ]
+
+
+def test_phase1j_golden_task_set_covers_all_required_scenarios() -> None:
+    assert PHASE1J_TASK_SET.exists(), "Phase 1J golden task set must be checked in."
+
+    tasks = GoldenTaskStore(PHASE1J_TASK_SET).load(tags=["phase1j-golden"])
+    task_ids = {task.task_id for task in tasks}
+
+    assert task_ids == {
+        "phase1j.create_file_smoke_verify",
+        "phase1j.modify_bug_test_pass",
+        "phase1j.verification_failure_repair",
+        "phase1j.completion_rejected_continue",
+        "phase1j.final_review_rejected_repair",
+        "phase1j.full_markdown_report",
+        "phase1j.approval_required_resume",
+        "phase1j.sandbox_required_unavailable_fail_closed",
+        "phase1j.dynamic_retrieval_after_failure",
+        "phase1j.memory_write_after_verified_completion",
+    }
+    for task in tasks:
+        contract = task.to_dict().get("golden_contract", {})
+        assert contract.get("expected_files"), task.task_id
+        assert contract.get("expected_commands"), task.task_id
+        assert contract.get("expected_evidence"), task.task_id
+        assert contract.get("expected_report_sections"), task.task_id
+        assert contract.get("required_trace_artifacts"), task.task_id
+        assert any(outcome.kind != ExpectedOutcomeKind.HEURISTIC for outcome in task.expected_outcomes)
 
 
 def test_task_validation_rejects_missing_prompt_and_invalid_tag() -> None:

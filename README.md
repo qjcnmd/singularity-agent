@@ -212,6 +212,7 @@ Evaluation and benchmark commands:
 ```bash
 singularity-agent eval task validate golden.json --json
 singularity-agent eval task list golden.json --version v1 --tag tool-heavy
+singularity-agent eval task validate docs/evaluation/phase1j-golden-tasks.json --json
 singularity-agent eval trace replay work/traces/runs/<run_id>
 singularity-agent eval suite run golden.json --trace-run-dir work/traces/runs/<run_id>
 singularity-agent eval ab run golden.json --baseline-profile-json "{}" --candidate-profile-json "{}"
@@ -219,7 +220,7 @@ singularity-agent eval regression run golden.json --baseline-profile-json "{}" -
 singularity-agent eval report show work/evaluations/<eval_run_id>/report.md
 ```
 
-`benchmark` is an alias for `eval`. Suite, A/B, and regression commands default to deterministic offline scoring and trace replay; pass `--execute` to run declared hooks/tests through the runtime boundaries. Reports are written to `work/evaluations/<run_id>/` by default. See `docs/evaluation-runtime.md` for the Benchmark Task schema, trace replay semantics, scoring fields, A/B profiles, and regression report format.
+`benchmark` is an alias for `eval`. Suite, A/B, and regression commands default to deterministic offline scoring and trace replay; pass `--execute` to run declared hooks/tests through the runtime boundaries. Reports are written to `work/evaluations/<run_id>/` by default. The built-in Phase 1J Golden Task Set is checked in at `docs/evaluation/phase1j-golden-tasks.json`; each task declares expected files, commands, evidence, report sections, and trace artifacts. See `docs/evaluation-runtime.md` for the Benchmark Task schema, trace replay semantics, scoring fields, A/B profiles, Golden Task evidence, and regression report format.
 
 Exit code conventions:
 

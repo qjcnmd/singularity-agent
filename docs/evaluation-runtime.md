@@ -41,6 +41,14 @@ Golden tasks are stored as JSON or YAML documents:
           "command": "python -m compileall src"
         }
       ],
+      "golden_contract": {
+        "scenario": "create_file_smoke_verify",
+        "expected_files": ["quicksort.py", "tests/test_quicksort.py"],
+        "expected_commands": ["python -m pytest tests/test_quicksort.py"],
+        "expected_evidence": ["file_created", "smoke_verified", "final_report_written"],
+        "expected_report_sections": ["Goal", "Changes", "Verification", "Risks"],
+        "required_trace_artifacts": ["diff", "verification", "report"]
+      },
       "tags": ["easy", "tool-heavy"],
       "profiles": {
         "model": "baseline",
@@ -71,6 +79,27 @@ Evaluation hooks are declarative. Command hooks are intended to run through `Com
 
 `archive_path` is accepted in the schema, but execution is fail-closed until Singularity has a controlled archive restore adapter that stages files and applies them through `MutationRuntime`.
 
+`golden_contract` is optional for legacy benchmark tasks and required for the Phase 1J built-in Golden Task Set. When present, it records the scenario, expected files, expected commands, expected evidence names, expected markdown report sections, and required trace artifact kinds. Evaluation reports carry this contract through `execution_evidence.golden_contract` and render it in a `Golden Task Evidence` markdown section.
+
+The checked-in Phase 1J Golden Task Set lives at:
+
+```text
+docs/evaluation/phase1j-golden-tasks.json
+```
+
+It covers:
+
+- create file + smoke verify
+- modify bug + test pass
+- verification failure + repair
+- completion rejected + continue
+- final review rejected + repair
+- full markdown report
+- approval required + resume
+- sandbox required / unavailable fail closed
+- dynamic retrieval after failure
+- memory write only after verified completion
+
 ## CLI
 
 Validate and list a Golden Task Set:
@@ -78,6 +107,7 @@ Validate and list a Golden Task Set:
 ```bash
 singularity eval task validate golden.json --json
 singularity eval task list golden.json --version v1 --tag tool-heavy
+singularity eval task validate docs/evaluation/phase1j-golden-tasks.json --json
 ```
 
 Replay a trace with a fixed profile:
@@ -170,6 +200,9 @@ JSON reports include the complete machine-readable evaluation record:
 - intervention count and rate
 - per-profile metrics
 - per-task status, score, evidence, and failures
+- per-task Golden Task contract evidence when declared
 - report hash
 
-Markdown reports are human-readable summaries with suite metrics, profile metrics, and per-task status/score/failure rows. Use JSON when exact evidence, replay payloads, runtime overrides, execution evidence, or report hashes are required.
+Markdown reports are human-readable summaries with suite metrics, profile metrics, per-task status/score/failure rows, and a `Golden Task Evidence` section for tasks that declare `golden_contract`. Use JSON when exact evidence, replay payloads, runtime overrides, execution evidence, or report hashes are required.
+
+Regression reports attach an opaque `trace_artifact_ref` to each regression record. These refs are stable handles for trace/report correlation and do not expose local absolute paths.

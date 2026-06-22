@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from singularity.evaluation import (
     BenchmarkTask,
     EvaluationHook,
@@ -467,3 +469,155 @@ def test_scoring_marks_failed_policy_and_verification_as_failure() -> None:
     assert result.score < 0.5
     assert "verification_failed" in result.failure_reasons
     assert "policy_denials" in result.failure_reasons
+
+
+def _contract_task(task_id: str = "phase1j.create_file_smoke_verify") -> BenchmarkTask:
+    payload = _task(task_id).to_dict()
+    payload["golden_contract"] = {
+        "scenario": "create_file_smoke_verify",
+        "expected_files": ["quicksort.py", "tests/test_quicksort.py"],
+        "expected_commands": ["python -m pytest tests/test_quicksort.py"],
+        "expected_evidence": ["file_created", "verification_passed", "final_report_written"],
+        "expected_report_sections": ["Goal", "Changes", "Verification", "Risks"],
+        "required_trace_artifacts": ["diff", "verification", "report"],
+    }
+    payload["expected_outcomes"] = [
+        {
+            "kind": "assertion",
+            "weight": 0.3,
+            "assertion": "file_exists:quicksort.py",
+        },
+        {
+            "kind": "diff",
+            "weight": 0.2,
+            "expected_diff": {"paths": ["quicksort.py"], "max_changed_lines": 100},
+        },
+        {
+            "kind": "test",
+            "weight": 0.3,
+            "command": "python -m pytest tests/test_quicksort.py",
+        },
+        {
+            "kind": "heuristic",
+            "weight": 0.2,
+            "heuristic": "patch_quality",
+        },
+    ]
+    return BenchmarkTask.from_dict(payload)
+
+
+def test_evaluation_report_includes_golden_contract_evidence(tmp_path: Path) -> None:
+    task = _contract_task()
+    report = EvaluationRuntime(project_root=tmp_path).run_suite(
+        tasks=[task],
+        profiles=[EvaluationProfile(name="baseline", model="gpt-a")],
+        execute=False,
+    )
+    result = report.profile_reports[0].task_results[0]
+    payload = report.to_dict()
+    markdown = report.to_markdown()
+
+    contract = result.execution_evidence["golden_contract"]
+    assert contract["scenario"] == "create_file_smoke_verify"
+    assert contract["expected_files"][0]["path"] == "quicksort.py"
+    assert contract["expected_commands"][0]["command"] == "python -m pytest tests/test_quicksort.py"
+    assert contract["expected_evidence"][0]["name"] == "file_created"
+    assert contract["expected_report_sections"][0]["section"] == "Goal"
+    assert contract["required_trace_artifacts"][0]["kind"] == "diff"
+    assert payload["profile_reports"][0]["task_results"][0]["execution_evidence"]["golden_contract"] == contract
+    assert "## Golden Task Evidence" in markdown
+    assert "phase1j.create_file_smoke_verify" in markdown
+    assert "quicksort.py" in markdown
+    assert "python -m pytest tests/test_quicksort.py" in markdown
+
+
+def test_regression_report_binds_each_regression_to_trace_artifact_ref(tmp_path: Path) -> None:
+    task = _contract_task("phase1j.modify_bug_test_pass")
+    baseline = EvaluationRuntime(project_root=tmp_path).run_suite(
+        tasks=[task],
+        profiles=[EvaluationProfile(name="baseline", model="gpt-a")],
+        trace_run_dir=_trace(tmp_path, run_id="baseline_trace").store.run_dir,
+    )
+    candidate = EvaluationRuntime(project_root=tmp_path).run_suite(
+        tasks=[task],
+        profiles=[EvaluationProfile(name="candidate", model="gpt-b", allowed_tools=[])],
+        execute=False,
+    )
+
+    regression = RegressionDetector().compare(
+        baseline.profile_reports[0],
+        candidate.profile_reports[0],
+        threshold=0.0,
+    )
+
+    assert regression.regressions
+    task_regressions = [
+        item
+        for item in regression.regressions
+        if item.get("task_id") == "phase1j.modify_bug_test_pass"
+    ]
+    assert task_regressions
+    for item in task_regressions:
+        assert item["trace_artifact_ref"].startswith("regression:")
+    assert "trace artifact" in regression.to_markdown().lower()
+
+
+def test_write_regression_report_persists_trace_artifact_per_regression(tmp_path: Path) -> None:
+    task = _contract_task("phase1j.trace_artifact_regression")
+    baseline = EvaluationRuntime(project_root=tmp_path).run_suite(
+        tasks=[task],
+        profiles=[EvaluationProfile(name="baseline", model="gpt-a")],
+        trace_run_dir=_trace(tmp_path, run_id="trace_artifact_baseline").store.run_dir,
+    )
+    candidate = EvaluationRuntime(project_root=tmp_path).run_suite(
+        tasks=[task],
+        profiles=[EvaluationProfile(name="candidate", model="gpt-b")],
+        execute=False,
+    )
+    regression = RegressionDetector().compare(
+        baseline.profile_reports[0],
+        candidate.profile_reports[0],
+        threshold=0.0,
+    )
+    trace = TraceRuntime.create(tmp_path, run_id="regression_artifacts")
+    runtime = EvaluationRuntime(
+        project_root=tmp_path,
+        output_root=tmp_path / "evals",
+        trace_runtime=trace,
+    )
+
+    runtime.write_regression_report(run_id="regression_artifacts", regression=regression)
+
+    regression_refs = {
+        artifact.metadata.get("trace_artifact_ref")
+        for artifact in trace.store.artifacts()
+        if artifact.metadata.get("artifact_type") == "evaluation_regression"
+    }
+    expected_refs = {item["trace_artifact_ref"] for item in regression.regressions}
+    assert expected_refs
+    assert expected_refs.issubset(regression_refs)
+
+
+def test_offline_golden_suite_does_not_scan_workspace_for_diff_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _contract_task("phase1j.offline_fast")
+
+    def fail_if_scanned(_root: Path):
+        raise AssertionError("offline evaluation should not scan the workspace")
+
+    monkeypatch.setattr(
+        "singularity.evaluation.execution._capture_text_snapshot",
+        fail_if_scanned,
+    )
+
+    report = EvaluationRuntime(project_root=tmp_path).run_suite(
+        tasks=[task],
+        profiles=[EvaluationProfile(name="baseline", model="gpt-a")],
+        execute=False,
+    )
+    result = report.profile_reports[0].task_results[0]
+
+    assert result.execution_evidence["diff"]["status"] == "blocked"
+    assert "diff_requires_execution" in result.scoring.failure_reasons
