@@ -147,7 +147,7 @@ final_report_ready
 
 If the criteria are not met, `PlannerRuntime` returns `blocked`, `needs_review`, or another non-completed status. The model's prose cannot override missing evidence.
 
-`FinalReport` is built from runtime facts:
+`FinalReport` is built from runtime facts after final review:
 
 ```txt
 user_goal, status, files_changed, agent_changes,
@@ -157,7 +157,9 @@ risks, rollback_status, policy_approval_summary, artifacts, next_steps
 
 `policy_approval_summary` counts allowed low-risk actions, reviewed actions, denied actions, sandbox-required actions, user-approved actions, high-risk commands, and actions skipped due to policy.
 
-For read-only goals, completion criteria do not require mutation or verification evidence. For coding goals, finalization requires applied change evidence and a ready or ready-with-warnings verification assessment.
+For read-only goals, completion criteria do not require mutation or verification evidence. For coding goals, finalization requires applied change evidence, a ready or ready-with-warnings verification assessment, and a final review route of `approve`.
+
+Planner finalization writes both a structured JSON report and a markdown artifact. The markdown artifact path is recorded in planner events and trace.
 
 ## Persistence And Audit
 
@@ -170,6 +172,7 @@ Planner state is stored under:
   evidence.json
   budget.json
   final_report.json
+  final_report.md
   planner_events.jsonl
 ```
 

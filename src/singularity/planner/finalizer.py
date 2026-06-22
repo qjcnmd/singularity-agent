@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from singularity.planner.models import EvidenceLedger, FinalReport, TaskState, TaskStatus
@@ -47,7 +48,7 @@ class Finalizer:
         status = (
             TaskStatus.COMPLETED
             if verification_summary.get("status") in {"ready", "ready_with_warnings"}
-            and latest_review_decision in {None, "accept"}
+            and latest_review_decision == "accept"
             else state.status
         )
         next_steps = [] if status == TaskStatus.COMPLETED else ["Resolve unmet completion criteria."]
@@ -288,7 +289,104 @@ class Finalizer:
             "status": "recorded",
             "latest_review_id": latest.get("review_id"),
             "latest_decision": decision.get("action"),
+            "latest_route": decision.get("route"),
             "finding_count": len(findings),
             "blocking_finding_count": len(blocking),
             "remaining_risks": remaining_risks,
         }
+
+
+class FinalReportRuntime:
+    def validate(self, report: FinalReport) -> FinalReport:
+        return FinalReport.from_dict(report.to_dict())
+
+    def write_markdown(
+        self,
+        *,
+        report: FinalReport,
+        state: TaskState,
+        evidence: EvidenceLedger,
+        output_dir: Path,
+    ) -> Path:
+        report = self.validate(report)
+        path = output_dir / "final_report.md"
+        path.write_text(
+            self.render_markdown(report=report, state=state, evidence=evidence),
+            encoding="utf-8",
+        )
+        return path
+
+    def render_markdown(
+        self,
+        *,
+        report: FinalReport,
+        state: TaskState,
+        evidence: EvidenceLedger,
+    ) -> str:
+        lines = [
+            "# Final Report",
+            "",
+            f"- Goal: {report.user_goal}",
+            f"- Status: {report.status.value}",
+            "",
+            "## Requirements",
+            *_requirements(state),
+            "",
+            "## Rolling Plan",
+            *_rolling_plan(state),
+            "",
+            "## Changes",
+            *(f"- {path}" for path in (report.files_changed or ["-"])),
+            "",
+            "## Verification",
+            f"- Status: {report.verification_summary.get('status', 'unknown')}",
+            *_checks(report.verification_summary.get("check_status") or []),
+            "",
+            "## Failure / Repair History",
+            f"- Failure analyses: {len(evidence.failure_analyses)}",
+            f"- Repair plans: {len(evidence.repair_plans)}",
+            f"- Unresolved issues: {len(report.unresolved_issues)}",
+            "",
+            "## Final Review",
+            f"- Decision: {report.review_summary.get('latest_decision') or 'not_recorded'}",
+            f"- Route: {report.review_summary.get('latest_route') or 'not_recorded'}",
+            f"- Findings: {report.review_summary.get('finding_count', 0)}",
+            "",
+            "## Evidence Appendix",
+            f"- Inspected files: {len(evidence.inspected_files)}",
+            f"- Applied changes: {len(evidence.applied_changes)}",
+            f"- Verification results: {len(evidence.verification_results)}",
+            f"- Review results: {len(evidence.review_results)}",
+            f"- Artifacts: {len(report.artifacts)}",
+        ]
+        return "\n".join(lines).rstrip() + "\n"
+
+
+def _requirements(state: TaskState) -> list[str]:
+    criteria = (state.task_contract or {}).get("acceptance_criteria") or []
+    if not criteria:
+        return ["- No task contract criteria recorded."]
+    return [
+        f"- {item.get('criterion_id')}: {item.get('description')}"
+        for item in criteria
+        if isinstance(item, dict)
+    ]
+
+
+def _rolling_plan(state: TaskState) -> list[str]:
+    steps = (state.rolling_plan or {}).get("steps") or []
+    if not steps:
+        return ["- No rolling plan recorded."]
+    return [
+        f"- {item.get('step_id')}: {item.get('title')}"
+        for item in steps
+        if isinstance(item, dict)
+    ]
+
+
+def _checks(checks: list[Any]) -> list[str]:
+    return [
+        f"- {item.get('check_id')}: {item.get('status')}"
+        for item in checks
+        if isinstance(item, dict)
+    ]

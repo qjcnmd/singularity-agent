@@ -7,7 +7,7 @@ from uuid import uuid4
 from singularity.planner.budget import BudgetController
 from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.context import PlannerContextRenderer
-from singularity.planner.finalizer import Finalizer
+from singularity.planner.finalizer import Finalizer, FinalReportRuntime
 from singularity.planner.models import (
     ActionKind,
     ActionStatus,
@@ -51,6 +51,8 @@ class PlannerRuntime:
         task_id: str | None = None,
         trace: TraceWriter | None = None,
         store: PlannerStore | None = None,
+        review_runtime: Any | None = None,
+        final_report_runtime: FinalReportRuntime | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.session_id = session_id or uuid4().hex
@@ -64,6 +66,8 @@ class PlannerRuntime:
         self.replanner = Replanner()
         self.renderer = PlannerContextRenderer()
         self.finalizer = Finalizer()
+        self.final_report_runtime = final_report_runtime or FinalReportRuntime()
+        self.review_runtime = review_runtime
         self.state: TaskState | None = None
         self.plan: TaskPlan | None = None
         self.evidence = EvidenceLedger()
@@ -869,10 +873,22 @@ class PlannerRuntime:
             if self.trace is not None and hasattr(self.trace, "final_report_summary")
             else None
         )
+        final_review = self._run_final_review(trace_summary=trace_summary)
         report = self.finalizer.build(
             state=self._state(),
             evidence=self.evidence,
             trace_summary=trace_summary,
+        )
+        output_dir = self.store.session_dir(self.session_id)
+        artifact_ref = (output_dir / "final_report.md").relative_to(self.workspace_root).as_posix()
+        if artifact_ref not in report.artifacts:
+            report.artifacts.append(artifact_ref)
+            report.artifacts.sort()
+        artifact_path = self.final_report_runtime.write_markdown(
+            report=report,
+            state=self._state(),
+            evidence=self.evidence,
+            output_dir=output_dir,
         )
         self.final_report = report
         if report.status == TaskStatus.COMPLETED:
@@ -885,8 +901,53 @@ class PlannerRuntime:
         self._record_event(
             decision="finalize",
             reason="Final report generated from ledger evidence.",
+            evidence_refs=[artifact_ref],
             completion_assessment=report.verification_summary,
+            extra={
+                "final_report_artifact": artifact_ref,
+                "final_review_route": final_review.decision.route,
+            },
         )
+        if self.trace is not None:
+            self.trace.record(
+                "final_report.completed",
+                {
+                    "task_id": self.task_id,
+                    "session_id": self.session_id,
+                    "status": report.status.value,
+                    "artifact_path": artifact_ref,
+                    "review_route": final_review.decision.route,
+                },
+            )
+        return report
+
+    def _run_final_review(self, *, trace_summary: dict[str, Any] | None) -> Any:
+        runtime = self.review_runtime
+        if runtime is None:
+            from singularity.review import ReviewRuntime
+
+            runtime = ReviewRuntime(
+                self.workspace_root,
+                trace=self.trace,
+                planner=self,
+                enable_model_critic=False,
+            )
+            self.review_runtime = runtime
+        elif getattr(runtime, "planner", None) is None:
+            try:
+                runtime.planner = self
+            except Exception:
+                pass
+        report = runtime.final_review(
+            task_state=self._state(),
+            task_plan=self._plan(),
+            evidence_ledger=self.evidence,
+            trace_summary=trace_summary,
+        )
+        payload = report.model_dump(mode="json") if hasattr(report, "model_dump") else dict(report)
+        review_id = payload.get("review_id")
+        if not review_id or not any(item.get("review_id") == review_id for item in self.evidence.review_results):
+            self.record_review_observation(payload)
         return report
 
     def interrupt(self, reason: str = "interrupted") -> TaskState:

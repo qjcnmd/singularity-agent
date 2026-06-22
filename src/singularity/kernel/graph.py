@@ -706,6 +706,7 @@ class RuntimeFactory:
         verification_review.verification_runtime.planner = planner
         execution_core.edit_runtime.planner = planner
         verification_review.review_runtime.planner = planner
+        planner.review_runtime = verification_review.review_runtime
         tool_protocol.tool_runtime.planner = planner
 
     @staticmethod

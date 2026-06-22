@@ -16,6 +16,13 @@ from pydantic import BaseModel
 from singularity.workspace import CreateFile, MutationRuntime
 from singularity.command import CommandRequest, CommandRuntime
 from singularity.policy import PolicyConfig, PolicyRuntime, SecurityMode
+from singularity.review import (
+    ReviewDecision,
+    ReviewDecisionAction,
+    ReviewReport,
+    ReviewStage,
+    ReviewTarget,
+)
 from singularity.verification import VerificationRuntime
 
 
@@ -350,6 +357,52 @@ def test_final_report_is_generated_from_evidence(tmp_path: Path) -> None:
     assert report.files_changed == ["README.md"]
     assert report.verification_summary["status"] == "ready"
     assert (tmp_path / ".singularity" / "planner" / "session_1" / "final_report.json").exists()
+    markdown_artifacts = [artifact for artifact in report.artifacts if artifact.endswith("final_report.md")]
+    assert markdown_artifacts
+    markdown = (tmp_path / markdown_artifacts[0]).read_text(encoding="utf-8")
+    assert "# Final Report" in markdown
+    assert "## Verification" in markdown
+    assert "## Final Review" in markdown
+    assert "## Evidence Appendix" in markdown
+
+
+def test_final_review_rejects_before_completed(tmp_path: Path) -> None:
+    class RejectingReviewRuntime:
+        def final_review(self, **_kwargs: object) -> ReviewReport:
+            return ReviewReport(
+                target=ReviewTarget(stage=ReviewStage.FINAL, task_id="task_1"),
+                input_summary="final review rejected",
+                decision=ReviewDecision(
+                    action=ReviewDecisionAction.REPAIR,
+                    reasons=["Report evidence is incomplete."],
+                    repair_targets=["check_1"],
+                ),
+            )
+
+    planner = PlannerRuntime(
+        tmp_path,
+        session_id="session_1",
+        task_id="task_1",
+        review_runtime=RejectingReviewRuntime(),
+    )
+    planner.start_task("Change code")
+    planner.evidence.inspected_files.append("README.md")
+    planner.evidence.applied_changes.append(
+        {"changed_files": ["README.md"], "transaction_id": "tx_1"}
+    )
+    planner.evidence.verification_results.append(
+        {
+            "completion_assessment": {"status": "ready", "warnings": [], "remaining_risks": []},
+            "check_status": [{"check_id": "check_1", "status": "passed"}],
+        }
+    )
+    planner.state.final_assessment = {"status": "ready"}
+
+    report = planner.finalize()
+
+    assert report.status != TaskStatus.COMPLETED
+    assert planner.state.status == TaskStatus.REPAIRING_FAILURES
+    assert planner.evidence.review_results[-1]["decision"]["route"] == "repair"
 
 
 def test_replanner_maps_required_failures(tmp_path: Path) -> None:

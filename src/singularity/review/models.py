@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ReviewStage(str, Enum):
@@ -146,6 +146,7 @@ class ReviewDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: ReviewDecisionAction = ReviewDecisionAction.ACCEPT
+    route: str | None = None
     reasons: list[str] = Field(default_factory=list)
     finding_ids: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.9, ge=0.0, le=1.0)
@@ -156,6 +157,18 @@ class ReviewDecision(BaseModel):
     requires_human_approval: bool = False
     required_approval_decision_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def default_route(self) -> "ReviewDecision":
+        if self.route is None:
+            self.route = {
+                ReviewDecisionAction.ACCEPT: "approve",
+                ReviewDecisionAction.REPAIR: "repair",
+                ReviewDecisionAction.REPLAN: "replan",
+                ReviewDecisionAction.NEEDS_HUMAN_APPROVAL: "ask_user",
+                ReviewDecisionAction.ROLLBACK: "blocked",
+            }[self.action]
+        return self
 
 
 class ReviewReport(BaseModel):

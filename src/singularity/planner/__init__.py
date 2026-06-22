@@ -29,6 +29,7 @@ from singularity.planner.contract import (
     TaskContractSchemaError,
     VerificationRequirement,
 )
+from singularity.planner.finalizer import FinalReportRuntime
 from singularity.planner.runtime import PlannerRuntime, create_or_resume_planner
 from singularity.planner.semantic import (
     ExpectedEvidence,
@@ -55,6 +56,7 @@ __all__ = [
     "ExpectedEvidence",
     "FallbackStep",
     "FinalReport",
+    "FinalReportRuntime",
     "PLANNER_ERROR_CODES",
     "PlanDependency",
     "PlanStep",

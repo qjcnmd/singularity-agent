@@ -107,6 +107,7 @@ def test_runtime_graph_wires_planner_and_cross_runtime_dependencies(
     assert graph.verification_runtime.planner is graph.planner
     assert graph.edit_runtime.planner is graph.planner
     assert graph.review_runtime.planner is graph.planner
+    assert graph.planner.review_runtime is graph.review_runtime
     assert graph.tool_runtime.planner is graph.planner
     assert graph.edit_runtime.verification_runtime is graph.verification_runtime
     assert graph.edit_runtime.review_runtime is graph.review_runtime
