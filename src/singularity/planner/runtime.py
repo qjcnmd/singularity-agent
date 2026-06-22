@@ -34,6 +34,7 @@ from singularity.planner.policy import (
     VERIFICATION_TOOLS,
 )
 from singularity.planner.replanner import Replanner
+from singularity.planner.retrieval import LessonExtractionRuntime, RetrievalOrchestrator
 from singularity.planner.risk import RiskEscalator
 from singularity.planner.semantic import RollingPlan, SemanticPlannerRuntime
 from singularity.planner.store import PlannerStore
@@ -53,6 +54,10 @@ class PlannerRuntime:
         store: PlannerStore | None = None,
         review_runtime: Any | None = None,
         final_report_runtime: FinalReportRuntime | None = None,
+        project_index_runtime: Any | None = None,
+        memory_runtime: Any | None = None,
+        retrieval_orchestrator: RetrievalOrchestrator | None = None,
+        lesson_extraction_runtime: LessonExtractionRuntime | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.session_id = session_id or uuid4().hex
@@ -68,6 +73,10 @@ class PlannerRuntime:
         self.finalizer = Finalizer()
         self.final_report_runtime = final_report_runtime or FinalReportRuntime()
         self.review_runtime = review_runtime
+        self.project_index_runtime = project_index_runtime
+        self.memory_runtime = memory_runtime
+        self.retrieval_orchestrator = retrieval_orchestrator or RetrievalOrchestrator()
+        self.lesson_extraction_runtime = lesson_extraction_runtime or LessonExtractionRuntime()
         self.state: TaskState | None = None
         self.plan: TaskPlan | None = None
         self.evidence = EvidenceLedger()
@@ -383,8 +392,10 @@ class PlannerRuntime:
             return
         verification = {**verification, "tool_call_id": tool_call_id}
         self.evidence.verification_results.append(verification)
+        failure_analyses: list[dict[str, Any]] = []
         for analysis in verification.get("failure_analysis") or []:
             if isinstance(analysis, dict):
+                failure_analyses.append(analysis)
                 analysis_id = analysis.get("analysis_id")
                 if not analysis_id or not any(
                     existing.get("analysis_id") == analysis_id
@@ -419,6 +430,12 @@ class PlannerRuntime:
             self._state().status = TaskStatus.REPAIRING_FAILURES
             self._state().current_phase = "repairing_failures"
             self._plan().current_phase = "repairing_failures"
+        if failure_analyses:
+            self._record_dynamic_retrieval(
+                trigger="verification_failure",
+                failure_analysis=failure_analyses[-1],
+                changed_files=self._changed_files(),
+            )
         if isinstance(verification.get("review_report"), dict):
             self.record_review_observation(verification["review_report"])
         self._persist()
@@ -645,6 +662,11 @@ class PlannerRuntime:
         }
         if payload not in self.evidence.diff_observations:
             self.evidence.diff_observations.append(payload)
+        if payload["changed_files"] and self.state is not None:
+            self._record_dynamic_retrieval(
+                trigger="diff_observation",
+                changed_files=payload["changed_files"],
+            )
         self._persist()
 
     def update_from_edit(
@@ -891,6 +913,7 @@ class PlannerRuntime:
             output_dir=output_dir,
         )
         self.final_report = report
+        lesson_candidates = self.extract_lessons(report)
         if report.status == TaskStatus.COMPLETED:
             self._state().status = TaskStatus.COMPLETED
             self._state().completion_criteria.final_report_ready = True
@@ -906,6 +929,7 @@ class PlannerRuntime:
             extra={
                 "final_report_artifact": artifact_ref,
                 "final_review_route": final_review.decision.route,
+                "lesson_candidates": len(lesson_candidates),
             },
         )
         if self.trace is not None:
@@ -920,6 +944,13 @@ class PlannerRuntime:
                 },
             )
         return report
+
+    def extract_lessons(self, final_report: Any | None = None, *, accept: bool = False) -> list[Any]:
+        return self.lesson_extraction_runtime.extract(
+            self.final_report if final_report is None else final_report,
+            memory_runtime=self.memory_runtime,
+            accept=accept,
+        )
 
     def _run_final_review(self, *, trace_summary: dict[str, Any] | None) -> Any:
         runtime = self.review_runtime
@@ -1174,6 +1205,29 @@ class PlannerRuntime:
             for path in change.get("changed_files") or []:
                 changed.add(str(path))
         return sorted(changed)
+
+    def _record_dynamic_retrieval(
+        self,
+        *,
+        trigger: str,
+        failure_analysis: dict[str, Any] | None = None,
+        changed_files: list[str] | None = None,
+    ) -> None:
+        result = self.retrieval_orchestrator.retrieve(
+            current_step=self.semantic_rolling_plan().current_step(),
+            failure_analysis=failure_analysis,
+            changed_files=changed_files or [],
+            task_contract=self._state().task_contract,
+            project_index_runtime=self.project_index_runtime,
+            trigger=trigger,
+        )
+        if result not in self.evidence.retrieval_results:
+            self.evidence.retrieval_results.append(result)
+        self._record_event(
+            decision="dynamic_retrieval",
+            reason=f"Recorded {trigger} retrieval guidance.",
+            extra={"retrieval": result},
+        )
 
     def _persist(self) -> None:
         if self.state is None or self.plan is None:

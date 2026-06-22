@@ -51,6 +51,11 @@ class PlannerContextRenderer:
                         for item in evidence.sandbox_observations[-10:]
                     ],
                     "project_index": self._project_index_summary(evidence),
+                    "dynamic_retrieval": (
+                        evidence.retrieval_results[-1]
+                        if evidence.retrieval_results
+                        else None
+                    ),
                     "latest_review": (
                         evidence.review_results[-1]
                         if evidence.review_results

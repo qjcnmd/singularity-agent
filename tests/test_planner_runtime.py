@@ -545,6 +545,126 @@ testpaths = ["tests"]
     }
 
 
+def test_verification_failure_records_dynamic_retrieval_context(tmp_path: Path) -> None:
+    class FakeProjectIndex:
+        def get_test_impact(self, changed_files):
+            return {
+                "changed_files": list(changed_files),
+                "likely_tests": ["tests/test_app.py"],
+                "commands": ["python -m pytest tests/test_app.py"],
+            }
+
+    planner = PlannerRuntime(
+        tmp_path,
+        session_id="session_1",
+        task_id="task_1",
+        project_index_runtime=FakeProjectIndex(),
+    )
+    planner.start_task("Fix failing app test")
+    planner.update_from_mutation(
+        {
+            "mutation_status": "applied",
+            "changed_files": ["src/app.py"],
+            "transaction_id": "tx_1",
+        }
+    )
+
+    planner.update_from_verification(
+        {
+            "verification": {
+                "completion_assessment": {"status": "failed"},
+                "failure_analysis": [
+                    {
+                        "analysis_id": "failure_1",
+                        "check_id": "check_pytest",
+                        "failure_type": "unit_test_failure",
+                        "suspect_files": ["tests/test_app.py"],
+                        "retrieval_queries": ["tests/test_app.py", "AssertionError"],
+                    }
+                ],
+                "check_status": [{"check_id": "check_pytest", "status": "failed"}],
+            }
+        }
+    )
+
+    latest = planner.evidence.retrieval_results[-1]
+    assert latest["trigger"] == "verification_failure"
+    assert latest["files_to_read"] == ["src/app.py", "tests/test_app.py"]
+    assert "AssertionError" in latest["index_queries"]
+    context = json.loads(planner.planner_context_message()["content"])["planner"]
+    assert context["evidence"]["dynamic_retrieval"]["files_to_read"] == [
+        "src/app.py",
+        "tests/test_app.py",
+    ]
+
+
+def test_diff_observation_records_project_index_retrieval(tmp_path: Path) -> None:
+    class FakeProjectIndex:
+        def analyze_impact(self, changed_files):
+            return {
+                "requested_paths": list(changed_files),
+                "reverse_dependencies": ["src/caller.py"],
+                "affected_tests": ["tests/test_app.py"],
+            }
+
+        def get_test_impact(self, changed_files):
+            return {"changed_files": list(changed_files), "likely_tests": ["tests/test_app.py"]}
+
+    planner = PlannerRuntime(
+        tmp_path,
+        session_id="session_1",
+        task_id="task_1",
+        project_index_runtime=FakeProjectIndex(),
+    )
+    planner.start_task("Change app")
+
+    planner.record_diff_observation({"changed_files": ["src/app.py"]})
+
+    latest = planner.evidence.retrieval_results[-1]
+    assert latest["trigger"] == "diff_observation"
+    assert latest["files_to_read"] == ["src/app.py", "src/caller.py", "tests/test_app.py"]
+    assert latest["evidence_sources"] == ["project_index:impact", "project_index:test_impact"]
+
+
+def test_lesson_extraction_only_ingests_verified_completed_report(tmp_path: Path) -> None:
+    class FakeMemoryRuntime:
+        def __init__(self) -> None:
+            self.final_reports = []
+
+        def ingest_final_report(self, final_report, *, accept: bool = False):
+            self.final_reports.append((final_report, accept))
+            return [{"candidate_id": "cand_verified"}]
+
+    memory = FakeMemoryRuntime()
+    planner = PlannerRuntime(
+        tmp_path,
+        session_id="session_1",
+        task_id="task_1",
+        memory_runtime=memory,
+    )
+    planner.start_task("Change code")
+
+    failed = {
+        "status": "failed",
+        "verification_summary": {"status": "failed"},
+        "files_changed": ["src/app.py"],
+    }
+    assert planner.extract_lessons(failed) == []
+    assert memory.final_reports == []
+
+    completed = {
+        "status": "completed",
+        "verification_summary": {
+            "status": "ready",
+            "check_status": [{"check_id": "check_1", "status": "passed"}],
+        },
+        "files_changed": ["src/app.py"],
+    }
+
+    assert planner.extract_lessons(completed) == [{"candidate_id": "cand_verified"}]
+    assert memory.final_reports == [(completed, False)]
+
+
 def test_planner_records_review_observation_and_routes_decision(tmp_path: Path) -> None:
     planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Review")

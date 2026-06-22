@@ -30,6 +30,7 @@ from singularity.planner.contract import (
     VerificationRequirement,
 )
 from singularity.planner.finalizer import FinalReportRuntime
+from singularity.planner.retrieval import LessonExtractionRuntime, RetrievalOrchestrator
 from singularity.planner.runtime import PlannerRuntime, create_or_resume_planner
 from singularity.planner.semantic import (
     ExpectedEvidence,
@@ -62,7 +63,9 @@ __all__ = [
     "PlanStep",
     "PlannerRuntime",
     "PlannerStore",
+    "RetrievalOrchestrator",
     "ReportRequirement",
+    "LessonExtractionRuntime",
     "create_or_resume_planner",
     "ReplanDecision",
     "ReplanDecisionKind",

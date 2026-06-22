@@ -340,6 +340,7 @@ class RuntimeFactory:
             )
             self._wire_planner(
                 planner=planner,
+                infra=infra,
                 execution_core=execution_core,
                 tool_protocol=tool_protocol,
                 verification_review=verification_review,
@@ -697,10 +698,13 @@ class RuntimeFactory:
     def _wire_planner(
         *,
         planner: PlannerRuntime,
+        infra: _InfraRuntimes,
         execution_core: _ExecutionCoreRuntimes,
         tool_protocol: _ToolProtocolRuntimes,
         verification_review: _VerificationReviewRuntimes,
     ) -> None:
+        planner.project_index_runtime = infra.project_index_runtime
+        planner.memory_runtime = infra.memory_runtime
         execution_core.command_runtime.planner = planner
         execution_core.mutation_runtime.planner = planner
         verification_review.verification_runtime.planner = planner

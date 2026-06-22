@@ -105,6 +105,23 @@ Tool results are compact in model context, but the planner receives richer runti
 
 `ContextManager` receives a compact planner context message. Repairing phases prioritize failure evidence and recent changes. Finalizing phases prioritize changed files, verification status, unresolved failures, and risks.
 
+## Dynamic Retrieval And Memory Learning
+
+`RetrievalOrchestrator` turns runtime facts into explicit retrieval guidance:
+
+```txt
+current PlanStep + FailureAnalysis + changed files + TaskContract
+  -> files_to_read
+  -> index_queries
+  -> memory_queries
+```
+
+Verification failures trigger retrieval from `FailureAnalysis.suspect_files` and `retrieval_queries`. Diff observations trigger retrieval from changed files and `ProjectIndexRuntime` impact/test-impact results. The output is stored in `EvidenceLedger.retrieval_results` and rendered into planner context as `dynamic_retrieval`.
+
+Retrieval guidance is not the same as inspected evidence. A path in `files_to_read` does not satisfy `inspected_files` until a read/search tool reports real evidence.
+
+`LessonExtractionRuntime` gates memory learning. It only forwards a final report to `MemoryRuntime` when the final report status is `completed` and verification is ready or ready-with-warnings. `MemoryRuntime` still owns extraction, redaction, evidence-source checks, quarantine, and manual acceptance.
+
 ## Replanning, Budget, And Risk
 
 `Replanner` maps structured failures to deterministic next decisions:

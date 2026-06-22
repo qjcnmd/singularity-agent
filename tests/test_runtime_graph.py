@@ -116,6 +116,8 @@ def test_runtime_graph_wires_planner_and_cross_runtime_dependencies(
     assert graph.review_runtime.memory_runtime is graph.memory_runtime
     assert graph.context_manager.model_runtime is graph.model_runtime
     assert graph.context_manager.run_id == graph.trace.run_id
+    assert graph.planner.project_index_runtime is graph.project_index_runtime
+    assert graph.planner.memory_runtime is graph.memory_runtime
     assert graph.planner.evidence.project_index_observations
 
 
