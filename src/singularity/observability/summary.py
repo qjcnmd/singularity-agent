@@ -283,9 +283,22 @@ def _model_usage_summary(events: list[TraceEvent]) -> dict[str, Any]:
                     "cached_input_tokens",
                     "reasoning_tokens",
                 ):
-                    usage[key] += int(payload_usage.get(key) or 0)
+                    usage[key] += _safe_int(payload_usage.get(key))
         elif event.event_type == TraceEventType.MODEL_REQUEST_FAILED:
             usage["failures"] += 1
         elif event.event_type == TraceEventType.MODEL_TOOL_CALL_PROPOSED:
             usage["tool_calls_proposed"] += 1
     return usage
+
+
+def _safe_int(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except ValueError:
+            return 0
+    return 0

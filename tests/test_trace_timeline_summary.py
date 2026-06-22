@@ -93,3 +93,27 @@ def test_final_report_and_context_summary_are_redacted(tmp_path) -> None:
     assert report_summary["key_failures"] == ["pytest failed"]
     assert "sk-secret" not in str(context_lines)
     assert "sk-secret" not in str(report_summary)
+
+
+def test_model_usage_summary_handles_redacted_legacy_token_counts(tmp_path) -> None:
+    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+    trace.emit(
+        TraceEventType.MODEL_RESPONSE_RECEIVED,
+        runtime="model",
+        summary="model response",
+        ids={"task_id": "task_1"},
+        payload={
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": "<redacted>",
+                "total_tokens": 10,
+            }
+        },
+    )
+
+    report_summary = trace.final_report_summary(task_id="task_1")
+
+    assert report_summary["model_usage_summary"]["responses"] == 1
+    assert report_summary["model_usage_summary"]["input_tokens"] == 10
+    assert report_summary["model_usage_summary"]["output_tokens"] == 0
+    assert report_summary["model_usage_summary"]["total_tokens"] == 10

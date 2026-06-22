@@ -80,3 +80,22 @@ def test_redacts_long_text_and_payload_hash_is_stable() -> None:
     assert redacted["token"] == "<redacted>"
     assert str(redacted["safe"]).endswith("[truncated]")
     assert len(redacted["safe"]) <= 40
+
+
+def test_preserves_safe_numeric_token_usage_metrics() -> None:
+    redactor = TraceRedactor(output_limit_chars=1000)
+    payload = {
+        "usage": {
+            "input_tokens": 12,
+            "output_tokens": 7,
+            "total_tokens": 19,
+            "token": "secret-token",
+        }
+    }
+
+    redacted = redactor.redact_payload(payload)
+
+    assert redacted["usage"]["input_tokens"] == 12
+    assert redacted["usage"]["output_tokens"] == 7
+    assert redacted["usage"]["total_tokens"] == 19
+    assert redacted["usage"]["token"] == "<redacted>"

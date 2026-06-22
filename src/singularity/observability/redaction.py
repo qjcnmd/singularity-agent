@@ -33,6 +33,15 @@ PRIVATE_KEY_RE = re.compile(
 TOKEN_VALUE_RE = re.compile(
     r"\b(sk-[A-Za-z0-9._\-]+|gh[pousr]_[A-Za-z0-9_]+|npm_[A-Za-z0-9_]+)\b"
 )
+SAFE_NUMERIC_METRIC_KEYS = {
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_input_tokens",
+    "reasoning_tokens",
+    "prompt_tokens",
+    "completion_tokens",
+}
 
 
 class TraceRedactor:
@@ -43,7 +52,9 @@ class TraceRedactor:
         if isinstance(value, dict):
             redacted: dict[str, Any] = {}
             for key, item in value.items():
-                if SECRET_KEY_RE.search(str(key)):
+                if _is_safe_numeric_metric(key, item):
+                    redacted[key] = item
+                elif SECRET_KEY_RE.search(str(key)):
                     redacted[key] = "<redacted>"
                 else:
                     redacted[key] = self.redact_value(item)
@@ -76,3 +87,9 @@ class TraceRedactor:
         redacted = self.redact_payload(payload)
         text = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _is_safe_numeric_metric(key: object, value: Any) -> bool:
+    if str(key).lower() not in SAFE_NUMERIC_METRIC_KEYS:
+        return False
+    return isinstance(value, (int, float)) and not isinstance(value, bool)

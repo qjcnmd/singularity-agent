@@ -1198,8 +1198,12 @@ class PlannerRuntime:
                 phase_id="finalizing",
                 name="Finalize",
                 purpose="Generate a final report from runtime evidence.",
-                allowed_tools=["get_verification_result", "inspect_diff", "workspace_health"],
-                allowed_actions=[ActionKind.FINALIZE, ActionKind.ANALYZE_ISSUE],
+                allowed_tools=["get_verification_result", "inspect_diff", "read_file", "workspace_health"],
+                allowed_actions=[
+                    ActionKind.FINALIZE,
+                    ActionKind.ANALYZE_ISSUE,
+                    ActionKind.READ_RELEVANT_FILES,
+                ],
                 required_evidence=["final_report"],
             ),
         ]

@@ -50,6 +50,8 @@ class PlannerPolicy:
             return ActionKind.PROPOSE_CHANGE_SET
         if tool_name in DIFF_TOOLS:
             return ActionKind.ANALYZE_ISSUE
+        if tool_name == "get_verification_result":
+            return ActionKind.ANALYZE_ISSUE
         if tool_name in MUTATION_TOOLS or tool_name in LOW_LEVEL_MUTATION_TOOLS:
             return ActionKind.APPLY_MUTATION
         if tool_name in VERIFICATION_TOOLS:

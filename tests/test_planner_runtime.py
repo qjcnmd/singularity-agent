@@ -247,6 +247,41 @@ def test_applying_phase_defaults_to_facades_not_low_level_workspace_tools(tmp_pa
     assert low_level_denied.error_code == "action_not_allowed"
 
 
+def test_finalizing_phase_allows_read_only_evidence_tools(tmp_path: Path) -> None:
+    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner.start_task("Finalize report")
+    planner.state.status = TaskStatus.FINALIZING
+    planner.state.current_phase = "finalizing"
+
+    read_allowed = planner.authorize_tool_call(
+        tool_name="read_file",
+        tool_call_id="call_read",
+        spec=spec("read_file"),
+        arguments={"path": "quicksort.py"},
+    )
+    verification_result_allowed = planner.authorize_tool_call(
+        tool_name="get_verification_result",
+        tool_call_id="call_verify_result",
+        spec=spec("get_verification_result"),
+        arguments={},
+    )
+    write_denied = planner.authorize_tool_call(
+        tool_name="write_file",
+        tool_call_id="call_write",
+        spec=spec("write_file", permission=PermissionLevel.WRITE),
+        arguments={"path": "quicksort.py", "content": "x", "mode": "overwrite"},
+    )
+
+    assert read_allowed.allowed is True
+    assert read_allowed.action is not None
+    assert read_allowed.action.kind == ActionKind.READ_RELEVANT_FILES
+    assert verification_result_allowed.allowed is True
+    assert verification_result_allowed.action is not None
+    assert verification_result_allowed.action.kind == ActionKind.ANALYZE_ISSUE
+    assert write_denied.allowed is False
+    assert write_denied.error_code == "action_not_allowed"
+
+
 def test_tool_result_updates_evidence_ledger_and_advances_phase(tmp_path: Path) -> None:
     planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Read README")
