@@ -137,6 +137,7 @@ class TaskState:
     linked_verifications: list[str] = field(default_factory=list)
     final_assessment: dict[str, Any] = field(default_factory=dict)
     task_contract: dict[str, Any] = field(default_factory=dict)
+    lifecycle_status: str = "created"
 
     def touch(self) -> None:
         self.updated_at = _now()
@@ -164,6 +165,7 @@ class TaskState:
             "linked_verifications": self.linked_verifications,
             "final_assessment": self.final_assessment,
             "task_contract": self.task_contract,
+            "lifecycle_status": self.lifecycle_status,
         }
 
     @classmethod
@@ -192,6 +194,7 @@ class TaskState:
             linked_verifications=list(payload.get("linked_verifications") or []),
             final_assessment=dict(payload.get("final_assessment") or {}),
             task_contract=dict(payload.get("task_contract") or {}),
+            lifecycle_status=str(payload.get("lifecycle_status") or "created"),
         )
 
 

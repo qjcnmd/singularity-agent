@@ -104,6 +104,33 @@ class ContextManager:
     def close(self) -> None:
         self.store.close()
 
+    def set_user_goal(self, user_goal: str) -> None:
+        if self.user_goal == user_goal:
+            return
+        self.user_goal = user_goal
+        for message in self._messages:
+            if message.get("role") == "user":
+                message["content"] = user_goal
+                break
+        else:
+            self._messages.insert(1, {"role": "user", "content": user_goal})
+        previous_item_id = f"{self.run_id}_user_goal"
+        item_id = f"{previous_item_id}_{uuid4().hex[:8]}"
+        self.add_context_item(
+            self._make_item(
+                layer=ContextLayer.USER_GOAL,
+                source_runtime=ContextRuntime.USER,
+                item_type=ContextItemType.USER_GOAL,
+                content=user_goal,
+                authority=ContextAuthority.USER,
+                importance=1.0,
+                pinned=True,
+                item_id=item_id,
+            )
+        )
+        if self.store.load_item(previous_item_id) is not None:
+            self.store.supersede_item(previous_item_id, superseded_by=item_id)
+
     def messages(
         self,
         *,

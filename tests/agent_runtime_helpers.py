@@ -32,6 +32,7 @@ def make_agent_session(
     tool_runtime: ToolRuntime | None = None,
     protocol_runtime: Any | None = None,
     instruction_runtime: InstructionRuntime | None = None,
+    context_manager: ContextManager | None = None,
     context_db_path: Path | None = None,
     strict: bool = False,
 ) -> SingularityAgent:
@@ -81,6 +82,7 @@ def make_agent_session(
         tool_runtime=resolved_tool_runtime,
         protocol_runtime=resolved_protocol_runtime,
         instruction_runtime=resolved_instruction_runtime,
+        context_manager=context_manager,
         context_db_path=context_db_path,
         strict=strict,
     )

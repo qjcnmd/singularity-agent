@@ -15,6 +15,7 @@ from singularity.model import ModelPurpose, ModelRuntime, ModelTurnStatus
 from singularity.planner import PlannerRuntime, TaskStatus
 from singularity.provider import OpenAICompatibleProvider
 from singularity.policy import PolicyRuntime
+from singularity.task_controller import TaskController
 from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
 from singularity.tools import ToolRegistry, ToolRuntime
 from singularity.trace import TraceWriter
@@ -136,8 +137,9 @@ class SingularityAgent:
 
     def run(self, user_goal: str) -> SingularityAgentRunResult:
         planner = self.planner
+        controller = TaskController(planner=planner, trace=self.trace)
         if planner.state is None:
-            planner.start_task(user_goal)
+            controller.start(user_goal)
         effective_goal = getattr(planner.state, "effective_goal", None) or user_goal
         context = self.context_manager
         if context is None:
@@ -153,18 +155,18 @@ class SingularityAgent:
                 trace=self.trace,
             )
         else:
-            context.user_goal = effective_goal
+            context.set_user_goal(effective_goal)
         model_runtime = self.model_runtime
         instruction_runtime = self.instruction_runtime
         tool_schemas = self.tools.openai_tools(strict=self.strict)
         runtime = self.tool_runtime
         protocol_runtime = self.protocol_runtime
 
-        for turn in range(1, self.max_turns + 1):
+        def run_turn(turn: int) -> SingularityAgentRunResult | None:
             self._publish_progress(turn)
             planner.step()
             effective_goal = getattr(planner.state, "effective_goal", None) or user_goal
-            context.user_goal = effective_goal
+            context.set_user_goal(effective_goal)
             active_tool_schemas = planner.filtered_tools(tool_schemas)
             allowed_tool_names = [
                 tool.get("function", {}).get("name")
@@ -190,25 +192,26 @@ class SingularityAgent:
             if result.status != ModelTurnStatus.SUCCESS:
                 self._record_model_failure(planner, result, turn=turn)
                 outcome = self._outcome_from_model_failure(result)
-                planner.record_execution_outcome(outcome)
+                controller.apply_outcome(outcome)
                 self._record_outcome_context(context, planner, outcome)
                 terminal = self._terminal_result_from_outcome(outcome, turn=turn)
                 if terminal is not None:
                     return terminal
-                continue
+                return None
 
             assistant_message = self._assistant_message_from_result(result)
             if not result.tool_calls:
                 context.add_assistant_message(assistant_message)
                 final = self._attempt_finalize(
                     planner,
+                    controller=controller,
                     context=context,
                     turn=turn,
                     model_answer=assistant_message.get("content") or "",
                 )
                 if final is not None:
                     return final
-                continue
+                return None
 
             observation_start = len(context.tool_observations)
             protocol_result = protocol_runtime.process_model_turn(
@@ -223,40 +226,52 @@ class SingularityAgent:
             if protocol_result.next_action == "finalize":
                 final = self._attempt_finalize(
                     planner,
+                    controller=controller,
                     context=context,
                     turn=turn,
                     model_answer=assistant_message.get("content") or "",
                 )
                 if final is not None:
                     return final
-                continue
+                return None
 
+            controller.apply_protocol_result(protocol_result)
             outcome = self._reduce_protocol_result(
                 protocol_result,
                 context=context,
                 observation_start=observation_start,
             )
             if outcome is not None:
-                planner.record_execution_outcome(outcome)
+                controller.apply_outcome(outcome)
                 self._record_outcome_context(context, planner, outcome)
                 terminal = self._terminal_result_from_outcome(outcome, turn=turn)
                 if terminal is not None:
                     return terminal
+            return None
 
-        message = f"Stopped after max_turns={self.max_turns}; the model did not produce a final answer."
-        self.trace.record("error", {"type": "MaxTurnsExceeded", "message": message})
-        self.trace.record("final_answer", {"turn": self.max_turns, "content": message})
-        return SingularityAgentRunResult(
-            status=SingularityAgentRunStatus.MAX_TURNS_EXCEEDED,
-            final_answer=message,
-            turn=self.max_turns,
-            error_code="max_turns_exceeded",
+        def on_max_turns(max_turns: int) -> SingularityAgentRunResult:
+            message = f"Stopped after max_turns={max_turns}; the model did not produce a final answer."
+            self.trace.record("error", {"type": "MaxTurnsExceeded", "message": message})
+            self.trace.record("final_answer", {"turn": max_turns, "content": message})
+            return SingularityAgentRunResult(
+                status=SingularityAgentRunStatus.MAX_TURNS_EXCEEDED,
+                final_answer=message,
+                turn=max_turns,
+                error_code="max_turns_exceeded",
+            )
+
+        return controller.run_loop(
+            effective_goal,
+            max_turns=self.max_turns,
+            run_turn=run_turn,
+            on_max_turns=on_max_turns,
         )
 
     def _attempt_finalize(
         self,
         planner: PlannerRuntime,
         *,
+        controller: TaskController,
         context: ContextManager,
         turn: int,
         model_answer: str,
@@ -277,7 +292,7 @@ class SingularityAgent:
                 retry_allowed=True,
                 metadata={"assessment": assessment},
             )
-            planner.record_execution_outcome(outcome)
+            controller.apply_outcome(outcome)
             self._record_outcome_context(context, planner, outcome)
             return None
         if (
@@ -293,7 +308,7 @@ class SingularityAgent:
                 observation_summary="Completion evidence satisfied.",
                 retry_allowed=False,
             )
-            planner.record_execution_outcome(outcome)
+            controller.apply_outcome(outcome)
             self._record_outcome_context(context, planner, outcome)
             self.trace.record("final_answer", {"turn": turn, "content": model_answer})
             return SingularityAgentRunResult(
@@ -320,7 +335,7 @@ class SingularityAgent:
             retry_allowed=False,
             metadata={"verification_summary": report.verification_summary},
         )
-        planner.record_execution_outcome(outcome)
+        controller.apply_outcome(outcome)
         self._record_outcome_context(context, planner, outcome)
         self.trace.record("final_answer", {"turn": turn, "content": final_answer})
         return SingularityAgentRunResult(

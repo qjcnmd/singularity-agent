@@ -22,6 +22,7 @@ class PlannerContextRenderer:
                 "goal_revisions": state.goal_revisions[-5:],
                 "phase": state.current_phase,
                 "status": state.status.value,
+                "lifecycle_status": state.lifecycle_status,
                 "risk_level": state.risk_level.value,
                 "allowed_tools": plan.phase(state.current_phase).allowed_tools,
                 "task_contract": self._contract_summary(state.task_contract),

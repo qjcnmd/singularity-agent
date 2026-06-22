@@ -4,6 +4,7 @@ from typing import Any
 
 from singularity.agent import SingularityAgentRunStatus
 from singularity.command import CommandRuntime
+from singularity.context import ContextManager
 from singularity.edit import EditRuntime
 from singularity.planner import PlannerRuntime
 from singularity.policy import (
@@ -17,6 +18,7 @@ from singularity.policy import (
     RiskLevel,
     SecurityMode,
 )
+from singularity.task_controller import TaskLifecycleStatus
 from singularity.tools import ToolRegistry
 from singularity.tools.edit import register_edit_tools
 from singularity.tools.mutation import register_mutation_tools
@@ -218,12 +220,66 @@ def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:
     )
 
 
+def test_approval_wait_keeps_context_for_resume(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="placeholder",
+        db_path=tmp_path / "context.sqlite3",
+    )
+    provider = FakeProvider(
+        tool("call_read_1", "read_file", {"path": "README.md"}),
+        tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
+        tool(
+            "call_create",
+            "write_file",
+            {
+                "path": "needs-review.txt",
+                "content": "approval required\n",
+                "mode": "create",
+                "reason": "exercise pending approval lifecycle",
+            },
+        )
+    )
+    policy = PolicyRuntime(
+        PolicyConfig(
+            workspace_root=tmp_path,
+            approval_mode=ApprovalMode.REVIEW_ALL,
+            security_mode=SecurityMode.COMPAT,
+        )
+    )
+    agent = make_task_agent(
+        tmp_path,
+        provider=provider,
+        planner=planner,
+        policy_runtime=policy,
+        context_manager=context,
+        max_turns=3,
+    )
+
+    result = agent.run("create needs-review.txt")
+
+    assert result.status == SingularityAgentRunStatus.BLOCKED
+    assert result.error_code == "approval_required"
+    assert planner.state is not None
+    assert planner.state.lifecycle_status == TaskLifecycleStatus.WAITING_APPROVAL.value
+    messages = context.messages()
+    assert any(message["role"] == "user" and "create needs-review.txt" in message["content"] for message in messages)
+    assert any(message["role"] == "assistant" and message.get("tool_calls") for message in messages)
+    assert any(
+        message["role"] == "tool" and "approval_required" in str(message.get("content"))
+        for message in messages
+    )
+
+
 def make_task_agent(
     tmp_path: Path,
     *,
     provider: FakeProvider,
     planner: PlannerRuntime,
     policy_runtime: Any | None = None,
+    context_manager: ContextManager | None = None,
     max_turns: int = 6,
 ):
     trace = TraceWriter.create(tmp_path)
@@ -256,6 +312,7 @@ def make_task_agent(
         max_turns=max_turns,
         planner=planner,
         policy_runtime=policy,
+        context_manager=context_manager,
     )
 
 
