@@ -326,8 +326,15 @@ class FinalReportRuntime:
         lines = [
             "# Final Report",
             "",
-            f"- Goal: {report.user_goal}",
+            "## Objective",
+            "",
+            f"{report.user_goal}",
+            "",
+            "## Outcome",
+            "",
             f"- Status: {report.status.value}",
+            f"- Verification status: {report.verification_summary.get('status', 'unknown')}",
+            f"- Files changed: {', '.join(report.files_changed) if report.files_changed else '-'}",
             "",
             "## Requirements",
             *_requirements(state),
@@ -335,12 +342,16 @@ class FinalReportRuntime:
             "## Rolling Plan",
             *_rolling_plan(state),
             "",
-            "## Changes",
-            *(f"- {path}" for path in (report.files_changed or ["-"])),
+            "## Implementation",
+            *_implementation(report, evidence),
             "",
             "## Verification",
             f"- Status: {report.verification_summary.get('status', 'unknown')}",
             *_checks(report.verification_summary.get("check_status") or []),
+            *_verification_evidence(evidence),
+            "",
+            "## Results",
+            *_results(report),
             "",
             "## Failure / Repair History",
             f"- Failure analyses: {len(evidence.failure_analyses)}",
@@ -351,6 +362,9 @@ class FinalReportRuntime:
             f"- Decision: {report.review_summary.get('latest_decision') or 'not_recorded'}",
             f"- Route: {report.review_summary.get('latest_route') or 'not_recorded'}",
             f"- Findings: {report.review_summary.get('finding_count', 0)}",
+            "",
+            "## Risks and Next Steps",
+            *_risks_and_next_steps(report),
             "",
             "## Evidence Appendix",
             f"- Inspected files: {len(evidence.inspected_files)}",
@@ -384,9 +398,48 @@ def _rolling_plan(state: TaskState) -> list[str]:
     ]
 
 
+def _implementation(report: FinalReport, evidence: EvidenceLedger) -> list[str]:
+    lines = [f"- Changed file: {path}" for path in report.files_changed]
+    if not lines:
+        lines.append("- No workspace file changes recorded.")
+    for change in evidence.applied_changes[:10]:
+        summary = change.get("summary") or change.get("intent") or change.get("transaction_id")
+        if summary:
+            lines.append(f"- Change evidence: {summary}")
+    return lines
+
+
 def _checks(checks: list[Any]) -> list[str]:
     return [
         f"- {item.get('check_id')}: {item.get('status')}"
         for item in checks
         if isinstance(item, dict)
     ]
+
+
+def _verification_evidence(evidence: EvidenceLedger) -> list[str]:
+    if not evidence.verification_results:
+        return ["- No verification result recorded."]
+    latest = evidence.verification_results[-1]
+    lines: list[str] = []
+    for result in latest.get("results") or []:
+        if not isinstance(result, dict):
+            continue
+        command = ((result.get("evidence") or {}).get("command") or result.get("command"))
+        if isinstance(command, list):
+            command = " ".join(str(item) for item in command)
+        if command:
+            lines.append(f"- Command: `{command}`")
+    return lines or ["- Verification evidence recorded without command details."]
+
+
+def _results(report: FinalReport) -> list[str]:
+    if report.status == TaskStatus.COMPLETED:
+        return ["- Acceptance evidence is complete and the final review accepted the run."]
+    return ["- Acceptance evidence is incomplete or final review did not accept the run."]
+
+
+def _risks_and_next_steps(report: FinalReport) -> list[str]:
+    lines = [f"- Risk: {risk}" for risk in report.risks[:10]]
+    lines.extend(f"- Next step: {step}" for step in report.next_steps[:10])
+    return lines or ["- No unresolved risks or next steps recorded."]

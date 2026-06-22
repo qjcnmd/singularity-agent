@@ -3,7 +3,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from singularity.cli import app
+from singularity.cli import app, _run_live_quicksort_benchmark
 from singularity.cli import create_or_resume_planner, workspace_health_summary
 from singularity.evaluation import (
     BenchmarkTask,
@@ -172,6 +172,158 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
     assert bootstrap_config.config_sources["max_turns"] == "config:.singularity/config.toml"
     assert bootstrap_config.config_sources["dry_run"] == "cli"
     assert "final report" in result.output
+
+
+def test_cli_run_accepts_project_root(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, object]] = []
+    project_root = tmp_path / "project"
+    cwd = tmp_path / "cwd"
+    (project_root / ".singularity").mkdir(parents=True)
+    cwd.mkdir()
+    (project_root / ".singularity" / "config.toml").write_text("max_turns = 5\n", encoding="utf-8")
+
+    class FakeWorkspaceState:
+        baseline = None
+
+        def get_workspace_health(self) -> WorkspaceHealthReport:
+            return WorkspaceHealthReport(status=WorkspaceHealthStatus.CLEAN)
+
+    class FakeTrace:
+        class Store:
+            run_dir = project_root / "traces" / "run_1"
+
+        store = Store()
+
+        def record(self, event: str, data: dict) -> None:
+            calls.append((event, data))
+
+    class FakeGraph:
+        trace = FakeTrace()
+        workspace_state = FakeWorkspaceState()
+
+    class FakeResult:
+        final_answer = "done"
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            runtime_health_summary={"planner": "ok"},
+            shutdown_summary={"cleanup_status": "completed"},
+            recovery_summary={"recovered": False},
+            lifecycle_summary={"events": 3},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+        recovery_report = None
+
+        class Context:
+            class Identity:
+                run_id = "run_1"
+
+            identity = Identity()
+
+        context = Context()
+
+        def run_task(self, goal: str) -> FakeResult:
+            return FakeResult()
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            calls.append(("bootstrap_init", kwargs))
+
+        def boot(self, goal: str) -> FakeKernel:
+            return FakeKernel()
+
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+
+    result = runner.invoke(app, ["run", "hello", "--project-root", str(project_root), "--dry-run"])
+
+    assert result.exit_code == 0
+    payload = next(item for event, item in calls if event == "bootstrap_init")
+    assert payload["project_root"] == project_root.resolve()
+    assert payload["config"].project_root == project_root.resolve()
+    assert payload["config"].max_turns == 5
+
+
+def test_eval_live_quicksort_uses_kernel_and_independent_smoke(monkeypatch, tmp_path: Path) -> None:
+    class FakeTrace:
+        class Store:
+            run_dir = tmp_path / "trace" / "run_1"
+
+        store = Store()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            runtime_health_summary={"planner": "ok"},
+            shutdown_summary={"cleanup_status": "completed"},
+            recovery_summary={"recovered": False},
+            lifecycle_summary={"events": 3},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, goal: str) -> FakeResult:
+            (self.project_root / "quicksort.py").write_text(
+                "def quicksort(values):\n"
+                "    return sorted(values)\n"
+                "if __name__ == '__main__':\n"
+                "    assert quicksort([3, 1, 2]) == [1, 2, 3]\n",
+                encoding="utf-8",
+            )
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+
+    result = _run_live_quicksort_benchmark(
+        output_dir=tmp_path / "live",
+        run_id="live_test",
+        max_turns=3,
+        model=None,
+        base_url=None,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "completed"
+    assert Path(result["workspace"], "quicksort.py").exists()
+    assert result["independent_smoke"]["exit_code"] == 0
 
 
 def test_cli_converts_kernel_cancellation_to_exit(monkeypatch, tmp_path: Path) -> None:

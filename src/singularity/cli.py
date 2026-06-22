@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 import click
 import typer
@@ -20,6 +22,7 @@ from singularity.evaluation import (
 )
 from singularity.interaction import RichCliRenderer
 from singularity.kernel import CancellationError, KernelBootstrap
+from singularity.kernel.models import RunStatus
 from singularity.memory.cli import memory_app
 from singularity.observability import TraceRedactor, TraceRuntime, TraceStore
 from singularity.plugins.cli import plugin_app
@@ -74,6 +77,7 @@ eval_trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_ab_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_regression_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_report_app = typer.Typer(add_completion=False, no_args_is_help=True)
+eval_live_app = typer.Typer(add_completion=False, no_args_is_help=True)
 system_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 app.add_typer(index_app, name="index")
@@ -88,6 +92,7 @@ eval_app.add_typer(eval_trace_app, name="trace")
 eval_app.add_typer(eval_ab_app, name="ab")
 eval_app.add_typer(eval_regression_app, name="regression")
 eval_app.add_typer(eval_report_app, name="report")
+eval_app.add_typer(eval_live_app, name="live")
 console = Console()
 _REDACTOR = TraceRedactor()
 
@@ -229,10 +234,17 @@ def run_goal(
             help="Enable strict tool schema/protocol validation and redaction hardening.",
         ),
     ] = None,
+    project_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--project-root",
+            help="Workspace root for this run; defaults to the current directory.",
+        ),
+    ] = None,
 ) -> None:
     """Run the production-grade local CLI coding agent runtime."""
 
-    project_root = Path.cwd()
+    project_root = (project_root or Path.cwd()).expanduser().resolve(strict=False)
     runtime_config = ProductionRuntimeConfig.from_cli(
         project_root=project_root,
         max_turns=max_turns,
@@ -987,6 +999,120 @@ def eval_report_show(
         console.print(Panel(text, title="evaluation report", border_style="cyan"))
         return
     console.print(report_path.read_text(encoding="utf-8"))
+
+
+@eval_live_app.command("quicksort")
+def eval_live_quicksort(
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Directory for the live benchmark workspace and report."),
+    ] = None,
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Stable live benchmark run id."),
+    ] = None,
+    max_turns: Annotated[
+        int,
+        typer.Option("--max-turns", min=1, max=40, help="Maximum live model turns."),
+    ] = 12,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Override SINGULARITY_MODEL for this live benchmark."),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this live benchmark."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    """Run the live provider through a controlled quicksort create-and-verify task."""
+
+    result = _run_live_quicksort_benchmark(
+        output_dir=output_dir,
+        run_id=run_id,
+        max_turns=max_turns,
+        model=model,
+        base_url=base_url,
+    )
+    if json_output:
+        _write_stdout(json_dumps(result))
+        return
+    console.print(Panel(json_dumps(result), title="live quicksort benchmark", border_style="cyan"))
+    if not result["ok"]:
+        raise typer.Exit(1)
+
+
+def _run_live_quicksort_benchmark(
+    *,
+    output_dir: Path | None,
+    run_id: str | None,
+    max_turns: int,
+    model: str | None,
+    base_url: str | None,
+) -> dict[str, object]:
+    resolved_run_id = run_id or f"live_quicksort_{uuid4().hex[:8]}"
+    root = (output_dir or (Path.cwd() / "work" / "evaluations-live")).expanduser().resolve(strict=False)
+    workspace = root / resolved_run_id / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    readme = workspace / "README.md"
+    if not readme.exists():
+        readme.write_text(
+            "Live benchmark workspace. Create quicksort.py and verify it with python quicksort.py.\n",
+            encoding="utf-8",
+        )
+    goal = (
+        "Create quicksort.py in this workspace. It must define quicksort(values), "
+        "include a __main__ smoke assertion, and run python quicksort.py through "
+        "VerificationRuntime. Finish only after verification passes."
+    )
+    config = ProductionRuntimeConfig.from_cli(
+        project_root=workspace,
+        max_turns=max_turns,
+        model=model,
+        base_url=base_url,
+        approval_mode=ApprovalMode.AUTO_SAFE,
+        security_mode=SecurityMode.COMPAT,
+        profile="live-quicksort",
+        cli_overrides={"max_turns", "model", "base_url", "approval_mode", "security_mode", "profile"},
+    )
+    kernel = KernelBootstrap(project_root=workspace, config=config, console=console).boot(goal)
+    try:
+        agent_result = kernel.run_task(goal)
+        quicksort_path = workspace / "quicksort.py"
+        smoke = subprocess.run(
+            [sys.executable, "quicksort.py"],
+            cwd=workspace,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        ) if quicksort_path.exists() else None
+        ok = bool(
+            agent_result.status == RunStatus.COMPLETED
+            and quicksort_path.exists()
+            and smoke is not None
+            and smoke.returncode == 0
+        )
+        return {
+            "schema_version": "evaluation.live_provider_benchmark/v1",
+            "benchmark": "quicksort",
+            "run_id": resolved_run_id,
+            "ok": ok,
+            "status": agent_result.status.value,
+            "workspace": str(workspace),
+            "trace": str(kernel.graph.trace.store.run_dir),
+            "final_report": agent_result.final_report.to_dict(),
+            "independent_smoke": {
+                "command": [sys.executable, "quicksort.py"],
+                "exit_code": smoke.returncode if smoke is not None else None,
+                "stdout": smoke.stdout[:1000] if smoke is not None else "",
+                "stderr": smoke.stderr[:1000] if smoke is not None else "quicksort.py was not created",
+            },
+        }
+    finally:
+        close_resources = getattr(kernel, "close_resources", None)
+        if callable(close_resources):
+            close_resources()
 
 
 def _profiles_from_cli(profile_json: list[str] | None) -> list[EvaluationProfile]:

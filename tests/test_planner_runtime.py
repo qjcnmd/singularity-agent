@@ -361,8 +361,12 @@ def test_final_report_is_generated_from_evidence(tmp_path: Path) -> None:
     assert markdown_artifacts
     markdown = (tmp_path / markdown_artifacts[0]).read_text(encoding="utf-8")
     assert "# Final Report" in markdown
+    assert "## Objective" in markdown
+    assert "## Implementation" in markdown
     assert "## Verification" in markdown
+    assert "## Results" in markdown
     assert "## Final Review" in markdown
+    assert "## Risks and Next Steps" in markdown
     assert "## Evidence Appendix" in markdown
 
 

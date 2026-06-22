@@ -127,6 +127,14 @@ singularity eval suite run golden.json \
 
 Suite, A/B, and regression commands default to deterministic offline scoring and trace replay. Add `--execute` only when the task needs executable hooks, test commands, assertions against a prepared workspace, or inline-file snapshot materialization. The CLI execution path uses `CommandRuntime` and `VerificationRuntime`; full kernel-boot execution remains responsible for richer planner, memory, tool, and mutation wiring.
 
+Run the optional live-provider E2E smoke benchmark:
+
+```bash
+singularity-agent eval live quicksort --json
+```
+
+This command creates a controlled workspace under `work/evaluations-live/`, boots the real CLI kernel with the configured OpenAI-compatible provider, asks the agent to create and verify `quicksort.py`, and then independently runs `python quicksort.py`. Unlike trace replay, this path can make live model calls and should be run only when `SINGULARITY_API_KEY`, `SINGULARITY_MODEL`, and `SINGULARITY_BASE_URL` are intentionally configured.
+
 Run A/B or regression checks:
 
 ```bash
