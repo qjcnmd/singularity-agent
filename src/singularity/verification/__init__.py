@@ -1,6 +1,15 @@
 from singularity.verification.assessor import CompletionAssessor
 from singularity.verification.discovery import CommandDiscovery, ProjectDetector
 from singularity.verification.errors import VERIFICATION_ERROR_CODES
+from singularity.verification.failure_analysis import (
+    FailureAnalysis,
+    FailureAnalysisRuntime,
+    NoProgressGuard,
+    RepairPlan,
+    RepairPlannerRuntime,
+    RepairStep,
+    RootCauseHypothesis,
+)
 from singularity.verification.impact import ImpactAnalyzer
 from singularity.verification.models import (
     CheckKind,
@@ -42,9 +51,12 @@ __all__ = [
     "DiscoveredCommand",
     "FailureParser",
     "FailureParserRegistry",
+    "FailureAnalysis",
+    "FailureAnalysisRuntime",
     "FailureType",
     "ImpactAnalysis",
     "ImpactAnalyzer",
+    "NoProgressGuard",
     "ParsedFailure",
     "ProjectDetector",
     "ProjectLanguage",
@@ -54,6 +66,10 @@ __all__ = [
     "RepairHintGenerator",
     "RepairLoopController",
     "RepairLoopState",
+    "RepairPlan",
+    "RepairPlannerRuntime",
+    "RepairStep",
+    "RootCauseHypothesis",
     "VERIFICATION_ERROR_CODES",
     "VerificationCheck",
     "VerificationDecision",

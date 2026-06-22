@@ -34,6 +34,8 @@ class PlannerContextRenderer:
                         if evidence.verification_results
                         else None
                     ),
+                    "failure_analysis": evidence.failure_analyses[-3:],
+                    "repair_plan": evidence.repair_plans[-1] if evidence.repair_plans else None,
                     "unresolved_failures": evidence.unresolved_failures[-10:],
                     "missing_evidence": evidence.missing_evidence[-10:],
                     "task_outcomes": evidence.task_outcomes[-10:],

@@ -375,6 +375,21 @@ class PlannerRuntime:
             return
         verification = {**verification, "tool_call_id": tool_call_id}
         self.evidence.verification_results.append(verification)
+        for analysis in verification.get("failure_analysis") or []:
+            if isinstance(analysis, dict):
+                analysis_id = analysis.get("analysis_id")
+                if not analysis_id or not any(
+                    existing.get("analysis_id") == analysis_id
+                    for existing in self.evidence.failure_analyses
+                ):
+                    self.evidence.failure_analyses.append(analysis)
+        repair_plan = verification.get("repair_plan")
+        if isinstance(repair_plan, dict):
+            plan_id = repair_plan.get("plan_id")
+            if not plan_id or not any(
+                existing.get("plan_id") == plan_id for existing in self.evidence.repair_plans
+            ):
+                self.evidence.repair_plans.append(repair_plan)
         self._record_sandbox_from_verification(verification)
         for status in verification.get("check_status") or []:
             self._append_unique(self._state().linked_verifications, status.get("check_id"))

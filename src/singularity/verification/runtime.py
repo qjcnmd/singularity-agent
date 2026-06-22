@@ -32,6 +32,7 @@ from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.trace import TraceWriter
 from singularity.verification.assessor import CompletionAssessor
 from singularity.verification.discovery import ProjectDetector
+from singularity.verification.failure_analysis import FailureAnalysisRuntime, RepairPlannerRuntime
 from singularity.verification.impact import ImpactAnalyzer
 from singularity.verification.models import (
     CheckKind,
@@ -80,6 +81,8 @@ class VerificationRuntime:
         self.hints = RepairHintGenerator()
         self.assessor = CompletionAssessor()
         self.repair_loop = RepairLoopController()
+        self.failure_analysis = FailureAnalysisRuntime()
+        self.repair_planner = RepairPlannerRuntime()
         self._plans: dict[str, VerificationPlan] = {}
         self._results: dict[str, list[VerificationResult]] = {}
         self._assessments: dict[str, CompletionAssessment] = {}
@@ -136,6 +139,19 @@ class VerificationRuntime:
         except Exception:
             return []
 
+    def _task_contract_payload(self) -> dict[str, Any] | None:
+        state = getattr(self.planner, "state", None)
+        contract = getattr(state, "task_contract", None)
+        return dict(contract) if isinstance(contract, dict) and contract else None
+
+    @staticmethod
+    def _verification_commands(plan: VerificationPlan) -> dict[str, list[str]]:
+        return {
+            check.id: list(check.command.argv)
+            for check in plan.all_checks()
+            if check.command is not None
+        }
+
     def run_plan(
         self,
         plan_id: str | None = None,
@@ -169,7 +185,20 @@ class VerificationRuntime:
                 "completion_assessment": assessment.to_dict(),
             },
         )
-        observation = self._observation(plan, results, assessment)
+        analyses = self.failure_analysis.analyze_results(
+            results,
+            changed_files=plan.impact_analysis.changed_files,
+            task_contract=self._task_contract_payload(),
+            verification_commands=self._verification_commands(plan),
+        )
+        repair_plan = self.repair_planner.plan(analyses) if analyses else None
+        observation = self._observation(
+            plan,
+            results,
+            assessment,
+            failure_analyses=analyses,
+            repair_plan=repair_plan,
+        )
         review_report = self._post_verification_review(
             plan=plan,
             results=results,
@@ -195,7 +224,20 @@ class VerificationRuntime:
         self._results[plan.id] = existing
         assessment = self.assessor.assess(plan=plan, results=existing)
         self._assessments[plan.id] = assessment
-        observation = self._observation(plan, existing, assessment)
+        analyses = self.failure_analysis.analyze_results(
+            existing,
+            changed_files=plan.impact_analysis.changed_files,
+            task_contract=self._task_contract_payload(),
+            verification_commands=self._verification_commands(plan),
+        )
+        repair_plan = self.repair_planner.plan(analyses) if analyses else None
+        observation = self._observation(
+            plan,
+            existing,
+            assessment,
+            failure_analyses=analyses,
+            repair_plan=repair_plan,
+        )
         review_report = self._post_verification_review(
             plan=plan,
             results=existing,
@@ -1051,6 +1093,9 @@ class VerificationRuntime:
         plan: VerificationPlan,
         results: list[VerificationResult],
         assessment: CompletionAssessment,
+        *,
+        failure_analyses: list[Any] | None = None,
+        repair_plan: Any | None = None,
     ) -> dict[str, Any]:
         failed = [
             result
@@ -1058,7 +1103,7 @@ class VerificationRuntime:
             if result.status
             in {CheckStatus.FAILED, CheckStatus.BLOCKED, CheckStatus.TIMEOUT, CheckStatus.FLAKY}
         ]
-        return {
+        payload = {
             "verification": {
                 "plan": plan.to_dict(),
                 "check_status": [
@@ -1080,6 +1125,16 @@ class VerificationRuntime:
                 "completion_assessment": assessment.to_dict(),
             }
         }
+        if failure_analyses:
+            payload["verification"]["failure_analysis"] = [
+                analysis.to_dict() if hasattr(analysis, "to_dict") else dict(analysis)
+                for analysis in failure_analyses
+            ]
+        if repair_plan is not None:
+            payload["verification"]["repair_plan"] = (
+                repair_plan.to_dict() if hasattr(repair_plan, "to_dict") else dict(repair_plan)
+            )
+        return payload
 
 
 def _excerpt(output: str, limit: int = 1200) -> str:
