@@ -78,12 +78,12 @@ def test_premature_final_then_quicksort_smoke_completes(tmp_path: Path) -> None:
         tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
         tool(
             "call_create",
-            "edit_apply",
+            "write_file",
             {
-                "summary": "create deterministic quicksort smoke target",
-                "operations": [
-                    {"kind": "create_file", "path": "quicksort.py", "content": QUICK_SORT}
-                ],
+                "path": "quicksort.py",
+                "content": QUICK_SORT,
+                "mode": "create",
+                "reason": "create deterministic quicksort smoke target",
             },
         ),
         tool(
@@ -136,16 +136,12 @@ def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> N
         tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
         tool(
             "call_create",
-            "edit_apply",
+            "write_file",
             {
-                "summary": "create failing smoke target",
-                "operations": [
-                    {
-                        "kind": "create_file",
-                        "path": "quicksort.py",
-                        "content": "print(1 / 0)\n",
-                    }
-                ],
+                "path": "quicksort.py",
+                "content": "print(1 / 0)\n",
+                "mode": "create",
+                "reason": "create failing smoke target",
             },
         ),
         tool(
@@ -179,12 +175,12 @@ def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:
         tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
         tool(
             "call_create",
-            "edit_apply",
+            "write_file",
             {
-                "summary": "policy should block this mutation",
-                "operations": [
-                    {"kind": "create_file", "path": "quicksort.py", "content": QUICK_SORT}
-                ],
+                "path": "quicksort.py",
+                "content": QUICK_SORT,
+                "mode": "create",
+                "reason": "policy should block this mutation",
             },
         ),
     )

@@ -25,6 +25,7 @@ from singularity.planner.models import (
     TaskStatus,
 )
 from singularity.planner.policy import (
+    DIFF_TOOLS,
     EDIT_PLAN_TOOLS,
     PlannerPolicy,
     READ_TOOLS,
@@ -261,6 +262,10 @@ class PlannerRuntime:
         elif tool_name.startswith("index_") and isinstance(content, dict):
             observation = content.get("project_index") if isinstance(content.get("project_index"), dict) else content
             self.record_project_index_observation(observation)
+        elif tool_name in DIFF_TOOLS and isinstance(content, dict):
+            self.record_diff_observation(content, tool_call_id=tool_call_id)
+        elif tool_name in MUTATION_TOOLS and isinstance(content, dict):
+            self.update_from_mutation(content, tool_call_id=tool_call_id)
         elif tool_name.startswith("edit_") and isinstance(content, dict):
             self.update_from_edit(content, tool_call_id=tool_call_id)
         elif tool_name.startswith("review_") and isinstance(content, dict):
@@ -307,6 +312,10 @@ class PlannerRuntime:
                 "changed_files": changed_files,
                 "status": payload.get("mutation_status"),
                 "artifact_path": payload.get("artifact_path"),
+                "diff_summary": payload.get("diff_summary") or [],
+                "diff_digest": payload.get("diff_digest"),
+                "artifact_refs": payload.get("artifact_refs") or [],
+                "warnings": payload.get("warnings") or [],
             }
             self.evidence.applied_changes.append(entry)
             self._append_unique(self._state().linked_transactions, transaction_id)
@@ -577,6 +586,29 @@ class PlannerRuntime:
                         "freshness": candidate.get("freshness"),
                     }
                 )
+        self._persist()
+
+    def record_diff_observation(
+        self,
+        observation: dict[str, Any],
+        *,
+        tool_call_id: str | None = None,
+    ) -> None:
+        self._throw_if_cancelled()
+        payload = {
+            "tool_call_id": tool_call_id,
+            "scope": observation.get("scope") or "current_run",
+            "changeset_id": observation.get("changeset_id"),
+            "changed_files": list(observation.get("changed_files") or []),
+            "added_files": list(observation.get("added_files") or []),
+            "modified_files": list(observation.get("modified_files") or []),
+            "deleted_files": list(observation.get("deleted_files") or []),
+            "diff_digest": observation.get("diff_digest"),
+            "artifact_refs": list(observation.get("artifact_refs") or []),
+            "warnings": list(observation.get("warnings") or []),
+        }
+        if payload not in self.evidence.diff_observations:
+            self.evidence.diff_observations.append(payload)
         self._persist()
 
     def update_from_edit(
@@ -931,11 +963,12 @@ class PlannerRuntime:
                 phase_id="applying_changes",
                 name="Apply Changes",
                 purpose="Apply mutations through EditRuntime, which delegates writes to Workspace Mutation Runtime.",
-                allowed_tools=sorted(MUTATION_TOOLS | READ_TOOLS),
+                allowed_tools=sorted(MUTATION_TOOLS | READ_TOOLS | DIFF_TOOLS),
                 allowed_actions=[
                     ActionKind.APPLY_MUTATION,
                     ActionKind.READ_RELEVANT_FILES,
                     ActionKind.SEARCH_CODE,
+                    ActionKind.ANALYZE_ISSUE,
                 ],
                 required_evidence=["applied_changes"],
             ),
@@ -943,16 +976,22 @@ class PlannerRuntime:
                 phase_id="running_verification",
                 name="Run Verification",
                 purpose="Run planned verification through VerificationRuntime.",
-                allowed_tools=sorted(VERIFICATION_TOOLS | {"workspace_health"}),
-                allowed_actions=[ActionKind.RUN_VERIFICATION, ActionKind.ANALYZE_ISSUE],
+                allowed_tools=sorted(VERIFICATION_TOOLS | DIFF_TOOLS | {"read_file", "workspace_health"}),
+                allowed_actions=[
+                    ActionKind.RUN_VERIFICATION,
+                    ActionKind.READ_RELEVANT_FILES,
+                    ActionKind.ANALYZE_ISSUE,
+                ],
                 required_evidence=["verification_results"],
             ),
             TaskPhase(
                 phase_id="repairing_failures",
                 name="Repair Failures",
                 purpose="Repair failures using parsed evidence and bounded retries.",
-                allowed_tools=sorted(MUTATION_TOOLS | EDIT_PLAN_TOOLS | READ_TOOLS | VERIFICATION_TOOLS),
+                allowed_tools=sorted(MUTATION_TOOLS | EDIT_PLAN_TOOLS | READ_TOOLS | DIFF_TOOLS | VERIFICATION_TOOLS),
                 allowed_actions=[
+                    ActionKind.APPLY_MUTATION,
+                    ActionKind.ANALYZE_ISSUE,
                     ActionKind.PARSE_FAILURE,
                     ActionKind.REPAIR_CHANGE,
                     ActionKind.READ_RELEVANT_FILES,
@@ -964,7 +1003,7 @@ class PlannerRuntime:
                 phase_id="finalizing",
                 name="Finalize",
                 purpose="Generate a final report from runtime evidence.",
-                allowed_tools=["get_verification_result", "workspace_health"],
+                allowed_tools=["get_verification_result", "inspect_diff", "workspace_health"],
                 allowed_actions=[ActionKind.FINALIZE, ActionKind.ANALYZE_ISSUE],
                 required_evidence=["final_report"],
             ),

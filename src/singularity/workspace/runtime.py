@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import difflib
 import os
 import shutil
 import tempfile
@@ -25,7 +26,13 @@ from singularity.policy import (
     RuntimeName,
 )
 from singularity.policy.audit import redact
-from singularity.workspace.diff import DiffEngine, FileDiff
+from singularity.workspace.diff import (
+    DiffEngine,
+    FileDiff,
+    UnifiedDiffError,
+    apply_unified_diff_to_text,
+    parse_unified_diff,
+)
 from singularity.workspace.errors import MutationError
 from singularity.workspace.git import GitState, collect_git_state
 from singularity.workspace.operations import (
@@ -242,6 +249,10 @@ class MutationRuntime:
         )
         self.project_index_runtime = project_index_runtime
         self._journals: dict[str, MutationJournal] = {}
+        self._changesets: dict[str, ChangeSet] = {}
+        self._changeset_transactions: dict[str, str] = {}
+        self._changeset_results: dict[str, MutationResult] = {}
+        self._changeset_order: list[str] = []
 
     def preview_operations(
         self,
@@ -398,6 +409,210 @@ class MutationRuntime:
             diffs=diffs,
         )
 
+    def apply_file_updates(
+        self,
+        updates: dict[str, str],
+        *,
+        intent: str,
+        created_by: str,
+        tool_call_id: str | None = None,
+    ) -> MutationResult:
+        operations: list[EditOperation] = []
+        for path, content in updates.items():
+            resolved = self.resolver.resolve(path)
+            if resolved.path.exists():
+                try:
+                    before = resolved.path.read_text(encoding="utf-8")
+                except UnicodeDecodeError as exc:
+                    raise MutationError(
+                        "encoding_error",
+                        f"Could not decode file: {resolved.relative_posix}",
+                        {"path": resolved.relative_posix},
+                    ) from exc
+                operations.append(
+                    ApplyUnifiedDiff(
+                        path=resolved.relative_posix,
+                        diff=_make_unified_diff(resolved.relative_posix, before, content),
+                    )
+                )
+            else:
+                operations.append(CreateFile(path=resolved.relative_posix, content=content))
+        return self.apply_operations(
+            operations,
+            intent=intent,
+            created_by=created_by,
+            tool_call_id=tool_call_id,
+        )
+
+    def operations_from_unified_diff(
+        self,
+        patch: str,
+        *,
+        expected_files: list[str] | None = None,
+        allow_new_files: bool = True,
+    ) -> list[ApplyUnifiedDiff]:
+        try:
+            patches = parse_unified_diff(patch)
+        except UnifiedDiffError as exc:
+            raise MutationError(exc.code, str(exc), {"path": exc.path}) from exc
+        expected = {self.resolver.resolve(path).relative_posix for path in expected_files or []}
+        paths = {self.resolver.resolve(item.path).relative_posix for item in patches}
+        if expected and paths != expected:
+            raise MutationError(
+                "unexpected_patch_files",
+                "Patch touched files outside expected_files.",
+                {"expected_files": sorted(expected), "actual_files": sorted(paths)},
+            )
+        operations: list[ApplyUnifiedDiff] = []
+        for item in patches:
+            resolved = self.resolver.resolve(item.path)
+            if item.is_binary or item.is_rename or item.is_delete:
+                raise MutationError(
+                    "unsupported_operation",
+                    "Only text create/modify patches are supported.",
+                    {"path": item.path},
+                )
+            if item.is_new_file and not allow_new_files:
+                raise MutationError(
+                    "new_file_not_allowed",
+                    "Patch creates a file but allow_new_files is false.",
+                    {"path": item.path},
+                )
+            if item.is_new_file and resolved.path.exists():
+                raise MutationError(
+                    "file_changed",
+                    "Patch creates a file that already exists.",
+                    {"path": resolved.relative_posix},
+                )
+            operations.append(
+                ApplyUnifiedDiff(
+                    path=resolved.relative_posix,
+                    diff=item.text,
+                )
+            )
+        return operations
+
+    def rollback_changeset(self, changeset_id: str, reason: str | None = None) -> MutationResult:
+        transaction_id = self._changeset_transactions.get(changeset_id)
+        if transaction_id is None:
+            return MutationResult(
+                ok=False,
+                status="rollback_failed",
+                error_code="rollback_failed",
+                message=f"Unknown changeset: {changeset_id}",
+                changeset_id=changeset_id,
+            )
+        changeset = self._changesets.get(changeset_id)
+        policy_result = self._rollback_policy_result(
+            changeset_id=changeset_id,
+            transaction_id=transaction_id,
+            reason=reason,
+            changed_files=changeset.affected_files if changeset else [],
+        )
+        if policy_result is not None:
+            self._remember_changeset_result(policy_result)
+            return policy_result
+        result = RollbackManager(self).rollback(transaction_id)
+        result.changeset_id = changeset_id
+        result.affected_files = changeset.affected_files if changeset else []
+        result.observation = {
+            "mutation_status": result.status,
+            "changeset_id": changeset_id,
+            "transaction_id": transaction_id,
+            "changed_files": result.affected_files,
+            "diff_summary": [],
+            "diff_digest": _digest_diffs([]),
+            "artifact_refs": [f"changeset:{changeset_id}"],
+            "warnings": [] if result.ok else [result.message],
+            "error_code": result.error_code,
+        }
+        if result.ok and self.planner is not None:
+            self.planner.update_from_mutation(
+                result.observation,
+                tool_call_id=None,
+            )
+        self._remember_changeset_result(result)
+        return result
+
+    def inspect_diff(
+        self,
+        *,
+        scope: str = "current_run",
+        changeset_id: str | None = None,
+        paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        if scope == "changeset" and not changeset_id:
+            raise MutationError(
+                "invalid_operation",
+                "changeset_id is required when scope is changeset.",
+            )
+        path_filter = {self.resolver.resolve(path).relative_posix for path in paths or []}
+        ids = [changeset_id] if scope == "changeset" and changeset_id else list(self._changeset_order)
+        diffs: list[FileDiff] = []
+        classes = {"added_files": set(), "modified_files": set(), "deleted_files": set()}
+        for item_id in ids:
+            result = self._changeset_results.get(str(item_id))
+            if result is None or not result.ok:
+                continue
+            change_classes = self._changeset_file_classes(str(item_id))
+            for diff in result.diffs:
+                if not path_filter or diff.path in path_filter:
+                    diffs.append(diff)
+                    for key, values in change_classes.items():
+                        if diff.path in values:
+                            classes[key].add(diff.path)
+        changed = sorted({diff.path for diff in diffs})
+        return {
+            "scope": scope,
+            "changeset_id": changeset_id,
+            "changed_files": changed,
+            "added_files": sorted(classes["added_files"]),
+            "modified_files": sorted(classes["modified_files"]),
+            "deleted_files": sorted(classes["deleted_files"]),
+            "diff_excerpt": _diff_excerpt(diffs),
+            "diff_digest": _digest_diffs(diffs),
+            "artifact_refs": self._artifact_refs(ids=[str(item_id) for item_id in ids if item_id], diffs=diffs),
+            "warnings": [],
+        }
+
+    def _changeset_file_classes(self, changeset_id: str) -> dict[str, set[str]]:
+        changeset = self._changesets.get(changeset_id)
+        if changeset is None:
+            return {"added_files": set(), "modified_files": set(), "deleted_files": set()}
+        added: set[str] = set()
+        modified: set[str] = set()
+        deleted: set[str] = set()
+        for path in changeset.affected_files:
+            if changeset.final_texts.get(path) is None:
+                deleted.add(path)
+            elif changeset.base_snapshots.get(path) is None:
+                added.add(path)
+            else:
+                modified.add(path)
+        return {
+            "added_files": added,
+            "modified_files": modified,
+            "deleted_files": deleted,
+        }
+
+    def _remember_changeset_result(self, result: MutationResult) -> None:
+        if result.changeset_id is None:
+            return
+        self._changeset_results[result.changeset_id] = result
+        if result.status == "rolled_back":
+            if result.changeset_id in self._changeset_order:
+                self._changeset_order.remove(result.changeset_id)
+            return
+        if result.ok and result.changeset_id not in self._changeset_order:
+            self._changeset_order.append(result.changeset_id)
+
+    def _artifact_refs(self, *, ids: list[str], diffs: list[FileDiff]) -> list[str]:
+        refs = [f"workspace:{path}" for path in sorted({diff.path for diff in diffs})]
+        refs.extend(f"changeset:{item_id}" for item_id in ids)
+        refs.extend(f"diff:{diff.digest}" for diff in diffs if diff.digest)
+        refs.extend(f"workspace:{diff.artifact_path}" for diff in diffs if diff.artifact_path)
+        return refs
+
     def apply_changeset(
         self,
         changeset: ChangeSet,
@@ -409,6 +624,7 @@ class MutationRuntime:
         transaction_id = uuid4().hex
         journal = MutationJournal(self, transaction_id)
         self._journals[transaction_id] = journal
+        self._changesets[changeset.id] = changeset
         git_before = collect_git_state(self.workspace_root)
         applied: list[JournalEntry] = []
         self._emit_observability(
@@ -429,6 +645,7 @@ class MutationRuntime:
             policy_decision = self._enforce_policy(changeset, transaction_id)
             if policy_decision is not None:
                 result = policy_decision
+                self._remember_changeset_result(result)
                 self._record_failure_trace(result, tool_call_id=tool_call_id, started=started)
                 return result
             for path in changeset.affected_files:
@@ -518,6 +735,7 @@ class MutationRuntime:
                 git_before=git_before,
                 git_after=collect_git_state(self.workspace_root),
             )
+            self._remember_changeset_result(result)
             self._record_failure_trace(result, tool_call_id=tool_call_id, started=started)
             return result
 
@@ -542,6 +760,8 @@ class MutationRuntime:
             git_before=git_before,
             git_after=git_after,
         )
+        self._changeset_transactions[changeset.id] = transaction_id
+        self._remember_changeset_result(result)
         if self.planner is not None:
             self.planner.update_from_mutation(result.observation | {"transaction_id": transaction_id}, tool_call_id=tool_call_id)
         return result
@@ -582,6 +802,67 @@ class MutationRuntime:
                 error_code=_policy_error_code(decision.outcome),
                 error_details={"policy": decision.to_dict(), "request": request.to_dict()},
             ),
+        )
+
+    def _rollback_policy_result(
+        self,
+        *,
+        changeset_id: str,
+        transaction_id: str,
+        reason: str | None,
+        changed_files: list[str],
+    ) -> MutationResult | None:
+        request = PolicyRequest(
+            session_id=getattr(self.planner, "session_id", "mutation_session"),
+            task_id=getattr(self.planner, "task_id", "mutation_task"),
+            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "mutation"),
+            action_id=transaction_id,
+            runtime=RuntimeName.MUTATION,
+            operation=OperationKind.ROLLBACK,
+            capability=Capability.ROLLBACK_MUTATION,
+            subject=PolicySubject(subject_type="runtime", name="MutationRuntime"),
+            resource=ResourceRef(
+                "changeset",
+                changeset_id,
+                workspace_relative=True,
+                metadata={"files": changed_files},
+            ),
+            reason=reason or "Rollback workspace changeset.",
+            proposed_by_model=False,
+            metadata={
+                "changeset_id": changeset_id,
+                "transaction_id": transaction_id,
+                "files_changed": changed_files,
+                "reversible": True,
+            },
+            reversible=True,
+            touches_workspace=True,
+            workspace_root=str(self.workspace_root),
+        )
+        decision = self.policy_runtime.enforce(request)
+        self._record_policy_trace(request, decision)
+        if decision.outcome == DecisionOutcome.ALLOW:
+            return None
+        self._record_policy_observation(request, decision)
+        return MutationResult(
+            ok=False,
+            status="rollback_failed",
+            error_code=_policy_error_code(decision.outcome),
+            message=decision.reason,
+            changeset_id=changeset_id,
+            transaction_id=transaction_id,
+            affected_files=changed_files,
+            observation={
+                "mutation_status": "rollback_failed",
+                "changeset_id": changeset_id,
+                "transaction_id": transaction_id,
+                "changed_files": changed_files,
+                "diff_summary": [],
+                "diff_digest": _digest_diffs([]),
+                "artifact_refs": [f"changeset:{changeset_id}"],
+                "warnings": [decision.reason],
+                "error_code": _policy_error_code(decision.outcome),
+            },
         )
 
     def _policy_request(
@@ -692,6 +973,25 @@ class MutationRuntime:
                     {"path": resolved.relative_posix},
                 )
             return None
+        if isinstance(operation, ApplyUnifiedDiff):
+            try:
+                file_patch = parse_unified_diff(operation.diff)[0]
+            except UnifiedDiffError as exc:
+                raise MutationError(exc.code, str(exc), {"path": exc.path or resolved.relative_posix}) from exc
+            if file_patch.is_delete:
+                raise MutationError(
+                    "unsupported_operation",
+                    "Deleting files through apply_patch is not supported.",
+                    {"path": resolved.relative_posix},
+                )
+            if file_patch.is_new_file:
+                if resolved.path.exists():
+                    raise MutationError(
+                        "file_changed",
+                        "Patch creates a file that already exists.",
+                        {"path": resolved.relative_posix},
+                    )
+                return None
         if not resolved.path.exists():
             raise MutationError(
                 "file_not_found",
@@ -803,10 +1103,17 @@ class MutationRuntime:
             )
             return
         if isinstance(operation, ApplyUnifiedDiff):
-            raise MutationError(
-                "invalid_operation",
-                "ApplyUnifiedDiff interface is reserved; parser implementation is pending.",
-            )
+            path = self.resolver.resolve(operation.path).relative_posix
+            text = final_texts.get(path)
+            try:
+                final_texts[path] = apply_unified_diff_to_text(
+                    text or "",
+                    operation.diff,
+                    path=path,
+                )
+            except UnifiedDiffError as exc:
+                raise MutationError(exc.code, str(exc), {"path": exc.path or path}) from exc
+            return
         if isinstance(operation, CreateFile):
             path = self.resolver.resolve(operation.path).relative_posix
             final_texts[path] = operation.content
@@ -914,20 +1221,53 @@ class MutationRuntime:
 
     def _rollback_entry(self, entry: JournalEntry) -> None:
         path = self.workspace_root / entry.path
-        current_sha = hash_bytes(path.read_bytes()) if path.exists() else None
+        current_raw = path.read_bytes() if path.exists() else None
+        current_sha = hash_bytes(current_raw) if current_raw is not None else None
         if current_sha != entry.after_sha256:
             raise MutationError(
                 "rollback_conflict",
                 f"File changed after transaction: {entry.path}",
                 {"path": entry.path},
             )
+        before_rollback_snapshot = (
+            FileSnapshot.from_path(path, relative_path=entry.path)
+            if path.exists()
+            else None
+        )
         if entry.before_artifact_path is None:
             if path.exists():
                 path.unlink()
-            return
-        before_path = self.workspace_root / entry.before_artifact_path
-        before_raw = before_path.read_bytes()
-        self.atomic_writer.write_bytes(path, before_raw, snapshot=None)
+        else:
+            before_path = self.workspace_root / entry.before_artifact_path
+            before_raw = before_path.read_bytes()
+            self.atomic_writer.write_bytes(path, before_raw, snapshot=None)
+        after_rollback_snapshot = (
+            FileSnapshot.from_path(path, relative_path=entry.path)
+            if path.exists()
+            else None
+        )
+        if self.state_runtime is not None:
+            rollback_id = f"rollback:{entry.operation_id}"
+            if hasattr(self.state_runtime, "record_rollback"):
+                self.state_runtime.record_rollback(
+                    path=entry.path,
+                    before_snapshot=before_rollback_snapshot,
+                    after_snapshot=after_rollback_snapshot,
+                    transaction_id=entry.transaction_id,
+                    mutation_id=rollback_id,
+                    metadata={"changeset_id": entry.changeset_id, "action": "rollback"},
+                )
+            else:
+                self.state_runtime.record_mutation(
+                    path=entry.path,
+                    before_snapshot=before_rollback_snapshot,
+                    after_snapshot=after_rollback_snapshot,
+                    transaction_id=entry.transaction_id,
+                    mutation_id=rollback_id,
+                    tool_call_id=None,
+                    before_bytes=current_raw,
+                    metadata={"changeset_id": entry.changeset_id, "action": "rollback"},
+                )
 
     def _record_rollback_trace(
         self,
@@ -1123,6 +1463,9 @@ class MutationRuntime:
             "changeset_id": changeset.id,
             "changed_files": changeset.affected_files,
             "diff_summary": [diff.summary() for diff in changeset.diffs],
+            "diff_digest": _digest_diffs(changeset.diffs),
+            "artifact_refs": self._artifact_refs(ids=[changeset.id], diffs=changeset.diffs),
+            "warnings": review_reasons,
             "risk_level": changeset.risk_level,
             "risk_note": "; ".join(review_reasons) if review_reasons else "Policy allowed mutation.",
             "next_recommended_action": (
@@ -1312,3 +1655,35 @@ def _policy_error_code(outcome: DecisionOutcome) -> str:
         DecisionOutcome.ESCALATE: "policy_escalation_required",
     }
     return mapping.get(outcome, "policy_denied")
+
+
+def _make_unified_diff(path: str, before: str, after: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
+
+
+def _digest_diffs(diffs: list[FileDiff]) -> str:
+    return hash_bytes("\n".join(diff.digest for diff in diffs).encode("utf-8"))
+
+
+def _diff_excerpt(diffs: list[FileDiff], *, limit: int = 12000) -> str:
+    lines: list[str] = []
+    for diff in diffs:
+        lines.append(f"--- a/{diff.path}")
+        lines.append(f"+++ b/{diff.path}")
+        for hunk in diff.hunks:
+            lines.append(hunk.header)
+            lines.extend(hunk.lines)
+    text = "\n".join(lines)
+    redacted = redact(text)
+    if not isinstance(redacted, str):
+        redacted = str(redacted)
+    if len(redacted) <= limit:
+        return redacted
+    return redacted[:limit] + "\n...[truncated]..."

@@ -30,10 +30,10 @@ def spec(name: str, *, permission: PermissionLevel = PermissionLevel.READ_ONLY) 
         permission_level=permission,
         execution_backend=(
             ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME
-            if name == "edit_apply"
+            if name in {"write_file", "apply_patch", "edit_apply"}
             else ToolExecutionBackendKind.IN_PROCESS
         ),
-        uses_edit_runtime=name == "edit_apply",
+        uses_edit_runtime=name in {"write_file", "apply_patch", "edit_apply"},
         uses_mutation_runtime=permission == PermissionLevel.WRITE,
         uses_command_runtime=permission == PermissionLevel.SHELL,
     )
@@ -88,20 +88,29 @@ def test_phase_policy_allows_read_tools_before_mutation_and_blocks_write(tmp_pat
     assert denied.error_code == "action_not_allowed"
 
 
-def test_applying_phase_defaults_to_edit_apply_not_low_level_workspace_tools(tmp_path: Path) -> None:
+def test_applying_phase_defaults_to_facades_not_low_level_workspace_tools(tmp_path: Path) -> None:
     planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Change code")
     planner.state.status = TaskStatus.APPLYING_CHANGES
     planner.state.current_phase = "applying_changes"
 
-    edit_allowed = planner.authorize_tool_call(
+    write_allowed = planner.authorize_tool_call(
+        tool_name="write_file",
+        tool_call_id="call_write",
+        spec=spec("write_file", permission=PermissionLevel.WRITE),
+        arguments={"path": "x.txt", "content": "x\n", "mode": "create"},
+    )
+    patch_allowed = planner.authorize_tool_call(
+        tool_name="apply_patch",
+        tool_call_id="call_patch",
+        spec=spec("apply_patch", permission=PermissionLevel.WRITE),
+        arguments={"patch": "--- /dev/null\n+++ b/x.txt\n@@ -0,0 +1 @@\n+x\n"},
+    )
+    edit_denied = planner.authorize_tool_call(
         tool_name="edit_apply",
         tool_call_id="call_edit",
         spec=spec("edit_apply", permission=PermissionLevel.WRITE),
-        arguments={
-            "summary": "create",
-            "operations": [{"kind": "create_file", "path": "x.txt", "content": "x\n"}],
-        },
+        arguments={"summary": "create", "operations": []},
     )
     low_level_denied = planner.authorize_tool_call(
         tool_name="workspace_create_file",
@@ -110,8 +119,12 @@ def test_applying_phase_defaults_to_edit_apply_not_low_level_workspace_tools(tmp
         arguments={"path": "x.txt"},
     )
 
-    assert edit_allowed.allowed is True
-    assert edit_allowed.action.kind == ActionKind.APPLY_MUTATION
+    assert write_allowed.allowed is True
+    assert write_allowed.action.kind == ActionKind.APPLY_MUTATION
+    assert patch_allowed.allowed is True
+    assert patch_allowed.action.kind == ActionKind.APPLY_MUTATION
+    assert edit_denied.allowed is False
+    assert edit_denied.error_code == "action_not_allowed"
     assert low_level_denied.allowed is False
     assert low_level_denied.error_code == "action_not_allowed"
 
@@ -249,18 +262,13 @@ def test_risk_escalation_requires_review_for_high_risk_actions(tmp_path: Path) -
     planner.state.current_phase = "applying_changes"
 
     decision = planner.authorize_tool_call(
-        tool_name="edit_apply",
+        tool_name="write_file",
         tool_call_id="call_ci",
-        spec=spec("edit_apply", permission=PermissionLevel.WRITE),
+        spec=spec("write_file", permission=PermissionLevel.WRITE),
         arguments={
-            "summary": "Change CI",
-            "operations": [
-                {
-                    "kind": "create_file",
-                    "path": ".github/workflows/ci.yml",
-                    "content": "name: ci\n",
-                }
-            ],
+            "path": ".github/workflows/ci.yml",
+            "content": "name: ci\n",
+            "mode": "create",
         },
     )
 

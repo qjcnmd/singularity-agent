@@ -378,6 +378,52 @@ class LocalWorkspaceStateRuntime:
             after_snapshot=after,
         )
 
+    def record_rollback(
+        self,
+        *,
+        path: str,
+        before_snapshot: Any | None,
+        after_snapshot: Any | None,
+        transaction_id: str | None,
+        mutation_id: str | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> WorkspaceChange:
+        session_id = self._ensure_session()
+        before = self._coerce_snapshot(before_snapshot, path=path)
+        after = self._coerce_snapshot(after_snapshot, path=path)
+        event = self._append_event(
+            "rollback_completed",
+            path=path,
+            transaction_id=transaction_id,
+            mutation_id=mutation_id,
+            before_snapshot=before,
+            after_snapshot=after,
+            ownership=ChangeOwnership.USER_OWNED,
+            metadata=metadata or {},
+        )
+        if after is None:
+            self.store.remove_file_state(session_id=session_id, path=path)
+        else:
+            self.store.upsert_file_state(
+                session_id=session_id,
+                path=path,
+                snapshot=after,
+                ownership=ChangeOwnership.USER_OWNED,
+                event_id=event.event_id,
+                transaction_id=transaction_id,
+                mutation_id=mutation_id,
+                baseline_snapshot=self._baseline_snapshot(path),
+                before_snapshot=before,
+                updated_at=event.timestamp,
+            )
+        return WorkspaceChange(
+            path=path,
+            change_type=_change_type(before, after),
+            ownership=ChangeOwnership.USER_OWNED,
+            before_snapshot=before,
+            after_snapshot=after,
+        )
+
     def record_command_side_effects(
         self,
         *,

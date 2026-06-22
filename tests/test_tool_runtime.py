@@ -470,7 +470,7 @@ def test_runtime_reports_executed_tool_result_to_planner(tmp_path: Path) -> None
     assert planner.updates[0]["action_id"].startswith("action_")
 
 
-def test_edit_tool_with_runtime_observer_records_one_planner_change(tmp_path: Path) -> None:
+def test_write_file_facade_with_runtime_observer_records_one_planner_change(tmp_path: Path) -> None:
     planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Add file")
     planner.state.status = TaskStatus.APPLYING_CHANGES
@@ -493,16 +493,12 @@ def test_edit_tool_with_runtime_observer_records_one_planner_change(tmp_path: Pa
 
     result = runtime.execute_tool_call(
         make_tool_call(
-            "edit_apply",
+            "write_file",
             {
-                "summary": "add app",
-                "operations": [
-                    {
-                        "kind": "create_file",
-                        "path": "app.py",
-                        "content": "print('ok')\n",
-                    }
-                ],
+                "path": "app.py",
+                "content": "print('ok')\n",
+                "mode": "create",
+                "reason": "add app",
             },
             tool_call_id="call_mutate",
         )
@@ -511,4 +507,4 @@ def test_edit_tool_with_runtime_observer_records_one_planner_change(tmp_path: Pa
     assert result.ok is True
     assert len(planner.evidence.applied_changes) == 1
     assert planner.evidence.applied_changes[0]["transaction_id"]
-    assert len(planner.evidence.edit_results) == 1
+    assert planner.evidence.applied_changes[0]["diff_digest"]

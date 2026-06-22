@@ -34,7 +34,7 @@ class WorkspaceStateStore:
         self.db_path = self.state_root / "workspace_state.sqlite3"
         self.state_root.mkdir(parents=True, exist_ok=True)
         self.sessions_root.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(str(self.db_path))
+        self._connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._lock = RLock()
         self._init_schema()

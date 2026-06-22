@@ -21,6 +21,11 @@ class Finalizer:
             artifact = change.get("artifact_path")
             if artifact:
                 artifacts.add(str(artifact))
+            for ref in change.get("artifact_refs") or []:
+                artifacts.add(str(ref))
+        for diff in evidence.diff_observations:
+            for ref in diff.get("artifact_refs") or []:
+                artifacts.add(str(ref))
         for command in evidence.command_results:
             artifact = command.get("artifact_path")
             if artifact:

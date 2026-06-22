@@ -18,7 +18,7 @@ from singularity.edit.repair import EditRepairController
 from singularity.edit.validation import PatchValidator
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.review.models import ReviewDecisionAction
-from singularity.workspace import MutationRuntime
+from singularity.workspace import MutationError, MutationRuntime
 
 
 class EditRuntime:
@@ -83,6 +83,92 @@ class EditRuntime:
 
     def apply_intent(self, intent: EditIntent, *, tool_call_id: str | None = None) -> EditResult:
         return self._run(intent, apply=True, tool_call_id=tool_call_id, repair=True)
+
+    def write_file(
+        self,
+        *,
+        path: str,
+        content: str,
+        mode: str,
+        encoding: str = "utf-8",
+        reason: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> Any:
+        self._throw_if_cancelled()
+        if encoding.lower().replace("_", "-") != "utf-8":
+            raise MutationError(
+                "unsupported_operation",
+                "write_file only supports utf-8 text in this phase.",
+                {"encoding": encoding},
+            )
+        resolved = self.mutation_runtime.resolver.resolve(path)
+        exists = resolved.path.exists()
+        if mode == "create" and exists:
+            raise MutationError(
+                "invalid_operation",
+                f"Cannot create file that already exists: {resolved.relative_posix}",
+                {"path": resolved.relative_posix},
+            )
+        if mode == "overwrite" and not exists:
+            raise MutationError(
+                "file_not_found",
+                f"Cannot overwrite missing file: {resolved.relative_posix}",
+                {"path": resolved.relative_posix},
+            )
+        result = self.mutation_runtime.apply_file_updates(
+            {resolved.relative_posix: content},
+            intent=reason or f"write_file {mode}",
+            created_by="edit_runtime",
+            tool_call_id=tool_call_id,
+        )
+        self._emit(
+            TraceEventType.EDIT_APPLIED if result.ok else TraceEventType.EDIT_FAILED,
+            "write_file facade delegated through EditRuntime.",
+            {
+                "path": resolved.relative_posix,
+                "mode": mode,
+                "changeset_id": result.changeset_id,
+                "transaction_id": result.transaction_id,
+                "status": result.status,
+                "error_code": result.error_code,
+            },
+            severity=TraceSeverity.INFO if result.ok else TraceSeverity.WARNING,
+        )
+        return result
+
+    def apply_unified_diff(
+        self,
+        *,
+        patch: str,
+        reason: str | None = None,
+        expected_files: list[str] | None = None,
+        allow_new_files: bool = True,
+        tool_call_id: str | None = None,
+    ) -> Any:
+        self._throw_if_cancelled()
+        operations = self.mutation_runtime.operations_from_unified_diff(
+            patch,
+            expected_files=expected_files,
+            allow_new_files=allow_new_files,
+        )
+        result = self.applier.apply(
+            operations,
+            intent=reason or "apply unified diff",
+            tool_call_id=tool_call_id,
+        )
+        self._emit(
+            TraceEventType.EDIT_APPLIED if result.ok else TraceEventType.EDIT_FAILED,
+            "apply_patch facade delegated through EditRuntime.",
+            {
+                "changed_files": result.affected_files,
+                "changeset_id": result.changeset_id,
+                "transaction_id": result.transaction_id,
+                "status": result.status,
+                "error_code": result.error_code,
+            },
+            severity=TraceSeverity.INFO if result.ok else TraceSeverity.WARNING,
+        )
+        return result
 
     def _run(
         self,

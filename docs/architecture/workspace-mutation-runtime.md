@@ -1,6 +1,6 @@
 # Workspace Mutation Runtime
 
-Singularity v0.0.6 routes agent-owned workspace edits through a mutation runtime instead of a raw `write_file` handler. The goal is to make every file change explicit, reviewable, auditable, reversible, and safe against path escape or stale snapshots.
+Singularity routes agent-owned workspace edits through a mutation runtime instead of raw filesystem writes. Phase 1B adds a safe model-facing `write_file` facade, but that facade still delegates through `EditRuntime`, `MutationRuntime`, `WorkspacePathResolver`, and `AtomicWriter`. The goal is to make every file change explicit, reviewable, auditable, reversible, and safe against path escape or stale snapshots.
 
 The runtime is intentionally compact, but it establishes the production boundary:
 
@@ -62,7 +62,7 @@ CreateFile, DeleteFile, MoveFile, UpdateJson, UpdateYaml, UpdateToml,
 FormatFile
 ```
 
-The runtime implements the safe text operations plus `CreateFile`, `DeleteFile`, `MoveFile`, and `UpdateJson`. Parser-backed operations that are not implemented yet return `invalid_operation` instead of writing through an unsafe fallback.
+The runtime implements the safe text operations plus `ApplyUnifiedDiff` for text create/modify patches, `CreateFile`, `DeleteFile`, `MoveFile`, and `UpdateJson`. Parser-backed operations that are not implemented yet return `invalid_operation` instead of writing through an unsafe fallback.
 
 `src/singularity/workspace/diff.py`
 
@@ -90,7 +90,7 @@ workspace_delete_file
 workspace_move_file
 ```
 
-They return compact observations containing mutation status, changed files, diff summary, risk note, and next recommended action.
+They return compact observations containing mutation status, changed files, diff summary, risk note, and next recommended action. The default model-facing write tools are the Phase 1B facades `write_file` and `apply_patch`, registered with the edit tools and delegated into this runtime. `inspect_diff` reads the in-memory changeset ledger for current-run diff evidence without requiring Git.
 
 ## Apply Flow
 

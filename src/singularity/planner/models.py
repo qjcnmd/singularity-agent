@@ -343,6 +343,7 @@ class EvidenceLedger:
     sandbox_observations: list[dict[str, Any]] = field(default_factory=list)
     instruction_prompt_observations: list[dict[str, Any]] = field(default_factory=list)
     project_index_observations: list[dict[str, Any]] = field(default_factory=list)
+    diff_observations: list[dict[str, Any]] = field(default_factory=list)
     edit_plans: list[dict[str, Any]] = field(default_factory=list)
     edit_results: list[dict[str, Any]] = field(default_factory=list)
     review_results: list[dict[str, Any]] = field(default_factory=list)
@@ -371,6 +372,7 @@ class EvidenceLedger:
             "sandbox_observations": self.sandbox_observations,
             "instruction_prompt_observations": self.instruction_prompt_observations,
             "project_index_observations": self.project_index_observations,
+            "diff_observations": self.diff_observations,
             "edit_plans": self.edit_plans,
             "edit_results": self.edit_results,
             "review_results": self.review_results,
@@ -397,6 +399,7 @@ class EvidenceLedger:
             sandbox_observations=list(payload.get("sandbox_observations") or []),
             instruction_prompt_observations=list(payload.get("instruction_prompt_observations") or []),
             project_index_observations=list(payload.get("project_index_observations") or []),
+            diff_observations=list(payload.get("diff_observations") or []),
             edit_plans=list(payload.get("edit_plans") or []),
             edit_results=list(payload.get("edit_results") or []),
             review_results=list(payload.get("review_results") or []),

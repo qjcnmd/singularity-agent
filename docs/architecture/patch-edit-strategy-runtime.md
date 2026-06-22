@@ -1,12 +1,12 @@
 # Singularity Patch / Edit Strategy Runtime
 
-`EditRuntime` sits between `PlannerRuntime` and `MutationRuntime`. Agent-facing write intent should enter through `edit_apply`; the edit layer builds an `EditPlan`, selects a strategy, lowers the plan into existing workspace mutation operations, validates the patch, previews it, applies it through `MutationRuntime`, and records bounded trace/context evidence.
+`EditRuntime` sits between `PlannerRuntime` and `MutationRuntime`. Model-facing write intent should enter through the Phase 1B facades `write_file` and `apply_patch`; the edit layer lowers those requests into existing workspace mutation operations, validates the patch, applies it through `MutationRuntime`, and records bounded trace/context evidence. The older `edit_apply` tool remains registered for compatibility and internal tests, but it is no longer the default model-visible write entrypoint.
 
 It does not implement Git behavior. Branches, commits, PRs, remote collaboration, and direct filesystem writes stay outside this runtime.
 
 ## Boundary
 
-Default path:
+Compatibility edit-runtime path:
 
 ```text
 PlannerRuntime -> edit_plan/edit_preview/edit_apply -> EditRuntime -> MutationRuntime
@@ -14,7 +14,15 @@ PlannerRuntime -> edit_plan/edit_preview/edit_apply -> EditRuntime -> MutationRu
 
 `MutationRuntime` remains the only file-writing runtime. `VerificationRuntime` remains the only verification planner/runner. After a successful edit, `EditRuntime` asks `VerificationRuntime.plan_verification(...)` for a plan only; it does not run verification commands.
 
-Low-level `workspace_*` tools remain registered for compatibility and internal tests, but Planner default phases only allow `edit_apply` as the write entrypoint.
+Default model-facing apply path:
+
+```text
+PlannerRuntime -> write_file/apply_patch -> EditRuntime -> MutationRuntime -> WorkspacePathResolver -> AtomicWriter
+```
+
+Low-level `workspace_*` tools and `edit_apply` remain registered for compatibility and internal tests, but Planner default phases expose the Phase 1B facades instead.
+
+See also: `docs/phase1b_execution_primitives.md`.
 
 ## Strategies
 

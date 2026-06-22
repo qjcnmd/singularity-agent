@@ -303,6 +303,7 @@ def _auto_safe_runtime_allow(request: PolicyRequest, risk: RiskAssessment) -> bo
         OperationKind.SEARCH,
         OperationKind.MUTATE_FILE,
         OperationKind.CREATE_FILE,
+        OperationKind.ROLLBACK,
         OperationKind.EXECUTE_COMMAND,
         OperationKind.EXECUTE_PROJECT_CODE,
         OperationKind.VERIFICATION,
