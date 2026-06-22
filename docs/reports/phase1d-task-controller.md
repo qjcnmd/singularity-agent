@@ -77,7 +77,19 @@ Result:
 638 passed, 4 skipped
 ```
 
-Remote alignment is recorded after publish for this phase.
+Publish verification:
+
+```powershell
+git rev-list --left-right --count origin/main...HEAD
+```
+
+Result:
+
+```text
+0 0
+```
+
+Direct `git push origin main` succeeded for this phase.
 
 ## Risks
 
