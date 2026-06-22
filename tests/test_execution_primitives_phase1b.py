@@ -237,6 +237,57 @@ def test_workspace_escape_is_rejected_and_low_level_tools_stay_hidden(tmp_path: 
     assert "workspace_create_file" not in visible
 
 
+def test_checklist_schema_aliases_and_file_diff_scope(tmp_path: Path) -> None:
+    runtime = _tool_runtime(tmp_path)
+    missing_parent = runtime.execute_tool_call(
+        _tool_call(
+            "write_file",
+            {
+                "path": "pkg/quicksort.py",
+                "content": QUICK_SORT,
+                "overwrite_policy": "create",
+            },
+            call_id="missing_parent",
+        )
+    )
+    created = runtime.execute_tool_call(
+        _tool_call(
+            "write_file",
+            {
+                "path": "pkg/quicksort.py",
+                "content": QUICK_SORT,
+                "create_dirs": True,
+                "overwrite_policy": "create",
+            },
+            call_id="create_dirs",
+        )
+    )
+    before = QUICK_SORT
+    after = QUICK_SORT.replace("print(\"ok\")", "print(\"schema ok\")")
+    patched = runtime.execute_tool_call(
+        _tool_call(
+            "apply_patch",
+            {"unified_diff": _patch_for("pkg/quicksort.py", before, after), "strict": True},
+            call_id="unified_diff",
+        )
+    )
+    inspected = runtime.execute_tool_call(
+        _tool_call(
+            "inspect_diff",
+            {"scope": "file", "path": "pkg/quicksort.py"},
+            call_id="file_diff",
+        )
+    )
+
+    assert missing_parent.ok is False
+    assert missing_parent.error_code == "parent_directory_missing"
+    assert created.ok is True
+    assert patched.ok is True
+    assert (tmp_path / "pkg" / "quicksort.py").read_text(encoding="utf-8") == after
+    assert inspected.ok is True
+    assert inspected.content["changed_files"] == ["pkg/quicksort.py"]
+
+
 def test_facades_record_policy_trace_and_completion_evidence(tmp_path: Path) -> None:
     trace = TraceWriter.create(tmp_path)
     planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1", trace=trace)

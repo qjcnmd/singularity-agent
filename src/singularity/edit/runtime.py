@@ -91,6 +91,7 @@ class EditRuntime:
         content: str,
         mode: str,
         encoding: str = "utf-8",
+        create_dirs: bool = False,
         reason: str | None = None,
         tool_call_id: str | None = None,
     ) -> Any:
@@ -102,6 +103,12 @@ class EditRuntime:
                 {"encoding": encoding},
             )
         resolved = self.mutation_runtime.resolver.resolve(path)
+        if not create_dirs and not resolved.path.parent.exists():
+            raise MutationError(
+                "parent_directory_missing",
+                f"Parent directory does not exist: {resolved.relative_posix}",
+                {"path": resolved.relative_posix},
+            )
         exists = resolved.path.exists()
         if mode == "create" and exists:
             raise MutationError(
@@ -127,6 +134,7 @@ class EditRuntime:
             {
                 "path": resolved.relative_posix,
                 "mode": mode,
+                "create_dirs": create_dirs,
                 "changeset_id": result.changeset_id,
                 "transaction_id": result.transaction_id,
                 "status": result.status,

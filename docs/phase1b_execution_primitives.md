@@ -15,21 +15,26 @@ The facades are model-visible tools. They are not alternate runtimes and they do
 
 - `path: str`
 - `content: str`
-- `mode: "create" | "overwrite" | "upsert"`
+- `create_dirs: bool = False`
+- `overwrite_policy: "create" | "overwrite" | "upsert"`
+- `mode: "create" | "overwrite" | "upsert"` legacy equivalent to `overwrite_policy`
 - `encoding: "utf-8"`
 - `reason: str | None`
 
 `apply_patch`
 
-- `patch: str`
+- `unified_diff: str`
+- `patch: str` legacy equivalent to `unified_diff`
+- `strict: bool = True`
 - `reason: str | None`
 - `expected_files: list[str] | None`
 - `allow_new_files: bool`
 
 `inspect_diff`
 
-- `scope: "current_run" | "workspace" | "changeset"`
+- `scope: "current_run" | "workspace" | "changeset" | "file"`
 - `changeset_id: str | None`
+- `path: str | None`
 - `paths: list[str] | None`
 
 ## Runtime Delegation
@@ -42,7 +47,7 @@ After tool dispatch:
 ToolRuntime -> EditRuntime facade method -> MutationRuntime -> WorkspacePathResolver -> AtomicWriter
 ```
 
-`apply_patch` parses text unified diffs before creating a changeset. It supports text file creation and modification. Delete, rename, and binary patches are rejected as `unsupported_operation`. Context mismatch and stale snapshots fail before any file is written.
+`apply_patch` parses text unified diffs before creating a changeset. It supports strict text file creation and modification. Delete, rename, and binary patches are rejected as `unsupported_operation`. Context mismatch and stale snapshots fail before any file is written.
 
 `inspect_diff` reads the in-process `MutationRuntime` changeset ledger and bounded diff evidence. It does not require Git.
 

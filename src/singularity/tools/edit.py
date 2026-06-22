@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from singularity.edit import EditIntent, EditOperation, EditRuntime, EditScope
 from singularity.policy import Capability, OperationKind, ResourceRef
@@ -74,6 +74,11 @@ class WriteFileInput(BaseModel):
 
     path: str = Field(..., description="Workspace-relative file path.")
     content: str = Field(..., description="Complete UTF-8 file content to write.")
+    create_dirs: bool = Field(False, description="Create missing parent directories before writing.")
+    overwrite_policy: Literal["create", "overwrite", "upsert"] | None = Field(
+        None,
+        description="Checklist-compatible name for write mode.",
+    )
     mode: Literal["create", "overwrite", "upsert"] = Field(
         "upsert",
         description="Create only, overwrite only, or create/overwrite as needed.",
@@ -85,7 +90,13 @@ class WriteFileInput(BaseModel):
 class ApplyPatchInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    patch: str = Field(..., min_length=1, description="Unified diff patch text.")
+    patch: str | None = Field(None, min_length=1, description="Unified diff patch text.")
+    unified_diff: str | None = Field(
+        None,
+        min_length=1,
+        description="Checklist-compatible alias for patch.",
+    )
+    strict: bool = Field(True, description="Apply with strict context matching. Phase 1B supports strict mode.")
     reason: str | None = Field(None, description="Short reason for applying this patch.")
     expected_files: list[str] | None = Field(
         None,
@@ -93,15 +104,22 @@ class ApplyPatchInput(BaseModel):
     )
     allow_new_files: bool = Field(True, description="Whether the patch may create new files.")
 
+    @model_validator(mode="after")
+    def _requires_patch_text(self) -> "ApplyPatchInput":
+        if not self.patch and not self.unified_diff:
+            raise ValueError("patch or unified_diff is required.")
+        return self
+
 
 class InspectDiffInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    scope: Literal["current_run", "workspace", "changeset"] = Field(
+    scope: Literal["current_run", "workspace", "changeset", "file"] = Field(
         "current_run",
         description="Diff scope to inspect without requiring Git.",
     )
     changeset_id: str | None = Field(None, description="Required when scope is changeset.")
+    path: str | None = Field(None, description="Single file filter when scope is file.")
     paths: list[str] | None = Field(None, description="Optional workspace-relative path filter.")
 
 
@@ -139,8 +157,9 @@ class EditToolHandlers:
             result = self.runtime.write_file(
                 path=args.path,
                 content=args.content,
-                mode=args.mode,
+                mode=args.overwrite_policy or args.mode,
                 encoding=args.encoding,
+                create_dirs=args.create_dirs,
                 reason=args.reason,
             )
         except MutationError as exc:
@@ -148,9 +167,15 @@ class EditToolHandlers:
         return _mutation_facade_output(result, self.runtime, tool_name="write_file")
 
     def apply_patch(self, args: ApplyPatchInput) -> dict[str, Any]:
+        if not args.strict:
+            raise ToolExecutionFailure(
+                "apply_patch currently supports strict mode only.",
+                code="unsupported_operation",
+                details={"strict": args.strict},
+            )
         try:
             result = self.runtime.apply_unified_diff(
-                patch=args.patch,
+                patch=args.unified_diff or args.patch or "",
                 reason=args.reason,
                 expected_files=args.expected_files,
                 allow_new_files=args.allow_new_files,
@@ -164,11 +189,23 @@ class EditToolHandlers:
         return output
 
     def inspect_diff(self, args: InspectDiffInput) -> dict[str, Any]:
+        scope = args.scope
+        paths = list(args.paths or [])
+        if args.path:
+            paths.append(args.path)
+        if scope == "file":
+            if not args.path:
+                raise ToolExecutionFailure(
+                    "path is required when inspect_diff scope is file.",
+                    code="invalid_operation",
+                    details={"scope": scope},
+                )
+            scope = "current_run"
         try:
             result = self.runtime.mutation_runtime.inspect_diff(
-                scope=args.scope,
+                scope=scope,
                 changeset_id=args.changeset_id,
-                paths=args.paths,
+                paths=paths or None,
             )
         except MutationError as exc:
             _raise_mutation_failure(exc)
