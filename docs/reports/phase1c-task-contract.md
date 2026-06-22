@@ -82,7 +82,19 @@ Result:
 629 passed, 4 skipped
 ```
 
-Remote alignment is recorded after publish for this phase.
+Publish verification:
+
+```powershell
+git rev-list --left-right --count origin/main...HEAD
+```
+
+Result:
+
+```text
+0 0
+```
+
+Direct `git push origin main` failed with `Recv failure: Connection was reset`; the successful push used command-scoped proxy settings only.
 
 ## Risks
 
