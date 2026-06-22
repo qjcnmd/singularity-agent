@@ -139,6 +139,7 @@ class TaskState:
     task_contract: dict[str, Any] = field(default_factory=dict)
     lifecycle_status: str = "created"
     rolling_plan: dict[str, Any] = field(default_factory=dict)
+    sandbox_capability: dict[str, Any] = field(default_factory=dict)
 
     def touch(self) -> None:
         self.updated_at = _now()
@@ -168,6 +169,7 @@ class TaskState:
             "task_contract": self.task_contract,
             "lifecycle_status": self.lifecycle_status,
             "rolling_plan": self.rolling_plan,
+            "sandbox_capability": self.sandbox_capability,
         }
 
     @classmethod
@@ -198,6 +200,7 @@ class TaskState:
             task_contract=dict(payload.get("task_contract") or {}),
             lifecycle_status=str(payload.get("lifecycle_status") or "created"),
             rolling_plan=dict(payload.get("rolling_plan") or {}),
+            sandbox_capability=dict(payload.get("sandbox_capability") or {}),
         )
 
 

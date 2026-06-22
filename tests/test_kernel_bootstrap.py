@@ -29,6 +29,35 @@ def test_kernel_bootstrap_creates_ready_kernel_and_releases_lock_on_shutdown(
     assert not (tmp_path / ".singularity" / "locks" / "workspace.lock").exists()
 
 
+def test_kernel_bootstrap_records_effective_config_source_trace(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SINGULARITY_API_KEY", "test")
+    monkeypatch.setenv("SINGULARITY_BASE_URL", "http://localhost/v1")
+    monkeypatch.setenv("SINGULARITY_MODEL", "test-model")
+    config_dir = tmp_path / ".singularity"
+    config_dir.mkdir()
+    (config_dir / "config.toml").write_text("max_turns = 5\n", encoding="utf-8")
+    config = ProductionRuntimeConfig.from_cli(project_root=tmp_path)
+
+    kernel = KernelBootstrap(project_root=tmp_path, config=config).boot("Build kernel")
+
+    config_events = [
+        event
+        for event in kernel.graph.trace.store.query_events()
+        if event.runtime == "config" and event.summary == "Effective runtime config resolved."
+    ]
+    assert config_events
+    assert config_events[-1].payload["values"]["max_turns"] == 5
+    assert (
+        config_events[-1].payload["sources"]["max_turns"]
+        == "config:.singularity/config.toml"
+    )
+
+    kernel.shutdown()
+
+
 def test_kernel_bootstrap_failure_releases_lock_and_returns_partial_final_report(
     tmp_path: Path,
     monkeypatch,

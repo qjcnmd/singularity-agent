@@ -28,7 +28,7 @@ CLI
 -> AgentKernel
 -> SingularityAgent
 -> PlannerRuntime
--> ContextRuntime / ContextManager
+-> ContextManager
 -> InstructionRuntime
 -> ModelRuntime
 -> ToolCallingProtocolRuntime
@@ -51,7 +51,7 @@ Keep this list in sync with the matching block in `README.md`.
 - `AgentKernel`
 - `SingularityAgent`
 - `PlannerRuntime`
-- `ContextRuntime`
+- `ContextManager`
 - `InstructionRuntime`
 - `ModelRuntime`
 - `ToolCallingProtocolRuntime`
@@ -76,6 +76,21 @@ Keep this list in sync with the matching block in `README.md`.
 - `DocumentationRuntime`
 <!-- runtime-names:end -->
 
+## Runtime Capability Status
+
+| Capability | Status | Source of truth |
+| --- | --- | --- |
+| CLI and kernel boot graph | implemented | `src/singularity/cli.py`, `src/singularity/kernel/` |
+| Planner task state and evidence ledger | implemented | `src/singularity/planner/` |
+| `ContextManager` runtime class | implemented | `src/singularity/context/manager.py` |
+| `ContextRuntime` source-runtime enum | implemented | `src/singularity/context/models.py` |
+| Tool protocol, tool runtime, policy, approval, mutation, command, verification | implemented | `src/singularity/tool_protocol/`, `src/singularity/tools/`, `src/singularity/policy/`, `src/singularity/workspace/`, `src/singularity/command/`, `src/singularity/verification/` |
+| Sandbox capability state | implemented | `SandboxRuntime.capability_summary()` writes `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` into `TaskState.sandbox_capability` |
+| Sandbox hard isolation | partial | `DockerSandboxBackend` can provide hard network/process/resource isolation when available; `LocalStagingBackend` is soft copy-on-write workspace staging and must not be documented as hard isolation |
+| Final reports | implemented | kernel `FinalReport` in `src/singularity/kernel/finalization.py`; planner `FinalReport` in `src/singularity/planner/models.py` |
+| Desktop RuntimeHost, Rust Core, Tauri UI | planned | architecture docs and ADRs only |
+| Git Runtime, web search, multi-agent execution, remote approval, remote memory sync | planned | explicitly out of scope for the current Python CLI baseline |
+
 ## Ownership Map
 
 | Layer | Owns | Must not own |
@@ -84,7 +99,7 @@ Keep this list in sync with the matching block in `README.md`.
 | KernelBootstrap / AgentKernel | Runtime graph assembly, lifecycle, lock, cancellation, shutdown, recovery, finalization | Tool handler logic, model/tool protocol semantics, UI rendering policy |
 | SingularityAgent | Session orchestration across planner, context, model, protocol, and final answer | Direct tool execution, policy decisions, trace schema, storage layout |
 | PlannerRuntime | Task state, allowed actions, evidence ledger, completion assessment, final report facts | File writes, shell process execution, approval grants, provider calls |
-| ContextRuntime / ContextManager | Structured context items, bundles, references, compression, model projection | Raw secret retention, policy approval, tool execution, workspace mutation |
+| ContextManager | Structured context items, bundles, references, compression, model projection; `ContextRuntime` is only the source-runtime enum used on context items | Raw secret retention, policy approval, tool execution, workspace mutation |
 | InstructionRuntime | Instruction collection, trust hierarchy, prompt compilation, prompt manifest | Provider calls, tool execution, approvals, workspace writes |
 | ModelRuntime | Provider registry, request validation, tool-call normalization, retry, budget, streaming | Tool execution, policy decisions, context storage, raw secret archival |
 | ToolCallingProtocolRuntime | Tool-call validation, scheduling, replay detection, pending approval recovery, result binding | Handler execution, approval UI, direct storage writes outside protocol state |

@@ -99,6 +99,21 @@ def _is_click_usage_error(exc: Exception) -> bool:
     return cls.__name__ in {"UsageError", "NoSuchCommand"} and "click" in cls.__module__
 
 
+def _cli_overrides(names: list[str]) -> set[str] | None:
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return None
+    overrides: set[str] = set()
+    for name in names:
+        try:
+            source = ctx.get_parameter_source(name)
+        except Exception:
+            continue
+        if source == click.core.ParameterSource.COMMANDLINE:
+            overrides.add(name)
+    return overrides
+
+
 @app.command("run")
 @app.command("main", hidden=True)
 def run_goal(
@@ -107,7 +122,7 @@ def run_goal(
         typer.Argument(help="User goal for the production-grade local CLI coding agent runtime."),
     ],
     max_turns: Annotated[
-        int,
+        int | None,
         typer.Option(
             "--max-turns",
             "-t",
@@ -115,7 +130,7 @@ def run_goal(
             max=20,
             help="Maximum number of model turns before stopping.",
         ),
-    ] = 8,
+    ] = None,
     profile: Annotated[
         str | None,
         typer.Option(
@@ -132,39 +147,39 @@ def run_goal(
         ),
     ] = None,
     project_index_enabled: Annotated[
-        bool,
+        bool | None,
         typer.Option(
             "--project-index/--no-project-index",
             help="Enable ProjectIndexRuntime bootstrap and context/planner observations.",
         ),
-    ] = True,
+    ] = None,
     project_index_db: Annotated[
         Path | None,
         typer.Option("--project-index-db", help="Exact ProjectIndexRuntime SQLite path."),
     ] = None,
     project_index_build_on_boot: Annotated[
-        bool,
+        bool | None,
         typer.Option(
             "--project-index-build-on-boot/--no-project-index-build-on-boot",
             help="Build or refresh the project index during kernel boot.",
         ),
-    ] = True,
+    ] = None,
     approval_mode: Annotated[
-        ApprovalMode,
+        ApprovalMode | None,
         typer.Option(
             "--approval-mode",
             case_sensitive=False,
             help="Runtime approval mode: interactive, review_all, auto_safe, read_only, or non_interactive.",
         ),
-    ] = ApprovalMode.AUTO_SAFE,
+    ] = None,
     security_mode: Annotated[
-        SecurityMode,
+        SecurityMode | None,
         typer.Option(
             "--security-mode",
             case_sensitive=False,
             help="Runtime security mode: strict fails closed by default; compat preserves legacy local execution behavior.",
         ),
-    ] = SecurityMode.STRICT,
+    ] = None,
     trace_dir: Annotated[
         Path | None,
         typer.Option(
@@ -194,26 +209,26 @@ def run_goal(
         ),
     ] = None,
     raw_artifacts: Annotated[
-        bool,
+        bool | None,
         typer.Option(
             "--raw-artifacts/--no-raw-artifacts",
             help="Store redacted raw model response artifacts.",
         ),
-    ] = False,
+    ] = None,
     dry_run: Annotated[
-        bool,
+        bool | None,
         typer.Option(
             "--dry-run",
             help="Block mutation, command, verification, and other side-effect tools before execution.",
         ),
-    ] = False,
+    ] = None,
     strict: Annotated[
-        bool,
+        bool | None,
         typer.Option(
             "--strict",
             help="Enable strict tool schema/protocol validation and redaction hardening.",
         ),
-    ] = False,
+    ] = None,
 ) -> None:
     """Run the production-grade local CLI coding agent runtime."""
 
@@ -235,6 +250,25 @@ def run_goal(
         project_index_enabled=project_index_enabled,
         project_index_db=project_index_db,
         project_index_build_on_boot=project_index_build_on_boot,
+        cli_overrides=_cli_overrides(
+            [
+                "max_turns",
+                "profile",
+                "resume_session",
+                "project_index_enabled",
+                "project_index_db",
+                "project_index_build_on_boot",
+                "approval_mode",
+                "security_mode",
+                "trace_dir",
+                "context_db",
+                "model",
+                "base_url",
+                "raw_artifacts",
+                "dry_run",
+                "strict",
+            ]
+        ),
     )
     kernel = None
     renderer = RichCliRenderer(console)

@@ -44,6 +44,21 @@ cleanup_failed
 
 `backend_unavailable` means the current backend cannot enforce the required policy. It is not downgraded to normal local execution.
 
+At task boot, `SandboxRuntime.capability_summary()` writes a snapshot into `TaskState.sandbox_capability`:
+
+```txt
+hard_isolation
+soft_workspace_isolation
+no_isolation
+network_blocked
+write_scope
+approval_mode
+available_backends
+capabilities
+```
+
+On a local-only machine this snapshot must show `soft_workspace_isolation=True` and `hard_isolation=False` unless Docker is available. That evidence is the source for user-facing sandbox claims; local staging must not be described as container-grade isolation.
+
 ## Backend Selection
 
 `SandboxRuntime` builds the default backend list as:

@@ -40,7 +40,7 @@ They execute through the same production chain as every other tool call:
 CLI
 -> SingularityAgent
 -> PlannerRuntime
--> ContextRuntime
+-> ContextManager
 -> ModelRuntime
 -> ToolCallingProtocolRuntime
 -> ToolRuntime
@@ -58,7 +58,7 @@ Runtime names tracked by Documentation Runtime:
 - `AgentKernel`
 - `SingularityAgent`
 - `PlannerRuntime`
-- `ContextRuntime`
+- `ContextManager`
 - `InstructionRuntime`
 - `ModelRuntime`
 - `ToolCallingProtocolRuntime`
@@ -83,7 +83,26 @@ Runtime names tracked by Documentation Runtime:
 - `DocumentationRuntime`
 <!-- runtime-names:end -->
 
-Singularity does not implement a Git Runtime, web search, multi-agent execution, remote approval, or remote memory sync in this release. Sandbox execution prefers Docker as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps the local copy-on-write staging backend. Requests that require hard isolation fail closed when no capable backend is available.
+## Runtime Capability Status
+
+| Capability | Status | Source or boundary |
+| --- | --- | --- |
+| `CLI` | implemented | `src/singularity/cli.py` |
+| `KernelBootstrap` / `AgentKernel` | implemented | `src/singularity/kernel/bootstrap.py`, `src/singularity/kernel/runtime.py` |
+| `PlannerRuntime` | implemented | `src/singularity/planner/runtime.py` |
+| `ContextManager` | implemented | `src/singularity/context/manager.py` |
+| `ContextRuntime` enum | implemented | `src/singularity/context/models.py` |
+| `ModelRuntime` | implemented | `src/singularity/model/runtime.py` |
+| `ToolCallingProtocolRuntime` / `ToolRuntime` | implemented | `src/singularity/tool_protocol/runtime.py`, `src/singularity/tools/runtime.py` |
+| `PolicyRuntime` / `ApprovalGate` | implemented | `src/singularity/policy/runtime.py`, `src/singularity/policy/approval.py` |
+| `MutationRuntime` / `CommandRuntime` / `VerificationRuntime` | implemented | `src/singularity/workspace/runtime.py`, `src/singularity/command/runtime.py`, `src/singularity/verification/runtime.py` |
+| `SandboxRuntime` | partial | `DockerSandboxBackend` provides hard isolation when available; `LocalStagingBackend` provides soft copy-on-write workspace isolation only |
+| `FinalReport` | implemented | kernel: `src/singularity/kernel/finalization.py`; planner: `src/singularity/planner/models.py` |
+| `EvaluationRuntime` | implemented | `src/singularity/evaluation/runtime.py` |
+| Desktop RuntimeHost / Rust Core / Tauri UI | planned | documented in `docs/architecture/runtime-host-transition.md` and ADRs, not implemented in this Python CLI baseline |
+| Git Runtime / web search / multi-agent execution / remote approval / remote memory sync | planned | intentionally not implemented in this release |
+
+Singularity does not implement a Git Runtime, web search, multi-agent execution, remote approval, or remote memory sync in this release. Sandbox execution prefers `DockerSandboxBackend` as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps `LocalStagingBackend` for local copy-on-write staging. A request that requires hard isolation fails closed, and the runtime records `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` capability evidence in task state so sandbox downgrade never silently becomes a production isolation claim.
 
 ## Install
 
@@ -96,8 +115,10 @@ Configure the OpenAI-compatible provider through environment variables. The API 
 Runtime configuration precedence is:
 
 ```text
-explicit CLI flag > SINGULARITY_* > config file > defaults
+explicit CLI flag > SINGULARITY_* > .singularity/config.toml > defaults
 ```
+
+The optional `.singularity/config.toml` file may define non-secret runtime settings such as `max_turns`, `approval_mode`, `security_mode`, `model`, `base_url`, `raw_artifacts`, and `[project_index]` options. The API key remains environment-only. Boot trace records an effective config event with a redacted value summary and config source map; final reports include the same effective config summary.
 
 PowerShell:
 

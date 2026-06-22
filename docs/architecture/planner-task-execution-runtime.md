@@ -52,8 +52,10 @@ task_id, session_id, user_goal, normalized_goal, constraints,
 assumptions, current_phase, status, risk_level, created_at,
 updated_at, completion_criteria, open_questions, blocked_reasons,
 linked_transactions, linked_commands, linked_verifications,
-final_assessment
+final_assessment, sandbox_capability
 ```
+
+`sandbox_capability` is written during runtime graph wiring from `SandboxRuntime.capability_summary()`. It records `hard_isolation`, `soft_workspace_isolation`, `no_isolation`, `network_blocked`, `write_scope`, `approval_mode`, available backends, and backend capability flags so a local staging fallback is visible in task state.
 
 The status set includes:
 
@@ -164,7 +166,7 @@ final_report_ready
 
 If the criteria are not met, `PlannerRuntime` returns `blocked`, `needs_review`, or another non-completed status. The model's prose cannot override missing evidence.
 
-`FinalReport` is built from runtime facts after final review:
+Planner `FinalReport` is built from runtime facts after final review:
 
 ```txt
 user_goal, status, files_changed, agent_changes,
@@ -173,6 +175,8 @@ risks, rollback_status, policy_approval_summary, artifacts, next_steps
 ```
 
 `policy_approval_summary` counts allowed low-risk actions, reviewed actions, denied actions, sandbox-required actions, user-approved actions, high-risk commands, and actions skipped due to policy.
+
+This planner report is distinct from the kernel-level `FinalReport` in `src/singularity/kernel/finalization.py`. The kernel report owns run/session/task ids, kernel status, shutdown reason, cleanup status, recovery summary, runtime health summary, lifecycle summary, effective config summary, workspace summary, and trace summary. `AgentKernel.final_report()` may include the planner report as a source summary, but the two data structures are intentionally separate.
 
 For read-only goals, completion criteria do not require mutation or verification evidence. For coding goals, finalization requires applied change evidence, a ready or ready-with-warnings verification assessment, and a final review route of `approve`.
 

@@ -512,6 +512,17 @@ class PlannerRuntime:
             return "[sandbox] command blocked: backend cannot enforce required isolation."
         return f"[sandbox] {prefix} in isolated copy-on-write workspace via {backend}, exit_code={exit_code}."
 
+    def record_sandbox_capability(self, snapshot: dict[str, Any]) -> None:
+        self._throw_if_cancelled()
+        state = self._state()
+        state.sandbox_capability = dict(snapshot)
+        self._persist()
+        self._record_event(
+            decision="sandbox_capability",
+            reason="Sandbox capability snapshot recorded in task state.",
+            extra={"sandbox_capability": state.sandbox_capability},
+        )
+
     def record_policy_observation(self, observation: dict[str, Any]) -> None:
         self._throw_if_cancelled()
         state = self._state()

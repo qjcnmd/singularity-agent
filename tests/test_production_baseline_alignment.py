@@ -114,6 +114,68 @@ def test_production_runtime_config_maps_cli_policy_and_model_overrides(tmp_path:
     assert model_config.store_raw_responses is False
 
 
+def test_production_runtime_config_merges_cli_env_config_and_defaults(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_dir = tmp_path / ".singularity"
+    config_dir.mkdir()
+    (config_dir / "config.toml").write_text(
+        """
+max_turns = 4
+approval_mode = "review_all"
+security_mode = "compat"
+model = "config-model"
+base_url = "https://config.example/v1"
+raw_artifacts = true
+
+[project_index]
+enabled = false
+build_on_boot = false
+max_files = 123
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SINGULARITY_MAX_TURNS", "6")
+    monkeypatch.setenv("SINGULARITY_MODEL", "env-model")
+    monkeypatch.setenv("SINGULARITY_PROJECT_INDEX_ENABLED", "true")
+
+    config = ProductionRuntimeConfig.from_cli(
+        project_root=tmp_path,
+        approval_mode="read_only",
+        cli_overrides={"approval_mode"},
+    )
+    effective = config.effective_config()
+
+    assert config.max_turns == 6
+    assert config.approval_mode == ApprovalMode.READ_ONLY
+    assert config.security_mode == SecurityMode.COMPAT
+    assert config.model == "env-model"
+    assert config.base_url == "https://config.example/v1"
+    assert config.raw_artifacts is True
+    assert config.project_index_enabled is True
+    assert config.project_index_build_on_boot is False
+    assert config.project_index_max_files == 123
+    assert effective["sources"]["max_turns"] == "env:SINGULARITY_MAX_TURNS"
+    assert effective["sources"]["approval_mode"] == "cli"
+    assert effective["sources"]["security_mode"] == "config:.singularity/config.toml"
+    assert effective["sources"]["base_url"] == "config:.singularity/config.toml"
+    assert effective["sources"]["dry_run"] == "default"
+    assert "api_key" not in json.dumps(effective).lower()
+
+
+def test_production_runtime_config_reports_custom_config_file_source(tmp_path: Path) -> None:
+    config_file = tmp_path / "runtime.toml"
+    config_file.write_text("max_turns = 9\n", encoding="utf-8")
+
+    config = ProductionRuntimeConfig.from_cli(project_root=tmp_path, config_file=config_file)
+    effective = config.effective_config()
+
+    assert config.max_turns == 9
+    assert effective["config_file"] == "runtime.toml"
+    assert effective["sources"]["max_turns"] == "config:runtime.toml"
+
+
 def test_tool_policy_is_not_runtime_permission_decider(tmp_path: Path) -> None:
     calls: list[str] = []
     registry = ToolRegistry(tmp_path, include_default_tools=False)
@@ -433,7 +495,7 @@ def test_readme_documents_v010_production_architecture() -> None:
     assert "# Singularity v0.1.0" in readme
     assert "Project identity:" in readme
     assert "production-grade local coding agent runtime" in readme
-    assert "CLI\n-> SingularityAgent\n-> PlannerRuntime\n-> ContextRuntime\n-> ModelRuntime" in readme
+    assert "CLI\n-> SingularityAgent\n-> PlannerRuntime\n-> ContextManager\n-> ModelRuntime" in readme
     assert "ToolCallingProtocolRuntime\n-> ToolRuntime\n-> PolicyRuntime / ApprovalGate" in readme
     assert "list_files" in readme
     assert "read_file" in readme

@@ -12,7 +12,7 @@ CLI -> KernelBootstrap -> AgentKernel -> SingularityAgent -> PlannerRuntime
 
 `src/singularity/cli.py` still parses user flags into `ProductionRuntimeConfig`, but runtime construction is delegated to `KernelBootstrap`. The CLI then calls `AgentKernel.run_task()` and prints both the model final answer and the kernel `FinalReport`.
 
-Supported CLI inputs still flow through the config object:
+Supported CLI inputs still flow through the config object and override lower-priority sources:
 
 - `--max-turns`
 - `--profile`
@@ -25,6 +25,14 @@ Supported CLI inputs still flow through the config object:
 - `--raw-artifacts`
 - `--dry-run`
 - `--strict`
+
+The full runtime config precedence is:
+
+```txt
+explicit CLI flag > SINGULARITY_* > .singularity/config.toml > defaults
+```
+
+`ProductionRuntimeConfig.effective_config()` returns the redacted effective values and source map. `KernelBootstrap.boot()` records that payload in trace with runtime `config`, and kernel final reports include the same source-aware summary. `SINGULARITY_API_KEY` remains environment-only and is not written to the effective config payload.
 
 ## RuntimeGraph
 

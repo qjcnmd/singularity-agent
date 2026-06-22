@@ -82,8 +82,41 @@ def test_readme_runtime_names_match_runtime_map() -> None:
     runtime_map_names = _runtime_names(ROOT / "docs" / "architecture" / "runtime-map.md")
 
     assert readme_names == runtime_map_names
+    assert "ContextManager" in readme_names
+    assert "ContextRuntime" not in readme_names
     assert "DocumentationRuntime" in readme_names
     assert "GitRuntime" not in readme_names
+
+
+def test_readme_runtime_status_table_has_source_or_planned_mapping() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "## Runtime Capability Status" in text
+    assert "| Capability | Status | Source or boundary |" in text
+    for status in ("implemented", "partial", "planned"):
+        assert f"| {status} |" in text or f" {status} " in text
+    assert "`ContextManager` | implemented | `src/singularity/context/manager.py`" in text
+    assert "`ContextRuntime` enum | implemented | `src/singularity/context/models.py`" in text
+    assert "`FinalReport` | implemented | kernel: `src/singularity/kernel/finalization.py`" in text
+
+
+def test_config_and_sandbox_docs_match_implemented_evidence() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    runtime_map = (ROOT / "docs" / "architecture" / "runtime-map.md").read_text(encoding="utf-8")
+    sandbox = (ROOT / "docs" / "architecture" / "sandbox-isolation-runtime.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert ".singularity/config.toml" in readme
+    assert "effective config" in readme
+    assert "config source" in readme
+    assert "explicit CLI flag > SINGULARITY_* > .singularity/config.toml > defaults" in readme
+    assert "DockerSandboxBackend" in sandbox
+    assert "LocalStagingBackend" in sandbox
+    assert "hard_isolation" in runtime_map
+    assert "soft_workspace_isolation" in runtime_map
+    assert "no_isolation" in runtime_map
+    assert "fails closed" in readme
 
 
 def _runtime_names(path: Path) -> list[str]:

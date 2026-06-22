@@ -8,6 +8,7 @@ from singularity.kernel.graph import RuntimeFactory, RuntimeGraph
 from singularity.kernel.health import RuntimeHealthChecker
 from singularity.kernel.models import RuntimeComponentName, RuntimeComponentState, RunIdentity
 from singularity.observability import TraceRuntime
+from singularity.planner.models import TaskState
 
 
 def test_runtime_graph_initializes_components_in_declared_order(tmp_path: Path, monkeypatch) -> None:
@@ -119,6 +120,34 @@ def test_runtime_graph_wires_planner_and_cross_runtime_dependencies(
     assert graph.planner.project_index_runtime is graph.project_index_runtime
     assert graph.planner.memory_runtime is graph.memory_runtime
     assert graph.planner.evidence.project_index_observations
+
+
+def test_runtime_graph_records_sandbox_capability_in_task_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    graph = _build_graph(tmp_path, monkeypatch, user_goal="Need sandbox evidence")
+
+    snapshot = graph.planner.state.sandbox_capability
+    assert set(snapshot) >= {
+        "hard_isolation",
+        "soft_workspace_isolation",
+        "no_isolation",
+        "network_blocked",
+        "write_scope",
+        "approval_mode",
+        "available_backends",
+    }
+    assert snapshot["approval_mode"] == "non_interactive"
+    assert snapshot["soft_workspace_isolation"] is True
+    assert snapshot["no_isolation"] is False
+    assert snapshot["write_scope"] == "copy_on_write_workspace"
+    assert isinstance(snapshot["hard_isolation"], bool)
+    assert isinstance(snapshot["network_blocked"], bool)
+
+    restored = TaskState.from_dict(graph.planner.state.to_dict())
+
+    assert restored.sandbox_capability == snapshot
 
 
 def test_runtime_graph_owns_cancellation_token_targets(tmp_path: Path, monkeypatch) -> None:

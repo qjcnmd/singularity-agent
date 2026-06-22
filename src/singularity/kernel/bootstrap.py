@@ -97,6 +97,13 @@ class KernelBootstrap:
             status=KernelStatus.BOOTING,
         )
         trace.record("kernel.boot.started", {"run_id": identity.run_id, "session_id": identity.session_id})
+        trace.emit(
+            "context.observation_added",
+            runtime="config",
+            summary="Effective runtime config resolved.",
+            payload=config.effective_config(),
+            ids={"run_id": identity.run_id, "session_id": identity.session_id},
+        )
         try:
             self.workspace_lock.acquire_lock(
                 run_id=identity.run_id,
@@ -153,18 +160,7 @@ class KernelBootstrap:
                     [{"step": "release_lock", "status": "completed"}],
                 ),
                 lifecycle_summary=lifecycle.summary(),
-                config_summary={
-                    "max_turns": config.max_turns,
-                    "profile": config.profile,
-                    "approval_mode": config.approval_mode.value,
-                    "security_mode": config.security_mode.value,
-                    "interaction_mode": config.interaction_mode.value,
-                    "strict": config.strict,
-                    "dry_run": config.dry_run,
-                    "raw_artifacts": config.raw_artifacts,
-                    "project_index_enabled": config.project_index_enabled,
-                    "project_index_db": str(config.project_index_db_path()),
-                },
+                config_summary=config.final_report_config_summary(),
             )
             trace.record("finalization.completed", final_report.to_dict())
             if hasattr(trace, "store"):

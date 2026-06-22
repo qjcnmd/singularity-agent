@@ -52,6 +52,23 @@ def test_runtime_selects_local_backend_and_writes_trace(tmp_path: Path) -> None:
     assert events[-1]["sandbox_handle"].endswith("sandbox_runtime")
 
 
+def test_runtime_capability_summary_names_hard_soft_and_no_isolation(
+    tmp_path: Path,
+) -> None:
+    runtime = SandboxRuntime(tmp_path, backends=[LocalStagingBackend()])
+
+    summary = runtime.capability_summary(approval_mode="non_interactive")
+
+    assert summary["hard_isolation"] is False
+    assert summary["soft_workspace_isolation"] is True
+    assert summary["no_isolation"] is False
+    assert summary["network_blocked"] is False
+    assert summary["write_scope"] == "copy_on_write_workspace"
+    assert summary["approval_mode"] == "non_interactive"
+    assert summary["available_backends"] == ["local_staging"]
+    assert summary["capabilities"]["local_staging"]["network_isolation"] is False
+
+
 def test_runtime_defaults_to_docker_when_available(
     tmp_path: Path,
     monkeypatch,

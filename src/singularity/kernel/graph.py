@@ -340,7 +340,9 @@ class RuntimeFactory:
             )
             self._wire_planner(
                 planner=planner,
+                config=config,
                 infra=infra,
+                policy_sandbox=policy_sandbox,
                 execution_core=execution_core,
                 tool_protocol=tool_protocol,
                 verification_review=verification_review,
@@ -698,13 +700,21 @@ class RuntimeFactory:
     def _wire_planner(
         *,
         planner: PlannerRuntime,
+        config: ProductionRuntimeConfig,
         infra: _InfraRuntimes,
+        policy_sandbox: _PolicySandboxRuntimes,
         execution_core: _ExecutionCoreRuntimes,
         tool_protocol: _ToolProtocolRuntimes,
         verification_review: _VerificationReviewRuntimes,
     ) -> None:
         planner.project_index_runtime = infra.project_index_runtime
         planner.memory_runtime = infra.memory_runtime
+        if planner.state is not None:
+            planner.record_sandbox_capability(
+                policy_sandbox.sandbox_runtime.capability_summary(
+                    approval_mode=config.approval_mode.value,
+                )
+            )
         execution_core.command_runtime.planner = planner
         execution_core.mutation_runtime.planner = planner
         verification_review.verification_runtime.planner = planner

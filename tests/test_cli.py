@@ -84,6 +84,12 @@ def test_create_or_resume_planner_starts_new_task_without_resume(tmp_path: Path)
 
 def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[str, object]] = []
+    config_dir = tmp_path / ".singularity"
+    config_dir.mkdir()
+    (config_dir / "config.toml").write_text(
+        "max_turns = 4\napproval_mode = \"review_all\"\n",
+        encoding="utf-8",
+    )
 
     class FakeWorkspaceState:
         baseline = None
@@ -156,6 +162,15 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert ("boot", {"goal": "hello"}) in calls
     assert ("run_task", {"goal": "hello"}) in calls
+    bootstrap_config = next(
+        payload["config"]
+        for event, payload in calls
+        if event == "bootstrap_init" and isinstance(payload, dict)
+    )
+    assert bootstrap_config.max_turns == 4
+    assert bootstrap_config.dry_run is True
+    assert bootstrap_config.config_sources["max_turns"] == "config:.singularity/config.toml"
+    assert bootstrap_config.config_sources["dry_run"] == "cli"
     assert "final report" in result.output
 
 

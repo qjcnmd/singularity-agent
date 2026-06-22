@@ -166,6 +166,38 @@ class SandboxRuntime:
         if callable(request_checker):
             request_checker(request)
 
+    def capability_summary(self, *, approval_mode: str | None = None) -> dict[str, Any]:
+        backends: dict[str, dict[str, Any]] = {}
+        for backend in self.backends:
+            if not self._backend_available(backend):
+                continue
+            name = backend.name()
+            backends[name] = backend.capabilities().to_dict()
+        hard_isolation = any(
+            capabilities.get("network_isolation") is True
+            for capabilities in backends.values()
+        )
+        soft_workspace_isolation = any(
+            capabilities.get("copy_on_write") is True
+            or capabilities.get("filesystem_isolation") is True
+            for capabilities in backends.values()
+        )
+        default_profile = default_sandbox_profile(
+            SandboxProfileName.ISOLATED_VERIFICATION,
+            workspace_root=self.workspace_root,
+        )
+        return {
+            "hard_isolation": hard_isolation,
+            "soft_workspace_isolation": soft_workspace_isolation,
+            "no_isolation": not hard_isolation and not soft_workspace_isolation,
+            "network_blocked": hard_isolation,
+            "write_scope": default_profile.filesystem.mode.value,
+            "approval_mode": approval_mode,
+            "security_mode": self.security_mode.value,
+            "available_backends": sorted(backends),
+            "capabilities": backends,
+        }
+
     @staticmethod
     def _apply_policy_constraints(request: SandboxRequest) -> None:
         constraints = request.policy_constraints
@@ -177,12 +209,8 @@ class SandboxRuntime:
     def _select_backend(self, request: SandboxRequest) -> SandboxBackend | None:
         first_capability_error: SandboxCapabilityError | None = None
         for backend in self.backends:
-            if hasattr(backend, "is_available"):
-                try:
-                    if not backend.is_available():
-                        continue
-                except Exception:
-                    continue
+            if not self._backend_available(backend):
+                continue
             try:
                 self.ensure_capabilities(request, backend)
             except SandboxCapabilityError as exc:
@@ -192,6 +220,15 @@ class SandboxRuntime:
         if first_capability_error is not None:
             raise first_capability_error
         return None
+
+    @staticmethod
+    def _backend_available(backend: SandboxBackend) -> bool:
+        if not hasattr(backend, "is_available"):
+            return True
+        try:
+            return bool(backend.is_available())
+        except Exception:
+            return False
 
     def shutdown(self) -> None:
         return None
