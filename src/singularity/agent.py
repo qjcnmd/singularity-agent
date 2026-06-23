@@ -11,7 +11,7 @@ from singularity.context import ContextManager
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.instructions import InstructionRuntime
 from singularity.interaction import InteractionRuntime, ProgressEvent
-from singularity.model import ModelPurpose, ModelRuntime, ModelTurnStatus
+from singularity.model import ModelErrorKind, ModelPurpose, ModelRuntime, ModelTurnStatus
 from singularity.planner import PlannerRuntime, TaskStatus
 from singularity.provider import OpenAICompatibleProvider
 from singularity.policy import PolicyRuntime
@@ -513,12 +513,25 @@ class SingularityAgent:
             error_code = "unknown_tool"
         elif "schema" in lowered:
             error_code = "schema_mismatch"
+        error_kind = getattr(result.error, "kind", None) if result.error else None
+        blocked_external_dependency = (
+            not retryable
+            and error_kind in {ModelErrorKind.NETWORK_ERROR, ModelErrorKind.AUTH_ERROR}
+        )
         return ExecutionOutcome(
-            status=ExecutionOutcomeStatus.RETRYABLE if retryable else ExecutionOutcomeStatus.FATAL,
+            status=(
+                ExecutionOutcomeStatus.RETRYABLE
+                if retryable
+                else (
+                    ExecutionOutcomeStatus.BLOCKED
+                    if blocked_external_dependency
+                    else ExecutionOutcomeStatus.FATAL
+                )
+            ),
             source="model",
             reason=f"Model turn did not produce a valid response: {message}",
             error_code=error_code,
-            next_action="retry" if retryable else "abort",
+            next_action="retry" if retryable else ("blocked" if blocked_external_dependency else "abort"),
             observation_summary=message,
             retry_allowed=retryable,
             metadata={"model_status": result.status.value},

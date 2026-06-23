@@ -290,10 +290,11 @@ class OpenAICompatibleModelProvider:
                 metadata={"http_status": status},
             ) from exc
         except httpx.RequestError as exc:
+            retryable = not _request_error_is_permission_denied(exc)
             raise ModelError(
                 kind=ModelErrorKind.NETWORK_ERROR,
                 message=str(exc),
-                retryable=True,
+                retryable=retryable,
                 provider_name=self.provider_name,
                 model_name=str(payload["model"]),
             ) from exc
@@ -448,3 +449,17 @@ def _error_kind_for_status(status: int) -> ModelErrorKind:
     if status in {500, 502, 503, 504}:
         return ModelErrorKind.PROVIDER_OVERLOADED
     return ModelErrorKind.UNKNOWN_PROVIDER_ERROR
+
+
+def _request_error_is_permission_denied(exc: httpx.RequestError) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "winerror 10013",
+            "permission denied",
+            "operation not permitted",
+            "access is denied",
+            "访问权限不允许",
+        )
+    )

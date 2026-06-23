@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 from singularity.agent import SingularityAgentRunStatus
+from singularity.model import ModelError, ModelErrorKind
 from singularity.planner import PlannerRuntime
 from singularity.tools import ToolRegistry
 from singularity.tools.mutation import register_mutation_tools
@@ -21,6 +22,21 @@ class MockProvider:
     ) -> dict[str, Any]:
         self.calls.append({"messages": messages, "tools": tools})
         return self.responses.pop(0)
+
+
+class NonRetryableNetworkProvider:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def chat(
+        self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        self.calls.append({"messages": messages, "tools": tools})
+        raise ModelError(
+            kind=ModelErrorKind.NETWORK_ERROR,
+            message="[WinError 10013] socket access denied",
+            retryable=False,
+        )
 
 
 def test_agent_returns_final_answer_without_tool_calls(tmp_path: Path) -> None:
@@ -47,6 +63,18 @@ def test_agent_returns_final_answer_without_tool_calls(tmp_path: Path) -> None:
         "role": "user",
         "content": "say something",
     }
+
+
+def test_agent_stops_on_non_retryable_model_network_error(tmp_path: Path) -> None:
+    provider = NonRetryableNetworkProvider()
+    agent = make_agent_session(tmp_path, provider=provider, max_turns=5)
+
+    answer = agent.run("inspect the project")
+
+    assert answer.status == SingularityAgentRunStatus.BLOCKED
+    assert answer.error_code == "model_runtime_failed"
+    assert answer.turn == 1
+    assert len(provider.calls) == 1
 
 
 def test_agent_runs_complete_tool_call_loop(tmp_path: Path) -> None:

@@ -6,6 +6,8 @@ from singularity.model import (
     MockModelProvider,
     ModelCapabilities,
     ModelCapabilityError,
+    ModelError,
+    ModelErrorKind,
     ModelPreferences,
     ModelMessage,
     ModelRole,
@@ -171,6 +173,16 @@ class _FakeErrorClient(_FakeClient):
         return _FakeErrorResponse()
 
 
+class _FakePermissionDeniedClient(_FakeClient):
+    def post(self, url: str, *, headers: dict[str, str], json: dict) -> _FakeResponse:
+        self.payloads.append(json)
+        request = httpx.Request("POST", url)
+        raise httpx.ConnectError(
+            "[WinError 10013] 以一种访问权限不允许的方式做了一个访问套接字的尝试。",
+            request=request,
+        )
+
+
 def test_openai_compatible_model_provider_serializes_runtime_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -290,3 +302,29 @@ def test_openai_provider_error_does_not_include_response_body(
 
     assert "sk-leaked" not in str(exc_info.value)
     assert "OPENAI_API_KEY" not in str(exc_info.value)
+
+
+def test_openai_provider_permission_denied_network_error_is_not_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("singularity.model.providers.httpx.Client", _FakePermissionDeniedClient)
+    provider = OpenAICompatibleModelProvider(
+        Settings(base_url="https://example.test/v1", api_key="test-key", model="test-model")
+    )
+
+    with pytest.raises(ModelError) as exc_info:
+        provider.complete(
+            ProviderRequest(
+                request_id="req_1",
+                purpose="plan_next_action",
+                messages=[
+                    ModelMessage(
+                        role=ModelRole.USER,
+                        content=[ContentBlock.from_text("hi")],
+                    )
+                ],
+            )
+        )
+
+    assert exc_info.value.kind == ModelErrorKind.NETWORK_ERROR
+    assert exc_info.value.retryable is False
