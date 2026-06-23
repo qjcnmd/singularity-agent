@@ -437,22 +437,24 @@ def load_live_eval_manifest(path: Path | str) -> LiveEvalManifest:
 
 def summarize_live_results(results: list[LiveEvalTaskResult]) -> dict[str, Any]:
     task_count = len(results)
-    infrastructure_blocked_count = sum(1 for result in results if result.infrastructure_blocked)
+    scored_results = [result for result in results if not result.infrastructure_blocked]
+    scored_task_count = len(scored_results)
+    infrastructure_blocked_count = task_count - scored_task_count
     success_count = sum(1 for result in results if result.success)
     tests_passed_count = sum(1 for result in results if result.tests_passed)
     prompt_tokens = sum(result.prompt_tokens for result in results)
     cached_tokens = sum(result.cached_tokens for result in results)
     return {
         "task_count": task_count,
-        "scored_task_count": task_count - infrastructure_blocked_count,
+        "scored_task_count": scored_task_count,
         "infrastructure_blocked_count": infrastructure_blocked_count,
         "success_count": success_count,
-        "task_completion_rate": _rate(success_count, task_count),
+        "task_completion_rate": _rate(success_count, scored_task_count),
         "tests_passed_count": tests_passed_count,
-        "test_pass_rate": _rate(tests_passed_count, task_count),
+        "test_pass_rate": _rate(tests_passed_count, scored_task_count),
         "prompt_tokens": prompt_tokens,
         "cached_tokens": cached_tokens,
-        "request_cache_hit_rate": _average_rate({result.task_id: result.request_cache_hit_rate for result in results}),
+        "request_cache_hit_rate": _average_rate({result.task_id: result.request_cache_hit_rate for result in scored_results}),
         "run_cache_hit_rate": _rate(cached_tokens, prompt_tokens),
         "tool_calls": sum(result.tool_calls for result in results),
     }

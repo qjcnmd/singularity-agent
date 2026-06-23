@@ -63,13 +63,29 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         workspace=str(tmp_path),
         trace=str(tmp_path / "trace2"),
     )
+    blocked = LiveEvalTaskResult(
+        task_id="blocked",
+        success=False,
+        tests_passed=False,
+        infrastructure_blocked=True,
+        prompt_tokens=0,
+        cached_tokens=0,
+        request_cache_hit_rate=0.0,
+        run_cache_hit_rate=0.0,
+        tool_calls=0,
+        files_changed=[],
+        duration_seconds=0.5,
+        error_summary="infrastructure blocked",
+        workspace=str(tmp_path),
+        trace=str(tmp_path / "trace3"),
+    )
 
-    summary = summarize_live_results([first, second])
+    summary = summarize_live_results([first, second, blocked])
 
     assert summary == {
-        "task_count": 2,
+        "task_count": 3,
         "scored_task_count": 2,
-        "infrastructure_blocked_count": 0,
+        "infrastructure_blocked_count": 1,
         "success_count": 1,
         "task_completion_rate": 0.5,
         "tests_passed_count": 2,
@@ -243,6 +259,8 @@ def test_live_eval_marks_model_transport_blocker_without_running_verification(tm
 
     assert result["summary"]["infrastructure_blocked_count"] == 1
     assert result["summary"]["scored_task_count"] == 0
+    assert result["summary"]["task_completion_rate"] == 0.0
+    assert result["summary"]["test_pass_rate"] == 0.0
     task = result["tasks"][0]
     assert task["infrastructure_blocked"] is True
     assert task["verification"] is None
