@@ -13,6 +13,7 @@ from singularity.model.errors import (
     ModelCapabilityError,
     ModelContextTooLong,
 )
+from singularity.model.input_renderer import ModelInputRenderer
 from singularity.model.messages import MessageConverter
 from singularity.model.models import (
     ContentBlock,
@@ -23,7 +24,6 @@ from singularity.model.models import (
     ModelPreferences,
     ModelPurpose,
     ModelToolCall,
-    ModelToolSchema,
     ModelTurnRequest,
     ModelTurnResult,
     ModelTurnStatus,
@@ -56,6 +56,7 @@ SECRET_PATTERNS = (
     re.compile(r"\b[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=", re.IGNORECASE),
     re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}\b"),
 )
+ENV_ASSIGNMENT_PATTERN = re.compile(r"(?im)^\s*(?:export\s+)?[A-Z_][A-Z0-9_]{1,}\s*=")
 
 
 class ModelRuntime:
@@ -73,6 +74,10 @@ class ModelRuntime:
         self.trace = trace
         self.converter = MessageConverter()
         self.tool_renderer = ModelToolRenderer(tool_registry)
+        self.input_renderer = ModelInputRenderer(
+            registry=registry,
+            tool_renderer=self.tool_renderer,
+        )
         self.tool_normalizer = ToolCallNormalizer(tool_registry)
         self.validator = ModelResponseValidator(tool_registry)
         self.budget_manager = ModelBudgetManager()
@@ -137,104 +142,24 @@ class ModelRuntime:
         supports_developer_message: bool | None = None,
         strict_tools: bool = False,
     ) -> ModelTurnRequest:
-        tools = self.tool_renderer.render(
-            allowed_tool_names=allowed_tool_names,
-            strict=strict_tools,
-        )
-        provider_tools = self.tool_renderer.to_provider_tools(tools, strict=strict_tools)
-        prompt_bundle = None
-        if instruction_runtime is not None:
-            selected_provider = self.registry.select_provider(
-                ModelPreferences(),
-                purpose=purpose,
-            )
-            provider_supports_developer = selected_provider.capabilities().supports_developer_message
-            if supports_developer_message is not None:
-                provider_supports_developer = supports_developer_message
-            observations = list(runtime_observations or [])
-            if planner_context is not None:
-                observations.append(
-                    {
-                        "source_type": "runtime_observation",
-                        "origin": "planner_context",
-                        "content": planner_context.get("content") if isinstance(planner_context, dict) else planner_context,
-                    }
-                )
-            if hasattr(context, "instruction_sources"):
-                observations.extend(context.instruction_sources())
-            prompt_bundle = instruction_runtime.build_for_model_turn(
-                user_task=user_task or getattr(context, "user_goal", ""),
-                purpose=purpose,
-                user_session_instructions=user_session_instructions,
-                runtime_observations=observations,
-                retrieved_content=retrieved_content,
-                tool_protocol_summary=self._tool_protocol_summary(tools),
-                supports_developer_message=provider_supports_developer,
-                ids={
-                    "run_id": run_id,
-                    "session_id": session_id,
-                    "task_id": task_id,
-                    "phase_id": phase_id,
-                    "action_id": action_id,
-                },
-            )
-            history_messages = context.messages(
-                tools=provider_tools,
-                planner_context=None,
-                persist=True,
-            )[2:]
-            messages = [*prompt_bundle.messages, *history_messages]
-            for message in messages:
-                if isinstance(message, ModelMessage):
-                    message.metadata.setdefault("prompt_manifest_id", prompt_bundle.manifest.manifest_id)
-                    message.metadata.setdefault("prompt_hash", prompt_bundle.prompt_hash)
-        else:
-            messages = context.messages(
-                tools=provider_tools,
-                planner_context=planner_context,
-                persist=True,
-            )
-        prompt_metadata = (
-            {
-                "prompt_manifest_id": prompt_bundle.manifest.manifest_id,
-                "prompt_hash": prompt_bundle.prompt_hash,
-                "token_estimate": prompt_bundle.token_estimate,
-            }
-            if prompt_bundle is not None
-            else {}
-        )
-        return ModelTurnRequest(
-            request_id=f"model_req_{uuid4().hex[:12]}",
+        return self.input_renderer.build_request(
+            context,
             run_id=run_id,
             session_id=session_id,
             task_id=task_id,
             phase_id=phase_id,
             action_id=action_id,
             purpose=purpose,
-            messages=[self._coerce_message(message) for message in messages],
-            tools=tools,
-            tool_choice=tool_choice
-            or ToolChoicePolicy(
-                mode=(
-                    ToolChoiceMode.AUTO
-                    if allowed_tool_names is None
-                    else ToolChoiceMode.ALLOWED_TOOLS
-                ),
-                allowed_tool_names=(
-                    [tool.name for tool in tools]
-                    if allowed_tool_names is None
-                    else allowed_tool_names
-                ),
-            ),
-            context_metadata={
-                "context_budget": (
-                    context.last_budget.__dict__.copy()
-                    if getattr(context, "last_budget", None) is not None
-                    else {}
-                ),
-                **prompt_metadata,
-            },
-            trace_metadata=prompt_metadata,
+            allowed_tool_names=allowed_tool_names,
+            planner_context=planner_context,
+            tool_choice=tool_choice,
+            instruction_runtime=instruction_runtime,
+            user_task=user_task,
+            user_session_instructions=user_session_instructions,
+            runtime_observations=runtime_observations,
+            retrieved_content=retrieved_content,
+            supports_developer_message=supports_developer_message,
+            strict_tools=strict_tools,
         )
 
     def run_turn(self, request: ModelTurnRequest) -> ModelTurnResult:
@@ -634,19 +559,6 @@ class ModelRuntime:
             return [tool.name for tool in request.tools]
         return [spec.name for spec in self.tool_registry.list()]
 
-    @staticmethod
-    def _tool_protocol_summary(tools: list[ModelToolSchema]) -> str:
-        names = ", ".join(tool.name for tool in tools) if tools else "none"
-        return "\n".join(
-            [
-                "Tool protocol summary:",
-                "Only registered tools exposed in this request may be called.",
-                "Tool calls must use complete JSON arguments.",
-                "The model must not claim tool execution unless ToolRuntime returns a result.",
-                f"Exposed tools: {names}.",
-            ]
-        )
-
     def _context_export_error(self, request: ModelTurnRequest) -> str | None:
         if not self.config.allow_remote_provider:
             return None
@@ -656,7 +568,7 @@ class ModelRuntime:
             pattern.search(text) for pattern in SECRET_PATTERNS
         ):
             return "context_export_policy_secret_like_content"
-        if policy.deny_env_content and ".env" in text.lower():
+        if policy.deny_env_content and ENV_ASSIGNMENT_PATTERN.search(text):
             return "context_export_policy_env_content"
         return None
 

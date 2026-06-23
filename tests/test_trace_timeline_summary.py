@@ -117,3 +117,42 @@ def test_model_usage_summary_handles_redacted_legacy_token_counts(tmp_path) -> N
     assert report_summary["model_usage_summary"]["input_tokens"] == 10
     assert report_summary["model_usage_summary"]["output_tokens"] == 0
     assert report_summary["model_usage_summary"]["total_tokens"] == 10
+
+
+def test_model_usage_summary_reports_request_and_run_cache_hit_rates(tmp_path) -> None:
+    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+    trace.emit(
+        TraceEventType.MODEL_RESPONSE_RECEIVED,
+        runtime="model",
+        summary="first response",
+        ids={"task_id": "task_1"},
+        payload={
+            "request_id": "req_1",
+            "usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 25,
+            },
+        },
+    )
+    trace.emit(
+        TraceEventType.MODEL_RESPONSE_RECEIVED,
+        runtime="model",
+        summary="second response",
+        ids={"task_id": "task_1"},
+        payload={
+            "request_id": "req_2",
+            "usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 75,
+            },
+        },
+    )
+
+    usage = trace.final_report_summary(task_id="task_1")["model_usage_summary"]
+
+    assert usage["cached_input_tokens"] == 100
+    assert usage["request_cache_hit_rates"] == {
+        "req_1": 0.25,
+        "req_2": 0.75,
+    }
+    assert usage["run_cache_hit_rate"] == 0.5

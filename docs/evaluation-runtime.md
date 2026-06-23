@@ -135,6 +135,14 @@ singularity-agent eval live quicksort --json
 
 This command creates a controlled workspace under `work/evaluations-live/`, boots the real CLI kernel with the configured OpenAI-compatible provider, asks the agent to create and verify `quicksort.py`, and then independently runs `python quicksort.py`. Unlike trace replay, this path can make live model calls and should be run only when `SINGULARITY_API_KEY`, `SINGULARITY_MODEL`, and `SINGULARITY_BASE_URL` are intentionally configured.
 
+Run a manifest-driven live-provider eval:
+
+```bash
+singularity-agent eval live run docs/evaluation/live-agent-minimal-tasks.json --json
+```
+
+The live manifest schema is intentionally small: each task declares `task_id`, a `repo` or `fixture` workspace, optional `start_commit` or `prepare_commands`, `user_task`, `allowed_paths`, `verification_command`, and `success`. Each task runs in an isolated directory under `work/evaluations-live/<run_id>/<task_id>/workspace`; the runner boots the real Singularity kernel, runs the independent verification command, and writes `result.json` with completion, test, usage, cache-hit, tool-call, changed-file, duration, and error fields. Default pytest does not run this path; use the command above only when live provider environment variables are intentionally configured.
+
 Run A/B or regression checks:
 
 ```bash

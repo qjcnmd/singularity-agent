@@ -6,6 +6,7 @@ from singularity.model import (
     ToolCallNormalizer,
 )
 from singularity.tools import ToolRegistry
+from singularity.tools.read_only import register_read_only_tools
 
 
 def test_tool_renderer_filters_hashes_and_normalizes_tool_calls(tmp_path: Path) -> None:
@@ -66,3 +67,13 @@ def test_empty_allowed_tool_list_exposes_no_tools(tmp_path: Path) -> None:
         allowed_tool_names=[],
     )
     assert denied.parse_status == ModelToolParseStatus.UNKNOWN_TOOL
+
+
+def test_tool_renderer_orders_schemas_by_name_for_stable_prefix(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    register_read_only_tools(registry)
+    renderer = ModelToolRenderer(registry)
+
+    rendered = renderer.render(allowed_tool_names=["search_text", "read_file"])
+
+    assert [tool.name for tool in rendered] == ["read_file", "search_text"]

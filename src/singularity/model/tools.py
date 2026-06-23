@@ -26,7 +26,7 @@ class ModelToolRenderer:
             else set(allowed_tool_names)
         )
         schemas: list[ModelToolSchema] = []
-        for spec in self.registry.list():
+        for spec in sorted(self.registry.list(), key=lambda item: item.name):
             if spec.name not in allowed:
                 continue
             schemas.append(

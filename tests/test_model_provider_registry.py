@@ -111,6 +111,21 @@ class _FakeToolResponse(_FakeResponse):
         }
 
 
+class _FakeCachedTokenResponse(_FakeResponse):
+    def json(self) -> dict:
+        return {
+            "id": "resp_cached",
+            "model": "test-model",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 4},
+            },
+        }
+
+
 class _FakeErrorResponse:
     status_code = 500
     text = "provider echoed OPENAI_API_KEY=sk-leaked"
@@ -142,6 +157,12 @@ class _FakeToolClient(_FakeClient):
     def post(self, url: str, *, headers: dict[str, str], json: dict) -> _FakeToolResponse:
         self.payloads.append(json)
         return _FakeToolResponse()
+
+
+class _FakeCachedTokenClient(_FakeClient):
+    def post(self, url: str, *, headers: dict[str, str], json: dict) -> _FakeCachedTokenResponse:
+        self.payloads.append(json)
+        return _FakeCachedTokenResponse()
 
 
 class _FakeErrorClient(_FakeClient):
@@ -218,6 +239,31 @@ def test_openai_compatible_provider_streams_complete_response_fallback(
     ]
     assert events[0].tool_name == "read_file"
     assert events[0].arguments_delta == '{"path":"README.md"}'
+
+
+def test_openai_compatible_provider_records_cached_prompt_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("singularity.model.providers.httpx.Client", _FakeCachedTokenClient)
+    provider = OpenAICompatibleModelProvider(
+        Settings(base_url="https://example.test/v1", api_key="test-key", model="test-model")
+    )
+
+    response = provider.complete(
+        ProviderRequest(
+            request_id="req_1",
+            purpose="plan_next_action",
+            messages=[
+                ModelMessage(
+                    role=ModelRole.USER,
+                    content=[ContentBlock.from_text("hi")],
+                )
+            ],
+        )
+    )
+
+    assert response.usage.input_tokens == 10
+    assert response.usage.cached_input_tokens == 4
 
 
 def test_openai_provider_error_does_not_include_response_body(

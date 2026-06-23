@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+from singularity.evaluation.live import (
+    LIVE_RESULT_SCHEMA_VERSION,
+    LIVE_TASK_SET_SCHEMA_VERSION,
+    LiveAgentEvalRunner,
+    LiveEvalManifest,
+    LiveEvalTaskResult,
+    load_live_eval_manifest,
+    summarize_live_results,
+)
+from singularity.kernel.finalization import FinalReport
+from singularity.kernel.models import RunStatus
+
+
+def test_load_live_eval_manifest_example() -> None:
+    manifest = load_live_eval_manifest(Path("docs/evaluation/live-agent-minimal-tasks.json"))
+
+    assert manifest.schema_version == LIVE_TASK_SET_SCHEMA_VERSION
+    assert [task.task_id for task in manifest.tasks] == [
+        "live.create_quicksort",
+        "live.fix_math_test",
+        "live.repair_slugger",
+    ]
+    assert manifest.tasks[0].workspace.kind == "fixture"
+    assert manifest.tasks[0].allowed_paths == ["quicksort.py"]
+
+
+def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
+    first = LiveEvalTaskResult(
+        task_id="one",
+        success=True,
+        tests_passed=True,
+        prompt_tokens=100,
+        cached_tokens=25,
+        request_cache_hit_rate=0.25,
+        run_cache_hit_rate=0.25,
+        tool_calls=2,
+        files_changed=["a.py"],
+        duration_seconds=1.0,
+        error_summary="",
+        workspace=str(tmp_path),
+        trace=str(tmp_path / "trace"),
+    )
+    second = LiveEvalTaskResult(
+        task_id="two",
+        success=False,
+        tests_passed=True,
+        prompt_tokens=100,
+        cached_tokens=75,
+        request_cache_hit_rate=0.75,
+        run_cache_hit_rate=0.75,
+        tool_calls=3,
+        files_changed=["b.py"],
+        duration_seconds=2.0,
+        error_summary="agent status: failed",
+        workspace=str(tmp_path),
+        trace=str(tmp_path / "trace2"),
+    )
+
+    summary = summarize_live_results([first, second])
+
+    assert summary == {
+        "task_count": 2,
+        "success_count": 1,
+        "task_completion_rate": 0.5,
+        "tests_passed_count": 2,
+        "test_pass_rate": 1.0,
+        "prompt_tokens": 200,
+        "cached_tokens": 100,
+        "request_cache_hit_rate": 0.5,
+        "run_cache_hit_rate": 0.5,
+        "tool_calls": 5,
+    }
+
+
+def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest_payload = {
+        "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+        "tasks": [
+            {
+                "task_id": "fake.write_file",
+                "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                "prepare_commands": [f"{py} -c \"print('ready')\""],
+                "user_task": "Write done.txt with ok.",
+                "allowed_paths": ["done.txt"],
+                "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').read_text(encoding='utf-8') == 'ok'\"",
+                "success": {"type": "verification_exit_code", "exit_code": 0},
+            }
+        ],
+    }
+    manifest = LiveEvalManifest.from_dict(manifest_payload, base_dir=tmp_path)
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={
+                "tool_calls": 2,
+                "model_usage_summary": {
+                    "input_tokens": 10,
+                    "cached_input_tokens": 4,
+                    "request_cache_hit_rates": {"req_1": 0.4},
+                    "run_cache_hit_rate": 0.4,
+                },
+            },
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = LiveAgentEvalRunner(
+        output_root=tmp_path / "out",
+        run_id="run_fake",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    assert result["schema_version"] == LIVE_RESULT_SCHEMA_VERSION
+    assert result["summary"]["success_count"] == 1
+    task = result["tasks"][0]
+    assert task["task_id"] == "fake.write_file"
+    assert task["success"] is True
+    assert task["tests_passed"] is True
+    assert task["prompt_tokens"] == 10
+    assert task["cached_tokens"] == 4
+    assert task["request_cache_hit_rate"] == 0.4
+    assert task["run_cache_hit_rate"] == 0.4
+    assert task["tool_calls"] == 2
+    assert task["files_changed"] == ["done.txt"]
+    assert Path(result["result_path"]).exists()

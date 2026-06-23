@@ -136,6 +136,7 @@ max_files = 123
 """.lstrip(),
         encoding="utf-8",
     )
+    monkeypatch.delenv("SINGULARITY_BASE_URL", raising=False)
     monkeypatch.setenv("SINGULARITY_MAX_TURNS", "6")
     monkeypatch.setenv("SINGULARITY_MODEL", "env-model")
     monkeypatch.setenv("SINGULARITY_PROJECT_INDEX_ENABLED", "true")

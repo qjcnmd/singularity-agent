@@ -132,6 +132,36 @@ def test_model_runtime_blocks_secret_like_remote_context(tmp_path: Path) -> None
     assert "model.request.failed" in event_types
 
 
+def test_model_runtime_allows_env_filename_safety_instruction(tmp_path: Path) -> None:
+    provider = MockModelProvider(text="ok")
+    runtime = ModelRuntime.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRuntimeConfig(allow_remote_provider=True),
+    )
+
+    result = runtime.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="understanding_task",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Do not read, print, or modify .env files or API keys.",
+                }
+            ],
+        )
+    )
+
+    assert result.status == ModelTurnStatus.SUCCESS
+    assert provider.complete_calls == 1
+
+
 def test_model_runtime_build_request_from_context_uses_context_manager(tmp_path: Path) -> None:
     context = ContextManager(system_prompt="system", user_goal="inspect project")
     runtime = ModelRuntime.with_mock_provider(

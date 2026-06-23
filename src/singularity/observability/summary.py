@@ -268,6 +268,8 @@ def _model_usage_summary(events: list[TraceEvent]) -> dict[str, Any]:
         "total_tokens": 0,
         "cached_input_tokens": 0,
         "reasoning_tokens": 0,
+        "request_cache_hit_rates": {},
+        "run_cache_hit_rate": 0.0,
     }
     for event in events:
         if event.event_type == TraceEventType.MODEL_REQUEST_CREATED:
@@ -284,10 +286,21 @@ def _model_usage_summary(events: list[TraceEvent]) -> dict[str, Any]:
                     "reasoning_tokens",
                 ):
                     usage[key] += _safe_int(payload_usage.get(key))
+                input_tokens = _safe_int(payload_usage.get("input_tokens"))
+                cached_tokens = _safe_int(payload_usage.get("cached_input_tokens"))
+                request_id = str(event.payload.get("request_id") or event.event_id)
+                usage["request_cache_hit_rates"][request_id] = _cache_rate(
+                    cached_tokens,
+                    input_tokens,
+                )
         elif event.event_type == TraceEventType.MODEL_REQUEST_FAILED:
             usage["failures"] += 1
         elif event.event_type == TraceEventType.MODEL_TOOL_CALL_PROPOSED:
             usage["tool_calls_proposed"] += 1
+    usage["run_cache_hit_rate"] = _cache_rate(
+        usage["cached_input_tokens"],
+        usage["input_tokens"],
+    )
     return usage
 
 
@@ -302,3 +315,9 @@ def _safe_int(value: Any) -> int:
         except ValueError:
             return 0
     return 0
+
+
+def _cache_rate(cached_tokens: int, input_tokens: int) -> float:
+    if input_tokens <= 0:
+        return 0.0
+    return round(cached_tokens / input_tokens, 4)

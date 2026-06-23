@@ -12,6 +12,7 @@ from singularity.model.errors import (
     ModelRuntimeError,
     ModelToolCallParseError,
 )
+from singularity.model.input_renderer import ModelInputRenderer
 from singularity.model.messages import MessageConverter
 from singularity.model.models import (
     ContentBlock,
@@ -67,6 +68,7 @@ __all__ = [
     "ModelCapabilities",
     "ModelCapabilityError",
     "ModelContextTooLong",
+    "ModelInputRenderer",
     "ModelError",
     "ModelErrorKind",
     "ModelMessage",

@@ -3,6 +3,7 @@ from pathlib import Path
 from singularity.context import ContextManager
 from singularity.instructions import InstructionRuntime
 from singularity.model import (
+    ModelInputRenderer,
     ModelCapabilities,
     MockModelProvider,
     ModelPurpose,
@@ -65,6 +66,86 @@ def test_model_runtime_uses_provider_capability_for_developer_folding(tmp_path: 
     assert request.context_metadata["prompt_manifest_id"]
     assert all(message.role.value != "developer" for message in request.messages)
     assert request.messages[0].metadata["prompt_manifest_id"]
+
+
+def test_model_input_renderer_keeps_stable_prefix_metadata_and_dynamic_tail(
+    tmp_path: Path,
+) -> None:
+    context = ContextManager(system_prompt="legacy system", user_goal="Inspect project")
+    context.add_tool_result(
+        tool_call={"id": "call_1", "function": {"name": "read_file"}},
+        result={"ok": True, "content": {"path": "README.md", "content": "dynamic tool output"}},
+    )
+    provider = MockModelProvider(text="ok")
+    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    instruction_runtime = InstructionRuntime(workspace_root=tmp_path)
+
+    request = ModelInputRenderer(
+        registry=runtime.registry,
+        tool_renderer=runtime.tool_renderer,
+    ).build_request(
+        context,
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="understanding_task",
+        action_id="action_1",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        allowed_tool_names=["search_text", "read_file"],
+        planner_context={"content": "dynamic planner state"},
+        instruction_runtime=instruction_runtime,
+        user_task="Inspect project",
+    )
+
+    assert [tool.name for tool in request.tools] == ["read_file", "search_text"]
+    assert request.context_metadata["input_renderer"] == "model_input_renderer/v1"
+    assert request.context_metadata["stable_prefix_message_count"] >= 3
+    assert request.context_metadata["dynamic_tail_message_count"] >= 1
+    assert request.context_metadata["tool_schema_hash"] == request.trace_metadata["tool_schema_hash"]
+    assert request.messages[0].metadata["prompt_manifest_id"]
+    assert request.messages[-1].role.value == "tool"
+
+
+def test_model_input_renderer_hashes_ignore_ephemeral_prompt_ids(
+    tmp_path: Path,
+) -> None:
+    context = ContextManager(system_prompt="legacy system", user_goal="Inspect project")
+    provider = MockModelProvider(text="ok")
+    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    instruction_runtime = InstructionRuntime(workspace_root=tmp_path)
+    renderer = ModelInputRenderer(
+        registry=runtime.registry,
+        tool_renderer=runtime.tool_renderer,
+    )
+
+    first = renderer.build_request(
+        context,
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="understanding_task",
+        action_id="action_1",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        allowed_tool_names=[],
+        instruction_runtime=instruction_runtime,
+        user_task="Inspect project",
+    )
+    second = renderer.build_request(
+        context,
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="understanding_task",
+        action_id="action_2",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        allowed_tool_names=[],
+        instruction_runtime=instruction_runtime,
+        user_task="Inspect project",
+    )
+
+    assert first.context_metadata["stable_prefix_hash"] == second.context_metadata["stable_prefix_hash"]
+    assert first.context_metadata["tool_schema_hash"] == second.context_metadata["tool_schema_hash"]
+    assert first.context_metadata["prompt_manifest_id"] != second.context_metadata["prompt_manifest_id"]
 
 
 def test_context_manager_exports_untrusted_tool_and_file_sources(tmp_path: Path) -> None:

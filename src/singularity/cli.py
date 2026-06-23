@@ -18,8 +18,10 @@ from singularity.evaluation import (
     EvaluationProfile,
     EvaluationRuntime,
     GoldenTaskStore,
+    LiveAgentEvalRunner,
     RegressionDetector,
     TraceReplayRuntime,
+    load_live_eval_manifest,
 )
 from singularity.git_runtime.cli import git_app
 from singularity.interaction import RichCliRenderer
@@ -1027,6 +1029,50 @@ def eval_report_show(
         console.print(Panel(text, title="evaluation report", border_style="cyan"))
         return
     console.print(report_path.read_text(encoding="utf-8"))
+
+
+@eval_live_app.command("run")
+def eval_live_run(
+    task_set: Annotated[Path, typer.Argument(help="Live agent eval task-set JSON path.")],
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Directory for live eval workspaces and result JSON."),
+    ] = None,
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Stable live eval run id."),
+    ] = None,
+    max_turns: Annotated[
+        int | None,
+        typer.Option("--max-turns", min=1, max=40, help="Maximum live model turns per task."),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Override SINGULARITY_MODEL for this live eval."),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this live eval."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    """Run a manifest-driven live-provider agent evaluation."""
+
+    manifest = load_live_eval_manifest(task_set)
+    result = LiveAgentEvalRunner(
+        output_root=output_dir,
+        run_id=run_id,
+        max_turns=max_turns,
+        model=model,
+        base_url=base_url,
+        console=console,
+    ).run(manifest)
+    if json_output:
+        _write_stdout(json_dumps(result))
+    else:
+        console.print(Panel(json_dumps(result), title="live agent eval", border_style="cyan"))
+    if result["summary"]["success_count"] != result["summary"]["task_count"]:
+        raise typer.Exit(1)
 
 
 @eval_live_app.command("quicksort")

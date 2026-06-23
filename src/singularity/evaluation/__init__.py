@@ -21,6 +21,17 @@ from singularity.evaluation.reports import (
     RegressionReport,
     TaskEvaluationResult,
 )
+from singularity.evaluation.live import (
+    LIVE_RESULT_SCHEMA_VERSION,
+    LIVE_TASK_SET_SCHEMA_VERSION,
+    LiveAgentEvalRunner,
+    LiveEvalManifest,
+    LiveEvalTask,
+    LiveEvalTaskResult,
+    LiveEvalWorkspace,
+    load_live_eval_manifest,
+    summarize_live_results,
+)
 from singularity.evaluation.runtime import EvaluationRuntime, RegressionDetector
 from singularity.evaluation.scoring import ScoringEngine
 from singularity.evaluation.store import GoldenTaskStore
@@ -35,6 +46,13 @@ __all__ = [
     "ExpectedOutcomeKind",
     "GoldenTaskContract",
     "GoldenTaskStore",
+    "LIVE_RESULT_SCHEMA_VERSION",
+    "LIVE_TASK_SET_SCHEMA_VERSION",
+    "LiveAgentEvalRunner",
+    "LiveEvalManifest",
+    "LiveEvalTask",
+    "LiveEvalTaskResult",
+    "LiveEvalWorkspace",
     "PatchQualityEvaluator",
     "PatchQualityResult",
     "ProfileEvaluationReport",
@@ -49,4 +67,6 @@ __all__ = [
     "TraceReplayRuntime",
     "WorkspaceSnapshot",
     "WorkspaceSnapshotKind",
+    "load_live_eval_manifest",
+    "summarize_live_results",
 ]
