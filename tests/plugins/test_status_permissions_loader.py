@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from singularity.observability import TraceRuntime
@@ -51,6 +52,26 @@ def test_enable_disable_status_and_hash_mismatch(tmp_path: Path) -> None:
     assert disabled.enabled is False
 
 
+def test_enabled_plugin_path_mismatch_does_not_activate(tmp_path: Path) -> None:
+    plugin_dir = _plugin_dir(tmp_path, "path_plugin")
+    sentinel = tmp_path / "imported.txt"
+    _write_manifest(plugin_dir, plugin_id="path_plugin")
+    _write_plugin(plugin_dir, f"Path({str(sentinel)!r}).write_text('imported')\n")
+    discovered = discover_plugins(tmp_path)[0]
+    PluginStatusStore(tmp_path).enable(discovered)
+    status_path = tmp_path / ".singularity" / "plugin-status.json"
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    payload["plugins"]["path_plugin"]["path"] = str(tmp_path / "other-plugin-path")
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    diagnostics = PluginRuntime(tmp_path).activate(registry=registry)
+
+    assert any(diagnostic.code == "status_path_mismatch" for diagnostic in diagnostics)
+    assert registry.list() == []
+    assert not sentinel.exists()
+
+
 def test_permission_refusal_is_isolated_to_plugin(tmp_path: Path) -> None:
     plugin_dir = _plugin_dir(tmp_path, "permission_plugin")
     _write_manifest(plugin_dir, plugin_id="permission_plugin", permissions="[]")
@@ -63,6 +84,82 @@ def test_permission_refusal_is_isolated_to_plugin(tmp_path: Path) -> None:
     diagnostics = runtime.activate(registry=registry)
 
     assert any("did not declare required permissions" in diagnostic.message for diagnostic in diagnostics)
+    assert registry.list() == []
+
+
+def test_contribution_permissions_cannot_exceed_approved_permissions(tmp_path: Path) -> None:
+    plugin_dir = _plugin_dir(tmp_path, "approved_plugin")
+    _write_manifest(
+        plugin_dir,
+        plugin_id="approved_plugin",
+        permissions='["read_workspace", "write_workspace"]',
+    )
+    _write_plugin(
+        plugin_dir,
+        """
+def write(args):
+    return {"text": args.text}
+host.register_tool(
+    name="write",
+    description="Write text.",
+    input_schema={
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+        "additionalProperties": False,
+    },
+    handler=write,
+    risk_level="medium",
+    permission_level="write",
+    required_permissions=["write_workspace"],
+    uses_mutation_runtime=True,
+    approval_profile={"requires_approval": True},
+)
+""",
+    )
+    discovered = discover_plugins(tmp_path)[0]
+    PluginStatusStore(tmp_path).enable(discovered)
+    status_path = tmp_path / ".singularity" / "plugin-status.json"
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    payload["plugins"]["approved_plugin"]["approved_permissions"] = ["read_workspace"]
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    diagnostics = PluginRuntime(tmp_path).activate(registry=registry)
+
+    assert any(diagnostic.code == "plugin_tool_permission_not_approved" for diagnostic in diagnostics)
+    assert registry.list() == []
+
+
+def test_plugin_tool_schema_must_forbid_additional_properties(tmp_path: Path) -> None:
+    plugin_dir = _plugin_dir(tmp_path, "schema_plugin")
+    _write_manifest(plugin_dir, plugin_id="schema_plugin")
+    _write_plugin(
+        plugin_dir,
+        """
+def echo(args):
+    return {"text": args.text}
+host.register_tool(
+    name="echo",
+    description="Echo text.",
+    input_schema={
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    },
+    handler=echo,
+    risk_level="low",
+    required_permissions=["read_workspace"],
+)
+""",
+    )
+    discovered = discover_plugins(tmp_path)[0]
+    PluginStatusStore(tmp_path).enable(discovered)
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    diagnostics = PluginRuntime(tmp_path).activate(registry=registry)
+
+    assert any("additionalProperties" in diagnostic.message for diagnostic in diagnostics)
     assert registry.list() == []
 
 

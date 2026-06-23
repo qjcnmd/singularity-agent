@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from singularity.tools import (
     PermissionLevel,
+    ToolExecutionRequest,
     ToolPolicy,
     ToolRegistry,
     ToolRuntime,
@@ -103,6 +104,31 @@ def test_runtime_rejects_pydantic_validation_errors(tmp_path: Path) -> None:
 
 class WriteInput(BaseModel):
     path: str
+
+
+def test_runtime_rejects_disabled_tool_like_unknown_tool(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="disabled_tool",
+            description="disabled",
+            input_model=WriteInput,
+            handler=lambda _args: {"ok": True},
+            enabled=False,
+        )
+    )
+    runtime = ToolRuntime(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=TraceWriter.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
+    )
+
+    result = runtime.execute_tool_call(make_tool_call("disabled_tool", {"path": "README.md"}))
+
+    assert result.ok is False
+    assert result.error_code == "tool_not_found"
 
 
 def test_runtime_policy_denies_write_tools_by_default(tmp_path: Path) -> None:
@@ -323,6 +349,67 @@ def test_runtime_writes_audit_trace(tmp_path: Path) -> None:
     assert audit["cache_hit"] is False
     assert "duration_seconds" in audit
     assert "output_digest" in audit
+
+
+def test_runtime_execute_request_records_protocol_trace_ids(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("hello from request", encoding="utf-8")
+    trace = TraceWriter.create(tmp_path)
+    runtime = ToolRuntime(
+        registry=ToolRegistry(tmp_path),
+        policy=ToolPolicy.read_only(),
+        trace=trace,
+        workspace_root=tmp_path,
+        policy_runtime=make_test_policy_runtime(tmp_path),
+    )
+    request = ToolExecutionRequest(
+        tool_call_id="call_request",
+        tool_name="read_file",
+        raw_arguments='{"path":"README.md"}',
+        normalized_arguments={"path": "README.md"},
+        batch_id="batch_1",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="inspection",
+        model_request_id="model_req_1",
+        model_response_id="model_resp_1",
+        argument_digest="argument_digest_1",
+    )
+
+    result = runtime.execute_request(request)
+
+    assert result.ok is True
+    events = [json.loads(line) for line in trace.path.read_text(encoding="utf-8").splitlines()]
+    audit = [event["data"] for event in events if event["event"] == "tool_call"][-1]
+    assert audit["tool_call_id"] == "call_request"
+    assert audit["batch_id"] == "batch_1"
+    assert audit["model_request_id"] == "model_req_1"
+    assert audit["model_response_id"] == "model_resp_1"
+    assert audit["argument_digest"] == "argument_digest_1"
+    assert audit["policy_decision_id"] == result.metadata["policy_decision_id"]
+    assert audit["output_digest"] == result.metadata["output_digest"]
+
+
+def test_runtime_execute_request_keeps_final_schema_validation(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    request = ToolExecutionRequest(
+        tool_call_id="call_invalid_request",
+        tool_name="read_file",
+        raw_arguments='{"path":"README.md","max_bytes":0}',
+        normalized_arguments={"path": "README.md", "max_bytes": 0},
+        batch_id="batch_1",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="inspection",
+        model_request_id="model_req_1",
+        model_response_id="model_resp_1",
+    )
+
+    result = runtime.execute_request(request)
+
+    assert result.ok is False
+    assert result.error_code == "validation_error"
 
 
 class EchoInput(BaseModel):

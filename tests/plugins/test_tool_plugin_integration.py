@@ -7,7 +7,7 @@ from singularity.observability import TraceRuntime
 from singularity.plugins.discovery import discover_plugins
 from singularity.plugins.runtime import PluginRuntime
 from singularity.plugins.status import PluginStatusStore
-from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.tools import ToolOriginKind, ToolPolicy, ToolRegistry, ToolRuntime
 
 from tests.tool_runtime_helpers import make_test_policy_runtime
 
@@ -53,8 +53,20 @@ def register(host):
 
     assert diagnostics == []
     assert registry.get("echo_plugin__echo") is not None
+    record = registry.get_record("echo_plugin__echo")
+    assert record is not None
+    assert record.origin.kind == ToolOriginKind.PLUGIN
+    assert record.origin.plugin_id == "echo_plugin"
+    assert record.origin.local_tool_name == "echo"
+    assert record.origin.exposed_name == "echo_plugin__echo"
+    assert record.origin.manifest_hash == discovered.manifest_hash
+    assert record.origin.required_permissions == ("read_workspace",)
     exported = registry.to_openai_tools()
     assert exported[0]["function"]["name"] == "echo_plugin__echo"
+    assert set(exported[0]["function"]) == {"name", "description", "parameters"}
+    assert "plugin_id" not in json.dumps(exported)
+    assert "manifest_hash" not in json.dumps(exported)
+    assert "approved_permissions" not in json.dumps(exported)
 
     runtime = ToolRuntime(
         registry=registry,

@@ -125,7 +125,10 @@ testpaths = ["tests"]
     sandboxed = [result for result in results if result["evidence"]["sandbox_id"]]
     assert sandboxed
     assert any(result["evidence"]["sandbox_status"] == "success" for result in sandboxed)
-    assert all(result["evidence"]["sandbox_backend"] == "local_staging" for result in sandboxed)
+    assert {
+        result["evidence"]["sandbox_backend"]
+        for result in sandboxed
+    } <= {"docker", "windows_restricted_token", "local_staging"}
 
 
 def test_sandbox_unavailable_becomes_verification_failure_evidence(tmp_path: Path) -> None:

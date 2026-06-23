@@ -115,6 +115,35 @@ def test_empty_allowed_tool_list_exposes_no_tools(tmp_path: Path) -> None:
     assert denied.parse_status == ModelToolParseStatus.UNKNOWN_TOOL
 
 
+def test_disabled_tool_is_not_rendered_or_normalized(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="disabled_tool",
+            description="disabled",
+            input_model=ListInput,
+            handler=lambda _args: {},
+            enabled=False,
+        )
+    )
+
+    renderer = ModelToolRenderer(registry)
+
+    assert renderer.render() == []
+    assert registry.to_openai_tools() == []
+
+    denied = ToolCallNormalizer(registry).normalize(
+        {
+            "id": "call_disabled",
+            "type": "function",
+            "function": {"name": "disabled_tool", "arguments": {"expected_files": [], "content": ""}},
+        },
+        allowed_tool_names=["disabled_tool"],
+    )
+
+    assert denied.parse_status == ModelToolParseStatus.UNKNOWN_TOOL
+
+
 def test_tool_renderer_orders_schemas_by_name_for_stable_prefix(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
     register_read_only_tools(registry)

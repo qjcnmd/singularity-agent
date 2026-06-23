@@ -557,7 +557,7 @@ class ModelRuntime:
             return list(request.tool_choice.allowed_tool_names)
         if request.tools:
             return [tool.name for tool in request.tools]
-        return [spec.name for spec in self.tool_registry.list()]
+        return [spec.name for spec in self.tool_registry.list_model_visible()]
 
     def _context_export_error(self, request: ModelTurnRequest) -> str | None:
         if not self.config.allow_remote_provider:

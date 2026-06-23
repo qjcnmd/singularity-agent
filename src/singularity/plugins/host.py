@@ -192,6 +192,8 @@ def _model_from_schema(name: str, schema: dict[str, Any]) -> type[BaseModel]:
         raise ValueError("input_schema must be an object.")
     if schema.get("type", "object") != "object":
         raise ValueError("input_schema root type must be object.")
+    if schema.get("additionalProperties") is not False:
+        raise ValueError("Plugin tool input_schema.additionalProperties must be false.")
     properties = schema.get("properties") or {}
     if not isinstance(properties, dict):
         raise ValueError("input_schema.properties must be an object.")

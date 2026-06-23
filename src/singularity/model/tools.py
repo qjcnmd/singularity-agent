@@ -21,15 +21,25 @@ class ModelToolRenderer:
         self.registry = registry
 
     def render(self, *, allowed_tool_names: list[str] | None = None, strict: bool = False) -> list[ModelToolSchema]:
-        allowed = (
-            {spec.name for spec in self.registry.list()}
-            if allowed_tool_names is None
-            else set(allowed_tool_names)
-        )
+        visible = self.registry.list_model_visible()
+        visible_names = {spec.name for spec in visible}
+        allowed = visible_names if allowed_tool_names is None else set(allowed_tool_names) & visible_names
         schemas: list[ModelToolSchema] = []
-        for spec in sorted(self.registry.list(), key=lambda item: item.name):
+        for spec in sorted(visible, key=lambda item: item.name):
             if spec.name not in allowed:
                 continue
+            record = self.registry.get_record(spec.name)
+            metadata = {
+                "version": spec.version,
+                "permission_level": spec.permission_level.value,
+                "cacheable": spec.cacheable,
+                "idempotent": spec.idempotent,
+                "strict": strict,
+            }
+            if record is not None:
+                metadata["origin"] = record.origin.kind.value
+                if record.origin.plugin_id:
+                    metadata["plugin_id"] = record.origin.plugin_id
             schemas.append(
                 ModelToolSchema(
                     name=spec.name,
@@ -39,13 +49,7 @@ class ModelToolRenderer:
                     ),
                     capability_tags=[_capability_for_permission(spec.permission_level)],
                     risk_tags=list(spec.risk_tags),
-                    metadata={
-                        "version": spec.version,
-                        "permission_level": spec.permission_level.value,
-                        "cacheable": spec.cacheable,
-                        "idempotent": spec.idempotent,
-                        "strict": strict,
-                    },
+                    metadata=metadata,
                 )
             )
         return schemas
@@ -86,11 +90,8 @@ class ToolCallNormalizer:
         tool_call_id = str(tool_call.get("id") or "")
         tool_name = str(function.get("name") or "")
         raw_arguments_value = function.get("arguments", "{}")
-        allowed = (
-            {spec.name for spec in self.registry.list()}
-            if allowed_tool_names is None
-            else set(allowed_tool_names)
-        )
+        visible = {spec.name for spec in self.registry.list_model_visible()}
+        allowed = visible if allowed_tool_names is None else set(allowed_tool_names) & visible
         if not tool_call_id:
             errors.append("missing_tool_call_id")
             tool_call_id = "<missing>"

@@ -7,6 +7,7 @@ from singularity.policy import Capability, OperationKind
 from singularity.tools import (
     PermissionLevel,
     ToolExecutionBackendKind,
+    ToolOriginKind,
     ToolRegistry,
     ToolSpec,
     ToolSideEffectKind,
@@ -184,7 +185,7 @@ def test_dispatch_convenience_cannot_create_runtime(tmp_path: Path) -> None:
         registry.dispatch({"function": {"name": "missing", "arguments": "{}"}})
 
 
-def test_openai_schema_includes_safe_metadata(tmp_path: Path) -> None:
+def test_openai_schema_omits_internal_metadata(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
     registry.register(
         ToolSpec(
@@ -200,6 +201,38 @@ def test_openai_schema_includes_safe_metadata(tmp_path: Path) -> None:
 
     tool = registry.to_openai_tools(strict=True)[0]["function"]
 
-    assert tool["x-singularity-tool-version"] == "1.2.3"
-    assert tool["x-singularity-capabilities"] == ["READ_WORKSPACE"]
+    assert set(tool) == {"name", "description", "parameters", "strict"}
+    assert tool["name"] == "meta"
     assert "policy" not in tool
+
+
+def test_registry_records_builtin_origin_and_filters_disabled_tools(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="enabled",
+            description="enabled",
+            input_model=EmptyInput,
+            handler=handler,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="disabled",
+            description="disabled",
+            input_model=EmptyInput,
+            handler=handler,
+            enabled=False,
+        )
+    )
+
+    record = registry.get_record("enabled")
+
+    assert record is not None
+    assert record.origin.kind == ToolOriginKind.BUILTIN
+    assert [spec.name for spec in registry.list_model_visible()] == ["enabled"]
+    assert [tool["function"]["name"] for tool in registry.to_openai_tools()] == ["enabled"]
+    assert {record.spec.name for record in registry.list_records(include_disabled=True)} == {
+        "enabled",
+        "disabled",
+    }

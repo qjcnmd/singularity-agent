@@ -6,7 +6,10 @@ from typing import Any
 from singularity.policy import Capability
 from singularity.tools.models import (
     PermissionLevel,
+    RegisteredToolRecord,
     ToolExecutionBackendKind,
+    ToolOrigin,
+    ToolOriginKind,
     ToolSideEffectKind,
     ToolSpec,
 )
@@ -16,19 +19,37 @@ class ToolRegistry:
     def __init__(self, project_root: Path, *, include_default_tools: bool = True) -> None:
         self.project_root = project_root.resolve()
         self._tools: dict[str, ToolSpec] = {}
+        self._records: dict[str, RegisteredToolRecord] = {}
         self._frozen = False
         if include_default_tools:
             from singularity.tools.read_only import register_read_only_tools
 
             register_read_only_tools(self)
 
-    def register(self, spec: ToolSpec) -> None:
+    def register(
+        self,
+        spec: ToolSpec,
+        *,
+        origin: ToolOrigin | None = None,
+        admitted: bool = True,
+        admission_reason: str = "registered",
+        diagnostics: tuple[str, ...] = (),
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         if self._frozen:
             raise RuntimeError("Tool registry is frozen.")
         if spec.name in self._tools:
             raise ValueError(f"Tool already registered: {spec.name}")
         self._validate_spec(spec)
         self._tools[spec.name] = spec
+        self._records[spec.name] = RegisteredToolRecord(
+            spec=spec,
+            origin=origin or ToolOrigin(),
+            admitted=admitted,
+            admission_reason=admission_reason,
+            diagnostics=diagnostics,
+            metadata=dict(metadata or {}),
+        )
 
     def freeze(self) -> None:
         self._frozen = True
@@ -36,21 +57,43 @@ class ToolRegistry:
     def get(self, name: str) -> ToolSpec | None:
         return self._tools.get(name)
 
+    def get_record(self, name: str) -> RegisteredToolRecord | None:
+        return self._records.get(name)
+
     def list(self) -> list[ToolSpec]:
         return list(self._tools.values())
 
+    def list_records(
+        self,
+        *,
+        origin: ToolOriginKind | str | None = None,
+        include_disabled: bool = True,
+        admitted_only: bool = False,
+    ) -> list[RegisteredToolRecord]:
+        records = list(self._records.values())
+        if origin is not None:
+            origin_kind = origin if isinstance(origin, ToolOriginKind) else ToolOriginKind(str(origin))
+            records = [record for record in records if record.origin.kind == origin_kind]
+        if not include_disabled:
+            records = [record for record in records if record.spec.enabled]
+        if admitted_only:
+            records = [record for record in records if record.admitted]
+        return records
+
+    def list_model_visible(self) -> list[ToolSpec]:
+        return [
+            record.spec
+            for record in self.list_records(include_disabled=False, admitted_only=True)
+        ]
+
     def to_openai_tools(self, *, strict: bool = False) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
-        for spec in self._tools.values():
+        for spec in self.list_model_visible():
             parameters = spec.input_model.model_json_schema()
             function: dict[str, Any] = {
                 "name": spec.name,
                 "description": spec.description,
                 "parameters": self._parameters_schema(parameters, strict=strict),
-                "x-singularity-tool-version": spec.version,
-                "x-singularity-capabilities": [
-                    capability.value for capability in spec.capabilities
-                ],
             }
             if strict:
                 function["strict"] = True

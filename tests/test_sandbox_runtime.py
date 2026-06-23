@@ -14,6 +14,7 @@ from singularity.sandbox import (
     SandboxResourceLimits,
     SandboxRuntime,
     SandboxStatus,
+    WindowsRestrictedTokenBackend,
     default_sandbox_profile,
 )
 from singularity.policy import SecurityMode
@@ -74,18 +75,45 @@ def test_runtime_defaults_to_docker_when_available(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr("singularity.sandbox.backends.docker_backend_available", lambda: True)
+    monkeypatch.setattr(
+        "singularity.sandbox.backends.windows_restricted_token_available",
+        lambda: True,
+    )
 
     runtime = SandboxRuntime(tmp_path)
 
     assert runtime.backends[0].name() == "docker"
-    assert runtime.backends[1].name() == "local_staging"
+    assert runtime.backends[1].name() == "windows_restricted_token"
+    assert runtime.backends[2].name() == "local_staging"
 
 
-def test_runtime_falls_back_to_local_when_docker_unavailable(
+def test_runtime_falls_back_to_windows_before_local_when_docker_unavailable(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     monkeypatch.setattr("singularity.sandbox.backends.docker_backend_available", lambda: False)
+    monkeypatch.setattr(
+        "singularity.sandbox.backends.windows_restricted_token_available",
+        lambda: True,
+    )
+
+    runtime = SandboxRuntime(tmp_path)
+
+    assert [backend.name() for backend in runtime.backends] == [
+        "windows_restricted_token",
+        "local_staging",
+    ]
+
+
+def test_runtime_falls_back_to_local_when_stronger_backends_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("singularity.sandbox.backends.docker_backend_available", lambda: False)
+    monkeypatch.setattr(
+        "singularity.sandbox.backends.windows_restricted_token_available",
+        lambda: False,
+    )
 
     runtime = SandboxRuntime(tmp_path)
 
@@ -112,11 +140,13 @@ def test_runtime_skips_default_docker_for_unsupported_project_toolchain(tmp_path
     request.command = ["node", "--version"]
     docker = DockerSandboxBackend()
     docker.is_available = lambda: True  # type: ignore[method-assign]
-    runtime = SandboxRuntime(tmp_path, backends=[docker, LocalStagingBackend()])
+    windows = WindowsRestrictedTokenBackend()
+    windows.is_available = lambda: True  # type: ignore[method-assign]
+    runtime = SandboxRuntime(tmp_path, backends=[docker, windows, LocalStagingBackend()])
 
     selected = runtime._select_backend(request)
 
-    assert isinstance(selected, LocalStagingBackend)
+    assert isinstance(selected, WindowsRestrictedTokenBackend)
 
 
 def test_runtime_fails_closed_when_unsupported_toolchain_needs_hard_isolation(tmp_path: Path) -> None:

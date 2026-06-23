@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
 from singularity.observability.models import TraceEventType, TraceSeverity
-from singularity.plugins.diagnostics import check_plugin, duplicate_plugin_ids
+from singularity.plugins.diagnostics import check_plugin, duplicate_plugin_ids, resolve_entrypoint_path
 from singularity.plugins.discovery import discover_plugins
 from singularity.plugins.loader import PluginLoader
 from singularity.plugins.models import (
@@ -12,7 +14,11 @@ from singularity.plugins.models import (
     PluginDiagnostic,
     PluginDiagnosticSeverity,
     PluginLockEntry,
+    PluginPermission,
+    PluginStatus,
+    PluginToolContribution,
 )
+from singularity.plugins.permissions import ensure_permission_subset, permissions_for_tool
 from singularity.plugins.status import PluginLockStore, PluginStatusStore
 from singularity.policy import (
     Capability,
@@ -25,7 +31,7 @@ from singularity.policy import (
     RuntimeName,
 )
 from singularity.release.paths import RuntimeMode, RuntimePaths
-from singularity.tools import ToolRegistry
+from singularity.tools import ToolOrigin, ToolOriginKind, ToolRegistry
 
 
 class PluginRuntime:
@@ -87,10 +93,33 @@ class PluginRuntime:
         loader = PluginLoader(trace=self.trace)
 
         for plugin in discovered:
-            status = self.status_store.get(plugin.manifest.id)
-            if status is None or not status.enabled:
+            raw_status = self.status_store.get(plugin.manifest.id)
+            if raw_status is None or not raw_status.enabled:
                 continue
             processed_enabled = True
+            status = self.status_store.enabled_for(plugin)
+            if status is None:
+                plugin_diagnostics = check_plugin(plugin, status=raw_status)
+                if not _has_error(plugin_diagnostics):
+                    plugin_diagnostics.append(
+                        PluginDiagnostic(
+                            plugin_id=plugin.manifest.id,
+                            severity=PluginDiagnosticSeverity.ERROR,
+                            code="plugin_status_mismatch",
+                            message="Enabled plugin status does not match the discovered manifest.",
+                            path=str(plugin.manifest_path),
+                            details={
+                                "enabled_path": raw_status.path,
+                                "enabled_manifest_hash": raw_status.manifest_hash,
+                                "current_path": str(plugin.plugin_dir),
+                                "current_manifest_hash": plugin.manifest_hash,
+                            },
+                        )
+                    )
+                diagnostics.extend(plugin_diagnostics)
+                self._emit_check_failed(plugin, plugin_diagnostics)
+                lock_entries.append(_lock_entry(plugin, enabled=False, compatibility_status="status_mismatch"))
+                continue
             plugin_diagnostics = check_plugin(plugin, status=status)
             if plugin.manifest.id in duplicates:
                 plugin_diagnostics.append(
@@ -116,9 +145,29 @@ class PluginRuntime:
                 diagnostics.extend(result.diagnostics)
                 lock_entries.append(_lock_entry(plugin, enabled=True, compatibility_status="load_failed"))
                 continue
+            registered_tool_count = 0
             for contribution in result.contribution_set.tools:
+                admission_diagnostic = _admit_tool_contribution(
+                    plugin,
+                    status=status,
+                    contribution=contribution,
+                    policy_runtime=policy_runtime,
+                )
+                if admission_diagnostic is not None:
+                    diagnostics.append(admission_diagnostic)
+                    self._emit_check_failed(plugin, [admission_diagnostic])
+                    continue
                 try:
-                    registry.register(contribution.spec)
+                    registry.register(
+                        contribution.spec,
+                        origin=_tool_origin(plugin, status=status, contribution=contribution),
+                        admitted=True,
+                        admission_reason="plugin_contribution_admitted",
+                        metadata={
+                            "manifest_path": str(plugin.manifest_path),
+                            "plugin_policy_gate": policy_runtime is not None,
+                        },
+                    )
                 except Exception as exc:
                     diagnostic = PluginDiagnostic(
                         plugin_id=plugin.manifest.id,
@@ -131,6 +180,7 @@ class PluginRuntime:
                     diagnostics.append(diagnostic)
                     self._emit_check_failed(plugin, [diagnostic])
                     continue
+                registered_tool_count += 1
                 self._emit(
                     TraceEventType.PLUGIN_TOOL_REGISTERED,
                     plugin,
@@ -147,7 +197,10 @@ class PluginRuntime:
                 TraceEventType.PLUGIN_ACTIVATED,
                 plugin,
                 summary=f"Activated plugin {plugin.manifest.id}.",
-                payload={"tool_count": len(result.contribution_set.tools)},
+                payload={
+                    "tool_count": registered_tool_count,
+                    "contribution_count": len(result.contribution_set.tools),
+                },
             )
             lock_entries.append(_lock_entry(plugin, enabled=True, compatibility_status="compatible"))
 
@@ -246,6 +299,205 @@ class PluginRuntime:
             },
             severity=severity,
         )
+
+
+_HIGH_RISK_PLUGIN_PERMISSIONS = {
+    PluginPermission.READ_OUTSIDE_WORKSPACE,
+    PluginPermission.WRITE_WORKSPACE,
+    PluginPermission.EXECUTE_COMMAND,
+    PluginPermission.NETWORK_ACCESS,
+    PluginPermission.READ_ENV,
+    PluginPermission.CHANGE_CONFIG,
+}
+
+
+def _admit_tool_contribution(
+    plugin: DiscoveredPlugin,
+    *,
+    status: PluginStatus,
+    contribution: PluginToolContribution,
+    policy_runtime: PolicyRuntime | None,
+) -> PluginDiagnostic | None:
+    spec = contribution.spec
+    if contribution.plugin_id != plugin.manifest.id:
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_identity_mismatch",
+            "Plugin tool contribution plugin_id does not match the manifest.",
+        )
+    if contribution.exposed_name != spec.name:
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_name_mismatch",
+            "Plugin tool contribution exposed_name must match ToolSpec.name.",
+        )
+    try:
+        required_permissions = ensure_permission_subset(
+            plugin_id=plugin.manifest.id,
+            declared=plugin.manifest.permissions,
+            requested=contribution.required_permissions,
+        )
+    except Exception as exc:
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_permission_not_declared",
+            str(exc),
+            details={"type": type(exc).__name__},
+        )
+    try:
+        ensure_permission_subset(
+            plugin_id=plugin.manifest.id,
+            declared=status.approved_permissions,
+            requested=required_permissions,
+        )
+    except Exception as exc:
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_permission_not_approved",
+            str(exc),
+            details={"type": type(exc).__name__},
+        )
+    derived_permissions = permissions_for_tool(
+        permission_level=spec.permission_level,
+        capabilities=spec.capabilities,
+        operation=spec.operation,
+        side_effects=spec.side_effects,
+    )
+    missing_from_contribution = sorted(
+        permission.value for permission in set(derived_permissions) - set(required_permissions)
+    )
+    if missing_from_contribution:
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_permission_shape_mismatch",
+            "ToolSpec permission shape requires permissions not declared by the contribution.",
+            details={"missing_permissions": missing_from_contribution},
+        )
+    schema = spec.input_model.model_json_schema()
+    if not isinstance(schema, dict) or schema.get("type", "object") != "object":
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_schema_invalid",
+            "Plugin tool schema root must be an object.",
+        )
+    if schema.get("additionalProperties") is not False:
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_schema_allows_extra_properties",
+            "Plugin tool schema must forbid root additionalProperties.",
+        )
+    risk_tags = set(spec.risk_tags)
+    if "plugin" not in risk_tags or f"plugin:{plugin.manifest.id}" not in risk_tags:
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_risk_tags_missing",
+            "Plugin tool must carry plugin risk tags.",
+        )
+    plugin_profile = spec.approval_profile.get("plugin")
+    if not isinstance(plugin_profile, dict) or plugin_profile.get("plugin_id") != plugin.manifest.id:
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_approval_profile_missing",
+            "Plugin tool must carry a plugin approval profile.",
+        )
+    if _has_high_risk_permissions(required_permissions) and not _has_high_risk_gate(
+        policy_runtime=policy_runtime,
+        approval_profile=spec.approval_profile,
+    ):
+        return _contribution_error(
+            plugin,
+            contribution,
+            "plugin_tool_high_risk_gate_required",
+            "High-risk plugin tool permissions require a policy gate or explicit approval profile.",
+        )
+    return None
+
+
+def _tool_origin(
+    plugin: DiscoveredPlugin,
+    *,
+    status: PluginStatus,
+    contribution: PluginToolContribution,
+) -> ToolOrigin:
+    return ToolOrigin(
+        kind=ToolOriginKind.PLUGIN,
+        plugin_id=plugin.manifest.id,
+        local_tool_name=contribution.local_name,
+        exposed_name=contribution.exposed_name,
+        manifest_hash=plugin.manifest_hash,
+        source_path=_plugin_source_path(plugin),
+        required_permissions=_permission_values(contribution.required_permissions),
+        approved_permissions=_permission_values(status.approved_permissions),
+        activation_hash=_stable_digest(plugin.manifest.activation),
+        schema_digest=_stable_digest(contribution.spec.input_model.model_json_schema()),
+    )
+
+
+def _contribution_error(
+    plugin: DiscoveredPlugin,
+    contribution: PluginToolContribution,
+    code: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> PluginDiagnostic:
+    return PluginDiagnostic(
+        plugin_id=plugin.manifest.id,
+        severity=PluginDiagnosticSeverity.ERROR,
+        code=code,
+        message=message,
+        path=str(plugin.manifest_path),
+        details={
+            "tool_name": contribution.exposed_name,
+            "local_tool_name": contribution.local_name,
+            **(details or {}),
+        },
+    )
+
+
+def _has_high_risk_permissions(permissions: tuple[PluginPermission, ...]) -> bool:
+    return bool(set(permissions) & _HIGH_RISK_PLUGIN_PERMISSIONS)
+
+
+def _has_high_risk_gate(
+    *,
+    policy_runtime: PolicyRuntime | None,
+    approval_profile: dict[str, Any],
+) -> bool:
+    if policy_runtime is not None:
+        return True
+    return bool(
+        approval_profile.get("requires_approval")
+        or approval_profile.get("approval_required")
+        or approval_profile.get("requires_review")
+        or approval_profile.get("plugin_high_risk_allowed")
+    )
+
+
+def _permission_values(permissions: tuple[PluginPermission, ...]) -> tuple[str, ...]:
+    return tuple(permission.value for permission in permissions)
+
+
+def _stable_digest(payload: Any) -> str:
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _plugin_source_path(plugin: DiscoveredPlugin) -> str:
+    try:
+        entrypoint, _callable_name = resolve_entrypoint_path(plugin)
+    except Exception:
+        return str(plugin.manifest_path)
+    return str(entrypoint)
 
 
 def _has_error(diagnostics: list[PluginDiagnostic]) -> bool:

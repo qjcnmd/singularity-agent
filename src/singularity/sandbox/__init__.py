@@ -3,8 +3,10 @@ from singularity.sandbox.backends import (
     DockerSandboxBackend,
     LocalStagingBackend,
     SandboxBackend,
+    WindowsRestrictedTokenBackend,
     default_sandbox_backends,
     docker_backend_available,
+    windows_restricted_token_available,
 )
 from singularity.sandbox.environment import SandboxEnvironmentBuilder
 from singularity.sandbox.exceptions import (
@@ -73,7 +75,9 @@ __all__ = [
     "SandboxUnavailable",
     "SandboxViolation",
     "SandboxViolationError",
+    "WindowsRestrictedTokenBackend",
     "default_sandbox_profile",
     "default_sandbox_backends",
     "docker_backend_available",
+    "windows_restricted_token_available",
 ]

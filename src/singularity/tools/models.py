@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
@@ -38,6 +41,12 @@ class ToolExecutionBackendKind(str, Enum):
     DELEGATED_COMMAND_RUNTIME = "delegated_command_runtime"
     DELEGATED_VERIFICATION_RUNTIME = "delegated_verification_runtime"
     EXTERNAL_PROCESS = "external_process"
+
+
+class ToolOriginKind(str, Enum):
+    BUILTIN = "builtin"
+    PLUGIN = "plugin"
+    FUTURE_MCP = "future_mcp"
 
 
 class ToolCachePolicy(BaseModel):
@@ -95,6 +104,103 @@ class ToolExecutionRecord(BaseModel):
     status: str
     error_code: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolOrigin(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ToolOriginKind = ToolOriginKind.BUILTIN
+    plugin_id: str | None = None
+    local_tool_name: str | None = None
+    exposed_name: str | None = None
+    manifest_hash: str | None = None
+    source_path: str | None = None
+    required_permissions: tuple[str, ...] = ()
+    approved_permissions: tuple[str, ...] = ()
+    activation_hash: str | None = None
+    schema_digest: str | None = None
+
+
+@dataclass(frozen=True)
+class RegisteredToolRecord:
+    spec: "ToolSpec"
+    origin: ToolOrigin = field(default_factory=ToolOrigin)
+    admitted: bool = True
+    admission_reason: str = "registered"
+    diagnostics: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ToolExecutionRequest:
+    tool_call_id: str | None
+    tool_name: str
+    raw_arguments: str
+    normalized_arguments: dict[str, Any] = field(default_factory=dict)
+    batch_id: str | None = None
+    run_id: str | None = None
+    session_id: str | None = None
+    task_id: str | None = None
+    phase_id: str | None = None
+    model_request_id: str | None = None
+    model_response_id: str | None = None
+    argument_digest: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.tool_name = str(self.tool_name or "<unknown>")
+        self.raw_arguments = _raw_arguments_text(self.raw_arguments)
+        self.normalized_arguments = dict(self.normalized_arguments or {})
+        self.metadata = dict(self.metadata or {})
+        if not self.argument_digest:
+            self.argument_digest = _execution_argument_digest(
+                self.normalized_arguments if self.normalized_arguments else self.raw_arguments
+            )
+
+    @classmethod
+    def from_provider_tool_call(cls, tool_call: dict[str, Any]) -> "ToolExecutionRequest":
+        function = tool_call.get("function") if isinstance(tool_call, dict) else {}
+        function = function if isinstance(function, dict) else {}
+        return cls(
+            tool_call_id=str(tool_call.get("id") or "") if isinstance(tool_call, dict) else None,
+            tool_name=str(function.get("name") or "<unknown>"),
+            raw_arguments=_raw_arguments_text(function.get("arguments") or "{}"),
+        )
+
+    @classmethod
+    def from_envelope(
+        cls,
+        envelope: Any,
+        *,
+        batch: Any | None = None,
+    ) -> "ToolExecutionRequest":
+        metadata = dict(getattr(envelope, "metadata", {}) or {})
+        batch_id = getattr(batch, "batch_id", None) or metadata.get("batch_id")
+        return cls(
+            tool_call_id=getattr(envelope, "tool_call_id", None),
+            tool_name=str(getattr(envelope, "tool_name", "") or "<unknown>"),
+            raw_arguments=_raw_arguments_text(getattr(envelope, "raw_arguments", "{}")),
+            normalized_arguments=dict(getattr(envelope, "normalized_arguments", {}) or {}),
+            batch_id=str(batch_id) if batch_id else None,
+            run_id=str(getattr(envelope, "run_id", "") or getattr(batch, "run_id", "") or "") or None,
+            session_id=str(getattr(envelope, "session_id", "") or getattr(batch, "session_id", "") or "") or None,
+            task_id=str(getattr(envelope, "task_id", "") or getattr(batch, "task_id", "") or "") or None,
+            phase_id=str(getattr(envelope, "phase_id", "") or getattr(batch, "phase_id", "") or "") or None,
+            model_request_id=str(
+                getattr(envelope, "model_request_id", "")
+                or getattr(batch, "model_request_id", "")
+                or ""
+            )
+            or None,
+            model_response_id=str(
+                getattr(envelope, "model_response_id", "")
+                or getattr(batch, "model_response_id", "")
+                or ""
+            )
+            or None,
+            argument_digest=str(getattr(envelope, "argument_digest", "") or ""),
+            metadata=metadata,
+        )
 
 
 class ToolError(BaseModel):
@@ -267,3 +373,14 @@ def _default_side_effects(permission: PermissionLevel) -> ToolSideEffectKind:
     if permission in {PermissionLevel.SHELL, PermissionLevel.GIT}:
         return ToolSideEffectKind.EXECUTE_COMMAND
     return ToolSideEffectKind.READ_WORKSPACE
+
+
+def _raw_arguments_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value if value is not None else {}, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _execution_argument_digest(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
