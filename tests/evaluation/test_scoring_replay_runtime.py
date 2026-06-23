@@ -531,6 +531,50 @@ def test_evaluation_report_includes_golden_contract_evidence(tmp_path: Path) -> 
     assert "python -m pytest tests/test_quicksort.py" in markdown
 
 
+@pytest.mark.parametrize(
+    "assertion",
+    [
+        "file_exists:../outside.txt",
+        "file_contains:../outside.txt:secret",
+        "json:../outside.json:key:secret",
+        "json:config.json:missing:value",
+        "file_contains:missing_parts",
+    ],
+)
+def test_evaluation_assertions_fail_closed(tmp_path: Path, assertion: str) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    (tmp_path / "outside.json").write_text('{"key": "secret"}\n', encoding="utf-8")
+    (project / "config.json").write_text('{"key": "value"}\n', encoding="utf-8")
+    task = BenchmarkTask(
+        task_id="task.outside_assertion",
+        version="v1",
+        title="Reject outside assertion path",
+        input_prompt="Check assertion path containment.",
+        workspace_snapshot=WorkspaceSnapshot(kind=WorkspaceSnapshotKind.GIT_REF, git_ref="HEAD"),
+        expected_outcomes=[
+            ExpectedOutcome(
+                kind=ExpectedOutcomeKind.ASSERTION,
+                weight=1.0,
+                assertion=assertion,
+            )
+        ],
+        tags=["easy"],
+    )
+
+    report = EvaluationRuntime(project_root=project).run_suite(
+        tasks=[task],
+        profiles=[EvaluationProfile(name="baseline", model="gpt-a")],
+        execute=False,
+    )
+
+    assertions = report.profile_reports[0].task_results[0].execution_evidence["assertions"]
+    assert assertions["failed"] == 1
+    assert assertions["results"][0]["passed"] is False
+
+
 def test_regression_report_binds_each_regression_to_trace_artifact_ref(tmp_path: Path) -> None:
     task = _contract_task("phase1j.modify_bug_test_pass")
     baseline = EvaluationRuntime(project_root=tmp_path).run_suite(

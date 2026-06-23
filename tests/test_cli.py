@@ -1,6 +1,9 @@
 import json
+import os
+from hashlib import sha256
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from singularity.cli import app, _run_live_quicksort_benchmark
@@ -324,6 +327,35 @@ def test_eval_live_quicksort_uses_kernel_and_independent_smoke(monkeypatch, tmp_
     assert result["status"] == "completed"
     assert Path(result["workspace"], "quicksort.py").exists()
     assert result["independent_smoke"]["exit_code"] == 0
+
+
+@pytest.mark.live_provider
+def test_eval_live_quicksort_real_provider_opt_in(tmp_path: Path) -> None:
+    if os.getenv("SINGULARITY_RUN_LIVE_PROVIDER_EVAL") != "1":
+        pytest.skip("set SINGULARITY_RUN_LIVE_PROVIDER_EVAL=1 to run live provider eval")
+    required = ["SINGULARITY_API_KEY", "SINGULARITY_MODEL", "SINGULARITY_BASE_URL"]
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        pytest.skip(f"missing live provider environment: {', '.join(missing)}")
+
+    result = _run_live_quicksort_benchmark(
+        output_dir=tmp_path / "live",
+        run_id="live_provider",
+        max_turns=12,
+        model=None,
+        base_url=None,
+    )
+
+    payload = json.dumps(result, ensure_ascii=False, default=str)
+    api_key = os.environ["SINGULARITY_API_KEY"]
+    assert result["ok"] is True
+    assert result["independent_smoke"]["exit_code"] == 0
+    assert "SINGULARITY_API_KEY" not in payload
+    leaked_api_key = api_key in payload
+    api_key_fingerprint = sha256(api_key.encode()).hexdigest()
+    assert (
+        not leaked_api_key
+    ), f"live benchmark payload leaked api key sha256={api_key_fingerprint}"
 
 
 def test_cli_converts_kernel_cancellation_to_exit(monkeypatch, tmp_path: Path) -> None:

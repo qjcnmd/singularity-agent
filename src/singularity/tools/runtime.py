@@ -799,10 +799,13 @@ class ToolRuntime:
     ) -> tuple[ToolResult, str]:
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(spec.handler, validated_args)
+        shutdown_wait = True
         try:
             output = future.result(timeout=spec.timeout_seconds)
         except FutureTimeout:
             future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            shutdown_wait = False
             result = ToolResult.failure(
                 code="timeout",
                 message=f"Tool timed out after {spec.timeout_seconds} seconds.",
@@ -837,7 +840,8 @@ class ToolRuntime:
             )
             return result, self._result_digest(result)
         finally:
-            executor.shutdown(wait=True, cancel_futures=True)
+            if shutdown_wait:
+                executor.shutdown(wait=True, cancel_futures=True)
 
         return self._handler_output_to_result(spec, output, handler_isolation="thread")
 

@@ -26,7 +26,9 @@ from singularity.observability.models import TraceArtifactKind, TraceEventType
 from singularity.verification.models import CheckKind, VerificationCheck
 from singularity.verification.runtime import VerificationRuntime
 from singularity.workspace import MutationRuntime
+from singularity.workspace.errors import MutationError
 from singularity.workspace.operations import CreateFile
+from singularity.workspace.pathing import WorkspacePathResolver
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,7 @@ class EvaluationTaskExecutor:
         self.verification_runtime = verification_runtime
         self.mutation_runtime = mutation_runtime
         self.trace_runtime = trace_runtime
+        self.path_resolver = WorkspacePathResolver(self.project_root)
 
     def evaluate(
         self,
@@ -494,25 +497,37 @@ class EvaluationTaskExecutor:
         }
 
     def _evaluate_assertion(self, expression: str) -> bool:
-        if not expression:
-            return False
-        if expression.startswith("file_exists:"):
-            return (self.project_root / expression.removeprefix("file_exists:").strip()).exists()
-        if expression.startswith("file_contains:"):
-            _, path, needle = expression.split(":", 2)
-            target = self.project_root / path.strip()
-            return target.exists() and needle in target.read_text(encoding="utf-8")
-        if expression.startswith("json:"):
-            _, path, key, expected = expression.split(":", 3)
-            target = self.project_root / path.strip()
-            if not target.exists():
+        try:
+            if not expression:
                 return False
-            payload = json.loads(target.read_text(encoding="utf-8"))
-            value: Any = payload
-            for part in key.split("."):
-                value = value[part]
-            return str(value) == expected
+            if expression.startswith("file_exists:"):
+                target = self._resolve_assertion_path(expression.removeprefix("file_exists:"))
+                return bool(target and target.exists())
+            if expression.startswith("file_contains:"):
+                _, path, needle = expression.split(":", 2)
+                target = self._resolve_assertion_path(path)
+                if target is None:
+                    return False
+                return target.exists() and needle in target.read_text(encoding="utf-8")
+            if expression.startswith("json:"):
+                _, path, key, expected = expression.split(":", 3)
+                target = self._resolve_assertion_path(path)
+                if target is None or not target.exists():
+                    return False
+                payload = json.loads(target.read_text(encoding="utf-8"))
+                value: Any = payload
+                for part in key.split("."):
+                    value = value[part]
+                return str(value) == expected
+        except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return False
         return False
+
+    def _resolve_assertion_path(self, path: str) -> Path | None:
+        try:
+            return self.path_resolver.resolve(path.strip()).path
+        except MutationError:
+            return None
 
 
 class EvaluationArtifactWriter:

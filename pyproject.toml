@@ -43,6 +43,9 @@ sg = "singularity.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live_provider: opt-in tests that call a real configured model provider",
+]
 norecursedirs = [
     ".git",
     ".singularity",

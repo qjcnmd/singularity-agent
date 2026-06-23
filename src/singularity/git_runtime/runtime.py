@@ -156,16 +156,24 @@ class GitRuntime:
         allow_empty: bool = False,
     ) -> GitCommitResult:
         files = self._normalize_paths(paths)
-        add_args = ["add", "--", *files] if files else ["add", "-A"]
-        added = self._run(add_args)
-        if added.returncode != 0:
+        if files:
+            added = self._run(["add", "--", *files])
+            if added.returncode != 0:
+                return GitCommitResult(
+                    ok=False,
+                    message=message,
+                    files=files,
+                    exit_code=added.returncode,
+                    stdout=added.stdout,
+                    stderr=added.stderr,
+                )
+        elif not allow_empty:
             return GitCommitResult(
                 ok=False,
                 message=message,
-                files=files,
-                exit_code=added.returncode,
-                stdout=added.stdout,
-                stderr=added.stderr,
+                files=[],
+                exit_code=2,
+                stderr="Explicit paths are required; refusing to stage the entire workspace.",
             )
         commit_args = ["commit", "-m", message]
         if allow_empty:

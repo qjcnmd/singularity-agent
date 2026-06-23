@@ -67,6 +67,51 @@ def test_git_runtime_reports_status_diff_and_local_commit(tmp_path: Path) -> Non
     assert diff.paths == ["example.txt"]
 
 
+def test_git_runtime_commit_requires_explicit_paths(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    runtime = GitRuntime(repo)
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    (repo / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+
+    result = runtime.commit("unsafe default")
+
+    assert result.ok is False
+    assert result.exit_code == 2
+    assert "Explicit paths are required" in result.stderr
+    status = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "?? tracked.txt" in status.stdout
+    assert "?? untracked.txt" in status.stdout
+
+
+def test_git_runtime_allow_empty_does_not_stage_untracked_paths(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    runtime = GitRuntime(repo)
+    (repo / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+
+    result = runtime.commit("empty commit", allow_empty=True)
+
+    assert result.ok is True
+    assert result.commit
+    status = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "?? untracked.txt" in status.stdout
+
+
 def test_git_cli_status_and_diff_json(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
