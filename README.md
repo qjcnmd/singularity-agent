@@ -56,6 +56,8 @@ Runtime names tracked by Documentation Runtime:
 - `CLI`
 - `KernelBootstrap`
 - `AgentKernel`
+- `RuntimeHost`
+- `SessionRuntime`
 - `SingularityAgent`
 - `PlannerRuntime`
 - `ContextManager`
@@ -107,7 +109,8 @@ Runtime names tracked by Documentation Runtime:
 | `MemorySyncRuntime` | implemented | file-backed memory bundle export/import in `src/singularity/memory/sync.py`; remote entries import as reviewable candidates by default |
 | `FinalReport` | implemented | kernel: `src/singularity/kernel/finalization.py`; planner: `src/singularity/planner/models.py` |
 | `EvaluationRuntime` | implemented | `src/singularity/evaluation/runtime.py` |
-| Desktop RuntimeHost / Rust Core / Tauri UI | planned | documented in `docs/architecture/runtime-host-transition.md` and ADRs, not implemented in this Python CLI baseline |
+| Python RuntimeHost facade | implemented | `src/singularity/runtime_host/` wraps `KernelBootstrap` / `AgentKernel`, projects `RunEvent` / `ApprovalEvent` / `ToolCallEvent`, reads artifacts by opaque ref, and is covered by `tests/test_runtime_host.py` |
+| RuntimeHost daemon / Rust Core / Tauri UI | planned | documented in `docs/architecture/runtime-host-transition.md` and ADRs; HTTP, WebSocket, JSON-RPC, Rust, and Tauri are not implemented in this Python CLI baseline |
 | web search / multi-agent execution | planned | intentionally not implemented in this release |
 
 Singularity implements `GitRuntime` as a local-only status/diff/commit wrapper, `RemoteApprovalRuntime` as a file-backed request/grant exchange, `MemorySyncRuntime` as a file-backed bundle exchange, and `ParallelToolExecutor` for read-only idempotent tool groups. It still does not implement web search or multi-agent execution in this release. Sandbox execution prefers `DockerSandboxBackend` as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps `LocalStagingBackend` for local copy-on-write staging. A request that requires hard isolation fails closed, and the runtime records `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` capability evidence in task state so sandbox downgrade never silently becomes a production isolation claim.

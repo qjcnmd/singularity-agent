@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import time
+import difflib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,14 @@ from uuid import uuid4
 from rich.console import Console
 
 from singularity.config import ProductionRuntimeConfig, adaptive_default_max_turns
+from singularity.evaluation.models import (
+    BenchmarkAdapterKind,
+    BenchmarkTask,
+    BenchmarkVisibility,
+    ExpectedOutcomeKind,
+    WorkspaceSnapshotKind,
+)
+from singularity.evaluation.store import GoldenTaskStore
 from singularity.interaction import InteractionMode
 from singularity.observability.redaction import TraceRedactor
 from singularity.policy import ApprovalMode, SecurityMode
@@ -187,6 +196,9 @@ class LiveEvalTaskResult:
     error_summary: str
     workspace: str
     trace: str
+    verification_workspace: str = ""
+    patch: dict[str, Any] = field(default_factory=dict)
+    checks: dict[str, Any] = field(default_factory=dict)
     verification: CommandEvalResult | None = None
     request_cache_hit_rates: dict[str, float] = field(default_factory=dict)
 
@@ -206,9 +218,61 @@ class LiveEvalTaskResult:
             "error_summary": self.error_summary,
             "workspace": self.workspace,
             "trace": self.trace,
+            "verification_workspace": self.verification_workspace,
+            "patch": self.patch,
+            "checks": self.checks,
             "verification": self.verification.to_dict() if self.verification else None,
             "request_cache_hit_rates": dict(sorted(self.request_cache_hit_rates.items())),
         }
+
+
+class SingularityPrivateBenchmarkAdapter:
+    def load(self, path: Path | str) -> LiveEvalManifest:
+        task_path = Path(path)
+        tasks = [
+            self._convert(task)
+            for task in GoldenTaskStore(task_path).load()
+            if task.adapter == BenchmarkAdapterKind.SINGULARITY_PRIVATE
+            and task.visibility == BenchmarkVisibility.PRIVATE
+        ]
+        if not tasks:
+            raise ValueError("No private Singularity benchmark tasks found.")
+        return LiveEvalManifest(tasks=tasks, base_dir=task_path.parent.resolve(strict=False))
+
+    def _convert(self, task: BenchmarkTask) -> LiveEvalTask:
+        command = _first_test_command(task)
+        if not command:
+            raise ValueError(f"Private benchmark task {task.task_id} requires a test expected_outcome.")
+        metadata = dict(task.input.metadata)
+        if task.workspace_snapshot.kind == WorkspaceSnapshotKind.INLINE_FILES:
+            workspace = LiveEvalWorkspace(kind="fixture", files=dict(task.workspace_snapshot.inline_files))
+        elif task.workspace_snapshot.kind == WorkspaceSnapshotKind.GIT_REF:
+            repo_path = metadata.get("repo_path") or metadata.get("repo")
+            if not repo_path:
+                raise ValueError(
+                    f"Private git_ref benchmark task {task.task_id} requires input.metadata.repo_path."
+                )
+            workspace = LiveEvalWorkspace(
+                kind="repo",
+                path=str(repo_path),
+                start_commit=task.workspace_snapshot.git_ref,
+            )
+        else:
+            raise ValueError(
+                f"Private benchmark task {task.task_id} uses unsupported snapshot kind: "
+                f"{task.workspace_snapshot.kind.value}"
+            )
+        return LiveEvalTask(
+            task_id=task.task_id,
+            workspace=workspace,
+            user_task=task.input.prompt,
+            allowed_paths=_allowed_paths_for_task(task, metadata),
+            verification_command=command,
+            success={"type": "verification_exit_code", "exit_code": 0},
+            verification_prepare_commands=[
+                str(command) for command in metadata.get("verification_prepare_commands") or []
+            ],
+        )
 
 
 class LiveAgentEvalRunner:
@@ -263,6 +327,8 @@ class LiveAgentEvalRunner:
         workspace = task_dir / "workspace"
         trace_path = ""
         verification: CommandEvalResult | None = None
+        public_verification: CommandEvalResult | None = None
+        hidden_verification: CommandEvalResult | None = None
         files_changed: list[str] = []
         errors: list[str] = []
         usage: dict[str, Any] = {}
@@ -271,6 +337,11 @@ class LiveAgentEvalRunner:
         tests_passed = False
         kernel = None
         before_snapshot: dict[str, str] = {}
+        before_text_snapshot: dict[str, str] = {}
+        baseline_workspace = task_dir / "baseline-workspace"
+        verification_workspace = task_dir / "verification-workspace"
+        patch_payload: dict[str, Any] = {}
+        checks: dict[str, Any] = {}
         try:
             _reset_dir(task_dir, root=self.run_dir)
             self._materialize_workspace(task, workspace=workspace, manifest_base=manifest_base)
@@ -284,15 +355,20 @@ class LiveAgentEvalRunner:
                         trace=trace_path,
                         started=started,
                         verification=prepared,
+                        verification_workspace=verification_workspace,
                         files_changed=[],
                         usage={},
                         tool_calls=0,
                         errors=errors,
+                        patch={},
+                        checks=_checks_payload(None, prepared),
                         success=False,
                         tests_passed=False,
                         infrastructure_blocked=False,
                     )
             before_snapshot = _snapshot_files(workspace)
+            before_text_snapshot = _read_text_files(workspace)
+            shutil.copytree(workspace, baseline_workspace, ignore=_copy_ignore)
             goal = _task_goal(task)
             config = ProductionRuntimeConfig.from_cli(
                 project_root=workspace,
@@ -324,59 +400,103 @@ class LiveAgentEvalRunner:
             if _infrastructure_blocked(agent_result, usage=usage, tool_calls=tool_calls):
                 errors.append("infrastructure blocked: model provider unavailable")
                 files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
+                patch_payload = _patch_payload(before_text_snapshot, workspace)
                 return self._task_result(
                     task=task,
                     workspace=workspace,
                     trace=trace_path,
                     started=started,
                     verification=None,
+                    verification_workspace=verification_workspace,
                     files_changed=files_changed,
                     usage=usage,
                     tool_calls=tool_calls,
                     errors=errors,
+                    patch=patch_payload,
+                    checks=_checks_payload(None, None),
                     success=False,
                     tests_passed=False,
                     infrastructure_blocked=True,
                 )
             files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
+            patch_payload = _patch_payload(before_text_snapshot, workspace)
+            applicable = _prepare_verification_workspace(
+                source_workspace=workspace,
+                verification_workspace=verification_workspace,
+                baseline_workspace=baseline_workspace,
+                before_snapshot=before_text_snapshot,
+                root=task_dir,
+            )
+            patch_payload["applicable"] = applicable
+            if task.verification_prepare_commands:
+                public_verification = CommandEvalResult(
+                    command=task.verification_command,
+                    exit_code=0,
+                    duration_seconds=0.0,
+                    error_summary="hidden verifier only",
+                )
+            else:
+                public_verification = _run_shell(
+                    task.verification_command,
+                    cwd=verification_workspace,
+                    timeout_seconds=task.verification_timeout_seconds,
+                    redactor=self.redactor,
+                )
             for command in task.verification_prepare_commands:
-                prepared = _run_shell(command, cwd=workspace, timeout_seconds=120, redactor=self.redactor)
+                prepared = _run_shell(command, cwd=verification_workspace, timeout_seconds=120, redactor=self.redactor)
                 if not prepared.passed:
                     errors.append(f"verification prepare failed: {prepared.error_summary or command}")
+                    checks = _checks_payload(public_verification, prepared)
                     return self._task_result(
                         task=task,
                         workspace=workspace,
                         trace=trace_path,
                         started=started,
                         verification=prepared,
+                        verification_workspace=verification_workspace,
                         files_changed=files_changed,
                         usage=usage,
                         tool_calls=tool_calls,
                         errors=errors,
+                        patch=patch_payload,
+                        checks=checks,
                         success=False,
                         tests_passed=False,
                         infrastructure_blocked=False,
                     )
-            verification = _run_shell(
+            hidden_verification = _run_shell(
                 task.verification_command,
-                cwd=workspace,
+                cwd=verification_workspace,
                 timeout_seconds=task.verification_timeout_seconds,
                 redactor=self.redactor,
             )
+            verification = hidden_verification
+            checks = _checks_payload(public_verification, hidden_verification)
             tests_passed = verification.passed
             allowed_ok = _allowed_scope_ok(files_changed, task.allowed_paths)
-            criterion_ok = _success_criterion_ok(task.success, verification=verification, workspace=workspace)
+            criterion_ok = _success_criterion_ok(task.success, verification=verification, workspace=verification_workspace)
             agent_status = getattr(agent_result.status, "value", agent_result.status)
             agent_completed = agent_status == "completed"
             if not agent_completed:
                 errors.append(f"agent status: {getattr(agent_result.status, 'value', agent_result.status)}")
             if not tests_passed:
                 errors.append(f"verification failed: {verification.error_summary or verification.command}")
+            if not public_verification.passed:
+                errors.append(f"public verification failed: {public_verification.error_summary or public_verification.command}")
+            if not patch_payload.get("applicable"):
+                errors.append("patch could not be applied to clean verification workspace")
             if not allowed_ok:
                 errors.append("changed files outside allowed_paths")
             if not criterion_ok:
                 errors.append("success criterion failed")
-            success_ok = bool(agent_completed and tests_passed and allowed_ok and criterion_ok)
+            success_ok = bool(
+                agent_completed
+                and tests_passed
+                and public_verification.passed
+                and patch_payload.get("applicable")
+                and allowed_ok
+                and criterion_ok
+            )
         except Exception as exc:
             errors.append(self.redactor.redact_text(str(exc)) or type(exc).__name__)
         finally:
@@ -389,10 +509,13 @@ class LiveAgentEvalRunner:
             trace=trace_path,
             started=started,
             verification=verification,
+            verification_workspace=verification_workspace,
             files_changed=files_changed,
             usage=usage,
             tool_calls=tool_calls,
             errors=errors,
+            patch=patch_payload,
+            checks=checks,
             success=success_ok,
             tests_passed=tests_passed,
             infrastructure_blocked=False,
@@ -423,10 +546,13 @@ class LiveAgentEvalRunner:
         trace: str,
         started: float,
         verification: CommandEvalResult | None,
+        verification_workspace: Path,
         files_changed: list[str],
         usage: dict[str, Any],
         tool_calls: int,
         errors: list[str],
+        patch: dict[str, Any],
+        checks: dict[str, Any],
         success: bool,
         tests_passed: bool,
         infrastructure_blocked: bool,
@@ -447,6 +573,9 @@ class LiveAgentEvalRunner:
             error_summary=self.redactor.redact_text("; ".join(dict.fromkeys(errors)))[:1000],
             workspace=str(workspace),
             trace=trace,
+            verification_workspace=str(verification_workspace) if verification_workspace else "",
+            patch=patch or {"diff": "", "applicable": False, "changed_files": []},
+            checks=checks or _checks_payload(None, verification),
             verification=verification,
             request_cache_hit_rates=request_rates,
         )
@@ -488,6 +617,16 @@ def summarize_live_results(results: list[LiveEvalTaskResult]) -> dict[str, Any]:
         "run_cache_hit_rate": _rate(cached_tokens, prompt_tokens),
         "tool_calls": sum(result.tool_calls for result in results),
     }
+
+
+class SweBenchAdapter:
+    def load(self, _path: Path | str) -> LiveEvalManifest:
+        raise NotImplementedError("SWE-bench adapter boundary is reserved; use SingularityPrivateBenchmarkAdapter today.")
+
+
+class TerminalBenchAdapter:
+    def load(self, _path: Path | str) -> LiveEvalManifest:
+        raise NotImplementedError("Terminal-Bench adapter boundary is reserved; use SingularityPrivateBenchmarkAdapter today.")
 
 
 def _score_status(*, task_count: int, scored_task_count: int, infrastructure_blocked_count: int) -> str:
@@ -603,6 +742,100 @@ def _run_shell(command: str, *, cwd: Path, timeout_seconds: int, redactor: Trace
         )
 
 
+def _patch_payload(before_snapshot: dict[str, str], workspace: Path) -> dict[str, Any]:
+    after = _read_text_files(workspace)
+    paths = sorted(path for path in set(before_snapshot) | set(after) if before_snapshot.get(path, "") != after.get(path, ""))
+    diff_lines: list[str] = []
+    for path in paths:
+        old = before_snapshot.get(path, "").splitlines(keepends=True)
+        new = after.get(path, "").splitlines(keepends=True)
+        diff_lines.extend(
+            difflib.unified_diff(
+                old,
+                new,
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+                lineterm="",
+            )
+        )
+    return {
+        "schema_version": "evaluation.patch/v1",
+        "changed_files": paths,
+        "diff": "\n".join(diff_lines),
+        "applicable": False,
+    }
+
+
+def _prepare_verification_workspace(
+    *,
+    source_workspace: Path,
+    verification_workspace: Path,
+    baseline_workspace: Path,
+    before_snapshot: dict[str, str],
+    root: Path,
+) -> bool:
+    _reset_dir(verification_workspace, root=root)
+    if baseline_workspace.exists():
+        for source_file in baseline_workspace.rglob("*"):
+            if not source_file.is_file():
+                continue
+            relative = source_file.relative_to(baseline_workspace).as_posix()
+            if _skip_path(relative):
+                continue
+            target = _workspace_path(verification_workspace, relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_file, target)
+    if _read_text_files(verification_workspace) != before_snapshot:
+        return False
+    after = _read_text_files(source_workspace)
+    for path in sorted(set(before_snapshot) | set(after)):
+        target = _workspace_path(verification_workspace, path)
+        if path not in after:
+            if target.exists():
+                target.unlink()
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(after[path], encoding="utf-8")
+    return _read_text_files(verification_workspace) == after
+
+
+def _checks_payload(
+    public: CommandEvalResult | None,
+    hidden: CommandEvalResult | None,
+) -> dict[str, Any]:
+    return {
+        "public": _check_payload(public),
+        "hidden": _check_payload(hidden),
+    }
+
+
+def _check_payload(result: CommandEvalResult | None) -> dict[str, Any]:
+    if result is None:
+        return {"passed": False, "status": "not_run"}
+    payload = result.to_dict()
+    payload["status"] = "passed" if result.passed else "failed"
+    return payload
+
+
+def _first_test_command(task: BenchmarkTask) -> str:
+    for outcome in task.expected_outcomes:
+        if outcome.kind == ExpectedOutcomeKind.TEST and outcome.command:
+            return outcome.command
+    return ""
+
+
+def _allowed_paths_for_task(task: BenchmarkTask, metadata: dict[str, Any]) -> list[str]:
+    explicit = metadata.get("allowed_paths")
+    if explicit:
+        return [str(path) for path in explicit]
+    paths: list[str] = []
+    if task.golden_contract is not None:
+        paths.extend(task.golden_contract.expected_files)
+    for outcome in task.expected_outcomes:
+        paths.extend(str(path) for path in outcome.expected_diff.get("paths", []) or [])
+    return sorted(dict.fromkeys(paths)) or ["."]
+
+
 def _run_git(args: list[str], *, cwd: Path) -> None:
     completed = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=False)
     if completed.returncode:
@@ -644,6 +877,23 @@ def _snapshot_files(root: Path) -> dict[str, str]:
         except OSError:
             continue
     return snapshot
+
+
+def _read_text_files(root: Path) -> dict[str, str]:
+    files: dict[str, str] = {}
+    if not root.exists():
+        return files
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if _skip_path(relative):
+            continue
+        try:
+            files[relative] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+    return files
 
 
 def _allowed_scope_ok(files_changed: list[str], allowed_paths: list[str]) -> bool:

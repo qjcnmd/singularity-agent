@@ -808,3 +808,49 @@ def test_cli_eval_report_show_reads_json_and_markdown(tmp_path: Path, monkeypatc
     assert '"run_id": "show_cli"' in shown_json.output
     assert shown_md.exit_code == 0
     assert "# Evaluation Report `show_cli`" in shown_md.output
+
+
+def test_cli_eval_live_private_uses_private_benchmark_adapter(tmp_path: Path, monkeypatch) -> None:
+    task_set = tmp_path / "private.json"
+    task = BenchmarkTask(
+        task_id="private.cli",
+        version="v1",
+        title="Private CLI eval",
+        input={
+            "prompt": "Fix app.py.",
+            "metadata": {"allowed_paths": ["app.py"]},
+        },
+        workspace_snapshot=WorkspaceSnapshot(
+            kind=WorkspaceSnapshotKind.INLINE_FILES,
+            inline_files={"app.py": "def answer():\n    return 0\n"},
+        ),
+        expected_outcomes=[
+            ExpectedOutcome(kind=ExpectedOutcomeKind.TEST, weight=1.0, command="python -m pytest tests/test_app.py")
+        ],
+        tags=["easy"],
+    )
+    task_set.write_text(GoldenTaskStore.to_json_document([task]), encoding="utf-8")
+    seen = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs) -> None:
+            seen["kwargs"] = kwargs
+
+        def run(self, manifest):
+            seen["task_id"] = manifest.tasks[0].task_id
+            seen["verification_command"] = manifest.tasks[0].verification_command
+            return {
+                "schema_version": "evaluation.live_agent_eval_result/v1",
+                "run_id": "private_cli",
+                "summary": {"success_count": 1, "task_count": 1},
+                "tasks": [],
+            }
+
+    monkeypatch.setattr("singularity.cli.LiveAgentEvalRunner", FakeRunner)
+
+    result = runner.invoke(app, ["eval", "live", "private", str(task_set), "--run-id", "private_cli", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["run_id"] == "private_cli"
+    assert seen["task_id"] == "private.cli"
+    assert seen["verification_command"] == "python -m pytest tests/test_app.py"

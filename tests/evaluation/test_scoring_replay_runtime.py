@@ -251,6 +251,36 @@ def test_evaluation_report_hash_ignores_run_id_and_generated_at(tmp_path: Path) 
     assert first.report_hash() == second.report_hash()
 
 
+def test_evaluation_report_includes_failure_taxonomy_and_previous_comparison(tmp_path: Path) -> None:
+    runtime = EvaluationRuntime(project_root=tmp_path, output_root=tmp_path / "evals")
+    profile = EvaluationProfile(name="baseline", model="gpt-a")
+    first = runtime.run_suite(
+        tasks=[_task("task.first")],
+        profiles=[profile],
+        trace_run_dir=_trace(tmp_path, run_id="previous_trace").store.run_dir,
+        run_id="previous",
+        write_report=True,
+    )
+    second = runtime.run_suite(
+        tasks=[_task("task.second")],
+        profiles=[profile],
+        run_id="current",
+        write_report=True,
+    )
+
+    assert first.metrics["success_rate"] == 1.0
+    assert second.metrics["failure_taxonomy"]
+    assert second.metrics["previous_comparison"] == {
+        "previous_run_id": "previous",
+        "success_rate_delta": -1.0,
+        "average_score_delta": -0.625,
+        "cost_delta": -0.05,
+        "latency_ms_delta": -1200,
+        "tool_calls_delta": -1,
+    }
+    assert "previous comparison" in second.to_markdown().lower()
+
+
 def test_runtime_blocks_archive_snapshot_execution_without_direct_unpack(tmp_path: Path) -> None:
     task = BenchmarkTask(
         task_id="task.archive",

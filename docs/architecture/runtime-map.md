@@ -7,7 +7,8 @@ Current v0.1.x status:
 - Python remains the production runtime.
 - CLI remains the only shipped client.
 - No Tauri, Electron, Rust rewrite, web search, or multi-agent execution is implemented here.
-- The next implementation phase is Desktop Transition Runtime: a RuntimeHost/local-daemon boundary around the existing Python runtime.
+- The current desktop-transition implementation is a Python `RuntimeHost` facade around the existing runtime.
+- The next implementation phase is the local daemon boundary around that facade, not a desktop UI rewrite.
 
 ## Phase 1A Fixed Behavior Status
 
@@ -39,6 +40,18 @@ CLI
 -> TraceRuntime / Audit / FinalReport
 ```
 
+The in-process RuntimeHost path is:
+
+```text
+RuntimeHost
+-> KernelBootstrap
+-> AgentKernel
+-> SingularityAgent
+-> existing runtime graph
+```
+
+The CLI has not yet been migrated to call RuntimeHost; that is the next client-boundary step.
+
 `RuntimeGraph` also boots supporting components that do not appear in every tool-call path: `InteractionRuntime`, `ProjectIndexRuntime`, `MemoryRuntime`, `EditRuntime`, `PluginRuntime`, `ReviewRuntime`, and lazy `EvaluationRuntime`.
 
 ## Runtime Name Contract
@@ -49,6 +62,8 @@ Keep this list in sync with the matching block in `README.md`.
 - `CLI`
 - `KernelBootstrap`
 - `AgentKernel`
+- `RuntimeHost`
+- `SessionRuntime`
 - `SingularityAgent`
 - `PlannerRuntime`
 - `ContextManager`
@@ -96,7 +111,8 @@ Keep this list in sync with the matching block in `README.md`.
 | Remote approval | implemented | `src/singularity/policy/remote.py` exports policy request/decision JSON and imports scoped approval grants; no network approval service is implied |
 | Remote memory sync | implemented | `src/singularity/memory/sync.py` exports/imports local JSON bundles and imports remote entries as candidates by default |
 | Final reports | implemented | kernel `FinalReport` in `src/singularity/kernel/finalization.py`; planner `FinalReport` in `src/singularity/planner/models.py` |
-| Desktop RuntimeHost, Rust Core, Tauri UI | planned | architecture docs and ADRs only |
+| Python RuntimeHost facade | implemented | `src/singularity/runtime_host/` exposes start/resume/cancel, approval grant submission, state snapshots, run-event projection, and artifact reads over the existing Python runtime |
+| RuntimeHost daemon, Rust Core, Tauri UI | planned | architecture docs and ADRs only; HTTP, WebSocket, JSON-RPC, Rust, and Tauri remain out of scope |
 | web search, multi-agent execution | planned | explicitly out of scope for the current Python CLI baseline |
 
 ## Ownership Map
@@ -104,6 +120,7 @@ Keep this list in sync with the matching block in `README.md`.
 | Layer | Owns | Must not own |
 | --- | --- | --- |
 | CLI | Argument parsing, local user IO, exit codes, command rendering | Runtime state, policy decisions, tool execution, protocol recovery |
+| RuntimeHost | In-process product API over start/resume/cancel, approval grants, snapshots, event projection, and artifact reads | Tool execution shortcuts, direct policy decisions, UI rendering, daemon transport |
 | KernelBootstrap / AgentKernel | Runtime graph assembly, lifecycle, lock, cancellation, shutdown, recovery, finalization | Tool handler logic, model/tool protocol semantics, UI rendering policy |
 | SingularityAgent | Session orchestration across planner, context, model, protocol, and final answer | Direct tool execution, policy decisions, trace schema, storage layout |
 | PlannerRuntime | Task state, allowed actions, evidence ledger, completion assessment, final report facts | File writes, shell process execution, approval grants, provider calls |
@@ -141,9 +158,9 @@ Keep this list in sync with the matching block in `README.md`.
 
 ## Desktop Contract
 
-Future desktop work must preserve these boundaries:
+Future desktop and daemon work must preserve these boundaries:
 
 1. Tauri/TypeScript UI is a client, not the runtime core.
-2. A local daemon or RuntimeHost owns the current runtime graph and exposes events, commands, and state snapshots.
+2. The Python RuntimeHost facade owns the current runtime graph; the future local daemon wraps that facade and exposes events, commands, and state snapshots.
 3. Rust Core is introduced only after the RuntimeHost boundary proves which contracts are stable.
 4. Python remains the plugin/runtime compatibility layer until explicit migration removes a specific boundary.

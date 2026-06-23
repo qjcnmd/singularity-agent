@@ -91,9 +91,26 @@ class EvaluationReport:
             f"- latency_ms: {self.metrics.get('latency_ms', 0)}",
             f"- tool calls: {self.metrics.get('tool_calls', 0)}",
             f"- intervention rate: {self.metrics.get('intervention_rate', 0):.2f}",
-            "",
-            "## Profiles",
         ]
+        taxonomy = self.metrics.get("failure_taxonomy") or {}
+        if taxonomy:
+            lines.append(f"- failure taxonomy: `{json.dumps(taxonomy, sort_keys=True)}`")
+        comparison = self.metrics.get("previous_comparison") or {}
+        if comparison:
+            lines.extend(
+                [
+                    "",
+                    "## Previous Comparison",
+                    "",
+                    f"- previous run: `{comparison.get('previous_run_id')}`",
+                    f"- success rate delta: {comparison.get('success_rate_delta', 0):.4f}",
+                    f"- average score delta: {comparison.get('average_score_delta', 0):.4f}",
+                    f"- cost delta: {comparison.get('cost_delta', 0):.6f}",
+                    f"- latency_ms delta: {comparison.get('latency_ms_delta', 0)}",
+                    f"- tool calls delta: {comparison.get('tool_calls_delta', 0)}",
+                ]
+            )
+        lines.extend(["", "## Profiles"])
         for profile_report in self.profile_reports:
             metrics = profile_report.metrics
             lines.extend(
@@ -249,6 +266,12 @@ def metrics_for_results(results: list[TaskEvaluationResult]) -> dict[str, Any]:
     successes = len([item for item in results if item.scoring.status == "success"])
     score_total = sum(item.scoring.score for item in results)
     interventions = sum(item.intervention_count for item in results)
+    failure_taxonomy: dict[str, int] = {}
+    for item in results:
+        if item.scoring.status == "success":
+            continue
+        for reason in item.scoring.failure_reasons or ["unknown"]:
+            failure_taxonomy[reason] = failure_taxonomy.get(reason, 0) + 1
     return {
         "task_count": total,
         "success_count": successes,
@@ -260,6 +283,7 @@ def metrics_for_results(results: list[TaskEvaluationResult]) -> dict[str, Any]:
         "tool_calls": sum(item.tool_calls for item in results),
         "intervention_count": interventions,
         "intervention_rate": round(interventions / total, 4) if total else 0.0,
+        "failure_taxonomy": dict(sorted(failure_taxonomy.items())),
     }
 
 

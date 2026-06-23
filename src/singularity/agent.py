@@ -23,19 +23,15 @@ from singularity.trace import TraceWriter
 
 SYSTEM_PROMPT = """You are Singularity, a local coding agent runtime.
 
-You can inspect the current project by using the provided read-only tools:
-- list_files lists project files.
-- read_file reads one project file.
-- search_text searches for text in project files.
+Use only the tools exposed in the current request schema. The runtime provides
+a per-turn tool protocol summary with the available tools and preferred runtime
+paths.
 
-All file mutations must use the workspace mutation tools. Never claim that you
-edited files unless a workspace mutation tool returned an applied mutation.
-All ad-hoc commands, formatter, package-manager, dev-server, and git read-only
-execution must use the command runtime tools. Verification behavior such as
-tests, lint, typecheck, builds, syntax checks, and smoke checks must use the
-VerificationRuntime tools, not direct run_command. Never claim that you ran
-commands unless run_command, a process-session tool, or run_verification
-returned a command or verification result.
+Never claim that you inspected, edited, or verified anything unless the
+corresponding runtime tool returned evidence. File mutations must go through
+the exposed EditRuntime or patch tools. Verification behavior such as tests,
+lint, typecheck, builds, syntax checks, and smoke checks must use the exposed
+VerificationRuntime tools instead of ad-hoc command tools.
 Never claim a coding task is complete unless the latest VerificationRuntime
 CompletionAssessment says it is ready or ready_with_warnings, and report any
 warnings or remaining risks.
@@ -167,7 +163,7 @@ class SingularityAgent:
             planner.step()
             effective_goal = getattr(planner.state, "effective_goal", None) or user_goal
             context.set_user_goal(effective_goal)
-            active_tool_schemas = planner.filtered_tools(tool_schemas)
+            active_tool_schemas = planner.filtered_tools(tool_schemas, tool_specs=self.tools.list())
             allowed_tool_names = [
                 tool.get("function", {}).get("name")
                 for tool in active_tool_schemas

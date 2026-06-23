@@ -14,10 +14,9 @@ LOW_LEVEL_MUTATION_TOOLS = {
     "workspace_create_file",
     "workspace_delete_file",
     "workspace_move_file",
-    "edit_apply",
 }
 EDIT_PLAN_TOOLS = {"edit_plan", "edit_preview"}
-MUTATION_TOOLS = {"write_file", "apply_patch"}
+MUTATION_TOOLS = {"write_file", "apply_patch", "edit_apply"}
 EDIT_TOOLS = {*EDIT_PLAN_TOOLS, *MUTATION_TOOLS}
 VERIFICATION_TOOLS = {
     "plan_verification",

@@ -18,6 +18,23 @@ class TaskDifficulty(str, Enum):
     HARD = "hard"
 
 
+class BenchmarkTaskKind(str, Enum):
+    REPO_ISSUE_REPAIR = "repo_issue_repair"
+    TERMINAL_TASK = "terminal_task"
+    SINGULARITY_INTERNAL = "singularity_internal"
+
+
+class BenchmarkVisibility(str, Enum):
+    PUBLIC = "public"
+    PRIVATE = "private"
+
+
+class BenchmarkAdapterKind(str, Enum):
+    SINGULARITY_PRIVATE = "singularity_private"
+    SWE_BENCH = "swe_bench"
+    TERMINAL_BENCH = "terminal_bench"
+
+
 class WorkspaceSnapshotKind(str, Enum):
     GIT_REF = "git_ref"
     ARCHIVE_PATH = "archive_path"
@@ -262,6 +279,9 @@ class BenchmarkTask:
     task_id: str
     version: str
     title: str
+    task_type: BenchmarkTaskKind | str = BenchmarkTaskKind.SINGULARITY_INTERNAL
+    visibility: BenchmarkVisibility | str = BenchmarkVisibility.PRIVATE
+    adapter: BenchmarkAdapterKind | str = BenchmarkAdapterKind.SINGULARITY_PRIVATE
     input: TaskInput | dict[str, Any] | str | None = None
     workspace_snapshot: WorkspaceSnapshot | dict[str, Any] | None = None
     expected_outcomes: list[ExpectedOutcome | dict[str, Any]] = field(default_factory=list)
@@ -281,6 +301,9 @@ class BenchmarkTask:
         task_id: str,
         version: str,
         title: str = "",
+        task_type: BenchmarkTaskKind | str = BenchmarkTaskKind.SINGULARITY_INTERNAL,
+        visibility: BenchmarkVisibility | str = BenchmarkVisibility.PRIVATE,
+        adapter: BenchmarkAdapterKind | str = BenchmarkAdapterKind.SINGULARITY_PRIVATE,
         input_prompt: str | None = None,
         input: TaskInput | dict[str, Any] | str | None = None,
         workspace_snapshot: WorkspaceSnapshot | dict[str, Any] | None = None,
@@ -299,6 +322,9 @@ class BenchmarkTask:
         object.__setattr__(self, "task_id", task_id)
         object.__setattr__(self, "version", version)
         object.__setattr__(self, "title", title)
+        object.__setattr__(self, "task_type", _task_kind(task_type))
+        object.__setattr__(self, "visibility", _visibility(visibility))
+        object.__setattr__(self, "adapter", _adapter_kind(adapter))
         object.__setattr__(self, "input", _task_input(resolved_input))
         object.__setattr__(self, "workspace_snapshot", _snapshot(workspace_snapshot))
         object.__setattr__(
@@ -354,6 +380,9 @@ class BenchmarkTask:
             "task_id": self.task_id,
             "version": self.version,
             "title": self.title,
+            "task_type": self.task_type.value,
+            "visibility": self.visibility.value,
+            "adapter": self.adapter.value,
             "input": self.input.to_dict(),
             "workspace_snapshot": self.workspace_snapshot.to_dict(),
             "expected_outcomes": [item.to_dict() for item in self.expected_outcomes],
@@ -381,6 +410,9 @@ class BenchmarkTask:
             task_id=str(payload.get("task_id", "")),
             version=str(payload.get("version", "")),
             title=str(payload.get("title", "")),
+            task_type=str(payload.get("task_type", BenchmarkTaskKind.SINGULARITY_INTERNAL.value)),
+            visibility=str(payload.get("visibility", BenchmarkVisibility.PRIVATE.value)),
+            adapter=str(payload.get("adapter", BenchmarkAdapterKind.SINGULARITY_PRIVATE.value)),
             input=payload.get("input"),
             workspace_snapshot=payload.get("workspace_snapshot"),
             expected_outcomes=list(payload.get("expected_outcomes") or []),
@@ -539,6 +571,33 @@ def _snapshot(value: WorkspaceSnapshot | dict[str, Any] | None) -> WorkspaceSnap
     if isinstance(value, WorkspaceSnapshot):
         return value
     return WorkspaceSnapshot.from_dict(value or {})
+
+
+def _task_kind(value: BenchmarkTaskKind | str) -> BenchmarkTaskKind:
+    if isinstance(value, BenchmarkTaskKind):
+        return value
+    try:
+        return BenchmarkTaskKind(str(value))
+    except ValueError as exc:
+        raise ValueError(f"Unsupported BenchmarkTask.task_type: {value}") from exc
+
+
+def _visibility(value: BenchmarkVisibility | str) -> BenchmarkVisibility:
+    if isinstance(value, BenchmarkVisibility):
+        return value
+    try:
+        return BenchmarkVisibility(str(value))
+    except ValueError as exc:
+        raise ValueError(f"Unsupported BenchmarkTask.visibility: {value}") from exc
+
+
+def _adapter_kind(value: BenchmarkAdapterKind | str) -> BenchmarkAdapterKind:
+    if isinstance(value, BenchmarkAdapterKind):
+        return value
+    try:
+        return BenchmarkAdapterKind(str(value))
+    except ValueError as exc:
+        raise ValueError(f"Unsupported BenchmarkTask.adapter: {value}") from exc
 
 
 def _outcome(value: ExpectedOutcome | dict[str, Any]) -> ExpectedOutcome:

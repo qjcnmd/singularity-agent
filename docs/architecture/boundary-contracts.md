@@ -1,6 +1,6 @@
 # Boundary Contracts
 
-This document defines the contracts a future RuntimeHost, local daemon, Tauri desktop shell, and TypeScript UI must obey while the production runtime is still Python.
+This document defines the contracts the current Python RuntimeHost facade, a future local daemon, Tauri desktop shell, and TypeScript UI must obey while the production runtime is still Python.
 
 ## Core Rule
 
@@ -14,6 +14,7 @@ Current client:
 
 Future clients:
 
+- CLI through RuntimeHost
 - Tauri desktop shell
 - TypeScript UI
 - local daemon control API
@@ -124,13 +125,14 @@ Storage contracts:
 
 ## RuntimeHost Boundary
 
-The future RuntimeHost is the stable process API above Python runtimes. It should expose:
+The current Python RuntimeHost is the in-process API above Python runtimes. It exposes:
 
 - start/resume/cancel run
 - submit local approval decision
 - list state snapshot
 - list/read artifact by ref
 - subscribe to run events
-- health and diagnostics
+
+The future local daemon should wrap the same contract and add health, diagnostics, HTTP, WebSocket, and JSON-RPC transport.
 
 It must not expose raw internal objects such as `ToolRegistry`, `PolicyRuntime`, or `ContextManager` to the UI or plugins.

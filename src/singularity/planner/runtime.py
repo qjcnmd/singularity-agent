@@ -39,6 +39,12 @@ from singularity.planner.risk import RiskEscalator
 from singularity.planner.semantic import RollingPlan, SemanticPlannerRuntime
 from singularity.planner.store import PlannerStore
 from singularity.tools.models import ToolResult, ToolSpec
+from singularity.tools.router import (
+    ToolExposureDecision,
+    ToolRouter,
+    target_paths_from_tool_arguments,
+    write_blocked_by_user_constraint,
+)
 from singularity.trace import TraceWriter
 from singularity.execution_outcome import ExecutionOutcome
 
@@ -65,6 +71,7 @@ class PlannerRuntime:
         self.trace = trace
         self.store = store or PlannerStore(self.workspace_root)
         self.policy = PlannerPolicy()
+        self.tool_router = ToolRouter()
         self.contract_builder = TaskContractBuilder()
         self.semantic_planner = SemanticPlannerRuntime()
         self.risk = RiskEscalator()
@@ -207,6 +214,26 @@ class PlannerRuntime:
                 action_kind=self.policy.action_for_tool(tool_name).value,
                 decision="deny",
                 reason=decision.reason,
+            )
+            return decision
+
+        target_paths = target_paths_from_tool_arguments(tool_name, normalized_args)
+        if write_blocked_by_user_constraint(spec, self._active_user_constraints(), target_paths):
+            decision = AuthorizationDecision(
+                allowed=False,
+                error_code="user_constraint_blocks_write_path",
+                reason=f"{tool_name} targets a path blocked by active user constraints.",
+            )
+            self._record_event(
+                action_id=tool_call_id,
+                action_kind=self.policy.action_for_tool(tool_name).value,
+                decision="deny",
+                reason=decision.reason,
+                extra={
+                    "reason_code": decision.error_code,
+                    "blocked_paths": target_paths,
+                    "active_user_constraints": self._active_user_constraints(),
+                },
             )
             return decision
 
@@ -1051,12 +1078,63 @@ class PlannerRuntime:
             ),
         }
 
-    def filtered_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def decide_tool_exposure(
+        self,
+        available_tools: list[ToolSpec],
+        *,
+        policy_profile: str | None = None,
+        sandbox_mode: str | None = None,
+        security_mode: str | None = None,
+        workspace_state: dict[str, Any] | None = None,
+    ) -> ToolExposureDecision:
         self._throw_if_cancelled()
-        allowed = set(self._plan().phase(self._state().current_phase).allowed_tools)
+        state = self._state()
+        phase = self._plan().phase(state.current_phase)
+        allowed = set(phase.allowed_tools)
         current_step = self.semantic_rolling_plan().current_step()
         if current_step is not None:
             allowed.update(current_step.allowed_capabilities)
+        decision = self.tool_router.decide(
+            phase=phase.phase_id,
+            phase_allowed_tool_names=allowed,
+            available_tools=available_tools,
+            task_state=state,
+            policy_profile=policy_profile,
+            sandbox_mode=sandbox_mode or _sandbox_mode(state.sandbox_capability),
+            security_mode=security_mode,
+            active_user_constraints=self._active_user_constraints(),
+            workspace_state=workspace_state,
+        )
+        if self.trace is not None:
+            self.trace.record("tool.exposure_decided", decision.to_trace_data())
+        return decision
+
+    def filtered_tools(
+        self,
+        tools: list[dict[str, Any]],
+        *,
+        tool_specs: list[ToolSpec] | None = None,
+        policy_profile: str | None = None,
+        sandbox_mode: str | None = None,
+        security_mode: str | None = None,
+        workspace_state: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        self._throw_if_cancelled()
+        if tool_specs is not None:
+            allowed = set(
+                self.decide_tool_exposure(
+                    tool_specs,
+                    policy_profile=policy_profile,
+                    sandbox_mode=sandbox_mode,
+                    security_mode=security_mode,
+                    workspace_state=workspace_state,
+                ).selected_tool_names
+            )
+        else:
+            allowed = set(self._plan().phase(self._state().current_phase).allowed_tools)
+            current_step = self.semantic_rolling_plan().current_step()
+            if current_step is not None:
+                allowed.update(current_step.allowed_capabilities)
         return [
             tool
             for tool in tools
@@ -1309,6 +1387,18 @@ class PlannerRuntime:
             raise RuntimeError("Planner task has not started.")
         return self.state
 
+    def _active_user_constraints(self) -> list[str]:
+        state = self._state()
+        constraints = list(state.constraints)
+        for item in (state.task_contract or {}).get("constraints") or []:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("description") or item.get("value")
+                if text:
+                    self._append_unique(constraints, text)
+            else:
+                self._append_unique(constraints, item)
+        return constraints
+
     def _throw_if_cancelled(self) -> None:
         token = getattr(self, "cancellation_token", None)
         if token is not None and hasattr(token, "throw_if_cancelled"):
@@ -1414,3 +1504,8 @@ def create_or_resume_planner(
         return planner.resume(session_id, workspace_health=workspace_health.to_dict())
     planner.start_task(user_goal)
     return planner
+
+
+def _sandbox_mode(sandbox_capability: dict[str, Any]) -> str | None:
+    value = sandbox_capability.get("mode") or sandbox_capability.get("filesystem_mode")
+    return str(value) if value else None

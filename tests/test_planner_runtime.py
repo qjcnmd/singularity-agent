@@ -245,7 +245,7 @@ def test_applying_phase_defaults_to_facades_not_low_level_workspace_tools(tmp_pa
         spec=spec("apply_patch", permission=PermissionLevel.WRITE),
         arguments={"patch": "--- /dev/null\n+++ b/x.txt\n@@ -0,0 +1 @@\n+x\n"},
     )
-    edit_denied = planner.authorize_tool_call(
+    edit_allowed = planner.authorize_tool_call(
         tool_name="edit_apply",
         tool_call_id="call_edit",
         spec=spec("edit_apply", permission=PermissionLevel.WRITE),
@@ -262,10 +262,43 @@ def test_applying_phase_defaults_to_facades_not_low_level_workspace_tools(tmp_pa
     assert write_allowed.action.kind == ActionKind.APPLY_MUTATION
     assert patch_allowed.allowed is True
     assert patch_allowed.action.kind == ActionKind.APPLY_MUTATION
-    assert edit_denied.allowed is False
-    assert edit_denied.error_code == "action_not_allowed"
+    assert edit_allowed.allowed is True
+    assert edit_allowed.action.kind == ActionKind.APPLY_MUTATION
     assert low_level_denied.allowed is False
     assert low_level_denied.error_code == "action_not_allowed"
+
+
+def test_user_write_constraint_blocks_tests_paths_at_authorization(tmp_path: Path) -> None:
+    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner.start_task("Change code")
+    planner.state.status = TaskStatus.APPLYING_CHANGES
+    planner.state.current_phase = "applying_changes"
+    planner.state.constraints.append("不要修改 tests/")
+
+    source_allowed = planner.authorize_tool_call(
+        tool_name="write_file",
+        tool_call_id="call_src",
+        spec=spec("write_file", permission=PermissionLevel.WRITE),
+        arguments={"path": "src/app.py", "content": "x\n", "mode": "create"},
+    )
+    tests_write_denied = planner.authorize_tool_call(
+        tool_name="write_file",
+        tool_call_id="call_tests",
+        spec=spec("write_file", permission=PermissionLevel.WRITE),
+        arguments={"path": "tests/test_sample.py", "content": "x\n", "mode": "create"},
+    )
+    tests_patch_denied = planner.authorize_tool_call(
+        tool_name="apply_patch",
+        tool_call_id="call_patch",
+        spec=spec("apply_patch", permission=PermissionLevel.WRITE),
+        arguments={"patch": "--- a/tests/test_sample.py\n+++ b/tests/test_sample.py\n@@ -1 +1 @@\n-old\n+new\n"},
+    )
+
+    assert source_allowed.allowed is True
+    assert tests_write_denied.allowed is False
+    assert tests_write_denied.error_code == "user_constraint_blocks_write_path"
+    assert tests_patch_denied.allowed is False
+    assert tests_patch_denied.error_code == "user_constraint_blocks_write_path"
 
 
 def test_finalizing_phase_allows_read_only_evidence_tools(tmp_path: Path) -> None:

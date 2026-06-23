@@ -570,6 +570,26 @@ class EvaluationArtifactWriter:
                 )
         return output_dir
 
+    def previous_report_payload(self, *, run_id: str) -> dict[str, Any] | None:
+        candidates = []
+        if not self.output_root.exists():
+            return None
+        for report_path in self.output_root.glob("*/report.json"):
+            if report_path.parent.name == run_id:
+                continue
+            try:
+                candidates.append((report_path.stat().st_mtime_ns, report_path))
+            except OSError:
+                continue
+        for _mtime, report_path in sorted(candidates, reverse=True):
+            try:
+                payload = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("metrics"), dict):
+                return payload
+        return None
+
     def write_regression_report(
         self,
         *,

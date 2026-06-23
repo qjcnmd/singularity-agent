@@ -1,5 +1,8 @@
 from singularity.evaluation.models import (
+    BenchmarkAdapterKind,
     BenchmarkTask,
+    BenchmarkTaskKind,
+    BenchmarkVisibility,
     EvaluationHook,
     EvaluationProfile,
     ExpectedOutcome,
@@ -29,6 +32,9 @@ from singularity.evaluation.live import (
     LiveEvalTask,
     LiveEvalTaskResult,
     LiveEvalWorkspace,
+    SingularityPrivateBenchmarkAdapter,
+    SweBenchAdapter,
+    TerminalBenchAdapter,
     load_live_eval_manifest,
     summarize_live_results,
 )
@@ -38,6 +44,9 @@ from singularity.evaluation.store import GoldenTaskStore
 
 __all__ = [
     "BenchmarkTask",
+    "BenchmarkAdapterKind",
+    "BenchmarkTaskKind",
+    "BenchmarkVisibility",
     "EvaluationHook",
     "EvaluationProfile",
     "EvaluationReport",
@@ -53,6 +62,9 @@ __all__ = [
     "LiveEvalTask",
     "LiveEvalTaskResult",
     "LiveEvalWorkspace",
+    "SingularityPrivateBenchmarkAdapter",
+    "SweBenchAdapter",
+    "TerminalBenchAdapter",
     "PatchQualityEvaluator",
     "PatchQualityResult",
     "ProfileEvaluationReport",

@@ -15,6 +15,9 @@ Golden tasks are stored as JSON or YAML documents:
       "task_id": "parser.empty-section",
       "version": "v1",
       "title": "Fix parser empty sections",
+      "task_type": "repo_issue_repair",
+      "visibility": "private",
+      "adapter": "singularity_private",
       "input": {
         "prompt": "Fix parsing for empty sections and run tests."
       },
@@ -72,6 +75,20 @@ Supported `expected_outcomes.kind` values:
 - `assertion`
 - `diff`
 - `heuristic`
+
+Supported `task_type` values:
+
+- `repo_issue_repair`
+- `terminal_task`
+- `singularity_internal`
+
+Supported `visibility` values are `public` and `private`. Public benchmarks are intended for externally reproducible tasks; private benchmarks can carry hidden setup/checks without exposing them to the agent prompt.
+
+Supported `adapter` values are:
+
+- `singularity_private` (implemented)
+- `swe_bench` (reserved adapter boundary)
+- `terminal_bench` (reserved adapter boundary)
 
 Each task must use one difficulty tag: `easy`, `medium`, or `hard`. Optional workload tags include `memory-heavy` and `tool-heavy`. Task versions currently support `v1` and `v2`.
 
@@ -141,7 +158,15 @@ Run a manifest-driven live-provider eval:
 singularity-agent eval live run docs/evaluation/live-agent-minimal-tasks.json --json
 ```
 
+Run a private BenchmarkTask set through the private adapter:
+
+```bash
+singularity-agent eval live private private-benchmark.json --json
+```
+
 The live manifest schema is intentionally small: each task declares `task_id`, a `repo` or `fixture` workspace, optional `start_commit` or `prepare_commands`, `user_task`, `allowed_paths`, `verification_command`, and `success`. Use `verification_prepare_commands` only for evaluator-owned hidden setup that must run after the agent finishes and before independent verification, such as applying a benchmark test patch without exposing it to the model; when hidden setup is present, the exact `verification_command` is also kept out of the model task. Each task runs in an isolated directory under `work/evaluations-live/<run_id>/<task_id>/workspace`; the runner boots the real Singularity kernel, runs the independent verification command, and writes `result.json` with completion, test, usage, cache-hit, tool-call, changed-file, duration, and error fields. Default pytest does not run this path; use the command above only when live provider environment variables are intentionally configured.
+
+Live evaluation also writes a clean verification workspace per task. The runner records the agent workspace patch as `patch.diff`, reapplies the changed files onto the clean verification workspace, then records public and hidden check results under `checks.public` and `checks.hidden`. A task is successful only when the agent completes, the patch is applicable, changed files stay inside `allowed_paths`, and the independent verification criteria pass in the verification workspace.
 
 Run A/B or regression checks:
 
@@ -217,6 +242,8 @@ JSON reports include the complete machine-readable evaluation record:
 - per-profile metrics
 - per-task status, score, evidence, and failures
 - per-task Golden Task contract evidence when declared
+- failure taxonomy counts
+- previous-run metric comparison when an earlier report exists in the same output root
 - report hash
 
 Markdown reports are human-readable summaries with suite metrics, profile metrics, per-task status/score/failure rows, and a `Golden Task Evidence` section for tasks that declare `golden_contract`. Use JSON when exact evidence, replay payloads, runtime overrides, execution evidence, or report hashes are required.

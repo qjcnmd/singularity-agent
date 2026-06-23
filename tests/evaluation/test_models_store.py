@@ -6,6 +6,9 @@ import pytest
 
 from singularity.evaluation import (
     BenchmarkTask,
+    BenchmarkAdapterKind,
+    BenchmarkTaskKind,
+    BenchmarkVisibility,
     EvaluationHook,
     ExpectedOutcome,
     ExpectedOutcomeKind,
@@ -57,10 +60,58 @@ def test_benchmark_task_round_trips_and_validates_required_schema() -> None:
     restored = BenchmarkTask.from_dict(task.to_dict())
 
     assert restored == task
+    assert restored.task_type == BenchmarkTaskKind.SINGULARITY_INTERNAL
+    assert restored.visibility == BenchmarkVisibility.PRIVATE
+    assert restored.adapter == BenchmarkAdapterKind.SINGULARITY_PRIVATE
     assert restored.input.prompt == "Fix parsing for empty sections."
     assert restored.workspace_snapshot.kind == WorkspaceSnapshotKind.INLINE_FILES
     assert restored.expected_outcomes[0].kind == ExpectedOutcomeKind.TEST
     assert restored.tags == ["easy", "memory-heavy"]
+
+
+def test_benchmark_task_supports_public_repo_issue_and_terminal_task_schema() -> None:
+    repo_issue = _task("task.repo_issue").with_updates(
+        task_type="repo_issue_repair",
+        visibility="public",
+        adapter="swe_bench",
+        input={
+            "prompt": "Fix the issue and produce a patch.",
+            "metadata": {
+                "repo": "owner/project",
+                "base_commit": "abc123",
+                "issue": "Parser drops empty sections.",
+            },
+        },
+    )
+    terminal = _task("task.terminal").with_updates(
+        task_type="terminal_task",
+        visibility="private",
+        adapter="terminal_bench",
+    )
+
+    assert repo_issue.task_type == BenchmarkTaskKind.REPO_ISSUE_REPAIR
+    assert repo_issue.visibility == BenchmarkVisibility.PUBLIC
+    assert repo_issue.adapter == BenchmarkAdapterKind.SWE_BENCH
+    assert repo_issue.input.metadata["base_commit"] == "abc123"
+    assert terminal.task_type == BenchmarkTaskKind.TERMINAL_TASK
+    assert terminal.adapter == BenchmarkAdapterKind.TERMINAL_BENCH
+
+
+def test_benchmark_task_rejects_unknown_type_visibility_or_adapter() -> None:
+    payload = _task().to_dict()
+    payload["task_type"] = "unknown"
+    with pytest.raises(ValueError, match="BenchmarkTask.task_type"):
+        BenchmarkTask.from_dict(payload)
+
+    payload = _task().to_dict()
+    payload["visibility"] = "secret"
+    with pytest.raises(ValueError, match="BenchmarkTask.visibility"):
+        BenchmarkTask.from_dict(payload)
+
+    payload = _task().to_dict()
+    payload["adapter"] = "random"
+    with pytest.raises(ValueError, match="BenchmarkTask.adapter"):
+        BenchmarkTask.from_dict(payload)
 
 
 def test_benchmark_task_round_trips_golden_contract() -> None:

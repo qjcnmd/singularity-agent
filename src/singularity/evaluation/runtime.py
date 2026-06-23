@@ -98,6 +98,10 @@ class EvaluationRuntime:
             output_dir=output_dir,
         )
         if write_report:
+            report = _with_previous_comparison(
+                report,
+                self.artifact_writer.previous_report_payload(run_id=run_id),
+            )
             self.artifact_writer.write_report(
                 run_id=run_id,
                 json_text=report.to_json(),
@@ -411,3 +415,37 @@ def _apply_score_delta(scoring: Any, delta: float) -> Any:
         evidence=evidence,
         failure_reasons=scoring.failure_reasons,
     )
+
+
+def _with_previous_comparison(
+    report: EvaluationReport,
+    previous: dict[str, Any] | None,
+) -> EvaluationReport:
+    if not previous:
+        return report
+    previous_metrics = previous.get("metrics")
+    if not isinstance(previous_metrics, dict):
+        return report
+    metrics = dict(report.metrics)
+    metrics["previous_comparison"] = {
+        "previous_run_id": str(previous.get("run_id") or ""),
+        "success_rate_delta": _metric_delta(metrics, previous_metrics, "success_rate"),
+        "average_score_delta": _metric_delta(metrics, previous_metrics, "average_score"),
+        "cost_delta": _metric_delta(metrics, previous_metrics, "cost"),
+        "latency_ms_delta": _metric_delta(metrics, previous_metrics, "latency_ms"),
+        "tool_calls_delta": _metric_delta(metrics, previous_metrics, "tool_calls"),
+    }
+    return EvaluationReport(
+        run_id=report.run_id,
+        generated_at=report.generated_at,
+        profile_reports=report.profile_reports,
+        metrics=metrics,
+        output_dir=report.output_dir,
+    )
+
+
+def _metric_delta(current: dict[str, Any], previous: dict[str, Any], key: str) -> float | int:
+    delta = float(current.get(key, 0) or 0) - float(previous.get(key, 0) or 0)
+    if key in {"latency_ms", "tool_calls"}:
+        return int(delta)
+    return round(delta, 6)
