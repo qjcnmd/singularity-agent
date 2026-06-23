@@ -26,6 +26,7 @@ from singularity.model.models import (
     ToolChoicePolicy,
 )
 from singularity.model.streaming import ProviderStreamEvent
+from singularity.model.streaming import ProviderStreamEventType
 
 
 @dataclass
@@ -233,7 +234,7 @@ class OpenAICompatibleModelProvider:
         self._capabilities = capabilities or ModelCapabilities(
             supports_tools=True,
             supports_parallel_tool_calls=True,
-            supports_streaming=False,
+            supports_streaming=True,
             supports_json_mode=True,
             supports_developer_message=False,
         )
@@ -304,12 +305,30 @@ class OpenAICompatibleModelProvider:
         )
 
     def stream(self, request: ProviderRequest) -> Iterable[ProviderStreamEvent]:
-        raise ModelError(
-            kind=ModelErrorKind.UNSUPPORTED_CAPABILITY,
-            message="Streaming is not implemented for OpenAICompatibleModelProvider.",
-            retryable=False,
-            provider_name=self.provider_name,
-            model_name=request.preferences.model_name or self.settings.model,
+        response = self.complete(request)
+        if response.message.text:
+            yield ProviderStreamEvent(
+                type=ProviderStreamEventType.TEXT_DELTA,
+                text_delta=response.message.text,
+            )
+        for call in response.tool_calls:
+            yield ProviderStreamEvent(
+                type=ProviderStreamEventType.TOOL_CALL_DELTA,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                arguments_delta=call.raw_arguments,
+            )
+            yield ProviderStreamEvent(
+                type=ProviderStreamEventType.TOOL_CALL_COMPLETED,
+                tool_call_id=call.tool_call_id,
+            )
+        yield ProviderStreamEvent(
+            type=ProviderStreamEventType.USAGE_DELTA,
+            usage_delta=response.usage.to_dict(),
+        )
+        yield ProviderStreamEvent(
+            type=ProviderStreamEventType.RESPONSE_COMPLETED,
+            metadata={"finish_reason": response.finish_reason or "stop"},
         )
 
     def _chat_completions_url(self) -> str:
@@ -345,7 +364,8 @@ def _safe_provider_tool_call(tool_call: Any) -> dict[str, Any]:
             "type": "function",
             "function": {"name": "<unknown>", "arguments": "{}"},
         }
-    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    raw_function = tool_call.get("function")
+    function = raw_function if isinstance(raw_function, dict) else {}
     arguments = function.get("arguments", "{}")
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)

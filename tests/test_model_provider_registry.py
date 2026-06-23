@@ -86,6 +86,31 @@ class _FakeResponse:
         }
 
 
+class _FakeToolResponse(_FakeResponse):
+    def json(self) -> dict:
+        return {
+            "id": "resp_2",
+            "model": "test-model",
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }
+
+
 class _FakeErrorResponse:
     status_code = 500
     text = "provider echoed OPENAI_API_KEY=sk-leaked"
@@ -111,6 +136,12 @@ class _FakeClient:
     def post(self, url: str, *, headers: dict[str, str], json: dict) -> _FakeResponse:
         self.payloads.append(json)
         return _FakeResponse()
+
+
+class _FakeToolClient(_FakeClient):
+    def post(self, url: str, *, headers: dict[str, str], json: dict) -> _FakeToolResponse:
+        self.payloads.append(json)
+        return _FakeToolResponse()
 
 
 class _FakeErrorClient(_FakeClient):
@@ -153,6 +184,40 @@ def test_openai_compatible_provider_keeps_parallel_tool_compatibility() -> None:
     )
 
     assert provider.capabilities().supports_parallel_tool_calls is True
+    assert provider.capabilities().supports_streaming is True
+
+
+def test_openai_compatible_provider_streams_complete_response_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("singularity.model.providers.httpx.Client", _FakeToolClient)
+    provider = OpenAICompatibleModelProvider(
+        Settings(base_url="https://example.test/v1", api_key="test-key", model="test-model")
+    )
+
+    events = list(
+        provider.stream(
+            ProviderRequest(
+                request_id="req_1",
+                purpose="plan_next_action",
+                messages=[
+                    ModelMessage(
+                        role=ModelRole.USER,
+                        content=[ContentBlock.from_text("hi")],
+                    )
+                ],
+            )
+        )
+    )
+
+    assert [event.type.value for event in events] == [
+        "tool_call_delta",
+        "tool_call_completed",
+        "usage_delta",
+        "response_completed",
+    ]
+    assert events[0].tool_name == "read_file"
+    assert events[0].arguments_delta == '{"path":"README.md"}'
 
 
 def test_openai_provider_error_does_not_include_response_body(

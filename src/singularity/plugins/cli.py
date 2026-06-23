@@ -8,6 +8,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from singularity.cli_paths import resolve_project_root
 from singularity.observability import TraceRuntime
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.plugins.compatibility import check_compatibility
@@ -23,6 +24,10 @@ from singularity.release.paths import RuntimeMode, resolve_runtime_paths
 
 plugin_app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
+ProjectRootOption = Annotated[
+    Path | None,
+    typer.Option("--project-root", help="Workspace/project root; defaults to the current directory."),
+]
 
 
 @plugin_app.command("list")
@@ -39,8 +44,9 @@ def list_plugins(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
-    project_root = Path.cwd()
+    project_root = resolve_project_root(project_root)
     discovered = _discover(project_root, mode=mode, home=home)
     statuses = PluginStatusStore(project_root).load()
     payload = {
@@ -72,8 +78,9 @@ def inspect_plugin(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
-    project_root = Path.cwd()
+    project_root = resolve_project_root(project_root)
     discovered = _discover(project_root, mode=mode, home=home)
     plugin = _find_unique(discovered, plugin_id)
     status = PluginStatusStore(project_root).get(plugin_id)
@@ -108,8 +115,9 @@ def enable_plugin(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
-    project_root = Path.cwd()
+    project_root = resolve_project_root(project_root)
     discovered = _discover(project_root, mode=mode, home=home)
     plugin = _find_unique(discovered, plugin_id)
     config = _parse_config(config_json)
@@ -154,8 +162,9 @@ def disable_plugin(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
-    project_root = Path.cwd()
+    project_root = resolve_project_root(project_root)
     discovered = _discover(project_root, mode=mode, home=home)
     plugin = next((item for item in discovered if item.manifest.id == plugin_id), None)
     status = PluginStatusStore(project_root).disable(plugin_id)
@@ -183,8 +192,9 @@ def check_plugins(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
-    project_root = Path.cwd()
+    project_root = resolve_project_root(project_root)
     discovered = _discover(project_root, mode=mode, home=home)
     if plugin_id:
         discovered = [_find_unique(discovered, plugin_id)]

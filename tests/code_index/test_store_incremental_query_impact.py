@@ -3,6 +3,7 @@ from pathlib import Path
 from singularity.code_index import (
     ContextCandidate,
     ProjectIndexRuntime,
+    ProjectIndexRuntimeConfig,
     ProjectIndexStore,
     WorkspaceScanner,
 )
@@ -75,6 +76,26 @@ def test_runtime_incremental_query_and_impact_use_structured_facts(tmp_path: Pat
 
     assert "src/service.py" in result.rebuilt_files
     assert result.summary["file_count"] >= 3
+
+
+def test_disabled_project_index_bootstrap_has_no_store_side_effect(tmp_path: Path) -> None:
+    runtime = ProjectIndexRuntime(tmp_path, config=ProjectIndexRuntimeConfig(enabled=False))
+
+    summary = runtime.bootstrap(reason="test")
+    observation = runtime.observation_for_goal("inspect")
+    health = runtime.health_check()
+    impact = runtime.analyze_impact(["src/service.py"])
+    test_impact = runtime.get_test_impact(["src/service.py"])
+    update = runtime.update_after_changeset({"changed_files": ["src/service.py"]}, reason="test")
+
+    assert summary.limitations == ["project_index_disabled"]
+    assert observation["warnings"] == ["project_index_disabled"]
+    assert health["ok"] is True
+    assert health["summary"]["file_count"] == 0
+    assert impact.risk_reasons == ["project_index_disabled"]
+    assert test_impact.require_full_test is True
+    assert update.changed_files == ["src/service.py"]
+    assert not (tmp_path / ".singularity" / "index.sqlite").exists()
 
 
 def test_full_index_rebuild_failure_preserves_previous_index(tmp_path: Path) -> None:

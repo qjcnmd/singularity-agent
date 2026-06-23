@@ -15,6 +15,7 @@ from singularity.code_index.models import (
     SCHEMA_VERSION,
     BackendInfo,
     CallEdgeRecord,
+    CodeImpactAnalysis,
     ConfigFactRecord,
     DependencyEdgeRecord,
     DocSectionRecord,
@@ -22,9 +23,11 @@ from singularity.code_index.models import (
     Evidence,
     FileRecord,
     IndexSummary,
+    IncrementalIndexResult,
     ProjectRootRecord,
     ReferenceRecord,
     SymbolRecord,
+    TestImpactAnalysis,
     TestMappingRecord,
     TrustLevel,
 )
@@ -64,7 +67,7 @@ class ProjectIndexRuntime:
         self.config = config or ProjectIndexRuntimeConfig(db_path=Path(db_path) if db_path else None)
         self.db_path = Path(db_path) if db_path else self.config.db_path or self.workspace_root / ".singularity" / "index.sqlite"
         self.trace = trace
-        self.store = ProjectIndexStore(self.db_path)
+        self._store: ProjectIndexStore | None = None
         self.plugins = plugins or [PythonPlugin(), JavaScriptPlugin(), TypeScriptPlugin(), RustPlugin()]
         self.scanner = WorkspaceScanner(
             self.workspace_root,
@@ -74,17 +77,46 @@ class ProjectIndexRuntime:
                 max_total_bytes=self.config.max_total_bytes,
             ),
         )
-        self.query_service = ProjectIndexQueryService(self.store)
-        self.impact_analyzer = ProjectImpactAnalyzer(self.store)
-        self.incremental = IncrementalIndexer(self)
+        self._query_service: ProjectIndexQueryService | None = None
+        self._impact_analyzer: ProjectImpactAnalyzer | None = None
+        self._incremental: IncrementalIndexer | None = None
         self.index_id = f"index_{uuid4().hex[:12]}"
         self._bootstrapped = False
 
+    @property
+    def store(self) -> ProjectIndexStore:
+        if self._store is None:
+            self._store = ProjectIndexStore(self.db_path)
+        return self._store
+
+    @store.setter
+    def store(self, value: ProjectIndexStore) -> None:
+        self._store = value
+        self._query_service = None
+        self._impact_analyzer = None
+
+    @property
+    def query_service(self) -> ProjectIndexQueryService:
+        if self._query_service is None:
+            self._query_service = ProjectIndexQueryService(self.store)
+        return self._query_service
+
+    @property
+    def impact_analyzer(self) -> ProjectImpactAnalyzer:
+        if self._impact_analyzer is None:
+            self._impact_analyzer = ProjectImpactAnalyzer(self.store)
+        return self._impact_analyzer
+
+    @property
+    def incremental(self) -> IncrementalIndexer:
+        if self._incremental is None:
+            self._incremental = IncrementalIndexer(self)
+        return self._incremental
+
     def bootstrap(self, *, reason: str = "kernel_boot") -> IndexSummary:
         if not self.config.enabled:
-            summary = self.store.load_summary()
             self._bootstrapped = True
-            return summary
+            return self._disabled_summary()
         if self.config.build_on_boot or self.store.load_summary().file_count == 0:
             return self.build_full_index(reason=reason)
         summary = self.refresh(reason=reason)
@@ -153,6 +185,8 @@ class ProjectIndexRuntime:
         self.store = ProjectIndexStore(self.db_path)
 
     def refresh(self, *, reason: str = "manual") -> IndexSummary:
+        if not self.config.enabled:
+            return self._disabled_summary()
         current = {file.path: file for file in self.scanner.scan()}
         indexed = {file.path: file for file in self.store.all_files()}
         changed = [
@@ -171,6 +205,12 @@ class ProjectIndexRuntime:
 
     def update_after_changeset(self, changeset: Any, *, reason: str = "changeset") -> Any:
         changed, deleted = self._changed_and_deleted_from(changeset)
+        if not self.config.enabled:
+            return IncrementalIndexResult(
+                changed_files=changed,
+                deleted_files=deleted,
+                summary=_bounded_summary(self._disabled_summary()),
+            )
         return self.incremental.update_after_changeset(
             changed_files=changed,
             deleted_files=deleted,
@@ -178,21 +218,50 @@ class ProjectIndexRuntime:
         )
 
     def find_relevant_files(self, goal: str, hints: Iterable[str] | None = None):
+        if not self.config.enabled:
+            return []
         return self.query_service.find_relevant_files(goal, hints)
 
     def find_symbols(self, query: str):
+        if not self.config.enabled:
+            return []
         return self.query_service.find_symbols(query)
 
     def get_context_candidates(self, goal: str, budget_tokens: int = 4000, hints: Iterable[str] | None = None):
+        if not self.config.enabled:
+            return []
         return self.query_service.get_context_candidates(goal, budget_tokens=budget_tokens, hints=hints)
 
     def analyze_impact(self, paths: Iterable[str]):
+        paths = list(paths)
+        if not self.config.enabled:
+            return CodeImpactAnalysis(
+                requested_paths=paths,
+                risk_level="unknown",
+                risk_reasons=["project_index_disabled"],
+                recommended_validation=["Run relevant tests manually because ProjectIndexRuntime is disabled."],
+            )
         return self.impact_analyzer.analyze_paths(paths)
 
     def get_test_impact(self, changed_files: Iterable[str]):
+        changed_files = list(changed_files)
+        if not self.config.enabled:
+            return TestImpactAnalysis(
+                changed_files=changed_files,
+                require_full_test=True,
+                confidence_note="ProjectIndexRuntime is disabled.",
+            )
         return self.impact_analyzer.get_test_impact(changed_files)
 
     def explain(self) -> dict[str, object]:
+        if not self.config.enabled:
+            summary = self._disabled_summary()
+            return {
+                "summary": summary.to_dict(),
+                "project_roots": [],
+                "entrypoints": [],
+                "limitations": summary.limitations,
+            }
         return self.query_service.explain_project_structure()
 
     def observation_for_goal(
@@ -202,6 +271,11 @@ class ProjectIndexRuntime:
         hints: Iterable[str] | None = None,
         budget_tokens: int = 3000,
     ) -> dict[str, Any]:
+        if not self.config.enabled:
+            return build_project_index_observation(
+                index_id=self.index_id,
+                summary=self._disabled_summary(),
+            ).to_dict()
         summary = self.store.load_summary()
         relevant = self.find_relevant_files(goal, hints)
         context = self.get_context_candidates(goal, budget_tokens=budget_tokens, hints=hints)
@@ -213,6 +287,14 @@ class ProjectIndexRuntime:
         ).to_dict()
 
     def health_check(self) -> dict[str, Any]:
+        if not self.config.enabled:
+            return {
+                "ok": True,
+                "enabled": False,
+                "db_path": str(self.db_path),
+                "bootstrapped": self._bootstrapped,
+                "summary": _bounded_summary(self._disabled_summary()),
+            }
         summary = self.store.load_summary()
         return {
             "ok": self.config.enabled and self.db_path.exists(),
@@ -220,6 +302,9 @@ class ProjectIndexRuntime:
             "bootstrapped": self._bootstrapped,
             "summary": _bounded_summary(summary),
         }
+
+    def _disabled_summary(self) -> IndexSummary:
+        return IndexSummary(limitations=["project_index_disabled"])
 
     def _index_paths(self, paths: Iterable[str]) -> list[str]:
         normalized = sorted(set(paths))
@@ -299,7 +384,7 @@ class ProjectIndexRuntime:
         matched = [plugin for plugin in self.plugins if plugin.supports(file)]
         if matched:
             return matched
-        if any(role.value == "doc" for role in file.roles):
+        if any(str(role) == "doc" for role in file.roles):
             return [self.plugins[0]]
         return []
 
@@ -383,7 +468,7 @@ def _bounded_summary(summary: IndexSummary) -> dict[str, Any]:
         "dependency_count": summary.dependency_count,
         "entrypoint_count": summary.entrypoint_count,
         "languages": summary.languages,
-        "freshness": summary.freshness.value,
+        "freshness": summary.freshness.value if hasattr(summary.freshness, "value") else str(summary.freshness),
     }
 
 

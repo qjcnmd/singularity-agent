@@ -129,3 +129,20 @@ def test_git_cli_status_and_diff_json(monkeypatch, tmp_path: Path) -> None:
     assert diff.exit_code == 0, diff.output
     assert json.loads(status.output)["available"] is True
     assert json.loads(diff.output)["paths"] == ["example.txt"]
+
+
+def test_git_cli_accepts_explicit_project_root(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    cwd = tmp_path / "cwd"
+    repo.mkdir()
+    cwd.mkdir()
+    _init_repo(repo)
+    (repo / "example.txt").write_text("one\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+
+    status = runner.invoke(app, ["git", "status", "--project-root", str(repo), "--json"])
+
+    assert status.exit_code == 0, status.output
+    payload = json.loads(status.output)
+    assert payload["available"] is True
+    assert Path(payload["workspace_root"]) == repo.resolve()

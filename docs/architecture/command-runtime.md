@@ -38,7 +38,7 @@ Most read-only tools have a bounded input/output shape. Shell does not. Even a s
 
 When `PolicyRuntime` returns `sandbox_required`, CommandRuntime calls `SandboxRuntime` and does not spawn the command through `LocalProcessBackend`.
 
-`GitRuntime` is not implemented yet. Read-only git commands can run through CommandRuntime. Git mutations such as `add`, `commit`, `reset`, `clean`, `push`, `pull`, and `rebase` require review or should move to a dedicated GitRuntime later.
+`GitRuntime` is implemented as a local-only status/diff/commit wrapper. It invokes the configured git executable directly, never executes user-provided shell command strings, never pushes or pulls, and stages only explicit paths scoped to the configured workspace root.
 
 ## Request And Plan
 

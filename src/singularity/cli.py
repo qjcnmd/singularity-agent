@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from singularity.cli_paths import resolve_project_root
 from singularity.code_index import ProjectIndexRuntime
 from singularity.config import ProductionRuntimeConfig, adaptive_default_max_turns
 from singularity.evaluation import (
@@ -99,6 +100,10 @@ eval_app.add_typer(eval_report_app, name="report")
 eval_app.add_typer(eval_live_app, name="live")
 console = Console()
 _REDACTOR = TraceRedactor()
+ProjectRootOption = Annotated[
+    Path | None,
+    typer.Option("--project-root", help="Workspace/project root; defaults to the current directory."),
+]
 
 
 def _is_click_usage_error(exc: Exception) -> bool:
@@ -248,7 +253,7 @@ def run_goal(
 ) -> None:
     """Run the production-oriented local CLI coding agent runtime."""
 
-    project_root = (project_root or Path.cwd()).expanduser().resolve(strict=False)
+    project_root = resolve_project_root(project_root)
     runtime_config = ProductionRuntimeConfig.from_cli(
         project_root=project_root,
         max_turns=max_turns,
@@ -381,10 +386,11 @@ def version_command(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Print Singularity version and installation information."""
 
-    paths = resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd())
+    paths = resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root))
     info = version_info(paths)
     if json_output:
         _write_stdout(json_dumps(info.to_dict()))
@@ -420,10 +426,11 @@ def doctor_command(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Diagnose installed CLI and runtime directory health without modifying data."""
 
-    project_root = Path.cwd()
+    project_root = resolve_project_root(project_root)
     report = DoctorEngine.default().run(
         paths=resolve_runtime_paths(mode=mode, home=home, project_root=project_root),
         project_root=project_root,
@@ -461,12 +468,13 @@ def repair_command(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Plan or apply safe local runtime repairs."""
 
     if dry_run and apply_changes:
         raise typer.BadParameter("Use either --dry-run or --apply, not both.")
-    project_root = Path.cwd()
+    project_root = resolve_project_root(project_root)
     paths = resolve_runtime_paths(mode=mode, home=home, project_root=project_root)
     before = DoctorEngine.default().run(paths=paths, project_root=project_root, check_id=check_id)
     plan = RepairEngine().run(before, paths=paths, project_root=project_root, apply=apply_changes)
@@ -506,11 +514,12 @@ def system_init(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Initialize user-level Singularity runtime directories and defaults."""
 
     result = initialize_runtime(
-        resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()),
+        resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)),
         force=force,
     )
     _print_release_payload(result, json_output=json_output, title="runtime initialized")
@@ -527,11 +536,12 @@ def system_migrate(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Apply pending release/runtime migrations with backup and rollback."""
 
     result = {
-        "applied": apply_migrations(resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()))
+        "applied": apply_migrations(resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)))
     }
     _print_release_payload(result, json_output=json_output, title="migrations")
 
@@ -547,10 +557,11 @@ def system_repair(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Repair missing runtime directories and default files without overwriting data."""
 
-    result = repair_runtime(resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()))
+    result = repair_runtime(resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)))
     _print_release_payload(result, json_output=json_output, title="repair")
 
 
@@ -571,6 +582,7 @@ def system_uninstall(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Remove Singularity runtime-managed files with protected user data defaults."""
 
@@ -579,7 +591,7 @@ def system_uninstall(
         if not confirmed:
             raise typer.Abort()
     result = uninstall_runtime(
-        resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()),
+        resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)),
         dry_run=dry_run,
         purge_user_data=purge_user_data,
     )
@@ -600,11 +612,12 @@ def system_export(
         Path | None,
         typer.Option("--home", help="Override runtime root for this command."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Export Singularity user data into a portable zip archive."""
 
     result = export_user_data(
-        resolve_runtime_paths(mode=mode, home=home, project_root=Path.cwd()),
+        resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)),
         output,
     )
     _print_release_payload(result, json_output=json_output, title="export")
@@ -659,10 +672,11 @@ def _format_list(values: list[str]) -> str:
 def index_build(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Build the ProjectIndexRuntime SQLite index."""
 
-    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
     summary = runtime.build_full_index(reason="cli_build").to_dict()
     _print_index_payload(summary, json_output=json_output, title="project index")
 
@@ -671,10 +685,11 @@ def index_build(
 def index_refresh(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Refresh the ProjectIndexRuntime index incrementally when possible."""
 
-    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
     summary = runtime.refresh(reason="cli_refresh").to_dict()
     _print_index_payload(summary, json_output=json_output, title="project index")
 
@@ -683,10 +698,11 @@ def index_refresh(
 def index_explain(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Explain indexed project structure and limitations."""
 
-    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
     runtime.bootstrap(reason="cli_explain")
     _print_index_payload(runtime.explain(), json_output=json_output, title="project index explain")
 
@@ -696,10 +712,11 @@ def index_relevant(
     goal: Annotated[str, typer.Argument(help="Goal or query used to rank relevant files.")],
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Rank relevant files for a goal."""
 
-    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
     runtime.bootstrap(reason="cli_relevant")
     payload = {"relevant_files": [item.to_dict() for item in runtime.find_relevant_files(goal)]}
     _print_index_payload(payload, json_output=json_output, title="project index relevant")
@@ -710,10 +727,11 @@ def index_impact(
     paths: Annotated[list[str], typer.Argument(help="Workspace-relative paths to analyze.")],
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Analyze code-index impact for paths."""
 
-    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
     runtime.bootstrap(reason="cli_impact")
     _print_index_payload(runtime.analyze_impact(paths).to_dict(), json_output=json_output, title="project index impact")
 
@@ -723,10 +741,11 @@ def index_tests(
     paths: Annotated[list[str], typer.Argument(help="Changed workspace-relative paths.")],
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Return test impact for changed paths."""
 
-    runtime = ProjectIndexRuntime(Path.cwd(), db_path=db_path)
+    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
     runtime.bootstrap(reason="cli_tests")
     _print_index_payload(runtime.get_test_impact(paths).to_dict(), json_output=json_output, title="project index tests")
 
@@ -818,13 +837,14 @@ def eval_suite_run(
         typer.Option("--tag", help="Require a tag; repeat for multiple tags."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print report JSON.")] = False,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Run a benchmark suite against one or more fixed profiles."""
 
     tasks = GoldenTaskStore(task_set).load(version=version, tags=tag or None)
     profiles = _profiles_from_cli(profile_json)
     runtime = _evaluation_runtime_from_cli(
-        project_root=Path.cwd(),
+        project_root=resolve_project_root(project_root),
         output_root=output_dir,
         run_id=run_id,
         execute=execute,
@@ -848,11 +868,12 @@ def eval_trace_replay(
         typer.Option("--profile-json", help="EvaluationProfile JSON object."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Replay a stored trace deterministically under a fixed evaluation profile."""
 
     profile = _profiles_from_cli([profile_json] if profile_json else None)[0]
-    result = TraceReplayRuntime(project_root=Path.cwd()).replay(trace_run_dir, profile=profile)
+    result = TraceReplayRuntime(project_root=resolve_project_root(project_root)).replay(trace_run_dir, profile=profile)
     _print_eval_payload(result.to_dict(), json_output=json_output, title="trace replay")
 
 
@@ -887,6 +908,7 @@ def eval_ab_run(
         ),
     ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Print report JSON.")] = False,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Run an A/B evaluation for model, prompt, memory, or tool-policy profiles."""
 
@@ -895,7 +917,7 @@ def eval_ab_run(
     baseline = EvaluationProfile.from_dict(json.loads(baseline_profile_json))
     candidate = EvaluationProfile.from_dict(json.loads(candidate_profile_json))
     runtime = _evaluation_runtime_from_cli(
-        project_root=Path.cwd(),
+        project_root=resolve_project_root(project_root),
         output_root=output_dir,
         run_id=run_id,
         execute=execute,
@@ -951,6 +973,7 @@ def eval_regression_run(
         ),
     ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Print regression report JSON.")] = False,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Compare a candidate profile against a baseline benchmark report."""
 
@@ -959,7 +982,7 @@ def eval_regression_run(
     baseline = EvaluationProfile.from_dict(json.loads(baseline_profile_json))
     candidate = EvaluationProfile.from_dict(json.loads(candidate_profile_json))
     runtime = _evaluation_runtime_from_cli(
-        project_root=Path.cwd(),
+        project_root=resolve_project_root(project_root),
         output_root=output_dir,
         run_id=run_id,
         execute=execute,
@@ -1092,17 +1115,14 @@ def _run_live_quicksort_benchmark(
             timeout=15,
             check=False,
         ) if quicksort_path.exists() else None
-        ok = bool(
-            agent_result.status == RunStatus.COMPLETED
-            and quicksort_path.exists()
-            and smoke is not None
-            and smoke.returncode == 0
-        )
+        artifact_ok = bool(quicksort_path.exists() and smoke is not None and smoke.returncode == 0)
+        agent_completed = agent_result.status == RunStatus.COMPLETED
         return {
             "schema_version": "evaluation.live_provider_benchmark/v1",
             "benchmark": "quicksort",
             "run_id": resolved_run_id,
-            "ok": ok,
+            "ok": artifact_ok,
+            "agent_completed": agent_completed,
             "status": agent_result.status.value,
             "workspace": str(workspace),
             "trace": str(kernel.graph.trace.store.run_dir),
@@ -1246,10 +1266,11 @@ def trace_list(
         Path | None,
         typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """List local structured trace runs."""
 
-    traces_root = trace_dir or (Path.cwd() / "work" / "traces" / "runs")
+    traces_root = trace_dir or (resolve_project_root(project_root) / "work" / "traces" / "runs")
     if not traces_root.exists():
         console.print("No trace runs found.")
         return
@@ -1264,10 +1285,11 @@ def trace_show(
         Path | None,
         typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Show a trace run summary."""
 
-    store = TraceStore(Path.cwd(), run_id=run_id, trace_dir=trace_dir)
+    store = TraceStore(resolve_project_root(project_root), run_id=run_id, trace_dir=trace_dir)
     summary = store.summarize(run_id=run_id).to_dict()
     console.print(json_dumps(summary))
 
@@ -1279,10 +1301,11 @@ def trace_timeline(
         Path | None,
         typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Show a trace run timeline."""
 
-    store = TraceStore(Path.cwd(), run_id=run_id, trace_dir=trace_dir)
+    store = TraceStore(resolve_project_root(project_root), run_id=run_id, trace_dir=trace_dir)
     for item in store.get_timeline(run_id=run_id):
         console.print(
             f"{item.timestamp.isoformat()} {item.event_type} "
@@ -1297,10 +1320,11 @@ def trace_errors(
         Path | None,
         typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Show warning/error/critical events for a trace run."""
 
-    store = TraceStore(Path.cwd(), run_id=run_id, trace_dir=trace_dir)
+    store = TraceStore(resolve_project_root(project_root), run_id=run_id, trace_dir=trace_dir)
     for event in store.query_events(run_id=run_id):
         if event.severity.value in {"warning", "error", "critical"}:
             console.print(
@@ -1316,10 +1340,11 @@ def trace_artifacts(
         Path | None,
         typer.Option("--trace-dir", help="Directory that contains trace run/session directories."),
     ] = None,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """List artifacts for a trace run."""
 
-    store = TraceStore(Path.cwd(), run_id=run_id, trace_dir=trace_dir)
+    store = TraceStore(resolve_project_root(project_root), run_id=run_id, trace_dir=trace_dir)
     for artifact in store.artifacts():
         console.print(
             f"{artifact.artifact_id} {artifact.kind.value} "

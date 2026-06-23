@@ -78,8 +78,9 @@ class GitCommitResult:
 class GitRuntime:
     """Small local Git control-plane wrapper.
 
-    The runtime is intentionally local-only. It never shells out, never pushes,
-    and only stages paths explicitly scoped to the configured workspace root.
+    The runtime is intentionally local-only. It invokes the configured git
+    executable directly, never pushes, and only stages paths explicitly scoped
+    to the configured workspace root.
     """
 
     def __init__(

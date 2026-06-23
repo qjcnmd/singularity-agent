@@ -99,7 +99,7 @@ Runtime names tracked by Documentation Runtime:
 | `ModelRuntime` | implemented | `src/singularity/model/runtime.py` |
 | `ToolCallingProtocolRuntime` / `ToolRuntime` | implemented | `src/singularity/tool_protocol/runtime.py`, `src/singularity/tools/runtime.py` |
 | `ParallelToolExecutor` | implemented | `src/singularity/tool_protocol/parallel.py`; only read-only idempotent tool groups run concurrently |
-| `PolicyRuntime` / `ApprovalGate` | implemented | `src/singularity/policy/runtime.py`, `src/singularity/policy/approval.py` |
+| `PolicyRuntime` / `ApprovalGate` | implemented | `src/singularity/policy/engine.py`, `src/singularity/policy/approval.py` |
 | `MutationRuntime` / `CommandRuntime` / `VerificationRuntime` | implemented | `src/singularity/workspace/runtime.py`, `src/singularity/command/runtime.py`, `src/singularity/verification/runtime.py` |
 | `SandboxRuntime` | partial | `DockerSandboxBackend` provides hard isolation when available; `LocalStagingBackend` provides soft copy-on-write workspace isolation only |
 | `GitRuntime` | implemented | local-only status, diff, and commit wrapper in `src/singularity/git_runtime/`; no push, PR, or remote branch automation |
@@ -363,10 +363,12 @@ Use the repository validation command:
 
 ```bash
 python -m pytest tests --basetemp work/pytest-tmp
+python -m ruff check .
+python -m mypy
 git diff --check
 ```
 
-The declared development dependency set currently includes `pytest`; no mandatory `ruff` or `mypy` gate is configured in `pyproject.toml`.
+The declared development dependency set includes `pytest`, `ruff`, `mypy`, and `pytest-cov`. Ruff is configured as a low-noise correctness gate, mypy is scoped to production-critical modules, and coverage is configured for reporting before a fail-under threshold is introduced.
 
 Before publishing, verify remote alignment with:
 

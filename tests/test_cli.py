@@ -258,6 +258,23 @@ def test_cli_run_accepts_project_root(monkeypatch, tmp_path: Path) -> None:
     assert payload["config"].max_turns == 5
 
 
+def test_index_cli_accepts_explicit_project_root(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    cwd = tmp_path / "cwd"
+    project_root.mkdir()
+    cwd.mkdir()
+    (project_root / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+
+    result = runner.invoke(app, ["index", "build", "--project-root", str(project_root), "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["file_count"] >= 1
+    assert (project_root / ".singularity" / "index.sqlite").exists()
+    assert not (cwd / ".singularity" / "index.sqlite").exists()
+
+
 def test_eval_live_quicksort_uses_kernel_and_independent_smoke(monkeypatch, tmp_path: Path) -> None:
     class FakeTrace:
         class Store:
@@ -324,9 +341,86 @@ def test_eval_live_quicksort_uses_kernel_and_independent_smoke(monkeypatch, tmp_
     )
 
     assert result["ok"] is True
+    assert result["agent_completed"] is True
     assert result["status"] == "completed"
     assert Path(result["workspace"], "quicksort.py").exists()
     assert result["independent_smoke"]["exit_code"] == 0
+
+
+def test_eval_live_quicksort_accepts_verified_artifact_when_agent_blocks_late(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeTrace:
+        class Store:
+            run_dir = tmp_path / "trace" / "run_1"
+
+        store = Store()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class BlockedStatus:
+        value = "blocked"
+
+    class FakeResult:
+        status = BlockedStatus()
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="blocked",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            runtime_health_summary={"planner": "ok"},
+            shutdown_summary={"cleanup_status": "completed"},
+            recovery_summary={"recovered": False},
+            lifecycle_summary={"events": 3},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, goal: str) -> FakeResult:
+            (self.project_root / "quicksort.py").write_text(
+                "def quicksort(values):\n"
+                "    return sorted(values)\n"
+                "if __name__ == '__main__':\n"
+                "    assert quicksort([3, 1, 2]) == [1, 2, 3]\n",
+                encoding="utf-8",
+            )
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+
+    result = _run_live_quicksort_benchmark(
+        output_dir=tmp_path / "live",
+        run_id="late_block",
+        max_turns=3,
+        model=None,
+        base_url=None,
+    )
+
+    assert result["ok"] is True
+    assert result["agent_completed"] is False
+    assert result["status"] == "blocked"
 
 
 @pytest.mark.live_provider

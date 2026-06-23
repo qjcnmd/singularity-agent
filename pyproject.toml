@@ -24,9 +24,13 @@ devtools = [
 
 [dependency-groups]
 dev = [
+    "mypy>=1.10",
+    "pytest-cov>=5.0",
     "pytest>=8.0",
+    "ruff>=0.6",
 ]
 test = [
+    "pytest-cov>=5.0",
     "pytest>=8.0",
 ]
 build = [
@@ -58,6 +62,49 @@ norecursedirs = [
     "outputs",
     "work",
 ]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "outputs",
+    "work",
+]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+ignore_missing_imports = true
+check_untyped_defs = false
+follow_imports = "skip"
+files = [
+    "src/singularity/cli_paths.py",
+    "src/singularity/code_index/runtime.py",
+    "src/singularity/git_runtime",
+    "src/singularity/model/providers.py",
+    "src/singularity/tool_protocol/parallel.py",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["singularity"]
+omit = [
+    "*/tests/*",
+    "*/work/*",
+    "*/outputs/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/singularity"]

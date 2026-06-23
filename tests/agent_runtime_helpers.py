@@ -7,6 +7,7 @@ from typing import Any
 from rich.console import Console
 
 from singularity.agent import SingularityAgent
+from singularity.context import ContextManager
 from singularity.instructions import InstructionRuntime
 from singularity.model import ModelRuntime
 from singularity.planner import PlannerRuntime
