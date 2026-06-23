@@ -260,7 +260,7 @@ This separation matters because a formatter, package manager, test, or code gene
 
 Command trace includes lightweight git summaries before and after execution. The current implementation reads `.git/HEAD` and branch refs without running extra git commands from inside the trace path. It does not claim full dirty-file status there.
 
-The workspace mutation runtime still records richer git state by issuing read-only git commands through `CommandRuntime`.
+`GitRuntime` owns local Git status, diff statistics, scoped staging, and local commits. CommandRuntime trace git summaries are only command side-effect context, not a replacement for GitRuntime.
 
 ## Trace Fields
 

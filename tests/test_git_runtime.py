@@ -112,6 +112,18 @@ def test_git_runtime_allow_empty_does_not_stage_untracked_paths(tmp_path: Path) 
     assert "?? untracked.txt" in status.stdout
 
 
+def test_git_runtime_rejects_paths_outside_workspace(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    runtime = GitRuntime(repo)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside workspace"):
+        runtime.commit("outside", paths=[str(outside)])
+
+
 def test_git_cli_status_and_diff_json(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

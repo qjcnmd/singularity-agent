@@ -76,7 +76,7 @@ class GitCommitResult:
 
 
 class GitRuntime:
-    """Small local Git control-plane wrapper.
+    """Small local-only Git adapter.
 
     The runtime is intentionally local-only. It invokes the configured git
     executable directly, never pushes, and only stages paths explicitly scoped

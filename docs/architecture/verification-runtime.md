@@ -31,7 +31,7 @@ ToolRuntime
 
 `ContextManager` stores verification tool observations like any other tool result. The model-facing message receives only a bounded summary: plan status, check statuses, failed checks, parsed failures, repair hints, and completion assessment. Full command output stays in command artifacts and trace.
 
-`GitRuntime` is still reserved. Verification records transaction/change-set identifiers and uses command side-effect reporting, but does not stage, commit, reset, clean, or push.
+`GitRuntime` is a separate local-only status, diff, and commit adapter. Verification records transaction/change-set identifiers and uses command side-effect reporting, but does not stage, commit, reset, clean, or push.
 
 ## Project Detection And Command Discovery
 

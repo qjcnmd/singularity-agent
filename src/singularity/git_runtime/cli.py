@@ -48,13 +48,13 @@ def git_commit(
     message: Annotated[str, typer.Option("--message", "-m", help="Local commit message.")],
     path: Annotated[
         list[Path] | None,
-        typer.Option("--path", help="Workspace path to stage; repeat for multiple paths."),
+        typer.Option("--path", help="Explicit workspace path to stage; repeat for multiple paths."),
     ] = None,
     allow_empty: Annotated[bool, typer.Option("--allow-empty", help="Allow an empty local commit.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Create a local Git commit. This command never pushes."""
+    """Create a local Git commit from explicit paths. This command never pushes."""
 
     result = GitRuntime(resolve_project_root(project_root)).commit(
         message,

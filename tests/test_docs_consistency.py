@@ -103,6 +103,35 @@ def test_readme_runtime_status_table_has_source_or_planned_mapping() -> None:
     assert "`FinalReport` | implemented | kernel: `src/singularity/kernel/finalization.py`" in text
 
 
+def test_readme_implemented_runtime_source_paths_exist() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    for capability, status, source in _runtime_status_rows(text):
+        if status != "implemented":
+            continue
+        for relative_path in re.findall(r"`(src/singularity/[^`]+)`", source):
+            path = ROOT / relative_path
+            assert path.exists(), f"{capability} references missing source path: {relative_path}"
+
+
+def test_git_runtime_docs_match_local_only_contract() -> None:
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in [
+            ROOT / "README.md",
+            ROOT / "docs" / "architecture" / "runtime-map.md",
+            ROOT / "docs" / "architecture" / "command-runtime.md",
+            ROOT / "docs" / "architecture" / "code-index-runtime.md",
+            ROOT / "docs" / "architecture" / "verification-runtime.md",
+        ]
+    )
+
+    assert "Git-absent runtime boundary" not in combined
+    assert "GitRuntime` is still reserved" not in combined
+    assert "local-only status, diff, and commit" in combined
+    assert "Push, pull, reset, remote branches, pull requests" in combined
+
+
 def test_config_and_sandbox_docs_match_implemented_evidence() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     runtime_map = (ROOT / "docs" / "architecture" / "runtime-map.md").read_text(encoding="utf-8")
@@ -131,3 +160,15 @@ def _runtime_names(path: Path) -> list[str]:
     )
     assert match, f"missing runtime-names markers in {path}"
     return re.findall(r"`([^`]+)`", match.group(1))
+
+
+def _runtime_status_rows(text: str) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for line in text.splitlines():
+        if not line.startswith("| `"):
+            continue
+        parts = [part.strip() for part in line.strip("|").split("|")]
+        if len(parts) != 3:
+            continue
+        rows.append((parts[0], parts[1], parts[2]))
+    return rows

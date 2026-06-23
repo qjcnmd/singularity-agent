@@ -6,7 +6,7 @@ Singularity uses `ProjectIndexRuntime` as the read-only code intelligence layer 
 
 `ProjectIndexRuntime` never executes workspace code. Source files, README text, comments, package metadata, and documentation are treated as untrusted workspace data. The runtime records structure, hashes, paths, symbols, imports, test mappings, document sections, freshness, confidence, evidence, trust level, and backend/source metadata.
 
-It does not own Git, branch, commit, PR, push, shell execution, mutation writes, prompt compilation, or command verification. Those remain owned by the existing Git-absent runtime boundary, MutationRuntime, InstructionRuntime, CommandRuntime, VerificationRuntime, PolicyRuntime, and Kernel.
+It does not own Git, branch, commit, PR, push, shell execution, mutation writes, prompt compilation, or command verification. Local Git status, diff, and commits remain owned by GitRuntime; mutation writes, prompt compilation, command execution, verification, policy, and orchestration remain owned by MutationRuntime, InstructionRuntime, CommandRuntime, VerificationRuntime, PolicyRuntime, and Kernel.
 
 ## Storage
 
