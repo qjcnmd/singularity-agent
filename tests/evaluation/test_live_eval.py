@@ -86,6 +86,7 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         "task_count": 3,
         "scored_task_count": 2,
         "infrastructure_blocked_count": 1,
+        "score_status": "scored",
         "success_count": 1,
         "task_completion_rate": 0.5,
         "tests_passed_count": 2,
@@ -259,6 +260,7 @@ def test_live_eval_marks_model_transport_blocker_without_running_verification(tm
 
     assert result["summary"]["infrastructure_blocked_count"] == 1
     assert result["summary"]["scored_task_count"] == 0
+    assert result["summary"]["score_status"] == "infrastructure_blocked"
     assert result["summary"]["task_completion_rate"] == 0.0
     assert result["summary"]["test_pass_rate"] == 0.0
     task = result["tasks"][0]

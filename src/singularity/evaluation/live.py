@@ -448,6 +448,11 @@ def summarize_live_results(results: list[LiveEvalTaskResult]) -> dict[str, Any]:
         "task_count": task_count,
         "scored_task_count": scored_task_count,
         "infrastructure_blocked_count": infrastructure_blocked_count,
+        "score_status": _score_status(
+            task_count=task_count,
+            scored_task_count=scored_task_count,
+            infrastructure_blocked_count=infrastructure_blocked_count,
+        ),
         "success_count": success_count,
         "task_completion_rate": _rate(success_count, scored_task_count),
         "tests_passed_count": tests_passed_count,
@@ -458,6 +463,14 @@ def summarize_live_results(results: list[LiveEvalTaskResult]) -> dict[str, Any]:
         "run_cache_hit_rate": _rate(cached_tokens, prompt_tokens),
         "tool_calls": sum(result.tool_calls for result in results),
     }
+
+
+def _score_status(*, task_count: int, scored_task_count: int, infrastructure_blocked_count: int) -> str:
+    if scored_task_count > 0:
+        return "scored"
+    if task_count > 0 and infrastructure_blocked_count == task_count:
+        return "infrastructure_blocked"
+    return "empty"
 
 
 def _workspace_payload(payload: dict[str, Any]) -> dict[str, Any]:
