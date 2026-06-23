@@ -17,6 +17,13 @@ class WriteInput(BaseModel):
     path: str
 
 
+class ListInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_files: list[str]
+    content: str
+
+
 def test_validator_builds_readonly_batch_and_schedules_parallel_readonly(tmp_path) -> None:
     validator = ToolProtocolValidator(ToolRegistry(tmp_path))
     assistant_message = {
@@ -267,6 +274,53 @@ def test_validator_accepts_dict_arguments_and_normalizes_to_json(tmp_path) -> No
     assert result.batch is not None
     assert result.batch.tool_calls[0].raw_arguments == '{"path":"."}'
     assert result.batch.tool_calls[0].normalized_arguments == {"path": ".", "max_depth": 4}
+
+
+def test_validator_coerces_json_string_for_list_fields_only(tmp_path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="list_input",
+            version="0.0.1",
+            description="list input",
+            input_model=ListInput,
+            handler=lambda args: None,
+            permission_level=PermissionLevel.WRITE,
+            uses_mutation_runtime=True,
+        )
+    )
+
+    result = ToolProtocolValidator(registry).validate_assistant_message(
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        model_request_id="req_1",
+        model_response_id="resp_1",
+        assistant_message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_list",
+                    "type": "function",
+                    "function": {
+                        "name": "list_input",
+                        "arguments": {
+                            "expected_files": '["close_elements.py"]',
+                            "content": '{"still":"a string"}',
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    assert result.valid is True
+    assert result.batch.tool_calls[0].normalized_arguments == {
+        "expected_files": ["close_elements.py"],
+        "content": '{"still":"a string"}',
+    }
 
 
 def test_validator_enforces_tool_choice_and_allowed_tools(tmp_path) -> None:

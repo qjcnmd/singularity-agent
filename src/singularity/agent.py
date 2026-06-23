@@ -247,6 +247,16 @@ class SingularityAgent:
                 terminal = self._terminal_result_from_outcome(outcome, turn=turn)
                 if terminal is not None:
                     return terminal
+            if self._should_auto_finalize_after_tools(planner, protocol_result):
+                final = self._attempt_finalize(
+                    planner,
+                    controller=controller,
+                    context=context,
+                    turn=turn,
+                    model_answer=assistant_message.get("content") or "",
+                )
+                if final is not None:
+                    return final
             return None
 
         def on_max_turns(max_turns: int) -> SingularityAgentRunResult:
@@ -343,6 +353,24 @@ class SingularityAgent:
             final_answer=final_answer,
             turn=turn,
         )
+
+    @staticmethod
+    def _should_auto_finalize_after_tools(
+        planner: PlannerRuntime,
+        protocol_result: Any,
+    ) -> bool:
+        state = planner.state
+        if state is None:
+            return False
+        if state.status != TaskStatus.FINALIZING and state.current_phase != TaskStatus.FINALIZING.value:
+            return False
+        if int(getattr(protocol_result, "pending_approval_count", 0) or 0):
+            return False
+        if int(getattr(protocol_result, "failed_count", 0) or 0):
+            return False
+        if int(getattr(protocol_result, "rejected_count", 0) or 0):
+            return False
+        return True
 
     def _reduce_protocol_result(
         self,

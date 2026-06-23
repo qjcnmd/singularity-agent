@@ -537,7 +537,7 @@ class PlannerRuntime:
         }
         if payload not in self.evidence.policy_observations:
             self.evidence.policy_observations.append(payload)
-        if payload["outcome"] in {"deny", "require_review", "sandbox_required", "escalate"}:
+        if payload["outcome"] in {"deny", "require_review", "escalate"}:
             self.evidence.unresolved_failures.append({"policy": payload})
             state.status = TaskStatus.NEEDS_REVIEW
             if payload["reason"]:

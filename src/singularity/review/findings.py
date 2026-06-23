@@ -216,7 +216,7 @@ class RuleFindingCollector:
         if not policy:
             return []
         outcome = str(policy.get("outcome") or "").lower()
-        if outcome not in {"deny", "require_review", "sandbox_required", "ask_user", "escalate"}:
+        if outcome not in {"deny", "require_review", "ask_user", "escalate"}:
             return []
         return [
             ReviewFinding(

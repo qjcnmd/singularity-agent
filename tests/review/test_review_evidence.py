@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from singularity.review.evidence import collect_review_evidence, stable_payload_hash, to_bounded_plain
+from singularity.review.findings import RuleFindingCollector
+from singularity.review.models import ReviewStage, ReviewTarget
 
 
 @dataclass
@@ -38,3 +40,13 @@ def test_to_bounded_plain_handles_model_dump_and_to_dict() -> None:
 
     assert to_bounded_plain(ModelLike()) == {"mode": "json", "value": "ok"}
     assert to_bounded_plain(DictLike()) == {"value": "ok"}
+
+
+def test_sandbox_required_policy_observation_is_not_blocking_finding() -> None:
+    findings = RuleFindingCollector().collect(
+        target=ReviewTarget(stage=ReviewStage.POST_VERIFICATION),
+        evidence=[],
+        context={"policy_observation": {"outcome": "sandbox_required", "reason": "use sandbox"}},
+    )
+
+    assert findings == []

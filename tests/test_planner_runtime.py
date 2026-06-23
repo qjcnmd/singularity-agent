@@ -72,6 +72,27 @@ def test_start_task_builds_state_plan_and_persists(tmp_path: Path) -> None:
     assert (tmp_path / ".singularity" / "planner" / "session_1" / "planner_events.jsonl").exists()
 
 
+def test_sandbox_required_policy_observation_is_not_unresolved_failure(tmp_path: Path) -> None:
+    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner.start_task("Run verification")
+
+    planner.record_policy_observation(
+        {
+            "outcome": "sandbox_required",
+            "runtime": "verification",
+            "operation": "run_verification",
+            "reason": "Verification command execution requires an isolated sandbox.",
+            "risk_level": "medium",
+            "resource": "python test.py",
+            "decision_id": "decision_1",
+        }
+    )
+
+    assert planner.evidence.policy_observations
+    assert planner.evidence.unresolved_failures == []
+    assert planner.state.blocked_reasons == []
+
+
 def test_task_contract_builder_extracts_create_file_smoke_contract() -> None:
     contract = TaskContractBuilder().build("Create quicksort.py and run smoke verification")
 

@@ -52,6 +52,18 @@ def test_policy_risk_requires_human_approval_before_other_actions() -> None:
     assert decision.required_approval_decision_id == "decision_1"
 
 
+def test_sandbox_required_policy_signal_does_not_require_human_approval_when_verified() -> None:
+    target = ReviewTarget(stage=ReviewStage.POST_VERIFICATION, verification_id="vplan_1")
+
+    decision = ReviewDecisionEngine().decide(
+        target=target,
+        findings=[],
+        context={"policy_outcome": "sandbox_required", "verification_status": "ready"},
+    )
+
+    assert decision.action == ReviewDecisionAction.ACCEPT
+
+
 def test_failed_required_verification_repairs() -> None:
     target = ReviewTarget(stage=ReviewStage.POST_VERIFICATION, verification_id="vplan_1")
 

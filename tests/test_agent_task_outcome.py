@@ -106,7 +106,8 @@ def test_premature_final_then_quicksort_smoke_completes(tmp_path: Path) -> None:
     assert result.status == SingularityAgentRunStatus.COMPLETED
     assert "status: completed" in result.final_answer
     assert (tmp_path / "quicksort.py").exists()
-    assert len(provider.calls) == 6
+    assert len(provider.calls) == 5
+    assert len(provider.responses) == 1
     rejected = planner.evidence.task_outcomes[0]
     assert rejected["status"] == "replan_required"
     assert rejected["error_code"] == "completion_rejected"
@@ -117,6 +118,43 @@ def test_premature_final_then_quicksort_smoke_completes(tmp_path: Path) -> None:
     assert smoke["evidence"]["exit_code"] == 0
     assert "ok" in smoke["evidence"]["stdout_excerpt"]
     assert smoke["evidence"]["stderr_excerpt"] == ""
+
+
+def test_ready_verification_finalizes_without_extra_model_turn(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        tool("call_read_1", "read_file", {"path": "README.md"}),
+        tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
+        tool(
+            "call_create",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": QUICK_SORT,
+                "mode": "create",
+                "reason": "create deterministic quicksort smoke target",
+            },
+        ),
+        tool(
+            "call_verify",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=4)
+
+    result = agent.run("implement quicksort.py and verify it")
+
+    assert result.status == SingularityAgentRunStatus.COMPLETED
+    assert result.turn == 4
+    assert "status: completed" in result.final_answer
+    assert len(provider.calls) == 4
+    assert planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "ready"
 
 
 def test_malformed_tool_args_record_retryable_outcome(tmp_path: Path) -> None:

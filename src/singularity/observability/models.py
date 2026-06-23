@@ -42,6 +42,8 @@ class TraceEventType(str, Enum):
     TOOL_PROTOCOL_CALL_SCHEDULED = "tool_protocol.call_scheduled"
     TOOL_PROTOCOL_CALL_STARTED = "tool_protocol.call_started"
     TOOL_PROTOCOL_CALL_COMPLETED = "tool_protocol.call_completed"
+    TOOL_PROTOCOL_PARALLEL_GROUP_STARTED = "tool_protocol.parallel_group_started"
+    TOOL_PROTOCOL_PARALLEL_GROUP_COMPLETED = "tool_protocol.parallel_group_completed"
     TOOL_PROTOCOL_RESULT_BOUND = "tool_protocol.result_bound"
     TOOL_PROTOCOL_SYNTHETIC_RESULT_CREATED = "tool_protocol.synthetic_result_created"
     TOOL_PROTOCOL_REPLAY_DETECTED = "tool_protocol.replay_detected"

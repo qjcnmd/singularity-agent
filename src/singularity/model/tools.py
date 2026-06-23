@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from types import UnionType
+from typing import Any, Union, get_args, get_origin
 
 from pydantic import ValidationError
 
@@ -135,6 +136,7 @@ class ToolCallNormalizer:
         spec = self.registry.get(tool_name)
         try:
             assert spec is not None
+            parsed = coerce_json_string_fields(parsed, spec.input_model)
             validated = spec.input_model.model_validate(parsed)
         except (ValidationError, AssertionError) as exc:
             details = exc.errors() if isinstance(exc, ValidationError) else [str(exc)]
@@ -175,3 +177,31 @@ def _capability_for_permission(permission: PermissionLevel) -> str:
         PermissionLevel.GIT: "git",
     }
     return mapping.get(permission, permission.value)
+
+
+def coerce_json_string_fields(payload: dict[str, Any], input_model: Any) -> dict[str, Any]:
+    fields = getattr(input_model, "model_fields", {})
+    if not fields:
+        return payload
+    coerced = dict(payload)
+    for name, field in fields.items():
+        value = coerced.get(name)
+        if not isinstance(value, str) or not _expects_json_container(field.annotation):
+            continue
+        text = value.strip()
+        if not text or text[0] not in "[{":
+            continue
+        try:
+            coerced[name] = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+    return coerced
+
+
+def _expects_json_container(annotation: Any) -> bool:
+    origin = get_origin(annotation)
+    if origin in {list, dict} or annotation in {list, dict}:
+        return True
+    if origin in {Union, UnionType}:
+        return any(_expects_json_container(arg) for arg in get_args(annotation))
+    return False

@@ -32,7 +32,7 @@ class ReviewDecisionEngine:
         verification_status = str(context.get("verification_status") or "").lower()
         policy_outcome = str(context.get("policy_outcome") or "").lower()
 
-        if policy_risks or policy_outcome in {"require_review", "ask_user", "escalate", "sandbox_required", "deny"}:
+        if policy_risks or policy_outcome in {"require_review", "ask_user", "escalate", "deny"}:
             return ReviewDecision(
                 action=ReviewDecisionAction.NEEDS_HUMAN_APPROVAL,
                 reasons=_reasons(policy_risks or blocking or findings, fallback="Policy risk requires human approval."),

@@ -10,6 +10,7 @@ from singularity.model.models import (
     ToolChoiceMode,
     ToolChoicePolicy,
 )
+from singularity.model.tools import coerce_json_string_fields
 from pydantic import ValidationError
 from singularity.tool_protocol.errors import ToolProtocolValidationError
 from singularity.tool_protocol.models import (
@@ -181,6 +182,7 @@ class ToolProtocolValidator:
             errors.append(ToolCallFailureKind.unknown_tool.value)
         elif not errors:
             try:
+                parsed_arguments = coerce_json_string_fields(parsed_arguments, spec.input_model)
                 validated = spec.input_model.model_validate(parsed_arguments)
                 parsed_arguments = validated.model_dump(mode="json")
             except ValidationError:
