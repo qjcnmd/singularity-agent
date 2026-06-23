@@ -35,6 +35,7 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         task_id="one",
         success=True,
         tests_passed=True,
+        infrastructure_blocked=False,
         prompt_tokens=100,
         cached_tokens=25,
         request_cache_hit_rate=0.25,
@@ -50,6 +51,7 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         task_id="two",
         success=False,
         tests_passed=True,
+        infrastructure_blocked=False,
         prompt_tokens=100,
         cached_tokens=75,
         request_cache_hit_rate=0.75,
@@ -66,6 +68,8 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
 
     assert summary == {
         "task_count": 2,
+        "scored_task_count": 2,
+        "infrastructure_blocked_count": 0,
         "success_count": 1,
         "task_completion_rate": 0.5,
         "tests_passed_count": 2,
@@ -168,3 +172,78 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     assert task["tool_calls"] == 2
     assert task["files_changed"] == ["done.txt"]
     assert Path(result["result_path"]).exists()
+
+
+def test_live_eval_marks_model_transport_blocker_without_running_verification(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest = LiveEvalManifest.from_dict(
+        {
+            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.model_blocked",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Write done.txt with ok.",
+                    "allowed_paths": ["done.txt"],
+                    "verification_command": f"{py} -c \"raise SystemExit(99)\"",
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.FAILED
+        final_answer = "[WinError 10013] socket access denied"
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="error",
+            diagnostics_count=1,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"model_usage_summary": {"input_tokens": 0}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def run_task(self, _goal: str) -> FakeResult:
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            _ = kwargs
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel()
+
+    result = LiveAgentEvalRunner(
+        output_root=tmp_path / "out",
+        run_id="run_blocked",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    assert result["summary"]["infrastructure_blocked_count"] == 1
+    assert result["summary"]["scored_task_count"] == 0
+    task = result["tasks"][0]
+    assert task["infrastructure_blocked"] is True
+    assert task["verification"] is None
+    assert "infrastructure blocked" in task["error_summary"]

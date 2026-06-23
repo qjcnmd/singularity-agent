@@ -169,6 +169,7 @@ class LiveEvalTaskResult:
     task_id: str
     success: bool
     tests_passed: bool
+    infrastructure_blocked: bool
     prompt_tokens: int
     cached_tokens: int
     request_cache_hit_rate: float
@@ -187,6 +188,7 @@ class LiveEvalTaskResult:
             "task_id": self.task_id,
             "success": self.success,
             "tests_passed": self.tests_passed,
+            "infrastructure_blocked": self.infrastructure_blocked,
             "prompt_tokens": self.prompt_tokens,
             "cached_tokens": self.cached_tokens,
             "request_cache_hit_rate": self.request_cache_hit_rate,
@@ -281,6 +283,7 @@ class LiveAgentEvalRunner:
                         errors=errors,
                         success=False,
                         tests_passed=False,
+                        infrastructure_blocked=False,
                     )
             before_snapshot = _snapshot_files(workspace)
             goal = _task_goal(task)
@@ -311,6 +314,23 @@ class LiveAgentEvalRunner:
             trace_summary = _trace_summary(kernel, agent_result)
             usage = dict(trace_summary.get("model_usage_summary") or {})
             tool_calls = _safe_int(trace_summary.get("tool_calls")) or _safe_int(usage.get("tool_calls_proposed"))
+            if _infrastructure_blocked(agent_result, usage=usage, tool_calls=tool_calls):
+                errors.append("infrastructure blocked: model provider unavailable")
+                files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
+                return self._task_result(
+                    task=task,
+                    workspace=workspace,
+                    trace=trace_path,
+                    started=started,
+                    verification=None,
+                    files_changed=files_changed,
+                    usage=usage,
+                    tool_calls=tool_calls,
+                    errors=errors,
+                    success=False,
+                    tests_passed=False,
+                    infrastructure_blocked=True,
+                )
             verification = _run_shell(
                 task.verification_command,
                 cwd=workspace,
@@ -350,6 +370,7 @@ class LiveAgentEvalRunner:
             errors=errors,
             success=success_ok,
             tests_passed=tests_passed,
+            infrastructure_blocked=False,
         )
 
     def _materialize_workspace(self, task: LiveEvalTask, *, workspace: Path, manifest_base: Path) -> None:
@@ -383,12 +404,14 @@ class LiveAgentEvalRunner:
         errors: list[str],
         success: bool,
         tests_passed: bool,
+        infrastructure_blocked: bool,
     ) -> LiveEvalTaskResult:
         request_rates = _float_map(usage.get("request_cache_hit_rates") or {})
         return LiveEvalTaskResult(
             task_id=task.task_id,
             success=success,
             tests_passed=tests_passed,
+            infrastructure_blocked=infrastructure_blocked,
             prompt_tokens=_safe_int(usage.get("input_tokens")),
             cached_tokens=_safe_int(usage.get("cached_input_tokens")),
             request_cache_hit_rate=_average_rate(request_rates),
@@ -414,12 +437,15 @@ def load_live_eval_manifest(path: Path | str) -> LiveEvalManifest:
 
 def summarize_live_results(results: list[LiveEvalTaskResult]) -> dict[str, Any]:
     task_count = len(results)
+    infrastructure_blocked_count = sum(1 for result in results if result.infrastructure_blocked)
     success_count = sum(1 for result in results if result.success)
     tests_passed_count = sum(1 for result in results if result.tests_passed)
     prompt_tokens = sum(result.prompt_tokens for result in results)
     cached_tokens = sum(result.cached_tokens for result in results)
     return {
         "task_count": task_count,
+        "scored_task_count": task_count - infrastructure_blocked_count,
+        "infrastructure_blocked_count": infrastructure_blocked_count,
         "success_count": success_count,
         "task_completion_rate": _rate(success_count, task_count),
         "tests_passed_count": tests_passed_count,
@@ -470,6 +496,14 @@ def _trace_summary(kernel: Any, agent_result: Any) -> dict[str, Any]:
     if trace is not None and hasattr(trace, "final_report_summary"):
         return trace.final_report_summary(task_id=task_id)
     return {}
+
+
+def _infrastructure_blocked(agent_result: Any, *, usage: dict[str, Any], tool_calls: int) -> bool:
+    status = str(getattr(getattr(agent_result, "status", None), "value", getattr(agent_result, "status", "")))
+    if status != "failed" or _safe_int(usage.get("input_tokens")) or tool_calls:
+        return False
+    answer = str(getattr(agent_result, "final_answer", "") or "").lower()
+    return any(marker in answer for marker in ("winerror 10013", "network", "socket", "访问权限不允许"))
 
 
 def _success_criterion_ok(success: dict[str, Any], *, verification: CommandEvalResult, workspace: Path) -> bool:
