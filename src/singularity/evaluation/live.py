@@ -65,6 +65,7 @@ class LiveEvalTask:
     verification_command: str
     success: dict[str, Any]
     prepare_commands: list[str] = field(default_factory=list)
+    verification_prepare_commands: list[str] = field(default_factory=list)
     verification_timeout_seconds: int = 120
 
     @classmethod
@@ -76,6 +77,9 @@ class LiveEvalTask:
             prepare_commands = [single] if single else []
         if not isinstance(prepare_commands, list):
             raise ValueError("live eval prepare_commands must be a list.")
+        verification_prepare_commands = payload.get("verification_prepare_commands") or []
+        if not isinstance(verification_prepare_commands, list):
+            raise ValueError("live eval verification_prepare_commands must be a list.")
         task = cls(
             task_id=str(payload.get("task_id") or "").strip(),
             workspace=LiveEvalWorkspace.from_dict(workspace_payload),
@@ -84,6 +88,7 @@ class LiveEvalTask:
             verification_command=str(payload.get("verification_command") or "").strip(),
             success=_dict(payload.get("success"), "success"),
             prepare_commands=[str(item) for item in prepare_commands if str(item).strip()],
+            verification_prepare_commands=[str(item) for item in verification_prepare_commands if str(item).strip()],
             verification_timeout_seconds=int(payload.get("verification_timeout_seconds") or 120),
         )
         task._validate()
@@ -115,6 +120,8 @@ class LiveEvalTask:
         }
         if self.prepare_commands:
             payload["prepare_commands"] = list(self.prepare_commands)
+        if self.verification_prepare_commands:
+            payload["verification_prepare_commands"] = list(self.verification_prepare_commands)
         return payload
 
 
@@ -331,6 +338,25 @@ class LiveAgentEvalRunner:
                     tests_passed=False,
                     infrastructure_blocked=True,
                 )
+            files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
+            for command in task.verification_prepare_commands:
+                prepared = _run_shell(command, cwd=workspace, timeout_seconds=120, redactor=self.redactor)
+                if not prepared.passed:
+                    errors.append(f"verification prepare failed: {prepared.error_summary or command}")
+                    return self._task_result(
+                        task=task,
+                        workspace=workspace,
+                        trace=trace_path,
+                        started=started,
+                        verification=prepared,
+                        files_changed=files_changed,
+                        usage=usage,
+                        tool_calls=tool_calls,
+                        errors=errors,
+                        success=False,
+                        tests_passed=False,
+                        infrastructure_blocked=False,
+                    )
             verification = _run_shell(
                 task.verification_command,
                 cwd=workspace,
@@ -338,7 +364,6 @@ class LiveAgentEvalRunner:
                 redactor=self.redactor,
             )
             tests_passed = verification.passed
-            files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
             allowed_ok = _allowed_scope_ok(files_changed, task.allowed_paths)
             criterion_ok = _success_criterion_ok(task.success, verification=verification, workspace=workspace)
             agent_status = getattr(agent_result.status, "value", agent_result.status)
@@ -490,10 +515,16 @@ def _workspace_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _task_goal(task: LiveEvalTask) -> str:
     allowed = ", ".join(task.allowed_paths)
+    verification_instruction = (
+        "Before finishing, run the relevant visible checks you can infer. "
+        "Hidden evaluator setup and independent verification will run after you finish."
+        if task.verification_prepare_commands
+        else f"Before finishing, run this verification command: {task.verification_command}"
+    )
     return (
         f"{task.user_task}\n\n"
         f"Allowed modification scope: {allowed}.\n"
-        f"Before finishing, run this verification command: {task.verification_command}\n"
+        f"{verification_instruction}\n"
         "Do not read, print, or modify .env files or API keys."
     )
 

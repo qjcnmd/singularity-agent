@@ -267,3 +267,91 @@ def test_live_eval_marks_model_transport_blocker_without_running_verification(tm
     assert task["infrastructure_blocked"] is True
     assert task["verification"] is None
     assert "infrastructure blocked" in task["error_summary"]
+
+
+def test_live_eval_runs_hidden_verification_prepare_after_agent(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    hidden_test = "from solution import answer\n\n\ndef test_answer():\n    assert answer() == 42\n"
+    hidden_source = tmp_path / "hidden_test_source.py"
+    hidden_source.write_text(hidden_test, encoding="utf-8")
+    hidden_code = (
+        "from pathlib import Path; "
+        "Path('tests').mkdir(exist_ok=True); "
+        f"Path('tests/test_hidden.py').write_text(Path({str(hidden_source)!r}).read_text(encoding='utf-8'), encoding='utf-8')"
+    )
+    manifest = LiveEvalManifest.from_dict(
+        {
+            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.hidden_verification",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Create solution.py with answer().",
+                    "allowed_paths": ["solution.py"],
+                    "verification_prepare_commands": [f"{py} -c {json.dumps(hidden_code)}"],
+                    "verification_command": f"{py} -m pytest tests/test_hidden.py",
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+    seen_goals: list[str] = []
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"input_tokens": 10}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, goal: str) -> FakeResult:
+            seen_goals.append(goal)
+            (self.project_root / "solution.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = LiveAgentEvalRunner(
+        output_root=tmp_path / "out",
+        run_id="run_hidden",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    assert result["summary"]["success_count"] == 1
+    task = result["tasks"][0]
+    assert task["success"] is True
+    assert task["files_changed"] == ["solution.py"]
+    assert "tests/test_hidden.py" not in seen_goals[0]
