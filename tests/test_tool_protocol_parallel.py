@@ -33,7 +33,7 @@ def test_parallel_executor_collects_completed_futures_without_losing_input_order
     completion_order: list[str] = []
     lock = Lock()
 
-    class Runtime:
+    class ExecutorStub:
         def execute_tool_call(self, tool_call: dict[str, Any]) -> ToolResult:
             name = tool_call["function"]["name"]
             if name == "slow":
@@ -44,7 +44,7 @@ def test_parallel_executor_collects_completed_futures_without_losing_input_order
 
     results = ParallelToolExecutor(max_workers=2).execute(
         [_call("call_slow", "slow"), _call("call_fast", "fast")],
-        tool_runtime=Runtime(),  # type: ignore[arg-type]
+        tool_executor=ExecutorStub(),  # type: ignore[arg-type]
     )
 
     assert completion_order == ["fast", "slow"]

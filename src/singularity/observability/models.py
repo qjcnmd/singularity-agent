@@ -143,8 +143,8 @@ class TraceEventType(str, Enum):
     KERNEL_BOOT_STARTED = "kernel.boot.started"
     KERNEL_BOOT_COMPLETED = "kernel.boot.completed"
     KERNEL_BOOT_FAILED = "kernel.boot.failed"
-    RUNTIME_INITIALIZED = "runtime.initialized"
-    RUNTIME_HEALTH_CHECKED = "runtime.health_checked"
+    COMPONENT_INITIALIZED = "component.initialized"
+    COMPONENT_HEALTH_CHECKED = "component.health_checked"
     LIFECYCLE_RUN_STARTED = "lifecycle.run.started"
     LIFECYCLE_SESSION_STARTED = "lifecycle.session.started"
     LIFECYCLE_TASK_STARTED = "lifecycle.task.started"
@@ -197,7 +197,7 @@ class TraceEvent:
     parent_event_id: str | None
     timestamp: datetime
     monotonic_ms: int
-    runtime: str
+    component: str
     severity: TraceSeverity | str
     summary: str
     payload: dict[str, Any] = field(default_factory=dict)
@@ -229,7 +229,7 @@ class TraceEvent:
             "parent_event_id": self.parent_event_id,
             "timestamp": self.timestamp.isoformat(),
             "monotonic_ms": self.monotonic_ms,
-            "runtime": self.runtime,
+            "component": self.component,
             "severity": self.severity.value,
             "summary": self.summary,
             "payload": self.payload,
@@ -270,7 +270,7 @@ class TraceSpan:
     phase_id: str | None
     action_id: str | None
     name: str
-    runtime: str
+    component: str
     started_at: datetime
     ended_at: datetime | None
     duration_ms: int | None
@@ -296,7 +296,7 @@ class TraceSpan:
             "phase_id": self.phase_id,
             "action_id": self.action_id,
             "name": self.name,
-            "runtime": self.runtime,
+            "component": self.component,
             "started_at": self.started_at.isoformat(),
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
             "duration_ms": self.duration_ms,
@@ -367,7 +367,7 @@ class TraceTimelineItem:
     timestamp: datetime
     event_id: str
     event_type: str
-    runtime: str
+    component: str
     summary: str
     severity: str
     related_ids: list[str] = field(default_factory=list)
@@ -381,7 +381,7 @@ class TraceTimelineItem:
             "timestamp": self.timestamp.isoformat(),
             "event_id": self.event_id,
             "event_type": self.event_type,
-            "runtime": self.runtime,
+            "component": self.component,
             "summary": self.summary,
             "severity": self.severity,
             "related_ids": self.related_ids,

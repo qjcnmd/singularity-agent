@@ -64,9 +64,9 @@ class PlannerPolicy:
             return False
         if spec.permission_level == PermissionLevel.WRITE and tool_name not in MUTATION_TOOLS:
             return False
-        if tool_name in MUTATION_TOOLS and not spec.uses_mutation_runtime:
+        if tool_name in MUTATION_TOOLS and not spec.uses_mutation_manager:
             return False
-        if tool_name in VERIFICATION_TOOLS and spec.permission_level == PermissionLevel.SHELL and not spec.uses_command_runtime:
+        if tool_name in VERIFICATION_TOOLS and spec.permission_level == PermissionLevel.SHELL and not spec.uses_command_executor:
             return False
         return self.action_for_tool(tool_name) in phase.allowed_actions
 

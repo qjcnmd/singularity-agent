@@ -6,7 +6,7 @@ from singularity.context.models import (
     ContextItem,
     ContextItemType,
     ContextLayer,
-    ContextRuntime,
+    ContextSource,
     ContextSensitivity,
 )
 from singularity.context.tokens import TokenCounter
@@ -20,7 +20,7 @@ def system_item(text: str) -> ContextItem:
         task_id="task_1",
         phase_id="inspect",
         layer=ContextLayer.SYSTEM,
-        source_runtime=ContextRuntime.SYSTEM,
+        source_component=ContextSource.SYSTEM,
         item_type=ContextItemType.SYSTEM_INSTRUCTION,
         content=text,
         authority=ContextAuthority.SYSTEM,
@@ -37,7 +37,7 @@ def goal_item(text: str) -> ContextItem:
         task_id="task_1",
         phase_id="inspect",
         layer=ContextLayer.USER_GOAL,
-        source_runtime=ContextRuntime.USER,
+        source_component=ContextSource.USER,
         item_type=ContextItemType.USER_GOAL,
         content=text,
         authority=ContextAuthority.USER,

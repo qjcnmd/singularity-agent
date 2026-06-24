@@ -11,7 +11,7 @@ P3 resolved the previously planned `parallel executor` item. This does not imple
 New failing tests confirmed the gap:
 
 - The scheduler still returned `sequential` for multiple read-only tool calls even when provider capabilities supported parallel tool calls.
-- The runtime executed two read-only handlers sequentially; a thread barrier test caused both calls to fail instead of passing concurrently.
+- The component executed two read-only handlers sequentially; a thread barrier test caused both calls to fail instead of passing concurrently.
 
 ## Implementation
 
@@ -19,7 +19,7 @@ Implemented:
 
 - `ParallelToolExecutor` in `src/singularity/tool_protocol/parallel.py`.
 - Scheduler support for `ToolExecutionMode.PARALLEL_READONLY`.
-- Runtime execution path for `parallel_readonly` plans.
+- Parallel executor path for `parallel_readonly` plans.
 - Deterministic result binding: handlers run concurrently, but protocol results are bound and appended in original tool-call order.
 
 Safety boundaries:
@@ -34,7 +34,7 @@ Safety boundaries:
 Updated:
 
 - `README.md`
-- `docs/architecture/runtime-map.md`
+- `docs/architecture/execution-map.md`
 - `docs/architecture/tool-protocol.md`
 
 The docs now list `ParallelToolExecutor` as implemented and keep web search plus multi-agent execution as planned/out of scope.
@@ -44,7 +44,7 @@ The docs now list `ParallelToolExecutor` as implemented and keep web search plus
 Command:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_tool_protocol_scheduler.py tests\test_tool_protocol_runtime.py tests\test_docs_consistency.py tests\test_production_baseline_alignment.py --basetemp work\pytest-tmp-p3-focused
+.\.venv\Scripts\python.exe -m pytest tests\test_tool_protocol_scheduler.py tests\test_tool_tool_protocol.py tests\test_docs_consistency.py tests\test_production_baseline_alignment.py --basetemp work\pytest-tmp-p3-focused
 ```
 
 Result:

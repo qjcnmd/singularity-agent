@@ -13,7 +13,7 @@ class RetrievalOrchestrator:
         failure_analysis: Any | None = None,
         changed_files: list[str] | None = None,
         task_contract: dict[str, Any] | None = None,
-        project_index_runtime: Any | None = None,
+        project_index: Any | None = None,
         trigger: str = "manual",
     ) -> dict[str, Any]:
         analysis = _plain(failure_analysis)
@@ -44,14 +44,14 @@ class RetrievalOrchestrator:
 
         if analysis.get("analysis_id"):
             evidence_sources.append(f"failure_analysis:{analysis['analysis_id']}")
-        impact = _project_index_impact(project_index_runtime, changed)
+        impact = _project_index_impact(project_index, changed)
         if impact:
             evidence_sources.append("project_index:impact")
             for path in _strings(impact.get("reverse_dependencies") or []):
                 _append_unique(files_to_read, path)
             for path in _strings(impact.get("affected_tests") or []):
                 _append_unique(files_to_read, path)
-        test_impact = _project_index_tests(project_index_runtime, changed)
+        test_impact = _project_index_tests(project_index, changed)
         if test_impact:
             evidence_sources.append("project_index:test_impact")
             for path in _strings(test_impact.get("likely_tests") or []):
@@ -69,24 +69,24 @@ class RetrievalOrchestrator:
                 "test_impact": test_impact,
             },
             "evidence_sources": evidence_sources,
-            "trust_level": "runtime_generated",
+            "trust_level": "component_generated",
         }
 
 
-class LessonExtractionRuntime:
+class LessonExtractor:
     def extract(
         self,
         final_report: Any,
         *,
-        memory_runtime: Any | None,
+        memory_pipeline: Any | None,
         accept: bool = False,
     ) -> list[Any]:
-        if memory_runtime is None or not hasattr(memory_runtime, "ingest_final_report"):
+        if memory_pipeline is None or not hasattr(memory_pipeline, "ingest_final_report"):
             return []
         payload = _plain(final_report)
         if not _verified_completed(payload):
             return []
-        return list(memory_runtime.ingest_final_report(final_report, accept=accept))
+        return list(memory_pipeline.ingest_final_report(final_report, accept=accept))
 
 
 def _verified_completed(report: dict[str, Any]) -> bool:
@@ -101,20 +101,20 @@ def _verified_completed(report: dict[str, Any]) -> bool:
     }
 
 
-def _project_index_impact(runtime: Any | None, changed_files: list[str]) -> dict[str, Any]:
-    if runtime is None or not changed_files or not hasattr(runtime, "analyze_impact"):
+def _project_index_impact(project_index: Any | None, changed_files: list[str]) -> dict[str, Any]:
+    if project_index is None or not changed_files or not hasattr(project_index, "analyze_impact"):
         return {}
     try:
-        return _plain(runtime.analyze_impact(changed_files))
+        return _plain(project_index.analyze_impact(changed_files))
     except Exception:
         return {}
 
 
-def _project_index_tests(runtime: Any | None, changed_files: list[str]) -> dict[str, Any]:
-    if runtime is None or not changed_files or not hasattr(runtime, "get_test_impact"):
+def _project_index_tests(project_index: Any | None, changed_files: list[str]) -> dict[str, Any]:
+    if project_index is None or not changed_files or not hasattr(project_index, "get_test_impact"):
         return {}
     try:
-        return _plain(runtime.get_test_impact(changed_files))
+        return _plain(project_index.get_test_impact(changed_files))
     except Exception:
         return {}
 

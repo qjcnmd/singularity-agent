@@ -2,8 +2,8 @@ from singularity.kernel.bootstrap import KernelBootstrap
 from singularity.kernel.cancellation import CancellationManager, CancellationToken
 from singularity.kernel.exceptions import CancellationError, KernelError
 from singularity.kernel.finalization import FinalReport, KernelFinalizer, PartialFinalReport
-from singularity.kernel.graph import RuntimeFactory, RuntimeGraph
-from singularity.kernel.health import RuntimeHealthChecker, RuntimeHealthReport
+from singularity.kernel.graph import AgentGraphBuilder, AgentGraph
+from singularity.kernel.health import ComponentHealthChecker, ComponentHealthReport
 from singularity.kernel.lifecycle import RunLifecycleManager
 from singularity.kernel.locks import WorkspaceLockManager
 from singularity.kernel.models import (
@@ -15,19 +15,19 @@ from singularity.kernel.models import (
     LifecycleEvent,
     RunIdentity,
     RunStatus,
-    RuntimeComponentName,
-    RuntimeComponentState,
+    ComponentName,
+    ComponentState,
     SessionStatus,
     ShutdownReason,
 )
 from singularity.kernel.recovery import CrashRecoveryManager, RecoveryReport
-from singularity.kernel.runtime import AgentKernel, AgentRunResult
+from singularity.kernel.agent_kernel import AgentKernel, RunResult
 from singularity.kernel.shutdown import ShutdownManager, ShutdownSummary
 
 __all__ = [
     "AgentKernel",
     "AgentRun",
-    "AgentRunResult",
+    "RunResult",
     "AgentSession",
     "CancellationManager",
     "CancellationError",
@@ -46,12 +46,12 @@ __all__ = [
     "RunIdentity",
     "RunLifecycleManager",
     "RunStatus",
-    "RuntimeComponentName",
-    "RuntimeComponentState",
-    "RuntimeFactory",
-    "RuntimeGraph",
-    "RuntimeHealthChecker",
-    "RuntimeHealthReport",
+    "ComponentName",
+    "ComponentState",
+    "AgentGraphBuilder",
+    "AgentGraph",
+    "ComponentHealthChecker",
+    "ComponentHealthReport",
     "SessionStatus",
     "ShutdownManager",
     "ShutdownReason",

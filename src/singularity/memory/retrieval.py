@@ -12,7 +12,7 @@ from singularity.memory.models import (
 )
 
 
-class MemoryRetrieval:
+class MemoryRetriever:
     def __init__(self, entries: Iterable[MemoryEntry]) -> None:
         self.entries = list(entries)
 

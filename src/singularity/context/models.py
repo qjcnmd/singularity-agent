@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 
-class ContextRuntime(str, Enum):
+class ContextSource(str, Enum):
     MODEL = "model"
     TOOL = "tool"
     TOOL_PROTOCOL = "tool_protocol"
@@ -67,7 +67,7 @@ class ContextLayer(str, Enum):
 class ContextAuthority(str, Enum):
     USER = "user"
     SYSTEM = "system"
-    RUNTIME = "runtime"
+    COMPONENT = "component"
     TOOL = "tool"
     MODEL = "model"
     SUMMARY = "summary"
@@ -88,7 +88,7 @@ class ContextSensitivity(str, Enum):
 
 class CacheAttributionSource(str, Enum):
     PROVIDER_NATIVE = "provider_native"
-    RUNTIME_INFERRED = "runtime_inferred"
+    COMPONENT_INFERRED = "component_inferred"
     UNKNOWN = "unknown"
 
 
@@ -151,7 +151,7 @@ class ContextItem:
     task_id: str
     phase_id: str
     layer: ContextLayer | str
-    source_runtime: ContextRuntime | str
+    source_component: ContextSource | str
     item_type: ContextItemType | str
     content: Any
     content_digest: str = ""
@@ -159,7 +159,7 @@ class ContextItem:
     updated_at: str = field(default_factory=lambda: _now())
     importance: float = 0.5
     relevance_score: float | None = None
-    authority: ContextAuthority | str = ContextAuthority.RUNTIME
+    authority: ContextAuthority | str = ContextAuthority.COMPONENT
     freshness: ContextFreshness | str = ContextFreshness.CURRENT
     sensitivity: ContextSensitivity | str = ContextSensitivity.WORKSPACE
     token_count: int = 0
@@ -170,7 +170,7 @@ class ContextItem:
 
     def __post_init__(self) -> None:
         self.layer = _enum(ContextLayer, self.layer)
-        self.source_runtime = _enum(ContextRuntime, self.source_runtime)
+        self.source_component = _enum(ContextSource, self.source_component)
         self.item_type = _enum(ContextItemType, self.item_type)
         self.authority = _enum(ContextAuthority, self.authority)
         self.freshness = _enum(ContextFreshness, self.freshness)
@@ -194,7 +194,7 @@ class ContextItem:
             task_id=str(payload.get("task_id") or payload["run_id"]),
             phase_id=str(payload.get("phase_id") or "context"),
             layer=payload.get("layer") or ContextLayer.SCRATCHPAD,
-            source_runtime=payload.get("source_runtime") or ContextRuntime.SYSTEM,
+            source_component=payload.get("source_component") or ContextSource.SYSTEM,
             item_type=payload.get("item_type") or ContextItemType.SUMMARY,
             content=payload.get("content"),
             content_digest=str(payload.get("content_digest") or ""),
@@ -202,7 +202,7 @@ class ContextItem:
             updated_at=str(payload.get("updated_at") or _now()),
             importance=float(payload.get("importance") or 0.5),
             relevance_score=payload.get("relevance_score"),
-            authority=payload.get("authority") or ContextAuthority.RUNTIME,
+            authority=payload.get("authority") or ContextAuthority.COMPONENT,
             freshness=payload.get("freshness") or ContextFreshness.CURRENT,
             sensitivity=payload.get("sensitivity") or ContextSensitivity.WORKSPACE,
             token_count=int(payload.get("token_count") or 0),
@@ -456,7 +456,7 @@ class PolicyObservation:
     constraints_summary: list[str]
     user_decision: str | None
     approval_grant_id: str | None
-    runtime: str
+    component: str
     operation: str
     resource: str
     reference: str | None = None

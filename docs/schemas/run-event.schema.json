@@ -8,7 +8,7 @@
     "event_type",
     "schema_version",
     "run_id",
-    "runtime",
+    "component",
     "severity",
     "timestamp",
     "sequence",
@@ -24,7 +24,7 @@
     "task_id": { "type": ["string", "null"] },
     "phase_id": { "type": ["string", "null"] },
     "action_id": { "type": ["string", "null"] },
-    "runtime": { "type": "string", "minLength": 1 },
+    "component": { "type": "string", "minLength": 1 },
     "severity": {
       "type": "string",
       "enum": ["debug", "info", "warning", "error", "critical"]

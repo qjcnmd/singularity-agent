@@ -15,7 +15,7 @@ Items 11 and 12 remain intentionally out of scope for this goal: web search and 
 ## Verification Of Existing Issues
 
 - `pyproject.toml` registers only `singularity-agent` and `sg` console scripts.
-- `docs/INSTALL.md`, `docs/evaluation-runtime.md`, `docs/PLUGIN_RUNTIME.md`, `docs/RELEASE_RUNTIME.md`, and architecture runtime docs still contained bare `singularity ...` command examples.
+- `docs/INSTALL.md`, `docs/evaluation-harness.md`, `docs/PLUGIN_RUNTIME.md`, `docs/RELEASE_RUNTIME.md`, and architecture component docs still contained bare `singularity ...` command examples.
 - `src/singularity/config.py` used `8` as the default `max_turns` fallback.
 - `README.md`, `src/singularity/cli.py`, `docs/adr/0001-local-first-agent.md`, and `pyproject.toml` used over-strong production wording.
 
@@ -25,7 +25,7 @@ Items 11 and 12 remain intentionally out of scope for this goal: web search and 
   - short/default tasks: `8`;
   - medium tasks: `12`;
   - long roadmap, integration, report, commit, or verification-heavy tasks: `16`.
-- Wired the CLI `run` command to pass the adaptive default into `ProductionRuntimeConfig.from_cli(...)`.
+- Wired the CLI `run` command to pass the adaptive default into `ProductionConfig.from_cli(...)`.
 - Preserved precedence: explicit CLI flag, `SINGULARITY_MAX_TURNS`, and `.singularity/config.toml` still override the adaptive default.
 - Marked the config source as `default:adaptive` when adaptive fallback is used.
 - Updated CLI help to describe `--max-turns` as an override for the adaptive default.

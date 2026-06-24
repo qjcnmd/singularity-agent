@@ -11,7 +11,7 @@ from singularity.context.models import (
     ContextItemType,
     ContextLayer,
     ContextReference,
-    ContextRuntime,
+    ContextSource,
     ContextSensitivity,
     ContextSnapshot,
 )
@@ -32,7 +32,7 @@ def make_item(
         task_id="task_1",
         phase_id=phase_id,
         layer=layer,
-        source_runtime=ContextRuntime.TOOL,
+        source_component=ContextSource.TOOL,
         item_type=item_type,
         content=content,
         authority=ContextAuthority.TOOL,
@@ -61,7 +61,7 @@ def test_store_appends_and_queries_context_items_by_layer_type_and_phase(
         phase_id="verify",
         layer=ContextLayer.VERIFICATION,
         item_type=ContextItemType.VERIFICATION_EVIDENCE,
-        source_runtime=ContextRuntime.TOOL,
+        source_component=ContextSource.TOOL,
     )
 
     assert [item.item_id for item in queried] == ["item_2"]

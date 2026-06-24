@@ -4,25 +4,25 @@ import json
 import os
 
 from singularity.diagnostics import DoctorEngine
-from singularity.release.init import default_config, initialize_runtime
+from singularity.release.init import default_config, initialize_user_data
 from singularity.release.models import atomic_write_json
-from singularity.release.paths import resolve_runtime_paths
+from singularity.release.paths import resolve_user_data_paths
 
 
-def test_filesystem_check_reports_missing_runtime_dirs_as_repairable(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
+def test_filesystem_check_reports_missing_user_data_dirs_as_repairable(tmp_path):
+    paths = resolve_user_data_paths(home=tmp_path / "component")
 
     result = DoctorEngine.default().run(paths=paths, project_root=tmp_path, group="filesystem")
 
-    finding = next(item for item in result.findings if item.check_id == "filesystem.runtime_dirs")
+    finding = next(item for item in result.findings if item.check_id == "filesystem.user_data_dirs")
     assert finding.status == "failed"
     assert finding.auto_repairable is True
     assert str(paths.config_dir) in finding.details["missing"]
 
 
 def test_filesystem_check_reports_unwritable_directory(monkeypatch, tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
-    initialize_runtime(paths)
+    paths = resolve_user_data_paths(home=tmp_path / "component")
+    initialize_user_data(paths)
     original_access = os.access
 
     def fake_access(path, mode):
@@ -32,7 +32,7 @@ def test_filesystem_check_reports_unwritable_directory(monkeypatch, tmp_path):
 
     monkeypatch.setattr(os, "access", fake_access)
 
-    result = DoctorEngine.default().run(paths=paths, project_root=tmp_path, check_id="filesystem.runtime_dirs")
+    result = DoctorEngine.default().run(paths=paths, project_root=tmp_path, check_id="filesystem.user_data_dirs")
 
     finding = result.findings[0]
     assert finding.status == "failed"
@@ -42,9 +42,9 @@ def test_filesystem_check_reports_unwritable_directory(monkeypatch, tmp_path):
 
 def test_config_check_reports_missing_fields_without_leaking_api_key(monkeypatch, tmp_path):
     monkeypatch.setenv("SINGULARITY_API_KEY", "sk-secret-value")
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
-    initialize_runtime(paths)
-    atomic_write_json(paths.config_file, {"schema_version": 1, "runtime": {"mode": "user"}})
+    paths = resolve_user_data_paths(home=tmp_path / "component")
+    initialize_user_data(paths)
+    atomic_write_json(paths.config_file, {"schema_version": 1, "component": {"mode": "user"}})
 
     result = DoctorEngine.default().run(paths=paths, project_root=tmp_path, group="config")
     payload = result.to_json()
@@ -59,8 +59,8 @@ def test_config_check_reports_missing_fields_without_leaking_api_key(monkeypatch
 
 
 def test_data_integrity_reports_broken_memory_jsonl_as_non_destructive(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
-    initialize_runtime(paths)
+    paths = resolve_user_data_paths(home=tmp_path / "component")
+    initialize_user_data(paths)
     memory_entries = tmp_path / ".singularity" / "memory" / "auto" / "entries.jsonl"
     memory_entries.parent.mkdir(parents=True)
     memory_entries.write_text("{broken json\n", encoding="utf-8")
@@ -74,8 +74,8 @@ def test_data_integrity_reports_broken_memory_jsonl_as_non_destructive(tmp_path)
 
 
 def test_data_integrity_reports_missing_trace_index_as_repairable(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
-    initialize_runtime(paths)
+    paths = resolve_user_data_paths(home=tmp_path / "component")
+    initialize_user_data(paths)
     run_dir = paths.traces_dir / "run_1"
     run_dir.mkdir(parents=True)
     (run_dir / "events.jsonl").write_text("", encoding="utf-8")
@@ -89,8 +89,8 @@ def test_data_integrity_reports_missing_trace_index_as_repairable(tmp_path):
 
 
 def test_schema_check_reports_legacy_manifest_with_migration_hint(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
-    initialize_runtime(paths)
+    paths = resolve_user_data_paths(home=tmp_path / "component")
+    initialize_user_data(paths)
     manifest = json.loads(paths.manifest_file.read_text(encoding="utf-8"))
     manifest["last_migration"] = "000"
     atomic_write_json(paths.manifest_file, manifest)

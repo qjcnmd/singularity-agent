@@ -46,9 +46,9 @@ def default_checks() -> list[DiagnosticCheck]:
         DiagnosticCheck("environment.virtualenv", "environment", DiagnosticSeverity.INFO, _virtualenv_check),
         DiagnosticCheck("config.file", "config", DiagnosticSeverity.ERROR, _config_file_check),
         DiagnosticCheck("config.provider", "config", DiagnosticSeverity.WARNING, _provider_check),
-        DiagnosticCheck("filesystem.runtime_dirs", "filesystem", DiagnosticSeverity.ERROR, _runtime_dirs_check),
+        DiagnosticCheck("filesystem.user_data_dirs", "filesystem", DiagnosticSeverity.ERROR, _user_data_dirs_check),
         DiagnosticCheck("filesystem.workspace_dirs", "filesystem", DiagnosticSeverity.SUGGESTION, _workspace_dirs_check),
-        DiagnosticCheck("runtime.components", "runtime", DiagnosticSeverity.INFO, _runtime_components_check),
+        DiagnosticCheck("component.graph", "component", DiagnosticSeverity.INFO, _component_graph_check),
         DiagnosticCheck("schema.migrations", "schema", DiagnosticSeverity.WARNING, _migration_check),
         DiagnosticCheck("schema.memory_index", "schema", DiagnosticSeverity.SUGGESTION, _memory_index_check),
         DiagnosticCheck("schema.project_index", "schema", DiagnosticSeverity.SUGGESTION, _project_index_check),
@@ -292,7 +292,7 @@ def _provider_check(context: DiagnosticContext) -> DiagnosticFinding:
     )
 
 
-def _runtime_dirs_check(context: DiagnosticContext) -> DiagnosticFinding:
+def _user_data_dirs_check(context: DiagnosticContext) -> DiagnosticFinding:
     managed = [context.paths.root, *context.paths.directories()]
     missing: list[str] = []
     not_dirs: list[str] = []
@@ -308,11 +308,11 @@ def _runtime_dirs_check(context: DiagnosticContext) -> DiagnosticFinding:
         repairable = bool(missing) and not not_dirs and not unwritable
         return _finding(
             context,
-            "filesystem.runtime_dirs",
+            "filesystem.user_data_dirs",
             "filesystem",
             DiagnosticSeverity.ERROR,
             "failed",
-            "One or more runtime directories are missing or inaccessible.",
+            "One or more user data directories are missing or inaccessible.",
             f"missing={missing}; not_dirs={not_dirs}; unwritable={unwritable}",
         "Run singularity-agent repair --apply to create missing directories." if repairable else "Fix path types or permissions manually.",
             auto_repairable=repairable,
@@ -326,11 +326,11 @@ def _runtime_dirs_check(context: DiagnosticContext) -> DiagnosticFinding:
         )
     return _finding(
         context,
-        "filesystem.runtime_dirs",
+        "filesystem.user_data_dirs",
         "filesystem",
         DiagnosticSeverity.INFO,
         "passed",
-        "Runtime directories are present and writable.",
+        "User data directories are present and writable.",
         "; ".join(str(path) for path in managed),
         "No action needed.",
         details={"paths": [str(path) for path in managed]},
@@ -367,23 +367,23 @@ def _workspace_dirs_check(context: DiagnosticContext) -> DiagnosticFinding:
     )
 
 
-def _runtime_components_check(context: DiagnosticContext) -> DiagnosticFinding:
+def _component_graph_check(context: DiagnosticContext) -> DiagnosticFinding:
     modules = {
-        "tool_runtime": "singularity.tools.runtime",
-        "command_runtime": "singularity.command.runtime",
-        "sandbox_runtime": "singularity.sandbox.runtime",
-        "policy_runtime": "singularity.policy.engine",
+        "tool_executor": "singularity.tools.executor",
+        "command_executor": "singularity.command.executor",
+        "sandbox_manager": "singularity.sandbox.manager",
+        "policy_engine": "singularity.policy.engine",
         "approval_gate": "singularity.policy.approval",
     }
     missing = [name for name, module in modules.items() if importlib.util.find_spec(module) is None]
     ok = not missing
     return _finding(
         context,
-        "runtime.components",
-        "runtime",
+        "component.graph",
+        "component",
         DiagnosticSeverity.INFO if ok else DiagnosticSeverity.ERROR,
         "passed" if ok else "failed",
-        "Core runtime component modules are importable." if ok else "Some core runtime component modules are missing.",
+        "Core execution component modules are importable." if ok else "Some core execution component modules are missing.",
         "missing=" + (", ".join(missing) if missing else "<none>"),
         "Reinstall Singularity or restore the missing package files." if missing else "No action needed.",
         details={"modules": modules, "missing": missing},
@@ -398,7 +398,7 @@ def _migration_check(context: DiagnosticContext) -> DiagnosticFinding:
             "schema",
             DiagnosticSeverity.ERROR,
             "failed",
-            "Runtime manifest is missing.",
+            "Installation manifest is missing.",
             f"{context.paths.manifest_file} does not exist.",
             "Run singularity-agent repair --apply to create the manifest.",
             auto_repairable=True,
@@ -414,7 +414,7 @@ def _migration_check(context: DiagnosticContext) -> DiagnosticFinding:
             "schema",
             DiagnosticSeverity.ERROR,
             "failed",
-            "Runtime manifest or migration state is unreadable.",
+            "Installation manifest or migration state is unreadable.",
             f"{type(exc).__name__}: {exc}",
             "Restore the manifest from backup or repair manually.",
             details={"path": str(context.paths.manifest_file), "error_type": type(exc).__name__},
@@ -432,7 +432,7 @@ def _migration_check(context: DiagnosticContext) -> DiagnosticFinding:
             "schema",
             DiagnosticSeverity.ERROR,
             "failed",
-            "Runtime manifest schema versions are unsupported.",
+            "Installation manifest schema versions are unsupported.",
             json.dumps(manifest.to_dict(), ensure_ascii=False, sort_keys=True),
             "Back up user data, then run a supported migration or restore a compatible manifest.",
             details={"manifest": manifest.to_dict()},
@@ -444,7 +444,7 @@ def _migration_check(context: DiagnosticContext) -> DiagnosticFinding:
             "schema",
             DiagnosticSeverity.WARNING,
             "failed",
-            "Runtime migrations are pending.",
+            "Installation migrations are pending.",
             "pending=" + ", ".join(item.version for item in pending),
             "Run singularity-agent repair --apply to apply migrations with backup.",
             auto_repairable=True,
@@ -456,7 +456,7 @@ def _migration_check(context: DiagnosticContext) -> DiagnosticFinding:
         "schema",
         DiagnosticSeverity.INFO,
         "passed",
-        "Runtime manifest schema and migrations are current.",
+        "Installation manifest schema and migrations are current.",
         json.dumps(manifest.to_dict(), ensure_ascii=False, sort_keys=True),
         "No action needed.",
         details={"manifest": manifest.to_dict()},

@@ -12,9 +12,9 @@ This phase did not modify Rust, Desktop, Tauri, MCP, multi-agent, plugin marketp
 
 Before this loop, Singularity already had:
 
-- `ProjectIndexRuntime` with relevant-file, impact, test-impact, and context-observation APIs.
-- `FailureAnalysisRuntime` with `suspect_files` and `retrieval_queries`.
-- `MemoryRuntime` with extractors, policy gates, redaction, quarantine, and manual acceptance.
+- `ProjectIndex` with relevant-file, impact, test-impact, and context-observation APIs.
+- `FailureAnalysisPipeline` with `suspect_files` and `retrieval_queries`.
+- `MemoryLearningPipeline` with extractors, policy gates, redaction, quarantine, and manual acceptance.
 - Planner context that exposed project-index observations.
 
 The Phase 1H contract was still missing:
@@ -28,35 +28,35 @@ The Phase 1H contract was still missing:
 ## Plan
 
 1. Add a minimal `RetrievalOrchestrator`.
-2. Feed it the current rolling plan step, failure analysis, changed files, task contract, and project index runtime.
+2. Feed it the current rolling plan step, failure analysis, changed files, task contract, and project index component.
 3. Store retrieval results in `EvidenceLedger`.
 4. Render the latest retrieval result into planner context.
-5. Add a minimal `LessonExtractionRuntime` that only calls memory for verified completed final reports.
-6. Wire graph-owned `ProjectIndexRuntime` and `MemoryRuntime` into `PlannerRuntime`.
+5. Add a minimal `LessonExtractor` that only calls memory for verified completed final reports.
+6. Wire graph-owned `ProjectIndex` and `MemoryLearningPipeline` into `Planner`.
 7. Add regression tests for failure-log suspect retrieval and unverified failure memory gating.
 
 ## Changes
 
 - `src/singularity/planner/retrieval.py`
   - Adds `RetrievalOrchestrator`.
-  - Adds `LessonExtractionRuntime`.
+  - Adds `LessonExtractor`.
 - `src/singularity/planner/models.py`
   - Persists `EvidenceLedger.retrieval_results`.
-- `src/singularity/planner/runtime.py`
+- `src/singularity/planner/engine.py`
   - Records dynamic retrieval after verification failures and diff observations.
   - Exposes `extract_lessons()` with verified-completed gating.
   - Calls lesson extraction during finalization after report generation.
 - `src/singularity/planner/context.py`
   - Renders latest dynamic retrieval result into planner context.
 - `src/singularity/kernel/graph.py`
-  - Wires shared project index and memory runtimes into planner.
+  - Wires shared project index and memory components into planner.
 - `src/singularity/planner/__init__.py`
-  - Exports Phase 1H runtime types.
+  - Exports Phase 1H component types.
 - `docs/phase1h_dynamic_retrieval_memory.md`
   - Documents Phase 1H behavior and boundaries.
-- `docs/architecture/planner-task-execution-runtime.md`
-  - Adds dynamic retrieval and memory learning runtime details.
-- `tests/test_planner_runtime.py`
+- `docs/architecture/planning-and-run-control.md`
+  - Adds dynamic retrieval and memory learning component details.
+- `tests/test_planner.py`
   - Adds regression coverage for failure retrieval and memory gating.
 
 ## Verification
@@ -64,7 +64,7 @@ The Phase 1H contract was still missing:
 Red test proof:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_planner_runtime.py::test_verification_failure_records_dynamic_retrieval_context tests\test_planner_runtime.py::test_lesson_extraction_only_ingests_verified_completed_report --basetemp work\pytest-tmp-phase1h-red
+.\.venv\Scripts\python.exe -m pytest tests\test_planner.py::test_verification_failure_records_dynamic_retrieval_context tests\test_planner.py::test_lesson_extraction_only_ingests_verified_completed_report --basetemp work\pytest-tmp-phase1h-red
 ```
 
 Result:
@@ -76,7 +76,7 @@ Result:
 Targeted Phase 1H validation:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_planner_runtime.py tests\test_failure_analysis_runtime.py tests\test_runtime_graph.py tests\code_index tests\memory --basetemp work\pytest-tmp-phase1h-targeted3
+.\.venv\Scripts\python.exe -m pytest tests\test_planner.py tests\test_failure_analysis_pipeline.py tests\test_agent_graph.py tests\code_index tests\memory --basetemp work\pytest-tmp-phase1h-targeted3
 ```
 
 Result:
@@ -116,6 +116,6 @@ origin/main...HEAD = 0 0
 ## Risks
 
 - Retrieval guidance is intentionally not counted as inspected-file evidence. The model or tools must still read/search files before the completion gate is satisfied.
-- `LessonExtractionRuntime` delegates candidate extraction, redaction, quarantine, and manual acceptance to existing `MemoryRuntime` and `MemoryPolicy`.
+- `LessonExtractor` delegates candidate extraction, redaction, quarantine, and manual acceptance to existing `MemoryLearningPipeline` and `MemoryPolicy`.
 - Existing verification/review memory candidate behavior is left intact; this phase adds a verified-completed lesson extraction gate rather than replacing the memory control plane.
 - The existing untracked `docs/reports/codebase-fact-report.md` was left untouched and is not part of this phase.

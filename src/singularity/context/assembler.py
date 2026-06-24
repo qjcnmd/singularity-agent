@@ -300,7 +300,7 @@ class ContextAssembler:
                 content = (
                     f"{self._bounded_text(raw, max_tokens=MAX_CONTEXT_FRAGMENT_TOKENS)}\n"
                     f"[context:{item.item_id} {item.layer.value}/{item.item_type.value} "
-                    f"source={item.source_runtime.value} digest={item.content_digest[:12]}]"
+                    f"source={item.source_component.value} digest={item.content_digest[:12]}]"
                 )
             return {
                 "role": str(item.metadata.get("role") or "system"),
@@ -326,7 +326,7 @@ class ContextAssembler:
             refs_text = f" refs={','.join(refs)}" if refs else ""
             content = (
                 f"[context:{item.item_id} {item.layer.value}/{item.item_type.value}"
-                f" source={item.source_runtime.value} fresh={item.freshness.value}"
+                f" source={item.source_component.value} fresh={item.freshness.value}"
                 f" digest={item.content_digest[:12]}{refs_text}] "
                 f"{self._bounded_text(payload, max_tokens=MAX_CONTEXT_FRAGMENT_TOKENS)}"
             )
@@ -378,7 +378,7 @@ class ContextAssembler:
         byte_count = len(bounded.encode("utf-8"))
         return (
             f"[context:{item.item_id} {item.layer.value}/{item.item_type.value} "
-            f"source={item.source_runtime.value} digest={item.content_digest[:12]} "
+            f"source={item.source_component.value} digest={item.content_digest[:12]} "
             f"t={token_count} b={byte_count}] {bounded}"
         )
 
@@ -441,7 +441,7 @@ class ContextAssembler:
                     {
                         "layer": item.layer.value,
                         "item_type": item.item_type.value,
-                        "source_runtime": item.source_runtime.value,
+                        "source_component": item.source_component.value,
                         "role": group.messages[0].get("role") if group.messages else "",
                     }
                 )
@@ -690,7 +690,7 @@ def _authority_weight(authority: ContextAuthority) -> float:
     weights = {
         ContextAuthority.SYSTEM: 10,
         ContextAuthority.USER: 9,
-        ContextAuthority.RUNTIME: 7,
+        ContextAuthority.COMPONENT: 7,
         ContextAuthority.TOOL: 6,
         ContextAuthority.SUMMARY: 4,
         ContextAuthority.MODEL: 1,

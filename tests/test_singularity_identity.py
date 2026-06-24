@@ -59,6 +59,8 @@ def test_tracked_files_do_not_use_retired_project_identity() -> None:
     offenders: list[str] = []
     for name in files:
         path = ROOT / name
+        if not path.exists():
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:

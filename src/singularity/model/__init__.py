@@ -1,5 +1,5 @@
 from singularity.model.budget import ModelBudgetManager
-from singularity.model.config import ContextExportPolicy, ModelRuntimeConfig
+from singularity.model.config import ContextExportPolicy, ModelRunnerConfig
 from singularity.model.errors import (
     ModelBudgetExceeded,
     ModelCapabilityError,
@@ -9,10 +9,10 @@ from singularity.model.errors import (
     ModelRequestValidationError,
     ModelResponseValidationError,
     ModelRetryExhausted,
-    ModelRuntimeError,
+    ModelRunnerError,
     ModelToolCallParseError,
 )
-from singularity.model.input_renderer import ModelInputRenderer
+from singularity.model.request_builder import ModelTurnRequestBuilder
 from singularity.model.messages import MessageConverter
 from singularity.model.models import (
     ContentBlock,
@@ -46,7 +46,7 @@ from singularity.model.providers import (
 )
 from singularity.model.registry import ModelProviderRegistry
 from singularity.model.retry import ModelRetryController, RetryPolicy
-from singularity.model.runtime import ModelRuntime
+from singularity.model.runner import ModelRunner
 from singularity.model.streaming import (
     ProviderStreamEvent,
     ProviderStreamEventType,
@@ -68,7 +68,7 @@ __all__ = [
     "ModelCapabilities",
     "ModelCapabilityError",
     "ModelContextTooLong",
-    "ModelInputRenderer",
+    "ModelTurnRequestBuilder",
     "ModelError",
     "ModelErrorKind",
     "ModelMessage",
@@ -83,9 +83,9 @@ __all__ = [
     "ModelRetryController",
     "ModelRetryExhausted",
     "ModelRole",
-    "ModelRuntime",
-    "ModelRuntimeConfig",
-    "ModelRuntimeError",
+    "ModelRunner",
+    "ModelRunnerConfig",
+    "ModelRunnerError",
     "ModelToolCall",
     "ModelToolCallParseError",
     "ModelToolParseStatus",

@@ -102,7 +102,7 @@
         {
           "kind": "test",
           "weight": 0.5,
-          "command": "python -m pytest tests/test_failure_analysis_runtime.py tests/test_verification_runtime.py"
+          "command": "python -m pytest tests/test_failure_analysis_pipeline.py tests/test_verification_runner.py"
         },
         {
           "kind": "assertion",
@@ -117,8 +117,8 @@
       ],
       "golden_contract": {
         "scenario": "verification_failure_repair",
-        "expected_files": ["src/singularity/verification/failure_analysis.py", "src/singularity/verification/runtime.py"],
-        "expected_commands": ["python -m pytest tests/test_failure_analysis_runtime.py tests/test_verification_runtime.py"],
+        "expected_files": ["src/singularity/verification/failure_analysis.py", "src/singularity/verification/runner.py"],
+        "expected_commands": ["python -m pytest tests/test_failure_analysis_pipeline.py tests/test_verification_runner.py"],
         "expected_evidence": ["verification_failed", "repair_applied", "verification_passed"],
         "expected_report_sections": ["Goal", "Failure Analysis", "Repair", "Verification", "Risks"],
         "required_trace_artifacts": ["verification", "repair", "report"]
@@ -141,18 +141,18 @@
         {
           "kind": "test",
           "weight": 0.6,
-          "command": "python -m pytest tests/test_planner_runtime.py tests/test_task_controller.py"
+          "command": "python -m pytest tests/test_planner.py tests/test_task_controller.py"
         },
         {
           "kind": "assertion",
           "weight": 0.4,
-          "assertion": "file_exists:src/singularity/planner/runtime.py"
+          "assertion": "file_exists:src/singularity/planner/engine.py"
         }
       ],
       "golden_contract": {
         "scenario": "completion_rejected_continue",
-        "expected_files": ["src/singularity/planner/runtime.py", "src/singularity/task_controller.py"],
-        "expected_commands": ["python -m pytest tests/test_planner_runtime.py tests/test_task_controller.py"],
+        "expected_files": ["src/singularity/planner/engine.py", "src/singularity/run_controller.py"],
+        "expected_commands": ["python -m pytest tests/test_planner.py tests/test_task_controller.py"],
         "expected_evidence": ["completion_rejected", "continued_after_rejection", "verification_passed"],
         "expected_report_sections": ["Goal", "Completion Gate", "Evidence", "Verification", "Risks"],
         "required_trace_artifacts": ["planner", "verification", "report"]
@@ -180,7 +180,7 @@
         {
           "kind": "assertion",
           "weight": 0.3,
-          "assertion": "file_exists:src/singularity/review/runtime.py"
+          "assertion": "file_exists:src/singularity/review/pipeline.py"
         },
         {
           "kind": "heuristic",
@@ -190,7 +190,7 @@
       ],
       "golden_contract": {
         "scenario": "final_review_rejected_repair",
-        "expected_files": ["src/singularity/review/runtime.py", "src/singularity/kernel/finalization.py"],
+        "expected_files": ["src/singularity/review/pipeline.py", "src/singularity/kernel/finalization.py"],
         "expected_commands": ["python -m pytest tests/review tests/test_kernel_finalization.py"],
         "expected_evidence": ["review_rejected", "repair_applied", "verification_passed"],
         "expected_report_sections": ["Goal", "Review Findings", "Repair", "Verification", "Risks"],
@@ -214,7 +214,7 @@
         {
           "kind": "test",
           "weight": 0.5,
-          "command": "python -m pytest tests/test_planner_runtime.py::test_planner_final_report_writes_markdown_artifact"
+          "command": "python -m pytest tests/test_planner.py::test_planner_final_report_writes_markdown_artifact"
         },
         {
           "kind": "assertion",
@@ -225,7 +225,7 @@
       "golden_contract": {
         "scenario": "full_markdown_report",
         "expected_files": ["work/reports/final_report.md"],
-        "expected_commands": ["python -m pytest tests/test_planner_runtime.py::test_planner_final_report_writes_markdown_artifact"],
+        "expected_commands": ["python -m pytest tests/test_planner.py::test_planner_final_report_writes_markdown_artifact"],
         "expected_evidence": ["final_report_written", "verification_passed"],
         "expected_report_sections": ["Goal", "Requirements", "Changes", "Verification", "Evidence", "Risks"],
         "required_trace_artifacts": ["report"]
@@ -258,7 +258,7 @@
       ],
       "golden_contract": {
         "scenario": "approval_required_resume",
-        "expected_files": ["src/singularity/policy/approval.py", "src/singularity/tool_protocol/runtime.py"],
+        "expected_files": ["src/singularity/policy/approval.py", "src/singularity/tool_protocol/engine.py"],
         "expected_commands": ["python -m pytest tests/test_tool_protocol_recovery.py tests/test_approval_gate.py"],
         "expected_evidence": ["approval_required", "resume_recorded", "verification_passed"],
         "expected_report_sections": ["Goal", "Approval", "Resume", "Verification", "Risks"],
@@ -282,18 +282,18 @@
         {
           "kind": "test",
           "weight": 0.7,
-          "command": "python -m pytest tests/test_sandbox_runtime.py tests/test_sandbox_integration.py"
+          "command": "python -m pytest tests/test_sandbox_manager.py tests/test_sandbox_integration.py"
         },
         {
           "kind": "assertion",
           "weight": 0.3,
-          "assertion": "file_exists:src/singularity/sandbox/runtime.py"
+          "assertion": "file_exists:src/singularity/sandbox/manager.py"
         }
       ],
       "golden_contract": {
         "scenario": "sandbox_required_unavailable_fail_closed",
-        "expected_files": ["src/singularity/sandbox/runtime.py", "docs/architecture/sandbox-isolation-runtime.md"],
-        "expected_commands": ["python -m pytest tests/test_sandbox_runtime.py tests/test_sandbox_integration.py"],
+        "expected_files": ["src/singularity/sandbox/manager.py", "docs/architecture/sandbox-isolation.md"],
+        "expected_commands": ["python -m pytest tests/test_sandbox_manager.py tests/test_sandbox_integration.py"],
         "expected_evidence": ["sandbox_fail_closed", "verification_passed", "final_report_written"],
         "expected_report_sections": ["Goal", "Sandbox Capability", "Verification", "Risks"],
         "required_trace_artifacts": ["sandbox", "verification", "report"]
@@ -316,7 +316,7 @@
         {
           "kind": "test",
           "weight": 0.7,
-          "command": "python -m pytest tests/test_planner_runtime.py::test_verification_failure_records_dynamic_retrieval_context"
+          "command": "python -m pytest tests/test_planner.py::test_verification_failure_records_dynamic_retrieval_context"
         },
         {
           "kind": "assertion",
@@ -326,8 +326,8 @@
       ],
       "golden_contract": {
         "scenario": "dynamic_retrieval_after_failure",
-        "expected_files": ["src/singularity/planner/retrieval.py", "src/singularity/planner/runtime.py"],
-        "expected_commands": ["python -m pytest tests/test_planner_runtime.py::test_verification_failure_records_dynamic_retrieval_context"],
+        "expected_files": ["src/singularity/planner/retrieval.py", "src/singularity/planner/engine.py"],
+        "expected_commands": ["python -m pytest tests/test_planner.py::test_verification_failure_records_dynamic_retrieval_context"],
         "expected_evidence": ["verification_failed", "dynamic_retrieval_recorded", "verification_passed"],
         "expected_report_sections": ["Goal", "Failure Analysis", "Retrieval", "Repair", "Verification"],
         "required_trace_artifacts": ["retrieval", "verification", "report"]
@@ -350,18 +350,18 @@
         {
           "kind": "test",
           "weight": 0.7,
-          "command": "python -m pytest tests/test_planner_runtime.py::test_lesson_extraction_only_ingests_verified_completed_report tests/memory"
+          "command": "python -m pytest tests/test_planner.py::test_lesson_extraction_only_ingests_verified_completed_report tests/memory"
         },
         {
           "kind": "assertion",
           "weight": 0.3,
-          "assertion": "file_exists:src/singularity/memory/runtime.py"
+          "assertion": "file_exists:src/singularity/memory/pipeline.py"
         }
       ],
       "golden_contract": {
         "scenario": "memory_write_after_verified_completion",
-        "expected_files": ["src/singularity/planner/retrieval.py", "src/singularity/memory/runtime.py"],
-        "expected_commands": ["python -m pytest tests/test_planner_runtime.py::test_lesson_extraction_only_ingests_verified_completed_report tests/memory"],
+        "expected_files": ["src/singularity/planner/retrieval.py", "src/singularity/memory/pipeline.py"],
+        "expected_commands": ["python -m pytest tests/test_planner.py::test_lesson_extraction_only_ingests_verified_completed_report tests/memory"],
         "expected_evidence": ["memory_write_gated", "verification_passed", "final_report_written"],
         "expected_report_sections": ["Goal", "Verification", "Memory Learning", "Risks"],
         "required_trace_artifacts": ["memory", "verification", "report"]

@@ -1,11 +1,11 @@
 import json
 from pathlib import Path
 
-from singularity.trace import TraceWriter
+from singularity.jsonl_trace import JsonlTraceRecorder
 
 
 def test_trace_writer_creates_jsonl_trace(tmp_path: Path) -> None:
-    trace = TraceWriter.create(tmp_path)
+    trace = JsonlTraceRecorder.create(tmp_path)
 
     trace.record("user_goal", {"goal": "learn the loop"})
     trace.record("final_answer", {"content": "done"})

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from singularity.command import CommandPurpose, CommandRequest, CommandRuntime
+from singularity.command import CommandPurpose, CommandRequest, CommandExecutor
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,7 @@ def collect_git_state(workspace_root: Path) -> GitState:
 
 
 def _git(workspace_root: Path, *args: str) -> str:
-    result = CommandRuntime(workspace_root).run(
+    result = CommandExecutor(workspace_root).run(
         CommandRequest(
             argv=["git", *args],
             cwd=".",

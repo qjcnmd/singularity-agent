@@ -1,6 +1,6 @@
 from singularity.review.decision import ReviewDecisionEngine
 from singularity.review.evidence import collect_review_evidence, stable_payload_hash, to_bounded_plain
-from singularity.review.exceptions import ReviewCriticError, ReviewRuntimeError
+from singularity.review.exceptions import ReviewCriticError, ReviewPipelineError
 from singularity.review.findings import RuleFindingCollector
 from singularity.review.models import (
     ReviewCategory,
@@ -30,8 +30,8 @@ __all__ = [
     "ReviewFreshness",
     "ReviewLocation",
     "ReviewReport",
-    "ReviewRuntime",
-    "ReviewRuntimeError",
+    "ReviewPipeline",
+    "ReviewPipelineError",
     "ReviewSeverity",
     "ReviewStage",
     "ReviewTarget",
@@ -48,8 +48,8 @@ def __getattr__(name: str):
         from singularity.review.critic import ModelCritic, ModelCriticOutcome
 
         return {"ModelCritic": ModelCritic, "ModelCriticOutcome": ModelCriticOutcome}[name]
-    if name == "ReviewRuntime":
-        from singularity.review.runtime import ReviewRuntime
+    if name == "ReviewPipeline":
+        from singularity.review.pipeline import ReviewPipeline
 
-        return ReviewRuntime
+        return ReviewPipeline
     raise AttributeError(name)

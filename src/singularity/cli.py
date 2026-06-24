@@ -12,42 +12,42 @@ from rich.console import Console
 from rich.panel import Panel
 
 from singularity.cli_paths import resolve_project_root
-from singularity.code_index import ProjectIndexRuntime
-from singularity.config import ProductionRuntimeConfig, adaptive_default_max_turns
+from singularity.code_index import ProjectIndex
+from singularity.config import ProductionConfig, adaptive_default_max_turns
 from singularity.evaluation import (
     EvaluationProfile,
-    EvaluationRuntime,
+    EvaluationHarness,
     GoldenTaskStore,
     LiveAgentEvalRunner,
     RegressionDetector,
     SingularityPrivateBenchmarkAdapter,
-    TraceReplayRuntime,
+    TraceReplayHarness,
     load_live_eval_manifest,
 )
-from singularity.git_runtime.cli import git_app
+from singularity.git_client.cli import git_app
 from singularity.interaction import RichCliRenderer
 from singularity.kernel import CancellationError, KernelBootstrap
 from singularity.kernel.models import RunStatus
 from singularity.memory.cli import memory_app
-from singularity.observability import TraceRedactor, TraceRuntime, TraceStore
+from singularity.observability import TraceRedactor, TraceRecorder, TraceStore
 from singularity.plugins.cli import plugin_app
-from singularity.command import CommandRuntime
-from singularity.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
+from singularity.command import CommandExecutor
+from singularity.policy import ApprovalMode, PolicyConfig, PolicyEngine, SecurityMode
 from singularity.policy.cli import approval_app
-from singularity.planner import PlannerRuntime, create_or_resume_planner as _create_or_resume_planner
+from singularity.planner import Planner, create_or_resume_planner as _create_or_resume_planner
 from singularity.diagnostics import DoctorEngine, RepairEngine
 from singularity.diagnostics.render import render_diagnostic_result, render_repair_plan
-from singularity.release.init import initialize_runtime
+from singularity.release.init import initialize_user_data
 from singularity.release.metadata import version_info
 from singularity.release.migrations import apply_migrations
-from singularity.release.paths import resolve_runtime_paths
+from singularity.release.paths import resolve_user_data_paths
 from singularity.release.repair import (
     export_user_data,
-    repair_runtime,
-    uninstall_runtime,
+    repair_user_data,
+    uninstall_user_data,
 )
-from singularity.sandbox import SandboxRuntime
-from singularity.verification import VerificationRuntime
+from singularity.sandbox import SandboxManager
+from singularity.verification import VerificationRunner
 from singularity.workspace_state import (
     WorkspaceHealthReport,
 )
@@ -72,7 +72,7 @@ app = typer.Typer(
     cls=_SingularityGroup,
     add_completion=False,
     no_args_is_help=True,
-    help="production-oriented local CLI coding agent runtime",
+    help="production-oriented local CLI coding agent harness",
 )
 trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
 index_app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -136,7 +136,7 @@ def _cli_overrides(names: list[str]) -> set[str] | None:
 def run_goal(
     goal: Annotated[
         str,
-        typer.Argument(help="User goal for the production-oriented local CLI coding agent runtime."),
+        typer.Argument(help="User goal for the production-oriented local CLI coding agent harness."),
     ],
     max_turns: Annotated[
         int | None,
@@ -152,7 +152,7 @@ def run_goal(
         str | None,
         typer.Option(
             "--profile",
-            help="Label this run with a runtime profile name for trace and final report summaries.",
+            help="Label this run with a execution profile name for trace and final report summaries.",
         ),
     ] = None,
     resume_session: Annotated[
@@ -160,19 +160,19 @@ def run_goal(
         typer.Option(
             "--resume",
             "--resume-session",
-            help="Resume a PlannerRuntime, context, protocol, and workspace state session by id.",
+            help="Resume a Planner, context, protocol, and workspace state session by id.",
         ),
     ] = None,
     project_index_enabled: Annotated[
         bool | None,
         typer.Option(
             "--project-index/--no-project-index",
-            help="Enable ProjectIndexRuntime bootstrap and context/planner observations.",
+            help="Enable ProjectIndex bootstrap and context/planner observations.",
         ),
     ] = None,
     project_index_db: Annotated[
         Path | None,
-        typer.Option("--project-index-db", help="Exact ProjectIndexRuntime SQLite path."),
+        typer.Option("--project-index-db", help="Exact ProjectIndex SQLite path."),
     ] = None,
     project_index_build_on_boot: Annotated[
         bool | None,
@@ -186,7 +186,7 @@ def run_goal(
         typer.Option(
             "--approval-mode",
             case_sensitive=False,
-            help="Runtime approval mode: interactive, review_all, auto_safe, read_only, or non_interactive.",
+            help="Policy approval mode: interactive, review_all, auto_safe, read_only, or non_interactive.",
         ),
     ] = None,
     security_mode: Annotated[
@@ -194,7 +194,7 @@ def run_goal(
         typer.Option(
             "--security-mode",
             case_sensitive=False,
-            help="Runtime security mode: strict fails closed by default; compat preserves legacy local execution behavior.",
+            help="Execution security mode: strict fails closed by default; compat preserves legacy local execution behavior.",
         ),
     ] = None,
     trace_dir: Annotated[
@@ -208,7 +208,7 @@ def run_goal(
         Path | None,
         typer.Option(
             "--context-db",
-            help="Exact ContextStore SQLite path; defaults to the trace run directory.",
+            help="Exact ObservationStore SQLite path; defaults to the trace run directory.",
         ),
     ] = None,
     model: Annotated[
@@ -254,10 +254,10 @@ def run_goal(
         ),
     ] = None,
 ) -> None:
-    """Run the production-oriented local CLI coding agent runtime."""
+    """Run the production-oriented local CLI coding agent harness."""
 
     project_root = resolve_project_root(project_root)
-    runtime_config = ProductionRuntimeConfig.from_cli(
+    production_config = ProductionConfig.from_cli(
         project_root=project_root,
         max_turns=max_turns,
         profile=profile,
@@ -300,7 +300,7 @@ def run_goal(
     try:
         kernel = KernelBootstrap(
             project_root=project_root,
-            config=runtime_config,
+            config=production_config,
             console=console,
         ).boot(goal)
         kernel.graph.trace.record(
@@ -308,15 +308,15 @@ def run_goal(
             {
                 "goal": goal,
                 "project_root": str(project_root),
-                "max_turns": runtime_config.max_turns,
-                "profile": runtime_config.profile,
-                "resume_session": runtime_config.resume_session,
-                "approval_mode": runtime_config.approval_mode.value,
-                "security_mode": runtime_config.security_mode.value,
-                "strict": runtime_config.strict,
-                "dry_run": runtime_config.dry_run,
-                "raw_artifacts": runtime_config.raw_artifacts,
-                "project_index_enabled": runtime_config.project_index_enabled,
+                "max_turns": production_config.max_turns,
+                "profile": production_config.profile,
+                "resume_session": production_config.resume_session,
+                "approval_mode": production_config.approval_mode.value,
+                "security_mode": production_config.security_mode.value,
+                "strict": production_config.strict,
+                "dry_run": production_config.dry_run,
+                "raw_artifacts": production_config.raw_artifacts,
+                "project_index_enabled": production_config.project_index_enabled,
             },
         )
         console.print(f"[bold]run_id[/bold] {kernel.context.identity.run_id}")
@@ -383,17 +383,17 @@ def version_command(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
     """Print Singularity version and installation information."""
 
-    paths = resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root))
+    paths = resolve_user_data_paths(mode=mode, home=home, project_root=resolve_project_root(project_root))
     info = version_info(paths)
     if json_output:
         _write_stdout(json_dumps(info.to_dict()))
@@ -402,7 +402,7 @@ def version_command(
     console.print(f"Python {info.python_version}")
     console.print(f"platform: {info.platform}")
     console.print(f"install_path: {info.install_path}")
-    console.print(f"runtime_dir: {info.runtime_dir}")
+    console.print(f"user_data_dir: {info.user_data_dir}")
     console.print(f"config_dir: {info.config_dir}")
 
 
@@ -423,19 +423,19 @@ def doctor_command(
     ] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Diagnose installed CLI and runtime directory health without modifying data."""
+    """Diagnose installed CLI and user-data directory health without modifying data."""
 
     project_root = resolve_project_root(project_root)
     report = DoctorEngine.default().run(
-        paths=resolve_runtime_paths(mode=mode, home=home, project_root=project_root),
+        paths=resolve_user_data_paths(mode=mode, home=home, project_root=project_root),
         project_root=project_root,
         check_id=check_id,
         group=group,
@@ -465,20 +465,20 @@ def repair_command(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Plan or apply safe local runtime repairs."""
+    """Plan or apply safe local installation repairs."""
 
     if dry_run and apply_changes:
         raise typer.BadParameter("Use either --dry-run or --apply, not both.")
     project_root = resolve_project_root(project_root)
-    paths = resolve_runtime_paths(mode=mode, home=home, project_root=project_root)
+    paths = resolve_user_data_paths(mode=mode, home=home, project_root=project_root)
     before = DoctorEngine.default().run(paths=paths, project_root=project_root, check_id=check_id)
     plan = RepairEngine().run(before, paths=paths, project_root=project_root, apply=apply_changes)
     if not apply_changes:
@@ -511,21 +511,21 @@ def system_init(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Initialize user-level Singularity runtime directories and defaults."""
+    """Initialize user-level Singularity user data directories and defaults."""
 
-    result = initialize_runtime(
-        resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)),
+    result = initialize_user_data(
+        resolve_user_data_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)),
         force=force,
     )
-    _print_release_payload(result, json_output=json_output, title="runtime initialized")
+    _print_release_payload(result, json_output=json_output, title="component initialized")
 
 
 @system_app.command("migrate")
@@ -533,18 +533,18 @@ def system_migrate(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Apply pending release/runtime migrations with backup and rollback."""
+    """Apply pending release/installation migrations with backup and rollback."""
 
     result = {
-        "applied": apply_migrations(resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)))
+        "applied": apply_migrations(resolve_user_data_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)))
     }
     _print_release_payload(result, json_output=json_output, title="migrations")
 
@@ -554,17 +554,17 @@ def system_repair(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Repair missing runtime directories and default files without overwriting data."""
+    """Repair missing user data directories and default files without overwriting data."""
 
-    result = repair_runtime(resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)))
+    result = repair_user_data(resolve_user_data_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)))
     _print_release_payload(result, json_output=json_output, title="repair")
 
 
@@ -579,22 +579,22 @@ def system_uninstall(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Remove Singularity runtime-managed files with protected user data defaults."""
+    """Remove Singularity-managed files with protected user data defaults."""
 
     if purge_user_data and not dry_run and not yes:
         confirmed = typer.confirm("Delete Singularity user data including memory, traces, eval data, and logs?")
         if not confirmed:
             raise typer.Abort()
-    result = uninstall_runtime(
-        resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)),
+    result = uninstall_user_data(
+        resolve_user_data_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)),
         dry_run=dry_run,
         purge_user_data=purge_user_data,
     )
@@ -609,18 +609,18 @@ def system_export(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
     """Export Singularity user data into a portable zip archive."""
 
     result = export_user_data(
-        resolve_runtime_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)),
+        resolve_user_data_paths(mode=mode, home=home, project_root=resolve_project_root(project_root)),
         output,
     )
     _print_release_payload(result, json_output=json_output, title="export")
@@ -646,9 +646,9 @@ def create_or_resume_planner(
     session_id: str | None,
     task_id: str,
     user_goal: str,
-    trace: TraceRuntime | None,
+    trace: TraceRecorder | None,
     workspace_health: WorkspaceHealthReport,
-) -> PlannerRuntime:
+) -> Planner:
     return _create_or_resume_planner(
         workspace_root=workspace_root,
         session_id=session_id,
@@ -677,10 +677,10 @@ def index_build(
     db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Build the ProjectIndexRuntime SQLite index."""
+    """Build the ProjectIndex SQLite index."""
 
-    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
-    summary = runtime.build_full_index(reason="cli_build").to_dict()
+    project_index = ProjectIndex(resolve_project_root(project_root), db_path=db_path)
+    summary = project_index.build_full_index(reason="cli_build").to_dict()
     _print_index_payload(summary, json_output=json_output, title="project index")
 
 
@@ -690,10 +690,10 @@ def index_refresh(
     db_path: Annotated[Path | None, typer.Option("--db", help="Project index SQLite path.")] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Refresh the ProjectIndexRuntime index incrementally when possible."""
+    """Refresh the ProjectIndex index incrementally when possible."""
 
-    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
-    summary = runtime.refresh(reason="cli_refresh").to_dict()
+    project_index = ProjectIndex(resolve_project_root(project_root), db_path=db_path)
+    summary = project_index.refresh(reason="cli_refresh").to_dict()
     _print_index_payload(summary, json_output=json_output, title="project index")
 
 
@@ -705,9 +705,9 @@ def index_explain(
 ) -> None:
     """Explain indexed project structure and limitations."""
 
-    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
-    runtime.bootstrap(reason="cli_explain")
-    _print_index_payload(runtime.explain(), json_output=json_output, title="project index explain")
+    project_index = ProjectIndex(resolve_project_root(project_root), db_path=db_path)
+    project_index.bootstrap(reason="cli_explain")
+    _print_index_payload(project_index.explain(), json_output=json_output, title="project index explain")
 
 
 @index_app.command("relevant")
@@ -719,9 +719,9 @@ def index_relevant(
 ) -> None:
     """Rank relevant files for a goal."""
 
-    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
-    runtime.bootstrap(reason="cli_relevant")
-    payload = {"relevant_files": [item.to_dict() for item in runtime.find_relevant_files(goal)]}
+    project_index = ProjectIndex(resolve_project_root(project_root), db_path=db_path)
+    project_index.bootstrap(reason="cli_relevant")
+    payload = {"relevant_files": [item.to_dict() for item in project_index.find_relevant_files(goal)]}
     _print_index_payload(payload, json_output=json_output, title="project index relevant")
 
 
@@ -734,9 +734,9 @@ def index_impact(
 ) -> None:
     """Analyze code-index impact for paths."""
 
-    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
-    runtime.bootstrap(reason="cli_impact")
-    _print_index_payload(runtime.analyze_impact(paths).to_dict(), json_output=json_output, title="project index impact")
+    project_index = ProjectIndex(resolve_project_root(project_root), db_path=db_path)
+    project_index.bootstrap(reason="cli_impact")
+    _print_index_payload(project_index.analyze_impact(paths).to_dict(), json_output=json_output, title="project index impact")
 
 
 @index_app.command("tests")
@@ -748,9 +748,9 @@ def index_tests(
 ) -> None:
     """Return test impact for changed paths."""
 
-    runtime = ProjectIndexRuntime(resolve_project_root(project_root), db_path=db_path)
-    runtime.bootstrap(reason="cli_tests")
-    _print_index_payload(runtime.get_test_impact(paths).to_dict(), json_output=json_output, title="project index tests")
+    project_index = ProjectIndex(resolve_project_root(project_root), db_path=db_path)
+    project_index.bootstrap(reason="cli_tests")
+    _print_index_payload(project_index.get_test_impact(paths).to_dict(), json_output=json_output, title="project index tests")
 
 
 def _print_index_payload(payload: object, *, json_output: bool, title: str) -> None:
@@ -829,8 +829,8 @@ def eval_suite_run(
         typer.Option(
             "--execute/--no-execute",
             help=(
-                "Run executable hooks/tests through CommandRuntime and "
-                "VerificationRuntime. Defaults to deterministic offline scoring."
+                "Run executable hooks/tests through CommandExecutor and "
+                "VerificationRunner. Defaults to deterministic offline scoring."
             ),
         ),
     ] = False,
@@ -846,13 +846,13 @@ def eval_suite_run(
 
     tasks = GoldenTaskStore(task_set).load(version=version, tags=tag or None)
     profiles = _profiles_from_cli(profile_json)
-    runtime = _evaluation_runtime_from_cli(
+    evaluation_harness = _evaluation_harness_from_cli(
         project_root=resolve_project_root(project_root),
         output_root=output_dir,
         run_id=run_id,
         execute=execute,
     )
-    report = runtime.run_suite(
+    report = evaluation_harness.run_suite(
         tasks=tasks,
         profiles=profiles,
         trace_run_dir=trace_run_dir,
@@ -876,7 +876,7 @@ def eval_trace_replay(
     """Replay a stored trace deterministically under a fixed evaluation profile."""
 
     profile = _profiles_from_cli([profile_json] if profile_json else None)[0]
-    result = TraceReplayRuntime(project_root=resolve_project_root(project_root)).replay(trace_run_dir, profile=profile)
+    result = TraceReplayHarness(project_root=resolve_project_root(project_root)).replay(trace_run_dir, profile=profile)
     _print_eval_payload(result.to_dict(), json_output=json_output, title="trace replay")
 
 
@@ -905,8 +905,8 @@ def eval_ab_run(
         typer.Option(
             "--execute/--no-execute",
             help=(
-                "Run executable hooks/tests through CommandRuntime and "
-                "VerificationRuntime. Defaults to deterministic offline scoring."
+                "Run executable hooks/tests through CommandExecutor and "
+                "VerificationRunner. Defaults to deterministic offline scoring."
             ),
         ),
     ] = False,
@@ -919,13 +919,13 @@ def eval_ab_run(
 
     baseline = EvaluationProfile.from_dict(json.loads(baseline_profile_json))
     candidate = EvaluationProfile.from_dict(json.loads(candidate_profile_json))
-    runtime = _evaluation_runtime_from_cli(
+    evaluation_harness = _evaluation_harness_from_cli(
         project_root=resolve_project_root(project_root),
         output_root=output_dir,
         run_id=run_id,
         execute=execute,
     )
-    report = runtime.run_ab(
+    report = evaluation_harness.run_ab(
         tasks=GoldenTaskStore(task_set).load(),
         baseline=baseline,
         candidate=candidate,
@@ -970,8 +970,8 @@ def eval_regression_run(
         typer.Option(
             "--execute/--no-execute",
             help=(
-                "Run executable hooks/tests through CommandRuntime and "
-                "VerificationRuntime. Defaults to deterministic offline scoring."
+                "Run executable hooks/tests through CommandExecutor and "
+                "VerificationRunner. Defaults to deterministic offline scoring."
             ),
         ),
     ] = False,
@@ -984,13 +984,13 @@ def eval_regression_run(
 
     baseline = EvaluationProfile.from_dict(json.loads(baseline_profile_json))
     candidate = EvaluationProfile.from_dict(json.loads(candidate_profile_json))
-    runtime = _evaluation_runtime_from_cli(
+    evaluation_harness = _evaluation_harness_from_cli(
         project_root=resolve_project_root(project_root),
         output_root=output_dir,
         run_id=run_id,
         execute=execute,
     )
-    report = runtime.run_ab(
+    report = evaluation_harness.run_ab(
         tasks=GoldenTaskStore(task_set).load(),
         baseline=baseline,
         candidate=candidate,
@@ -1005,7 +1005,7 @@ def eval_regression_run(
         threshold=threshold,
         block_on_regression=block_on_regression,
     )
-    runtime.write_regression_report(run_id=report.run_id, regression=regression)
+    evaluation_harness.write_regression_report(run_id=report.run_id, regression=regression)
     _print_eval_payload(
         regression.to_dict() if json_output else regression.to_markdown(),
         json_output=json_output,
@@ -1182,9 +1182,9 @@ def _run_live_quicksort_benchmark(
     goal = (
         "Create quicksort.py in this workspace. It must define quicksort(values), "
         "include a __main__ smoke assertion, and run python quicksort.py through "
-        "VerificationRuntime. Finish only after verification passes."
+        "VerificationRunner. Finish only after verification passes."
     )
-    config = ProductionRuntimeConfig.from_cli(
+    config = ProductionConfig.from_cli(
         project_root=workspace,
         max_turns=max_turns,
         model=model,
@@ -1259,18 +1259,18 @@ class _NoopTrace:
         return None
 
 
-def _evaluation_runtime_from_cli(
+def _evaluation_harness_from_cli(
     *,
     project_root: Path,
     output_root: Path | None,
     run_id: str | None,
     execute: bool,
-) -> EvaluationRuntime:
+) -> EvaluationHarness:
     if not execute:
-        return EvaluationRuntime(project_root=project_root, output_root=output_root)
+        return EvaluationHarness(project_root=project_root, output_root=output_root)
     root = output_root or (project_root / "work" / "evaluations")
     audit_root = root / (run_id or "cli_execute")
-    policy_runtime = PolicyRuntime(
+    policy_engine = PolicyEngine(
         PolicyConfig(
             workspace_root=project_root,
             approval_mode=ApprovalMode.NON_INTERACTIVE,
@@ -1278,28 +1278,28 @@ def _evaluation_runtime_from_cli(
             audit_log_path=audit_root / "policy-audit.jsonl",
         )
     )
-    sandbox_runtime = SandboxRuntime(
+    sandbox_manager = SandboxManager(
         project_root,
         trace=_NoopTrace(),
         security_mode=SecurityMode.STRICT,
     )
-    command_runtime = CommandRuntime(
+    command_executor = CommandExecutor(
         project_root,
         trace=None,
-        policy_runtime=policy_runtime,
-        sandbox_runtime=sandbox_runtime,
+        policy_engine=policy_engine,
+        sandbox_manager=sandbox_manager,
     )
-    verification_runtime = VerificationRuntime(
+    verification_runner = VerificationRunner(
         project_root,
-        command_runtime=command_runtime,
+        command_executor=command_executor,
         trace=None,
-        policy_runtime=policy_runtime,
+        policy_engine=policy_engine,
     )
-    return EvaluationRuntime(
+    return EvaluationHarness(
         project_root=project_root,
         output_root=output_root,
-        verification_runtime=verification_runtime,
-        command_runtime=command_runtime,
+        verification_runner=verification_runner,
+        command_executor=command_executor,
     )
 
 
@@ -1400,7 +1400,7 @@ def trace_timeline(
     for item in store.get_timeline(run_id=run_id):
         console.print(
             f"{item.timestamp.isoformat()} {item.event_type} "
-            f"[{item.runtime}] {item.summary}"
+            f"[{item.component}] {item.summary}"
         )
 
 

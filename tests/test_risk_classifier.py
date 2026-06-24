@@ -9,7 +9,7 @@ from singularity.policy import (
     RiskClassifier,
     RiskLevel,
     RiskTag,
-    RuntimeName,
+    PolicyComponent,
 )
 
 
@@ -27,10 +27,10 @@ def make_request(
         task_id="task",
         phase_id="phase",
         action_id="action",
-        runtime=RuntimeName.COMMAND if resource_type == "command" else RuntimeName.TOOL,
+        component=PolicyComponent.COMMAND if resource_type == "command" else PolicyComponent.TOOL,
         operation=operation,
         capability=capability,
-        subject=PolicySubject(subject_type="runtime", name="test"),
+        subject=PolicySubject(subject_type="component", name="test"),
         resource=ResourceRef(resource_type=resource_type, identifier=identifier),
         reason="test",
         workspace_root=str(tmp_path),

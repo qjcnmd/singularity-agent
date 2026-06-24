@@ -8,7 +8,7 @@ from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.command import (
     CommandPurpose,
     CommandRequest,
-    CommandRuntime,
+    CommandExecutor,
     FilesystemMode,
     NetworkMode,
     ResourceLimits,
@@ -59,42 +59,42 @@ class EmptyInput(BaseModel):
 
 
 class CommandToolHandlers:
-    def __init__(self, runtime: CommandRuntime) -> None:
-        self.runtime = runtime
+    def __init__(self, command_executor: CommandExecutor) -> None:
+        self.component = command_executor
 
     def run_command(self, args: RunCommandInput) -> dict[str, Any]:
         request = self._request(args)
-        if self.runtime.policy.requires_verification_runtime(request):
+        if self.component.policy.requires_verification_runner(request):
             raise ToolExecutionFailure(
-                "Verification-like commands must use VerificationRuntime tools.",
-                code="verification_runtime_required",
+                "Verification-like commands must use VerificationRunner tools.",
+                code="verification_runner_required",
                 details={"suggested_tool": "run_verification"},
             )
-        return self.runtime.run(request).to_observation()
+        return self.component.run(request).to_observation()
 
     def start_process(self, args: RunCommandInput) -> dict[str, Any]:
         request = self._request(args)
-        if self.runtime.policy.requires_verification_runtime(request):
+        if self.component.policy.requires_verification_runner(request):
             raise ToolExecutionFailure(
-                "Verification-like commands must use VerificationRuntime tools.",
-                code="verification_runtime_required",
+                "Verification-like commands must use VerificationRunner tools.",
+                code="verification_runner_required",
                 details={"suggested_tool": "run_verification"},
             )
-        session = self.runtime.start_process(request)
+        session = self.component.start_process(request)
         return {"process_session": session.to_dict()}
 
     def read_process_output(self, args: ProcessIdInput) -> dict[str, Any]:
-        output = self.runtime.read_process_output(args.process_id)
+        output = self.component.read_process_output(args.process_id)
         return {"process_output": output.to_dict()}
 
     def stop_process(self, args: ProcessIdInput) -> dict[str, Any]:
-        stopped = self.runtime.stop_process(args.process_id)
+        stopped = self.component.stop_process(args.process_id)
         return {"process_stop": stopped.to_dict()}
 
     def list_processes(self, _args: EmptyInput) -> dict[str, Any]:
         return {
             "processes": [
-                session.to_dict() for session in self.runtime.list_processes()
+                session.to_dict() for session in self.component.list_processes()
             ]
         }
 
@@ -126,14 +126,14 @@ def _command_identifier(args: dict[str, Any]) -> str:
     return ""
 
 
-def register_command_tools(registry: Any, runtime: CommandRuntime | None = None) -> None:
-    command_runtime = runtime or CommandRuntime(registry.project_root)
-    handlers = CommandToolHandlers(command_runtime)
+def register_command_tools(registry: Any, command_executor: CommandExecutor | None = None) -> None:
+    command_executor = command_executor or CommandExecutor(registry.project_root)
+    handlers = CommandToolHandlers(command_executor)
     registry.register(
         ToolSpec(
             name="run_command",
             version="0.0.7",
-            description="Run a structured command through CommandRuntime policy, limits, output collection, trace, and side-effect tracking.",
+            description="Run a structured command through CommandExecutor policy, limits, output collection, trace, and side-effect tracking.",
             input_model=RunCommandInput,
             handler=handlers.run_command,
             permission_level=PermissionLevel.SHELL,
@@ -144,20 +144,20 @@ def register_command_tools(registry: Any, runtime: CommandRuntime | None = None)
             ],
             side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
-            risk_tags=("command_runtime",),
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
+            risk_tags=("command_executor",),
             timeout_seconds=60.0,
             max_output_chars=12000,
             cacheable=False,
             idempotent=False,
-            uses_command_runtime=True,
+            uses_command_executor=True,
         )
     )
     registry.register(
         ToolSpec(
             name="start_process",
             version="0.0.7",
-            description="Start a long-running process session through CommandRuntime.",
+            description="Start a long-running process session through CommandExecutor.",
             input_model=RunCommandInput,
             handler=handlers.start_process,
             permission_level=PermissionLevel.SHELL,
@@ -168,20 +168,20 @@ def register_command_tools(registry: Any, runtime: CommandRuntime | None = None)
             ],
             side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
-            risk_tags=("command_runtime", "long_running"),
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
+            risk_tags=("command_executor", "long_running"),
             timeout_seconds=10.0,
             max_output_chars=12000,
             cacheable=False,
             idempotent=False,
-            uses_command_runtime=True,
+            uses_command_executor=True,
         )
     )
     registry.register(
         ToolSpec(
             name="read_process_output",
             version="0.0.7",
-            description="Read buffered output from a CommandRuntime process session.",
+            description="Read buffered output from a CommandExecutor process session.",
             input_model=ProcessIdInput,
             handler=handlers.read_process_output,
             permission_level=PermissionLevel.SHELL,
@@ -192,20 +192,20 @@ def register_command_tools(registry: Any, runtime: CommandRuntime | None = None)
             ],
             side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
-            risk_tags=("command_runtime",),
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
+            risk_tags=("command_executor",),
             timeout_seconds=5.0,
             max_output_chars=12000,
             cacheable=False,
             idempotent=True,
-            uses_command_runtime=True,
+            uses_command_executor=True,
         )
     )
     registry.register(
         ToolSpec(
             name="stop_process",
             version="0.0.7",
-            description="Stop a CommandRuntime process session and clean up its process tree.",
+            description="Stop a CommandExecutor process session and clean up its process tree.",
             input_model=ProcessIdInput,
             handler=handlers.stop_process,
             permission_level=PermissionLevel.SHELL,
@@ -216,36 +216,36 @@ def register_command_tools(registry: Any, runtime: CommandRuntime | None = None)
             ],
             side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
-            risk_tags=("command_runtime",),
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
+            risk_tags=("command_executor",),
             timeout_seconds=10.0,
             max_output_chars=12000,
             cacheable=False,
             idempotent=False,
-            uses_command_runtime=True,
+            uses_command_executor=True,
         )
     )
     registry.register(
         ToolSpec(
             name="list_processes",
             version="0.0.7",
-            description="List CommandRuntime process sessions.",
+            description="List CommandExecutor process sessions.",
             input_model=EmptyInput,
             handler=handlers.list_processes,
             permission_level=PermissionLevel.SHELL,
             capabilities=(Capability.EXECUTE_COMMAND,),
             operation=OperationKind.LIST_DIRECTORY,
             resource_resolver=lambda _args, _root: [
-                ResourceRef("process", "command_runtime_sessions")
+                ResourceRef("process", "command_executor_sessions")
             ],
             side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
-            risk_tags=("command_runtime",),
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
+            risk_tags=("command_executor",),
             timeout_seconds=5.0,
             max_output_chars=12000,
             cacheable=False,
             idempotent=True,
-            uses_command_runtime=True,
+            uses_command_executor=True,
         )
     )

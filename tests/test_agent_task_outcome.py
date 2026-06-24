@@ -2,11 +2,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from singularity.agent import SingularityAgentRunStatus
-from singularity.command import CommandRuntime
+from singularity.agent_loop import AgentLoopStatus
+from singularity.command import CommandExecutor
 from singularity.context import ContextManager
-from singularity.edit import EditRuntime
-from singularity.planner import PlannerRuntime
+from singularity.edit import EditExecutor
+from singularity.planner import Planner
 from singularity.policy import (
     ApprovalMode,
     DecisionOutcome,
@@ -14,19 +14,19 @@ from singularity.policy import (
     PolicyConfig,
     PolicyDecision,
     PolicyRequest,
-    PolicyRuntime,
+    PolicyEngine,
     RiskLevel,
     SecurityMode,
 )
-from singularity.task_controller import TaskLifecycleStatus
+from singularity.run_controller import RunLifecycleStatus
 from singularity.tools import ToolRegistry
 from singularity.tools.edit import register_edit_tools
 from singularity.tools.mutation import register_mutation_tools
 from singularity.tools.verification import register_verification_tools
-from singularity.trace import TraceWriter
-from singularity.verification import VerificationRuntime
-from singularity.workspace import MutationRuntime
-from tests.agent_runtime_helpers import make_agent_session
+from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.verification import VerificationRunner
+from singularity.workspace import WorkspaceMutationManager
+from tests.agent_loop_helpers import make_agent_session
 
 
 class FakeProvider:
@@ -45,7 +45,7 @@ class FakeProvider:
         return self.responses.pop(0)
 
 
-class DenyMutationPolicyRuntime:
+class DenyMutationPolicyEngine:
     def __init__(self, workspace_root: Path) -> None:
         self.config = PolicyConfig(workspace_root=workspace_root, approval_mode=ApprovalMode.AUTO_SAFE)
         self.requests: list[PolicyRequest] = []
@@ -73,7 +73,7 @@ class DenyMutationPolicyRuntime:
 
 def test_premature_final_then_quicksort_smoke_completes(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("task context", encoding="utf-8")
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     provider = FakeProvider(
         assistant("done too early"),
         tool("call_read_1", "read_file", {"path": "README.md"}),
@@ -103,7 +103,7 @@ def test_premature_final_then_quicksort_smoke_completes(tmp_path: Path) -> None:
 
     result = agent.run("implement quicksort.py and verify it")
 
-    assert result.status == SingularityAgentRunStatus.COMPLETED
+    assert result.status == AgentLoopStatus.COMPLETED
     assert "status: completed" in result.final_answer
     assert (tmp_path / "quicksort.py").exists()
     assert len(provider.calls) == 5
@@ -114,7 +114,7 @@ def test_premature_final_then_quicksort_smoke_completes(tmp_path: Path) -> None:
     assert rejected["next_action"] == "continue"
     assert rejected["retry_allowed"] is True
     latest = planner.evidence.verification_results[-1]
-    smoke = next(item for item in latest["results"] if item["kind"] == "runtime_smoke")
+    smoke = next(item for item in latest["results"] if item["kind"] == "verification_smoke")
     assert smoke["evidence"]["exit_code"] == 0
     assert "ok" in smoke["evidence"]["stdout_excerpt"]
     assert smoke["evidence"]["stderr_excerpt"] == ""
@@ -122,7 +122,7 @@ def test_premature_final_then_quicksort_smoke_completes(tmp_path: Path) -> None:
 
 def test_ready_verification_finalizes_without_extra_model_turn(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("task context", encoding="utf-8")
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     provider = FakeProvider(
         tool("call_read_1", "read_file", {"path": "README.md"}),
         tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
@@ -150,7 +150,7 @@ def test_ready_verification_finalizes_without_extra_model_turn(tmp_path: Path) -
 
     result = agent.run("implement quicksort.py and verify it")
 
-    assert result.status == SingularityAgentRunStatus.COMPLETED
+    assert result.status == AgentLoopStatus.COMPLETED
     assert result.turn == 4
     assert "status: completed" in result.final_answer
     assert len(provider.calls) == 4
@@ -158,7 +158,7 @@ def test_ready_verification_finalizes_without_extra_model_turn(tmp_path: Path) -
 
 
 def test_malformed_tool_args_record_retryable_outcome(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     provider = FakeProvider(
         raw_tool("call_bad", "read_file", "{not json"),
         assistant("still done too early"),
@@ -167,7 +167,7 @@ def test_malformed_tool_args_record_retryable_outcome(tmp_path: Path) -> None:
 
     result = agent.run("inspect then change code")
 
-    assert result.status == SingularityAgentRunStatus.MAX_TURNS_EXCEEDED
+    assert result.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
     assert len(provider.calls) == 2
     assert [item["status"] for item in planner.evidence.task_outcomes] == [
         "retryable",
@@ -181,7 +181,7 @@ def test_malformed_tool_args_record_retryable_outcome(tmp_path: Path) -> None:
 
 def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("task context", encoding="utf-8")
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     provider = FakeProvider(
         tool("call_read_1", "read_file", {"path": "README.md"}),
         tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
@@ -210,7 +210,7 @@ def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> N
 
     result = agent.run("implement quicksort.py and verify it")
 
-    assert result.status == SingularityAgentRunStatus.MAX_TURNS_EXCEEDED
+    assert result.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
     assert planner.state is not None
     assert planner.state.current_phase == "repairing_failures"
     assert planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "failed"
@@ -223,8 +223,8 @@ def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> N
 
 def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("task context", encoding="utf-8")
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
-    policy = DenyMutationPolicyRuntime(tmp_path)
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    policy = DenyMutationPolicyEngine(tmp_path)
     provider = FakeProvider(
         tool("call_read_1", "read_file", {"path": "README.md"}),
         tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
@@ -243,13 +243,13 @@ def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:
         tmp_path,
         provider=provider,
         planner=planner,
-        policy_runtime=policy,
+        policy_engine=policy,
         max_turns=5,
     )
 
     result = agent.run("implement quicksort.py and verify it")
 
-    assert result.status == SingularityAgentRunStatus.BLOCKED
+    assert result.status == AgentLoopStatus.BLOCKED
     assert result.error_code == "policy_denied"
     assert not (tmp_path / "quicksort.py").exists()
     assert any(
@@ -260,7 +260,7 @@ def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:
 
 def test_approval_wait_keeps_context_for_resume(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("task context", encoding="utf-8")
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     context = ContextManager(
         system_prompt="system",
         user_goal="placeholder",
@@ -280,7 +280,7 @@ def test_approval_wait_keeps_context_for_resume(tmp_path: Path) -> None:
             },
         )
     )
-    policy = PolicyRuntime(
+    policy = PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
             approval_mode=ApprovalMode.REVIEW_ALL,
@@ -291,17 +291,17 @@ def test_approval_wait_keeps_context_for_resume(tmp_path: Path) -> None:
         tmp_path,
         provider=provider,
         planner=planner,
-        policy_runtime=policy,
+        policy_engine=policy,
         context_manager=context,
         max_turns=3,
     )
 
     result = agent.run("create needs-review.txt")
 
-    assert result.status == SingularityAgentRunStatus.BLOCKED
+    assert result.status == AgentLoopStatus.BLOCKED
     assert result.error_code == "approval_required"
     assert planner.state is not None
-    assert planner.state.lifecycle_status == TaskLifecycleStatus.WAITING_APPROVAL.value
+    assert planner.state.lifecycle_status == RunLifecycleStatus.WAITING_APPROVAL.value
     messages = context.messages()
     assert any(message["role"] == "user" and "create needs-review.txt" in message["content"] for message in messages)
     assert any(message["role"] == "assistant" and message.get("tool_calls") for message in messages)
@@ -315,13 +315,13 @@ def make_task_agent(
     tmp_path: Path,
     *,
     provider: FakeProvider,
-    planner: PlannerRuntime,
-    policy_runtime: Any | None = None,
+    planner: Planner,
+    policy_engine: Any | None = None,
     context_manager: ContextManager | None = None,
     max_turns: int = 6,
 ):
-    trace = TraceWriter.create(tmp_path)
-    policy = policy_runtime or PolicyRuntime(
+    trace = JsonlTraceRecorder.create(tmp_path)
+    policy = policy_engine or PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
             approval_mode=ApprovalMode.AUTO_SAFE,
@@ -329,19 +329,19 @@ def make_task_agent(
         )
     )
     tools = ToolRegistry(tmp_path)
-    mutation_runtime = MutationRuntime(tmp_path, trace=trace, planner=planner, policy_runtime=policy)
-    register_mutation_tools(tools, mutation_runtime)
-    edit_runtime = EditRuntime(tmp_path, mutation_runtime=mutation_runtime, trace=trace, planner=planner)
-    register_edit_tools(tools, edit_runtime)
-    command_runtime = CommandRuntime(tmp_path, trace=trace, planner=planner, policy_runtime=policy)
-    verification_runtime = VerificationRuntime(
+    mutation_manager = WorkspaceMutationManager(tmp_path, trace=trace, planner=planner, policy_engine=policy)
+    register_mutation_tools(tools, mutation_manager)
+    edit_executor = EditExecutor(tmp_path, mutation_manager=mutation_manager, trace=trace, planner=planner)
+    register_edit_tools(tools, edit_executor)
+    command_executor = CommandExecutor(tmp_path, trace=trace, planner=planner, policy_engine=policy)
+    verification_runner = VerificationRunner(
         tmp_path,
-        command_runtime=command_runtime,
+        command_executor=command_executor,
         trace=trace,
         planner=planner,
-        policy_runtime=policy,
+        policy_engine=policy,
     )
-    register_verification_tools(tools, verification_runtime)
+    register_verification_tools(tools, verification_runner)
     return make_agent_session(
         tmp_path,
         provider=provider,
@@ -349,7 +349,7 @@ def make_task_agent(
         trace=trace,
         max_turns=max_turns,
         planner=planner,
-        policy_runtime=policy,
+        policy_engine=policy,
         context_manager=context_manager,
     )
 

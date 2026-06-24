@@ -7,7 +7,7 @@ Phase 1B narrows model-facing execution to stable facades:
 - `inspect_diff`
 - `run_verification` for task-specific smoke commands
 
-The facades are model-visible tools. They are not alternate runtimes and they do not write files directly.
+The facades are model-visible tools. They are not alternate components and they do not write files directly.
 
 ## Tool Schemas
 
@@ -37,19 +37,19 @@ The facades are model-visible tools. They are not alternate runtimes and they do
 - `path: str | None`
 - `paths: list[str] | None`
 
-## Runtime Delegation
+## Component Delegation
 
-`write_file` and `apply_patch` enter through `ToolRuntime`, which still performs schema validation, `PolicyRuntime` checks, optional `ApprovalGate` handling, planner authorization, trace, and audit recording.
+`write_file` and `apply_patch` enter through `ToolExecutor`, which still performs schema validation, `PolicyEngine` checks, optional `ApprovalGate` handling, planner authorization, trace, and audit recording.
 
 After tool dispatch:
 
 ```text
-ToolRuntime -> EditRuntime facade method -> MutationRuntime -> WorkspacePathResolver -> AtomicWriter
+ToolExecutor -> EditExecutor facade method -> WorkspaceMutationManager -> WorkspacePathResolver -> AtomicWriter
 ```
 
 `apply_patch` parses text unified diffs before creating a changeset. It supports strict text file creation and modification. Delete, rename, and binary patches are rejected as `unsupported_operation`. Context mismatch and stale snapshots fail before any file is written.
 
-`inspect_diff` reads the in-process `MutationRuntime` changeset ledger and bounded diff evidence. It does not require Git.
+`inspect_diff` reads the in-process `WorkspaceMutationManager` changeset ledger and bounded diff evidence. It does not require Git.
 
 ## Low-Level Tools
 
@@ -57,7 +57,7 @@ Low-level mutation tools such as `workspace_create_file`, `workspace_replace_tex
 
 ## Rollback
 
-`rollback_changeset(changeset_id, reason=None)` is an internal controller recovery API on `MutationRuntime`. It is not registered as a model tool.
+`rollback_changeset(changeset_id, reason=None)` is an internal controller recovery API on `WorkspaceMutationManager`. It is not registered as a model tool.
 
 Rollback uses the existing mutation journal, records policy audit and mutation trace entries, and updates planner workspace evidence when a planner is attached.
 
@@ -66,7 +66,7 @@ Rollback uses the existing mutation journal, records policy audit and mutation t
 Task-specific smoke commands still run through:
 
 ```text
-run_verification -> VerificationRuntime -> CommandRuntime
+run_verification -> VerificationRunner -> CommandExecutor
 ```
 
 Verification evidence includes command exit code, stdout/stderr excerpts, duration, parsed failures, check status, and completion assessment. Completion remains rejected unless verification evidence is ready or ready with warnings.

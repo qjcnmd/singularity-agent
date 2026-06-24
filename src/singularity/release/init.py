@@ -7,14 +7,14 @@ from singularity.release.metadata import package_version
 from singularity.release.models import (
     CONFIG_SCHEMA_VERSION,
     CURRENT_MIGRATION_VERSION,
-    RuntimeManifest,
+    InstallationManifest,
     atomic_write_json,
     read_json,
 )
-from singularity.release.paths import RuntimePaths
+from singularity.release.paths import UserDataPaths
 
 
-def initialize_runtime(paths: RuntimePaths, *, force: bool = False) -> dict[str, Any]:
+def initialize_user_data(paths: UserDataPaths, *, force: bool = False) -> dict[str, Any]:
     created_dirs: list[str] = []
     for directory in paths.directories():
         if not directory.exists():
@@ -31,10 +31,10 @@ def initialize_runtime(paths: RuntimePaths, *, force: bool = False) -> dict[str,
         now = _now()
         atomic_write_json(
             paths.manifest_file,
-            RuntimeManifest(
+            InstallationManifest(
                 app_version=package_version(),
                 last_migration=CURRENT_MIGRATION_VERSION,
-                runtime_mode=paths.mode.value,
+                mode=paths.mode.value,
                 created_at=now,
                 updated_at=now,
             ).to_dict(),
@@ -51,10 +51,10 @@ def initialize_runtime(paths: RuntimePaths, *, force: bool = False) -> dict[str,
     }
 
 
-def default_config(paths: RuntimePaths) -> dict[str, Any]:
+def default_config(paths: UserDataPaths) -> dict[str, Any]:
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
-        "runtime": {
+        "component": {
             "mode": paths.mode.value,
             "root": str(paths.root),
         },
@@ -77,7 +77,7 @@ def default_config(paths: RuntimePaths) -> dict[str, Any]:
     }
 
 
-def load_config(paths: RuntimePaths) -> dict[str, Any]:
+def load_config(paths: UserDataPaths) -> dict[str, Any]:
     return read_json(paths.config_file)
 
 
@@ -85,7 +85,7 @@ def validate_config(payload: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:
         issues.append("unsupported config schema_version")
-    for key in ("runtime", "policy", "sandbox", "model", "provider"):
+    for key in ("component", "policy", "sandbox", "model", "provider"):
         if not isinstance(payload.get(key), dict):
             issues.append(f"missing {key} section")
     return issues

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from singularity.instructions.config import InstructionRuntimeConfig
+from singularity.instructions.prompt_config import PromptAssemblyConfig
 from singularity.instructions.exceptions import InstructionSourceError
 from singularity.instructions.models import (
     InstructionPriority,
@@ -19,10 +19,10 @@ class ProjectInstructionLoader:
         self,
         workspace_root: Path | str,
         *,
-        config: InstructionRuntimeConfig | None = None,
+        config: PromptAssemblyConfig | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
-        self.config = config or InstructionRuntimeConfig()
+        self.config = config or PromptAssemblyConfig()
 
     def load(self) -> list[InstructionSource]:
         if not self.config.enable_project_instructions:
@@ -40,7 +40,7 @@ class ProjectInstructionLoader:
                     origin=str(path),
                     priority=InstructionPriority.PROJECT_INSTRUCTION,
                     trust_level=TrustLevel.PROJECT_DECLARED,
-                    scope=InstructionScope(applies_to_runtime=["model", "planner"]),
+                    scope=InstructionScope(applies_to_component=["model", "planner"]),
                     content=content,
                     metadata={
                         "path": str(path.relative_to(self.workspace_root)),

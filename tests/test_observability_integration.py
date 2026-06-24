@@ -9,29 +9,29 @@ import pytest
 from typer.testing import CliRunner
 
 from singularity.cli import app
-from singularity.command import CommandRequest, CommandRuntime
+from singularity.command import CommandRequest, CommandExecutor
 from singularity.context.manager import ContextManager
 from singularity.observability.models import TraceEventType
-from singularity.observability.runtime import TraceRuntime
-from singularity.planner import PlannerRuntime, TaskStatus
+from singularity.observability.recorder import TraceRecorder
+from singularity.planner import Planner, TaskStatus
 from singularity.planner.finalizer import Finalizer
 from singularity.policy import (
     Capability,
     OperationKind,
     PolicyConfig,
     PolicyRequest,
-    PolicyRuntime,
+    PolicyEngine,
     PolicySubject,
     ResourceRef,
-    RuntimeName,
+    PolicyComponent,
 )
 from singularity.policy.approval import ApprovalGate
 from singularity.policy.config import ApprovalMode
 from singularity.policy import SecurityMode
 from singularity.policy.exceptions import ApprovalRequired
 from singularity.policy.models import DecisionOutcome
-from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from singularity.workspace import CreateFile, MutationRuntime
+from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
+from singularity.workspace import CreateFile, WorkspaceMutationManager
 from singularity.command import (
     CommandPolicyResult,
     CommandDecision,
@@ -40,36 +40,36 @@ from singularity.command import (
     SemanticStatus,
 )
 from singularity.sandbox import (
-    SandboxRuntime,
+    SandboxManager,
     SandboxProfileName,
     SandboxRequest,
     default_sandbox_profile,
 )
-from singularity.verification import VerificationRuntime
-from tests.tool_runtime_helpers import make_test_policy_runtime
+from singularity.verification import VerificationRunner
+from tests.tool_executor_helpers import make_test_policy_engine
 
 
-def _compat_policy_runtime(tmp_path: Path) -> PolicyRuntime:
-    return PolicyRuntime(
+def _compat_policy_engine(tmp_path: Path) -> PolicyEngine:
+    return PolicyEngine(
         PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT)
     )
 
 
-def _event_values(trace: TraceRuntime) -> list[str]:
+def _event_values(trace: TraceRecorder) -> list[str]:
     return [event.event_type.value for event in trace.store.query_events()]
 
 
-def test_tool_runtime_dispatch_emits_structured_trace(tmp_path: Path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_tool", session_id="session_tool")
-    runtime = ToolRuntime(
+def test_tool_executor_dispatch_emits_structured_trace(tmp_path: Path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_tool", session_id="session_tool")
+    component = ToolExecutor(
         registry=ToolRegistry(tmp_path),
         policy=ToolPolicy.read_only(),
         trace=trace,
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
-    result = runtime.execute_tool_call(
+    result = component.execute_tool_call(
         {
             "id": "call_list",
             "type": "function",
@@ -85,23 +85,23 @@ def test_tool_runtime_dispatch_emits_structured_trace(tmp_path: Path) -> None:
     assert values.count(TraceEventType.TOOL_DISPATCH_COMPLETED.value) == 1
 
 
-def test_policy_runtime_and_approval_gate_emit_trace(tmp_path: Path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_policy", session_id="session_policy")
+def test_policy_engine_and_approval_gate_emit_trace(tmp_path: Path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_policy", session_id="session_policy")
     config = PolicyConfig(
         workspace_root=tmp_path,
         approval_mode=ApprovalMode.NON_INTERACTIVE,
         audit_log_path=tmp_path / "audit.jsonl",
     )
-    policy = PolicyRuntime(config, trace=trace)
+    policy = PolicyEngine(config, trace=trace)
     request = PolicyRequest(
         session_id="session_policy",
         task_id="task_policy",
         phase_id="phase",
         action_id="action",
-        runtime=RuntimeName.TOOL,
+        component=PolicyComponent.TOOL,
         operation=OperationKind.DELETE_FILE,
         capability=Capability.DELETE_FILE,
-        subject=PolicySubject(subject_type="runtime", name="test"),
+        subject=PolicySubject(subject_type="component", name="test"),
         resource=ResourceRef(
             resource_type="file",
             identifier=".env",
@@ -128,25 +128,25 @@ def test_policy_runtime_and_approval_gate_emit_trace(tmp_path: Path) -> None:
 
 
 def test_command_mutation_planner_context_and_final_report_trace(tmp_path: Path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_all", session_id="session_all")
-    planner = PlannerRuntime(tmp_path, session_id="session_all", task_id="task_all", trace=trace)
+    trace = TraceRecorder.create(tmp_path, run_id="run_all", session_id="session_all")
+    planner = Planner(tmp_path, session_id="session_all", task_id="task_all", trace=trace)
     planner.start_task("Add a file and verify it")
     planner.state.status = TaskStatus.APPLYING_CHANGES
     planner.state.current_phase = "applying_changes"
     planner.plan.current_phase = "applying_changes"
 
-    mutation = MutationRuntime(tmp_path, trace=trace, planner=planner)
+    mutation = WorkspaceMutationManager(tmp_path, trace=trace, planner=planner)
     mutation_result = mutation.apply_operations(
         [CreateFile(path="app.py", content="print('ok')\n")],
         intent="add app",
         created_by="test",
         tool_call_id="call_mutation",
     )
-    command = CommandRuntime(
+    command = CommandExecutor(
         tmp_path,
         trace=trace,
         planner=planner,
-        policy_runtime=_compat_policy_runtime(tmp_path),
+        policy_engine=_compat_policy_engine(tmp_path),
     )
     command_result = command.run(
         CommandRequest(
@@ -186,10 +186,10 @@ def test_command_mutation_planner_context_and_final_report_trace(tmp_path: Path)
 
 def test_trace_cli_show_and_timeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
-    trace = TraceRuntime.create(tmp_path, run_id="run_cli", session_id="session_cli")
+    trace = TraceRecorder.create(tmp_path, run_id="run_cli", session_id="session_cli")
     trace.emit(
         TraceEventType.COMMAND_COMPLETED,
-        runtime="command",
+        component="command",
         summary="command done",
         ids={"task_id": "task_cli", "command_id": "cmd_cli"},
     )
@@ -210,7 +210,7 @@ def test_trace_artifacts_cli_shows_handle_not_absolute_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    trace = TraceRuntime.create(tmp_path, run_id="run_artifacts", session_id="session")
+    trace = TraceRecorder.create(tmp_path, run_id="run_artifacts", session_id="session")
     artifact = trace.write_artifact(
         kind="report",
         text="artifact body",
@@ -226,11 +226,11 @@ def test_trace_artifacts_cli_shows_handle_not_absolute_path(
     assert str(tmp_path) not in result.output
 
 
-def test_sandbox_runtime_emits_unified_trace_when_trace_runtime_is_used(tmp_path: Path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_sandbox", session_id="session")
-    runtime = SandboxRuntime(tmp_path, trace=trace)
+def test_sandbox_manager_emits_unified_trace_when_trace_recorder_is_used(tmp_path: Path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_sandbox", session_id="session")
+    component = SandboxManager(tmp_path, trace=trace)
 
-    result = runtime.run(_sandbox_request(tmp_path))
+    result = component.run(_sandbox_request(tmp_path))
 
     assert result.status.value == "success"
     values = _event_values(trace)
@@ -241,9 +241,9 @@ def test_sandbox_runtime_emits_unified_trace_when_trace_runtime_is_used(tmp_path
     assert TraceEventType.SANDBOX_CLEANED.value in values
 
 
-def test_verification_runtime_emits_check_evidence_and_repair_trace(tmp_path: Path) -> None:
+def test_verification_runner_emits_check_evidence_and_repair_trace(tmp_path: Path) -> None:
     request = CommandRequest(argv=[sys.executable, "-m", "pytest"])
-    fake = _FakeCommandRuntime(
+    fake = _FakeCommandExecutor(
         [
             _command_result(
                 request,
@@ -275,11 +275,11 @@ def test_verification_runtime_emits_check_evidence_and_repair_trace(tmp_path: Pa
         json.dumps({"scripts": {"test": "python -m pytest"}}),
         encoding="utf-8",
     )
-    trace = TraceRuntime.create(tmp_path, run_id="run_verification", session_id="session")
-    runtime = VerificationRuntime(tmp_path, command_runtime=fake, trace=trace)
+    trace = TraceRecorder.create(tmp_path, run_id="run_verification", session_id="session")
+    component = VerificationRunner(tmp_path, command_executor=fake, trace=trace)
 
-    plan = runtime.plan_verification(changed_files=["src/app.py"], task_intent="code")
-    runtime.run_plan(plan.id)
+    plan = component.plan_verification(changed_files=["src/app.py"], task_intent="code")
+    component.run_plan(plan.id)
 
     values = _event_values(trace)
     assert TraceEventType.VERIFICATION_PLAN_CREATED.value in values
@@ -289,7 +289,7 @@ def test_verification_runtime_emits_check_evidence_and_repair_trace(tmp_path: Pa
     assert TraceEventType.VERIFICATION_FAILED.value in values
 
 
-class _FakeCommandRuntime:
+class _FakeCommandExecutor:
     def __init__(self, results: list[Any]) -> None:
         from singularity.command import CommandPolicy
 
@@ -342,11 +342,11 @@ def _command_result(
 
 def _sandbox_request(tmp_path: Path) -> SandboxRequest:
     return SandboxRequest(
-        sandbox_id="sandbox_runtime",
+        sandbox_id="sandbox_manager",
         session_id="session",
         task_id="task",
         action_id="action",
-        command=[sys.executable, "-c", "print('runtime')"],
+        command=[sys.executable, "-c", "print('component')"],
         cwd=tmp_path,
         workspace_root=tmp_path,
         profile=default_sandbox_profile(

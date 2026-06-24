@@ -8,8 +8,8 @@ from rich.console import Console
 from rich.panel import Panel
 
 from singularity.cli_paths import resolve_project_root
-from singularity.memory.runtime import MemoryRuntime
-from singularity.memory.sync import MemorySyncRuntime
+from singularity.memory.pipeline import MemoryLearningPipeline
+from singularity.memory.sync import MemoryBundleSync
 
 
 memory_app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -29,8 +29,8 @@ def memory_list(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(read_only=True, project_root=project_root)
-    entries = [entry.to_dict() for entry in runtime.store.load_entries(rebuild_index=False)]
+    memory_pipeline = _memory_pipeline(read_only=True, project_root=project_root)
+    entries = [entry.to_dict() for entry in memory_pipeline.store.load_entries(rebuild_index=False)]
     _print(entries, json_output=json_output, title="memory entries")
 
 
@@ -39,10 +39,10 @@ def memory_candidates(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(read_only=True, project_root=project_root)
+    memory_pipeline = _memory_pipeline(read_only=True, project_root=project_root)
     candidates = [
         candidate.to_dict()
-        for candidate in runtime.store.load_candidates(rebuild_index=False)
+        for candidate in memory_pipeline.store.load_candidates(rebuild_index=False)
     ]
     _print(candidates, json_output=json_output, title="memory candidates")
 
@@ -53,8 +53,8 @@ def memory_show(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(read_only=True, project_root=project_root)
-    entry = runtime.store.get_entry(memory_id, rebuild_index=False)
+    memory_pipeline = _memory_pipeline(read_only=True, project_root=project_root)
+    entry = memory_pipeline.store.get_entry(memory_id, rebuild_index=False)
     _print(entry.to_dict(), json_output=json_output, title=f"memory {memory_id}")
 
 
@@ -64,8 +64,8 @@ def memory_search(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(read_only=True, project_root=project_root)
-    results = [result.to_dict() for result in runtime.retrieve(goal=query)]
+    memory_pipeline = _memory_pipeline(read_only=True, project_root=project_root)
+    results = [result.to_dict() for result in memory_pipeline.retrieve(goal=query)]
     _print(results, json_output=json_output, title="memory search")
 
 
@@ -74,8 +74,8 @@ def memory_accept(
     candidate_id: Annotated[str, typer.Argument(help="Memory candidate id.")],
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(project_root=project_root)
-    entry = runtime.accept_candidate(candidate_id)
+    memory_pipeline = _memory_pipeline(project_root=project_root)
+    entry = memory_pipeline.accept_candidate(candidate_id)
     console.print(f"accepted {candidate_id} -> {entry.id}")
 
 
@@ -85,8 +85,8 @@ def memory_reject(
     reason: Annotated[str, typer.Option("--reason", help="Rejection reason.")] = "rejected",
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(project_root=project_root)
-    candidate = runtime.reject_candidate(candidate_id, reason=reason)
+    memory_pipeline = _memory_pipeline(project_root=project_root)
+    candidate = memory_pipeline.reject_candidate(candidate_id, reason=reason)
     console.print(f"rejected {candidate.id}")
 
 
@@ -96,8 +96,8 @@ def memory_delete(
     reason: Annotated[str, typer.Option("--reason", help="Tombstone reason.")] = "deleted",
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(project_root=project_root)
-    entry = runtime.delete_entry(memory_id, reason=reason)
+    memory_pipeline = _memory_pipeline(project_root=project_root)
+    entry = memory_pipeline.delete_entry(memory_id, reason=reason)
     console.print(f"deleted {entry.id}")
 
 
@@ -107,8 +107,8 @@ def memory_doctor(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(read_only=not repair, project_root=project_root)
-    report = runtime.doctor(repair=repair)
+    memory_pipeline = _memory_pipeline(read_only=not repair, project_root=project_root)
+    report = memory_pipeline.doctor(repair=repair)
     _print(report, json_output=json_output, title="memory doctor")
 
 
@@ -117,8 +117,8 @@ def memory_refresh(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(project_root=project_root)
-    report = runtime.refresh()
+    memory_pipeline = _memory_pipeline(project_root=project_root)
+    report = memory_pipeline.refresh()
     _print(report, json_output=json_output, title="memory refresh")
 
 
@@ -127,8 +127,8 @@ def memory_rules_list(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(read_only=True, project_root=project_root)
-    rules = runtime.list_rules()
+    memory_pipeline = _memory_pipeline(read_only=True, project_root=project_root)
+    rules = memory_pipeline.list_rules()
     _print(rules, json_output=json_output, title="memory rules")
 
 
@@ -138,8 +138,8 @@ def memory_sync_export(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(read_only=True, project_root=project_root)
-    result = MemorySyncRuntime(runtime.store).export_bundle(output_path)
+    memory_pipeline = _memory_pipeline(read_only=True, project_root=project_root)
+    result = MemoryBundleSync(memory_pipeline.store).export_bundle(output_path)
     _print(result.to_dict(), json_output=json_output, title="memory sync export")
 
 
@@ -156,22 +156,22 @@ def memory_sync_import(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    runtime = _runtime(read_only=False, project_root=project_root)
-    result = MemorySyncRuntime(runtime.store).import_bundle(
+    memory_pipeline = _memory_pipeline(read_only=False, project_root=project_root)
+    result = MemoryBundleSync(memory_pipeline.store).import_bundle(
         bundle_path,
         trust_entries=trust_entries,
     )
     _print(result.to_dict(), json_output=json_output, title="memory sync import")
 
 
-def _runtime(*, read_only: bool = False, project_root: Path | None = None) -> MemoryRuntime:
-    runtime = MemoryRuntime(resolve_project_root(project_root))
-    runtime.start_session(
+def _memory_pipeline(*, read_only: bool = False, project_root: Path | None = None) -> MemoryLearningPipeline:
+    memory_pipeline = MemoryLearningPipeline(resolve_project_root(project_root))
+    memory_pipeline.start_session(
         session_id="memory_cli",
         user_goal="memory cli",
         rebuild_index=not read_only,
     )
-    return runtime
+    return memory_pipeline
 
 
 def _print(payload: object, *, json_output: bool, title: str) -> None:

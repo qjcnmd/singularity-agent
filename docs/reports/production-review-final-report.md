@@ -20,21 +20,21 @@ Remote alignment before this final report: `git rev-list --left-right --count or
 
 | Priority | Item | Status | Evidence |
 | --- | --- | --- | --- |
-| P1-1 | ToolRuntime thread backend timeout was not a hard return timeout. | Fixed | `src/singularity/tools/runtime.py`; `tests/test_tool_runtime.py`; `docs/reports/phase-P1-resolution-report.md`. |
-| P1-2 | GitRuntime commit could stage the whole repo by default. | Fixed | `src/singularity/git_runtime/runtime.py`; `tests/test_git_runtime.py`; P1 and P3 reports. |
-| P1-3 | Evaluation assertion paths could escape the workspace. | Fixed | `src/singularity/evaluation/execution.py`; `tests/evaluation/test_scoring_replay_runtime.py`; P1 report. |
+| P1-1 | ToolExecutor thread backend timeout was not a hard return timeout. | Fixed | `src/singularity/tools/executor.py`; `tests/test_tool_executor.py`; `docs/reports/phase-P1-resolution-report.md`. |
+| P1-2 | GitClient commit could stage the whole repo by default. | Fixed | `src/singularity/git_client/client.py`; `tests/test_git_client.py`; P1 and P3 reports. |
+| P1-3 | Evaluation assertion paths could escape the workspace. | Fixed | `src/singularity/evaluation/execution.py`; `tests/evaluation/test_scoring_replay_harness.py`; P1 report. |
 | P1-4 | Live-provider benchmark/eval path was missing. | Fixed | `tests/test_cli.py` adds default-skipped live-provider coverage; P2/P3 runs executed it with real model env from local `key.txt`. |
 | P2-1 | CLI commands relied on `Path.cwd()`. | Fixed | `src/singularity/cli_paths.py` and CLI subcommand updates; P2 report. |
-| P2-2 | ProjectIndex initialized store even when disabled. | Fixed | `src/singularity/code_index/runtime.py`; `tests/code_index/test_store_incremental_query_impact.py`. |
+| P2-2 | ProjectIndex initialized store even when disabled. | Fixed | `src/singularity/code_index/index.py`; `tests/code_index/test_store_incremental_query_impact.py`. |
 | P2-3 | OpenAI-compatible provider lacked streaming capability support. | Fixed | `src/singularity/model/providers.py`; `tests/test_model_provider_registry.py`. |
 | P2-4 | Parallel executor blocked on submission-order futures. | Fixed | `src/singularity/tool_protocol/parallel.py`; `tests/test_tool_protocol_parallel.py`. |
-| P2-5 | README PolicyRuntime path was wrong. | Fixed | `README.md` now points to `src/singularity/policy/engine.py`. |
-| P2-6 | GitRuntime docs did not match implementation. | Fixed | `README.md`, `docs/architecture/command-runtime.md`, and P3 doc cleanup. |
+| P2-5 | README PolicyEngine path was wrong. | Fixed | `README.md` now points to `src/singularity/policy/engine.py`. |
+| P2-6 | GitClient docs did not match implementation. | Fixed | `README.md`, `docs/architecture/command-execution.md`, and P3 doc cleanup. |
 | P2-7 | pyproject lacked lint/type/coverage gates. | Fixed | `pyproject.toml` declares `ruff`, `mypy`, `pytest-cov`, and focused config. |
 | P2-8 | Core files exceed 1000 lines. | Deferred with plan | No behavior-safe split was needed for P2. `docs/reports/phase-P2-resolution-report.md` records the follow-up split order. |
-| P3-1 | Docs consistency tests were mostly keyword checks. | Fixed | `tests/test_docs_consistency.py` now validates implemented source paths and GitRuntime boundary wording. |
-| P3-2 | GitRuntime comments and naming were misleading. | Fixed | `src/singularity/git_runtime/runtime.py` and CLI help now use local-only adapter/explicit path wording. |
-| P3-3 | Low-risk docs, naming, error-message, UX issues. | Fixed | GitRuntime boundary docs aligned in code-index, command, and verification architecture docs. |
+| P3-1 | Docs consistency tests were mostly keyword checks. | Fixed | `tests/test_docs_consistency.py` now validates implemented source paths and GitClient boundary wording. |
+| P3-2 | GitClient comments and naming were misleading. | Fixed | `src/singularity/git_client/client.py` and CLI help now use local-only adapter/explicit path wording. |
+| P3-3 | Low-risk docs, naming, error-message, UX issues. | Fixed | GitClient boundary docs aligned in code-index, command, and verification architecture docs. |
 
 Historical review items 11 and 12 were not addressed because they were explicitly out of scope and did not block P1/P2/P3.
 
@@ -88,4 +88,4 @@ Results before writing this final report: diff check passed, remote alignment wa
 
 ## Remaining Gap To Codex CLI
 
-Singularity is now stronger on local runtime boundaries, reports, trace discipline, and opt-in live-provider validation than it was before this review. It still trails Codex CLI in mature ecosystem integration: broad provider streaming behavior, hardened long-running agent ergonomics, remote collaboration workflows, multi-agent execution, polished UX, and extensive battle-tested type/CI coverage.
+Singularity is now stronger on local component boundaries, reports, trace discipline, and opt-in live-provider validation than it was before this review. It still trails Codex CLI in mature ecosystem integration: broad provider streaming behavior, hardened long-running agent ergonomics, remote collaboration workflows, multi-agent execution, polished UX, and extensive battle-tested type/CI coverage.

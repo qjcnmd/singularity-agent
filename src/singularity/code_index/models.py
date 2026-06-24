@@ -21,7 +21,7 @@ class FreshnessStatus(str, Enum):
 
 
 class TrustLevel(str, Enum):
-    RUNTIME_GENERATED = "runtime_generated"
+    COMPONENT_GENERATED = "component_generated"
     WORKSPACE_UNTRUSTED = "workspace_untrusted"
     EXTERNAL_UNTRUSTED = "external_untrusted"
 
@@ -102,7 +102,7 @@ class Evidence:
 class BackendInfo:
     name: str
     version: str = "1.0.0"
-    source: str = "runtime"
+    source: str = "component"
 
     def to_dict(self) -> dict[str, Any]:
         return _to_plain(self)
@@ -116,9 +116,9 @@ class IndexFact:
     freshness: FreshnessStatus | str = FreshnessStatus.FRESH
     confidence: float = 1.0
     evidence: list[Evidence] = field(default_factory=list)
-    trust_level: TrustLevel | str = TrustLevel.RUNTIME_GENERATED
+    trust_level: TrustLevel | str = TrustLevel.COMPONENT_GENERATED
     backend: BackendInfo = DEFAULT_BACKEND
-    source: str = "runtime"
+    source: str = "component"
     observed_at: str = field(default_factory=lambda: _now())
 
     def __post_init__(self) -> None:

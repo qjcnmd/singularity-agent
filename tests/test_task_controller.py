@@ -4,12 +4,12 @@ import json
 from types import SimpleNamespace
 
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
-from singularity.planner import PlannerRuntime
-from singularity.task_controller import (
-    OutcomeReducer,
-    TaskController,
-    TaskEventKind,
-    TaskLifecycleStatus,
+from singularity.planner import Planner
+from singularity.run_controller import (
+    RunOutcomeReducer,
+    RunController,
+    RunControlEventKind,
+    RunLifecycleStatus,
 )
 
 
@@ -22,10 +22,10 @@ class RecordingTrace:
 
 
 def test_outcome_reducer_maps_waiting_and_nonterminal_outcomes() -> None:
-    reducer = OutcomeReducer()
+    reducer = RunOutcomeReducer()
 
     approval = reducer.reduce_outcome(
-        TaskLifecycleStatus.RUNNING,
+        RunLifecycleStatus.RUNNING,
         ExecutionOutcome(
             status=ExecutionOutcomeStatus.APPROVAL_REQUIRED,
             source="protocol",
@@ -35,7 +35,7 @@ def test_outcome_reducer_maps_waiting_and_nonterminal_outcomes() -> None:
         ),
     )
     replan = reducer.reduce_outcome(
-        TaskLifecycleStatus.RUNNING,
+        RunLifecycleStatus.RUNNING,
         ExecutionOutcome(
             status=ExecutionOutcomeStatus.REPLAN_REQUIRED,
             source="completion",
@@ -44,16 +44,16 @@ def test_outcome_reducer_maps_waiting_and_nonterminal_outcomes() -> None:
         ),
     )
 
-    assert approval.kind == TaskEventKind.OUTCOME_RECORDED
-    assert approval.to_status == TaskLifecycleStatus.WAITING_APPROVAL
+    assert approval.kind == RunControlEventKind.OUTCOME_RECORDED
+    assert approval.to_status == RunLifecycleStatus.WAITING_APPROVAL
     assert approval.terminal is False
-    assert replan.to_status == TaskLifecycleStatus.RUNNING
+    assert replan.to_status == RunLifecycleStatus.RUNNING
     assert replan.terminal is False
 
 
 def test_protocol_next_action_maps_to_task_event() -> None:
-    event = OutcomeReducer().reduce_protocol_result(
-        TaskLifecycleStatus.RUNNING,
+    event = RunOutcomeReducer().reduce_protocol_result(
+        RunLifecycleStatus.RUNNING,
         SimpleNamespace(
             next_action="resume_pending_approval",
             pending_approval_count=1,
@@ -61,15 +61,15 @@ def test_protocol_next_action_maps_to_task_event() -> None:
         ),
     )
 
-    assert event.kind == TaskEventKind.PROTOCOL_NEXT_ACTION
-    assert event.to_status == TaskLifecycleStatus.WAITING_APPROVAL
+    assert event.kind == RunControlEventKind.PROTOCOL_NEXT_ACTION
+    assert event.to_status == RunLifecycleStatus.WAITING_APPROVAL
     assert event.metadata["next_action"] == "resume_pending_approval"
 
 
 def test_task_controller_records_trace_event_for_state_transition(tmp_path) -> None:
     trace = RecordingTrace()
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
-    controller = TaskController(planner=planner, trace=trace)
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    controller = RunController(planner=planner, trace=trace)
 
     controller.start("create a file")
     event = controller.apply_outcome(
@@ -83,18 +83,18 @@ def test_task_controller_records_trace_event_for_state_transition(tmp_path) -> N
         )
     )
 
-    assert event.to_status == TaskLifecycleStatus.WAITING_USER
+    assert event.to_status == RunLifecycleStatus.WAITING_USER
     assert planner.state is not None
-    assert planner.state.lifecycle_status == TaskLifecycleStatus.WAITING_USER.value
+    assert planner.state.lifecycle_status == RunLifecycleStatus.WAITING_USER.value
     context = json.loads(planner.planner_context_message()["content"])["planner"]
-    assert context["lifecycle_status"] == TaskLifecycleStatus.WAITING_USER.value
+    assert context["lifecycle_status"] == RunLifecycleStatus.WAITING_USER.value
     assert trace.events[-1][0] == "task_lifecycle"
-    assert trace.events[-1][1]["to_status"] == TaskLifecycleStatus.WAITING_USER.value
+    assert trace.events[-1][1]["to_status"] == RunLifecycleStatus.WAITING_USER.value
 
 
 def test_task_controller_dispatches_protocol_recovery(tmp_path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
-    controller = TaskController(planner=planner)
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    controller = RunController(planner=planner)
     controller.start("resume protocol")
 
     class FakeRecoveryManager:
@@ -114,15 +114,15 @@ def test_task_controller_dispatches_protocol_recovery(tmp_path) -> None:
     event = controller.dispatch_protocol_recovery(recovery, run_id="run_1")
 
     assert recovery.calls == [{"run_id": "run_1", "session_id": "session_1", "task_id": "task_1"}]
-    assert event.kind == TaskEventKind.PROTOCOL_NEXT_ACTION
-    assert event.to_status == TaskLifecycleStatus.WAITING_APPROVAL
+    assert event.kind == RunControlEventKind.PROTOCOL_NEXT_ACTION
+    assert event.to_status == RunLifecycleStatus.WAITING_APPROVAL
     assert planner.state is not None
-    assert planner.state.lifecycle_status == TaskLifecycleStatus.WAITING_APPROVAL.value
+    assert planner.state.lifecycle_status == RunLifecycleStatus.WAITING_APPROVAL.value
 
 
 def test_task_controller_resumes_user_input_wait(tmp_path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
-    controller = TaskController(planner=planner)
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    controller = RunController(planner=planner)
     controller.start("ask when needed")
     controller.apply_outcome(
         ExecutionOutcome(
@@ -136,16 +136,16 @@ def test_task_controller_resumes_user_input_wait(tmp_path) -> None:
 
     event = controller.resume_user_input({"answer": "continue"})
 
-    assert event.kind == TaskEventKind.USER_INPUT_RESUMED
-    assert event.from_status == TaskLifecycleStatus.WAITING_USER
-    assert event.to_status == TaskLifecycleStatus.RUNNING
+    assert event.kind == RunControlEventKind.USER_INPUT_RESUMED
+    assert event.from_status == RunLifecycleStatus.WAITING_USER
+    assert event.to_status == RunLifecycleStatus.RUNNING
     assert planner.state is not None
-    assert planner.state.lifecycle_status == TaskLifecycleStatus.RUNNING.value
+    assert planner.state.lifecycle_status == RunLifecycleStatus.RUNNING.value
 
 
 def test_task_controller_checkpoint_resume_preserves_waiting_state(tmp_path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
-    controller = TaskController(planner=planner)
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    controller = RunController(planner=planner)
     controller.start("ask when needed")
     controller.apply_outcome(
         ExecutionOutcome(
@@ -158,16 +158,16 @@ def test_task_controller_checkpoint_resume_preserves_waiting_state(tmp_path) -> 
     )
     controller.checkpoint()
 
-    resumed = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
-    TaskController(planner=resumed).resume("session_1")
+    resumed = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    RunController(planner=resumed).resume("session_1")
 
     assert resumed.state is not None
-    assert resumed.state.lifecycle_status == TaskLifecycleStatus.WAITING_USER.value
+    assert resumed.state.lifecycle_status == RunLifecycleStatus.WAITING_USER.value
 
 
 def test_task_controller_blocks_after_max_turns(tmp_path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
-    controller = TaskController(planner=planner)
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    controller = RunController(planner=planner)
 
     result = controller.run_loop(
         "inspect workspace",
@@ -178,12 +178,12 @@ def test_task_controller_blocks_after_max_turns(tmp_path) -> None:
 
     assert result == "max:1"
     assert planner.state is not None
-    assert planner.state.lifecycle_status == TaskLifecycleStatus.BLOCKED.value
+    assert planner.state.lifecycle_status == RunLifecycleStatus.BLOCKED.value
 
 
 def test_task_controller_run_loop_owns_turn_iteration(tmp_path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
-    controller = TaskController(planner=planner)
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    controller = RunController(planner=planner)
     turns: list[int] = []
 
     result = controller.run_loop(
@@ -196,4 +196,4 @@ def test_task_controller_run_loop_owns_turn_iteration(tmp_path) -> None:
     assert result == "done"
     assert turns == [1, 2]
     assert planner.state is not None
-    assert planner.state.lifecycle_status == TaskLifecycleStatus.COMPLETED.value
+    assert planner.state.lifecycle_status == RunLifecycleStatus.COMPLETED.value

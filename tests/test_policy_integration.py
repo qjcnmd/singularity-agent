@@ -5,8 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from singularity.command import CommandRequest, CommandRuntime, ExecutionStatus
-from singularity.planner import EvidenceLedger, PlannerRuntime, TaskStatus, TaskState
+from singularity.command import CommandRequest, CommandExecutor, ExecutionStatus
+from singularity.planner import EvidenceLedger, Planner, TaskStatus, TaskState
 from singularity.planner.finalizer import Finalizer
 from singularity.policy import (
     Capability,
@@ -14,28 +14,28 @@ from singularity.policy import (
     OperationKind,
     PolicyConfig,
     PolicyRequest,
-    PolicyRuntime,
+    PolicyEngine,
     PolicySubject,
     ResourceRef,
-    RuntimeName,
+    PolicyComponent,
     SecurityMode,
 )
-from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
-from singularity.verification import VerificationRuntime
-from singularity.workspace import CreateFile, MutationRuntime
+from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolExecutor, ToolSpec
+from singularity.verification import VerificationRunner
+from singularity.workspace import CreateFile, WorkspaceMutationManager
 
 
 class EmptyInput(BaseModel):
     pass
 
 
-class CountingPolicyRuntime(PolicyRuntime):
+class CountingPolicyEngine(PolicyEngine):
     def __init__(self, tmp_path: Path) -> None:
         super().__init__(PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT))
         self.calls: list[str] = []
 
     def enforce(self, request):  # type: ignore[no-untyped-def]
-        self.calls.append(f"{request.runtime.value}:{request.operation.value}:{request.resource.identifier}")
+        self.calls.append(f"{request.component.value}:{request.operation.value}:{request.resource.identifier}")
         decision = super().evaluate(request)
         return decision.model_copy_with(
             outcome=DecisionOutcome.ALLOW,
@@ -52,7 +52,7 @@ def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_tool_runtime_dispatch_calls_policy_before_handler(tmp_path: Path) -> None:
+def test_tool_executor_dispatch_calls_policy_before_handler(tmp_path: Path) -> None:
     called = False
 
     def handler(_args: EmptyInput) -> str:
@@ -70,27 +70,27 @@ def test_tool_runtime_dispatch_calls_policy_before_handler(tmp_path: Path) -> No
             permission_level=PermissionLevel.READ_ONLY,
         )
     )
-    policy = CountingPolicyRuntime(tmp_path)
-    runtime = ToolRuntime(
+    policy = CountingPolicyEngine(tmp_path)
+    component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.coding_agent(),
         trace=None,
         workspace_root=tmp_path,
-        policy_runtime=policy,
+        policy_engine=policy,
     )
 
-    result = runtime.execute_tool_call(tool_call("safe_read", {}))
+    result = component.execute_tool_call(tool_call("safe_read", {}))
 
     assert result.ok is True
     assert called is True
     assert policy.calls and policy.calls[0].startswith("tool:")
 
 
-def test_mutation_runtime_calls_policy_before_apply(tmp_path: Path) -> None:
-    policy = CountingPolicyRuntime(tmp_path)
-    runtime = MutationRuntime(tmp_path, policy_runtime=policy)
+def test_mutation_manager_calls_policy_before_apply(tmp_path: Path) -> None:
+    policy = CountingPolicyEngine(tmp_path)
+    component = WorkspaceMutationManager(tmp_path, policy_engine=policy)
 
-    result = runtime.apply_operations(
+    result = component.apply_operations(
         [CreateFile(path="app.py", content="print('ok')\n")],
         intent="create app",
         created_by="test",
@@ -100,11 +100,11 @@ def test_mutation_runtime_calls_policy_before_apply(tmp_path: Path) -> None:
     assert any(":create_file:" in call or ":mutate_file:" in call for call in policy.calls)
 
 
-def test_command_runtime_calls_policy_before_execute(tmp_path: Path) -> None:
-    policy = CountingPolicyRuntime(tmp_path)
-    runtime = CommandRuntime(tmp_path, policy_runtime=policy)
+def test_command_executor_calls_policy_before_execute(tmp_path: Path) -> None:
+    policy = CountingPolicyEngine(tmp_path)
+    component = CommandExecutor(tmp_path, policy_engine=policy)
 
-    result = runtime.run(
+    result = component.run(
         CommandRequest(argv=[sys.executable, "-c", "print('ok')"], cwd=".")
     )
 
@@ -118,10 +118,10 @@ def test_policy_compat_allows_plain_local_command_without_review(tmp_path: Path)
         task_id="task",
         phase_id="command",
         action_id="cmd",
-        runtime=RuntimeName.COMMAND,
+        component=PolicyComponent.COMMAND,
         operation=OperationKind.EXECUTE_COMMAND,
         capability=Capability.EXECUTE_COMMAND,
-        subject=PolicySubject(subject_type="runtime", name="CommandRuntime"),
+        subject=PolicySubject(subject_type="component", name="CommandExecutor"),
         resource=ResourceRef("command", f"{sys.executable} -c \"print('ok')\""),
         reason=f"{sys.executable} -c \"print('ok')\"",
         proposed_by_model=True,
@@ -134,10 +134,10 @@ def test_policy_compat_allows_plain_local_command_without_review(tmp_path: Path)
         workspace_root=str(tmp_path),
     )
 
-    strict = PolicyRuntime(
+    strict = PolicyEngine(
         PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.STRICT)
     )
-    compat = PolicyRuntime(
+    compat = PolicyEngine(
         PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT)
     )
 
@@ -145,7 +145,7 @@ def test_policy_compat_allows_plain_local_command_without_review(tmp_path: Path)
     assert compat.enforce(request).outcome == DecisionOutcome.ALLOW
 
 
-def test_verification_runtime_does_not_bypass_policy(tmp_path: Path) -> None:
+def test_verification_runner_does_not_bypass_policy(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text(
         """
 [project]
@@ -159,24 +159,24 @@ testpaths = ["tests"]
     tests_dir = tmp_path / "tests"
     tests_dir.mkdir()
     (tests_dir / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-    policy = CountingPolicyRuntime(tmp_path)
-    command_runtime = CommandRuntime(tmp_path, policy_runtime=policy)
-    runtime = VerificationRuntime(tmp_path, command_runtime=command_runtime, policy_runtime=policy)
+    policy = CountingPolicyEngine(tmp_path)
+    command_executor = CommandExecutor(tmp_path, policy_engine=policy)
+    component = VerificationRunner(tmp_path, command_executor=command_executor, policy_engine=policy)
 
-    plan = runtime.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")
-    runtime.run_plan(plan.id)
+    plan = component.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")
+    component.run_plan(plan.id)
 
     assert any(call.startswith("verification:verification") for call in policy.calls)
     assert any(call.startswith("command:verification") for call in policy.calls)
 
 
 def test_planner_records_policy_observation_and_final_report_summary(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session", task_id="task")
+    planner = Planner(tmp_path, session_id="session", task_id="task")
     planner.start_task("Policy blocked task")
     planner.record_policy_observation(
         {
             "outcome": "deny",
-            "runtime": "command",
+            "component": "command",
             "operation": "package_install",
             "reason": "package install requires review but session is non-interactive.",
             "risk_level": "high",

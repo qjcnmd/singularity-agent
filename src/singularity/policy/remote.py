@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from singularity.policy.engine import PolicyRuntime
+from singularity.policy.engine import PolicyEngine
 from singularity.policy.models import (
     ApprovalGrant,
     ApprovalRequirement,
@@ -39,12 +39,12 @@ class RemoteApprovalExport:
         }
 
 
-class RemoteApprovalRuntime:
+class RemoteApprovalExchange:
     """File-backed remote approval adapter.
 
     This is a control-plane exchange format, not a network service. Operators
     can move request/grant JSON through any trusted channel, then import the
-    scoped grant back into the local PolicyRuntime.
+    scoped grant back into the local PolicyEngine.
     """
 
     def __init__(self, workspace_root: Path | str, *, approval_dir: Path | None = None) -> None:
@@ -108,9 +108,9 @@ class RemoteApprovalRuntime:
             raise ValueError("Remote approval grant must identify approved_by.")
         return grant
 
-    def register_grant(self, path: Path, policy_runtime: PolicyRuntime) -> ApprovalGrant:
+    def register_grant(self, path: Path, policy_engine: PolicyEngine) -> ApprovalGrant:
         grant = self.import_grant(path)
-        policy_runtime.register_grant(grant)
+        policy_engine.register_grant(grant)
         return grant
 
 
@@ -120,7 +120,7 @@ def _policy_request_from_dict(payload: dict[str, object]) -> PolicyRequest:
         task_id=str(payload["task_id"]),
         phase_id=str(payload["phase_id"]),
         action_id=str(payload["action_id"]),
-        runtime=str(payload["runtime"]),
+        component=str(payload["component"]),
         operation=str(payload["operation"]),
         capability=str(payload["capability"]),
         subject=PolicySubject(**dict(payload.get("subject") or {})),

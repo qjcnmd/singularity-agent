@@ -29,16 +29,16 @@ from singularity.planner.contract import (
     TaskContractSchemaError,
     VerificationRequirement,
 )
-from singularity.planner.finalizer import FinalReportRuntime
-from singularity.planner.retrieval import LessonExtractionRuntime, RetrievalOrchestrator
-from singularity.planner.runtime import PlannerRuntime, create_or_resume_planner
+from singularity.planner.finalizer import FinalReportRenderer
+from singularity.planner.retrieval import LessonExtractor, RetrievalOrchestrator
+from singularity.planner.engine import Planner, create_or_resume_planner
 from singularity.planner.semantic import (
     ExpectedEvidence,
     FallbackStep,
     PlanDependency,
     PlanStep,
     RollingPlan,
-    SemanticPlannerRuntime,
+    SemanticPlanner,
 )
 from singularity.planner.store import PlannerStore
 
@@ -57,15 +57,15 @@ __all__ = [
     "ExpectedEvidence",
     "FallbackStep",
     "FinalReport",
-    "FinalReportRuntime",
+    "FinalReportRenderer",
     "PLANNER_ERROR_CODES",
     "PlanDependency",
     "PlanStep",
-    "PlannerRuntime",
+    "Planner",
     "PlannerStore",
     "RetrievalOrchestrator",
     "ReportRequirement",
-    "LessonExtractionRuntime",
+    "LessonExtractor",
     "create_or_resume_planner",
     "ReplanDecision",
     "ReplanDecisionKind",
@@ -73,7 +73,7 @@ __all__ = [
     "RiskEscalation",
     "RiskLevel",
     "RollingPlan",
-    "SemanticPlannerRuntime",
+    "SemanticPlanner",
     "TaskPhase",
     "TaskPlan",
     "TaskContract",

@@ -9,7 +9,7 @@
     "run_id",
     "session_id",
     "name",
-    "runtime",
+    "component",
     "started_at",
     "status"
   ],
@@ -23,7 +23,7 @@
     "phase_id": { "type": ["string", "null"] },
     "action_id": { "type": ["string", "null"] },
     "name": { "type": "string", "minLength": 1 },
-    "runtime": { "type": "string", "minLength": 1 },
+    "component": { "type": "string", "minLength": 1 },
     "started_at": { "type": "string", "format": "date-time" },
     "ended_at": { "type": ["string", "null"], "format": "date-time" },
     "duration_ms": { "type": ["integer", "null"], "minimum": 0 },

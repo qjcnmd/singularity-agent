@@ -24,7 +24,7 @@ class ToolProtocolTrace:
         if hasattr(self.trace, "emit"):
             self.trace.emit(
                 event,
-                runtime="tool_protocol",
+                component="tool_protocol",
                 summary=summary,
                 payload=safe_payload,
                 ids=ids or {},

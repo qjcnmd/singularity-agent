@@ -13,13 +13,13 @@ MCP access must flow through a tool broker boundary.
 In the current Python baseline, the broker is:
 
 ```text
-PluginRuntime / MCP adapter
+PluginManager / MCP adapter
 -> ToolRegistry
--> ToolCallingProtocolRuntime
--> ToolRuntime
--> PolicyRuntime / ApprovalGate
--> owning execution runtime
--> TraceRuntime
+-> ToolProtocolEngine
+-> ToolExecutor
+-> PolicyEngine / ApprovalGate
+-> owning execution component
+-> TraceRecorder
 ```
 
 MCP tools are exposed as normal tool declarations with schemas, capabilities, side-effect metadata, idempotency, and backend contracts.

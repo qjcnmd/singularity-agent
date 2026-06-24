@@ -17,7 +17,7 @@ from singularity.evaluation.models import (
     WorkspaceSnapshotKind,
 )
 from singularity.evaluation.patch_quality import PatchQualityEvaluator
-from singularity.evaluation.replay import TraceReplayRuntime
+from singularity.evaluation.replay import TraceReplayHarness
 from singularity.evaluation.reports import (
     EvaluationReport,
     ProfileEvaluationReport,
@@ -38,7 +38,7 @@ from singularity.evaluation.live import (
     load_live_eval_manifest,
     summarize_live_results,
 )
-from singularity.evaluation.runtime import EvaluationRuntime, RegressionDetector
+from singularity.evaluation.harness import EvaluationHarness, RegressionDetector
 from singularity.evaluation.scoring import ScoringEngine
 from singularity.evaluation.store import GoldenTaskStore
 
@@ -50,7 +50,7 @@ __all__ = [
     "EvaluationHook",
     "EvaluationProfile",
     "EvaluationReport",
-    "EvaluationRuntime",
+    "EvaluationHarness",
     "ExpectedOutcome",
     "ExpectedOutcomeKind",
     "GoldenTaskContract",
@@ -76,7 +76,7 @@ __all__ = [
     "TaskEvaluationResult",
     "TaskInput",
     "TraceReplayResult",
-    "TraceReplayRuntime",
+    "TraceReplayHarness",
     "WorkspaceSnapshot",
     "WorkspaceSnapshotKind",
     "load_live_eval_manifest",

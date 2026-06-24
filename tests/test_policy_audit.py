@@ -11,7 +11,7 @@ from singularity.policy import (
     PolicyRequest,
     PolicySubject,
     ResourceRef,
-    RuntimeName,
+    PolicyComponent,
 )
 
 
@@ -23,10 +23,10 @@ def test_policy_audit_writes_jsonl_and_redacts_secrets(tmp_path: Path) -> None:
         task_id="task",
         phase_id="phase",
         action_id="action",
-        runtime=RuntimeName.COMMAND,
+        component=PolicyComponent.COMMAND,
         operation=OperationKind.NETWORK_ACCESS,
         capability=Capability.NETWORK_ACCESS,
-        subject=PolicySubject(subject_type="runtime", name="test"),
+        subject=PolicySubject(subject_type="component", name="test"),
         resource=ResourceRef(resource_type="network", identifier="https://example.test"),
         reason="Authorization: Bearer secret-token OPENAI_API_KEY=sk-test",
         workspace_root=str(tmp_path),

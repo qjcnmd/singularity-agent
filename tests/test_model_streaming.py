@@ -4,14 +4,14 @@ from singularity.model import (
     ProviderStreamEventType,
     StreamingAccumulator,
     MockModelProvider,
-    ModelRuntime,
+    ModelRunner,
     ModelTurnRequest,
     ModelPurpose,
     ToolChoicePolicy,
     ToolChoiceMode,
 )
 from singularity.tools import ToolRegistry
-from singularity.observability import TraceRuntime
+from singularity.observability import TraceRecorder
 
 
 def test_streaming_accumulator_buffers_text_and_tool_calls_without_executing() -> None:
@@ -41,8 +41,8 @@ def test_streaming_accumulator_buffers_text_and_tool_calls_without_executing() -
     assert result.executed_tool_count == 0
 
 
-def test_model_runtime_consumes_streaming_provider(tmp_path):
-    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+def test_model_runner_consumes_streaming_provider(tmp_path):
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
 
     class _StreamingProvider(MockModelProvider):
         def __init__(self) -> None:
@@ -59,7 +59,7 @@ def test_model_runtime_consumes_streaming_provider(tmp_path):
 
     provider = _StreamingProvider()
     provider._capabilities.supports_streaming = True
-    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path), trace=trace)
+    component = ModelRunner.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path), trace=trace)
     request = ModelTurnRequest(
         request_id="req_1",
         run_id="run_1",
@@ -73,7 +73,7 @@ def test_model_runtime_consumes_streaming_provider(tmp_path):
     )
     request.model_preferences.stream = True
 
-    result = runtime.run_turn(request)
+    result = component.run_turn(request)
 
     assert result.status.value == "success"
     assert result.assistant_message is not None

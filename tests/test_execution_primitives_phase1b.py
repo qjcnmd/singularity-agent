@@ -4,20 +4,20 @@ import json
 from pathlib import Path
 from typing import Any
 
-from singularity.agent import SingularityAgentRunStatus
-from singularity.command import CommandRuntime
-from singularity.edit import EditRuntime
-from singularity.planner import PlannerRuntime, TaskStatus
-from singularity.policy import ApprovalMode, PolicyConfig, PolicyRuntime, SecurityMode
-from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.agent_loop import AgentLoopStatus
+from singularity.command import CommandExecutor
+from singularity.edit import EditExecutor
+from singularity.planner import Planner, TaskStatus
+from singularity.policy import ApprovalMode, PolicyConfig, PolicyEngine, SecurityMode
+from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
 from singularity.tools.edit import register_edit_tools
 from singularity.tools.mutation import register_mutation_tools
 from singularity.tools.verification import register_verification_tools
-from singularity.trace import TraceWriter
-from singularity.verification import VerificationRuntime
-from singularity.workspace import MutationRuntime
-from singularity.workspace_state import LocalWorkspaceStateRuntime
-from tests.agent_runtime_helpers import make_agent_session
+from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.verification import VerificationRunner
+from singularity.workspace import WorkspaceMutationManager
+from singularity.workspace_state import WorkspaceStateManager
+from tests.agent_loop_helpers import make_agent_session
 
 
 def _tool_call(name: str, arguments: dict[str, Any], *, call_id: str = "call_1") -> dict[str, Any]:
@@ -54,15 +54,15 @@ def _new_file_patch(path: str, content: str) -> str:
     )
 
 
-def _tool_runtime(
+def _tool_executor(
     tmp_path: Path,
     *,
-    planner: PlannerRuntime | None = None,
-    trace: TraceWriter | None = None,
-    state_runtime: LocalWorkspaceStateRuntime | None = None,
-) -> ToolRuntime:
-    trace = trace or TraceWriter.create(tmp_path)
-    policy = PolicyRuntime(
+    planner: Planner | None = None,
+    trace: JsonlTraceRecorder | None = None,
+    workspace_state_manager: WorkspaceStateManager | None = None,
+) -> ToolExecutor:
+    trace = trace or JsonlTraceRecorder.create(tmp_path)
+    policy = PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
             approval_mode=ApprovalMode.AUTO_SAFE,
@@ -70,40 +70,40 @@ def _tool_runtime(
         )
     )
     registry = ToolRegistry(tmp_path)
-    mutation = MutationRuntime(
+    mutation = WorkspaceMutationManager(
         tmp_path,
         trace=trace,
         planner=planner,
-        policy_runtime=policy,
-        state_runtime=state_runtime,
+        policy_engine=policy,
+        workspace_state_manager=workspace_state_manager,
     )
     register_mutation_tools(registry, mutation)
     register_edit_tools(
         registry,
-        EditRuntime(tmp_path, mutation_runtime=mutation, trace=trace, planner=planner),
+        EditExecutor(tmp_path, mutation_manager=mutation, trace=trace, planner=planner),
     )
-    command = CommandRuntime(tmp_path, trace=trace, planner=planner, policy_runtime=policy)
-    verification = VerificationRuntime(tmp_path, command_runtime=command, trace=trace, planner=planner, policy_runtime=policy)
+    command = CommandExecutor(tmp_path, trace=trace, planner=planner, policy_engine=policy)
+    verification = VerificationRunner(tmp_path, command_executor=command, trace=trace, planner=planner, policy_engine=policy)
     register_verification_tools(registry, verification)
-    tool_runtime = ToolRuntime(
+    tool_executor = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.coding_agent(),
         trace=trace,
         workspace_root=tmp_path,
         planner=planner,
-        policy_runtime=policy,
+        policy_engine=policy,
     )
-    tool_runtime.mutation_runtime = mutation  # controller/internal test hook
-    return tool_runtime
+    tool_executor.mutation_manager = mutation  # controller/internal test hook
+    return tool_executor
 
 
 def test_write_file_facade_creates_inspect_diff_and_rolls_back(tmp_path: Path) -> None:
-    runtime = _tool_runtime(tmp_path)
+    component = _tool_executor(tmp_path)
 
-    result = runtime.execute_tool_call(
+    result = component.execute_tool_call(
         _tool_call("write_file", {"path": "quicksort.py", "content": QUICK_SORT, "mode": "create"}, call_id="write")
     )
-    inspect = runtime.execute_tool_call(_tool_call("inspect_diff", {"scope": "current_run"}, call_id="inspect"))
+    inspect = component.execute_tool_call(_tool_call("inspect_diff", {"scope": "current_run"}, call_id="inspect"))
 
     assert result.ok is True
     assert result.content["status"] == "applied"
@@ -115,22 +115,22 @@ def test_write_file_facade_creates_inspect_diff_and_rolls_back(tmp_path: Path) -
     assert inspect.content["added_files"] == ["quicksort.py"]
     assert "quicksort.py" in inspect.content["changed_files"]
 
-    rollback = runtime.mutation_runtime.rollback_changeset(result.content["changeset_id"])
+    rollback = component.mutation_manager.rollback_changeset(result.content["changeset_id"])
     assert rollback.ok is True
     assert not (tmp_path / "quicksort.py").exists()
 
 
 def test_apply_patch_facade_creates_and_modifies_without_git(tmp_path: Path) -> None:
-    runtime = _tool_runtime(tmp_path)
-    create = runtime.execute_tool_call(
+    component = _tool_executor(tmp_path)
+    create = component.execute_tool_call(
         _tool_call("apply_patch", {"patch": _new_file_patch("quicksort.py", QUICK_SORT)}, call_id="create")
     )
     before = QUICK_SORT
     after = QUICK_SORT.replace("print(\"ok\")", "print(\"sorted ok\")")
-    modify = runtime.execute_tool_call(
+    modify = component.execute_tool_call(
         _tool_call("apply_patch", {"patch": _patch_for("quicksort.py", before, after)}, call_id="modify")
     )
-    inspect = runtime.execute_tool_call(
+    inspect = component.execute_tool_call(
         _tool_call("inspect_diff", {"scope": "changeset", "changeset_id": modify.content["changeset_id"]}, call_id="inspect")
     )
 
@@ -146,14 +146,14 @@ def test_apply_patch_modifies_existing_python_and_smoke_verification_succeeds(tm
         "def add(a, b):\n    return a - b\n\nif __name__ == '__main__':\n    assert add(2, 3) == 5\n",
         encoding="utf-8",
     )
-    runtime = _tool_runtime(tmp_path)
+    component = _tool_executor(tmp_path)
     before = (tmp_path / "calc.py").read_text(encoding="utf-8")
     after = before.replace("return a - b", "return a + b")
 
-    patch = runtime.execute_tool_call(
+    patch = component.execute_tool_call(
         _tool_call("apply_patch", {"patch": _patch_for("calc.py", before, after)}, call_id="patch")
     )
-    verify = runtime.execute_tool_call(
+    verify = component.execute_tool_call(
         _tool_call(
             "run_verification",
             {
@@ -168,21 +168,21 @@ def test_apply_patch_modifies_existing_python_and_smoke_verification_succeeds(tm
 
     assert patch.ok is True
     assert verify.ok is True
-    smoke = next(item for item in verify.content["verification"]["results"] if item["kind"] == "runtime_smoke")
+    smoke = next(item for item in verify.content["verification"]["results"] if item["kind"] == "verification_smoke")
     assert smoke["evidence"]["exit_code"] == 0
     assert verify.content["verification"]["completion_assessment"]["status"] == "ready"
 
 
 def test_inspect_diff_reports_multi_file_patch_and_rollback_restores(tmp_path: Path) -> None:
-    state = LocalWorkspaceStateRuntime(tmp_path)
+    state = WorkspaceStateManager(tmp_path)
     state.begin_session(session_id="session_1", task_id="task_1")
-    runtime = _tool_runtime(tmp_path, state_runtime=state)
+    component = _tool_executor(tmp_path, workspace_state_manager=state)
     patch_text = _new_file_patch("a.py", "print('a')\n") + _new_file_patch("b.py", "print('b')\n")
 
-    patch = runtime.execute_tool_call(_tool_call("apply_patch", {"patch": patch_text}, call_id="patch"))
-    inspect = runtime.execute_tool_call(_tool_call("inspect_diff", {"scope": "current_run"}, call_id="inspect"))
+    patch = component.execute_tool_call(_tool_call("apply_patch", {"patch": patch_text}, call_id="patch"))
+    inspect = component.execute_tool_call(_tool_call("inspect_diff", {"scope": "current_run"}, call_id="inspect"))
     before_rollback = state.get_workspace_health()
-    rollback = runtime.mutation_runtime.rollback_changeset(patch.content["changeset_id"])
+    rollback = component.mutation_manager.rollback_changeset(patch.content["changeset_id"])
     after_rollback = state.get_workspace_health()
 
     assert patch.ok is True
@@ -200,13 +200,13 @@ def test_apply_patch_conflict_and_illegal_patch_leave_workspace_unchanged(tmp_pa
     source.write_text("print('current')\n", encoding="utf-8")
     other = tmp_path / "other.py"
     other.write_text("old\n", encoding="utf-8")
-    runtime = _tool_runtime(tmp_path)
+    component = _tool_executor(tmp_path)
     stale = _patch_for("app.py", "print('old')\n", "print('new')\n")
     good = _patch_for("other.py", "old\n", "new\n")
 
-    conflict = runtime.execute_tool_call(_tool_call("apply_patch", {"patch": stale}, call_id="conflict"))
-    mixed = runtime.execute_tool_call(_tool_call("apply_patch", {"patch": good + stale}, call_id="mixed"))
-    illegal = runtime.execute_tool_call(_tool_call("apply_patch", {"patch": "not a patch"}, call_id="illegal"))
+    conflict = component.execute_tool_call(_tool_call("apply_patch", {"patch": stale}, call_id="conflict"))
+    mixed = component.execute_tool_call(_tool_call("apply_patch", {"patch": good + stale}, call_id="mixed"))
+    illegal = component.execute_tool_call(_tool_call("apply_patch", {"patch": "not a patch"}, call_id="illegal"))
 
     assert conflict.ok is False
     assert conflict.error_code in {"patch_context_not_found", "invalid_patch", "transaction_failed"}
@@ -217,18 +217,18 @@ def test_apply_patch_conflict_and_illegal_patch_leave_workspace_unchanged(tmp_pa
 
 
 def test_workspace_escape_is_rejected_and_low_level_tools_stay_hidden(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("change code")
     planner.state.status = TaskStatus.APPLYING_CHANGES
     planner.state.current_phase = "applying_changes"
-    runtime = _tool_runtime(tmp_path, planner=planner)
+    component = _tool_executor(tmp_path, planner=planner)
 
-    denied = runtime.execute_tool_call(
+    denied = component.execute_tool_call(
         _tool_call("write_file", {"path": "../outside.txt", "content": "x", "mode": "create"}, call_id="escape")
     )
     visible = {
         tool["function"]["name"]
-        for tool in planner.filtered_tools(runtime.registry.openai_tools())
+        for tool in planner.filtered_tools(component.registry.openai_tools())
     }
 
     assert denied.ok is False
@@ -238,8 +238,8 @@ def test_workspace_escape_is_rejected_and_low_level_tools_stay_hidden(tmp_path: 
 
 
 def test_checklist_schema_aliases_and_file_diff_scope(tmp_path: Path) -> None:
-    runtime = _tool_runtime(tmp_path)
-    missing_parent = runtime.execute_tool_call(
+    component = _tool_executor(tmp_path)
+    missing_parent = component.execute_tool_call(
         _tool_call(
             "write_file",
             {
@@ -250,7 +250,7 @@ def test_checklist_schema_aliases_and_file_diff_scope(tmp_path: Path) -> None:
             call_id="missing_parent",
         )
     )
-    created = runtime.execute_tool_call(
+    created = component.execute_tool_call(
         _tool_call(
             "write_file",
             {
@@ -264,14 +264,14 @@ def test_checklist_schema_aliases_and_file_diff_scope(tmp_path: Path) -> None:
     )
     before = QUICK_SORT
     after = QUICK_SORT.replace("print(\"ok\")", "print(\"schema ok\")")
-    patched = runtime.execute_tool_call(
+    patched = component.execute_tool_call(
         _tool_call(
             "apply_patch",
             {"unified_diff": _patch_for("pkg/quicksort.py", before, after), "strict": True},
             call_id="unified_diff",
         )
     )
-    inspected = runtime.execute_tool_call(
+    inspected = component.execute_tool_call(
         _tool_call(
             "inspect_diff",
             {"scope": "file", "path": "pkg/quicksort.py"},
@@ -289,21 +289,21 @@ def test_checklist_schema_aliases_and_file_diff_scope(tmp_path: Path) -> None:
 
 
 def test_facades_record_policy_trace_and_completion_evidence(tmp_path: Path) -> None:
-    trace = TraceWriter.create(tmp_path)
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1", trace=trace)
+    trace = JsonlTraceRecorder.create(tmp_path)
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1", trace=trace)
     planner.start_task("implement quicksort")
     planner.state.status = TaskStatus.APPLYING_CHANGES
     planner.state.current_phase = "applying_changes"
-    runtime = _tool_runtime(tmp_path, planner=planner, trace=trace)
+    component = _tool_executor(tmp_path, planner=planner, trace=trace)
 
-    write = runtime.execute_tool_call(
+    write = component.execute_tool_call(
         _tool_call("write_file", {"path": "quicksort.py", "content": QUICK_SORT, "mode": "create"}, call_id="write")
     )
-    inspect = runtime.execute_tool_call(_tool_call("inspect_diff", {"scope": "current_run"}, call_id="inspect"))
+    inspect = component.execute_tool_call(_tool_call("inspect_diff", {"scope": "current_run"}, call_id="inspect"))
     planner.state.status = TaskStatus.APPLYING_CHANGES
     planner.state.current_phase = "applying_changes"
     planner.plan.current_phase = "applying_changes"
-    patch = runtime.execute_tool_call(
+    patch = component.execute_tool_call(
         _tool_call(
             "apply_patch",
             {"patch": _new_file_patch("extra.py", "print('extra')\n")},
@@ -338,8 +338,8 @@ def test_deterministic_quicksort_tasks_complete_with_write_file_and_apply_patch(
         {"patch": _new_file_patch("quicksort.py", QUICK_SORT)},
     )
 
-    assert write_result.status == SingularityAgentRunStatus.COMPLETED
-    assert patch_result.status == SingularityAgentRunStatus.COMPLETED
+    assert write_result.status == AgentLoopStatus.COMPLETED
+    assert patch_result.status == AgentLoopStatus.COMPLETED
     assert write_planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "ready"
     assert patch_planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "ready"
 
@@ -355,21 +355,21 @@ class _FakeProvider:
 def _run_quicksort_agent(root: Path, mutation_tool: str, mutation_args: dict[str, Any]):
     root.mkdir(parents=True)
     (root / "README.md").write_text("task context", encoding="utf-8")
-    planner = PlannerRuntime(root, session_id="session_1", task_id="task_1")
-    policy = PolicyRuntime(
+    planner = Planner(root, session_id="session_1", task_id="task_1")
+    policy = PolicyEngine(
         PolicyConfig(
             workspace_root=root,
             approval_mode=ApprovalMode.AUTO_SAFE,
             security_mode=SecurityMode.COMPAT,
         )
     )
-    trace = TraceWriter.create(root)
+    trace = JsonlTraceRecorder.create(root)
     registry = ToolRegistry(root)
-    mutation = MutationRuntime(root, trace=trace, planner=planner, policy_runtime=policy)
+    mutation = WorkspaceMutationManager(root, trace=trace, planner=planner, policy_engine=policy)
     register_mutation_tools(registry, mutation)
-    register_edit_tools(registry, EditRuntime(root, mutation_runtime=mutation, trace=trace, planner=planner))
-    command = CommandRuntime(root, trace=trace, planner=planner, policy_runtime=policy)
-    verification = VerificationRuntime(root, command_runtime=command, trace=trace, planner=planner, policy_runtime=policy)
+    register_edit_tools(registry, EditExecutor(root, mutation_manager=mutation, trace=trace, planner=planner))
+    command = CommandExecutor(root, trace=trace, planner=planner, policy_engine=policy)
+    verification = VerificationRunner(root, command_executor=command, trace=trace, planner=planner, policy_engine=policy)
     register_verification_tools(registry, verification)
     provider = _FakeProvider(
         _tool_response("call_read_1", "read_file", {"path": "README.md"}),
@@ -393,7 +393,7 @@ def _run_quicksort_agent(root: Path, mutation_tool: str, mutation_args: dict[str
         trace=trace,
         max_turns=5,
         planner=planner,
-        policy_runtime=policy,
+        policy_engine=policy,
     )
     return agent.run("implement quicksort.py and verify it"), planner
 

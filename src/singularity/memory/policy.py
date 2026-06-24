@@ -42,7 +42,7 @@ class MemoryPolicy:
         MemoryScope.WORKSPACE,
         MemoryScope.PROJECT,
         MemoryScope.USER_PREFERENCE,
-        MemoryScope.TOOL_RUNTIME,
+        MemoryScope.TOOL_EXECUTOR,
     }
 
     def evaluate(self, candidate: MemoryCandidate) -> AdmissionDecision:

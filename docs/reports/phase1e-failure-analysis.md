@@ -15,11 +15,11 @@ Before this loop, Singularity already had useful verification failure primitives
 - `FailureParserRegistry` parsed pytest, TypeScript, ESLint, Python traceback, command, and generic failures.
 - `RepairHintGenerator` generated local hints from parsed failures.
 - `RepairLoopController` tracked repeated failure fingerprints.
-- `PlannerRuntime.replan()` could route generic verification failures to `repairing_failures`.
+- `Planner.replan()` could route generic verification failures to `repairing_failures`.
 
 The Phase 1E contract was still missing:
 
-- No `FailureAnalysisRuntime`.
+- No `FailureAnalysisPipeline`.
 - No `FailureAnalysis`, `RootCauseHypothesis`, `RepairPlan`, `RepairStep`, or `NoProgressGuard` contract surface.
 - No verification observation field for structured failure analysis.
 - No planner evidence fields for failure analysis and repair plans.
@@ -39,19 +39,19 @@ The Phase 1E contract was still missing:
 ## Changes
 
 - `src/singularity/verification/failure_analysis.py`
-  - Added Phase 1E failure analysis, repair plan, and no-progress runtime types.
-- `src/singularity/verification/runtime.py`
+  - Added Phase 1E failure analysis, repair plan, and no-progress component types.
+- `src/singularity/verification/runner.py`
   - Generates `failure_analysis` and `repair_plan` for failed checks in `run_plan()` and `rerun_check()`.
   - Binds repair plans to original `VerificationPlan` command argv.
 - `src/singularity/verification/__init__.py`
-  - Exports Phase 1E runtime and model types.
+  - Exports Phase 1E component and model types.
 - `src/singularity/planner/models.py`
   - Persists `EvidenceLedger.failure_analyses` and `EvidenceLedger.repair_plans`.
-- `src/singularity/planner/runtime.py`
+- `src/singularity/planner/engine.py`
   - Records failure analyses and repair plans from verification observations.
 - `src/singularity/planner/context.py`
   - Exposes latest failure analysis and repair plan in planner context.
-- `tests/test_failure_analysis_runtime.py`
+- `tests/test_failure_analysis_pipeline.py`
   - Adds Phase 1E coverage.
 
 ## Verification
@@ -59,7 +59,7 @@ The Phase 1E contract was still missing:
 Targeted Phase 1E validation:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_failure_analysis_runtime.py tests\test_verification_runtime.py tests\test_planner_runtime.py tests\test_agent_task_outcome.py tests\test_agent.py tests\test_task_controller.py tests\test_context_policy_planner_integration.py --basetemp work/pytest-tmp
+.\.venv\Scripts\python.exe -m pytest tests\test_failure_analysis_pipeline.py tests\test_verification_runner.py tests\test_planner.py tests\test_agent_task_outcome.py tests\test_agent.py tests\test_task_controller.py tests\test_context_policy_planner_integration.py --basetemp work/pytest-tmp
 ```
 
 Result:
@@ -97,6 +97,6 @@ Direct `git push origin main` succeeded for this phase. A follow-up `git ls-remo
 ## Risks
 
 - Repair plans are advisory and evidence-bound; they do not auto-edit code.
-- Failure type promotion from runtime smoke to unit test failure is limited to pytest commands or parsed test names.
+- Failure type promotion from component smoke to unit test failure is limited to pytest commands or parsed test names.
 - Dynamic retrieval hook is represented as structured retrieval queries; Phase 1F can consume these when rolling planning is added.
 - The existing untracked `docs/reports/codebase-fact-report.md` was left untouched and is not part of this phase.

@@ -1,15 +1,15 @@
 from pathlib import Path
 from typing import Any
 
-from singularity.agent import SingularityAgentRunStatus
+from singularity.agent_loop import AgentLoopStatus
 from singularity.model import ModelError, ModelErrorKind
-from singularity.planner import PlannerRuntime
+from singularity.planner import Planner
 from singularity.tools import ToolRegistry
 from singularity.tools.mutation import register_mutation_tools
-from singularity.trace import TraceWriter
-from singularity.workspace import MutationRuntime
-from singularity.workspace_state import LocalWorkspaceStateRuntime
-from tests.agent_runtime_helpers import make_agent_session
+from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.workspace import WorkspaceMutationManager
+from singularity.workspace_state import WorkspaceStateManager
+from tests.agent_loop_helpers import make_agent_session
 
 
 class MockProvider:
@@ -71,8 +71,8 @@ def test_agent_stops_on_non_retryable_model_network_error(tmp_path: Path) -> Non
 
     answer = agent.run("inspect the project")
 
-    assert answer.status == SingularityAgentRunStatus.BLOCKED
-    assert answer.error_code == "model_runtime_failed"
+    assert answer.status == AgentLoopStatus.BLOCKED
+    assert answer.error_code == "model_runner_failed"
     assert answer.turn == 1
     assert len(provider.calls) == 1
 
@@ -128,8 +128,8 @@ def test_agent_runs_complete_tool_call_loop(tmp_path: Path) -> None:
 def test_agent_injects_workspace_state_observation_after_tool_call(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
     readme.write_text("Singularity README content", encoding="utf-8")
-    trace = TraceWriter.create(tmp_path)
-    state = LocalWorkspaceStateRuntime(tmp_path, trace=trace)
+    trace = JsonlTraceRecorder.create(tmp_path)
+    state = WorkspaceStateManager(tmp_path, trace=trace)
     state.begin_session(task_id="task_1", session_id="session_1")
     provider = MockProvider(
         {
@@ -167,7 +167,7 @@ def test_agent_injects_workspace_state_observation_after_tool_call(tmp_path: Pat
         tmp_path,
         provider=provider,
         trace=trace,
-        state_runtime=state,
+        workspace_state_manager=state,
     )
 
     answer = agent.run("read the README")
@@ -185,10 +185,10 @@ def test_agent_injects_workspace_state_observation_after_tool_call(tmp_path: Pat
 
 
 def test_agent_filters_tools_and_injects_planner_context(tmp_path: Path) -> None:
-    trace = TraceWriter.create(tmp_path)
+    trace = JsonlTraceRecorder.create(tmp_path)
     tools = ToolRegistry(tmp_path)
-    register_mutation_tools(tools, MutationRuntime(tmp_path, trace=trace))
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1", trace=trace)
+    register_mutation_tools(tools, WorkspaceMutationManager(tmp_path, trace=trace))
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1", trace=trace)
     provider = MockProvider(
         {
             "choices": [
@@ -224,7 +224,7 @@ def test_agent_filters_tools_and_injects_planner_context(tmp_path: Path) -> None
 
 
 def test_agent_returns_planner_final_report_when_completion_evidence_exists(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     provider = MockProvider(
         {
             "choices": [
@@ -272,7 +272,7 @@ def test_agent_returns_planner_final_report_when_completion_evidence_exists(tmp_
 
 
 def test_agent_blocks_final_answer_when_completion_evidence_is_missing(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     provider = MockProvider(
         {
             "choices": [
@@ -294,6 +294,6 @@ def test_agent_blocks_final_answer_when_completion_evidence_is_missing(tmp_path:
 
     answer = agent.run("change code")
 
-    assert answer.status == SingularityAgentRunStatus.MAX_TURNS_EXCEEDED
+    assert answer.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
     assert planner.evidence.task_outcomes[-1]["error_code"] == "completion_rejected"
     assert "required_changes_applied" in planner.evidence.missing_evidence

@@ -37,7 +37,7 @@ def test_manifest_discovery_supports_both_manifest_names(tmp_path: Path) -> None
 def test_manifest_discovery_order_project_env_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project_plugin = _plugin_dir(tmp_path, "project_plugin")
     env_root = tmp_path / "env_plugins"
-    user_home = tmp_path / "runtime_home"
+    user_home = tmp_path / "user_data_home"
     env_plugin = env_root / "env_plugin"
     user_plugin = user_home / "config" / "plugins" / "user_plugin"
     _write_manifest(project_plugin, plugin_id="project_plugin")

@@ -141,7 +141,7 @@ def _freshness(payload: dict[str, Any]) -> ReviewFreshness:
 
 def _trust_level(source: str) -> ReviewTrustLevel:
     if source in {"validation", "patch_validation", "edit_result", "verification", "verification_result", "policy_observation"}:
-        return ReviewTrustLevel.TRUSTED_RUNTIME
+        return ReviewTrustLevel.TRUSTED_COMPONENT
     if source in {"code_impact", "test_impact", "project_index"}:
         return ReviewTrustLevel.WORKSPACE_DERIVED
     if source == "model_critic":

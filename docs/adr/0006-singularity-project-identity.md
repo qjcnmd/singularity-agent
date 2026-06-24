@@ -4,7 +4,7 @@ Status: Accepted
 
 ## Context
 
-The project is a local coding agent runtime with a Python CLI baseline and a future desktop architecture. The public identity, package namespace, commands, environment variables, runtime directories, and documentation should be consistent.
+The project is a local coding agent component with a Python CLI baseline and a future desktop architecture. The public identity, package namespace, commands, environment variables, user data directories, and documentation should be consistent.
 
 ## Decision
 
@@ -16,7 +16,7 @@ Names:
 - primary CLI: `singularity-agent`
 - short CLI alias: `sg`
 - environment prefix: `SINGULARITY_`
-- project runtime directory: `.singularity/`
+- project component directory: `.singularity/`
 - user configuration: `~/.config/singularity/`
 - user data: `~/.local/share/singularity/`
 - user cache: `~/.cache/singularity/`
@@ -26,6 +26,6 @@ Do not create a bare `singularity` executable because it conflicts with existing
 ## Consequences
 
 - Source imports use `singularity.*`.
-- Runtime config files use `singularity.json`.
+- Component config files use `singularity.json`.
 - Schema ids use `https://singularity.local/...`.
 - Documentation and tests use Singularity-only naming.

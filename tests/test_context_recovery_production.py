@@ -59,7 +59,7 @@ def test_recovery_detects_pending_approval_and_open_mutation(
             constraints_summary=[],
             user_decision=None,
             approval_grant_id=None,
-            runtime="policy",
+            component="policy",
             operation="write",
             resource="src/app.py",
             reference="ref_policy",

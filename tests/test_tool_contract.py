@@ -13,14 +13,14 @@ from singularity.tools import (
     ToolOutputEnvelope,
     ToolRegistry,
     ToolRetryPolicy,
-    ToolRuntime,
+    ToolExecutor,
     ToolSensitivityLevel,
     ToolSideEffectKind,
     ToolSpec,
 )
 from singularity.tools.policy import ToolPolicy
-from singularity.trace import TraceWriter
-from tests.tool_runtime_helpers import make_test_policy_runtime
+from singularity.jsonl_trace import JsonlTraceRecorder
+from tests.tool_executor_helpers import make_test_policy_engine
 
 
 class StrictInput(BaseModel):
@@ -73,15 +73,15 @@ def test_tool_spec_output_model_is_enforced(tmp_path: Path) -> None:
             handler=lambda _args: {"missing": "field"},
         )
     )
-    runtime = ToolRuntime(
+    component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.read_only(),
-        trace=TraceWriter.create(tmp_path),
+        trace=JsonlTraceRecorder.create(tmp_path),
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
-    result = runtime.execute_tool_call(make_tool_call("bad_output", {"value": "x"}))
+    result = component.execute_tool_call(make_tool_call("bad_output", {"value": "x"}))
 
     assert result.ok is False
     assert result.error_code == "output_validation_error"
@@ -97,15 +97,15 @@ def test_strict_input_validation_rejects_unknown_fields(tmp_path: Path) -> None:
             handler=lambda args: {"value": args.value},
         )
     )
-    runtime = ToolRuntime(
+    component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.read_only(),
-        trace=TraceWriter.create(tmp_path),
+        trace=JsonlTraceRecorder.create(tmp_path),
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
-    result = runtime.execute_tool_call(
+    result = component.execute_tool_call(
         make_tool_call("strict_echo", {"value": "x", "ignored": "nope"})
     )
 

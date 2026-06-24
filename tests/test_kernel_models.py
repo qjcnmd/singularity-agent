@@ -10,8 +10,8 @@ from singularity.kernel.models import (
     LifecycleEvent,
     RunIdentity,
     RunStatus,
-    RuntimeComponentName,
-    RuntimeComponentState,
+    ComponentName,
+    ComponentState,
     SessionStatus,
     ShutdownReason,
 )
@@ -26,7 +26,7 @@ def test_run_identity_creates_linked_run_session_and_task_ids() -> None:
     assert identity.to_dict()["run_id"] == identity.run_id
 
 
-def test_kernel_context_serializes_safe_runtime_state(tmp_path: Path) -> None:
+def test_kernel_context_serializes_safe_component_state(tmp_path: Path) -> None:
     identity = RunIdentity.new(run_id="run_1", session_id="session_1", task_id="task_1")
     run = AgentRun(identity=identity, user_goal="Implement kernel")
     session = AgentSession(identity=identity)
@@ -37,8 +37,8 @@ def test_kernel_context_serializes_safe_runtime_state(tmp_path: Path) -> None:
         session=session,
         status=KernelStatus.READY,
         components={
-            RuntimeComponentName.PLANNER: RuntimeComponentState.READY,
-            RuntimeComponentName.MODEL: RuntimeComponentState.INITIALIZED,
+            ComponentName.PLANNER: ComponentState.READY,
+            ComponentName.MODEL: ComponentState.INITIALIZED,
         },
         workspace_lock_status="acquired",
     )

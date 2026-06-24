@@ -1,9 +1,9 @@
 # Upgrade And Migration
 
-Singularity stores release/runtime upgrade state in:
+Singularity stores release/component upgrade state in:
 
 ```text
-state/runtime-manifest.json
+state/installation-manifest.json
 ```
 
 The manifest records:
@@ -15,7 +15,7 @@ The manifest records:
   "memory_schema_version": 1,
   "trace_schema_version": 1,
   "eval_schema_version": 1,
-  "last_migration": "001-release-runtime"
+  "last_migration": "001-installation-layout"
 }
 ```
 
@@ -53,7 +53,7 @@ Use repair for missing directories or missing default files:
 singularity-agent system repair
 ```
 
-Repair is conservative. It recreates missing runtime-owned structure and reports permission problems, but it does not silently overwrite user data.
+Repair is conservative. It recreates missing component-owned structure and reports permission problems, but it does not silently overwrite user data.
 
 ## Data Protection
 

@@ -26,7 +26,7 @@ class InstructionPriority(str, Enum):
     USER_SESSION = "user_session"
     USER_TASK = "user_task"
     PROJECT_INSTRUCTION = "project_instruction"
-    RUNTIME_OBSERVATION = "runtime_observation"
+    COMPONENT_OBSERVATION = "component_observation"
     RETRIEVED_CONTENT = "retrieved_content"
     MODEL_GENERATED = "model_generated"
 
@@ -56,7 +56,7 @@ class TrustLevel(str, Enum):
     TRUSTED_SINGULARITY = "trusted_singularity"
     TRUSTED_USER = "trusted_user"
     PROJECT_DECLARED = "project_declared"
-    RUNTIME_OBSERVATION = "runtime_observation"
+    COMPONENT_OBSERVATION = "component_observation"
     UNTRUSTED_CONTENT = "untrusted_content"
     MODEL_GENERATED = "model_generated"
 
@@ -81,17 +81,17 @@ class InstructionSourceType(str, Enum):
 
 @dataclass
 class InstructionScope(SerializableDataclass):
-    applies_to_runtime: list[str] = field(default_factory=list)
+    applies_to_component: list[str] = field(default_factory=list)
     applies_to_purpose: list[str] = field(default_factory=list)
     applies_to_paths: list[str] = field(default_factory=list)
     applies_to_tools: list[str] = field(default_factory=list)
     session_only: bool = False
     task_only: bool = False
 
-    def matches(self, *, purpose: str | None = None, runtime: str | None = None) -> bool:
+    def matches(self, *, purpose: str | None = None, component: str | None = None) -> bool:
         if purpose and self.applies_to_purpose and purpose not in self.applies_to_purpose:
             return False
-        if runtime and self.applies_to_runtime and runtime not in self.applies_to_runtime:
+        if component and self.applies_to_component and component not in self.applies_to_component:
             return False
         return True
 
@@ -222,7 +222,7 @@ class InstructionCompilerInput:
 PRIORITY_ORDER = [
     InstructionPriority.MODEL_GENERATED,
     InstructionPriority.RETRIEVED_CONTENT,
-    InstructionPriority.RUNTIME_OBSERVATION,
+    InstructionPriority.COMPONENT_OBSERVATION,
     InstructionPriority.PROJECT_INSTRUCTION,
     InstructionPriority.USER_TASK,
     InstructionPriority.USER_SESSION,
@@ -259,7 +259,7 @@ def _to_plain(value: Any) -> Any:
 def _from_payload(cls: Any, payload: dict[str, Any]) -> Any:
     if cls is InstructionScope:
         return InstructionScope(
-            applies_to_runtime=list(payload.get("applies_to_runtime") or []),
+            applies_to_component=list(payload.get("applies_to_component") or []),
             applies_to_purpose=list(payload.get("applies_to_purpose") or []),
             applies_to_paths=list(payload.get("applies_to_paths") or []),
             applies_to_tools=list(payload.get("applies_to_tools") or []),

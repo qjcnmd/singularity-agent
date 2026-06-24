@@ -1,9 +1,9 @@
 from singularity.instructions.compiler import PromptCompiler
-from singularity.instructions.config import InstructionRuntimeConfig
+from singularity.instructions.prompt_config import PromptAssemblyConfig
 from singularity.instructions.exceptions import (
     InstructionConflictError,
     InstructionHierarchyError,
-    InstructionRuntimeError,
+    PromptAssemblyError,
     InstructionSourceError,
     PromptBudgetExceeded,
     PromptCompilationError,
@@ -29,7 +29,7 @@ from singularity.instructions.models import (
 )
 from singularity.instructions.project import ProjectInstructionLoader
 from singularity.instructions.resolver import InstructionResolver
-from singularity.instructions.runtime import InstructionRuntime
+from singularity.instructions.prompt_assembly import PromptAssemblyPipeline
 from singularity.instructions.sources import InstructionSourceCollector
 
 __all__ = [
@@ -42,9 +42,9 @@ __all__ = [
     "InstructionHierarchyError",
     "InstructionPriority",
     "InstructionResolver",
-    "InstructionRuntime",
-    "InstructionRuntimeConfig",
-    "InstructionRuntimeError",
+    "PromptAssemblyPipeline",
+    "PromptAssemblyConfig",
+    "PromptAssemblyError",
     "InstructionScope",
     "InstructionSource",
     "InstructionSourceCollector",

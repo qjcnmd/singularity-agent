@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 
 from singularity.diagnostics import DoctorEngine, RepairEngine
-from singularity.release.init import initialize_runtime
+from singularity.release.init import initialize_user_data
 from singularity.release.models import atomic_write_json
-from singularity.release.paths import resolve_runtime_paths
+from singularity.release.paths import resolve_user_data_paths
 
 
-def test_repair_dry_run_does_not_create_runtime_files(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
+def test_repair_dry_run_does_not_create_user_data_files(tmp_path):
+    paths = resolve_user_data_paths(home=tmp_path / "component")
     result = DoctorEngine.default().run(paths=paths, project_root=tmp_path)
 
     plan = RepairEngine().run(result, paths=paths, project_root=tmp_path, apply=False)
@@ -22,7 +22,7 @@ def test_repair_dry_run_does_not_create_runtime_files(tmp_path):
 
 
 def test_repair_apply_creates_missing_dirs_and_audit_log(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
+    paths = resolve_user_data_paths(home=tmp_path / "component")
     result = DoctorEngine.default().run(paths=paths, project_root=tmp_path, group="filesystem")
 
     plan = RepairEngine().run(result, paths=paths, project_root=tmp_path, apply=True)
@@ -32,12 +32,12 @@ def test_repair_apply_creates_missing_dirs_and_audit_log(tmp_path):
     assert paths.logs_dir.exists()
     assert plan.audit_log_path == str(paths.logs_dir / "repair-audit.jsonl")
     audit = paths.logs_dir.joinpath("repair-audit.jsonl").read_text(encoding="utf-8")
-    assert "filesystem.runtime_dirs" in audit
+    assert "filesystem.user_data_dirs" in audit
 
 
 def test_unfiltered_repair_apply_does_not_create_workspace_suggestions(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
-    initialize_runtime(paths)
+    paths = resolve_user_data_paths(home=tmp_path / "component")
+    initialize_user_data(paths)
     workspace_state = tmp_path / ".singularity"
 
     result = DoctorEngine.default().run(paths=paths, project_root=tmp_path)
@@ -53,23 +53,23 @@ def test_unfiltered_repair_apply_does_not_create_workspace_suggestions(tmp_path)
 
 
 def test_repair_apply_fills_missing_config_fields_without_overwriting_custom(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
-    initialize_runtime(paths)
-    atomic_write_json(paths.config_file, {"schema_version": 1, "runtime": {"mode": "custom"}})
+    paths = resolve_user_data_paths(home=tmp_path / "component")
+    initialize_user_data(paths)
+    atomic_write_json(paths.config_file, {"schema_version": 1, "component": {"mode": "custom"}})
     result = DoctorEngine.default().run(paths=paths, project_root=tmp_path, check_id="config.file")
 
     plan = RepairEngine().run(result, paths=paths, project_root=tmp_path, apply=True)
     config = json.loads(paths.config_file.read_text(encoding="utf-8"))
 
     assert plan.applied is True
-    assert config["runtime"]["mode"] == "custom"
+    assert config["component"]["mode"] == "custom"
     assert config["policy"]["approval_mode"] == "auto_safe"
     assert config["provider"]["api_key_env"] == "SINGULARITY_API_KEY"
 
 
 def test_repair_apply_rebuilds_missing_trace_index(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
-    initialize_runtime(paths)
+    paths = resolve_user_data_paths(home=tmp_path / "component")
+    initialize_user_data(paths)
     run_dir = paths.traces_dir / "run_1"
     run_dir.mkdir(parents=True)
     (run_dir / "events.jsonl").write_text("", encoding="utf-8")
@@ -81,8 +81,8 @@ def test_repair_apply_rebuilds_missing_trace_index(tmp_path):
 
 
 def test_repair_does_not_delete_broken_user_data(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
-    initialize_runtime(paths)
+    paths = resolve_user_data_paths(home=tmp_path / "component")
+    initialize_user_data(paths)
     broken_memory = tmp_path / ".singularity" / "memory" / "auto" / "entries.jsonl"
     broken_trace = paths.traces_dir / "run_1" / "events.jsonl"
     broken_eval = paths.eval_dir / "report.json"

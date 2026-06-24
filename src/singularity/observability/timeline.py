@@ -35,7 +35,7 @@ class TraceTimelineBuilder:
                     timestamp=event.timestamp,
                     event_id=event.event_id,
                     event_type=event.event_type.value,
-                    runtime=event.runtime,
+                    component=event.component,
                     summary=event.summary,
                     severity=event.severity.value,
                     related_ids=_related_ids(event),

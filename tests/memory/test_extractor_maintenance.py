@@ -44,7 +44,7 @@ def test_extractor_handles_trace_final_report_review_verification_and_rollback()
         {
             "user_goal": "Implement memory",
             "verification_summary": {"status": "ready", "passed_checks": ["pytest"]},
-            "files_changed": ["src/singularity/memory/runtime.py"],
+            "files_changed": ["src/singularity/memory/pipeline.py"],
         }
     )
     review_candidates = extractor.from_review_report(

@@ -14,7 +14,7 @@ from singularity.tools.models import (
     ToolExecutionFailure,
     ToolSpec,
 )
-from singularity.workspace import CreateFile, DeleteFile, MoveFile, MutationRuntime, ReplaceText
+from singularity.workspace import CreateFile, DeleteFile, MoveFile, WorkspaceMutationManager, ReplaceText
 
 
 class ReplaceTextInput(BaseModel):
@@ -60,8 +60,8 @@ class MoveFileInput(BaseModel):
 
 
 class MutationToolHandlers:
-    def __init__(self, runtime: MutationRuntime) -> None:
-        self.runtime = runtime
+    def __init__(self, mutation_manager: WorkspaceMutationManager) -> None:
+        self.component = mutation_manager
 
     def replace_text(self, args: ReplaceTextInput) -> dict[str, Any]:
         result = self._run(
@@ -115,13 +115,13 @@ class MutationToolHandlers:
 
     def _run(self, operations: list[Any], *, intent: str, dry_run: bool) -> Any:
         result = (
-            self.runtime.preview_operations(
+            self.component.preview_operations(
                 operations,
                 intent=intent,
                 created_by="tool:workspace_mutation",
             )
             if dry_run
-            else self.runtime.apply_operations(
+            else self.component.apply_operations(
                 operations,
                 intent=intent,
                 created_by="tool:workspace_mutation",
@@ -138,10 +138,10 @@ class MutationToolHandlers:
 
 def register_mutation_tools(
     registry: Any,
-    runtime: MutationRuntime | None = None,
+    mutation_manager: WorkspaceMutationManager | None = None,
 ) -> None:
-    mutation_runtime = runtime or MutationRuntime(Path(registry.project_root))
-    handlers = MutationToolHandlers(mutation_runtime)
+    mutation_manager = mutation_manager or WorkspaceMutationManager(Path(registry.project_root))
+    handlers = MutationToolHandlers(mutation_manager)
     registry.register(
         ToolSpec(
             name="workspace_replace_text",
@@ -160,20 +160,20 @@ def register_mutation_tools(
             ],
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_MANAGER,
             risk_tags=("write", "filesystem", "mutation"),
             timeout_seconds=10.0,
             max_output_chars=12000,
             cacheable=False,
             idempotent=False,
-            uses_mutation_runtime=True,
+            uses_mutation_manager=True,
         )
     )
     registry.register(
         ToolSpec(
             name="workspace_create_file",
             version="0.0.6",
-            description="Create a workspace file via Workspace Mutation Runtime.",
+            description="Create a workspace file via WorkspaceMutationManager.",
             input_model=CreateFileInput,
             handler=handlers.create_file,
             permission_level=PermissionLevel.WRITE,
@@ -184,20 +184,20 @@ def register_mutation_tools(
             ],
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_MANAGER,
             risk_tags=("write", "filesystem", "mutation", "create"),
             timeout_seconds=10.0,
             max_output_chars=12000,
             cacheable=False,
             idempotent=False,
-            uses_mutation_runtime=True,
+            uses_mutation_manager=True,
         )
     )
     registry.register(
         ToolSpec(
             name="workspace_delete_file",
             version="0.0.6",
-            description="Delete a workspace file via Workspace Mutation Runtime.",
+            description="Delete a workspace file via WorkspaceMutationManager.",
             input_model=DeleteFileInput,
             handler=handlers.delete_file,
             permission_level=PermissionLevel.WRITE,
@@ -208,20 +208,20 @@ def register_mutation_tools(
             ],
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_MANAGER,
             risk_tags=("write", "filesystem", "mutation", "delete"),
             timeout_seconds=10.0,
             max_output_chars=12000,
             cacheable=False,
             idempotent=False,
-            uses_mutation_runtime=True,
+            uses_mutation_manager=True,
         )
     )
     registry.register(
         ToolSpec(
             name="workspace_move_file",
             version="0.0.6",
-            description="Move a workspace file via Workspace Mutation Runtime.",
+            description="Move a workspace file via WorkspaceMutationManager.",
             input_model=MoveFileInput,
             handler=handlers.move_file,
             permission_level=PermissionLevel.WRITE,
@@ -233,12 +233,12 @@ def register_mutation_tools(
             ],
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_MANAGER,
             risk_tags=("write", "filesystem", "mutation", "move"),
             timeout_seconds=10.0,
             max_output_chars=12000,
             cacheable=False,
             idempotent=False,
-            uses_mutation_runtime=True,
+            uses_mutation_manager=True,
         )
     )

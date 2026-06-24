@@ -1,7 +1,7 @@
 from singularity.policy.approval import ApprovalGate
 from singularity.policy.audit import PolicyAuditWriter
 from singularity.policy.config import ApprovalMode, PolicyConfig, SecurityMode
-from singularity.policy.engine import PolicyRuntime
+from singularity.policy.engine import PolicyEngine
 from singularity.policy.exceptions import (
     ApprovalDenied,
     ApprovalRequired,
@@ -26,10 +26,10 @@ from singularity.policy.models import (
     ResourceRef,
     RiskLevel,
     RiskTag,
-    RuntimeName,
+    PolicyComponent,
 )
 from singularity.policy.risk import RiskAssessment, RiskClassifier
-from singularity.policy.remote import RemoteApprovalExport, RemoteApprovalRuntime
+from singularity.policy.remote import RemoteApprovalExport, RemoteApprovalExchange
 
 __all__ = [
     "ApprovalDenied",
@@ -52,16 +52,16 @@ __all__ = [
     "PolicyError",
     "PolicyEscalationRequired",
     "PolicyRequest",
-    "PolicyRuntime",
+    "PolicyEngine",
     "PolicySubject",
     "ResourceRef",
     "RiskAssessment",
     "RiskClassifier",
     "RiskLevel",
     "RiskTag",
-    "RuntimeName",
+    "PolicyComponent",
     "RemoteApprovalExport",
-    "RemoteApprovalRuntime",
+    "RemoteApprovalExchange",
     "SandboxRequired",
     "SecurityMode",
 ]

@@ -3,14 +3,14 @@ from __future__ import annotations
 import pytest
 
 from singularity.observability.models import TraceStatus
-from singularity.observability.runtime import TraceRuntime
+from singularity.observability.recorder import TraceRecorder
 
 
 def test_span_manager_start_end_and_context_manager_success(tmp_path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
 
-    with trace.span("outer", runtime="planner", ids={"task_id": "task_1"}) as outer:
-        with trace.span("inner", runtime="command", ids={"task_id": "task_1"}) as inner:
+    with trace.span("outer", component="planner", ids={"task_id": "task_1"}) as outer:
+        with trace.span("inner", component="command", ids={"task_id": "task_1"}) as inner:
             assert inner.parent_span_id == outer.span_id
 
     spans = trace.store.latest_spans()
@@ -21,10 +21,10 @@ def test_span_manager_start_end_and_context_manager_success(tmp_path) -> None:
 
 
 def test_span_manager_context_manager_records_failed_status(tmp_path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
 
     with pytest.raises(ValueError):
-        with trace.span("broken", runtime="tool", ids={"task_id": "task_1"}):
+        with trace.span("broken", component="tool", ids={"task_id": "task_1"}):
             raise ValueError("boom")
 
     span = next(iter(trace.store.latest_spans().values()))

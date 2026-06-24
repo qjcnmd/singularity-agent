@@ -1,46 +1,46 @@
 from __future__ import annotations
 
 from singularity.observability.models import TraceEventType, TraceSeverity
-from singularity.observability.runtime import TraceRuntime
+from singularity.observability.recorder import TraceRecorder
 
 
-def test_timeline_and_summary_correlate_runtime_events(tmp_path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+def test_timeline_and_summary_correlate_interaction_events(tmp_path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
     trace.emit(
         TraceEventType.ACTION_STARTED,
-        runtime="planner",
+        component="planner",
         summary="Run tests",
         ids={"task_id": "task_1", "action_id": "action_1"},
     )
     trace.emit(
         TraceEventType.POLICY_BLOCKED,
-        runtime="policy",
+        component="policy",
         summary="Package install blocked",
         ids={"task_id": "task_1", "policy_decision_id": "decision_1"},
         severity=TraceSeverity.WARNING,
     )
     trace.emit(
         TraceEventType.APPROVAL_GRANTED,
-        runtime="approval",
+        component="approval",
         summary="User approved once",
         ids={"task_id": "task_1", "approval_grant_id": "grant_1"},
     )
     trace.emit(
         TraceEventType.COMMAND_COMPLETED,
-        runtime="command",
+        component="command",
         summary="pytest passed",
         ids={"task_id": "task_1", "command_id": "cmd_1", "sandbox_id": "sandbox_1"},
         payload={"exit_code": 0},
     )
     trace.emit(
         TraceEventType.VERIFICATION_CHECK_COMPLETED,
-        runtime="verification",
+        component="verification",
         summary="unit tests passed",
         ids={"task_id": "task_1", "verification_id": "check_1"},
     )
     trace.emit(
         TraceEventType.PLANNER_REPLAN_TRIGGERED,
-        runtime="planner",
+        component="planner",
         summary="Replanned after failure",
         ids={"task_id": "task_1"},
     )
@@ -67,7 +67,7 @@ def test_timeline_and_summary_correlate_runtime_events(tmp_path) -> None:
 
 
 def test_final_report_and_context_summary_are_redacted(tmp_path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
     artifact = trace.write_artifact(
         kind="stderr",
         text="failure OPENAI_API_KEY=sk-secret",
@@ -76,7 +76,7 @@ def test_final_report_and_context_summary_are_redacted(tmp_path) -> None:
     )
     trace.emit(
         TraceEventType.COMMAND_FAILED,
-        runtime="command",
+        component="command",
         summary="pytest failed",
         ids={"task_id": "task_1", "command_id": "cmd_1"},
         payload={"stderr": "OPENAI_API_KEY=sk-secret"},
@@ -96,10 +96,10 @@ def test_final_report_and_context_summary_are_redacted(tmp_path) -> None:
 
 
 def test_model_usage_summary_handles_redacted_legacy_token_counts(tmp_path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
     trace.emit(
         TraceEventType.MODEL_RESPONSE_RECEIVED,
-        runtime="model",
+        component="model",
         summary="model response",
         ids={"task_id": "task_1"},
         payload={
@@ -120,10 +120,10 @@ def test_model_usage_summary_handles_redacted_legacy_token_counts(tmp_path) -> N
 
 
 def test_model_usage_summary_reports_request_and_run_cache_hit_rates(tmp_path) -> None:
-    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
     trace.emit(
         TraceEventType.MODEL_RESPONSE_RECEIVED,
-        runtime="model",
+        component="model",
         summary="first response",
         ids={"task_id": "task_1"},
         payload={
@@ -136,7 +136,7 @@ def test_model_usage_summary_reports_request_and_run_cache_hit_rates(tmp_path) -
     )
     trace.emit(
         TraceEventType.MODEL_RESPONSE_RECEIVED,
-        runtime="model",
+        component="model",
         summary="second response",
         ids={"task_id": "task_1"},
         payload={

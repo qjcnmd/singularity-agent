@@ -22,7 +22,7 @@ from singularity.command.models import (
     SemanticStatus,
 )
 from singularity.command.policy import CommandPolicy
-from singularity.command.runtime import CommandRuntime
+from singularity.command.executor import CommandExecutor
 
 __all__ = [
     "CommandDecision",
@@ -34,7 +34,7 @@ __all__ = [
     "CommandRequest",
     "CommandResult",
     "CommandRisk",
-    "CommandRuntime",
+    "CommandExecutor",
     "ExecutionBackend",
     "ExecutionStatus",
     "FilesystemMode",

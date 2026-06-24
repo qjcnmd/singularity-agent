@@ -1,10 +1,10 @@
-# Phase 1G Resolution Report: Final Review Gate / FinalReportRuntime
+# Phase 1G Resolution Report: Final Review Gate / FinalReportRenderer
 
 Date: 2026-06-22
 
 ## Scope
 
-Phase 1G completes the finalization loop for the current Python CLI runtime.
+Phase 1G completes the finalization loop for the current Python CLI component.
 
 This phase did not modify Rust, Desktop, Tauri, MCP, multi-agent, plugin marketplace, or Future items.
 
@@ -12,13 +12,13 @@ This phase did not modify Rust, Desktop, Tauri, MCP, multi-agent, plugin marketp
 
 Before this loop, Singularity already had:
 
-- `ReviewRuntime.final_review()`.
+- `ReviewPipeline.final_review()`.
 - A structured planner `FinalReport`.
 - Review observations in the planner evidence ledger.
 
 The Phase 1G contract was still partial:
 
-- `ReviewRuntime.final_review()` existed but was not forced in the completion path.
+- `ReviewPipeline.final_review()` existed but was not forced in the completion path.
 - A task could complete without a final review accept decision.
 - Review decisions had action values but not the roadmap route names.
 - Planner final reports were persisted as JSON only.
@@ -27,11 +27,11 @@ The Phase 1G contract was still partial:
 ## Plan
 
 1. Add final review route names to existing review decisions.
-2. Run final review inside `PlannerRuntime.finalize()`.
+2. Run final review inside `Planner.finalize()`.
 3. Require final review approval before `COMPLETED`.
-4. Add the smallest `FinalReportRuntime` that validates the existing report schema and writes markdown.
+4. Add the smallest `FinalReportRenderer` that validates the existing report schema and writes markdown.
 5. Record the markdown artifact path in planner events and trace.
-6. Wire the production `ReviewRuntime` back into `PlannerRuntime`.
+6. Wire the production `ReviewPipeline` back into `Planner`.
 7. Add regression tests for final review rejection and markdown artifact generation.
 
 ## Changes
@@ -40,28 +40,28 @@ The Phase 1G contract was still partial:
   - Adds the roadmap route field on `ReviewDecision`.
 - `src/singularity/planner/finalizer.py`
   - Requires final review acceptance for completed status.
-  - Adds `FinalReportRuntime` markdown rendering and schema validation.
-- `src/singularity/planner/runtime.py`
+  - Adds `FinalReportRenderer` markdown rendering and schema validation.
+- `src/singularity/planner/engine.py`
   - Runs final review before final report generation.
   - Writes `final_report.md`.
   - Records the artifact path in trace and planner events.
 - `src/singularity/kernel/graph.py`
-  - Wires the shared production `ReviewRuntime` into `PlannerRuntime`.
+  - Wires the shared production `ReviewPipeline` into `Planner`.
 - `docs/phase1g_final_review_report.md`
   - Documents implemented Phase 1G behavior.
-- `docs/architecture/planner-task-execution-runtime.md`
+- `docs/architecture/planning-and-run-control.md`
   - Updates finalization and persistence status.
-- `tests/test_planner_runtime.py`
+- `tests/test_planner.py`
   - Adds final review rejection and markdown report coverage.
-- `tests/test_runtime_graph.py`
-  - Verifies runtime graph wiring.
+- `tests/test_agent_graph.py`
+  - Verifies agent graph wiring.
 
 ## Verification
 
 Targeted Phase 1G validation:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_planner_runtime.py tests\test_agent.py tests\test_agent_task_outcome.py tests\review tests\test_runtime_graph.py tests\test_verification_runtime.py --basetemp work/pytest-tmp
+.\.venv\Scripts\python.exe -m pytest tests\test_planner.py tests\test_agent.py tests\test_agent_task_outcome.py tests\review tests\test_agent_graph.py tests\test_verification_runner.py --basetemp work/pytest-tmp
 ```
 
 Result:
@@ -100,7 +100,7 @@ origin/main...HEAD = 0 0
 
 ## Risks
 
-- `FinalReportRuntime` intentionally reuses the existing planner `FinalReport` structure instead of creating a parallel report schema.
+- `FinalReportRenderer` intentionally reuses the existing planner `FinalReport` structure instead of creating a parallel report schema.
 - Markdown rendering is deterministic and local. It does not add a model reporting step.
-- Review model critic behavior is unchanged; the planner-created fallback review runtime disables model critic when no shared runtime is wired.
+- Review model critic behavior is unchanged; the planner-created fallback review component disables model critic when no shared component is wired.
 - The existing untracked `docs/reports/codebase-fact-report.md` was left untouched and is not part of this phase.

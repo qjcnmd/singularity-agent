@@ -19,11 +19,11 @@ from singularity.memory.models import (
     TTL,
 )
 from singularity.memory.policy import AdmissionAction, AdmissionDecision, MemoryPolicy
-from singularity.memory.retrieval import MemoryRetrieval
+from singularity.memory.retrieval import MemoryRetriever
 from singularity.memory.rules import PathScopedRule
-from singularity.memory.runtime import MemoryRuntime
+from singularity.memory.pipeline import MemoryLearningPipeline
 from singularity.memory.store import MemoryStore
-from singularity.memory.sync import MemorySyncExport, MemorySyncImport, MemorySyncRuntime
+from singularity.memory.sync import MemorySyncExport, MemorySyncImport, MemoryBundleSync
 
 __all__ = [
     "AdmissionAction",
@@ -40,8 +40,8 @@ __all__ = [
     "MemoryMaintenance",
     "MemoryPolicy",
     "MemoryQuery",
-    "MemoryRetrieval",
-    "MemoryRuntime",
+    "MemoryRetriever",
+    "MemoryLearningPipeline",
     "MemoryScope",
     "MemorySearchResult",
     "MemorySource",
@@ -49,7 +49,7 @@ __all__ = [
     "MemoryStore",
     "MemorySyncExport",
     "MemorySyncImport",
-    "MemorySyncRuntime",
+    "MemoryBundleSync",
     "MemoryType",
     "PathScopedRule",
     "Provenance",

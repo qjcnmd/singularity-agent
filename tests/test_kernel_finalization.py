@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from singularity.config import ProductionRuntimeConfig
-from singularity.agent import SingularityAgentRunResult, SingularityAgentRunStatus
+from singularity.config import ProductionConfig
+from singularity.agent_loop import AgentLoopResult, AgentLoopStatus
 from singularity.kernel import CancellationError
 from singularity.kernel.cancellation import CancellationManager
 from singularity.kernel.finalization import KernelFinalizer
@@ -19,7 +19,7 @@ from singularity.kernel.models import (
     RunStatus,
     ShutdownReason,
 )
-from singularity.kernel.runtime import AgentKernel
+from singularity.kernel.agent_kernel import AgentKernel
 from singularity.kernel.shutdown import ShutdownSummary
 from singularity.workspace_state import WorkspaceHealthReport, WorkspaceHealthStatus
 
@@ -39,7 +39,7 @@ def test_kernel_finalizer_builds_safe_final_report(tmp_path) -> None:
     report = finalizer.finalize(
         context=context,
         planner_report={"status": "completed", "api_key": "secret-value"},
-        runtime_health_summary={"planner": "ok"},
+        component_health_summary={"planner": "ok"},
         shutdown_summary=ShutdownSummary(ShutdownReason.NORMAL, "completed", []),
         recovery_summary={"recovered": False},
         lifecycle_summary={"events": 3},
@@ -50,7 +50,7 @@ def test_kernel_finalizer_builds_safe_final_report(tmp_path) -> None:
     assert payload["session_id"] == "session_1"
     assert payload["task_id"] == "task_1"
     assert payload["kernel_status"] == "finalized"
-    assert payload["runtime_health_summary"] == {"planner": "ok"}
+    assert payload["component_health_summary"] == {"planner": "ok"}
     assert payload["shutdown_summary"]["cleanup_status"] == "completed"
     assert payload["diagnostics_count"] == 1
     assert "secret-value" not in str(payload)
@@ -77,7 +77,7 @@ def test_agent_kernel_finalizes_failed_run_before_reraising(
     def fail_run(*args, **kwargs):
         raise RuntimeError("planner failed")
 
-    monkeypatch.setattr("singularity.kernel.runtime.SingularityAgent.run", fail_run)
+    monkeypatch.setattr("singularity.kernel.agent_kernel.AgentLoop.run", fail_run)
 
     with pytest.raises(RuntimeError, match="planner failed"):
         kernel.run_task("Build kernel")
@@ -96,14 +96,14 @@ def test_agent_kernel_maps_blocked_agent_result_to_failed_run(
     kernel, _trace = _build_kernel(tmp_path)
 
     def blocked_run(*args, **kwargs):
-        return SingularityAgentRunResult(
-            status=SingularityAgentRunStatus.BLOCKED,
+        return AgentLoopResult(
+            status=AgentLoopStatus.BLOCKED,
             final_answer="Planner blocked finalization",
             turn=1,
             error_code="completion_blocked",
         )
 
-    monkeypatch.setattr("singularity.kernel.runtime.SingularityAgent.run", blocked_run)
+    monkeypatch.setattr("singularity.kernel.agent_kernel.AgentLoop.run", blocked_run)
 
     result = kernel.run_task("Build kernel")
 
@@ -119,14 +119,14 @@ def test_agent_kernel_maps_max_turns_to_failed_run(
     kernel, _trace = _build_kernel(tmp_path)
 
     def max_turns_run(*args, **kwargs):
-        return SingularityAgentRunResult(
-            status=SingularityAgentRunStatus.MAX_TURNS_EXCEEDED,
+        return AgentLoopResult(
+            status=AgentLoopStatus.MAX_TURNS_EXCEEDED,
             final_answer="Stopped after max_turns=1",
             turn=1,
             error_code="max_turns_exceeded",
         )
 
-    monkeypatch.setattr("singularity.kernel.runtime.SingularityAgent.run", max_turns_run)
+    monkeypatch.setattr("singularity.kernel.agent_kernel.AgentLoop.run", max_turns_run)
 
     result = kernel.run_task("Build kernel")
 
@@ -147,23 +147,23 @@ def test_agent_kernel_shutdown_writes_final_report_during_shutdown_step(tmp_path
     assert kernel.workspace_lock.released is True
 
 
-def test_agent_kernel_shutdown_rejects_late_runtime_actions(tmp_path: Path) -> None:
+def test_agent_kernel_shutdown_rejects_late_component_actions(tmp_path: Path) -> None:
     kernel, _trace = _build_kernel(tmp_path)
 
     kernel.shutdown(ShutdownReason.ERROR)
 
-    for runtime in (
+    for component in (
         kernel.graph.planner,
-        kernel.graph.model_runtime,
-        kernel.graph.command_runtime,
-        kernel.graph.sandbox_runtime,
-        kernel.graph.verification_runtime,
+        kernel.graph.model_runner,
+        kernel.graph.command_executor,
+        kernel.graph.sandbox_manager,
+        kernel.graph.verification_runner,
     ):
         with pytest.raises(CancellationError):
-            runtime.cancellation_token.throw_if_cancelled()
+            component.cancellation_token.throw_if_cancelled()
 
 
-def test_agent_kernel_close_resources_closes_stateful_runtimes(tmp_path: Path) -> None:
+def test_agent_kernel_close_resources_closes_stateful_components(tmp_path: Path) -> None:
     kernel, _trace = _build_kernel(tmp_path)
 
     kernel.shutdown(ShutdownReason.NORMAL)
@@ -172,7 +172,7 @@ def test_agent_kernel_close_resources_closes_stateful_runtimes(tmp_path: Path) -
     assert kernel.graph.workspace_state.closed is True
     assert kernel.graph.workspace_state.closed_session_status == "closed"
     assert kernel.graph.context_manager.closed is True
-    assert kernel.graph.protocol_runtime.closed is True
+    assert kernel.graph.tool_protocol.closed is True
 
 
 class _Trace:
@@ -216,11 +216,11 @@ class _Planner:
         self.interrupt_reason = reason
 
 
-class _Runtime:
+class _Component:
     pass
 
 
-class _ClosableRuntime:
+class _ClosableComponent:
     def __init__(self) -> None:
         self.closed = False
 
@@ -230,39 +230,39 @@ class _ClosableRuntime:
 
 class _Graph:
     def __init__(self, tmp_path: Path, trace: _Trace) -> None:
-        self.config = ProductionRuntimeConfig.from_cli(project_root=tmp_path, dry_run=True)
+        self.config = ProductionConfig.from_cli(project_root=tmp_path, dry_run=True)
         self.trace = trace
         self.workspace_state = _WorkspaceState()
         self.planner = _Planner()
-        self.model_runtime = _Runtime()
-        self.command_runtime = _Runtime()
-        self.sandbox_runtime = _Runtime()
-        self.verification_runtime = _Runtime()
-        self.review_runtime = _Runtime()
-        self.mutation_runtime = _Runtime()
-        self.tools = _Runtime()
-        self.policy_runtime = _Runtime()
-        self.tool_runtime = _Runtime()
-        self.protocol_runtime = _ClosableRuntime()
-        self.instruction_runtime = _Runtime()
-        self.context_manager = _ClosableRuntime()
+        self.model_runner = _Component()
+        self.command_executor = _Component()
+        self.sandbox_manager = _Component()
+        self.verification_runner = _Component()
+        self.review_pipeline = _Component()
+        self.mutation_manager = _Component()
+        self.tools = _Component()
+        self.policy_engine = _Component()
+        self.tool_executor = _Component()
+        self.tool_protocol = _ClosableComponent()
+        self.prompt_assembly = _Component()
+        self.context_manager = _ClosableComponent()
 
     def cancellation_targets(self) -> list[tuple[str, object]]:
         return [
             ("planner", self.planner),
-            ("model_runtime", self.model_runtime),
-            ("command_runtime", self.command_runtime),
-            ("sandbox_runtime", self.sandbox_runtime),
-            ("verification_runtime", self.verification_runtime),
-            ("review_runtime", self.review_runtime),
-            ("tool_runtime", self.tool_runtime),
-            ("protocol_runtime", self.protocol_runtime),
+            ("model_runner", self.model_runner),
+            ("command_executor", self.command_executor),
+            ("sandbox_manager", self.sandbox_manager),
+            ("verification_runner", self.verification_runner),
+            ("review_pipeline", self.review_pipeline),
+            ("tool_executor", self.tool_executor),
+            ("tool_protocol", self.tool_protocol),
             ("context_manager", self.context_manager),
         ]
 
     def install_cancellation_tokens(self, token_factory) -> None:
-        for _name, runtime in self.cancellation_targets():
-            setattr(runtime, "cancellation_token", token_factory())
+        for _name, component in self.cancellation_targets():
+            setattr(component, "cancellation_token", token_factory())
 
 
 class _Lock:

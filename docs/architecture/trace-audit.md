@@ -10,9 +10,9 @@ Current durable objects:
 - `TraceSpan`
 - `TraceArtifact`
 - policy audit entries
-- legacy `TraceWriter` events for compatibility paths
+- legacy `JsonlTraceRecorder` events for compatibility paths
 
-Every event should include identity ids, runtime name, event type, timestamp, severity, summary, payload hash when available, redaction flag, and related artifact refs.
+Every event should include identity ids, component name, event type, timestamp, severity, summary, payload hash when available, redaction flag, and related artifact refs.
 
 ## Spans
 
@@ -70,7 +70,7 @@ Rules:
 - do not include secret values in policy audit
 - do not store secret values in memory entries
 
-If a runtime needs to mention a secret, it should use a class name such as `api_key`, a digest, or a redacted placeholder.
+If a component needs to mention a secret, it should use a class name such as `api_key`, a digest, or a redacted placeholder.
 
 ## Audit Boundaries
 
@@ -92,7 +92,7 @@ Tool audit:
 
 ## Desktop Rendering
 
-Desktop should render trace through RuntimeHost event/state APIs:
+Desktop should render trace through AgentHost event/state APIs:
 
 - timeline from events and spans
 - artifacts by artifact ref

@@ -11,7 +11,7 @@ from singularity.context.models import (
 from singularity.context.tokens import TokenCounter
 
 
-def test_context_manager_records_structured_runtime_observations(
+def test_context_manager_records_structured_component_observations(
     tmp_path: Path,
 ) -> None:
     context = ContextManager(
@@ -45,7 +45,7 @@ def test_context_manager_records_structured_runtime_observations(
             constraints_summary=["no git mutation"],
             user_decision=None,
             approval_grant_id=None,
-            runtime="policy",
+            component="policy",
             operation="git push",
             resource="repo",
             reference="ref_policy",

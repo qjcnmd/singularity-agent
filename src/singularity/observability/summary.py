@@ -47,7 +47,7 @@ class TraceSummaryBuilder:
                 "event_id": event.event_id,
                 "event_type": event.event_type.value,
                 "summary": event.summary,
-                "runtime": event.runtime,
+                "component": event.component,
             }
             for event in selected_events
             if event.severity in {TraceSeverity.ERROR, TraceSeverity.CRITICAL}

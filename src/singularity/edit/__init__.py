@@ -13,7 +13,7 @@ from singularity.edit.models import (
     PatchCandidate,
     PatchValidationResult,
 )
-from singularity.edit.runtime import EditRuntime
+from singularity.edit.executor import EditExecutor
 
 __all__ = [
     "EditFailureCategory",
@@ -25,7 +25,7 @@ __all__ = [
     "EditPlan",
     "EditRepairAttempt",
     "EditResult",
-    "EditRuntime",
+    "EditExecutor",
     "EditScope",
     "EditStrategyKind",
     "PatchCandidate",

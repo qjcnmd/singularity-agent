@@ -17,17 +17,17 @@ Resolved the P0 blockers from the remaining roadmap:
   - Expanded `final_report.md` sections to include objective, outcome, implementation, verification evidence, results, final review, risks, and evidence appendix.
 - `README.md`
   - Documented `--project-root` and the optional live quicksort benchmark.
-- `docs/evaluation-runtime.md`
+- `docs/evaluation-harness.md`
   - Documented that `eval live quicksort` can make live model calls, unlike deterministic trace replay.
 - `tests/test_cli.py`
   - Added coverage for explicit project roots and the live benchmark wrapper with a fake kernel plus independent smoke check.
-- `tests/test_planner_runtime.py`
+- `tests/test_planner.py`
   - Added report-section assertions for the expanded Markdown.
 
 ## Verification
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_cli.py tests\test_planner_runtime.py tests\evaluation\test_models_store.py tests\evaluation\test_scoring_replay_runtime.py --basetemp work\pytest-tmp-p0
+.\.venv\Scripts\python.exe -m pytest tests\test_cli.py tests\test_planner.py tests\evaluation\test_models_store.py tests\evaluation\test_scoring_replay_harness.py --basetemp work\pytest-tmp-p0
 ```
 
 Result:

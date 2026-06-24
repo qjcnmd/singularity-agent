@@ -14,10 +14,10 @@ from singularity.workspace_state.models import (
     WorkspaceHealthReport,
     WorkspaceHealthStatus,
 )
-from singularity.workspace_state.runtime import (
+from singularity.workspace_state.manager import (
     WORKSPACE_STATE_ERROR_CODES,
     ArtifactStore,
-    LocalWorkspaceStateRuntime,
+    WorkspaceStateManager,
     WorkspaceStateError,
     WorkspaceStatePolicy,
     ownership_for_command_purpose,
@@ -31,7 +31,7 @@ __all__ = [
     "ChangeOwnership",
     "FileSnapshot",
     "JournalEvent",
-    "LocalWorkspaceStateRuntime",
+    "WorkspaceStateManager",
     "RecoveryResult",
     "RecoveryStatus",
     "RollbackItem",

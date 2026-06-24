@@ -115,7 +115,7 @@ class ObservationStore:
                     payload={
                         "item_type": stored_item.item_type.value,
                         "layer": stored_item.layer.value,
-                        "source_runtime": stored_item.source_runtime.value,
+                        "source_component": stored_item.source_component.value,
                         "content_digest": stored_item.content_digest,
                         "sensitivity": stored_item.sensitivity.value,
                     },
@@ -151,7 +151,7 @@ class ObservationStore:
         phase_id: str | None = None,
         layer: Any | None = None,
         item_type: Any | None = None,
-        source_runtime: Any | None = None,
+        source_component: Any | None = None,
         freshness: Any | None = None,
     ) -> list[ContextItem]:
         clauses: list[str] = []
@@ -162,7 +162,7 @@ class ObservationStore:
             ("phase_id", phase_id),
             ("layer", _value(layer)),
             ("item_type", _value(item_type)),
-            ("source_runtime", _value(source_runtime)),
+            ("source_component", _value(source_component)),
             ("freshness", _value(freshness)),
         ):
             if value is not None:
@@ -823,7 +823,7 @@ class ObservationStore:
                 task_id text not null,
                 phase_id text not null,
                 layer text not null,
-                source_runtime text not null,
+                source_component text not null,
                 item_type text not null,
                 content text,
                 content_digest text not null,
@@ -1047,7 +1047,7 @@ class ObservationStore:
             """
             insert into context_items(
                 item_id, seq, run_id, session_id, task_id, phase_id, layer,
-                source_runtime, item_type, content, content_digest, created_at,
+                source_component, item_type, content, content_digest, created_at,
                 updated_at, importance, relevance_score, authority, freshness,
                 sensitivity, token_count, refs, metadata, pinned, expires_at
             )
@@ -1061,7 +1061,7 @@ class ObservationStore:
                 item.task_id,
                 item.phase_id,
                 item.layer.value,
-                item.source_runtime.value,
+                item.source_component.value,
                 item.item_type.value,
                 json.dumps(item.content, ensure_ascii=False, default=str),
                 item.content_digest,
@@ -1168,7 +1168,7 @@ class ObservationStore:
             task_id=row["task_id"],
             phase_id=row["phase_id"],
             layer=row["layer"],
-            source_runtime=row["source_runtime"],
+            source_component=row["source_component"],
             item_type=row["item_type"],
             content=json.loads(row["content"]) if row["content"] else None,
             content_digest=row["content_digest"],
@@ -1254,7 +1254,7 @@ class ObservationStore:
             return
         self.trace.emit(
             event_type,
-            runtime="context",
+            component="context",
             summary=event_type,
             payload=payload,
             ids={"run_id": payload.get("run_id")},
@@ -1263,9 +1263,6 @@ class ObservationStore:
     @staticmethod
     def _now() -> str:
         return datetime.now(UTC).isoformat()
-
-
-ContextStore = ObservationStore
 
 
 def _value(value: Any) -> str | None:

@@ -30,15 +30,15 @@ class KernelBootstrapError(KernelError):
     pass
 
 
-class RuntimeGraphError(KernelError):
+class AgentGraphError(KernelError):
     pass
 
 
-class RuntimeInitializationError(KernelError):
+class AgentGraphInitializationError(KernelError):
     pass
 
 
-class RuntimeHealthError(KernelError):
+class ComponentHealthError(KernelError):
     pass
 
 

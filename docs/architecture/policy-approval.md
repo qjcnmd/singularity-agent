@@ -1,13 +1,13 @@
 # Policy And Approval Contract
 
-`PolicyRuntime` is the single runtime permission decision source. `ApprovalGate` resolves local review prompts into scoped grants. This contract is binding for CLI, future daemon, and desktop UI.
+`PolicyEngine` is the single component permission decision source. `ApprovalGate` resolves local review prompts into scoped grants. This contract is binding for CLI, future daemon, and desktop UI.
 
 ## Decision Inputs
 
 Every policy-controlled action must provide:
 
 - session, task, phase, action ids
-- runtime name
+- component name
 - operation kind
 - capability
 - subject
@@ -90,21 +90,21 @@ Expected behavior:
 
 ## Sandbox Required
 
-When policy returns `sandbox_required`, the owning execution runtime must call `SandboxRuntime`. It must not run through a normal local process backend as a fallback.
+When policy returns `sandbox_required`, the owning execution component must call `SandboxManager`. It must not run through a normal local process backend as a fallback.
 
-If the requested sandbox capability is unavailable, the result is a fail-closed runtime failure. Unsupported hard network isolation, process limits, or memory limits are not silently ignored.
+If the requested sandbox capability is unavailable, the result is a fail-closed component failure. Unsupported hard network isolation, process limits, or memory limits are not silently ignored.
 
 ## Fail Closed
 
 Fail closed applies when:
 
-- policy runtime is missing
+- policy component is missing
 - approval gate is unavailable and review is required
 - non-interactive mode needs approval
 - sandbox is required but unavailable
 - resource cannot be normalized safely
 - a tool declares high-risk side effects without the owning backend contract
-- a runtime cannot write an audit record for a controlled decision
+- a component cannot write an audit record for a controlled decision
 
 ## Audit
 

@@ -55,7 +55,7 @@ class ProjectIndexQueryService:
                             description="Relevant file scoring from path, symbols, docs, tests, and entrypoints.",
                         )
                     ],
-                    trust_level=TrustLevel.RUNTIME_GENERATED,
+                    trust_level=TrustLevel.COMPONENT_GENERATED,
                     source="project_index_query",
                 )
             )
@@ -153,7 +153,7 @@ class ProjectIndexQueryService:
             reasons.append("test-related goal")
         elif FileRole.TEST in file.roles:
             score -= 0.3
-        if FileRole.CONFIG in file.roles and any(term in {"config", "配置", "settings", "runtime"} for term in terms):
+        if FileRole.CONFIG in file.roles and any(term in {"config", "配置", "settings", "component"} for term in terms):
             score += 1.0
             reasons.append("config-related goal")
         if file.freshness != FreshnessStatus.FRESH:

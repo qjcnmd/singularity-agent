@@ -1,28 +1,28 @@
 from pathlib import Path
 
 from singularity.context import ContextManager
-from singularity.instructions import InstructionRuntime
+from singularity.instructions import PromptAssemblyPipeline
 from singularity.model import (
-    ModelInputRenderer,
+    ModelTurnRequestBuilder,
     ModelCapabilities,
     MockModelProvider,
     ModelPurpose,
-    ModelRuntime,
+    ModelRunner,
     ModelTurnStatus,
 )
-from singularity.observability import TraceRuntime
-from singularity.planner import PlannerRuntime, TaskStatus
+from singularity.observability import TraceRecorder
+from singularity.planner import Planner, TaskStatus
 from singularity.tools import ToolRegistry
 
 
-def test_model_runtime_build_request_uses_instruction_runtime_bundle(tmp_path: Path) -> None:
+def test_model_runner_build_request_uses_prompt_assembly_bundle(tmp_path: Path) -> None:
     context = ContextManager(system_prompt="legacy system", user_goal="Inspect project")
     provider = MockModelProvider(text="ok")
-    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
-    instruction_runtime = InstructionRuntime(workspace_root=tmp_path, trace=trace)
-    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path), trace=trace)
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
+    prompt_assembly = PromptAssemblyPipeline(workspace_root=tmp_path, trace=trace)
+    component = ModelRunner.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path), trace=trace)
 
-    request = runtime.build_request_from_context(
+    request = component.build_request_from_context(
         context,
         run_id="run_1",
         session_id="session_1",
@@ -30,11 +30,11 @@ def test_model_runtime_build_request_uses_instruction_runtime_bundle(tmp_path: P
         phase_id="understanding_task",
         action_id="action_1",
         purpose=ModelPurpose.PLAN_NEXT_ACTION,
-        instruction_runtime=instruction_runtime,
+        prompt_assembly=prompt_assembly,
         user_task="Inspect project",
         supports_developer_message=True,
     )
-    result = runtime.run_turn(request)
+    result = component.run_turn(request)
 
     assert request.messages[0].metadata["prompt_manifest_id"]
     assert request.context_metadata["prompt_hash"] == request.trace_metadata["prompt_hash"]
@@ -42,16 +42,16 @@ def test_model_runtime_build_request_uses_instruction_runtime_bundle(tmp_path: P
     assert provider.requests[0].trace_metadata["prompt_manifest_id"]
 
 
-def test_model_runtime_uses_provider_capability_for_developer_folding(tmp_path: Path) -> None:
+def test_model_runner_uses_provider_capability_for_developer_folding(tmp_path: Path) -> None:
     context = ContextManager(system_prompt="legacy system", user_goal="Inspect project")
     provider = MockModelProvider(
         text="ok",
         capabilities=ModelCapabilities(supports_developer_message=False),
     )
-    instruction_runtime = InstructionRuntime(workspace_root=tmp_path)
-    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    prompt_assembly = PromptAssemblyPipeline(workspace_root=tmp_path)
+    component = ModelRunner.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
 
-    request = runtime.build_request_from_context(
+    request = component.build_request_from_context(
         context,
         run_id="run_1",
         session_id="session_1",
@@ -59,7 +59,7 @@ def test_model_runtime_uses_provider_capability_for_developer_folding(tmp_path: 
         phase_id="understanding_task",
         action_id="action_1",
         purpose=ModelPurpose.PLAN_NEXT_ACTION,
-        instruction_runtime=instruction_runtime,
+        prompt_assembly=prompt_assembly,
         user_task="Inspect project",
     )
 
@@ -77,12 +77,12 @@ def test_model_input_renderer_keeps_stable_prefix_metadata_and_dynamic_tail(
         result={"ok": True, "content": {"path": "README.md", "content": "dynamic tool output"}},
     )
     provider = MockModelProvider(text="ok")
-    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
-    instruction_runtime = InstructionRuntime(workspace_root=tmp_path)
+    component = ModelRunner.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    prompt_assembly = PromptAssemblyPipeline(workspace_root=tmp_path)
 
-    request = ModelInputRenderer(
-        registry=runtime.registry,
-        tool_renderer=runtime.tool_renderer,
+    request = ModelTurnRequestBuilder(
+        registry=component.registry,
+        tool_renderer=component.tool_renderer,
     ).build_request(
         context,
         run_id="run_1",
@@ -93,7 +93,7 @@ def test_model_input_renderer_keeps_stable_prefix_metadata_and_dynamic_tail(
         purpose=ModelPurpose.PLAN_NEXT_ACTION,
         allowed_tool_names=["search_text", "read_file"],
         planner_context={"content": "dynamic planner state"},
-        instruction_runtime=instruction_runtime,
+        prompt_assembly=prompt_assembly,
         user_task="Inspect project",
     )
 
@@ -111,11 +111,11 @@ def test_model_input_renderer_hashes_ignore_ephemeral_prompt_ids(
 ) -> None:
     context = ContextManager(system_prompt="legacy system", user_goal="Inspect project")
     provider = MockModelProvider(text="ok")
-    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
-    instruction_runtime = InstructionRuntime(workspace_root=tmp_path)
-    renderer = ModelInputRenderer(
-        registry=runtime.registry,
-        tool_renderer=runtime.tool_renderer,
+    component = ModelRunner.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    prompt_assembly = PromptAssemblyPipeline(workspace_root=tmp_path)
+    renderer = ModelTurnRequestBuilder(
+        registry=component.registry,
+        tool_renderer=component.tool_renderer,
     )
 
     first = renderer.build_request(
@@ -127,7 +127,7 @@ def test_model_input_renderer_hashes_ignore_ephemeral_prompt_ids(
         action_id="action_1",
         purpose=ModelPurpose.PLAN_NEXT_ACTION,
         allowed_tool_names=[],
-        instruction_runtime=instruction_runtime,
+        prompt_assembly=prompt_assembly,
         user_task="Inspect project",
     )
     second = renderer.build_request(
@@ -139,7 +139,7 @@ def test_model_input_renderer_hashes_ignore_ephemeral_prompt_ids(
         action_id="action_2",
         purpose=ModelPurpose.PLAN_NEXT_ACTION,
         allowed_tool_names=[],
-        instruction_runtime=instruction_runtime,
+        prompt_assembly=prompt_assembly,
         user_task="Inspect project",
     )
 
@@ -164,7 +164,7 @@ def test_context_manager_exports_untrusted_tool_and_file_sources(tmp_path: Path)
 
 
 def test_planner_records_instruction_prompt_observation_and_final_report_summary(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Change code")
     planner.evidence.inspected_files.append("README.md")
     planner.evidence.applied_changes.append({"changed_files": ["README.md"], "transaction_id": "tx_1"})
@@ -193,7 +193,7 @@ def test_planner_records_instruction_prompt_observation_and_final_report_summary
 
 
 def test_final_report_persists_instruction_prompt_summary(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Change code")
     planner.evidence.inspected_files.append("README.md")
     planner.evidence.applied_changes.append({"changed_files": ["README.md"], "transaction_id": "tx_1"})
@@ -215,7 +215,7 @@ def test_final_report_persists_instruction_prompt_summary(tmp_path: Path) -> Non
 
 
 def test_planner_instruction_prompt_observation_replaces_cumulative_snapshot(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Change code")
 
     planner.record_instruction_prompt_observation(

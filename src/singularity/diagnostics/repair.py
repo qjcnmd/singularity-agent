@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from singularity.code_index import ProjectIndexRuntime
+from singularity.code_index import ProjectIndex
 from singularity.memory.store import MemoryStore
-from singularity.release.init import default_config, initialize_runtime
+from singularity.release.init import default_config, initialize_user_data
 from singularity.release.migrations import apply_migrations
 from singularity.release.models import atomic_write_json, read_json
-from singularity.release.paths import RuntimePaths
+from singularity.release.paths import UserDataPaths
 
 from singularity.diagnostics.models import (
     DiagnosticFinding,
@@ -29,7 +29,7 @@ class RepairEngine:
         self,
         result: DiagnosticResult,
         *,
-        paths: RuntimePaths,
+        paths: UserDataPaths,
         project_root: Path,
         apply: bool = False,
     ) -> RepairPlan:
@@ -105,17 +105,17 @@ class RepairEngine:
     @staticmethod
     def _description(kind: str, finding: DiagnosticFinding) -> str:
         return {
-            "create_dirs": "Create missing Singularity runtime/workspace directories.",
+            "create_dirs": "Create missing Singularity user-data/workspace directories.",
             "write_default_config": "Write default Singularity config file.",
             "merge_default_config": "Merge missing default config fields without overwriting custom values.",
-            "write_manifest": "Create missing runtime manifest and defaults.",
-            "apply_migrations": "Apply pending runtime migrations with existing backup flow.",
+            "write_manifest": "Create missing installation manifest and defaults.",
+            "apply_migrations": "Apply pending installation migrations with existing backup flow.",
             "rebuild_memory_index": "Rebuild derived memory index without deleting memory entries.",
             "rebuild_project_index": "Rebuild derived project index cache.",
             "rebuild_trace_indexes": "Rebuild missing trace index files from trace metadata.",
         }.get(kind, finding.suggested_fix)
 
-    def _apply_action(self, action: RepairAction, *, paths: RuntimePaths, project_root: Path) -> None:
+    def _apply_action(self, action: RepairAction, *, paths: UserDataPaths, project_root: Path) -> None:
         if action.kind == "create_dirs":
             for raw_path in action.params.get("missing") or action.params.get("paths") or []:
                 Path(raw_path).mkdir(parents=True, exist_ok=True)
@@ -130,7 +130,7 @@ class RepairEngine:
             self._merge_default_config(paths)
             return
         if action.kind == "write_manifest":
-            initialize_runtime(paths, force=False)
+            initialize_user_data(paths, force=False)
             return
         if action.kind == "apply_migrations":
             apply_migrations(paths)
@@ -141,7 +141,7 @@ class RepairEngine:
             store.rebuild_index()
             return
         if action.kind == "rebuild_project_index":
-            ProjectIndexRuntime(project_root).build_full_index(reason="diagnostic_repair")
+            ProjectIndex(project_root).build_full_index(reason="diagnostic_repair")
             return
         if action.kind == "rebuild_trace_indexes":
             self._rebuild_trace_indexes(paths)
@@ -149,14 +149,14 @@ class RepairEngine:
         raise ValueError(f"Unsupported repair action: {action.kind}")
 
     @staticmethod
-    def _merge_default_config(paths: RuntimePaths) -> None:
+    def _merge_default_config(paths: UserDataPaths) -> None:
         paths.config_dir.mkdir(parents=True, exist_ok=True)
         current = read_json(paths.config_file) if paths.config_file.exists() else {}
         merged = _deep_merge_missing(current, default_config(paths))
         atomic_write_json(paths.config_file, merged)
 
     @staticmethod
-    def _rebuild_trace_indexes(paths: RuntimePaths) -> None:
+    def _rebuild_trace_indexes(paths: UserDataPaths) -> None:
         if not paths.traces_dir.exists():
             return
         for run_dir in paths.traces_dir.iterdir():
@@ -175,7 +175,7 @@ class RepairEngine:
             atomic_write_json(index, payload)
 
     @staticmethod
-    def _write_audit(paths: RuntimePaths, actions: list[RepairAction]) -> Path:
+    def _write_audit(paths: UserDataPaths, actions: list[RepairAction]) -> Path:
         paths.logs_dir.mkdir(parents=True, exist_ok=True)
         audit_log = paths.logs_dir / "repair-audit.jsonl"
         payload = {

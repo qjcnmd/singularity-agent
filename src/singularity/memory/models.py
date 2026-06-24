@@ -17,7 +17,7 @@ class MemoryScope(str, Enum):
     WORKSPACE = "workspace"
     PROJECT = "project"
     USER_PREFERENCE = "user_preference"
-    TOOL_RUNTIME = "tool_runtime"
+    TOOL_EXECUTOR = "tool_executor"
 
 
 class MemoryType(str, Enum):
@@ -26,7 +26,7 @@ class MemoryType(str, Enum):
     TEST_COMMAND = "test_command"
     MODULE_BOUNDARY = "module_boundary"
     USER_PREFERENCE = "user_preference"
-    TOOL_RUNTIME = "tool_runtime"
+    TOOL_EXECUTOR = "tool_executor"
     LESSON = "lesson"
     CAUTION = "caution"
     FAILURE_LESSON = "failure_lesson"
@@ -92,7 +92,7 @@ class MemoryEvidenceRef:
     artifact_ref: str | None = None
     path: str | None = None
     captured_at: str = field(default_factory=lambda: _now())
-    trust_level: str = "runtime_evidence"
+    trust_level: str = "component_evidence"
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -111,7 +111,7 @@ class MemoryEvidenceRef:
             artifact_ref=payload.get("artifact_ref"),
             path=payload.get("path"),
             captured_at=str(payload.get("captured_at") or _now()),
-            trust_level=str(payload.get("trust_level") or "runtime_evidence"),
+            trust_level=str(payload.get("trust_level") or "component_evidence"),
             metadata=dict(payload.get("metadata") or {}),
         )
 
@@ -119,7 +119,7 @@ class MemoryEvidenceRef:
 @dataclass(frozen=True)
 class Provenance:
     evidence: list[MemoryEvidenceRef] = field(default_factory=list)
-    created_by: str = "memory_runtime"
+    created_by: str = "memory_pipeline"
     source_run_id: str | None = None
     source_session_id: str | None = None
     source_task_id: str | None = None
@@ -147,7 +147,7 @@ class Provenance:
                 MemoryEvidenceRef.from_dict(item)
                 for item in list(payload.get("evidence") or [])
             ],
-            created_by=str(payload.get("created_by") or "memory_runtime"),
+            created_by=str(payload.get("created_by") or "memory_pipeline"),
             source_run_id=payload.get("source_run_id"),
             source_session_id=payload.get("source_session_id"),
             source_task_id=payload.get("source_task_id"),
@@ -472,7 +472,7 @@ class MemoryContextBlock:
     items: list[dict[str, Any]]
     token_count: int
     budget: int
-    runtime: str = "memory"
+    component: str = "memory"
     priority: float = 0.65
     pollution_risk: str = "bounded"
     generated_at: str = field(default_factory=lambda: _now())

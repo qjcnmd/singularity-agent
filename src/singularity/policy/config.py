@@ -59,7 +59,7 @@ class PolicyConfig:
             object.__setattr__(self, "approval_grants_path", Path(self.approval_grants_path))
 
     @classmethod
-    def runtime_default(cls, workspace_root: Path | str) -> "PolicyConfig":
+    def default_for_workspace(cls, workspace_root: Path | str) -> "PolicyConfig":
         return cls(workspace_root=workspace_root, approval_mode=ApprovalMode.AUTO_SAFE)
 
 

@@ -137,6 +137,6 @@ def test_add_memory_context_block_adds_untrusted_memory_item() -> None:
     item = context.add_memory_context_block(block)
 
     assert item.item_type.value == "memory_context"
-    assert item.source_runtime.value == "memory"
+    assert item.source_component.value == "memory"
     assert item.content["trust_level"] == "untrusted_memory"
     assert item.content["items"][0]["id"] == "mem_1"

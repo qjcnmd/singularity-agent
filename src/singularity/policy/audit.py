@@ -54,7 +54,7 @@ class PolicyAuditWriter:
             action_id=request.action_id,
             request_id=request.request_id,
             decision_id=decision.decision_id,
-            runtime=request.runtime,
+            component=request.component,
             operation=request.operation,
             capability=request.capability,
             resource_summary=redact_resource_identifier(request.resource.identifier),

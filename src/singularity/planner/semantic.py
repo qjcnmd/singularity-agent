@@ -139,7 +139,7 @@ class RollingPlan:
         )
 
 
-class SemanticPlannerRuntime:
+class SemanticPlanner:
     def initial_plan(self, task_contract: TaskContract | dict[str, Any]) -> RollingPlan:
         contract = _contract(task_contract)
         steps = [

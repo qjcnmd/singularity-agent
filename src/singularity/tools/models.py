@@ -36,10 +36,10 @@ class ToolSensitivityLevel(str, Enum):
 
 class ToolExecutionBackendKind(str, Enum):
     IN_PROCESS = "in_process"
-    DELEGATED_MUTATION_RUNTIME = "delegated_mutation_runtime"
-    DELEGATED_EDIT_RUNTIME = "delegated_edit_runtime"
-    DELEGATED_COMMAND_RUNTIME = "delegated_command_runtime"
-    DELEGATED_VERIFICATION_RUNTIME = "delegated_verification_runtime"
+    DELEGATED_MUTATION_MANAGER = "delegated_mutation_manager"
+    DELEGATED_EDIT_EXECUTOR = "delegated_edit_executor"
+    DELEGATED_COMMAND_EXECUTOR = "delegated_command_executor"
+    DELEGATED_VERIFICATION_RUNNER = "delegated_verification_runner"
     EXTERNAL_PROCESS = "external_process"
 
 
@@ -278,9 +278,9 @@ class ToolSpec(BaseModel):
     max_output_chars: int = Field(20000, gt=0)
     cacheable: bool = False
     idempotent: bool = True
-    uses_edit_runtime: bool = False
-    uses_mutation_runtime: bool = False
-    uses_command_runtime: bool = False
+    uses_edit_executor: bool = False
+    uses_mutation_manager: bool = False
+    uses_command_executor: bool = False
     delegates_policy_constraints: bool = False
     capabilities: tuple[Capability, ...] = ()
     operation: OperationKind | None = None

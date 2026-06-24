@@ -1,9 +1,9 @@
 import json
 from pathlib import Path
 
-from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
-from singularity.trace import TraceWriter
-from tests.tool_runtime_helpers import make_test_policy_runtime
+from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
+from singularity.jsonl_trace import JsonlTraceRecorder
+from tests.tool_executor_helpers import make_test_policy_engine
 
 
 def make_tool_call(name: str, arguments: dict) -> dict:
@@ -42,17 +42,17 @@ def test_read_file_reads_project_file(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
     readme.write_text("hello from singularity", encoding="utf-8")
     registry = ToolRegistry(tmp_path)
-    runtime = ToolRuntime(
+    tool_executor = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.read_only(),
-        trace=TraceWriter.create(tmp_path),
+        trace=JsonlTraceRecorder.create(tmp_path),
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
     result = registry.dispatch_for_tests(
         make_tool_call("read_file", {"path": "README.md", "max_bytes": 100}),
-        runtime=runtime,
+        executor=tool_executor,
     )
 
     assert result["ok"] is True
@@ -65,17 +65,17 @@ def test_read_file_rejects_path_escape(tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside.txt"
     outside.write_text("outside", encoding="utf-8")
     registry = ToolRegistry(tmp_path)
-    runtime = ToolRuntime(
+    tool_executor = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.read_only(),
-        trace=TraceWriter.create(tmp_path),
+        trace=JsonlTraceRecorder.create(tmp_path),
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
     result = registry.dispatch_for_tests(
         make_tool_call("read_file", {"path": "../outside.txt"}),
-        runtime=runtime,
+        executor=tool_executor,
     )
 
     assert result["ok"] is False
@@ -85,17 +85,17 @@ def test_read_file_rejects_path_escape(tmp_path: Path) -> None:
 
 def test_dispatch_returns_error_for_invalid_json(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path)
-    runtime = ToolRuntime(
+    tool_executor = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.read_only(),
-        trace=TraceWriter.create(tmp_path),
+        trace=JsonlTraceRecorder.create(tmp_path),
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
     result = registry.dispatch_for_tests(
         make_raw_tool_call("read_file", "{not json"),
-        runtime=runtime,
+        executor=tool_executor,
     )
 
     assert result["ok"] is False
@@ -105,17 +105,17 @@ def test_dispatch_returns_error_for_invalid_json(tmp_path: Path) -> None:
 
 def test_dispatch_returns_error_for_unknown_tool(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path)
-    runtime = ToolRuntime(
+    tool_executor = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.read_only(),
-        trace=TraceWriter.create(tmp_path),
+        trace=JsonlTraceRecorder.create(tmp_path),
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
     result = registry.dispatch_for_tests(
         make_tool_call("missing_tool", {"path": "README.md"}),
-        runtime=runtime,
+        executor=tool_executor,
     )
 
     assert result["ok"] is False

@@ -2,8 +2,8 @@ from pathlib import Path
 
 from singularity.code_index import (
     ContextCandidate,
-    ProjectIndexRuntime,
-    ProjectIndexRuntimeConfig,
+    ProjectIndex,
+    ProjectIndexConfig,
     ProjectIndexStore,
     WorkspaceScanner,
 )
@@ -39,7 +39,7 @@ def test_store_upsert_query_stale_and_delete(tmp_path: Path) -> None:
     assert store.files_by_path(["src/app.py"]) == {}
 
 
-def test_runtime_incremental_query_and_impact_use_structured_facts(tmp_path: Path) -> None:
+def test_project_index_incremental_query_and_impact_use_structured_facts(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "tests").mkdir()
     (tmp_path / "src" / "service.py").write_text(
@@ -55,12 +55,12 @@ def test_runtime_incremental_query_and_impact_use_structured_facts(tmp_path: Pat
         encoding="utf-8",
     )
 
-    runtime = ProjectIndexRuntime(tmp_path)
-    summary = runtime.build_full_index(reason="test")
-    relevant = runtime.find_relevant_files("change calculate service")
-    impact = runtime.analyze_impact(["src/service.py"])
-    test_impact = runtime.get_test_impact(["src/service.py"])
-    context = runtime.get_context_candidates("change calculate service", budget_tokens=500)
+    component = ProjectIndex(tmp_path)
+    summary = component.build_full_index(reason="test")
+    relevant = component.find_relevant_files("change calculate service")
+    impact = component.analyze_impact(["src/service.py"])
+    test_impact = component.get_test_impact(["src/service.py"])
+    context = component.get_context_candidates("change calculate service", budget_tokens=500)
 
     assert summary.file_count >= 3
     assert relevant[0].path == "src/service.py"
@@ -72,21 +72,21 @@ def test_runtime_incremental_query_and_impact_use_structured_facts(tmp_path: Pat
         "def calculate():\n    return 2\n",
         encoding="utf-8",
     )
-    result = runtime.update_after_changeset({"changed_files": ["src/service.py"]}, reason="test")
+    result = component.update_after_changeset({"changed_files": ["src/service.py"]}, reason="test")
 
     assert "src/service.py" in result.rebuilt_files
     assert result.summary["file_count"] >= 3
 
 
 def test_disabled_project_index_bootstrap_has_no_store_side_effect(tmp_path: Path) -> None:
-    runtime = ProjectIndexRuntime(tmp_path, config=ProjectIndexRuntimeConfig(enabled=False))
+    component = ProjectIndex(tmp_path, config=ProjectIndexConfig(enabled=False))
 
-    summary = runtime.bootstrap(reason="test")
-    observation = runtime.observation_for_goal("inspect")
-    health = runtime.health_check()
-    impact = runtime.analyze_impact(["src/service.py"])
-    test_impact = runtime.get_test_impact(["src/service.py"])
-    update = runtime.update_after_changeset({"changed_files": ["src/service.py"]}, reason="test")
+    summary = component.bootstrap(reason="test")
+    observation = component.observation_for_goal("inspect")
+    health = component.health_check()
+    impact = component.analyze_impact(["src/service.py"])
+    test_impact = component.get_test_impact(["src/service.py"])
+    update = component.update_after_changeset({"changed_files": ["src/service.py"]}, reason="test")
 
     assert summary.limitations == ["project_index_disabled"]
     assert observation["warnings"] == ["project_index_disabled"]
@@ -101,19 +101,19 @@ def test_disabled_project_index_bootstrap_has_no_store_side_effect(tmp_path: Pat
 def test_full_index_rebuild_failure_preserves_previous_index(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "service.py").write_text("def calculate():\n    return 1\n", encoding="utf-8")
-    runtime = ProjectIndexRuntime(tmp_path)
-    initial = runtime.build_full_index(reason="initial")
+    component = ProjectIndex(tmp_path)
+    initial = component.build_full_index(reason="initial")
 
     def fail_extract(_files):
         raise RuntimeError("extract failed")
 
-    runtime._extract_facts = fail_extract  # type: ignore[method-assign]
+    component._extract_facts = fail_extract  # type: ignore[method-assign]
     try:
-        runtime.build_full_index(reason="failing")
+        component.build_full_index(reason="failing")
     except RuntimeError:
         pass
     else:
         raise AssertionError("index rebuild failure was swallowed")
 
-    assert runtime.store.load_summary().file_count == initial.file_count
-    assert runtime.store.files_by_path(["src/service.py"])
+    assert component.store.load_summary().file_count == initial.file_count
+    assert component.store.files_by_path(["src/service.py"])

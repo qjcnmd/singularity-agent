@@ -12,18 +12,18 @@ CONFIG_SCHEMA_VERSION = 1
 MEMORY_SCHEMA_VERSION = 1
 TRACE_SCHEMA_VERSION = 1
 EVAL_SCHEMA_VERSION = 1
-CURRENT_MIGRATION_VERSION = "001-release-runtime"
+CURRENT_MIGRATION_VERSION = "001-installation-layout"
 
 
 @dataclass(frozen=True)
-class RuntimeManifest:
+class InstallationManifest:
     app_version: str
     config_schema_version: int = CONFIG_SCHEMA_VERSION
     memory_schema_version: int = MEMORY_SCHEMA_VERSION
     trace_schema_version: int = TRACE_SCHEMA_VERSION
     eval_schema_version: int = EVAL_SCHEMA_VERSION
     last_migration: str = CURRENT_MIGRATION_VERSION
-    runtime_mode: str = "user"
+    mode: str = "user"
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -31,7 +31,7 @@ class RuntimeManifest:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "RuntimeManifest":
+    def from_dict(cls, payload: dict[str, Any]) -> "InstallationManifest":
         return cls(
             app_version=str(payload.get("app_version") or "0.0.0"),
             config_schema_version=int(payload.get("config_schema_version") or 0),
@@ -39,7 +39,7 @@ class RuntimeManifest:
             trace_schema_version=int(payload.get("trace_schema_version") or 0),
             eval_schema_version=int(payload.get("eval_schema_version") or 0),
             last_migration=str(payload.get("last_migration") or "000"),
-            runtime_mode=str(payload.get("runtime_mode") or "user"),
+            mode=str(payload.get("mode") or "user"),
             created_at=payload.get("created_at"),
             updated_at=payload.get("updated_at"),
         )

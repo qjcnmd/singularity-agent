@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from singularity import __version__
-from singularity.release.paths import RuntimePaths, resolve_runtime_paths
+from singularity.release.paths import UserDataPaths, resolve_user_data_paths
 
 
 OPTIONAL_FEATURE_MODULES = {
@@ -28,7 +28,7 @@ class VersionInfo:
     install_path: str
     installed_package: bool
     config_dir: str
-    runtime_dir: str
+    user_data_dir: str
     optional_features: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -39,7 +39,7 @@ class VersionInfo:
             "install_path": self.install_path,
             "installed_package": self.installed_package,
             "config_dir": self.config_dir,
-            "runtime_dir": self.runtime_dir,
+            "user_data_dir": self.user_data_dir,
             "optional_features": self.optional_features,
         }
 
@@ -55,8 +55,8 @@ def package_version() -> str:
     return metadata_version
 
 
-def version_info(paths: RuntimePaths | None = None) -> VersionInfo:
-    runtime_paths = paths or resolve_runtime_paths()
+def version_info(paths: UserDataPaths | None = None) -> VersionInfo:
+    user_data_paths = paths or resolve_user_data_paths()
     install_path = _install_path()
     return VersionInfo(
         version=package_version(),
@@ -64,8 +64,8 @@ def version_info(paths: RuntimePaths | None = None) -> VersionInfo:
         platform=platform.platform(),
         install_path=str(install_path),
         installed_package=_installed_package(),
-        config_dir=str(runtime_paths.config_dir),
-        runtime_dir=str(runtime_paths.root),
+        config_dir=str(user_data_paths.config_dir),
+        user_data_dir=str(user_data_paths.root),
         optional_features=optional_feature_status(),
     )
 

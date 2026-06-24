@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from singularity.observability import TraceRuntime
+from singularity.observability import TraceRecorder
 from singularity.plugins.diagnostics import validate_config
 from singularity.plugins.discovery import discover_plugins
-from singularity.plugins.runtime import PluginRuntime
+from singularity.plugins.manager import PluginManager
 from singularity.plugins.status import PluginStatusStore
 from singularity.tools import ToolRegistry
 
@@ -17,9 +17,9 @@ def test_disabled_plugin_is_not_loaded(tmp_path: Path) -> None:
     _write_manifest(plugin_dir, plugin_id="disabled_plugin")
     _write_plugin(plugin_dir, f"Path({str(sentinel)!r}).write_text('imported')\n")
 
-    runtime = PluginRuntime(tmp_path)
+    component = PluginManager(tmp_path)
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    diagnostics = runtime.activate(registry=registry)
+    diagnostics = component.activate(registry=registry)
 
     assert diagnostics == []
     assert not sentinel.exists()
@@ -41,9 +41,9 @@ def test_enable_disable_status_and_hash_mismatch(tmp_path: Path) -> None:
         manifest_path.read_text(encoding="utf-8").replace('version = "0.1.0"', 'version = "0.1.1"'),
         encoding="utf-8",
     )
-    runtime = PluginRuntime(tmp_path)
+    component = PluginManager(tmp_path)
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    diagnostics = runtime.activate(registry=registry)
+    diagnostics = component.activate(registry=registry)
 
     assert any(diagnostic.code == "manifest_hash_mismatch" for diagnostic in diagnostics)
     assert registry.list() == []
@@ -65,7 +65,7 @@ def test_enabled_plugin_path_mismatch_does_not_activate(tmp_path: Path) -> None:
     status_path.write_text(json.dumps(payload), encoding="utf-8")
 
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    diagnostics = PluginRuntime(tmp_path).activate(registry=registry)
+    diagnostics = PluginManager(tmp_path).activate(registry=registry)
 
     assert any(diagnostic.code == "status_path_mismatch" for diagnostic in diagnostics)
     assert registry.list() == []
@@ -79,9 +79,9 @@ def test_permission_refusal_is_isolated_to_plugin(tmp_path: Path) -> None:
     discovered = discover_plugins(tmp_path)[0]
     PluginStatusStore(tmp_path).enable(discovered)
 
-    runtime = PluginRuntime(tmp_path)
+    component = PluginManager(tmp_path)
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    diagnostics = runtime.activate(registry=registry)
+    diagnostics = component.activate(registry=registry)
 
     assert any("did not declare required permissions" in diagnostic.message for diagnostic in diagnostics)
     assert registry.list() == []
@@ -112,7 +112,7 @@ host.register_tool(
     risk_level="medium",
     permission_level="write",
     required_permissions=["write_workspace"],
-    uses_mutation_runtime=True,
+    uses_mutation_manager=True,
     approval_profile={"requires_approval": True},
 )
 """,
@@ -125,7 +125,7 @@ host.register_tool(
     status_path.write_text(json.dumps(payload), encoding="utf-8")
 
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    diagnostics = PluginRuntime(tmp_path).activate(registry=registry)
+    diagnostics = PluginManager(tmp_path).activate(registry=registry)
 
     assert any(diagnostic.code == "plugin_tool_permission_not_approved" for diagnostic in diagnostics)
     assert registry.list() == []
@@ -157,7 +157,7 @@ host.register_tool(
     PluginStatusStore(tmp_path).enable(discovered)
 
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    diagnostics = PluginRuntime(tmp_path).activate(registry=registry)
+    diagnostics = PluginManager(tmp_path).activate(registry=registry)
 
     assert any("additionalProperties" in diagnostic.message for diagnostic in diagnostics)
     assert registry.list() == []
@@ -180,17 +180,17 @@ def test_config_schema_validation_rejects_bad_config() -> None:
     }
 
 
-def test_plugin_exception_does_not_crash_runtime(tmp_path: Path) -> None:
+def test_plugin_exception_does_not_crash_plugin_manager(tmp_path: Path) -> None:
     plugin_dir = _plugin_dir(tmp_path, "broken_plugin")
     _write_manifest(plugin_dir, plugin_id="broken_plugin")
     _write_plugin(plugin_dir, "raise RuntimeError('boom')\n")
     discovered = discover_plugins(tmp_path)[0]
     PluginStatusStore(tmp_path).enable(discovered)
-    trace = TraceRuntime.create(tmp_path, trace_dir=tmp_path / "traces")
+    trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "traces")
 
-    runtime = PluginRuntime(tmp_path, trace=trace)
+    component = PluginManager(tmp_path, trace=trace)
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    diagnostics = runtime.activate(registry=registry)
+    diagnostics = component.activate(registry=registry)
 
     assert any(diagnostic.code == "plugin_load_failed" for diagnostic in diagnostics)
     assert registry.list() == []

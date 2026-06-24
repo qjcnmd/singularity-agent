@@ -37,7 +37,7 @@ def make_entry(entry_id: str = "mem_1") -> MemoryEntry:
     )
 
 
-def test_store_creates_runtime_local_memory_layout(tmp_path: Path) -> None:
+def test_store_creates_pipeline_local_memory_layout(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path)
     store.initialize()
 

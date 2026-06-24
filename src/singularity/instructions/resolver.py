@@ -36,7 +36,7 @@ class InstructionResolver:
         filtered = [
             source
             for source in sources
-            if source.scope.matches(purpose=purpose, runtime="model")
+            if source.scope.matches(purpose=purpose, component="model")
         ]
         filtered.sort(
             key=lambda source: self.hierarchy.effective_priority(source),

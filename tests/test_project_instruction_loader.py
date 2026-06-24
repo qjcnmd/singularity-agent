@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from singularity.instructions import (
-    InstructionRuntimeConfig,
+    PromptAssemblyConfig,
     InstructionSourceType,
     ProjectInstructionLoader,
     TrustLevel,
@@ -30,7 +30,7 @@ def test_loads_agents_and_singularity_instruction_files(tmp_path: Path) -> None:
 def test_loader_rejects_workspace_escape(tmp_path: Path) -> None:
     loader = ProjectInstructionLoader(
         tmp_path,
-        config=InstructionRuntimeConfig(project_instruction_filenames=["../outside.md"]),
+        config=PromptAssemblyConfig(project_instruction_filenames=["../outside.md"]),
     )
 
     with pytest.raises(InstructionSourceError):
@@ -41,7 +41,7 @@ def test_loader_truncates_large_files_and_does_not_require_git(tmp_path: Path) -
     (tmp_path / "AGENTS.md").write_text("x" * 128, encoding="utf-8")
     loader = ProjectInstructionLoader(
         tmp_path,
-        config=InstructionRuntimeConfig(max_project_instruction_bytes=16),
+        config=PromptAssemblyConfig(max_project_instruction_bytes=16),
     )
 
     sources = loader.load()

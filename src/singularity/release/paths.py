@@ -9,15 +9,15 @@ from pathlib import Path
 APP_NAME = "singularity"
 
 
-class RuntimeMode(str, Enum):
+class UserDataMode(str, Enum):
     USER = "user"
     DEVELOPMENT = "development"
     PORTABLE = "portable"
 
 
 @dataclass(frozen=True)
-class RuntimePaths:
-    mode: RuntimeMode
+class UserDataPaths:
+    mode: UserDataMode
     root: Path
     config_dir: Path
     state_dir: Path
@@ -35,7 +35,7 @@ class RuntimePaths:
 
     @property
     def manifest_file(self) -> Path:
-        return self.state_dir / "runtime-manifest.json"
+        return self.state_dir / "installation-manifest.json"
 
     def directories(self) -> tuple[Path, ...]:
         return (
@@ -59,26 +59,26 @@ class RuntimePaths:
         return payload
 
 
-def resolve_runtime_paths(
+def resolve_user_data_paths(
     *,
-    mode: RuntimeMode | str | None = None,
+    mode: UserDataMode | str | None = None,
     home: Path | str | None = None,
     project_root: Path | str | None = None,
-) -> RuntimePaths:
+) -> UserDataPaths:
     resolved_mode = _mode(mode)
     env_home = os.getenv("SINGULARITY_HOME")
     if home is not None:
         root = Path(home).expanduser()
     elif env_home:
         root = Path(env_home).expanduser()
-    elif resolved_mode == RuntimeMode.DEVELOPMENT:
+    elif resolved_mode == UserDataMode.DEVELOPMENT:
         root = Path(project_root or Path.cwd()).expanduser() / ".singularity"
-    elif resolved_mode == RuntimeMode.PORTABLE:
+    elif resolved_mode == UserDataMode.PORTABLE:
         root = Path(project_root or Path.cwd()).expanduser() / ".singularity"
     else:
         root = _user_data_root()
     root = root.resolve(strict=False)
-    return RuntimePaths(
+    return UserDataPaths(
         mode=resolved_mode,
         root=root,
         config_dir=root / "config",
@@ -93,10 +93,10 @@ def resolve_runtime_paths(
     )
 
 
-def _mode(value: RuntimeMode | str | None) -> RuntimeMode:
-    raw = value or os.getenv("SINGULARITY_MODE") or RuntimeMode.USER.value
+def _mode(value: UserDataMode | str | None) -> UserDataMode:
+    raw = value or os.getenv("SINGULARITY_MODE") or UserDataMode.USER.value
     try:
-        return RuntimeMode(str(raw).lower())
+        return UserDataMode(str(raw).lower())
     except ValueError as exc:
         raise ValueError("SINGULARITY_MODE must be user, development, or portable.") from exc
 

@@ -182,7 +182,7 @@ class CommandPolicy:
         if CommandRisk.VCS_MUTATION in risk_tags:
             return CommandPolicyResult(
                 decision=CommandDecision.REQUIRE_REVIEW,
-                reasons=["Git mutation commands must use GitRuntime or explicit review."],
+                reasons=["Git mutation commands must use GitClient or explicit review."],
                 risk_tags=risk_tags,
                 required_network=request.network_mode,
                 required_filesystem=request.filesystem_mode,
@@ -339,7 +339,7 @@ class CommandPolicy:
             tags.add(CommandRisk.UNKNOWN)
         return sorted_risks(tags)
 
-    def requires_verification_runtime(self, request: CommandRequest) -> bool:
+    def requires_verification_runner(self, request: CommandRequest) -> bool:
         return _is_verification_like_request(request)
 
     @staticmethod

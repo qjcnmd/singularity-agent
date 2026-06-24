@@ -10,14 +10,14 @@ from singularity.release.init import default_config, validate_config
 from singularity.release.metadata import package_version
 from singularity.release.models import (
     CURRENT_MIGRATION_VERSION,
-    RuntimeManifest,
+    InstallationManifest,
     atomic_write_json,
     read_json,
 )
-from singularity.release.paths import RuntimePaths
+from singularity.release.paths import UserDataPaths
 
 
-MigrationFn = Callable[[RuntimePaths], None]
+MigrationFn = Callable[[UserDataPaths], None]
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class Migration:
 
 
 def pending_migrations(
-    paths: RuntimePaths,
+    paths: UserDataPaths,
     *,
     migrations: list[Migration] | None = None,
 ) -> list[Migration]:
@@ -38,45 +38,45 @@ def pending_migrations(
 
 
 def apply_migrations(
-    paths: RuntimePaths,
+    paths: UserDataPaths,
     *,
     migrations: list[Migration] | None = None,
 ) -> list[dict[str, str]]:
     applied: list[dict[str, str]] = []
     for migration in pending_migrations(paths, migrations=migrations):
-        backup = backup_runtime(paths, label=f"migration-{migration.version}")
+        backup = backup_installation(paths, label=f"migration-{migration.version}")
         try:
             migration.apply(paths)
             manifest = load_manifest(paths)
             now = _now()
             atomic_write_json(
                 paths.manifest_file,
-                RuntimeManifest(
+                InstallationManifest(
                     app_version=package_version(),
                     config_schema_version=manifest.config_schema_version,
                     memory_schema_version=manifest.memory_schema_version,
                     trace_schema_version=manifest.trace_schema_version,
                     eval_schema_version=manifest.eval_schema_version,
                     last_migration=migration.version,
-                    runtime_mode=paths.mode.value,
+                    mode=paths.mode.value,
                     created_at=manifest.created_at,
                     updated_at=now,
                 ).to_dict(),
             )
             applied.append({"version": migration.version, "name": migration.name, "backup": str(backup)})
         except Exception:
-            restore_backup(paths, backup)
+            restore_installation_backup(paths, backup)
             raise
     return applied
 
 
-def load_manifest(paths: RuntimePaths) -> RuntimeManifest:
+def load_manifest(paths: UserDataPaths) -> InstallationManifest:
     if not paths.manifest_file.exists():
         raise FileNotFoundError(paths.manifest_file)
-    return RuntimeManifest.from_dict(read_json(paths.manifest_file))
+    return InstallationManifest.from_dict(read_json(paths.manifest_file))
 
 
-def backup_runtime(paths: RuntimePaths, *, label: str) -> Path:
+def backup_installation(paths: UserDataPaths, *, label: str) -> Path:
     target = paths.backups_dir / f"{label}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     target.mkdir(parents=True, exist_ok=False)
     for name, source in (("config", paths.config_dir), ("state", paths.state_dir)):
@@ -85,7 +85,7 @@ def backup_runtime(paths: RuntimePaths, *, label: str) -> Path:
     return target
 
 
-def restore_backup(paths: RuntimePaths, backup: Path) -> None:
+def restore_installation_backup(paths: UserDataPaths, backup: Path) -> None:
     for name, target in (("config", paths.config_dir), ("state", paths.state_dir)):
         saved = backup / name
         if target.exists():
@@ -94,20 +94,20 @@ def restore_backup(paths: RuntimePaths, backup: Path) -> None:
             shutil.copytree(saved, target)
 
 
-def _release_runtime_v1(paths: RuntimePaths) -> None:
+def _installation_layout_v1(paths: UserDataPaths) -> None:
     if not paths.config_file.exists():
         atomic_write_json(paths.config_file, default_config(paths))
         return
     config = read_json(paths.config_file)
     if validate_config(config):
         return
-    config.setdefault("runtime", {})["mode"] = paths.mode.value
-    config["runtime"]["root"] = str(paths.root)
+    config.setdefault("component", {})["mode"] = paths.mode.value
+    config["component"]["root"] = str(paths.root)
     atomic_write_json(paths.config_file, config)
 
 
 MIGRATIONS = [
-    Migration(CURRENT_MIGRATION_VERSION, "release runtime manifest and config paths", _release_runtime_v1),
+    Migration(CURRENT_MIGRATION_VERSION, "release installation manifest and config paths", _installation_layout_v1),
 ]
 
 

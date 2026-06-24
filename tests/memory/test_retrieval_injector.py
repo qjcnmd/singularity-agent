@@ -14,7 +14,7 @@ from singularity.memory.models import (
     MemoryType,
     Provenance,
 )
-from singularity.memory.retrieval import MemoryRetrieval
+from singularity.memory.retrieval import MemoryRetriever
 
 
 def entry(entry_id: str, title: str, body: str, **kwargs) -> MemoryEntry:
@@ -51,7 +51,7 @@ def test_retrieval_ranks_by_goal_path_tool_error_and_module() -> None:
     relevant = entry(
         "mem_pytest",
         "Use pytest command",
-        "Use python -m pytest tests --basetemp work/pytest-tmp for memory runtime.",
+        "Use python -m pytest tests --basetemp work/pytest-tmp for memory pipeline.",
         paths=["tests/memory/test_store.py"],
         tools=["pytest"],
         modules=["memory"],
@@ -60,9 +60,9 @@ def test_retrieval_ranks_by_goal_path_tool_error_and_module() -> None:
     )
     unrelated = entry("mem_docs", "Docs lesson", "Update docs after architecture changes.")
 
-    results = MemoryRetrieval([unrelated, relevant]).search(
+    results = MemoryRetriever([unrelated, relevant]).search(
         MemoryQuery(
-            goal="fix memory runtime unit test failure",
+            goal="fix memory pipeline unit test failure",
             paths=["tests/memory/test_store.py"],
             tools=["pytest"],
             error_types=["unit_test_failure"],
@@ -77,7 +77,7 @@ def test_retrieval_ranks_by_goal_path_tool_error_and_module() -> None:
 
 
 def test_retrieval_filters_tombstones_expired_and_conflicted_entries() -> None:
-    results = MemoryRetrieval(
+    results = MemoryRetriever(
         [
             entry("mem_deleted", "Deleted", "Deleted", status=MemoryStatus.TOMBSTONED),
             entry(
@@ -94,7 +94,7 @@ def test_retrieval_filters_tombstones_expired_and_conflicted_entries() -> None:
 
 
 def test_retrieval_does_not_return_unrelated_auto_memory_but_keeps_human_global_context() -> None:
-    results = MemoryRetrieval(
+    results = MemoryRetriever(
         [
             entry("mem_unrelated", "Docker lesson", "Use docker compose for services."),
             entry(
@@ -121,7 +121,7 @@ def test_retrieval_does_not_return_unrelated_auto_memory_but_keeps_human_global_
 
 
 def test_injector_budgets_items_and_marks_pollution_risk() -> None:
-    results = MemoryRetrieval(
+    results = MemoryRetriever(
         [
             entry("mem_high", "High confidence", "Verified pytest command.", confidence=Confidence.HIGH),
             entry(
@@ -136,7 +136,7 @@ def test_injector_budgets_items_and_marks_pollution_risk() -> None:
 
     block = MemoryInjector(max_items=2, token_budget=40).build_block(results)
 
-    assert block.runtime == "memory"
+    assert block.component == "memory"
     assert len(block.items) == 2
     assert block.token_count <= 40
     assert {item["pollution_risk"] for item in block.items} >= {"low", "medium"}

@@ -4,12 +4,12 @@ Phase 1D adds a thin task lifecycle controller above the existing planner, model
 
 ## Types
 
-- `TaskLifecycleStatus`
-- `TaskEventKind`
-- `TaskEvent`
-- `TaskStateStore`
-- `OutcomeReducer`
-- `TaskController`
+- `RunLifecycleStatus`
+- `RunControlEventKind`
+- `RunControlEvent`
+- `RunCheckpointStore`
+- `RunOutcomeReducer`
+- `RunController`
 
 ## Lifecycle Statuses
 
@@ -32,11 +32,11 @@ The existing planner `TaskStatus` remains as the planner phase/status surface fo
 
 ## Controller Responsibilities
 
-`TaskController` owns the outer task turn loop through `run_loop()`. `SingularityAgent.run()` still owns per-turn model/tool orchestration, but no longer owns the `for turn` lifecycle loop directly.
+`RunController` owns the outer task turn loop through `run_loop()`. `AgentLoop.run()` still owns per-turn model/tool orchestration, but no longer owns the `for turn` lifecycle loop directly.
 
 The controller:
 
-- starts tasks through `PlannerRuntime.start_task()`
+- starts tasks through `Planner.start_task()`
 - records lifecycle events to trace and planner event storage
 - reduces `ExecutionOutcome` into lifecycle status changes
 - maps Tool Protocol `next_action` values into lifecycle events
@@ -46,7 +46,7 @@ The controller:
 
 ## Reducer Behavior
 
-`OutcomeReducer` maps outcomes without letting non-terminal results end the task:
+`RunOutcomeReducer` maps outcomes without letting non-terminal results end the task:
 
 - `approval_required` -> `waiting_approval`
 - `user_input_required` -> `waiting_user`
@@ -55,7 +55,7 @@ The controller:
 - `blocked` -> `blocked`
 - `fatal` -> `failed`
 
-Tool Protocol recovery and turn results are mapped to `TaskEvent`:
+Tool Protocol recovery and turn results are mapped to `RunControlEvent`:
 
 - `pending_approval` / `resume_pending_approval` -> `waiting_approval`
 - `ask_user` / `request_user_input` -> `waiting_user`
@@ -64,11 +64,11 @@ Tool Protocol recovery and turn results are mapped to `TaskEvent`:
 
 ## Resume Boundaries
 
-The controller reuses the existing planner checkpoint files under `.singularity/planner/<session_id>/`. It does not introduce a second durable state store. `TaskStateStore` is a small adapter over `PlannerStore` so the lifecycle owner can checkpoint and resume without duplicating persistence.
+The controller reuses the existing planner checkpoint files under `.singularity/planner/<session_id>/`. It does not introduce a second durable state store. `RunCheckpointStore` is a small adapter over `PlannerStore` so the lifecycle owner can checkpoint and resume without duplicating persistence.
 
 ## Context Boundary
 
-When an existing `ContextManager` is supplied to `SingularityAgent`, the agent now calls `ContextManager.set_user_goal()` so pending approval or user-input resumes keep the current task goal in both in-memory messages and context items.
+When an existing `ContextManager` is supplied to `AgentLoop`, the agent now calls `ContextManager.set_user_goal()` so pending approval or user-input resumes keep the current task goal in both in-memory messages and context items.
 
 ## Non-Goals
 

@@ -46,7 +46,7 @@ class ReviewDecisionAction(str, Enum):
 
 
 class ReviewTrustLevel(str, Enum):
-    TRUSTED_RUNTIME = "trusted_runtime"
+    TRUSTED_COMPONENT = "trusted_component"
     TRUSTED_OPERATOR = "trusted_operator"
     WORKSPACE_DERIVED = "workspace_derived"
     MODEL_DERIVED = "model_derived"

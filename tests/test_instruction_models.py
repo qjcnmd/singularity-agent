@@ -14,7 +14,7 @@ from singularity.model import ModelMessage, ModelRole
 
 def test_instruction_models_construct_and_serialize() -> None:
     scope = InstructionScope(
-        applies_to_runtime=["model"],
+        applies_to_component=["model"],
         applies_to_purpose=["plan_next_action"],
         applies_to_paths=["src/**"],
         applies_to_tools=["read_file"],
@@ -28,12 +28,12 @@ def test_instruction_models_construct_and_serialize() -> None:
         priority=InstructionPriority.USER_TASK,
         trust_level=TrustLevel.TRUSTED_USER,
         scope=scope,
-        content="Inspect the runtime.",
+        content="Inspect the component.",
     )
     frame = InstructionFrame(
         frame_id="frame_1",
         source=source,
-        normalized_content="Inspect the runtime.",
+        normalized_content="Inspect the component.",
         effective_priority=InstructionPriority.USER_TASK,
         effective_trust_level=TrustLevel.TRUSTED_USER,
     )
@@ -43,7 +43,7 @@ def test_instruction_models_construct_and_serialize() -> None:
         priority=InstructionPriority.USER_TASK,
         trust_level=TrustLevel.TRUSTED_USER,
         source_refs=["source_1"],
-        content="Inspect the runtime.",
+        content="Inspect the component.",
         token_estimate=4,
     )
     manifest = PromptManifest(

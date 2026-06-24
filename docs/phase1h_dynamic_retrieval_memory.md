@@ -1,6 +1,6 @@
 # Phase 1H Dynamic Retrieval And Memory Learning
 
-Phase 1H makes retrieval and learning explicit runtime steps instead of relying on the model to remember to read or search.
+Phase 1H makes retrieval and learning explicit executor steps instead of relying on the model to remember to read or search.
 
 ## Implemented
 
@@ -9,13 +9,13 @@ Phase 1H makes retrieval and learning explicit runtime steps instead of relying 
   - latest `FailureAnalysis`
   - changed files
   - `TaskContract`
-  - `ProjectIndexRuntime` impact and test-impact results
-- `PlannerRuntime` records dynamic retrieval after:
+  - `ProjectIndex` impact and test-impact results
+- `Planner` records dynamic retrieval after:
   - verification failures with suspect files
   - diff observations with changed files
 - Retrieval output is stored in `EvidenceLedger.retrieval_results` and rendered into planner context as `dynamic_retrieval`.
-- `LessonExtractionRuntime` only forwards final reports to memory when the final report is `completed` and verification is ready.
-- Production graph wiring attaches the shared `ProjectIndexRuntime` and `MemoryRuntime` to `PlannerRuntime`.
+- `LessonExtractor` only forwards final reports to memory when the final report is `completed` and verification is ready.
+- Production graph wiring attaches the shared `ProjectIndex` and `MemoryLearningPipeline` to `Planner`.
 
 ## Retrieval Output
 
@@ -38,7 +38,7 @@ trust_level
 
 ## Memory Learning Boundary
 
-`LessonExtractionRuntime` does not write model guesses to durable memory. It delegates extraction and policy checks to `MemoryRuntime`, and it only calls memory after:
+`LessonExtractor` does not write model guesses to durable memory. It delegates extraction and policy checks to `MemoryLearningPipeline`, and it only calls memory after:
 
 ```text
 FinalReport.status == completed
@@ -52,4 +52,4 @@ Existing `MemoryPolicy` still handles stable evidence, redaction, quarantine, an
 - No Rust, Desktop, Tauri, MCP, multi-agent, plugin marketplace, or Future work.
 - No new dependency.
 - No new planner state machine phase.
-- Retrieval results are runtime-generated and traceable, but still treated as untrusted context until files are actually read.
+- Retrieval results are component-generated and traceable, but still treated as untrusted context until files are actually read.

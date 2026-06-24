@@ -520,7 +520,7 @@ class FinalReport:
     execution_trace_summary: dict[str, Any] = field(default_factory=dict)
     model_usage_summary: dict[str, Any] = field(default_factory=dict)
     instruction_prompt_summary: dict[str, Any] = field(default_factory=dict)
-    runtime_health_summary: dict[str, Any] = field(default_factory=dict)
+    component_health_summary: dict[str, Any] = field(default_factory=dict)
     shutdown_summary: dict[str, Any] = field(default_factory=dict)
     recovery_summary: dict[str, Any] = field(default_factory=dict)
     lifecycle_summary: dict[str, Any] = field(default_factory=dict)
@@ -542,7 +542,7 @@ class FinalReport:
             "execution_trace_summary": self.execution_trace_summary,
             "model_usage_summary": self.model_usage_summary,
             "instruction_prompt_summary": self.instruction_prompt_summary,
-            "runtime_health_summary": self.runtime_health_summary,
+            "component_health_summary": self.component_health_summary,
             "shutdown_summary": self.shutdown_summary,
             "recovery_summary": self.recovery_summary,
             "lifecycle_summary": self.lifecycle_summary,
@@ -568,7 +568,7 @@ class FinalReport:
             execution_trace_summary=dict(payload.get("execution_trace_summary") or {}),
             model_usage_summary=dict(payload.get("model_usage_summary") or {}),
             instruction_prompt_summary=dict(payload.get("instruction_prompt_summary") or {}),
-            runtime_health_summary=dict(payload.get("runtime_health_summary") or {}),
+            component_health_summary=dict(payload.get("component_health_summary") or {}),
             shutdown_summary=dict(payload.get("shutdown_summary") or {}),
             recovery_summary=dict(payload.get("recovery_summary") or {}),
             lifecycle_summary=dict(payload.get("lifecycle_summary") or {}),

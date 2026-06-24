@@ -1,42 +1,42 @@
 from __future__ import annotations
 
 
-class ModelRuntimeError(RuntimeError):
+class ModelRunnerError(RuntimeError):
     pass
 
 
-class ModelProviderError(ModelRuntimeError):
+class ModelProviderError(ModelRunnerError):
     pass
 
 
-class ModelProviderNotFound(ModelRuntimeError):
+class ModelProviderNotFound(ModelRunnerError):
     pass
 
 
-class ModelCapabilityError(ModelRuntimeError):
+class ModelCapabilityError(ModelRunnerError):
     pass
 
 
-class ModelRequestValidationError(ModelRuntimeError):
+class ModelRequestValidationError(ModelRunnerError):
     pass
 
 
-class ModelResponseValidationError(ModelRuntimeError):
+class ModelResponseValidationError(ModelRunnerError):
     pass
 
 
-class ModelContextTooLong(ModelRuntimeError):
+class ModelContextTooLong(ModelRunnerError):
     pass
 
 
-class ModelBudgetExceeded(ModelRuntimeError):
+class ModelBudgetExceeded(ModelRunnerError):
     pass
 
 
-class ModelToolCallParseError(ModelRuntimeError):
+class ModelToolCallParseError(ModelRunnerError):
     pass
 
 
-class ModelRetryExhausted(ModelRuntimeError):
+class ModelRetryExhausted(ModelRunnerError):
     pass
 

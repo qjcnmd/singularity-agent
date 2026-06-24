@@ -71,7 +71,7 @@ def test_tool_call_normalizer_coerces_json_string_for_list_fields_only(tmp_path:
             input_model=ListInput,
             handler=lambda _args: {},
             permission_level=PermissionLevel.WRITE,
-            uses_mutation_runtime=True,
+            uses_mutation_manager=True,
         )
     )
 

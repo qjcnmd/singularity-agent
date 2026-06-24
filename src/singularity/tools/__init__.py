@@ -22,7 +22,7 @@ from singularity.tools.models import (
 from singularity.tools.policy import ToolPolicy
 from singularity.tools.registry import ToolRegistry
 from singularity.tools.router import ToolExposureDecision, ToolExposureRecord, ToolRouter
-from singularity.tools.runtime import ToolRuntime
+from singularity.tools.executor import ToolExecutor
 from singularity.tools.workspace_state import register_workspace_state_tools
 from singularity.tools.code_index import register_code_index_tools
 from singularity.tools.command import register_command_tools
@@ -51,7 +51,7 @@ __all__ = [
     "ToolRouter",
     "ToolRetryPolicy",
     "ToolResult",
-    "ToolRuntime",
+    "ToolExecutor",
     "ToolSensitivityLevel",
     "ToolSideEffectKind",
     "ToolSpec",

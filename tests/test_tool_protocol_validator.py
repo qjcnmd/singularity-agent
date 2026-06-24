@@ -79,7 +79,7 @@ def test_validator_schedules_mutation_calls_sequentially(tmp_path) -> None:
             handler=lambda args: None,
             permission_level=PermissionLevel.WRITE,
             risk_tags=("write",),
-            uses_mutation_runtime=True,
+            uses_mutation_manager=True,
         )
     )
     validator = ToolProtocolValidator(registry)
@@ -286,7 +286,7 @@ def test_validator_coerces_json_string_for_list_fields_only(tmp_path) -> None:
             input_model=ListInput,
             handler=lambda args: None,
             permission_level=PermissionLevel.WRITE,
-            uses_mutation_runtime=True,
+            uses_mutation_manager=True,
         )
     )
 

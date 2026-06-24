@@ -21,9 +21,9 @@ sg
 
 It resolves to `singularity.cli:main`, so installed usage does not depend on running inside the source checkout.
 
-## Runtime Home
+## Component Home
 
-By default Singularity stores user-level runtime data under the platform user data directory, then creates this layout:
+By default Singularity stores user-level component data under the platform user data directory, then creates this layout:
 
 ```text
 config/
@@ -37,19 +37,19 @@ backups/
 tmp/
 ```
 
-Override the runtime root for tests, portable installs, or isolated runs:
+Override the component root for tests, portable installs, or isolated runs:
 
 ```bash
 SINGULARITY_HOME=/path/to/singularity-home singularity-agent system init
 ```
 
-Portable mode keeps the runtime under the current project directory:
+Portable mode keeps the component under the current project directory:
 
 ```bash
 singularity-agent system init --mode portable
 ```
 
-Development mode keeps the runtime under `.singularity/` in the current checkout:
+Development mode keeps the component under `.singularity/` in the current checkout:
 
 ```bash
 singularity-agent system init --mode development
@@ -88,4 +88,4 @@ python -m pip install ".[eval]"
 python -m pip install ".[devtools]"
 ```
 
-The `sandbox` extra currently has no additional Python dependency; sandbox capability is checked at runtime.
+The `sandbox` extra currently has no additional Python dependency; sandbox capability is checked at component.

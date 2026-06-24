@@ -48,7 +48,7 @@ class DefaultLocalPolicyRules:
                 scope=approval_scope_for_request(request),
                 review_kind=result.review_kind,
                 details={
-                    "runtime": request.runtime.value,
+                    "component": request.component.value,
                     "operation": request.operation.value,
                     "resource": request.resource.identifier,
                     "risk_level": risk.level.value,
@@ -216,8 +216,8 @@ class DefaultLocalPolicyRules:
                 ),
             )
 
-        if config.approval_mode == ApprovalMode.AUTO_SAFE and _auto_safe_runtime_allow(request, risk):
-            return RuleResult(DecisionOutcome.ALLOW, "Low-risk runtime action allowed by auto_safe mode.", "auto_safe_runtime_allow")
+        if config.approval_mode == ApprovalMode.AUTO_SAFE and _auto_safe_component_allow(request, risk):
+            return RuleResult(DecisionOutcome.ALLOW, "Low-risk component action allowed by auto_safe mode.", "auto_safe_component_allow")
 
         if operation in {
             OperationKind.MUTATE_FILE,
@@ -236,7 +236,7 @@ class DefaultLocalPolicyRules:
             return RuleResult(
                 DecisionOutcome.REQUIRE_REVIEW,
                 f"{operation.value} requires local CLI review.",
-                "require_review_runtime_action",
+                "require_review_pipeline_action",
                 constraints=PolicyConstraints(
                     filesystem_mode=(
                         "workspace_write"
@@ -277,7 +277,7 @@ def _outside_write_or_delete(request: PolicyRequest, tags: set[RiskTag]) -> bool
     }
 
 
-def _auto_safe_runtime_allow(request: PolicyRequest, risk: RiskAssessment) -> bool:
+def _auto_safe_component_allow(request: PolicyRequest, risk: RiskAssessment) -> bool:
     if request.operation == OperationKind.START_LONG_PROCESS:
         return bool(request.metadata.get("risk_acceptance_reason"))
     if risk.level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
@@ -295,7 +295,7 @@ def _auto_safe_runtime_allow(request: PolicyRequest, risk: RiskAssessment) -> bo
         OperationKind.CHANGE_CONFIG,
     }:
         return False
-    if request.runtime.value == "tool" and request.metadata.get("delegated_runtime"):
+    if request.component.value == "tool" and request.metadata.get("delegated_executor"):
         return True
     return request.operation in {
         OperationKind.READ_FILE,
@@ -358,7 +358,7 @@ def _disabled_by_config(
 
 
 def _compat_local_command_allow(request: PolicyRequest, risk: RiskAssessment) -> bool:
-    if request.runtime.value != "command":
+    if request.component.value != "command":
         return False
     if request.operation == OperationKind.VERIFICATION:
         if request.capability != Capability.EXECUTE_PROJECT_CODE:
@@ -394,7 +394,7 @@ def _compat_local_command_allow(request: PolicyRequest, risk: RiskAssessment) ->
 
 
 def _strict_command_requires_sandbox(request: PolicyRequest) -> bool:
-    if request.runtime.value != "command":
+    if request.component.value != "command":
         return False
     return request.operation in {
         OperationKind.EXECUTE_COMMAND,

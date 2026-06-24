@@ -54,8 +54,8 @@ class MemorySyncImport:
         }
 
 
-class MemorySyncRuntime:
-    """File-backed memory export/import runtime.
+class MemoryBundleSync:
+    """File-backed memory export/import pipeline.
 
     Imported active entries become candidates by default. This keeps remote or
     shared memory reviewable instead of silently becoming local truth.

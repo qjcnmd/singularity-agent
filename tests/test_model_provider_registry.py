@@ -183,7 +183,7 @@ class _FakePermissionDeniedClient(_FakeClient):
         )
 
 
-def test_openai_compatible_model_provider_serializes_runtime_request(
+def test_openai_compatible_model_provider_serializes_model_turn_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _FakeClient.payloads = []

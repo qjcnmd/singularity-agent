@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from singularity.cli_paths import resolve_project_root
-from singularity.observability import TraceRuntime
+from singularity.observability import TraceRecorder
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.plugins.compatibility import check_compatibility
 from singularity.plugins.diagnostics import check_plugin, duplicate_plugin_ids, validate_config
@@ -20,7 +20,7 @@ from singularity.plugins.models import (
     PluginDiagnosticSeverity,
 )
 from singularity.plugins.status import PluginStatusStore
-from singularity.release.paths import RuntimeMode, resolve_runtime_paths
+from singularity.release.paths import UserDataMode, resolve_user_data_paths
 
 plugin_app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
@@ -38,11 +38,11 @@ def list_plugins(
     ] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
@@ -72,11 +72,11 @@ def inspect_plugin(
     ] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
@@ -109,11 +109,11 @@ def enable_plugin(
     ] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
@@ -156,11 +156,11 @@ def disable_plugin(
     ] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
@@ -186,11 +186,11 @@ def check_plugins(
     ] = False,
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Runtime mode: user, development, or portable."),
+        typer.Option("--mode", help="User data mode: user, development, or portable."),
     ] = None,
     home: Annotated[
         Path | None,
-        typer.Option("--home", help="Override runtime root for this command."),
+        typer.Option("--home", help="Override Singularity home for this command."),
     ] = None,
     project_root: ProjectRootOption = None,
 ) -> None:
@@ -235,12 +235,12 @@ def check_plugins(
 def _discover(
     project_root: Path,
     *,
-    mode: RuntimeMode | str | None,
+    mode: UserDataMode | str | None,
     home: Path | str | None,
 ) -> list[DiscoveredPlugin]:
     return discover_plugins(
         project_root,
-        runtime_paths=resolve_runtime_paths(mode=mode, home=home, project_root=project_root),
+        runtime_paths=resolve_user_data_paths(mode=mode, home=home, project_root=project_root),
     )
 
 
@@ -269,10 +269,10 @@ def _emit_management_trace(
     event_type: TraceEventType,
     plugin: DiscoveredPlugin,
 ) -> None:
-    trace = TraceRuntime.create(project_root)
+    trace = TraceRecorder.create(project_root)
     trace.emit(
         event_type,
-        runtime="plugin",
+        component="plugin",
         summary=f"Plugin {plugin.manifest.id} management state changed.",
         payload={
             "plugin_id": plugin.manifest.id,

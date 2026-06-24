@@ -6,21 +6,21 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from singularity.command import CommandPurpose, CommandRequest, CommandRuntime
+from singularity.command import CommandPurpose, CommandRequest, CommandExecutor
 from singularity.context import ContextManager
 from singularity.kernel.cancellation import CancellationManager, CancellationToken
 from singularity.kernel.exceptions import CancellationError
 from singularity.kernel.models import CancellationReason
-from singularity.model import MockModelProvider, ModelRuntime, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResult, ModelTurnStatus
-from singularity.planner import PlannerRuntime
-from singularity.review import ReviewRuntime
-from singularity.sandbox import SandboxRuntime
-from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
-from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.model import MockModelProvider, ModelRunner, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResult, ModelTurnStatus
+from singularity.planner import Planner
+from singularity.review import ReviewPipeline
+from singularity.sandbox import SandboxManager
+from singularity.tool_protocol.engine import ToolProtocolEngine
+from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
 from singularity.tools.models import PermissionLevel, ToolResult, ToolSpec
-from singularity.verification import VerificationRuntime
-from tests.test_sandbox_runtime import sandbox_request
-from tests.tool_runtime_helpers import make_test_policy_runtime
+from singularity.verification import VerificationRunner
+from tests.test_sandbox_manager import sandbox_request
+from tests.tool_executor_helpers import make_test_policy_engine
 
 
 def test_cancellation_token_raises_after_cancel() -> None:
@@ -57,19 +57,19 @@ def test_cancellation_manager_cancels_root_and_children() -> None:
     assert child.reason == CancellationReason.POLICY_ABORT
 
 
-def test_model_runtime_checks_cancellation_before_provider_call(tmp_path: Path) -> None:
+def test_model_runner_checks_cancellation_before_provider_call(tmp_path: Path) -> None:
     provider = MockModelProvider(text="should not run")
-    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
-    runtime.cancellation_token = _cancelled_token()
+    component = ModelRunner.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    component.cancellation_token = _cancelled_token()
 
     with pytest.raises(CancellationError):
-        runtime.run_turn(ModelTurnRequest.simple(messages=[]))
+        component.run_turn(ModelTurnRequest.simple(messages=[]))
 
     assert provider.complete_calls == 0
 
 
-def test_planner_runtime_checks_cancellation_before_step(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+def test_planner_checks_cancellation_before_step(tmp_path: Path) -> None:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("inspect")
     planner.cancellation_token = _cancelled_token()
 
@@ -77,12 +77,12 @@ def test_planner_runtime_checks_cancellation_before_step(tmp_path: Path) -> None
         planner.step()
 
 
-def test_command_runtime_checks_cancellation_before_start(tmp_path: Path) -> None:
-    runtime = CommandRuntime(tmp_path)
-    runtime.cancellation_token = _cancelled_token()
+def test_command_executor_checks_cancellation_before_start(tmp_path: Path) -> None:
+    component = CommandExecutor(tmp_path)
+    component.cancellation_token = _cancelled_token()
 
     with pytest.raises(CancellationError):
-        runtime.run(
+        component.run(
             CommandRequest(
                 argv=[sys.executable, "-c", "print('should not run')"],
                 cwd=".",
@@ -91,24 +91,24 @@ def test_command_runtime_checks_cancellation_before_start(tmp_path: Path) -> Non
         )
 
 
-def test_sandbox_runtime_checks_cancellation_before_backend(tmp_path: Path) -> None:
-    runtime = SandboxRuntime(tmp_path)
-    runtime.cancellation_token = _cancelled_token()
+def test_sandbox_manager_checks_cancellation_before_backend(tmp_path: Path) -> None:
+    component = SandboxManager(tmp_path)
+    component.cancellation_token = _cancelled_token()
 
     with pytest.raises(CancellationError):
-        runtime.run(sandbox_request(tmp_path))
+        component.run(sandbox_request(tmp_path))
 
 
-def test_verification_runtime_checks_cancellation_before_running_plan(tmp_path: Path) -> None:
-    runtime = VerificationRuntime(tmp_path)
-    plan = runtime.plan_verification(changed_files=["README.md"], task_intent="docs")
-    runtime.cancellation_token = _cancelled_token()
+def test_verification_runner_checks_cancellation_before_running_plan(tmp_path: Path) -> None:
+    component = VerificationRunner(tmp_path)
+    plan = component.plan_verification(changed_files=["README.md"], task_intent="docs")
+    component.cancellation_token = _cancelled_token()
 
     with pytest.raises(CancellationError):
-        runtime.run_plan(plan.id)
+        component.run_plan(plan.id)
 
 
-def test_tool_runtime_checks_cancellation_before_handler(tmp_path: Path) -> None:
+def test_tool_executor_checks_cancellation_before_handler(tmp_path: Path) -> None:
     calls = []
 
     class EmptyInput(BaseModel):
@@ -124,24 +124,24 @@ def test_tool_runtime_checks_cancellation_before_handler(tmp_path: Path) -> None
             permission_level=PermissionLevel.READ_ONLY,
         )
     )
-    runtime = ToolRuntime(
+    component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.read_only(),
         trace=None,
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
-    runtime.cancellation_token = _cancelled_token()
+    component.cancellation_token = _cancelled_token()
 
     with pytest.raises(CancellationError):
-        runtime.execute_tool_call(
+        component.execute_tool_call(
             {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{}"}}
         )
 
     assert calls == []
 
 
-def test_tool_protocol_runtime_checks_cancellation_before_tool_handler(tmp_path: Path) -> None:
+def test_tool_tool_protocol_checks_cancellation_before_tool_handler(tmp_path: Path) -> None:
     calls = []
 
     class EmptyInput(BaseModel):
@@ -157,14 +157,14 @@ def test_tool_protocol_runtime_checks_cancellation_before_tool_handler(tmp_path:
             permission_level=PermissionLevel.READ_ONLY,
         )
     )
-    tool_runtime = ToolRuntime(
+    tool_executor = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.read_only(),
         trace=None,
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
-    protocol = ToolCallingProtocolRuntime(registry=registry, trace=None)
+    protocol = ToolProtocolEngine(registry=registry, trace=None)
     protocol.cancellation_token = _cancelled_token()
     context = ContextManager(system_prompt="system", user_goal="inspect")
     result = ModelTurnResult(
@@ -186,20 +186,20 @@ def test_tool_protocol_runtime_checks_cancellation_before_tool_handler(tmp_path:
         protocol.handle_model_turn_result(
             result,
             context=context,
-            tool_runtime=tool_runtime,
+            tool_executor=tool_executor,
             planner=None,
-            policy_runtime=None,
+            policy_engine=None,
         )
 
     assert calls == []
 
 
-def test_review_runtime_checks_cancellation_before_review(tmp_path: Path) -> None:
-    runtime = ReviewRuntime(tmp_path, enable_model_critic=False)
-    runtime.cancellation_token = _cancelled_token()
+def test_review_pipeline_checks_cancellation_before_review(tmp_path: Path) -> None:
+    component = ReviewPipeline(tmp_path, enable_model_critic=False)
+    component.cancellation_token = _cancelled_token()
 
     with pytest.raises(CancellationError):
-        runtime.post_verification_review(verification={"completion_assessment": {"status": "ready"}})
+        component.post_verification_review(verification={"completion_assessment": {"status": "ready"}})
 
 
 def _cancelled_token() -> CancellationToken:

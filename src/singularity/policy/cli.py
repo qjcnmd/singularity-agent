@@ -10,8 +10,8 @@ from rich.panel import Panel
 
 from singularity.cli_paths import resolve_project_root
 from singularity.policy.config import PolicyConfig
-from singularity.policy.engine import PolicyRuntime
-from singularity.policy.remote import RemoteApprovalRuntime
+from singularity.policy.engine import PolicyEngine
+from singularity.policy.remote import RemoteApprovalExchange
 
 
 approval_app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -37,7 +37,7 @@ def export_remote_request(
 ) -> None:
     """Export a policy request/decision pair for file-backed remote review."""
 
-    remote = RemoteApprovalRuntime(resolve_project_root(project_root))
+    remote = RemoteApprovalExchange(resolve_project_root(project_root))
     exported = remote.export_request_from_files(request_json, decision_json, output_path=output)
     _print(exported.to_dict(), json_output=json_output, title="remote approval request")
 
@@ -51,8 +51,8 @@ def import_remote_grant(
     """Import and register a file-backed remote approval grant."""
 
     project_root = resolve_project_root(project_root)
-    remote = RemoteApprovalRuntime(project_root)
-    policy = PolicyRuntime(PolicyConfig(workspace_root=project_root))
+    remote = RemoteApprovalExchange(project_root)
+    policy = PolicyEngine(PolicyConfig(workspace_root=project_root))
     grant = remote.register_grant(grant_json, policy)
     _print(
         {

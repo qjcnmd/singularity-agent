@@ -1,6 +1,6 @@
 # Tool Protocol Contract
 
-All model tool calls flow through `ToolCallingProtocolRuntime` and `ToolRuntime`. This contract is the stable bridge for future desktop resume, approval, and replay behavior.
+All model tool calls flow through `ToolProtocolEngine` and `ToolExecutor`. This contract is the stable bridge for future desktop resume, approval, and replay behavior.
 
 ## Input
 
@@ -70,7 +70,7 @@ Default execution is sequential. Read-only parallel execution is allowed only wh
 
 Side-effect tools are not parallelized. Mutation, command, verification, approval-required, unknown, and non-idempotent tools stay sequential.
 
-When a batch is scheduled as `parallel_readonly`, `ParallelToolExecutor` runs the read-only handlers concurrently and `ToolCallingProtocolRuntime` binds and appends results in the original tool-call order.
+When a batch is scheduled as `parallel_readonly`, `ParallelToolExecutor` runs the read-only handlers concurrently and `ToolProtocolEngine` binds and appends results in the original tool-call order.
 
 ## Pending Approval
 
@@ -78,11 +78,11 @@ When policy requires local review:
 
 - the tool record moves to `waiting_approval`
 - the turn result is `pending_approval`
-- the runtime reports `pending_approval_count`
+- the component reports `pending_approval_count`
 - next action is `resume_pending_approval`
 - no handler runs before a scoped grant exists
 
-Desktop must display approval from the policy requirement, not from model prose. Grant submission goes to RuntimeHost and is consumed by `PolicyRuntime`.
+Desktop must display approval from the policy requirement, not from model prose. Grant submission goes to AgentHost and is consumed by `PolicyEngine`.
 
 ## Replay
 
@@ -107,7 +107,7 @@ Resume must load:
 - succeeded-but-not-appended calls
 - assistant messages missing tool messages
 
-The runtime may append missing safe results, but it must not rerun side effects without an explicit replay contract.
+The component may append missing safe results, but it must not rerun side effects without an explicit replay contract.
 
 ## Strict Mode
 

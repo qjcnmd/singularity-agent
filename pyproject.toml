@@ -1,7 +1,7 @@
 [project]
 name = "singularity-agent"
 version = "0.1.0"
-description = "A production-oriented local coding agent runtime."
+description = "A production-oriented local coding agent harness."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -87,8 +87,8 @@ check_untyped_defs = false
 follow_imports = "skip"
 files = [
     "src/singularity/cli_paths.py",
-    "src/singularity/code_index/runtime.py",
-    "src/singularity/git_runtime",
+    "src/singularity/code_index/index.py",
+    "src/singularity/git_client",
     "src/singularity/model/providers.py",
     "src/singularity/tool_protocol/parallel.py",
 ]

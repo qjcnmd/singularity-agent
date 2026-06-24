@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from singularity.code_index import ProjectIndexRuntime
+from singularity.code_index import ProjectIndex
 from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.tools.models import (
     PermissionLevel,
@@ -45,42 +45,42 @@ class IndexNoInput(BaseModel):
 
 
 class CodeIndexToolHandlers:
-    def __init__(self, runtime: ProjectIndexRuntime) -> None:
-        self.runtime = runtime
+    def __init__(self, project_index: ProjectIndex) -> None:
+        self.component = project_index
 
     def relevant(self, args: IndexRelevantInput) -> dict[str, Any]:
         return {
-            "project_index": self.runtime.observation_for_goal(
+            "project_index": self.component.observation_for_goal(
                 args.goal,
                 hints=args.hints,
             )
         }
 
     def symbols(self, args: IndexSymbolsInput) -> dict[str, Any]:
-        return {"symbols": [symbol.to_dict() for symbol in self.runtime.find_symbols(args.query)[:50]]}
+        return {"symbols": [symbol.to_dict() for symbol in self.component.find_symbols(args.query)[:50]]}
 
     def explain(self, args: IndexNoInput) -> dict[str, Any]:
         _ = args
-        return {"project_index": self.runtime.explain()}
+        return {"project_index": self.component.explain()}
 
     def impact(self, args: IndexImpactInput) -> dict[str, Any]:
-        return {"impact": self.runtime.analyze_impact(args.paths).to_dict()}
+        return {"impact": self.component.analyze_impact(args.paths).to_dict()}
 
     def tests(self, args: IndexTestsInput) -> dict[str, Any]:
-        return {"test_impact": self.runtime.get_test_impact(args.changed_files).to_dict()}
+        return {"test_impact": self.component.get_test_impact(args.changed_files).to_dict()}
 
 
 def register_code_index_tools(
     registry: Any,
-    runtime: ProjectIndexRuntime | None = None,
+    project_index: ProjectIndex | None = None,
 ) -> None:
-    index_runtime = runtime or ProjectIndexRuntime(Path(registry.project_root))
-    handlers = CodeIndexToolHandlers(index_runtime)
+    project_index = project_index or ProjectIndex(Path(registry.project_root))
+    handlers = CodeIndexToolHandlers(project_index)
     for spec in (
         ToolSpec(
             name="index_relevant",
             version="0.1.0",
-            description="Find relevant files from the ProjectIndexRuntime without reading full file contents.",
+            description="Find relevant files from the ProjectIndex without reading full file contents.",
             input_model=IndexRelevantInput,
             handler=handlers.relevant,
             permission_level=PermissionLevel.READ_ONLY,
@@ -100,7 +100,7 @@ def register_code_index_tools(
         ToolSpec(
             name="index_symbols",
             version="0.1.0",
-            description="Search symbols from the ProjectIndexRuntime.",
+            description="Search symbols from the ProjectIndex.",
             input_model=IndexSymbolsInput,
             handler=handlers.symbols,
             permission_level=PermissionLevel.READ_ONLY,

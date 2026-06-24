@@ -12,7 +12,7 @@ LOW_LEVEL_INTERNAL_TOOLS = {
     "workspace_delete_file",
     "workspace_move_file",
 }
-COMMAND_RUNTIME_TOOLS = {
+COMMAND_EXECUTOR_TOOLS = {
     "run_command",
     "start_process",
     "read_process_output",
@@ -171,13 +171,13 @@ class ToolRouter:
                 "internal_tool_layer",
                 factors,
             )
-        if spec.name in COMMAND_RUNTIME_TOOLS:
+        if spec.name in COMMAND_EXECUTOR_TOOLS:
             return _record(
                 spec,
-                "command_runtime_indirect",
+                "command_executor_indirect",
                 risk_category,
                 phase,
-                "runtime_indirection",
+                "executor_indirection",
                 factors,
             )
         if spec.name not in phase_allowed_tool_names:

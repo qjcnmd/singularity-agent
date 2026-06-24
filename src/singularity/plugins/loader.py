@@ -110,7 +110,7 @@ class PluginLoader:
             return
         self.trace.emit(
             event_type,
-            runtime="plugin",
+            component="plugin",
             summary=summary,
             payload={
                 "plugin_id": plugin.manifest.id,

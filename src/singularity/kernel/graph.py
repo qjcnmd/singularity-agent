@@ -5,160 +5,160 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from singularity.command import CommandRuntime
-from singularity.config import ProductionRuntimeConfig
-from singularity.code_index import ProjectIndexRuntime
-from singularity.edit import EditRuntime
-from singularity.agent import SYSTEM_PROMPT
+from singularity.command import CommandExecutor
+from singularity.config import ProductionConfig
+from singularity.code_index import ProjectIndex
+from singularity.edit import EditExecutor
+from singularity.agent_loop import SYSTEM_PROMPT
 from singularity.context import ContextManager
-from singularity.evaluation import EvaluationRuntime
-from singularity.instructions import InstructionRuntime
-from singularity.interaction import InteractionMode, InteractionRuntime
+from singularity.evaluation import EvaluationHarness
+from singularity.instructions import PromptAssemblyPipeline
+from singularity.interaction import InteractionMode, InteractionController
 from singularity.model import (
     ModelProviderRegistry,
-    ModelRuntime,
+    ModelRunner,
     OpenAICompatibleModelProvider,
 )
-from singularity.memory import MemoryRuntime
-from singularity.observability import TraceRuntime
-from singularity.policy import ApprovalGate, ApprovalMode, PolicyRuntime
-from singularity.plugins import PluginRuntime
-from singularity.planner import PlannerRuntime, create_or_resume_planner
-from singularity.review import ReviewRuntime
-from singularity.sandbox import SandboxRuntime
-from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
+from singularity.memory import MemoryLearningPipeline
+from singularity.observability import TraceRecorder
+from singularity.policy import ApprovalGate, ApprovalMode, PolicyEngine
+from singularity.plugins import PluginManager
+from singularity.planner import Planner, create_or_resume_planner
+from singularity.review import ReviewPipeline
+from singularity.sandbox import SandboxManager
+from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tool_protocol.state import ToolProtocolStateStore
-from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
 from singularity.tools.command import register_command_tools
 from singularity.tools.code_index import register_code_index_tools
 from singularity.tools.edit import register_edit_tools
 from singularity.tools.mutation import register_mutation_tools
 from singularity.tools.verification import register_verification_tools
 from singularity.tools.workspace_state import register_workspace_state_tools
-from singularity.verification import VerificationRuntime
-from singularity.workspace import MutationRuntime
-from singularity.workspace_state import LocalWorkspaceStateRuntime, WorkspaceHealthReport
+from singularity.verification import VerificationRunner
+from singularity.workspace import WorkspaceMutationManager
+from singularity.workspace_state import WorkspaceStateManager, WorkspaceHealthReport
 
-from singularity.kernel.exceptions import RuntimeInitializationError
+from singularity.kernel.exceptions import AgentGraphInitializationError
 from singularity.kernel.models import (
-    RuntimeComponentName,
-    RuntimeComponentState,
+    ComponentName,
+    ComponentState,
     RunIdentity,
 )
 
 
-RUNTIME_INITIALIZATION_ORDER = [
-    RuntimeComponentName.CONFIGURATION,
-    RuntimeComponentName.OBSERVABILITY,
-    RuntimeComponentName.INTERACTION,
-    RuntimeComponentName.WORKSPACE_STATE,
-    RuntimeComponentName.PROJECT_INDEX,
-    RuntimeComponentName.MEMORY,
-    RuntimeComponentName.POLICY,
-    RuntimeComponentName.SANDBOX,
-    RuntimeComponentName.COMMAND,
-    RuntimeComponentName.MUTATION,
-    RuntimeComponentName.EDIT,
-    RuntimeComponentName.TOOLS,
-    RuntimeComponentName.PLUGINS,
-    RuntimeComponentName.TOOL_RUNTIME,
-    RuntimeComponentName.TOOL_PROTOCOL,
-    RuntimeComponentName.VERIFICATION,
-    RuntimeComponentName.REVIEW,
-    RuntimeComponentName.EVALUATION,
-    RuntimeComponentName.INSTRUCTIONS,
-    RuntimeComponentName.MODEL,
-    RuntimeComponentName.CONTEXT,
-    RuntimeComponentName.PLANNER,
+AGENT_COMPONENT_INITIALIZATION_ORDER = [
+    ComponentName.CONFIGURATION,
+    ComponentName.OBSERVABILITY,
+    ComponentName.INTERACTION,
+    ComponentName.WORKSPACE_STATE,
+    ComponentName.PROJECT_INDEX,
+    ComponentName.MEMORY,
+    ComponentName.POLICY,
+    ComponentName.SANDBOX,
+    ComponentName.COMMAND,
+    ComponentName.MUTATION,
+    ComponentName.EDIT,
+    ComponentName.TOOLS,
+    ComponentName.PLUGINS,
+    ComponentName.TOOL_EXECUTOR,
+    ComponentName.TOOL_PROTOCOL,
+    ComponentName.VERIFICATION,
+    ComponentName.REVIEW,
+    ComponentName.EVALUATION,
+    ComponentName.INSTRUCTIONS,
+    ComponentName.MODEL,
+    ComponentName.CONTEXT,
+    ComponentName.PLANNER,
 ]
 
 
 @dataclass
-class _RuntimeComponentMarker:
-    components: dict[RuntimeComponentName, RuntimeComponentState]
-    trace: TraceRuntime
+class _ComponentMarker:
+    components: dict[ComponentName, ComponentState]
+    trace: TraceRecorder
 
-    def mark(self, component: RuntimeComponentName) -> None:
-        self.components[component] = RuntimeComponentState.READY
+    def mark(self, component: ComponentName) -> None:
+        self.components[component] = ComponentState.READY
         self.trace.record(
-            "runtime.initialized",
-            {"component": component.value, "state": RuntimeComponentState.READY.value},
+            "component.initialized",
+            {"component": component.value, "state": ComponentState.READY.value},
         )
 
 
 @dataclass(frozen=True)
-class _InfraRuntimes:
-    interaction_runtime: InteractionRuntime
-    state_runtime: LocalWorkspaceStateRuntime
-    project_index_runtime: ProjectIndexRuntime
-    memory_runtime: MemoryRuntime
+class _InfraComponents:
+    interaction_controller: InteractionController
+    workspace_state_manager: WorkspaceStateManager
+    project_index: ProjectIndex
+    memory_pipeline: MemoryLearningPipeline
 
 
 @dataclass(frozen=True)
-class _PolicySandboxRuntimes:
-    policy_runtime: PolicyRuntime
+class _PolicySandboxComponents:
+    policy_engine: PolicyEngine
     approval_gate: ApprovalGate
-    sandbox_runtime: SandboxRuntime
+    sandbox_manager: SandboxManager
 
 
 @dataclass(frozen=True)
-class _ExecutionCoreRuntimes:
-    command_runtime: CommandRuntime
-    mutation_runtime: MutationRuntime
-    edit_runtime: EditRuntime
+class _ExecutionCoreComponents:
+    command_executor: CommandExecutor
+    mutation_manager: WorkspaceMutationManager
+    edit_executor: EditExecutor
 
 
 @dataclass(frozen=True)
-class _ToolProtocolRuntimes:
+class _ToolProtocolEngines:
     tools: ToolRegistry
-    plugin_runtime: PluginRuntime
-    tool_runtime: ToolRuntime
-    protocol_runtime: ToolCallingProtocolRuntime
+    plugin_manager: PluginManager
+    tool_executor: ToolExecutor
+    tool_protocol: ToolProtocolEngine
 
 
 @dataclass(frozen=True)
-class _VerificationReviewRuntimes:
-    verification_runtime: VerificationRuntime
-    review_runtime: ReviewRuntime
+class _VerificationReviewPipelines:
+    verification_runner: VerificationRunner
+    review_pipeline: ReviewPipeline
 
 
 @dataclass(frozen=True)
-class _ModelContextRuntimes:
-    instruction_runtime: InstructionRuntime
-    model_runtime: ModelRuntime
+class _ModelContextComponents:
+    prompt_assembly: PromptAssemblyPipeline
+    model_runner: ModelRunner
     context_manager: ContextManager
 
 
 @dataclass
-class RuntimeGraph:
-    config: ProductionRuntimeConfig
-    trace: TraceRuntime
-    interaction_runtime: InteractionRuntime
-    workspace_state: LocalWorkspaceStateRuntime
-    project_index_runtime: ProjectIndexRuntime
-    memory_runtime: MemoryRuntime
-    policy_runtime: PolicyRuntime
+class AgentGraph:
+    config: ProductionConfig
+    trace: TraceRecorder
+    interaction_controller: InteractionController
+    workspace_state: WorkspaceStateManager
+    project_index: ProjectIndex
+    memory_pipeline: MemoryLearningPipeline
+    policy_engine: PolicyEngine
     approval_gate: ApprovalGate
-    sandbox_runtime: SandboxRuntime
-    command_runtime: CommandRuntime
-    mutation_runtime: MutationRuntime
-    edit_runtime: EditRuntime
+    sandbox_manager: SandboxManager
+    command_executor: CommandExecutor
+    mutation_manager: WorkspaceMutationManager
+    edit_executor: EditExecutor
     tools: ToolRegistry
-    plugin_runtime: PluginRuntime
-    verification_runtime: VerificationRuntime
-    review_runtime: ReviewRuntime
-    instruction_runtime: InstructionRuntime
-    model_runtime: ModelRuntime
+    plugin_manager: PluginManager
+    verification_runner: VerificationRunner
+    review_pipeline: ReviewPipeline
+    prompt_assembly: PromptAssemblyPipeline
+    model_runner: ModelRunner
     context_manager: ContextManager
-    tool_runtime: ToolRuntime
-    protocol_runtime: ToolCallingProtocolRuntime
-    planner: PlannerRuntime
-    initialization_order: list[RuntimeComponentName] = field(
-        default_factory=lambda: list(RUNTIME_INITIALIZATION_ORDER)
+    tool_executor: ToolExecutor
+    tool_protocol: ToolProtocolEngine
+    planner: Planner
+    initialization_order: list[ComponentName] = field(
+        default_factory=lambda: list(AGENT_COMPONENT_INITIALIZATION_ORDER)
     )
-    components: dict[RuntimeComponentName, RuntimeComponentState] = field(default_factory=dict)
-    _evaluation_runtime: EvaluationRuntime | None = field(default=None, repr=False)
-    _evaluation_runtime_factory: Callable[[], EvaluationRuntime] | None = field(
+    components: dict[ComponentName, ComponentState] = field(default_factory=dict)
+    _evaluation_harness: EvaluationHarness | None = field(default=None, repr=False)
+    _evaluation_harness_factory: Callable[[], EvaluationHarness] | None = field(
         default=None,
         repr=False,
     )
@@ -167,129 +167,129 @@ class RuntimeGraph:
     def __post_init__(self) -> None:
         if not self.components:
             self.components = {
-                component: RuntimeComponentState.READY
+                component: ComponentState.READY
                 for component in self.initialization_order
             }
 
-    def state(self, component: RuntimeComponentName) -> RuntimeComponentState:
-        return self.components.get(component, RuntimeComponentState.PENDING)
+    def state(self, component: ComponentName) -> ComponentState:
+        return self.components.get(component, ComponentState.PENDING)
 
     @property
-    def evaluation_runtime(self) -> EvaluationRuntime:
-        if self._evaluation_runtime is not None:
-            return self._evaluation_runtime
-        if self._evaluation_runtime_factory is None:
-            raise RuntimeInitializationError(
-                "Evaluation runtime is not available.",
-                code="evaluation_runtime_unavailable",
+    def evaluation_harness(self) -> EvaluationHarness:
+        if self._evaluation_harness is not None:
+            return self._evaluation_harness
+        if self._evaluation_harness_factory is None:
+            raise AgentGraphInitializationError(
+                "EvaluationHarness is not available.",
+                code="evaluation_harness_unavailable",
             )
         try:
-            runtime = self._evaluation_runtime_factory()
+            evaluation_harness = self._evaluation_harness_factory()
         except Exception as exc:
-            self.components[RuntimeComponentName.EVALUATION] = RuntimeComponentState.FAILED
-            raise RuntimeInitializationError(
-                "Evaluation runtime initialization failed.",
-                code="evaluation_runtime_failed",
+            self.components[ComponentName.EVALUATION] = ComponentState.FAILED
+            raise AgentGraphInitializationError(
+                "EvaluationHarness initialization failed.",
+                code="evaluation_harness_failed",
                 details={"error_type": type(exc).__name__, "message": str(exc)},
             ) from exc
-        runtime.planner_runtime = self.planner
+        evaluation_harness.planner = self.planner
         if self._cancellation_token_factory is not None:
-            setattr(runtime, "cancellation_token", self._cancellation_token_factory())
+            setattr(evaluation_harness, "cancellation_token", self._cancellation_token_factory())
         else:
-            setattr(runtime, "cancellation_token", None)
-        self._evaluation_runtime = runtime
-        self._evaluation_runtime_factory = None
-        return runtime
+            setattr(evaluation_harness, "cancellation_token", None)
+        self._evaluation_harness = evaluation_harness
+        self._evaluation_harness_factory = None
+        return evaluation_harness
 
     def cancellation_targets(self) -> list[tuple[str, Any]]:
         targets: list[tuple[str, Any]] = [
             ("planner", self.planner),
-            ("model_runtime", self.model_runtime),
-            ("command_runtime", self.command_runtime),
-            ("sandbox_runtime", self.sandbox_runtime),
-            ("verification_runtime", self.verification_runtime),
-            ("edit_runtime", self.edit_runtime),
-            ("review_runtime", self.review_runtime),
-            ("tool_runtime", self.tool_runtime),
-            ("protocol_runtime", self.protocol_runtime),
+            ("model_runner", self.model_runner),
+            ("command_executor", self.command_executor),
+            ("sandbox_manager", self.sandbox_manager),
+            ("verification_runner", self.verification_runner),
+            ("edit_executor", self.edit_executor),
+            ("review_pipeline", self.review_pipeline),
+            ("tool_executor", self.tool_executor),
+            ("tool_protocol", self.tool_protocol),
             ("context_manager", self.context_manager),
         ]
-        if self._evaluation_runtime is not None:
-            targets.append(("evaluation_runtime", self._evaluation_runtime))
+        if self._evaluation_harness is not None:
+            targets.append(("evaluation_harness", self._evaluation_harness))
         return targets
 
     def reset_cancellation_tokens(self) -> None:
         self._cancellation_token_factory = None
-        for _name, runtime in self.cancellation_targets():
-            setattr(runtime, "cancellation_token", None)
+        for _name, component in self.cancellation_targets():
+            setattr(component, "cancellation_token", None)
 
     def install_cancellation_tokens(self, token_factory: Callable[[], Any]) -> None:
         self._cancellation_token_factory = token_factory
-        for _name, runtime in self.cancellation_targets():
-            setattr(runtime, "cancellation_token", token_factory())
+        for _name, component in self.cancellation_targets():
+            setattr(component, "cancellation_token", token_factory())
 
     def components_for_health(self) -> dict[str, Any]:
         return {
             "config": self.config,
             "trace": self.trace,
-            "interaction": self.interaction_runtime,
+            "interaction": self.interaction_controller,
             "workspace": self.workspace_state,
-            "project_index": self.project_index_runtime,
-            "memory": self.memory_runtime,
-            "policy": self.policy_runtime,
-            "sandbox": self.sandbox_runtime,
-            "command": self.command_runtime,
-            "mutation": self.mutation_runtime,
-            "edit": self.edit_runtime,
+            "project_index": self.project_index,
+            "memory": self.memory_pipeline,
+            "policy": self.policy_engine,
+            "sandbox": self.sandbox_manager,
+            "command": self.command_executor,
+            "mutation": self.mutation_manager,
+            "edit": self.edit_executor,
             "tools": self.tools,
-            "plugins": self.plugin_runtime,
-            "tool_runtime": self.tool_runtime,
-            "tool_protocol": self.protocol_runtime,
-            "verification": self.verification_runtime,
-            "review": self.review_runtime,
-            "evaluation": self._evaluation_runtime or self._evaluation_runtime_factory,
-            "instructions": self.instruction_runtime,
-            "model": self.model_runtime,
+            "plugins": self.plugin_manager,
+            "tool_executor": self.tool_executor,
+            "tool_protocol": self.tool_protocol,
+            "verification": self.verification_runner,
+            "review": self.review_pipeline,
+            "evaluation": self._evaluation_harness or self._evaluation_harness_factory,
+            "instructions": self.prompt_assembly,
+            "model": self.model_runner,
             "context": self.context_manager,
             "planner": self.planner,
         }
 
 
-class RuntimeFactory:
+class AgentGraphBuilder:
     def build(
         self,
         *,
         project_root: Path,
-        config: ProductionRuntimeConfig,
-        trace: TraceRuntime,
+        config: ProductionConfig,
+        trace: TraceRecorder,
         identity: RunIdentity,
         user_goal: str,
         workspace_health: WorkspaceHealthReport | None = None,
-        interaction_runtime: InteractionRuntime | None = None,
-    ) -> RuntimeGraph:
+        interaction_controller: InteractionController | None = None,
+    ) -> AgentGraph:
         components = {
-            component: RuntimeComponentState.PENDING
-            for component in RUNTIME_INITIALIZATION_ORDER
+            component: ComponentState.PENDING
+            for component in AGENT_COMPONENT_INITIALIZATION_ORDER
         }
-        marker = _RuntimeComponentMarker(components=components, trace=trace)
+        marker = _ComponentMarker(components=components, trace=trace)
 
         try:
-            marker.mark(RuntimeComponentName.CONFIGURATION)
-            marker.mark(RuntimeComponentName.OBSERVABILITY)
+            marker.mark(ComponentName.CONFIGURATION)
+            marker.mark(ComponentName.OBSERVABILITY)
             infra = self._build_infra(
                 project_root=project_root,
                 config=config,
                 trace=trace,
                 identity=identity,
                 user_goal=user_goal,
-                interaction_runtime=interaction_runtime,
+                interaction_controller=interaction_controller,
                 marker=marker,
             )
             policy_sandbox = self._build_policy_sandbox(
                 project_root=project_root,
                 config=config,
                 trace=trace,
-                interaction_runtime=infra.interaction_runtime,
+                interaction_controller=infra.interaction_controller,
                 marker=marker,
             )
             execution_core = self._build_execution_core(
@@ -317,7 +317,7 @@ class RuntimeFactory:
                 tool_protocol=tool_protocol,
                 marker=marker,
             )
-            marker.mark(RuntimeComponentName.EVALUATION)
+            marker.mark(ComponentName.EVALUATION)
             model_context = self._build_model_context(
                 project_root=project_root,
                 config=config,
@@ -336,7 +336,7 @@ class RuntimeFactory:
                 identity=identity,
                 user_goal=user_goal,
                 workspace_health=workspace_health,
-                state_runtime=infra.state_runtime,
+                workspace_state_manager=infra.workspace_state_manager,
             )
             self._wire_planner(
                 planner=planner,
@@ -350,36 +350,36 @@ class RuntimeFactory:
             self._prime_planner_context(
                 user_goal=user_goal,
                 planner=planner,
-                project_index_runtime=infra.project_index_runtime,
-                memory_runtime=infra.memory_runtime,
+                project_index=infra.project_index,
+                memory_pipeline=infra.memory_pipeline,
                 context_manager=model_context.context_manager,
             )
 
-            graph = RuntimeGraph(
+            graph = AgentGraph(
                 config=config,
                 trace=trace,
-                interaction_runtime=infra.interaction_runtime,
-                workspace_state=infra.state_runtime,
-                project_index_runtime=infra.project_index_runtime,
-                memory_runtime=infra.memory_runtime,
-                policy_runtime=policy_sandbox.policy_runtime,
+                interaction_controller=infra.interaction_controller,
+                workspace_state=infra.workspace_state_manager,
+                project_index=infra.project_index,
+                memory_pipeline=infra.memory_pipeline,
+                policy_engine=policy_sandbox.policy_engine,
                 approval_gate=policy_sandbox.approval_gate,
-                sandbox_runtime=policy_sandbox.sandbox_runtime,
-                command_runtime=execution_core.command_runtime,
-                mutation_runtime=execution_core.mutation_runtime,
-                edit_runtime=execution_core.edit_runtime,
+                sandbox_manager=policy_sandbox.sandbox_manager,
+                command_executor=execution_core.command_executor,
+                mutation_manager=execution_core.mutation_manager,
+                edit_executor=execution_core.edit_executor,
                 tools=tool_protocol.tools,
-                plugin_runtime=tool_protocol.plugin_runtime,
-                verification_runtime=verification_review.verification_runtime,
-                review_runtime=verification_review.review_runtime,
-                instruction_runtime=model_context.instruction_runtime,
-                model_runtime=model_context.model_runtime,
+                plugin_manager=tool_protocol.plugin_manager,
+                verification_runner=verification_review.verification_runner,
+                review_pipeline=verification_review.review_pipeline,
+                prompt_assembly=model_context.prompt_assembly,
+                model_runner=model_context.model_runner,
                 context_manager=model_context.context_manager,
-                tool_runtime=tool_protocol.tool_runtime,
-                protocol_runtime=tool_protocol.protocol_runtime,
+                tool_executor=tool_protocol.tool_executor,
+                tool_protocol=tool_protocol.tool_protocol,
                 planner=planner,
                 components=components,
-                _evaluation_runtime_factory=self._evaluation_runtime_factory(
+                _evaluation_harness_factory=self._evaluation_harness_factory(
                     project_root=project_root,
                     trace=trace,
                     infra=infra,
@@ -390,13 +390,13 @@ class RuntimeFactory:
                 ),
             )
             graph.reset_cancellation_tokens()
-            marker.mark(RuntimeComponentName.PLANNER)
+            marker.mark(ComponentName.PLANNER)
             return graph
         except Exception as exc:
             self._mark_first_pending_failed(components)
-            raise RuntimeInitializationError(
-                "Runtime graph initialization failed.",
-                code="runtime_graph_failed",
+            raise AgentGraphInitializationError(
+                "Agent graph initialization failed.",
+                code="agent_graph_failed",
                 details={"error_type": type(exc).__name__, "message": str(exc)},
             ) from exc
 
@@ -404,240 +404,240 @@ class RuntimeFactory:
         self,
         *,
         project_root: Path,
-        config: ProductionRuntimeConfig,
-        trace: TraceRuntime,
+        config: ProductionConfig,
+        trace: TraceRecorder,
         identity: RunIdentity,
         user_goal: str,
-        interaction_runtime: InteractionRuntime | None,
-        marker: _RuntimeComponentMarker,
-    ) -> _InfraRuntimes:
-        if interaction_runtime is None:
+        interaction_controller: InteractionController | None,
+        marker: _ComponentMarker,
+    ) -> _InfraComponents:
+        if interaction_controller is None:
             interaction_mode = (
                 InteractionMode.NON_INTERACTIVE
                 if config.approval_mode == ApprovalMode.NON_INTERACTIVE
                 else config.interaction_mode
             )
-            interaction_runtime = InteractionRuntime(
+            interaction_controller = InteractionController(
                 mode=interaction_mode,
                 trace=trace,
             )
         if hasattr(trace, "set_interaction_sink"):
-            trace.set_interaction_sink(interaction_runtime.consume_trace_event)
-        marker.mark(RuntimeComponentName.INTERACTION)
+            trace.set_interaction_sink(interaction_controller.consume_trace_event)
+        marker.mark(ComponentName.INTERACTION)
 
-        state_runtime = LocalWorkspaceStateRuntime(project_root, trace=trace)
+        workspace_state_manager = WorkspaceStateManager(project_root, trace=trace)
         if config.resume_session:
-            state_runtime.recover_session(config.resume_session)
+            workspace_state_manager.recover_session(config.resume_session)
         else:
-            state_runtime.begin_session(task_id=identity.task_id, session_id=identity.session_id)
-        marker.mark(RuntimeComponentName.WORKSPACE_STATE)
+            workspace_state_manager.begin_session(task_id=identity.task_id, session_id=identity.session_id)
+        marker.mark(ComponentName.WORKSPACE_STATE)
 
-        project_index_runtime = ProjectIndexRuntime(
+        project_index = ProjectIndex(
             project_root,
             trace=trace,
             config=config.to_project_index_config(),
         )
         if config.project_index_enabled:
-            project_index_runtime.bootstrap(reason="kernel_boot")
-        marker.mark(RuntimeComponentName.PROJECT_INDEX)
+            project_index.bootstrap(reason="kernel_boot")
+        marker.mark(ComponentName.PROJECT_INDEX)
 
-        memory_runtime = MemoryRuntime(project_root, trace=trace)
-        memory_runtime.start_session(session_id=identity.session_id, user_goal=user_goal)
-        marker.mark(RuntimeComponentName.MEMORY)
+        memory_pipeline = MemoryLearningPipeline(project_root, trace=trace)
+        memory_pipeline.start_session(session_id=identity.session_id, user_goal=user_goal)
+        marker.mark(ComponentName.MEMORY)
 
-        return _InfraRuntimes(
-            interaction_runtime=interaction_runtime,
-            state_runtime=state_runtime,
-            project_index_runtime=project_index_runtime,
-            memory_runtime=memory_runtime,
+        return _InfraComponents(
+            interaction_controller=interaction_controller,
+            workspace_state_manager=workspace_state_manager,
+            project_index=project_index,
+            memory_pipeline=memory_pipeline,
         )
 
     def _build_policy_sandbox(
         self,
         *,
         project_root: Path,
-        config: ProductionRuntimeConfig,
-        trace: TraceRuntime,
-        interaction_runtime: InteractionRuntime,
-        marker: _RuntimeComponentMarker,
-    ) -> _PolicySandboxRuntimes:
+        config: ProductionConfig,
+        trace: TraceRecorder,
+        interaction_controller: InteractionController,
+        marker: _ComponentMarker,
+    ) -> _PolicySandboxComponents:
         policy_config = config.to_policy_config()
-        policy_runtime = PolicyRuntime(policy_config, trace=trace)
+        policy_engine = PolicyEngine(policy_config, trace=trace)
         approval_gate = ApprovalGate(
             policy_config,
             trace=trace,
-            interaction=interaction_runtime,
+            interaction=interaction_controller,
         )
-        marker.mark(RuntimeComponentName.POLICY)
+        marker.mark(ComponentName.POLICY)
 
-        sandbox_runtime = SandboxRuntime(
+        sandbox_manager = SandboxManager(
             project_root,
             trace=trace,
             security_mode=config.security_mode,
         )
-        marker.mark(RuntimeComponentName.SANDBOX)
+        marker.mark(ComponentName.SANDBOX)
 
-        return _PolicySandboxRuntimes(
-            policy_runtime=policy_runtime,
+        return _PolicySandboxComponents(
+            policy_engine=policy_engine,
             approval_gate=approval_gate,
-            sandbox_runtime=sandbox_runtime,
+            sandbox_manager=sandbox_manager,
         )
 
     def _build_execution_core(
         self,
         *,
         project_root: Path,
-        trace: TraceRuntime,
-        infra: _InfraRuntimes,
-        policy_sandbox: _PolicySandboxRuntimes,
-        marker: _RuntimeComponentMarker,
-    ) -> _ExecutionCoreRuntimes:
-        command_runtime = CommandRuntime(
+        trace: TraceRecorder,
+        infra: _InfraComponents,
+        policy_sandbox: _PolicySandboxComponents,
+        marker: _ComponentMarker,
+    ) -> _ExecutionCoreComponents:
+        command_executor = CommandExecutor(
             project_root,
             trace=trace,
-            state_runtime=infra.state_runtime,
+            workspace_state_manager=infra.workspace_state_manager,
             planner=None,
-            policy_runtime=policy_sandbox.policy_runtime,
-            sandbox_runtime=policy_sandbox.sandbox_runtime,
+            policy_engine=policy_sandbox.policy_engine,
+            sandbox_manager=policy_sandbox.sandbox_manager,
         )
-        marker.mark(RuntimeComponentName.COMMAND)
+        marker.mark(ComponentName.COMMAND)
 
-        mutation_runtime = MutationRuntime(
+        mutation_manager = WorkspaceMutationManager(
             project_root,
             trace=trace,
-            state_runtime=infra.state_runtime,
+            workspace_state_manager=infra.workspace_state_manager,
             planner=None,
-            policy_runtime=policy_sandbox.policy_runtime,
-            project_index_runtime=infra.project_index_runtime,
+            policy_engine=policy_sandbox.policy_engine,
+            project_index=infra.project_index,
         )
-        marker.mark(RuntimeComponentName.MUTATION)
+        marker.mark(ComponentName.MUTATION)
 
-        edit_runtime = EditRuntime(
+        edit_executor = EditExecutor(
             project_root,
-            mutation_runtime=mutation_runtime,
-            project_index_runtime=infra.project_index_runtime,
+            mutation_manager=mutation_manager,
+            project_index=infra.project_index,
             trace=trace,
         )
-        marker.mark(RuntimeComponentName.EDIT)
+        marker.mark(ComponentName.EDIT)
 
-        return _ExecutionCoreRuntimes(
-            command_runtime=command_runtime,
-            mutation_runtime=mutation_runtime,
-            edit_runtime=edit_runtime,
+        return _ExecutionCoreComponents(
+            command_executor=command_executor,
+            mutation_manager=mutation_manager,
+            edit_executor=edit_executor,
         )
 
     def _build_tools_protocol(
         self,
         *,
         project_root: Path,
-        config: ProductionRuntimeConfig,
-        trace: TraceRuntime,
-        infra: _InfraRuntimes,
-        policy_sandbox: _PolicySandboxRuntimes,
-        execution_core: _ExecutionCoreRuntimes,
-        marker: _RuntimeComponentMarker,
-    ) -> _ToolProtocolRuntimes:
+        config: ProductionConfig,
+        trace: TraceRecorder,
+        infra: _InfraComponents,
+        policy_sandbox: _PolicySandboxComponents,
+        execution_core: _ExecutionCoreComponents,
+        marker: _ComponentMarker,
+    ) -> _ToolProtocolEngines:
         tools = ToolRegistry(project_root)
-        register_mutation_tools(tools, execution_core.mutation_runtime)
-        register_edit_tools(tools, execution_core.edit_runtime)
-        register_command_tools(tools, execution_core.command_runtime)
-        register_workspace_state_tools(tools, infra.state_runtime)
-        register_code_index_tools(tools, infra.project_index_runtime)
-        marker.mark(RuntimeComponentName.TOOLS)
+        register_mutation_tools(tools, execution_core.mutation_manager)
+        register_edit_tools(tools, execution_core.edit_executor)
+        register_command_tools(tools, execution_core.command_executor)
+        register_workspace_state_tools(tools, infra.workspace_state_manager)
+        register_code_index_tools(tools, infra.project_index)
+        marker.mark(ComponentName.TOOLS)
 
-        plugin_runtime = PluginRuntime(project_root, trace=trace)
-        plugin_runtime.activate(
+        plugin_manager = PluginManager(project_root, trace=trace)
+        plugin_manager.activate(
             registry=tools,
-            policy_runtime=policy_sandbox.policy_runtime,
+            policy_engine=policy_sandbox.policy_engine,
         )
-        marker.mark(RuntimeComponentName.PLUGINS)
+        marker.mark(ComponentName.PLUGINS)
 
-        tool_runtime = ToolRuntime(
+        tool_executor = ToolExecutor(
             registry=tools,
             policy=ToolPolicy.coding_agent(),
             trace=trace,
             workspace_root=project_root,
             planner=None,
-            policy_runtime=policy_sandbox.policy_runtime,
+            policy_engine=policy_sandbox.policy_engine,
             approval_gate=policy_sandbox.approval_gate,
             dry_run=config.dry_run,
         )
-        marker.mark(RuntimeComponentName.TOOL_RUNTIME)
+        marker.mark(ComponentName.TOOL_EXECUTOR)
 
-        protocol_runtime = ToolCallingProtocolRuntime(
+        tool_protocol = ToolProtocolEngine(
             registry=tools,
             trace=trace,
             state_store=ToolProtocolStateStore(trace.store.run_dir / "tool_protocol.sqlite3"),
-            workspace_state_hook=_workspace_state_context_hook(infra.state_runtime),
+            workspace_state_hook=_workspace_state_context_hook(infra.workspace_state_manager),
         )
-        marker.mark(RuntimeComponentName.TOOL_PROTOCOL)
+        marker.mark(ComponentName.TOOL_PROTOCOL)
 
-        return _ToolProtocolRuntimes(
+        return _ToolProtocolEngines(
             tools=tools,
-            plugin_runtime=plugin_runtime,
-            tool_runtime=tool_runtime,
-            protocol_runtime=protocol_runtime,
+            plugin_manager=plugin_manager,
+            tool_executor=tool_executor,
+            tool_protocol=tool_protocol,
         )
 
     def _build_verification_review(
         self,
         *,
         project_root: Path,
-        trace: TraceRuntime,
-        infra: _InfraRuntimes,
-        policy_sandbox: _PolicySandboxRuntimes,
-        execution_core: _ExecutionCoreRuntimes,
-        tool_protocol: _ToolProtocolRuntimes,
-        marker: _RuntimeComponentMarker,
-    ) -> _VerificationReviewRuntimes:
-        verification_runtime = VerificationRuntime(
+        trace: TraceRecorder,
+        infra: _InfraComponents,
+        policy_sandbox: _PolicySandboxComponents,
+        execution_core: _ExecutionCoreComponents,
+        tool_protocol: _ToolProtocolEngines,
+        marker: _ComponentMarker,
+    ) -> _VerificationReviewPipelines:
+        verification_runner = VerificationRunner(
             project_root,
-            command_runtime=execution_core.command_runtime,
+            command_executor=execution_core.command_executor,
             trace=trace,
             planner=None,
-            policy_runtime=policy_sandbox.policy_runtime,
-            project_index_runtime=infra.project_index_runtime,
+            policy_engine=policy_sandbox.policy_engine,
+            project_index=infra.project_index,
         )
-        register_verification_tools(tool_protocol.tools, verification_runtime)
-        execution_core.edit_runtime.verification_runtime = verification_runtime
-        marker.mark(RuntimeComponentName.VERIFICATION)
+        register_verification_tools(tool_protocol.tools, verification_runner)
+        execution_core.edit_executor.verification_runner = verification_runner
+        marker.mark(ComponentName.VERIFICATION)
 
-        review_runtime = ReviewRuntime(
+        review_pipeline = ReviewPipeline(
             project_root,
             trace=trace,
-            project_index_runtime=infra.project_index_runtime,
-            policy_runtime=policy_sandbox.policy_runtime,
-            model_runtime=None,
-            memory_runtime=infra.memory_runtime,
+            project_index=infra.project_index,
+            policy_engine=policy_sandbox.policy_engine,
+            model_runner=None,
+            memory_pipeline=infra.memory_pipeline,
         )
-        execution_core.edit_runtime.review_runtime = review_runtime
-        verification_runtime.review_runtime = review_runtime
-        verification_runtime.memory_runtime = infra.memory_runtime
-        marker.mark(RuntimeComponentName.REVIEW)
+        execution_core.edit_executor.review_pipeline = review_pipeline
+        verification_runner.review_pipeline = review_pipeline
+        verification_runner.memory_pipeline = infra.memory_pipeline
+        marker.mark(ComponentName.REVIEW)
 
-        return _VerificationReviewRuntimes(
-            verification_runtime=verification_runtime,
-            review_runtime=review_runtime,
+        return _VerificationReviewPipelines(
+            verification_runner=verification_runner,
+            review_pipeline=review_pipeline,
         )
 
     def _build_model_context(
         self,
         *,
         project_root: Path,
-        config: ProductionRuntimeConfig,
-        trace: TraceRuntime,
+        config: ProductionConfig,
+        trace: TraceRecorder,
         identity: RunIdentity,
         user_goal: str,
-        execution_core: _ExecutionCoreRuntimes,
-        tool_protocol: _ToolProtocolRuntimes,
-        verification_review: _VerificationReviewRuntimes,
-        marker: _RuntimeComponentMarker,
-    ) -> _ModelContextRuntimes:
-        instruction_runtime = InstructionRuntime(workspace_root=project_root, trace=trace)
-        marker.mark(RuntimeComponentName.INSTRUCTIONS)
+        execution_core: _ExecutionCoreComponents,
+        tool_protocol: _ToolProtocolEngines,
+        verification_review: _VerificationReviewPipelines,
+        marker: _ComponentMarker,
+    ) -> _ModelContextComponents:
+        prompt_assembly = PromptAssemblyPipeline(workspace_root=project_root, trace=trace)
+        marker.mark(ComponentName.INSTRUCTIONS)
 
         settings = config.to_settings()
-        model_config = config.to_model_runtime_config()
+        model_config = config.to_model_runner_config()
         model_provider = OpenAICompatibleModelProvider(
             settings,
             timeout_seconds=model_config.request_timeout_seconds,
@@ -646,32 +646,32 @@ class RuntimeFactory:
             default_provider_name=model_config.default_provider
         )
         model_registry.register(model_provider)
-        model_runtime = ModelRuntime(
+        model_runner = ModelRunner(
             registry=model_registry,
             tool_registry=tool_protocol.tools,
             config=model_config,
             trace=trace,
         )
-        verification_review.review_runtime.model_runtime = model_runtime
-        marker.mark(RuntimeComponentName.MODEL)
+        verification_review.review_pipeline.model_runner = model_runner
+        marker.mark(ComponentName.MODEL)
 
         context_manager = ContextManager(
             system_prompt=SYSTEM_PROMPT,
             user_goal=user_goal,
             provider=None,
-            model_runtime=model_runtime,
+            model_runner=model_runner,
             run_id=identity.run_id,
             session_id=identity.session_id,
             task_id=identity.task_id,
             db_path=config.context_db_path(trace.store.run_dir),
             trace=trace,
         )
-        execution_core.edit_runtime.context_manager = context_manager
-        marker.mark(RuntimeComponentName.CONTEXT)
+        execution_core.edit_executor.context_manager = context_manager
+        marker.mark(ComponentName.CONTEXT)
 
-        return _ModelContextRuntimes(
-            instruction_runtime=instruction_runtime,
-            model_runtime=model_runtime,
+        return _ModelContextComponents(
+            prompt_assembly=prompt_assembly,
+            model_runner=model_runner,
             context_manager=context_manager,
         )
 
@@ -679,63 +679,63 @@ class RuntimeFactory:
         self,
         *,
         project_root: Path,
-        config: ProductionRuntimeConfig,
-        trace: TraceRuntime,
+        config: ProductionConfig,
+        trace: TraceRecorder,
         identity: RunIdentity,
         user_goal: str,
         workspace_health: WorkspaceHealthReport | None,
-        state_runtime: LocalWorkspaceStateRuntime,
-    ) -> PlannerRuntime:
+        workspace_state_manager: WorkspaceStateManager,
+    ) -> Planner:
         return create_or_resume_planner(
             workspace_root=project_root,
             session_id=config.resume_session,
             task_id=identity.task_id,
             user_goal=user_goal,
             trace=trace,
-            workspace_health=workspace_health or state_runtime.get_workspace_health(),
+            workspace_health=workspace_health or workspace_state_manager.get_workspace_health(),
             fallback_session_id=identity.session_id,
         )
 
     @staticmethod
     def _wire_planner(
         *,
-        planner: PlannerRuntime,
-        config: ProductionRuntimeConfig,
-        infra: _InfraRuntimes,
-        policy_sandbox: _PolicySandboxRuntimes,
-        execution_core: _ExecutionCoreRuntimes,
-        tool_protocol: _ToolProtocolRuntimes,
-        verification_review: _VerificationReviewRuntimes,
+        planner: Planner,
+        config: ProductionConfig,
+        infra: _InfraComponents,
+        policy_sandbox: _PolicySandboxComponents,
+        execution_core: _ExecutionCoreComponents,
+        tool_protocol: _ToolProtocolEngines,
+        verification_review: _VerificationReviewPipelines,
     ) -> None:
-        planner.project_index_runtime = infra.project_index_runtime
-        planner.memory_runtime = infra.memory_runtime
+        planner.project_index = infra.project_index
+        planner.memory_pipeline = infra.memory_pipeline
         if planner.state is not None:
             planner.record_sandbox_capability(
-                policy_sandbox.sandbox_runtime.capability_summary(
+                policy_sandbox.sandbox_manager.capability_summary(
                     approval_mode=config.approval_mode.value,
                 )
             )
-        execution_core.command_runtime.planner = planner
-        execution_core.mutation_runtime.planner = planner
-        verification_review.verification_runtime.planner = planner
-        execution_core.edit_runtime.planner = planner
-        verification_review.review_runtime.planner = planner
-        planner.review_runtime = verification_review.review_runtime
-        tool_protocol.tool_runtime.planner = planner
+        execution_core.command_executor.planner = planner
+        execution_core.mutation_manager.planner = planner
+        verification_review.verification_runner.planner = planner
+        execution_core.edit_executor.planner = planner
+        verification_review.review_pipeline.planner = planner
+        planner.review_pipeline = verification_review.review_pipeline
+        tool_protocol.tool_executor.planner = planner
 
     @staticmethod
     def _prime_planner_context(
         *,
         user_goal: str,
-        planner: PlannerRuntime,
-        project_index_runtime: ProjectIndexRuntime,
-        memory_runtime: MemoryRuntime,
+        planner: Planner,
+        project_index: ProjectIndex,
+        memory_pipeline: MemoryLearningPipeline,
         context_manager: ContextManager,
     ) -> None:
-        index_observation = project_index_runtime.observation_for_goal(user_goal)
+        index_observation = project_index.observation_for_goal(user_goal)
         context_manager.add_project_index(index_observation)
         planner.record_project_index_observation(index_observation)
-        memory_block = memory_runtime.context_block(
+        memory_block = memory_pipeline.context_block(
             goal=user_goal,
             max_items=6,
             token_budget=512,
@@ -744,44 +744,44 @@ class RuntimeFactory:
             context_manager.add_memory_context_block(memory_block)
 
     @staticmethod
-    def _evaluation_runtime_factory(
+    def _evaluation_harness_factory(
         *,
         project_root: Path,
-        trace: TraceRuntime,
-        infra: _InfraRuntimes,
-        execution_core: _ExecutionCoreRuntimes,
-        tool_protocol: _ToolProtocolRuntimes,
-        verification_review: _VerificationReviewRuntimes,
-        planner: PlannerRuntime,
-    ) -> Callable[[], EvaluationRuntime]:
-        def build_evaluation_runtime() -> EvaluationRuntime:
-            return EvaluationRuntime(
+        trace: TraceRecorder,
+        infra: _InfraComponents,
+        execution_core: _ExecutionCoreComponents,
+        tool_protocol: _ToolProtocolEngines,
+        verification_review: _VerificationReviewPipelines,
+        planner: Planner,
+    ) -> Callable[[], EvaluationHarness]:
+        def build_evaluation_harness() -> EvaluationHarness:
+            return EvaluationHarness(
                 project_root=project_root,
-                trace_runtime=trace,
-                verification_runtime=verification_review.verification_runtime,
-                memory_runtime=infra.memory_runtime,
-                planner_runtime=planner,
-                tool_runtime=tool_protocol.tool_runtime,
-                command_runtime=execution_core.command_runtime,
-                mutation_runtime=execution_core.mutation_runtime,
+                trace_recorder=trace,
+                verification_runner=verification_review.verification_runner,
+                memory_pipeline=infra.memory_pipeline,
+                planner=planner,
+                tool_executor=tool_protocol.tool_executor,
+                command_executor=execution_core.command_executor,
+                mutation_manager=execution_core.mutation_manager,
             )
 
-        return build_evaluation_runtime
+        return build_evaluation_harness
 
     @staticmethod
     def _mark_first_pending_failed(
-        components: dict[RuntimeComponentName, RuntimeComponentState],
+        components: dict[ComponentName, ComponentState],
     ) -> None:
         for component, state in list(components.items()):
-            if state == RuntimeComponentState.PENDING:
-                components[component] = RuntimeComponentState.FAILED
+            if state == ComponentState.PENDING:
+                components[component] = ComponentState.FAILED
                 break
 
 
-def _workspace_state_context_hook(state_runtime: LocalWorkspaceStateRuntime):
+def _workspace_state_context_hook(workspace_state_manager: WorkspaceStateManager):
     def hook(context, *, batch, tool_call_id: str | None) -> None:
         _ = batch, tool_call_id
-        state_runtime.record_external_changes()
-        context.add_workspace_state(state_runtime.get_workspace_health().to_observation())
+        workspace_state_manager.record_external_changes()
+        context.add_workspace_state(workspace_state_manager.get_workspace_health().to_observation())
 
     return hook

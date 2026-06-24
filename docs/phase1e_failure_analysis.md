@@ -9,14 +9,14 @@ Phase 1E adds structured failure analysis and repair planning after verification
 - `RepairPlan`
 - `RepairStep`
 - `NoProgressGuard`
-- `FailureAnalysisRuntime`
-- `RepairPlannerRuntime`
+- `FailureAnalysisPipeline`
+- `RepairPlanner`
 
-## Runtime Flow
+## Component Flow
 
-`VerificationRuntime.run_plan()` and `VerificationRuntime.rerun_check()` now build structured failure analysis for failed, blocked, timeout, and flaky checks.
+`VerificationRunner.run_plan()` and `VerificationRunner.rerun_check()` now build structured failure analysis for failed, blocked, timeout, and flaky checks.
 
-For each failed result, `FailureAnalysisRuntime` records:
+For each failed result, `FailureAnalysisPipeline` records:
 
 - failure type
 - root-cause hypothesis
@@ -25,7 +25,7 @@ For each failed result, `FailureAnalysisRuntime` records:
 - bound next verification command
 - no-progress guard state
 
-`RepairPlannerRuntime` converts one or more analyses into a `RepairPlan` with repair steps and a required `next_verification` command. If any analysis trips the no-progress guard, the repair strategy becomes `stop_and_ask`.
+`RepairPlanner` converts one or more analyses into a `RepairPlan` with repair steps and a required `next_verification` command. If any analysis trips the no-progress guard, the repair strategy becomes `stop_and_ask`.
 
 ## Planner Integration
 
@@ -34,7 +34,7 @@ Verification observations include:
 - `verification.failure_analysis`
 - `verification.repair_plan`
 
-`PlannerRuntime.update_from_verification()` persists those values into `EvidenceLedger.failure_analyses` and `EvidenceLedger.repair_plans`. Planner context exposes the latest failure analyses and repair plan so the next model turn is not just told to enter a generic repair phase.
+`Planner.update_from_verification()` persists those values into `EvidenceLedger.failure_analyses` and `EvidenceLedger.repair_plans`. Planner context exposes the latest failure analyses and repair plan so the next model turn is not just told to enter a generic repair phase.
 
 ## No-Progress Guard
 

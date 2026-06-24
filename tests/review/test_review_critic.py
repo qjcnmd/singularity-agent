@@ -6,7 +6,7 @@ from singularity.model import ModelMessage, ModelTurnResult, ModelTurnStatus
 from singularity.review import ModelCritic, ReviewCategory, ReviewReport, ReviewStage, ReviewTarget
 
 
-class FakeModelRuntime:
+class FakeModelRunner:
     def __init__(self, text: str | Exception) -> None:
         self.text = text
         self.requests = []
@@ -48,7 +48,7 @@ def test_model_critic_parses_machine_readable_findings() -> None:
         }
     )
 
-    outcome = ModelCritic(FakeModelRuntime(text)).review(base_report(), bundle={"summary": "x"})
+    outcome = ModelCritic(FakeModelRunner(text)).review(base_report(), bundle={"summary": "x"})
 
     assert outcome.status == "ok"
     assert outcome.findings[0].category == ReviewCategory.TEST_GAP
@@ -56,7 +56,7 @@ def test_model_critic_parses_machine_readable_findings() -> None:
 
 def test_model_critic_unavailable_and_invalid_do_not_block_rules() -> None:
     unavailable = ModelCritic(None).review(base_report(), bundle={})
-    invalid = ModelCritic(FakeModelRuntime("not json")).review(base_report(), bundle={})
+    invalid = ModelCritic(FakeModelRunner("not json")).review(base_report(), bundle={})
 
     assert unavailable.status == "model_critic_unavailable"
     assert unavailable.findings[0].blocking is False
@@ -64,8 +64,8 @@ def test_model_critic_unavailable_and_invalid_do_not_block_rules() -> None:
     assert invalid.findings[0].blocking is False
 
 
-def test_model_critic_runtime_failure_degrades_to_non_blocking_finding() -> None:
-    outcome = ModelCritic(FakeModelRuntime(RuntimeError("provider down"))).review(base_report(), bundle={})
+def test_model_critic_model_runner_failure_degrades_to_non_blocking_finding() -> None:
+    outcome = ModelCritic(FakeModelRunner(RuntimeError("provider down"))).review(base_report(), bundle={})
 
     assert outcome.status == "model_critic_unavailable"
     assert outcome.findings[0].category == ReviewCategory.VERIFICATION_GAP

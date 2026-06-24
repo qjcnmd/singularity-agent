@@ -133,7 +133,7 @@ def test_scheduler_forces_command_and_verification_after_mutation(tmp_path) -> N
             input_model=EmptyInput,
             handler=lambda _args: {},
             permission_level=PermissionLevel.WRITE,
-            uses_mutation_runtime=True,
+            uses_mutation_manager=True,
         )
     )
     registry.register(
@@ -143,8 +143,8 @@ def test_scheduler_forces_command_and_verification_after_mutation(tmp_path) -> N
             input_model=EmptyInput,
             handler=lambda _args: {},
             permission_level=PermissionLevel.SHELL,
-            uses_command_runtime=True,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
+            uses_command_executor=True,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
         )
     )
     registry.register(
@@ -154,8 +154,8 @@ def test_scheduler_forces_command_and_verification_after_mutation(tmp_path) -> N
             input_model=EmptyInput,
             handler=lambda _args: {},
             permission_level=PermissionLevel.SHELL,
-            uses_command_runtime=True,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNTIME,
+            uses_command_executor=True,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNNER,
             delegates_policy_constraints=True,
         )
     )

@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from singularity.observability import TraceRuntime
+from singularity.observability import TraceRecorder
 from singularity.plugins.discovery import discover_plugins
-from singularity.plugins.runtime import PluginRuntime
+from singularity.plugins.manager import PluginManager
 from singularity.plugins.status import PluginStatusStore
-from singularity.tools import ToolOriginKind, ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.tools import ToolOriginKind, ToolPolicy, ToolRegistry, ToolExecutor
 
-from tests.tool_runtime_helpers import make_test_policy_runtime
+from tests.tool_executor_helpers import make_test_policy_engine
 
 
 def test_enabled_tool_plugin_registers_exports_executes_and_traces(tmp_path: Path) -> None:
@@ -43,12 +43,12 @@ def register(host):
     )
     discovered = discover_plugins(tmp_path)[0]
     PluginStatusStore(tmp_path).enable(discovered, config={"prefix": ">"})
-    trace = TraceRuntime.create(tmp_path, trace_dir=tmp_path / "traces")
+    trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "traces")
     registry = ToolRegistry(tmp_path, include_default_tools=False)
 
-    diagnostics = PluginRuntime(tmp_path, trace=trace).activate(
+    diagnostics = PluginManager(tmp_path, trace=trace).activate(
         registry=registry,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
     assert diagnostics == []
@@ -68,14 +68,14 @@ def register(host):
     assert "manifest_hash" not in json.dumps(exported)
     assert "approved_permissions" not in json.dumps(exported)
 
-    runtime = ToolRuntime(
+    component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.coding_agent(),
         trace=trace,
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
-    result = runtime.execute_tool_call(
+    result = component.execute_tool_call(
         {
             "id": "call_1",
             "function": {
@@ -109,11 +109,11 @@ def register(host):
     )
     discovered = discover_plugins(tmp_path)[0]
     PluginStatusStore(tmp_path).enable(discovered)
-    trace = TraceRuntime.create(tmp_path, trace_dir=tmp_path / "traces")
+    trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "traces")
 
-    diagnostics = PluginRuntime(tmp_path, trace=trace).activate(
+    diagnostics = PluginManager(tmp_path, trace=trace).activate(
         registry=ToolRegistry(tmp_path, include_default_tools=False),
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
     assert diagnostics == []

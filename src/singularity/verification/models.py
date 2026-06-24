@@ -32,7 +32,7 @@ class CheckKind(str, Enum):
     UNIT_TEST = "unit_test"
     INTEGRATION_TEST = "integration_test"
     BUILD = "build"
-    RUNTIME_SMOKE = "runtime_smoke"
+    VERIFICATION_SMOKE = "verification_smoke"
     SECURITY = "security"
     CUSTOM = "custom"
     MANUAL_REVIEW = "manual_review"

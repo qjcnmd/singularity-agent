@@ -21,7 +21,7 @@ class TaskEvaluationResult:
     scoring: ScoringResult
     replay: TraceReplayResult | None = None
     patch_quality: dict[str, Any] = field(default_factory=dict)
-    runtime_overrides: dict[str, Any] = field(default_factory=dict)
+    agent_config_overrides: dict[str, Any] = field(default_factory=dict)
     execution_evidence: dict[str, Any] = field(default_factory=dict)
     latency_ms: int = 0
     cost: float = 0.0
@@ -35,7 +35,7 @@ class TaskEvaluationResult:
             "scoring": self.scoring.to_dict(),
             "replay": self.replay.to_dict() if self.replay else None,
             "patch_quality": self.patch_quality,
-            "runtime_overrides": self.runtime_overrides,
+            "agent_config_overrides": self.agent_config_overrides,
             "execution_evidence": self.execution_evidence,
             "latency_ms": self.latency_ms,
             "cost": self.cost,

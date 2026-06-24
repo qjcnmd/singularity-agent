@@ -4,7 +4,7 @@ import pytest
 
 from singularity.interaction import (
     InteractionMode,
-    InteractionRuntime,
+    InteractionController,
     UserDecision,
 )
 from singularity.policy import (
@@ -19,7 +19,7 @@ from singularity.policy import (
     PolicyRequest,
     PolicySubject,
     ResourceRef,
-    RuntimeName,
+    PolicyComponent,
     SandboxRequired,
 )
 
@@ -46,10 +46,10 @@ def review_decision(tmp_path: Path) -> tuple[PolicyRequest, PolicyDecision]:
         task_id="task",
         phase_id="phase",
         action_id="action",
-        runtime=RuntimeName.COMMAND,
+        component=PolicyComponent.COMMAND,
         operation=OperationKind.EXECUTE_COMMAND,
         capability=Capability.EXECUTE_COMMAND,
-        subject=PolicySubject(subject_type="runtime", name="CommandRuntime"),
+        subject=PolicySubject(subject_type="component", name="CommandExecutor"),
         resource=ResourceRef(resource_type="command", identifier="python -c print(1)"),
         reason="test",
         workspace_root=str(tmp_path),
@@ -64,7 +64,7 @@ def review_decision(tmp_path: Path) -> tuple[PolicyRequest, PolicyDecision]:
 
 def test_interactive_approve_once_generates_single_use_grant(tmp_path: Path) -> None:
     request, decision = review_decision(tmp_path)
-    interaction = InteractionRuntime(provider=FakeProvider("approve"))
+    interaction = InteractionController(provider=FakeProvider("approve"))
 
     grant = ApprovalGate(
         PolicyConfig(workspace_root=tmp_path),
@@ -81,7 +81,7 @@ def test_interactive_reject_raises_approval_denied(tmp_path: Path) -> None:
     from singularity.policy import ApprovalDenied
 
     request, decision = review_decision(tmp_path)
-    interaction = InteractionRuntime(provider=FakeProvider("reject"))
+    interaction = InteractionController(provider=FakeProvider("reject"))
 
     with pytest.raises(ApprovalDenied):
         ApprovalGate(
@@ -94,7 +94,7 @@ def test_interactive_revise_raises_policy_ask_user(tmp_path: Path) -> None:
     from singularity.policy import PolicyAskUserRequired
 
     request, decision = review_decision(tmp_path)
-    interaction = InteractionRuntime(provider=FakeProvider("revise"))
+    interaction = InteractionController(provider=FakeProvider("revise"))
 
     with pytest.raises(PolicyAskUserRequired):
         ApprovalGate(
@@ -107,7 +107,7 @@ def test_interactive_abort_raises_approval_denied(tmp_path: Path) -> None:
     from singularity.policy import ApprovalDenied
 
     request, decision = review_decision(tmp_path)
-    interaction = InteractionRuntime(provider=FakeProvider("abort"))
+    interaction = InteractionController(provider=FakeProvider("abort"))
 
     with pytest.raises(ApprovalDenied):
         ApprovalGate(
@@ -117,7 +117,7 @@ def test_interactive_abort_raises_approval_denied(tmp_path: Path) -> None:
 
 def test_non_interactive_review_fails_without_blocking(tmp_path: Path) -> None:
     request, decision = review_decision(tmp_path)
-    interaction = InteractionRuntime(mode=InteractionMode.NON_INTERACTIVE)
+    interaction = InteractionController(mode=InteractionMode.NON_INTERACTIVE)
 
     with pytest.raises(ApprovalRequired):
         ApprovalGate(

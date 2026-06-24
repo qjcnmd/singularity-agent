@@ -33,7 +33,7 @@ Existing behavior already enforced that model final text is not evidence, so thi
 
 - `src/singularity/planner/contract.py`
   - Added Phase 1C contract types and `TaskContractBuilder`.
-- `src/singularity/planner/runtime.py`
+- `src/singularity/planner/engine.py`
   - Builds and stores a contract in `start_task()`.
   - Adds `contract_smoke_commands()`.
   - Adds contract criterion status to `assess_completion()`.
@@ -43,7 +43,7 @@ Existing behavior already enforced that model final text is not evidence, so thi
   - Renders contract summary into planner context.
 - `src/singularity/planner/__init__.py`
   - Exports contract types.
-- `tests/test_planner_runtime.py`
+- `tests/test_planner.py`
   - Adds Phase 1C coverage for requirement extraction and criterion gating.
 - `docs/phase1c_task_contract.md`
   - Documents contract behavior and boundaries.
@@ -53,7 +53,7 @@ Existing behavior already enforced that model final text is not evidence, so thi
 Targeted Phase 1C validation:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_planner_runtime.py tests\test_verification_runtime.py tests\test_agent.py tests\test_agent_task_outcome.py tests\test_context_policy_planner_integration.py --basetemp work/pytest-tmp
+.\.venv\Scripts\python.exe -m pytest tests\test_planner.py tests\test_verification_runner.py tests\test_agent.py tests\test_agent_task_outcome.py tests\test_context_policy_planner_integration.py --basetemp work/pytest-tmp
 ```
 
 Result:

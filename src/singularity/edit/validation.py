@@ -23,12 +23,12 @@ class PatchValidator:
         self,
         workspace_root: Path | str,
         *,
-        mutation_runtime: Any,
-        project_index_runtime: Any | None = None,
+        mutation_manager: Any,
+        project_index: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
-        self.mutation_runtime = mutation_runtime
-        self.project_index_runtime = project_index_runtime
+        self.mutation_manager = mutation_manager
+        self.project_index = project_index
 
     def validate(self, candidate: PatchCandidate, *, intent_summary: str, scope: Any) -> PatchValidationResult:
         issues: list[EditIssue] = []
@@ -37,10 +37,10 @@ class PatchValidator:
             return self._result(False, issues, candidate=candidate)
 
         try:
-            changeset = self.mutation_runtime.create_changeset(
+            changeset = self.mutation_manager.create_changeset(
                 candidate.operations,
                 intent=intent_summary,
-                created_by="edit_runtime",
+                created_by="edit_executor",
             )
         except MutationError as exc:
             issue = _issue_from_mutation_error(exc)
@@ -118,7 +118,7 @@ class PatchValidator:
                 )
             expected = scope.expected_hashes.get(path) or scope.expected_hashes.get(normalized)
             if expected:
-                current = self.mutation_runtime.index.current_hash(normalized)
+                current = self.mutation_manager.index.current_hash(normalized)
                 if current != expected:
                     issues.append(
                         EditIssue(
@@ -252,12 +252,12 @@ class PatchValidator:
         return issues
 
     def _impact(self, changed_files: list[str]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[EditIssue]]:
-        if self.project_index_runtime is None or not changed_files:
+        if self.project_index is None or not changed_files:
             return None, None, []
         issues: list[EditIssue] = []
         try:
-            impact_obj = self.project_index_runtime.analyze_impact(changed_files)
-            test_obj = self.project_index_runtime.get_test_impact(changed_files)
+            impact_obj = self.project_index.analyze_impact(changed_files)
+            test_obj = self.project_index.get_test_impact(changed_files)
             impact = impact_obj.to_dict() if hasattr(impact_obj, "to_dict") else dict(impact_obj)
             test_impact = test_obj.to_dict() if hasattr(test_obj, "to_dict") else dict(test_obj)
         except Exception as exc:

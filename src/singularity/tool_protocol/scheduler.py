@@ -99,7 +99,7 @@ def _is_readonly(call: ToolCallEnvelope, spec: ToolSpec | None) -> bool:
         return False
     if spec.side_effects not in {ToolSideEffectKind.NONE, ToolSideEffectKind.READ_WORKSPACE}:
         return False
-    if spec.uses_mutation_runtime or spec.uses_command_runtime:
+    if spec.uses_mutation_manager or spec.uses_command_executor:
         return False
     return True
 
@@ -120,7 +120,7 @@ def _is_mutation(call: ToolCallEnvelope, spec: ToolSpec | None) -> bool:
     return (
         spec.permission_level == PermissionLevel.WRITE
         or spec.side_effects == ToolSideEffectKind.MUTATE_WORKSPACE
-        or spec.uses_mutation_runtime
+        or spec.uses_mutation_manager
     )
 
 
@@ -130,7 +130,7 @@ def _is_command(call: ToolCallEnvelope, spec: ToolSpec | None) -> bool:
     return (
         spec.permission_level in {PermissionLevel.SHELL, PermissionLevel.GIT}
         or spec.side_effects == ToolSideEffectKind.EXECUTE_COMMAND
-        or spec.uses_command_runtime
+        or spec.uses_command_executor
     )
 
 
@@ -139,7 +139,7 @@ def _is_verification(call: ToolCallEnvelope, spec: ToolSpec | None) -> bool:
         return True
     if spec is None:
         return False
-    return spec.execution_backend == ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNTIME
+    return spec.execution_backend == ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNNER
 
 
 ToolCallScheduler = ToolProtocolScheduler

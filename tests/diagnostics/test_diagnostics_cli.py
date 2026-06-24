@@ -5,14 +5,14 @@ import json
 from typer.testing import CliRunner
 
 from singularity.cli import app
-from singularity.release.paths import resolve_runtime_paths
+from singularity.release.paths import resolve_user_data_paths
 
 
 runner = CliRunner()
 
 
 def test_doctor_cli_json_uses_diagnostic_result_schema(monkeypatch, tmp_path):
-    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "component"))
     assert runner.invoke(app, ["system", "init"]).exit_code == 0
 
     result = runner.invoke(app, ["doctor", "--json", "--check", "environment.python"])
@@ -25,10 +25,10 @@ def test_doctor_cli_json_uses_diagnostic_result_schema(monkeypatch, tmp_path):
 
 
 def test_repair_cli_defaults_to_dry_run(monkeypatch, tmp_path):
-    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "component"))
 
     result = runner.invoke(app, ["repair", "--json"])
-    paths = resolve_runtime_paths()
+    paths = resolve_user_data_paths()
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
@@ -41,9 +41,9 @@ def test_repair_cli_defaults_to_dry_run(monkeypatch, tmp_path):
 
 
 def test_repair_cli_apply_runs_then_reports_remaining_errors(monkeypatch, tmp_path):
-    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "component"))
 
-    result = runner.invoke(app, ["repair", "--apply", "--check", "filesystem.runtime_dirs", "--json"])
+    result = runner.invoke(app, ["repair", "--apply", "--check", "filesystem.user_data_dirs", "--json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
@@ -55,7 +55,7 @@ def test_repair_cli_apply_runs_then_reports_remaining_errors(monkeypatch, tmp_pa
 
 
 def test_repair_cli_apply_returns_nonzero_when_action_fails(monkeypatch, tmp_path):
-    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "component"))
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["system", "init"]).exit_code == 0
     broken_entries = tmp_path / ".singularity" / "memory" / "auto" / "entries.jsonl"

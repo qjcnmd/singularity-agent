@@ -7,23 +7,23 @@ from pathlib import Path
 from typing import Any
 
 from singularity.release.doctor import run_doctor
-from singularity.release.init import initialize_runtime
+from singularity.release.init import initialize_user_data
 from singularity.release.migrations import load_manifest
-from singularity.release.paths import RuntimePaths
+from singularity.release.paths import UserDataPaths
 
 
 PROTECTED_USER_DATA_DIRS = {"memory", "traces", "eval", "logs"}
 
 
-def repair_runtime(paths: RuntimePaths) -> dict[str, Any]:
+def repair_user_data(paths: UserDataPaths) -> dict[str, Any]:
     before = run_doctor(paths).to_dict()
-    init_result = initialize_runtime(paths, force=False)
+    init_result = initialize_user_data(paths, force=False)
     after = run_doctor(paths).to_dict()
     return {"before": before, "repair": init_result, "after": after}
 
 
-def uninstall_plan(paths: RuntimePaths, *, purge_user_data: bool = False) -> dict[str, Any]:
-    owned, reason = _runtime_is_owned(paths)
+def uninstall_plan(paths: UserDataPaths, *, purge_user_data: bool = False) -> dict[str, Any]:
+    owned, reason = _installation_is_owned(paths)
     if not owned:
         return {
             "root": str(paths.root),
@@ -62,8 +62,8 @@ def uninstall_plan(paths: RuntimePaths, *, purge_user_data: bool = False) -> dic
     }
 
 
-def uninstall_runtime(
-    paths: RuntimePaths,
+def uninstall_user_data(
+    paths: UserDataPaths,
     *,
     dry_run: bool = True,
     purge_user_data: bool = False,
@@ -85,7 +85,7 @@ def uninstall_runtime(
     return plan
 
 
-def export_user_data(paths: RuntimePaths, output: Path | str) -> dict[str, Any]:
+def export_user_data(paths: UserDataPaths, output: Path | str) -> dict[str, Any]:
     output_path = Path(output).expanduser().resolve(strict=False)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     included_roots = [
@@ -100,7 +100,7 @@ def export_user_data(paths: RuntimePaths, output: Path | str) -> dict[str, Any]:
     manifest = {
         "schema_version": "singularity.export/v1",
         "created_at": datetime.now(UTC).isoformat(),
-        "runtime_root": "redacted",
+        "user_data_root": "redacted",
         "included": [],
     }
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -123,13 +123,13 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
-def _runtime_is_owned(paths: RuntimePaths) -> tuple[bool, str | None]:
+def _installation_is_owned(paths: UserDataPaths) -> tuple[bool, str | None]:
     if not paths.manifest_file.exists():
-        return False, f"Singularity runtime manifest not found: {paths.manifest_file}"
+        return False, f"Singularity installation manifest not found: {paths.manifest_file}"
     try:
         manifest = load_manifest(paths)
     except Exception as exc:
-        return False, f"Singularity runtime manifest is unreadable: {type(exc).__name__}: {exc}"
+        return False, f"Singularity installation manifest is unreadable: {type(exc).__name__}: {exc}"
     if not manifest.app_version:
-        return False, "Singularity runtime manifest is missing app_version."
+        return False, "Singularity installation manifest is missing app_version."
     return True, None

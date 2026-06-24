@@ -82,7 +82,7 @@ class SemanticStatus(str, Enum):
     BUILD_FAILED = "build_failed"
     LINT_FAILED = "lint_failed"
     TYPECHECK_FAILED = "typecheck_failed"
-    RUNTIME_FAILED = "runtime_failed"
+    EXECUTION_FAILED = "execution_failed"
     POLICY_BLOCKED = "policy_blocked"
 
 

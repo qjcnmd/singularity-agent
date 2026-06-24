@@ -1,27 +1,27 @@
 from __future__ import annotations
 
 
-class InstructionRuntimeError(Exception):
+class PromptAssemblyError(Exception):
     pass
 
 
-class InstructionSourceError(InstructionRuntimeError):
+class InstructionSourceError(PromptAssemblyError):
     pass
 
 
-class InstructionHierarchyError(InstructionRuntimeError):
+class InstructionHierarchyError(PromptAssemblyError):
     pass
 
 
-class InstructionConflictError(InstructionRuntimeError):
+class InstructionConflictError(PromptAssemblyError):
     pass
 
 
-class PromptCompilationError(InstructionRuntimeError):
+class PromptCompilationError(PromptAssemblyError):
     pass
 
 
-class PromptInjectionWarning(InstructionRuntimeError):
+class PromptInjectionWarning(PromptAssemblyError):
     pass
 
 

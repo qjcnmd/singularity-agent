@@ -16,7 +16,7 @@ from singularity.plugins.models import (
     PluginManifest,
     PluginType,
 )
-from singularity.release.paths import RuntimeMode, RuntimePaths, resolve_runtime_paths
+from singularity.release.paths import UserDataMode, UserDataPaths, resolve_user_data_paths
 
 MANIFEST_NAMES = ("plugin.toml", "singularity-plugin.toml")
 ENV_PLUGIN_PATH = "SINGULARITY_PLUGIN_PATH"
@@ -25,14 +25,14 @@ ENV_PLUGIN_PATH = "SINGULARITY_PLUGIN_PATH"
 def discover_plugins(
     project_root: Path | str,
     *,
-    runtime_paths: RuntimePaths | None = None,
-    mode: RuntimeMode | str | None = None,
+    runtime_paths: UserDataPaths | None = None,
+    mode: UserDataMode | str | None = None,
     home: Path | str | None = None,
 ) -> list[DiscoveredPlugin]:
     """Discover plugin manifests without importing plugin code."""
 
     project_root = Path(project_root).resolve(strict=False)
-    paths = runtime_paths or resolve_runtime_paths(
+    paths = runtime_paths or resolve_user_data_paths(
         mode=mode,
         home=home,
         project_root=project_root,
@@ -46,7 +46,7 @@ def discover_plugins(
 
 def _discovery_roots(
     project_root: Path,
-    runtime_paths: RuntimePaths,
+    runtime_paths: UserDataPaths,
 ) -> list[tuple[str, Path]]:
     roots: list[tuple[str, Path]] = [
         ("project", project_root / ".singularity" / "plugins"),

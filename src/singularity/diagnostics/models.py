@@ -7,7 +7,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from singularity.release.paths import RuntimePaths
+from singularity.release.paths import UserDataPaths
 
 
 DIAGNOSTIC_RESULT_SCHEMA = "diagnostic-result/v1"
@@ -23,7 +23,7 @@ class DiagnosticSeverity(str, Enum):
 
 @dataclass(frozen=True)
 class DiagnosticContext:
-    paths: RuntimePaths
+    paths: UserDataPaths
     project_root: Path
 
 
@@ -178,7 +178,7 @@ def _legacy_check_name(check_id: str) -> str:
         "environment.package": "cli_installation",
         "environment.optional_dependencies": "optional_dependencies",
         "config.file": "config_schema",
-        "config.provider": "runtime_configuration",
-        "filesystem.runtime_dirs": "runtime_directories",
+        "config.provider": "component_configuration",
+        "filesystem.user_data_dirs": "user_data_directories",
         "schema.migrations": "migrations",
     }.get(check_id, check_id)

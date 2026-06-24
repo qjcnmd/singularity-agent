@@ -17,8 +17,8 @@ RECOVERABLE_CATEGORIES = {
 
 
 class EditRepairController:
-    def __init__(self, mutation_runtime: Any) -> None:
-        self.mutation_runtime = mutation_runtime
+    def __init__(self, mutation_manager: Any) -> None:
+        self.mutation_manager = mutation_manager
 
     def can_repair(self, category: EditFailureCategory | str) -> bool:
         return EditFailureCategory(category) in RECOVERABLE_CATEGORIES
@@ -76,7 +76,7 @@ class EditRepairController:
         scope = replace(intent.scope, expected_hashes=dict(intent.scope.expected_hashes))
         operations = []
         for operation in intent.operations:
-            current = self.mutation_runtime.index.current_hash(operation.path)
+            current = self.mutation_manager.index.current_hash(operation.path)
             if current:
                 operation = replace(operation, expected_sha256=current)
                 scope.expected_hashes[operation.path] = current

@@ -35,7 +35,7 @@ def test_duplicate_tool_is_rejected(tmp_path: Path) -> None:
 def test_invalid_write_tool_without_mutation_backend_is_rejected(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
 
-    with pytest.raises(ValueError, match="mutation runtime"):
+    with pytest.raises(ValueError, match="mutation manager"):
         registry.register(
             ToolSpec(
                 name="bad_write",
@@ -50,10 +50,10 @@ def test_invalid_write_tool_without_mutation_backend_is_rejected(tmp_path: Path)
         )
 
 
-def test_edit_backend_requires_edit_runtime_and_mutation_delegation(tmp_path: Path) -> None:
+def test_edit_backend_requires_edit_executor_and_mutation_delegation(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
 
-    with pytest.raises(ValueError, match="uses_edit_runtime"):
+    with pytest.raises(ValueError, match="uses_edit_executor"):
         registry.register(
             ToolSpec(
                 name="bad_edit",
@@ -64,12 +64,12 @@ def test_edit_backend_requires_edit_runtime_and_mutation_delegation(tmp_path: Pa
                 side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
                 capabilities=(Capability.MUTATE_WORKSPACE,),
                 operation=OperationKind.MUTATE_FILE,
-                execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
-                uses_mutation_runtime=True,
+                execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
+                uses_mutation_manager=True,
             )
         )
 
-    with pytest.raises(ValueError, match="mutation runtime"):
+    with pytest.raises(ValueError, match="mutation manager"):
         registry.register(
             ToolSpec(
                 name="bad_edit_no_mutation",
@@ -80,8 +80,8 @@ def test_edit_backend_requires_edit_runtime_and_mutation_delegation(tmp_path: Pa
                 side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
                 capabilities=(Capability.MUTATE_WORKSPACE,),
                 operation=OperationKind.MUTATE_FILE,
-                execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
-                uses_edit_runtime=True,
+                execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
+                uses_edit_executor=True,
             )
         )
 
@@ -95,9 +95,9 @@ def test_edit_backend_requires_edit_runtime_and_mutation_delegation(tmp_path: Pa
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
             capabilities=(Capability.MUTATE_WORKSPACE,),
             operation=OperationKind.MUTATE_FILE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
-            uses_edit_runtime=True,
-            uses_mutation_runtime=True,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
+            uses_edit_executor=True,
+            uses_mutation_manager=True,
         )
     )
 
@@ -107,7 +107,7 @@ def test_edit_backend_requires_edit_runtime_and_mutation_delegation(tmp_path: Pa
 def test_invalid_shell_tool_without_command_backend_is_rejected(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
 
-    with pytest.raises(ValueError, match="command runtime"):
+    with pytest.raises(ValueError, match="command executor"):
         registry.register(
             ToolSpec(
                 name="bad_shell",
@@ -125,7 +125,7 @@ def test_invalid_shell_tool_without_command_backend_is_rejected(tmp_path: Path) 
 def test_only_verification_backend_can_delegate_policy_constraints(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
 
-    with pytest.raises(ValueError, match="verification runtime"):
+    with pytest.raises(ValueError, match="verification runner"):
         registry.register(
             ToolSpec(
                 name="delegating_command",
@@ -136,8 +136,8 @@ def test_only_verification_backend_can_delegate_policy_constraints(tmp_path: Pat
                 side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
                 capabilities=(Capability.EXECUTE_COMMAND,),
                 operation=OperationKind.EXECUTE_COMMAND,
-                execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
-                uses_command_runtime=True,
+                execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
+                uses_command_executor=True,
                 delegates_policy_constraints=True,
             )
         )
@@ -178,7 +178,7 @@ def test_registry_indexes_capabilities_and_side_effects(tmp_path: Path) -> None:
     assert shapes[0]["capabilities"] == ["READ_WORKSPACE", "LIST_DIRECTORY"]
 
 
-def test_dispatch_convenience_cannot_create_runtime(tmp_path: Path) -> None:
+def test_dispatch_convenience_cannot_create_executor(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
 
     with pytest.raises(RuntimeError, match="dispatch_for_tests"):

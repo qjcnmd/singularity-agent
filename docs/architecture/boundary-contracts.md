@@ -1,10 +1,10 @@
 # Boundary Contracts
 
-This document defines the contracts the current Python RuntimeHost facade, a future local daemon, Tauri desktop shell, and TypeScript UI must obey while the production runtime is still Python.
+This document defines the contracts the current Python AgentHost facade, a future local daemon, Tauri desktop shell, and TypeScript UI must obey while the production component is still Python.
 
 ## Core Rule
 
-Clients request, runtimes decide and execute, stores persist, trace explains. No layer may skip the owner of a side effect.
+Clients request, components decide and execute, stores persist, trace explains. No layer may skip the owner of a side effect.
 
 ## Client Boundary
 
@@ -14,7 +14,7 @@ Current client:
 
 Future clients:
 
-- CLI through RuntimeHost
+- CLI through AgentHost
 - Tauri desktop shell
 - TypeScript UI
 - local daemon control API
@@ -24,25 +24,25 @@ Client responsibilities:
 
 - collect user intent and local decisions
 - render progress, approvals, traces, artifacts, and final report
-- send commands to RuntimeHost with `run_id`, `session_id`, `task_id`, and idempotency key when applicable
+- send commands to AgentHost with `run_id`, `session_id`, `task_id`, and idempotency key when applicable
 - subscribe to run events
 
 Client forbidden behavior:
 
 - execute tools directly
-- write runtime state files directly
+- write session state files directly
 - grant approval without a `PolicyDecision` that requires review
 - parse raw trace files as the only integration contract
 - treat model text as policy or approval
 
-## SingularityAgent Boundary
+## AgentLoop Boundary
 
-`SingularityAgent` is an orchestration adapter inside the runtime host. It may call:
+`AgentLoop` is an orchestration adapter inside the component host. It may call:
 
 - `planner.step()`
 - `context.build_bundle()`
-- `model_runtime.run_turn()`
-- `ToolCallingProtocolRuntime.process_model_turn()`
+- `model_runner.run_turn()`
+- `ToolProtocolEngine.process_model_turn()`
 - final report production
 
 It must not:
@@ -53,9 +53,9 @@ It must not:
 - write trace/audit records with raw payloads
 - own persistence for protocol, context, or workspace state
 
-## Runtime Boundary
+## Component Boundary
 
-Every runtime must expose:
+Every component must expose:
 
 - stable name
 - input model or request shape
@@ -65,11 +65,11 @@ Every runtime must expose:
 - recovery behavior
 - failure mode
 
-Every runtime must fail closed when its owning dependency is missing. Example: command execution cannot fall back to `subprocess` when `CommandRuntime` or required sandbox capability is unavailable.
+Every component must fail closed when its owning dependency is missing. Example: command execution cannot fall back to `subprocess` when `CommandExecutor` or required sandbox capability is unavailable.
 
 ## Tool Boundary
 
-`ToolRegistry` exposes tool declarations. `ToolRuntime` executes registered handlers only after schema validation, policy, approval, planner authorization, dry-run checks, and backend contract checks pass.
+`ToolRegistry` exposes tool declarations. `ToolExecutor` executes registered handlers only after schema validation, policy, approval, planner authorization, dry-run checks, and backend contract checks pass.
 
 Tool contracts must declare:
 
@@ -81,28 +81,28 @@ Tool contracts must declare:
 - execution backend
 - idempotency and cache policy
 - artifact policy
-- whether it delegates to mutation, edit, command, or verification runtime
+- whether it delegates to mutation, edit, command, or verification runner
 
 Forbidden tool behavior:
 
-- write files without `uses_mutation_runtime` or `uses_edit_runtime`
-- spawn processes without `uses_command_runtime`
-- run test/lint/build checks outside `VerificationRuntime`
+- write files without `uses_mutation_manager` or `uses_edit_executor`
+- spawn processes without `uses_command_executor`
+- run test/lint/build checks outside `VerificationRunner`
 - expose raw secret values in `ToolResult`, trace, context, or artifact metadata
 
 ## Policy Boundary
 
-`PolicyRuntime` owns allow, deny, review, ask-user, escalate, and sandbox-required decisions. `ApprovalGate` only resolves local review prompts into scoped grants.
+`PolicyEngine` owns allow, deny, review, ask-user, escalate, and sandbox-required decisions. `ApprovalGate` only resolves local review prompts into scoped grants.
 
-Policy inputs must include runtime, operation, capability, subject, resource, risk tags, reversibility, network/workspace/secret flags, and reason.
+Policy inputs must include component, operation, capability, subject, resource, risk tags, reversibility, network/workspace/secret flags, and reason.
 
-Policy outputs must be auditable and include a decision id. Any missing policy dependency is a blocking runtime error, not an implicit allow.
+Policy outputs must be auditable and include a decision id. Any missing policy dependency is a blocking component error, not an implicit allow.
 
 ## Trace Boundary
 
-`TraceRuntime` owns event, span, artifact, timeline, and summary persistence. It stores references and redacted summaries.
+`TraceRecorder` owns event, span, artifact, timeline, and summary persistence. It stores references and redacted summaries.
 
-Trace must not be the command bus. Desktop should subscribe to RuntimeHost events generated from runtime trace/state, but should not mutate trace files or depend on private filesystem paths.
+Trace must not be the command bus. Desktop should subscribe to AgentHost events generated from component trace/state, but should not mutate trace files or depend on private filesystem paths.
 
 ## Storage Boundary
 
@@ -123,9 +123,9 @@ Storage contracts:
 - redaction before write
 - recovery report when state is incomplete
 
-## RuntimeHost Boundary
+## AgentHost Boundary
 
-The current Python RuntimeHost is the in-process API above Python runtimes. It exposes:
+The current Python AgentHost is the in-process API above Python components. It exposes:
 
 - start/resume/cancel run
 - submit local approval decision
@@ -135,4 +135,4 @@ The current Python RuntimeHost is the in-process API above Python runtimes. It e
 
 The future local daemon should wrap the same contract and add health, diagnostics, HTTP, WebSocket, and JSON-RPC transport.
 
-It must not expose raw internal objects such as `ToolRegistry`, `PolicyRuntime`, or `ContextManager` to the UI or plugins.
+It must not expose raw internal objects such as `ToolRegistry`, `PolicyEngine`, or `ContextManager` to the UI or plugins.

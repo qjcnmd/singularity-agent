@@ -16,7 +16,7 @@ Every daemon-visible event uses the `run-event` schema:
   "task_id": "task_...",
   "phase_id": "phase_...",
   "action_id": "action_...",
-  "runtime": "tool_protocol",
+  "component": "tool_protocol",
   "severity": "info",
   "timestamp": "2026-06-21T00:00:00Z",
   "sequence": 42,
@@ -31,14 +31,14 @@ Fields are additive. Desktop clients must ignore unknown payload keys.
 
 ## Ordering
 
-RuntimeHost must provide per-run monotonic `sequence` values. Trace timestamps are useful for display, but clients should order by `(run_id, sequence)` when available.
+AgentHost must provide per-run monotonic `sequence` values. Trace timestamps are useful for display, but clients should order by `(run_id, sequence)` when available.
 
 ## Topics
 
 Desktop subscriptions should support these topic groups:
 
 - `lifecycle.*`
-- `runtime.*`
+- `component.*`
 - `planner.*`
 - `context.*`
 - `model.*`
@@ -68,10 +68,10 @@ Lifecycle:
 - shutdown started/completed
 - recovery detected/completed
 
-Runtime:
+Component:
 
 - boot started/completed/failed
-- runtime initialized
+- component initialized
 - health checked
 - cancellation requested
 
@@ -114,7 +114,7 @@ State and reporting:
 
 ## Replay And Resume
 
-RuntimeHost must support:
+AgentHost must support:
 
 - initial snapshot: current session/run state plus last sequence
 - event replay from `after_sequence`
@@ -135,4 +135,4 @@ Events are display-safe by default:
 - no raw tool args/results when sensitivity is secret
 - opaque artifact refs instead of internal absolute paths
 
-RuntimeHost may expose privileged local artifact reads later, but only by artifact ref and with the same redaction contract.
+AgentHost may expose privileged local artifact reads later, but only by artifact ref and with the same redaction contract.

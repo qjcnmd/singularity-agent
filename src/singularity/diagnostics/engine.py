@@ -12,7 +12,7 @@ from singularity.diagnostics.models import (
     DiagnosticSeverity,
     now_iso,
 )
-from singularity.release.paths import RuntimePaths
+from singularity.release.paths import UserDataPaths
 
 
 class DoctorEngine:
@@ -26,7 +26,7 @@ class DoctorEngine:
     def run(
         self,
         *,
-        paths: RuntimePaths,
+        paths: UserDataPaths,
         project_root: Path,
         check_id: str | None = None,
         group: str | None = None,

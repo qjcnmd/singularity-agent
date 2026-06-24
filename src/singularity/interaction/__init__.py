@@ -8,13 +8,13 @@ from singularity.interaction.models import (
     InteractionMode,
     OutcomeStatus,
     ProgressEvent,
-    RuntimeEvent,
+    InteractionEvent,
     UserDecision,
 )
-from singularity.interaction.runtime import (
+from singularity.interaction.controller import (
     InteractionProvider,
-    InteractionRuntime,
-    runtime_event_from_trace_event,
+    InteractionController,
+    interaction_event_from_trace_event,
 )
 
 __all__ = [
@@ -25,12 +25,12 @@ __all__ = [
     "FinalReport",
     "InteractionMode",
     "InteractionProvider",
-    "InteractionRuntime",
+    "InteractionController",
     "OutcomeStatus",
     "ProgressEvent",
     "RichCliRenderer",
     "RichInteractionProvider",
-    "RuntimeEvent",
+    "InteractionEvent",
     "UserDecision",
-    "runtime_event_from_trace_event",
+    "interaction_event_from_trace_event",
 ]

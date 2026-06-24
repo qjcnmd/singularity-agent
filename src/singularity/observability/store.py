@@ -71,7 +71,7 @@ class TraceStore:
             phase_id=latest.phase_id,
             action_id=latest.action_id,
             name=latest.name,
-            runtime=latest.runtime,
+            component=latest.component,
             started_at=latest.started_at,
             ended_at=ended_at or datetime.now(UTC),
             duration_ms=duration_ms,

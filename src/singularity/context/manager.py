@@ -24,7 +24,7 @@ from singularity.context.models import (
     ContextLayer,
     ContextReference,
     ContextRenderPolicy,
-    ContextRuntime,
+    ContextSource,
     ContextSensitivity,
     ContextSnapshot,
     ContextSummaryEnvelope,
@@ -56,7 +56,7 @@ class _CompactionGroup:
     group_id: str
     layer: str
     item_type: str
-    source_runtime: str
+    source_component: str
     item_ids: list[str]
     mode: str
     utility_score: float
@@ -106,7 +106,7 @@ class ContextManager:
         system_prompt: str,
         user_goal: str,
         provider: Any | None = None,
-        model_runtime: Any | None = None,
+        model_runner: Any | None = None,
         model_context_window: int = 128000,
         output_token_reserve: int = 4096,
         reasoning_token_reserve: int = 0,
@@ -126,7 +126,7 @@ class ContextManager:
         self.phase_id = phase_id
         self.user_goal = user_goal
         self.provider = provider
-        self.model_runtime = model_runtime
+        self.model_runner = model_runner
         self.trace = trace
         self.redactor = ContextRedactor()
         self.classifier = SensitivityClassifier()
@@ -178,7 +178,7 @@ class ContextManager:
         self.add_context_item(
             self._make_item(
                 layer=ContextLayer.USER_GOAL,
-                source_runtime=ContextRuntime.USER,
+                source_component=ContextSource.USER,
                 item_type=ContextItemType.USER_GOAL,
                 content=user_goal,
                 authority=ContextAuthority.USER,
@@ -238,10 +238,10 @@ class ContextManager:
             items.append(
                 self._make_item(
                     layer=ContextLayer.PLANNER_STATE,
-                    source_runtime=ContextRuntime.PLANNER,
+                    source_component=ContextSource.PLANNER,
                     item_type=ContextItemType.PLANNER_STATE,
                     content=planner_context,
-                    authority=ContextAuthority.RUNTIME,
+                    authority=ContextAuthority.COMPONENT,
                     importance=0.85,
                     phase_id=phase_id or self.phase_id,
                     pinned=True,
@@ -259,7 +259,7 @@ class ContextManager:
             items.append(
                 self._make_item(
                     layer=ContextLayer.COMPRESSED_HISTORY,
-                    source_runtime=ContextRuntime.SUMMARY,
+                    source_component=ContextSource.SUMMARY,
                     item_type=ContextItemType.SUMMARY,
                     content=self._summary,
                     authority=ContextAuthority.SUMMARY,
@@ -286,7 +286,7 @@ class ContextManager:
             run_id=self.run_id,
             task_id=self.task_id,
             phase_id=phase_id or self.phase_id,
-            model=getattr(getattr(self.model_runtime, "config", None), "default_model", "") or "",
+            model=getattr(getattr(self.model_runner, "config", None), "default_model", "") or "",
             provider=getattr(getattr(self.provider, "settings", None), "base_url", "") or "",
             tools=tools,
             render_policy=render_policy or self.render_policy,
@@ -427,7 +427,7 @@ class ContextManager:
         self.add_context_item(
             self._make_item(
                 layer=ContextLayer.RECENT_DIALOGUE,
-                source_runtime=ContextRuntime.MODEL,
+                source_component=ContextSource.MODEL,
                 item_type=ContextItemType.ASSISTANT_MESSAGE,
                 content=safe,
                 authority=ContextAuthority.MODEL,
@@ -507,7 +507,7 @@ class ContextManager:
             self._make_item(
                 item_id=observation.id,
                 layer=ContextLayer.TOOL_OBSERVATIONS,
-                source_runtime=ContextRuntime.TOOL,
+                source_component=ContextSource.TOOL,
                 item_type=ContextItemType.TOOL_OBSERVATION,
                 content=tool_message,
                 authority=ContextAuthority.TOOL,
@@ -618,7 +618,7 @@ class ContextManager:
             self._make_item(
                 item_id=observation.id,
                 layer=ContextLayer.TOOL_OBSERVATIONS,
-                source_runtime=ContextRuntime.TOOL_PROTOCOL,
+                source_component=ContextSource.TOOL_PROTOCOL,
                 item_type=ContextItemType.TOOL_OBSERVATION,
                 content=tool_message,
                 authority=ContextAuthority.TOOL,
@@ -645,7 +645,7 @@ class ContextManager:
                 "preview_tokens": observation.preview_tokens,
                 "raw_digest": raw_digest,
                 "sensitivity": sensitivity.value,
-                "source_runtime": ContextRuntime.TOOL_PROTOCOL.value,
+                "source_component": ContextSource.TOOL_PROTOCOL.value,
             },
         )
         return observation
@@ -696,7 +696,7 @@ class ContextManager:
         self.add_context_item(
             self._make_item(
                 layer=ContextLayer.FAILURE_MEMORY,
-                source_runtime=ContextRuntime.SUMMARY,
+                source_component=ContextSource.SUMMARY,
                 item_type=ContextItemType.SUMMARY,
                 content=content,
                 authority=ContextAuthority.SUMMARY,
@@ -724,10 +724,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.POLICY_STATE,
-                source_runtime=ContextRuntime.POLICY,
+                source_component=ContextSource.POLICY,
                 item_type=ContextItemType.POLICY_OBSERVATION,
                 content=payload,
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 importance=0.95 if payload.get("outcome") not in {"allow", "allowed"} else 0.7,
                 references=refs,
             )
@@ -738,10 +738,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.PLANNER_STATE,
-                source_runtime=ContextRuntime.PLANNER,
+                source_component=ContextSource.PLANNER,
                 item_type=ContextItemType.PLANNER_STATE,
                 content=payload,
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 importance=0.9,
                 pinned=True,
                 phase_id=str(payload.get("current_phase") or self.phase_id),
@@ -763,10 +763,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.EVIDENCE,
-                source_runtime=ContextRuntime.MUTATION,
+                source_component=ContextSource.MUTATION,
                 item_type=ContextItemType.MUTATION_EVIDENCE,
                 content=payload,
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 importance=0.85,
                 references=refs,
             )
@@ -787,10 +787,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.EVIDENCE,
-                source_runtime=ContextRuntime.COMMAND,
+                source_component=ContextSource.COMMAND,
                 item_type=ContextItemType.COMMAND_OBSERVATION,
                 content=payload,
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 importance=0.9 if payload.get("status") not in {"succeeded", "completed"} else 0.72,
                 references=refs,
             )
@@ -812,10 +812,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.VERIFICATION,
-                source_runtime=ContextRuntime.VERIFICATION,
+                source_component=ContextSource.VERIFICATION,
                 item_type=ContextItemType.VERIFICATION_EVIDENCE,
                 content=payload,
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 importance=0.95 if payload.get("status") not in {"passed", "succeeded"} else 0.78,
                 references=refs,
             )
@@ -825,10 +825,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.WORKSPACE_STATE,
-                source_runtime=ContextRuntime.WORKSPACE_STATE,
+                source_component=ContextSource.WORKSPACE_STATE,
                 item_type=ContextItemType.WORKSPACE_STATE,
                 content=dict(state),
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 importance=0.82,
             )
         )
@@ -857,10 +857,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.EVIDENCE,
-                source_runtime=ContextRuntime.EDIT,
+                source_component=ContextSource.EDIT,
                 item_type=ContextItemType.EDIT_EVIDENCE,
                 content=payload,
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 importance=0.88 if payload.get("ok") else 0.94,
                 references=refs,
             )
@@ -872,10 +872,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.WORKSPACE_STATE,
-                source_runtime=ContextRuntime.PROJECT_INDEX,
+                source_component=ContextSource.PROJECT_INDEX,
                 item_type=ContextItemType.PROJECT_INDEX,
                 content=payload,
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 sensitivity=ContextSensitivity.WORKSPACE,
                 importance=0.86,
                 metadata={
@@ -892,10 +892,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.FAILURE_MEMORY,
-                source_runtime=ContextRuntime.MEMORY,
+                source_component=ContextSource.MEMORY,
                 item_type=ContextItemType.MEMORY_CONTEXT,
                 content=payload,
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 sensitivity=ContextSensitivity.WORKSPACE,
                 importance=float(payload.get("priority") or 0.65),
                 metadata={
@@ -911,10 +911,10 @@ class ContextManager:
         return self.add_context_item(
             self._make_item(
                 layer=ContextLayer.FAILURE_MEMORY,
-                source_runtime=ContextRuntime.SYSTEM,
+                source_component=ContextSource.SYSTEM,
                 item_type=ContextItemType.FAILURE,
                 content=failure,
-                authority=ContextAuthority.RUNTIME,
+                authority=ContextAuthority.COMPONENT,
                 importance=0.9,
             )
         )
@@ -968,11 +968,11 @@ class ContextManager:
                 }
             )
         for item in self.store.query_items(run_id=self.run_id):
-            if item.source_runtime == ContextRuntime.PROJECT_INDEX:
+            if item.source_component == ContextSource.PROJECT_INDEX:
                 sources.append(
                     {
                         "source_type": "project_index",
-                        "origin": "ProjectIndexRuntime",
+                        "origin": "ProjectIndex",
                         "content": json.dumps(item.content, ensure_ascii=False, sort_keys=True, default=str),
                         "trust_level": "untrusted_content",
                         "metadata": {
@@ -999,7 +999,7 @@ class ContextManager:
             self._make_item(
                 item_id=f"{self.run_id}_system",
                 layer=ContextLayer.SYSTEM,
-                source_runtime=ContextRuntime.SYSTEM,
+                source_component=ContextSource.SYSTEM,
                 item_type=ContextItemType.SYSTEM_INSTRUCTION,
                 content=system_prompt,
                 authority=ContextAuthority.SYSTEM,
@@ -1012,7 +1012,7 @@ class ContextManager:
             self._make_item(
                 item_id=f"{self.run_id}_user_goal",
                 layer=ContextLayer.USER_GOAL,
-                source_runtime=ContextRuntime.USER,
+                source_component=ContextSource.USER,
                 item_type=ContextItemType.USER_GOAL,
                 content=user_goal,
                 authority=ContextAuthority.USER,
@@ -1037,7 +1037,7 @@ class ContextManager:
         force: bool = False,
         focused_item_ids: set[str] | None = None,
     ) -> bool:
-        if self.provider is None and self.model_runtime is None:
+        if self.provider is None and self.model_runner is None:
             return False
         plan = self._prepare_compaction_plan(focused_item_ids=focused_item_ids)
         self._observe_compaction(plan)
@@ -1123,7 +1123,7 @@ class ContextManager:
                     group_id=self._bucket_id(item),
                     layer=item.layer.value,
                     item_type=item.item_type.value,
-                    source_runtime=item.source_runtime.value,
+                    source_component=item.source_component.value,
                     item_ids=[item.item_id],
                     mode=mode,
                     utility_score=utility_score,
@@ -1139,7 +1139,7 @@ class ContextManager:
 
     @staticmethod
     def _bucket_id(item: ContextItem) -> str:
-        return f"{item.layer.value}:{item.item_type.value}:{item.source_runtime.value}:{item.item_id}"
+        return f"{item.layer.value}:{item.item_type.value}:{item.source_component.value}:{item.item_id}"
 
     @staticmethod
     def _bucket_sort_key(bucket: _CompactionGroup) -> tuple[Any, ...]:
@@ -1252,7 +1252,7 @@ class ContextManager:
                 self._make_item(
                     item_id=envelope.summary_id or self._summary_item_id(),
                     layer=ContextLayer.COMPRESSED_HISTORY,
-                    source_runtime=ContextRuntime.SUMMARY,
+                    source_component=ContextSource.SUMMARY,
                     item_type=ContextItemType.SUMMARY,
                     content=summary_text,
                     authority=ContextAuthority.SUMMARY,
@@ -1388,7 +1388,7 @@ class ContextManager:
         weights = {
             ContextAuthority.SYSTEM: 10,
             ContextAuthority.USER: 9,
-            ContextAuthority.RUNTIME: 7,
+            ContextAuthority.COMPONENT: 7,
             ContextAuthority.TOOL: 6,
             ContextAuthority.SUMMARY: 4,
             ContextAuthority.MODEL: 1,
@@ -1403,8 +1403,8 @@ class ContextManager:
     ) -> CacheAttribution:
         provider_name = None
         model_name = None
-        if self.model_runtime is not None:
-            config = getattr(self.model_runtime, "config", None)
+        if self.model_runner is not None:
+            config = getattr(self.model_runner, "config", None)
             model_name = getattr(config, "default_model", None) or getattr(config, "model", None)
         elif self.provider is not None:
             provider_name = getattr(self.provider, "provider_name", None) or getattr(self.provider, "name", lambda: None)()
@@ -1430,7 +1430,7 @@ class ContextManager:
         else:
             reasons.append("no_bundle")
         if source == CacheAttributionSource.UNKNOWN and (source_items or previous_summary):
-            source = CacheAttributionSource.RUNTIME_INFERRED
+            source = CacheAttributionSource.COMPONENT_INFERRED
             confidence = 0.35 if source_items else 0.2
             if previous_summary is not None:
                 evidence.append("previous_summary_present")
@@ -1609,7 +1609,7 @@ class ContextManager:
             "item_id": item.item_id,
             "layer": item.layer.value,
             "item_type": item.item_type.value,
-            "source_runtime": item.source_runtime.value,
+            "source_component": item.source_component.value,
             "reference_ids": refs,
             "raw_digest": item.content_digest,
         }
@@ -1706,17 +1706,17 @@ class ContextManager:
                 ),
             },
         ]
-        if self.model_runtime is not None:
+        if self.model_runner is not None:
             from singularity.model import (
                 ModelBudget,
                 ModelPurpose,
                 ModelTurnRequest,
-                ToolChoiceMode as RuntimeToolChoiceMode,
+                ToolChoiceMode as ContextToolChoiceMode,
                 ToolChoicePolicy,
             )
 
             request_id = f"model_compact_{uuid4().hex[:12]}"
-            result = self.model_runtime.run_turn(
+            result = self.model_runner.run_turn(
                 ModelTurnRequest(
                     request_id=request_id,
                     run_id=self.run_id,
@@ -1727,7 +1727,7 @@ class ContextManager:
                     purpose=ModelPurpose.COMPACT_CONTEXT,
                     messages=compression_messages,
                     tools=[],
-                    tool_choice=ToolChoicePolicy(mode=RuntimeToolChoiceMode.NONE),
+                    tool_choice=ToolChoicePolicy(mode=ContextToolChoiceMode.NONE),
                     budget=ModelBudget(),
                     context_metadata={"compaction_plan": self._plan_metadata(plan)},
                     trace_metadata={"compaction_plan": self._plan_metadata(plan)},
@@ -1940,7 +1940,7 @@ class ContextManager:
                     "group_id": group.group_id,
                     "layer": group.layer,
                     "item_type": group.item_type,
-                    "source_runtime": group.source_runtime,
+                    "source_component": group.source_component,
                     "item_ids": group.item_ids,
                     "mode": group.mode,
                 }
@@ -2007,7 +2007,7 @@ class ContextManager:
         self,
         *,
         layer: ContextLayer,
-        source_runtime: ContextRuntime,
+        source_component: ContextSource,
         item_type: ContextItemType,
         content: Any,
         authority: ContextAuthority,
@@ -2035,7 +2035,7 @@ class ContextManager:
             task_id=self.task_id,
             phase_id=phase_id or self.phase_id,
             layer=layer,
-            source_runtime=source_runtime,
+            source_component=source_component,
             item_type=item_type,
             content=content,
             authority=authority,
@@ -2147,7 +2147,7 @@ class ContextManager:
         if hasattr(self.trace, "emit"):
             self.trace.emit(
                 event_type,
-                runtime="context",
+                component="context",
                 summary=event_type,
                 payload=payload,
                 ids={

@@ -3,37 +3,37 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from singularity.kernel.exceptions import RuntimeHealthError
-from singularity.kernel.models import RuntimeComponentName
+from singularity.kernel.exceptions import ComponentHealthError
+from singularity.kernel.models import ComponentName
 
 
 DEFAULT_HEALTH_COMPONENTS = [
-    RuntimeComponentName.CONFIGURATION,
-    RuntimeComponentName.OBSERVABILITY,
-    RuntimeComponentName.INTERACTION,
-    RuntimeComponentName.WORKSPACE_STATE,
-    RuntimeComponentName.PROJECT_INDEX,
-    RuntimeComponentName.MEMORY,
-    RuntimeComponentName.POLICY,
-    RuntimeComponentName.SANDBOX,
-    RuntimeComponentName.COMMAND,
-    RuntimeComponentName.MUTATION,
-    RuntimeComponentName.EDIT,
-    RuntimeComponentName.TOOLS,
-    RuntimeComponentName.TOOL_RUNTIME,
-    RuntimeComponentName.TOOL_PROTOCOL,
-    RuntimeComponentName.VERIFICATION,
-    RuntimeComponentName.REVIEW,
-    RuntimeComponentName.EVALUATION,
-    RuntimeComponentName.INSTRUCTIONS,
-    RuntimeComponentName.MODEL,
-    RuntimeComponentName.CONTEXT,
-    RuntimeComponentName.PLANNER,
+    ComponentName.CONFIGURATION,
+    ComponentName.OBSERVABILITY,
+    ComponentName.INTERACTION,
+    ComponentName.WORKSPACE_STATE,
+    ComponentName.PROJECT_INDEX,
+    ComponentName.MEMORY,
+    ComponentName.POLICY,
+    ComponentName.SANDBOX,
+    ComponentName.COMMAND,
+    ComponentName.MUTATION,
+    ComponentName.EDIT,
+    ComponentName.TOOLS,
+    ComponentName.TOOL_EXECUTOR,
+    ComponentName.TOOL_PROTOCOL,
+    ComponentName.VERIFICATION,
+    ComponentName.REVIEW,
+    ComponentName.EVALUATION,
+    ComponentName.INSTRUCTIONS,
+    ComponentName.MODEL,
+    ComponentName.CONTEXT,
+    ComponentName.PLANNER,
 ]
 
 
 @dataclass(frozen=True)
-class RuntimeHealthReport:
+class ComponentHealthReport:
     ok: bool
     summary: dict[str, str]
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
@@ -46,12 +46,12 @@ class RuntimeHealthReport:
         }
 
 
-class RuntimeHealthChecker:
+class ComponentHealthChecker:
     def __init__(
         self,
         *,
         trace: Any | None = None,
-        critical_components: set[RuntimeComponentName] | None = None,
+        critical_components: set[ComponentName] | None = None,
     ) -> None:
         self.trace = trace
         self.critical_components = (
@@ -60,9 +60,9 @@ class RuntimeHealthChecker:
             else set(DEFAULT_HEALTH_COMPONENTS)
         )
 
-    def check(self, components: dict[str | RuntimeComponentName, Any]) -> RuntimeHealthReport:
+    def check(self, components: dict[str | ComponentName, Any]) -> ComponentHealthReport:
         normalized = {
-            key.value if isinstance(key, RuntimeComponentName) else str(key): value
+            key.value if isinstance(key, ComponentName) else str(key): value
             for key, value in components.items()
         }
         summary: dict[str, str] = {}
@@ -80,19 +80,19 @@ class RuntimeHealthChecker:
                 diagnostics.append(diagnostic)
                 if component in self.critical_components:
                     ok = False
-        report = RuntimeHealthReport(ok=ok, summary=summary, diagnostics=diagnostics)
+        report = ComponentHealthReport(ok=ok, summary=summary, diagnostics=diagnostics)
         if self.trace is not None and hasattr(self.trace, "record"):
-            self.trace.record("runtime.health_checked", report.to_dict())
+            self.trace.record("component.health_checked", report.to_dict())
         if not ok and any(item["critical"] for item in diagnostics):
             return report
         return report
 
-    def enforce(self, components: dict[str | RuntimeComponentName, Any]) -> RuntimeHealthReport:
+    def enforce(self, components: dict[str | ComponentName, Any]) -> ComponentHealthReport:
         report = self.check(components)
         if not report.ok:
-            raise RuntimeHealthError(
-                "Runtime health check failed.",
-                code="runtime_health_failed",
+            raise ComponentHealthError(
+                "Component health check failed.",
+                code="component_health_failed",
                 details=report.to_dict(),
             )
         return report

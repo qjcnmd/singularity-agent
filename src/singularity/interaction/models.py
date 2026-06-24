@@ -30,10 +30,10 @@ class OutcomeStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class RuntimeEvent:
+class InteractionEvent:
     event_type: str
     summary: str
-    runtime: str = "interaction"
+    component: str = "interaction"
     payload: dict[str, Any] = field(default_factory=dict)
     severity: str = "info"
     event_id: str = field(default_factory=lambda: f"interaction_evt_{uuid4().hex[:12]}")
@@ -50,7 +50,7 @@ class RuntimeEvent:
             "event_id": self.event_id,
             "event_type": self.event_type,
             "summary": self.summary,
-            "runtime": self.runtime,
+            "component": self.component,
             "payload": self.payload,
             "severity": self.severity,
             "run_id": self.run_id,
@@ -63,12 +63,12 @@ class RuntimeEvent:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "RuntimeEvent":
+    def from_dict(cls, payload: dict[str, Any]) -> "InteractionEvent":
         return cls(
             event_id=str(payload.get("event_id") or f"interaction_evt_{uuid4().hex[:12]}"),
             event_type=str(payload["event_type"]),
             summary=str(payload.get("summary") or ""),
-            runtime=str(payload.get("runtime") or "interaction"),
+            component=str(payload.get("component") or "interaction"),
             payload=dict(payload.get("payload") or {}),
             severity=str(payload.get("severity") or "info"),
             run_id=payload.get("run_id"),
@@ -84,7 +84,7 @@ class RuntimeEvent:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, default=str)
 
     @classmethod
-    def from_json(cls, text: str) -> "RuntimeEvent":
+    def from_json(cls, text: str) -> "InteractionEvent":
         return cls.from_dict(json.loads(text))
 
 
@@ -103,7 +103,7 @@ class ProgressEvent:
     action_id: str | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
-    def to_runtime_event(self) -> RuntimeEvent:
+    def to_interaction_event(self) -> InteractionEvent:
         payload = {
             **self.payload,
             "phase": self.phase,
@@ -111,11 +111,11 @@ class ProgressEvent:
             "current": self.current,
             "total": self.total,
         }
-        return RuntimeEvent(
+        return InteractionEvent(
             event_id=self.event_id,
             event_type=f"progress.{self.status}",
             summary=self.summary,
-            runtime="progress",
+            component="progress",
             payload=payload,
             run_id=self.run_id,
             session_id=self.session_id,

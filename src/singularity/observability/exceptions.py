@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 class ObservabilityError(Exception):
-    """Base error for trace runtime failures."""
+    """Base error for trace recording failures."""
 
 
 class TraceStoreError(ObservabilityError):

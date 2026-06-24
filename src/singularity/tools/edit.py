@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from singularity.edit import EditIntent, EditOperation, EditRuntime, EditScope
+from singularity.edit import EditIntent, EditOperation, EditExecutor, EditScope
 from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.tools.models import (
     PermissionLevel,
@@ -124,29 +124,29 @@ class InspectDiffInput(BaseModel):
 
 
 class EditToolHandlers:
-    def __init__(self, runtime: EditRuntime) -> None:
-        self.runtime = runtime
+    def __init__(self, edit_executor: EditExecutor) -> None:
+        self.component = edit_executor
 
     def plan(self, args: EditIntentInput) -> dict[str, Any]:
         intent = _intent(args)
-        result = self.runtime.plan_intent(intent)
+        result = self.component.plan_intent(intent)
         return {"edit": result.to_dict()}
 
     def preview(self, args: EditIntentInput) -> dict[str, Any]:
         intent = _intent(args)
-        result = self.runtime.preview_intent(intent)
+        result = self.component.preview_intent(intent)
         return {"edit": result.to_dict()}
 
     def apply(self, args: EditIntentInput) -> dict[str, Any]:
         intent = _intent(args)
         result = (
-            self.runtime.preview_intent(intent)
+            self.component.preview_intent(intent)
             if args.dry_run
-            else self.runtime.apply_intent(intent)
+            else self.component.apply_intent(intent)
         )
         if not result.ok:
             raise ToolExecutionFailure(
-                result.message or "Edit runtime failed.",
+                result.message or "EditExecutor failed.",
                 code=result.error_code or "edit_failed",
                 details={"edit": result.to_dict()},
             )
@@ -154,7 +154,7 @@ class EditToolHandlers:
 
     def write_file(self, args: WriteFileInput) -> dict[str, Any]:
         try:
-            result = self.runtime.write_file(
+            result = self.component.write_file(
                 path=args.path,
                 content=args.content,
                 mode=args.overwrite_policy or args.mode,
@@ -164,7 +164,7 @@ class EditToolHandlers:
             )
         except MutationError as exc:
             _raise_mutation_failure(exc)
-        return _mutation_facade_output(result, self.runtime, tool_name="write_file")
+        return _mutation_facade_output(result, self.component, tool_name="write_file")
 
     def apply_patch(self, args: ApplyPatchInput) -> dict[str, Any]:
         if not args.strict:
@@ -174,7 +174,7 @@ class EditToolHandlers:
                 details={"strict": args.strict},
             )
         try:
-            result = self.runtime.apply_unified_diff(
+            result = self.component.apply_unified_diff(
                 patch=args.unified_diff or args.patch or "",
                 reason=args.reason,
                 expected_files=args.expected_files,
@@ -184,7 +184,7 @@ class EditToolHandlers:
             _raise_mutation_failure(exc)
         if not result.ok:
             _raise_result_failure(result)
-        output = _mutation_facade_output(result, self.runtime, tool_name="apply_patch")
+        output = _mutation_facade_output(result, self.component, tool_name="apply_patch")
         output["conflicts"] = [] if result.ok else [result.message]
         return output
 
@@ -202,7 +202,7 @@ class EditToolHandlers:
                 )
             scope = "current_run"
         try:
-            result = self.runtime.mutation_runtime.inspect_diff(
+            result = self.component.mutation_manager.inspect_diff(
                 scope=scope,
                 changeset_id=args.changeset_id,
                 paths=paths or None,
@@ -212,9 +212,9 @@ class EditToolHandlers:
         return {"status": "ok", **result}
 
 
-def register_edit_tools(registry: Any, runtime: EditRuntime | None = None) -> None:
-    edit_runtime = runtime or EditRuntime(Path(registry.project_root))
-    handlers = EditToolHandlers(edit_runtime)
+def register_edit_tools(registry: Any, edit_executor: EditExecutor | None = None) -> None:
+    edit_executor = edit_executor or EditExecutor(Path(registry.project_root))
+    handlers = EditToolHandlers(edit_executor)
     _register_execution_primitive_tools(registry, handlers)
     registry.register(
         ToolSpec(
@@ -229,7 +229,7 @@ def register_edit_tools(registry: Any, runtime: EditRuntime | None = None) -> No
             resource_resolver=_edit_resources,
             side_effects=ToolSideEffectKind.READ_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            risk_tags=("edit_runtime", "plan", "read_only"),
+            risk_tags=("edit_executor", "plan", "read_only"),
             timeout_seconds=10.0,
             max_output_chars=16000,
             cacheable=False,
@@ -249,7 +249,7 @@ def register_edit_tools(registry: Any, runtime: EditRuntime | None = None) -> No
             resource_resolver=_edit_resources,
             side_effects=ToolSideEffectKind.READ_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            risk_tags=("edit_runtime", "preview", "read_only"),
+            risk_tags=("edit_executor", "preview", "read_only"),
             timeout_seconds=15.0,
             max_output_chars=20000,
             cacheable=False,
@@ -260,7 +260,7 @@ def register_edit_tools(registry: Any, runtime: EditRuntime | None = None) -> No
         ToolSpec(
             name="edit_apply",
             version="0.1.0",
-            description="Apply an edit through EditRuntime, which delegates all writes to MutationRuntime.",
+            description="Apply an edit through EditExecutor, which delegates all writes to WorkspaceMutationManager.",
             input_model=EditIntentInput,
             handler=handlers.apply,
             permission_level=PermissionLevel.WRITE,
@@ -269,14 +269,14 @@ def register_edit_tools(registry: Any, runtime: EditRuntime | None = None) -> No
             resource_resolver=_edit_resources,
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
-            risk_tags=("write", "filesystem", "mutation", "edit_runtime"),
+            execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
+            risk_tags=("write", "filesystem", "mutation", "edit_executor"),
             timeout_seconds=20.0,
             max_output_chars=20000,
             cacheable=False,
             idempotent=False,
-            uses_edit_runtime=True,
-            uses_mutation_runtime=True,
+            uses_edit_executor=True,
+            uses_mutation_manager=True,
         )
     )
 
@@ -286,7 +286,7 @@ def _register_execution_primitive_tools(registry: Any, handlers: EditToolHandler
         ToolSpec(
             name="write_file",
             version="0.1.0",
-            description="Create, overwrite, or upsert one UTF-8 workspace file through EditRuntime and MutationRuntime.",
+            description="Create, overwrite, or upsert one UTF-8 workspace file through EditExecutor and WorkspaceMutationManager.",
             input_model=WriteFileInput,
             handler=handlers.write_file,
             permission_level=PermissionLevel.WRITE,
@@ -297,21 +297,21 @@ def _register_execution_primitive_tools(registry: Any, handlers: EditToolHandler
             ],
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
-            risk_tags=("write", "filesystem", "mutation", "edit_runtime", "facade"),
+            execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
+            risk_tags=("write", "filesystem", "mutation", "edit_executor", "facade"),
             timeout_seconds=20.0,
             max_output_chars=20000,
             cacheable=False,
             idempotent=False,
-            uses_edit_runtime=True,
-            uses_mutation_runtime=True,
+            uses_edit_executor=True,
+            uses_mutation_manager=True,
         )
     )
     registry.register(
         ToolSpec(
             name="apply_patch",
             version="0.1.0",
-            description="Apply a text unified diff through EditRuntime and MutationRuntime.",
+            description="Apply a text unified diff through EditExecutor and WorkspaceMutationManager.",
             input_model=ApplyPatchInput,
             handler=handlers.apply_patch,
             permission_level=PermissionLevel.WRITE,
@@ -320,21 +320,21 @@ def _register_execution_primitive_tools(registry: Any, handlers: EditToolHandler
             resource_resolver=_patch_resources,
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
-            risk_tags=("write", "filesystem", "mutation", "edit_runtime", "facade", "patch"),
+            execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
+            risk_tags=("write", "filesystem", "mutation", "edit_executor", "facade", "patch"),
             timeout_seconds=30.0,
             max_output_chars=24000,
             cacheable=False,
             idempotent=False,
-            uses_edit_runtime=True,
-            uses_mutation_runtime=True,
+            uses_edit_executor=True,
+            uses_mutation_manager=True,
         )
     )
     registry.register(
         ToolSpec(
             name="inspect_diff",
             version="0.1.0",
-            description="Inspect current run or changeset diffs from MutationRuntime evidence without requiring Git.",
+            description="Inspect current run or changeset diffs from WorkspaceMutationManager evidence without requiring Git.",
             input_model=InspectDiffInput,
             handler=handlers.inspect_diff,
             permission_level=PermissionLevel.READ_ONLY,
@@ -356,14 +356,14 @@ def _register_execution_primitive_tools(registry: Any, handlers: EditToolHandler
 
 def _mutation_facade_output(
     result: MutationResult,
-    runtime: EditRuntime,
+    edit_executor: EditExecutor,
     *,
     tool_name: str,
 ) -> dict[str, Any]:
     if not result.ok:
         _raise_result_failure(result)
     classes = (
-        runtime.mutation_runtime._changeset_file_classes(result.changeset_id)
+        edit_executor.mutation_manager._changeset_file_classes(result.changeset_id)
         if result.changeset_id
         else {"added_files": set(), "modified_files": set(), "deleted_files": set()}
     )

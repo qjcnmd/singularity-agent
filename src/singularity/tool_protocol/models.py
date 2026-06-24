@@ -88,7 +88,7 @@ class ToolCallFailureKind(str, Enum):
     approval_required = "approval_required"
     approval_denied = "approval_denied"
     sandbox_required = "sandbox_required"
-    tool_runtime_failed = "tool_runtime_failed"
+    tool_executor_failed = "tool_executor_failed"
     result_binding_failed = "result_binding_failed"
     replay_detected = "replay_detected"
     conflicting_replay = "conflicting_replay"

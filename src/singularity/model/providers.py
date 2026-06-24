@@ -175,7 +175,7 @@ class MockModelProvider:
 
 
 class ChatProviderModelProvider:
-    """Adapter for the pre-runtime Provider.chat(messages, tools) contract."""
+    """Adapter for the earlier Provider.chat(messages, tools) contract."""
 
     def __init__(
         self,

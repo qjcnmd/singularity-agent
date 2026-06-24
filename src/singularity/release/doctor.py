@@ -15,10 +15,10 @@ from singularity.release.models import (
     ReleaseCheck,
     ReleaseDoctorReport,
 )
-from singularity.release.paths import RuntimePaths
+from singularity.release.paths import UserDataPaths
 
 
-def run_doctor(paths: RuntimePaths) -> ReleaseDoctorReport:
+def run_doctor(paths: UserDataPaths) -> ReleaseDoctorReport:
     checks: list[ReleaseCheck] = []
     checks.append(_python_check())
     info = version_info(paths)
@@ -35,7 +35,7 @@ def run_doctor(paths: RuntimePaths) -> ReleaseDoctorReport:
     )
     checks.extend(_directory_checks(paths))
     checks.append(_config_check(paths))
-    checks.append(_critical_runtime_config_check(paths))
+    checks.append(_critical_component_config_check(paths))
     checks.append(_optional_dependencies_check())
     checks.append(_migration_check(paths))
     return ReleaseDoctorReport(
@@ -56,10 +56,10 @@ def _python_check() -> ReleaseCheck:
     )
 
 
-def _directory_checks(paths: RuntimePaths) -> list[ReleaseCheck]:
+def _directory_checks(paths: UserDataPaths) -> list[ReleaseCheck]:
     checks: list[ReleaseCheck] = []
     for name, path in (
-        ("runtime_root", paths.root),
+        ("user_data_root", paths.root),
         ("config_dir", paths.config_dir),
         ("state_dir", paths.state_dir),
         ("cache_dir", paths.cache_dir),
@@ -95,7 +95,7 @@ def _directory_checks(paths: RuntimePaths) -> list[ReleaseCheck]:
     return checks
 
 
-def _config_check(paths: RuntimePaths) -> ReleaseCheck:
+def _config_check(paths: UserDataPaths) -> ReleaseCheck:
     if not paths.config_file.exists():
         return ReleaseCheck(
             "config_schema",
@@ -122,14 +122,14 @@ def _config_check(paths: RuntimePaths) -> ReleaseCheck:
     )
 
 
-def _critical_runtime_config_check(paths: RuntimePaths) -> ReleaseCheck:
+def _critical_component_config_check(paths: UserDataPaths) -> ReleaseCheck:
     try:
         config = load_config(paths)
     except Exception:
         return ReleaseCheck(
-            "runtime_configuration",
+            "component_configuration",
             "error",
-            "Runtime configuration is unavailable.",
+            "Installation configuration is unavailable.",
             suggestion="Run singularity-agent system init or singularity-agent system repair.",
         )
     missing_sections = [
@@ -144,19 +144,19 @@ def _critical_runtime_config_check(paths: RuntimePaths) -> ReleaseCheck:
     ]
     if missing_sections:
         return ReleaseCheck(
-            "runtime_configuration",
+            "component_configuration",
             "error",
-            "Missing runtime sections: " + ", ".join(missing_sections),
+            "Missing component configuration sections: " + ", ".join(missing_sections),
             suggestion="Run singularity-agent system repair.",
         )
     if missing_env:
         return ReleaseCheck(
-            "runtime_configuration",
+            "component_configuration",
             "warning",
             "Model/provider environment is incomplete: " + ", ".join(missing_env),
             suggestion="Set these variables before running model-backed commands.",
         )
-    return ReleaseCheck("runtime_configuration", "ok", "Critical runtime sections are configured.")
+    return ReleaseCheck("component_configuration", "ok", "Critical component sections are configured.")
 
 
 def _optional_dependencies_check() -> ReleaseCheck:
@@ -175,7 +175,7 @@ def _optional_dependencies_check() -> ReleaseCheck:
     )
 
 
-def _migration_check(paths: RuntimePaths) -> ReleaseCheck:
+def _migration_check(paths: UserDataPaths) -> ReleaseCheck:
     if not paths.manifest_file.exists():
         return ReleaseCheck(
             "migrations",

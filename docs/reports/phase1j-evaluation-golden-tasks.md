@@ -12,7 +12,7 @@ This phase did not modify Rust, Desktop, Tauri, MCP, multi-agent, plugin marketp
 
 Before this loop, Singularity already had:
 
-- `BenchmarkTask`, `ExpectedOutcome`, `GoldenTaskStore`, `EvaluationRuntime`, trace replay, A/B reports, regression reports, and CLI evaluation commands.
+- `BenchmarkTask`, `ExpectedOutcome`, `GoldenTaskStore`, `EvaluationHarness`, trace replay, A/B reports, regression reports, and CLI evaluation commands.
 - Tests for generic task schema round-trip, store filtering, trace replay determinism, report writing, and CLI evaluation commands.
 
 The Phase 1J contract was still missing:
@@ -25,11 +25,11 @@ The Phase 1J contract was still missing:
 
 ## Plan
 
-1. Keep Phase 1J inside the existing `src/singularity/evaluation` runtime.
+1. Keep Phase 1J inside the existing `src/singularity/evaluation` component.
 2. Add an optional, backwards-compatible `golden_contract` to `BenchmarkTask`.
 3. Add a checked-in `docs/evaluation/phase1j-golden-tasks.json` covering all ten required scenarios.
 4. Carry golden contract evidence into `TaskExecutionEvidence`, JSON reports, and Markdown reports.
-5. Add opaque regression `trace_artifact_ref` values and persist per-regression artifacts when a `TraceRuntime` is attached.
+5. Add opaque regression `trace_artifact_ref` values and persist per-regression artifacts when a `TraceRecorder` is attached.
 6. Make offline suite runs avoid whole-workspace snapshots so the checked-in suite is CI-runnable.
 7. Update README and evaluation docs.
 
@@ -54,28 +54,28 @@ The Phase 1J contract was still missing:
 - `src/singularity/evaluation/execution.py`
   - Records `execution_evidence.golden_contract`.
   - Marks offline diff outcomes as blocked without scanning the workspace.
-  - Writes per-regression trace artifacts when a `TraceRuntime` is present.
+  - Writes per-regression trace artifacts when a `TraceRecorder` is present.
 - `src/singularity/evaluation/reports.py`
   - Adds `Golden Task Evidence` to Markdown reports.
   - Adds trace artifact refs to regression Markdown.
-- `src/singularity/evaluation/runtime.py`
+- `src/singularity/evaluation/harness.py`
   - Adds stable opaque `trace_artifact_ref` values to regression records.
 - `src/singularity/evaluation/__init__.py`
   - Exports `GoldenTaskContract`.
 - `README.md`
   - Documents the checked-in Phase 1J task set and golden evidence fields.
-- `docs/evaluation-runtime.md`
+- `docs/evaluation-harness.md`
   - Documents `golden_contract`, Phase 1J scenarios, report evidence, and regression artifact refs.
 - Tests
   - Adds coverage in `tests/evaluation/test_models_store.py`.
-  - Adds coverage in `tests/evaluation/test_scoring_replay_runtime.py`.
+  - Adds coverage in `tests/evaluation/test_scoring_replay_harness.py`.
 
 ## Verification
 
 Red test proof:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\evaluation\test_models_store.py::test_benchmark_task_round_trips_golden_contract tests\evaluation\test_models_store.py::test_phase1j_golden_task_set_covers_all_required_scenarios tests\evaluation\test_scoring_replay_runtime.py::test_evaluation_report_includes_golden_contract_evidence tests\evaluation\test_scoring_replay_runtime.py::test_regression_report_binds_each_regression_to_trace_artifact_ref --basetemp work\pytest-tmp-phase1j-red
+.\.venv\Scripts\python.exe -m pytest tests\evaluation\test_models_store.py::test_benchmark_task_round_trips_golden_contract tests\evaluation\test_models_store.py::test_phase1j_golden_task_set_covers_all_required_scenarios tests\evaluation\test_scoring_replay_harness.py::test_evaluation_report_includes_golden_contract_evidence tests\evaluation\test_scoring_replay_harness.py::test_regression_report_binds_each_regression_to_trace_artifact_ref --basetemp work\pytest-tmp-phase1j-red
 ```
 
 Result:
@@ -87,7 +87,7 @@ Result:
 Additional red proof for CI-runnable offline suites:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\evaluation\test_scoring_replay_runtime.py::test_offline_golden_suite_does_not_scan_workspace_for_diff_outcomes --basetemp work\pytest-tmp-phase1j-red-offline-scan
+.\.venv\Scripts\python.exe -m pytest tests\evaluation\test_scoring_replay_harness.py::test_offline_golden_suite_does_not_scan_workspace_for_diff_outcomes --basetemp work\pytest-tmp-phase1j-red-offline-scan
 ```
 
 Result:
@@ -174,7 +174,7 @@ origin/main...HEAD = 0 0
 
 ## Risks
 
-- The checked-in Phase 1J suite is a contract and offline smoke by default. It does not perform a live model run unless a caller explicitly wires full runtime execution.
+- The checked-in Phase 1J suite is a contract and offline smoke by default. It does not perform a live model run unless a caller explicitly wires full component execution.
 - Offline suite runs intentionally mark executable test/diff outcomes as blocked instead of pretending they passed.
 - `golden_contract` is optional for legacy benchmark tasks to avoid breaking existing task files.
 - Regression artifact refs are opaque handles, not local filesystem paths.

@@ -8,7 +8,7 @@ After the user provided local provider settings in `C:\Users\Lenovo\Desktop\key.
 
 ## Findings From Real Live Run
 
-The first live run proved that the model/provider path was real: the agent created `quicksort.py` and verification executed. It also exposed two runtime defects that offline tests did not catch:
+The first live run proved that the model/provider path was real: the agent created `quicksort.py` and verification executed. It also exposed two component defects that offline tests did not catch:
 
 - model usage metrics such as `output_tokens` were redacted as if they were secrets, causing final report usage aggregation to raise a numeric conversion error;
 - finalizing phase policy denied read-only evidence tools, so a model that tried to inspect the generated file before finalizing could make the task fail even after verification passed.
@@ -25,7 +25,7 @@ The first live run proved that the model/provider path was real: the agent creat
 Commands run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_planner_runtime.py tests\test_trace_redaction.py tests\test_trace_timeline_summary.py tests\test_observability_integration.py tests\test_cli.py::test_eval_live_quicksort_uses_kernel_and_independent_smoke --basetemp work\pytest-tmp-live-hotfix-2
+.\.venv\Scripts\python.exe -m pytest tests\test_planner.py tests\test_trace_redaction.py tests\test_trace_timeline_summary.py tests\test_observability_integration.py tests\test_cli.py::test_eval_live_quicksort_uses_kernel_and_independent_smoke --basetemp work\pytest-tmp-live-hotfix-2
 git diff --check
 .\.venv\Scripts\python.exe -m singularity.cli eval live quicksort --run-id live_keyfile_p0_pass --max-turns 12 --json
 ```
@@ -36,7 +36,7 @@ Results:
 - `git diff --check` reported no whitespace errors, only Windows CRLF conversion warnings;
 - live provider benchmark result: `ok=true`;
 - live agent status: `completed`;
-- runtime verification status: `ready`;
+- component verification status: `ready`;
 - independent smoke command: `python quicksort.py`;
 - independent smoke exit code: `0`.
 

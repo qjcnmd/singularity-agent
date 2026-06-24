@@ -53,7 +53,7 @@ class ToolProtocolResultBuilder:
         if len(preview) > self.max_preview_chars:
             preview = preview[: self.max_preview_chars]
         digest = self.redactor.hash_value(raw_payload)
-        error_kind = None if result.ok else ToolCallFailureKind.tool_runtime_failed
+        error_kind = None if result.ok else ToolCallFailureKind.tool_executor_failed
         return envelope_from_tool_result(
             tool_call=tool_call,
             result=result,

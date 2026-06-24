@@ -20,7 +20,7 @@ from singularity.policy.risk import RiskClassifier
 from singularity.policy.rules import DefaultLocalPolicyRules
 
 
-class PolicyRuntime:
+class PolicyEngine:
     def __init__(
         self,
         config: PolicyConfig | None = None,
@@ -240,7 +240,7 @@ class PolicyRuntime:
         blocked = decision is not None and decision.outcome != DecisionOutcome.ALLOW
         self.trace.emit(
             event_type,
-            runtime="policy" if not event_type.value.startswith("approval.") else "approval",
+            component="policy" if not event_type.value.startswith("approval.") else "approval",
             summary=(
                 decision.reason
                 if decision is not None

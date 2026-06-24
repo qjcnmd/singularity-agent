@@ -50,8 +50,8 @@ class ExpectedOutcomeKind(str, Enum):
 
 
 VALID_DIFFICULTY_TAGS = {item.value for item in TaskDifficulty}
-VALID_RUNTIME_TAGS = {"memory-heavy", "tool-heavy", "phase1j-golden"}
-VALID_TAGS = VALID_DIFFICULTY_TAGS | VALID_RUNTIME_TAGS
+VALID_AGENT_HARNESS_TAGS = {"memory-heavy", "tool-heavy", "phase1j-golden"}
+VALID_TAGS = VALID_DIFFICULTY_TAGS | VALID_AGENT_HARNESS_TAGS
 VALID_TASK_VERSIONS = {"v1", "v2"}
 VALID_HOOK_STAGES = {"before_run", "after_run", "score_adjustment"}
 GOLDEN_CONTRACT_FIELDS = {
@@ -478,7 +478,7 @@ class EvaluationProfile:
     def config_fingerprint_payload(self) -> dict[str, Any]:
         return self.to_dict()
 
-    def to_runtime_overrides(self) -> dict[str, Any]:
+    def to_agent_config_overrides(self) -> dict[str, Any]:
         return {
             "profile": self.name,
             "model": self.model,

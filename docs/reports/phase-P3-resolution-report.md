@@ -8,24 +8,24 @@ Batch: P3 documentation, naming, and low-risk UX fixes
 
 P3 is complete with a small documentation-and-contract patch. The batch avoids broad refactoring and focuses on preventing the known drift from returning:
 
-- Documentation consistency tests now verify implemented runtime source paths exist, rather than only checking table keywords.
-- GitRuntime docs no longer describe stale reserved or Git-absent boundaries.
-- GitRuntime naming and CLI help now state the local-only, explicit-path behavior more directly.
+- Documentation consistency tests now verify implemented component source paths exist, rather than only checking table keywords.
+- GitClient docs no longer describe stale reserved or Git-absent boundaries.
+- GitClient naming and CLI help now state the local-only, explicit-path behavior more directly.
 
 ## Issue Status
 
 | Priority | Issue | Status | Evidence |
 | --- | --- | --- | --- |
-| P3-1 | Docs consistency tests mainly checked keywords and weak text presence. | Fixed | `tests/test_docs_consistency.py` now parses README runtime status rows and asserts implemented `src/singularity/...` source paths exist. It also guards GitRuntime docs against stale reserved/Git-absent wording and requires the local-only contract text. |
-| P3-2 | GitRuntime comments and naming were mildly misleading. | Fixed | `src/singularity/git_runtime/runtime.py` now calls GitRuntime a local-only Git adapter instead of a control-plane wrapper. `src/singularity/git_runtime/cli.py` makes `--path` and commit help explicitly describe staged paths and no push behavior. |
-| P3-3 | Other low-risk documentation, naming, error-message, and UX issues from review. | Fixed | `docs/architecture/code-index-runtime.md`, `docs/architecture/verification-runtime.md`, and `docs/architecture/command-runtime.md` now align with the implemented local-only GitRuntime boundary. `tests/test_git_runtime.py` adds behavior coverage for rejecting paths outside the workspace. |
+| P3-1 | Docs consistency tests mainly checked keywords and weak text presence. | Fixed | `tests/test_docs_consistency.py` now parses README component status rows and asserts implemented `src/singularity/...` source paths exist. It also guards GitClient docs against stale reserved/Git-absent wording and requires the local-only contract text. |
+| P3-2 | GitClient comments and naming were mildly misleading. | Fixed | `src/singularity/git_client/client.py` now calls GitClient a local-only Git adapter instead of a control-plane wrapper. `src/singularity/git_client/cli.py` makes `--path` and commit help explicitly describe staged paths and no push behavior. |
+| P3-3 | Other low-risk documentation, naming, error-message, and UX issues from review. | Fixed | `docs/architecture/code-index.md`, `docs/architecture/verification-runner.md`, and `docs/architecture/command-execution.md` now align with the implemented local-only GitClient boundary. `tests/test_git_client.py` adds behavior coverage for rejecting paths outside the workspace. |
 
 ## Validation
 
 Commands run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_docs_consistency.py tests\test_git_runtime.py --basetemp work\pytest-tmp-p3-targeted
+.\.venv\Scripts\python.exe -m pytest tests\test_docs_consistency.py tests\test_git_client.py --basetemp work\pytest-tmp-p3-targeted
 ```
 
 Result: `15 passed`.
@@ -76,5 +76,5 @@ Result: passed; Git reported only Windows LF-to-CRLF working-copy warnings.
 
 ## Remaining Risk
 
-- The docs consistency suite is still intentionally lightweight. It now includes real source-path and GitRuntime boundary contracts, but it is not a full documentation linter.
-- The GitRuntime CLI remains local-only by design. Push, pull, PR, remote branch automation, reset, and workspace rollback remain outside this runtime.
+- The docs consistency suite is still intentionally lightweight. It now includes real source-path and GitClient boundary contracts, but it is not a full documentation linter.
+- The GitClient CLI remains local-only by design. Push, pull, PR, remote branch automation, reset, and workspace rollback remain outside this component.

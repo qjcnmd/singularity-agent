@@ -275,7 +275,7 @@ def _initial_markdown(label: str) -> str:
     return (
         f"# {titles.get(label, label.title())}\n\n"
         "<!-- memory:template -->\n"
-        "This file is managed by Singularity MemoryRuntime. Human notes may be edited, "
+        "This file is managed by Singularity MemoryLearningPipeline. Human notes may be edited, "
         "but protected memory blocks are validated on refresh.\n"
         "<!-- /memory:template -->\n"
     )

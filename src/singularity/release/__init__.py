@@ -1,11 +1,11 @@
-"""Release/runtime support for installed Singularity CLI usage."""
+"""Release and installation support for installed Singularity CLI usage."""
 
 from singularity.release.metadata import version_info
-from singularity.release.paths import RuntimeMode, RuntimePaths, resolve_runtime_paths
+from singularity.release.paths import UserDataMode, UserDataPaths, resolve_user_data_paths
 
 __all__ = [
-    "RuntimeMode",
-    "RuntimePaths",
-    "resolve_runtime_paths",
+    "UserDataMode",
+    "UserDataPaths",
+    "resolve_user_data_paths",
     "version_info",
 ]

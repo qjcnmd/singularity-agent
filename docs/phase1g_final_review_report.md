@@ -4,7 +4,7 @@ Phase 1G makes finalization evidence-gated instead of trusting a model final ans
 
 ## Implemented
 
-- `ReviewRuntime.final_review()` is now part of `PlannerRuntime.finalize()`.
+- `ReviewPipeline.final_review()` is now part of `Planner.finalize()`.
 - A task cannot become `completed` unless the latest final review decision is `accept`.
 - Review decisions expose a phase route:
   - `approve`
@@ -12,7 +12,7 @@ Phase 1G makes finalization evidence-gated instead of trusting a model final ans
   - `replan`
   - `ask_user`
   - `blocked`
-- `FinalReportRuntime` renders the existing structured `FinalReport` into a markdown artifact.
+- `FinalReportRenderer` renders the existing structured `FinalReport` into a markdown artifact.
 - Planner finalization records the markdown artifact path in planner events and trace.
 
 ## Final Report Artifact

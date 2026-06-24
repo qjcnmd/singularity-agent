@@ -22,7 +22,7 @@
     "id": { "type": "string", "minLength": 1 },
     "scope": {
       "type": "string",
-      "enum": ["session", "workspace", "project", "user_preference", "tool_runtime"]
+      "enum": ["session", "workspace", "project", "user_preference", "tool_executor"]
     },
     "type": { "type": "string", "minLength": 1 },
     "source": { "type": "string", "minLength": 1 },

@@ -28,8 +28,8 @@ class DirtySet:
 
 
 class IncrementalIndexer:
-    def __init__(self, runtime: Any) -> None:
-        self.runtime = runtime
+    def __init__(self, project_index: Any) -> None:
+        self.component = project_index
 
     def update_after_changeset(
         self,
@@ -40,12 +40,12 @@ class IncrementalIndexer:
     ) -> IncrementalIndexResult:
         dirty = self.compute_dirty_set(changed_files=changed_files, deleted_files=deleted_files or [])
         for path in dirty.deleted:
-            self.runtime.store.delete_by_path(path)
+            self.component.store.delete_by_path(path)
         if dirty.full_rebuild_required:
-            return self.runtime.build_full_index(reason=reason)
-        rebuilt = self.runtime._index_paths(dirty.rebuild_paths)
+            return self.component.build_full_index(reason=reason)
+        rebuilt = self.component._index_paths(dirty.rebuild_paths)
         if dirty.stale_paths:
-            self.runtime.store.mark_stale(dirty.stale_paths, FreshnessStatus.STALE_DEPENDENCY)
+            self.component.store.mark_stale(dirty.stale_paths, FreshnessStatus.STALE_DEPENDENCY)
         result = IncrementalIndexResult(
             changed_files=sorted(set(changed_files)),
             deleted_files=dirty.deleted,
@@ -53,11 +53,11 @@ class IncrementalIndexer:
             stale_files=dirty.stale_paths,
             dirty_reasons=dirty.reasons,
             full_rebuild_required=False,
-            summary=self.runtime.store.load_summary().to_dict(),
+            summary=self.component.store.load_summary().to_dict(),
             confidence=0.9,
             source="incremental_indexer",
         )
-        self.runtime._emit_index_event("project_index.updated", result.to_dict())
+        self.component._emit_index_event("project_index.updated", result.to_dict())
         return result
 
     def compute_dirty_set(
@@ -77,7 +77,7 @@ class IncrementalIndexer:
         full = bool(config_dirty)
         reverse = []
         if changed:
-            reverse = sorted({edge.importer_path for edge in self.runtime.store.query_reverse_dependencies(changed)})
+            reverse = sorted({edge.importer_path for edge in self.component.store.query_reverse_dependencies(changed)})
             for path in reverse:
                 reasons.setdefault(path, []).append("reverse_dependency_dirty")
         for path in config_dirty:

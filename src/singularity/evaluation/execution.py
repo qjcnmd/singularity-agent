@@ -12,7 +12,7 @@ from typing import Any
 from singularity.command import (
     CommandPurpose,
     CommandRequest,
-    CommandRuntime,
+    CommandExecutor,
     FilesystemMode,
 )
 from singularity.evaluation.models import (
@@ -24,8 +24,8 @@ from singularity.evaluation.models import (
 )
 from singularity.observability.models import TraceArtifactKind, TraceEventType
 from singularity.verification.models import CheckKind, VerificationCheck
-from singularity.verification.runtime import VerificationRuntime
-from singularity.workspace import MutationRuntime
+from singularity.verification.runner import VerificationRunner
+from singularity.workspace import WorkspaceMutationManager
 from singularity.workspace.errors import MutationError
 from singularity.workspace.operations import CreateFile
 from singularity.workspace.pathing import WorkspacePathResolver
@@ -41,7 +41,7 @@ class TaskExecutionEvidence:
     diff_summary: list[dict[str, Any]]
     hook_results: list[dict[str, Any]] = field(default_factory=list)
     snapshot: dict[str, Any] = field(default_factory=dict)
-    runtime_overrides: dict[str, Any] = field(default_factory=dict)
+    agent_config_overrides: dict[str, Any] = field(default_factory=dict)
     golden_contract: dict[str, Any] = field(default_factory=dict)
     failure_reasons: list[str] = field(default_factory=list)
 
@@ -55,34 +55,34 @@ class TaskExecutionEvidence:
             "diff_summary": self.diff_summary,
             "hook_results": self.hook_results,
             "snapshot": self.snapshot,
-            "runtime_overrides": self.runtime_overrides,
+            "agent_config_overrides": self.agent_config_overrides,
             "golden_contract": self.golden_contract,
             "failure_reasons": self.failure_reasons,
         }
 
 
-class EvaluationTaskExecutor:
+class BenchmarkTaskExecutor:
     def __init__(
         self,
         *,
         project_root: Path | str,
-        command_runtime: CommandRuntime | None = None,
-        verification_runtime: VerificationRuntime | None = None,
-        mutation_runtime: MutationRuntime | None = None,
-        trace_runtime: Any | None = None,
+        command_executor: CommandExecutor | None = None,
+        verification_runner: VerificationRunner | None = None,
+        mutation_manager: WorkspaceMutationManager | None = None,
+        trace_recorder: Any | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve(strict=False)
-        self.command_runtime = command_runtime
-        self.verification_runtime = verification_runtime
-        self.mutation_runtime = mutation_runtime
-        self.trace_runtime = trace_runtime
+        self.command_executor = command_executor
+        self.verification_runner = verification_runner
+        self.mutation_manager = mutation_manager
+        self.trace_recorder = trace_recorder
         self.path_resolver = WorkspacePathResolver(self.project_root)
 
     def evaluate(
         self,
         task: BenchmarkTask,
         *,
-        runtime_overrides: dict[str, Any],
+        agent_config_overrides: dict[str, Any],
         execute: bool,
     ) -> TaskExecutionEvidence:
         snapshot = self.prepare_snapshot(task, execute=execute)
@@ -132,7 +132,7 @@ class EvaluationTaskExecutor:
             diff_summary=diff_summary,
             hook_results=hook_results,
             snapshot=snapshot,
-            runtime_overrides=runtime_overrides,
+            agent_config_overrides=agent_config_overrides,
             golden_contract=golden_contract,
             failure_reasons=failure_reasons,
         )
@@ -156,13 +156,13 @@ class EvaluationTaskExecutor:
                 CreateFile(path=path, content=content)
                 for path, content in sorted(snapshot.inline_files.items())
             ]
-            if self.mutation_runtime is None:
-                payload["failure_reasons"] = ["mutation_runtime_unavailable"]
+            if self.mutation_manager is None:
+                payload["failure_reasons"] = ["mutation_manager_unavailable"]
                 return payload
-            result = self.mutation_runtime.apply_operations(
+            result = self.mutation_manager.apply_operations(
                 operations,
                 intent=f"materialize benchmark snapshot {task.task_id}",
-                created_by="EvaluationRuntime",
+                created_by="EvaluationHarness",
             )
             payload.update(
                 {
@@ -176,7 +176,7 @@ class EvaluationTaskExecutor:
                 payload["failure_reasons"] = [result.error_code or "snapshot_failed"]
             return payload
         if snapshot.kind == WorkspaceSnapshotKind.ARCHIVE_PATH:
-            # Archive materialization must not bypass MutationRuntime or workspace policy.
+            # Archive materialization must not bypass WorkspaceMutationManager or workspace policy.
             # Until a safe staging-to-mutation adapter exists, classify it as supported
             # schema input but block execution instead of unpacking directly.
             archive_path = Path(str(snapshot.archive_path or ""))
@@ -430,7 +430,7 @@ class EvaluationTaskExecutor:
         }
 
     def _run_verification_command(self, *, command: str, check_id: str) -> dict[str, Any]:
-        if self.verification_runtime is None:
+        if self.verification_runner is None:
             return self._run_command(command, purpose=CommandPurpose.PROJECT_VERIFICATION)
         check = VerificationCheck(
             id=check_id,
@@ -449,12 +449,12 @@ class EvaluationTaskExecutor:
             failure_policy="fail",
             source="benchmark_task",
         )
-        # VerificationRuntime owns policy checks and delegates process execution to CommandRuntime.
-        plan = self.verification_runtime.plan_verification(
+        # VerificationRunner owns policy checks and delegates process execution to CommandExecutor.
+        plan = self.verification_runner.plan_verification(
             changed_files=[],
             task_intent="benchmark expected outcome",
         )
-        result = self.verification_runtime._run_check(plan, check)
+        result = self.verification_runner._run_check(plan, check)
         return {
             "passed": result.status.value == "passed",
             "status": result.status.value,
@@ -475,9 +475,9 @@ class EvaluationTaskExecutor:
         timeout_seconds: int | None = None,
         argv: list[str] | None = None,
     ) -> dict[str, Any]:
-        if self.command_runtime is None:
-            return {"status": "blocked", "error_code": "command_runtime_unavailable"}
-        result = self.command_runtime.run(
+        if self.command_executor is None:
+            return {"status": "blocked", "error_code": "command_executor_unavailable"}
+        result = self.command_executor.run(
             CommandRequest(
                 argv=argv,
                 shell=command if argv is None else None,
@@ -536,11 +536,11 @@ class EvaluationArtifactWriter:
         *,
         project_root: Path | str,
         output_root: Path | str,
-        trace_runtime: Any | None = None,
+        trace_recorder: Any | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve(strict=False)
         self.output_root = Path(output_root)
-        self.trace_runtime = trace_runtime
+        self.trace_recorder = trace_recorder
 
     def write_report(self, *, run_id: str, json_text: str, markdown_text: str) -> Path:
         output_dir = self._run_output_dir(run_id)
@@ -549,17 +549,17 @@ class EvaluationArtifactWriter:
         md_path = output_dir / "report.md"
         json_path.write_text(json_text, encoding="utf-8")
         md_path.write_text(markdown_text, encoding="utf-8")
-        if self.trace_runtime is not None and hasattr(self.trace_runtime, "write_artifact"):
-            artifact = self.trace_runtime.write_artifact(
+        if self.trace_recorder is not None and hasattr(self.trace_recorder, "write_artifact"):
+            artifact = self.trace_recorder.write_artifact(
                 kind=TraceArtifactKind.REPORT,
                 path=json_path,
                 summary="Evaluation report JSON.",
                 metadata={"run_id": run_id, "report_path": str(json_path)},
             )
-            if hasattr(self.trace_runtime, "emit"):
-                self.trace_runtime.emit(
+            if hasattr(self.trace_recorder, "emit"):
+                self.trace_recorder.emit(
                     TraceEventType.FINAL_REPORT_CREATED,
-                    runtime="evaluation",
+                    component="evaluation",
                     summary="Evaluation report written.",
                     payload={
                         "run_id": run_id,
@@ -604,9 +604,9 @@ class EvaluationArtifactWriter:
         json_path.write_text(json_text, encoding="utf-8")
         md_path.write_text(markdown_text, encoding="utf-8")
         regression_artifact_refs: list[str] = []
-        if self.trace_runtime is not None and hasattr(self.trace_runtime, "write_artifact"):
+        if self.trace_recorder is not None and hasattr(self.trace_recorder, "write_artifact"):
             for regression in _regressions_from_report_json(json_text):
-                item_artifact = self.trace_runtime.write_artifact(
+                item_artifact = self.trace_recorder.write_artifact(
                     kind=TraceArtifactKind.REPORT,
                     text=json.dumps(regression, ensure_ascii=False, sort_keys=True),
                     summary="Evaluation regression artifact.",
@@ -619,7 +619,7 @@ class EvaluationArtifactWriter:
                     },
                 )
                 regression_artifact_refs.append(item_artifact.artifact_id)
-            artifact = self.trace_runtime.write_artifact(
+            artifact = self.trace_recorder.write_artifact(
                 kind=TraceArtifactKind.REPORT,
                 path=json_path,
                 summary="Evaluation regression report JSON.",
@@ -629,10 +629,10 @@ class EvaluationArtifactWriter:
                     "regression_artifacts": regression_artifact_refs,
                 },
             )
-            if hasattr(self.trace_runtime, "emit"):
-                self.trace_runtime.emit(
+            if hasattr(self.trace_recorder, "emit"):
+                self.trace_recorder.emit(
                     TraceEventType.FINAL_REPORT_CREATED,
-                    runtime="evaluation",
+                    component="evaluation",
                     summary="Evaluation regression report written.",
                     payload={
                         "run_id": run_id,

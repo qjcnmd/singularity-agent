@@ -9,10 +9,10 @@ from singularity.policy import (
     OperationKind,
     PolicyConfig,
     PolicyRequest,
-    PolicyRuntime,
+    PolicyEngine,
     PolicySubject,
     ResourceRef,
-    RuntimeName,
+    PolicyComponent,
 )
 
 
@@ -29,10 +29,10 @@ def req(
         task_id="task",
         phase_id="phase",
         action_id="action",
-        runtime=RuntimeName.MUTATION if "FILE" in capability.name else RuntimeName.COMMAND,
+        component=PolicyComponent.MUTATION if "FILE" in capability.name else PolicyComponent.COMMAND,
         operation=operation,
         capability=capability,
-        subject=PolicySubject(subject_type="runtime", name="test"),
+        subject=PolicySubject(subject_type="component", name="test"),
         resource=ResourceRef(resource_type=resource_type, identifier=identifier),
         reason="test",
         workspace_root=str(tmp_path),
@@ -40,9 +40,9 @@ def req(
 
 
 def test_policy_allows_workspace_read_and_reviews_mutation(tmp_path: Path) -> None:
-    runtime = PolicyRuntime(PolicyConfig(workspace_root=tmp_path))
+    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
 
-    read = runtime.evaluate(
+    read = component.evaluate(
         req(
             tmp_path,
             operation=OperationKind.READ_FILE,
@@ -51,7 +51,7 @@ def test_policy_allows_workspace_read_and_reviews_mutation(tmp_path: Path) -> No
             identifier="README.md",
         )
     )
-    mutate = runtime.evaluate(
+    mutate = component.evaluate(
         req(
             tmp_path,
             operation=OperationKind.MUTATE_FILE,
@@ -68,12 +68,12 @@ def test_policy_allows_workspace_read_and_reviews_mutation(tmp_path: Path) -> No
 
 def test_policy_denies_outside_delete_and_read_only_mutation(tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside.txt"
-    runtime = PolicyRuntime(PolicyConfig(workspace_root=tmp_path))
-    read_only = PolicyRuntime(
+    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
+    read_only = PolicyEngine(
         PolicyConfig(workspace_root=tmp_path, approval_mode=ApprovalMode.READ_ONLY)
     )
 
-    delete = runtime.evaluate(
+    delete = component.evaluate(
         req(
             tmp_path,
             operation=OperationKind.DELETE_FILE,
@@ -97,7 +97,7 @@ def test_policy_denies_outside_delete_and_read_only_mutation(tmp_path: Path) -> 
 
 
 def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_path: Path) -> None:
-    runtime = PolicyRuntime(
+    component = PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
             approval_mode=ApprovalMode.NON_INTERACTIVE,
@@ -112,11 +112,11 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
         identifier="src/app.py",
     )
 
-    denied = runtime.enforce(command)
+    denied = component.enforce(command)
     assert denied.outcome == DecisionOutcome.DENY
     assert denied.reason == "Review required but approval mode is non_interactive."
 
-    interactive = PolicyRuntime(PolicyConfig(workspace_root=tmp_path, security_mode="compat"))
+    interactive = PolicyEngine(PolicyConfig(workspace_root=tmp_path, security_mode="compat"))
     pending = interactive.evaluate(command)
     grant = ApprovalGrant(
         decision_id=pending.decision_id,
@@ -145,14 +145,14 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
     assert interactive.find_matching_grant(command) is None
 
 
-def test_policy_grants_persist_across_runtime_restarts(tmp_path: Path) -> None:
+def test_policy_grants_persist_across_process_restarts(tmp_path: Path) -> None:
     grant_path = tmp_path / "policy" / "grants.jsonl"
     config = PolicyConfig(
         workspace_root=tmp_path,
         approval_grants_path=grant_path,
         security_mode="compat",
     )
-    first = PolicyRuntime(config)
+    first = PolicyEngine(config)
     request = req(
         tmp_path,
         operation=OperationKind.MUTATE_FILE,
@@ -174,15 +174,15 @@ def test_policy_grants_persist_across_runtime_restarts(tmp_path: Path) -> None:
     )
 
     first.register_grant(grant)
-    restarted = PolicyRuntime(config)
+    restarted = PolicyEngine(config)
     allowed = restarted.enforce(request)
 
     assert allowed.outcome == DecisionOutcome.ALLOW
     assert allowed.approval_grant_id == grant.grant_id
-    assert PolicyRuntime(config).find_matching_grant(request) is None
+    assert PolicyEngine(config).find_matching_grant(request) is None
 
 
-def test_single_use_grant_cannot_be_consumed_twice_by_stale_runtime(tmp_path: Path) -> None:
+def test_single_use_grant_cannot_be_consumed_twice_by_stale_process(tmp_path: Path) -> None:
     config = PolicyConfig(
         workspace_root=tmp_path,
         approval_grants_path=tmp_path / "policy" / "grants.jsonl",
@@ -195,7 +195,7 @@ def test_single_use_grant_cannot_be_consumed_twice_by_stale_runtime(tmp_path: Pa
         resource_type="file",
         identifier="src/app.py",
     )
-    pending = PolicyRuntime(config).evaluate(request)
+    pending = PolicyEngine(config).evaluate(request)
     grant = ApprovalGrant(
         decision_id=pending.decision_id,
         request_id=request.request_id,
@@ -207,16 +207,16 @@ def test_single_use_grant_cannot_be_consumed_twice_by_stale_runtime(tmp_path: Pa
             single_use=True,
         ),
     )
-    writer = PolicyRuntime(config)
+    writer = PolicyEngine(config)
     writer.register_grant(grant)
-    stale = PolicyRuntime(config)
-    first = PolicyRuntime(config)
+    stale = PolicyEngine(config)
+    first = PolicyEngine(config)
 
     assert first.enforce(request).outcome == DecisionOutcome.ALLOW
     second = stale.enforce(request)
 
     assert second.outcome == DecisionOutcome.REQUIRE_REVIEW
-    assert PolicyRuntime(config).find_matching_grant(request) is None
+    assert PolicyEngine(config).find_matching_grant(request) is None
 
 
 def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path: Path) -> None:
@@ -232,7 +232,7 @@ def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path:
         resource_type="file",
         identifier="src/app.py",
     )
-    pending = PolicyRuntime(config).evaluate(request)
+    pending = PolicyEngine(config).evaluate(request)
     grant = ApprovalGrant(
         decision_id=pending.decision_id,
         request_id=request.request_id,
@@ -245,14 +245,14 @@ def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path:
             single_use=True,
         ),
     )
-    runtime = PolicyRuntime(config)
-    runtime.register_grant(grant)
+    component = PolicyEngine(config)
+    component.register_grant(grant)
     other_session = PolicyRequest(
         session_id="other_session",
         task_id=request.task_id,
         phase_id=request.phase_id,
         action_id=request.action_id,
-        runtime=request.runtime,
+        component=request.component,
         operation=request.operation,
         capability=request.capability,
         subject=request.subject,
@@ -261,7 +261,7 @@ def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path:
         workspace_root=request.workspace_root,
     )
 
-    assert PolicyRuntime(config).find_matching_grant(other_session) is None
+    assert PolicyEngine(config).find_matching_grant(other_session) is None
 
 
 def test_session_only_grant_without_session_id_fails_closed(tmp_path: Path) -> None:
@@ -277,7 +277,7 @@ def test_session_only_grant_without_session_id_fails_closed(tmp_path: Path) -> N
         resource_type="file",
         identifier="src/app.py",
     )
-    pending = PolicyRuntime(config).evaluate(request)
+    pending = PolicyEngine(config).evaluate(request)
     grant = ApprovalGrant(
         decision_id=pending.decision_id,
         request_id=request.request_id,
@@ -289,14 +289,14 @@ def test_session_only_grant_without_session_id_fails_closed(tmp_path: Path) -> N
             single_use=True,
         ),
     )
-    runtime = PolicyRuntime(config)
-    runtime.register_grant(grant)
+    component = PolicyEngine(config)
+    component.register_grant(grant)
 
-    assert PolicyRuntime(config).find_matching_grant(request) is None
+    assert PolicyEngine(config).find_matching_grant(request) is None
 
 
 def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
-    runtime = PolicyRuntime(
+    component = PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
             allow_workspace_reads=False,
@@ -305,7 +305,7 @@ def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
         )
     )
 
-    read = runtime.evaluate(
+    read = component.evaluate(
         req(
             tmp_path,
             operation=OperationKind.READ_FILE,
@@ -314,7 +314,7 @@ def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
             identifier="README.md",
         )
     )
-    command = runtime.evaluate(
+    command = component.evaluate(
         req(
             tmp_path,
             operation=OperationKind.EXECUTE_COMMAND,
@@ -323,7 +323,7 @@ def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
             identifier="python -c print(1)",
         )
     )
-    network = runtime.evaluate(
+    network = component.evaluate(
         req(
             tmp_path,
             operation=OperationKind.NETWORK_ACCESS,
@@ -340,7 +340,7 @@ def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
 
 def test_consume_grant_allows_without_reevaluating_policy(tmp_path: Path) -> None:
     audit_path = tmp_path / "policy.jsonl"
-    runtime = PolicyRuntime(
+    component = PolicyEngine(
         PolicyConfig(workspace_root=tmp_path, audit_log_path=audit_path)
     )
     request = req(
@@ -350,7 +350,7 @@ def test_consume_grant_allows_without_reevaluating_policy(tmp_path: Path) -> Non
         resource_type="command",
         identifier="python -c print(1)",
     )
-    pending = runtime.evaluate(request)
+    pending = component.evaluate(request)
     grant = ApprovalGrant(
         decision_id=pending.decision_id,
         request_id=request.request_id,
@@ -363,7 +363,7 @@ def test_consume_grant_allows_without_reevaluating_policy(tmp_path: Path) -> Non
     )
     audit_path.unlink()
 
-    allowed = runtime.consume_grant(request, pending, grant)
+    allowed = component.consume_grant(request, pending, grant)
 
     assert allowed.outcome == DecisionOutcome.ALLOW
     assert allowed.approval_grant_id == grant.grant_id
@@ -372,9 +372,9 @@ def test_consume_grant_allows_without_reevaluating_policy(tmp_path: Path) -> Non
 
 
 def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: Path) -> None:
-    runtime = PolicyRuntime(PolicyConfig(workspace_root=tmp_path))
+    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
 
-    verification = runtime.evaluate(
+    verification = component.evaluate(
         req(
             tmp_path,
             operation=OperationKind.VERIFICATION,
@@ -383,7 +383,7 @@ def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: P
             identifier="python -m pytest",
         )
     )
-    generated = runtime.evaluate(
+    generated = component.evaluate(
         req(
             tmp_path,
             operation=OperationKind.EXECUTE_PROJECT_CODE,

@@ -23,7 +23,7 @@ The current production path uses rules fallback. A future model extractor can re
 
 ## Planner Integration
 
-`PlannerRuntime.start_task()` builds a contract and stores it in `TaskState.task_contract`.
+`Planner.start_task()` builds a contract and stores it in `TaskState.task_contract`.
 
 The planner context includes a compact contract summary:
 
@@ -33,7 +33,7 @@ The planner context includes a compact contract summary:
 - report requirements
 - evidence requirements
 
-`PlannerRuntime.assess_completion()` returns per-criterion status:
+`Planner.assess_completion()` returns per-criterion status:
 
 ```text
 criteria.<criterion_id>.satisfied
@@ -50,11 +50,11 @@ Required contract criteria are added to `unmet` as `contract:<criterion_id>` whe
 python quicksort.py
 ```
 
-Verification still runs through `VerificationRuntime` and `CommandRuntime`.
+Verification still runs through `VerificationRunner` and `CommandExecutor`.
 
 ## Boundaries
 
 - Model final text is not evidence.
 - Generic chat does not receive artificial required criteria.
 - Contract extraction does not bypass planner, mutation, verification, policy, or trace.
-- The contract records report obligations, but full report generation remains owned by later final-report runtime work.
+- The contract records report obligations, but full report generation remains owned by later final-report component work.

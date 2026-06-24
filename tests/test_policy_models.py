@@ -12,7 +12,7 @@ from singularity.policy import (
     PolicySubject,
     ResourceRef,
     RiskLevel,
-    RuntimeName,
+    PolicyComponent,
 )
 
 
@@ -22,10 +22,10 @@ def test_policy_request_decision_and_grant_serialize(tmp_path: Path) -> None:
         task_id="task_1",
         phase_id="phase_1",
         action_id="action_1",
-        runtime=RuntimeName.COMMAND,
+        component=PolicyComponent.COMMAND,
         operation=OperationKind.EXECUTE_COMMAND,
         capability=Capability.EXECUTE_COMMAND,
-        subject=PolicySubject(subject_type="runtime", name="CommandRuntime"),
+        subject=PolicySubject(subject_type="component", name="CommandExecutor"),
         resource=ResourceRef(
             resource_type="command",
             identifier="python -m pytest",
@@ -58,7 +58,7 @@ def test_policy_request_decision_and_grant_serialize(tmp_path: Path) -> None:
     decision_payload = decision.to_dict()
     grant_payload = grant.to_dict()
 
-    assert request_payload["runtime"] == "command"
+    assert request_payload["component"] == "command"
     assert request_payload["operation"] == "execute_command"
     assert decision_payload["outcome"] == "require_review"
     assert decision_payload["constraints"]["max_duration_seconds"] == 30

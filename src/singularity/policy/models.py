@@ -11,7 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 
-class RuntimeName(str, Enum):
+class PolicyComponent(str, Enum):
     TOOL = "tool"
     MUTATION = "mutation"
     COMMAND = "command"
@@ -165,7 +165,7 @@ class PolicyRequest:
     task_id: str
     phase_id: str
     action_id: str
-    runtime: RuntimeName | str
+    component: PolicyComponent | str
     operation: OperationKind | str
     capability: Capability | str
     subject: PolicySubject
@@ -186,7 +186,7 @@ class PolicyRequest:
     workspace_root: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "runtime", _enum(RuntimeName, self.runtime))
+        object.__setattr__(self, "component", _enum(PolicyComponent, self.component))
         object.__setattr__(self, "operation", _enum(OperationKind, self.operation))
         object.__setattr__(self, "capability", _enum(Capability, self.capability))
         object.__setattr__(
@@ -202,7 +202,7 @@ class PolicyRequest:
             "task_id": self.task_id,
             "phase_id": self.phase_id,
             "action_id": self.action_id,
-            "runtime": self.runtime.value,
+            "component": self.component.value,
             "operation": self.operation.value,
             "capability": self.capability.value,
             "subject": self.subject.to_dict(),
@@ -396,7 +396,7 @@ class PolicyDecision:
                 scope=approval_scope_for_request(request),
                 review_kind=review_kind,
                 details={
-                    "runtime": request.runtime.value,
+                    "component": request.component.value,
                     "operation": request.operation.value,
                     "resource": request.resource.identifier,
                 },
@@ -452,7 +452,7 @@ class PolicyAuditEntry:
     action_id: str
     request_id: str
     decision_id: str
-    runtime: RuntimeName | str
+    component: PolicyComponent | str
     operation: OperationKind | str
     capability: Capability | str
     resource_summary: str
@@ -478,7 +478,7 @@ class PolicyAuditEntry:
             "action_id": self.action_id,
             "request_id": self.request_id,
             "decision_id": self.decision_id,
-            "runtime": _value(self.runtime),
+            "component": _value(self.component),
             "operation": _value(self.operation),
             "capability": _value(self.capability),
             "resource_summary": self.resource_summary,
@@ -523,8 +523,8 @@ def approval_scope_for_request(request: PolicyRequest) -> ApprovalScope:
 def policy_context_summary(
     request: PolicyRequest, outcome: DecisionOutcome, reason: str
 ) -> str:
-    runtime = request.runtime.value.replace("_", " ").title().replace(" ", "")
-    return f"[policy] {runtime} {outcome.value.replace('_', ' ')}: {reason}"
+    component_label = request.component.value.replace("_", " ").title().replace(" ", "")
+    return f"[policy] {component_label} {outcome.value.replace('_', ' ')}: {reason}"
 
 
 def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:

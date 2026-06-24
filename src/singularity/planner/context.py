@@ -99,7 +99,7 @@ class PlannerContextRenderer:
 
     @staticmethod
     def _policy_summary(observation: dict) -> str:
-        runtime = str(observation.get("runtime") or "policy").replace("_", " ").title()
+        component_label = str(observation.get("component") or "policy").replace("_", " ").title()
         outcome = {
             "allow": "allowed",
             "deny": "denied",
@@ -109,7 +109,7 @@ class PlannerContextRenderer:
             "ask_user": "needs input",
         }.get(str(observation.get("outcome") or ""), "blocked")
         reason = str(observation.get("reason") or "")
-        return f"[policy] {runtime} {outcome}: {reason}"
+        return f"[policy] {component_label} {outcome}: {reason}"
 
     @staticmethod
     def _sandbox_summary(observation: dict) -> str:

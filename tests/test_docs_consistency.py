@@ -8,7 +8,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 REQUIRED_ARCHITECTURE_DOCS = [
-    "runtime-map.md",
+    "execution-map.md",
+    "naming-and-runtime-map.md",
     "boundary-contracts.md",
     "state-model.md",
     "event-model.md",
@@ -17,20 +18,30 @@ REQUIRED_ARCHITECTURE_DOCS = [
     "trace-audit.md",
     "migration-to-desktop.md",
     "desktop-architecture-strategy.md",
-    "runtime-host-transition.md",
+    "agent-host-transition.md",
     "naming.md",
+    "agent-kernel.md",
+    "planning-and-run-control.md",
+    "model-runner.md",
+    "prompt-assembly.md",
+    "tool-execution.md",
+    "command-execution.md",
+    "workspace-mutation.md",
+    "workspace-state-checkpointing.md",
+    "observability-tracing.md",
+    "verification-runner.md",
 ]
 
 REQUIRED_ADRS = [
     "0001-local-first-agent.md",
     "0002-cli-is-client-not-core.md",
     "0003-rust-core-tauri-desktop.md",
-    "0004-python-as-plugin-runtime.md",
+    "0004-python-plugin-management.md",
     "0005-mcp-through-tool-broker.md",
     "0006-singularity-project-identity.md",
     "0007-adopt-rust-core-tauri-desktop-strategy.md",
-    "0008-runtimehost-as-product-core-boundary.md",
-    "0009-python-as-plugin-runtime.md",
+    "0008-agenthost-as-product-core-boundary.md",
+    "0009-python-plugin-management.md",
 ]
 
 REQUIRED_SCHEMAS = [
@@ -44,14 +55,14 @@ REQUIRED_SCHEMAS = [
 ]
 
 
-def test_documentation_runtime_architecture_docs_exist() -> None:
+def test_architecture_contract_docs_exist() -> None:
     for name in REQUIRED_ARCHITECTURE_DOCS:
         path = ROOT / "docs" / "architecture" / name
         assert path.exists(), f"missing docs/architecture/{name}"
         assert path.read_text(encoding="utf-8").lstrip().startswith("# ")
 
 
-def test_documentation_runtime_adr_files_exist() -> None:
+def test_architecture_contract_adr_files_exist() -> None:
     for name in REQUIRED_ADRS:
         path = ROOT / "docs" / "adr" / name
         assert path.exists(), f"missing docs/adr/{name}"
@@ -60,7 +71,7 @@ def test_documentation_runtime_adr_files_exist() -> None:
         assert "Status:" in text
 
 
-def test_documentation_runtime_schema_files_exist_and_parse() -> None:
+def test_architecture_contract_schema_files_exist_and_parse() -> None:
     for name in REQUIRED_SCHEMAS:
         path = ROOT / "docs" / "schemas" / name
         assert path.exists(), f"missing docs/schemas/{name}"
@@ -77,36 +88,36 @@ def test_readme_uses_singularity_identity() -> None:
     assert "Singularity" in text
 
 
-def test_readme_runtime_names_match_runtime_map() -> None:
-    readme_names = _runtime_names(ROOT / "README.md")
-    runtime_map_names = _runtime_names(ROOT / "docs" / "architecture" / "runtime-map.md")
+def test_readme_component_names_match_naming_map() -> None:
+    readme_names = _component_names(ROOT / "README.md")
+    naming_map_names = _component_names(ROOT / "docs" / "architecture" / "naming-and-runtime-map.md")
 
-    assert readme_names == runtime_map_names
+    assert readme_names == naming_map_names
     assert "ContextManager" in readme_names
-    assert "ContextRuntime" not in readme_names
-    assert "DocumentationRuntime" in readme_names
+    assert "ContextSource" not in readme_names
+    assert "DocumentationPipeline" in readme_names
     assert "ParallelToolExecutor" in readme_names
-    assert "GitRuntime" in readme_names
-    assert "MemorySyncRuntime" in readme_names
-    assert "RemoteApprovalRuntime" in readme_names
+    assert "GitClient" in readme_names
+    assert "MemoryBundleSync" in readme_names
+    assert "RemoteApprovalExchange" in readme_names
 
 
-def test_readme_runtime_status_table_has_source_or_planned_mapping() -> None:
+def test_readme_component_status_table_has_source_or_planned_mapping() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "## Runtime Capability Status" in text
+    assert "## Component Capability Status" in text
     assert "| Capability | Status | Source or boundary |" in text
     for status in ("implemented", "partial", "planned"):
         assert f"| {status} |" in text or f" {status} " in text
     assert "`ContextManager` | implemented | `src/singularity/context/manager.py`" in text
-    assert "`ContextRuntime` enum | implemented | `src/singularity/context/models.py`" in text
+    assert "`ModelRunner` | implemented | `src/singularity/model/runner.py`" in text
     assert "`FinalReport` | implemented | kernel: `src/singularity/kernel/finalization.py`" in text
 
 
-def test_readme_implemented_runtime_source_paths_exist() -> None:
+def test_readme_implemented_component_source_paths_exist() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    for capability, status, source in _runtime_status_rows(text):
+    for capability, status, source in _component_status_rows(text):
         if status != "implemented":
             continue
         for relative_path in re.findall(r"`(src/singularity/[^`]+)`", source):
@@ -114,28 +125,30 @@ def test_readme_implemented_runtime_source_paths_exist() -> None:
             assert path.exists(), f"{capability} references missing source path: {relative_path}"
 
 
-def test_git_runtime_docs_match_local_only_contract() -> None:
+def test_git_client_docs_match_local_only_contract() -> None:
     combined = "\n".join(
         path.read_text(encoding="utf-8")
         for path in [
             ROOT / "README.md",
-            ROOT / "docs" / "architecture" / "runtime-map.md",
-            ROOT / "docs" / "architecture" / "command-runtime.md",
-            ROOT / "docs" / "architecture" / "code-index-runtime.md",
-            ROOT / "docs" / "architecture" / "verification-runtime.md",
+            ROOT / "docs" / "architecture" / "naming-and-runtime-map.md",
+            ROOT / "docs" / "architecture" / "command-execution.md",
+            ROOT / "docs" / "architecture" / "code-index.md",
+            ROOT / "docs" / "architecture" / "verification-runner.md",
         ]
     )
 
-    assert "Git-absent runtime boundary" not in combined
-    assert "GitRuntime` is still reserved" not in combined
+    assert "Git-absent component boundary" not in combined
+    assert "GitClient` is still reserved" not in combined
     assert "local-only status, diff, and commit" in combined
     assert "Push, pull, reset, remote branches, pull requests" in combined
 
 
 def test_config_and_sandbox_docs_match_implemented_evidence() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    runtime_map = (ROOT / "docs" / "architecture" / "runtime-map.md").read_text(encoding="utf-8")
-    sandbox = (ROOT / "docs" / "architecture" / "sandbox-isolation-runtime.md").read_text(
+    naming_map = (ROOT / "docs" / "architecture" / "naming-and-runtime-map.md").read_text(
+        encoding="utf-8"
+    )
+    sandbox = (ROOT / "docs" / "architecture" / "sandbox-isolation.md").read_text(
         encoding="utf-8"
     )
 
@@ -145,24 +158,24 @@ def test_config_and_sandbox_docs_match_implemented_evidence() -> None:
     assert "explicit CLI flag > SINGULARITY_* > .singularity/config.toml > defaults" in readme
     assert "DockerSandboxBackend" in sandbox
     assert "LocalStagingBackend" in sandbox
-    assert "hard_isolation" in runtime_map
-    assert "soft_workspace_isolation" in runtime_map
-    assert "no_isolation" in runtime_map
+    assert "hard_isolation" in naming_map
+    assert "soft_workspace_isolation" in naming_map
+    assert "no_isolation" in naming_map
     assert "fails closed" in readme
 
 
-def _runtime_names(path: Path) -> list[str]:
+def _component_names(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8")
     match = re.search(
-        r"<!-- runtime-names:start -->(.*?)<!-- runtime-names:end -->",
+        r"<!-- architecture-components:start -->(.*?)<!-- architecture-components:end -->",
         text,
         re.DOTALL,
     )
-    assert match, f"missing runtime-names markers in {path}"
+    assert match, f"missing architecture-components markers in {path}"
     return re.findall(r"`([^`]+)`", match.group(1))
 
 
-def _runtime_status_rows(text: str) -> list[tuple[str, str, str]]:
+def _component_status_rows(text: str) -> list[tuple[str, str, str]]:
     rows: list[tuple[str, str, str]] = []
     for line in text.splitlines():
         if not line.startswith("| `"):

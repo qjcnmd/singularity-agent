@@ -13,8 +13,8 @@ from singularity.memory.models import (
     MemorySource,
     MemoryType,
 )
-from singularity.memory.runtime import MemoryRuntime
-from singularity.memory.sync import MemorySyncRuntime
+from singularity.memory.pipeline import MemoryLearningPipeline
+from singularity.memory.sync import MemoryBundleSync
 
 
 runner = CliRunner()
@@ -34,15 +34,15 @@ def _entry() -> MemoryEntry:
 
 
 def test_memory_sync_exports_bundle_and_imports_entries_as_candidates(tmp_path: Path) -> None:
-    source = MemoryRuntime(tmp_path / "source")
+    source = MemoryLearningPipeline(tmp_path / "source")
     source.start_session(session_id="source", user_goal="sync")
     source.store.upsert_entry(_entry())
     bundle_path = tmp_path / "bundle.json"
 
-    exported = MemorySyncRuntime(source.store).export_bundle(bundle_path)
-    target = MemoryRuntime(tmp_path / "target")
+    exported = MemoryBundleSync(source.store).export_bundle(bundle_path)
+    target = MemoryLearningPipeline(tmp_path / "target")
     target.start_session(session_id="target", user_goal="sync")
-    imported = MemorySyncRuntime(target.store).import_bundle(bundle_path)
+    imported = MemoryBundleSync(target.store).import_bundle(bundle_path)
 
     assert exported.path == bundle_path
     payload = json.loads(bundle_path.read_text(encoding="utf-8"))
@@ -58,7 +58,7 @@ def test_memory_sync_cli_export_and_import(monkeypatch, tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
     target_root.mkdir()
-    source = MemoryRuntime(source_root)
+    source = MemoryLearningPipeline(source_root)
     source.start_session(session_id="source", user_goal="sync")
     source.store.upsert_entry(_entry())
     bundle_path = tmp_path / "memory-bundle.json"

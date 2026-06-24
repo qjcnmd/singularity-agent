@@ -6,7 +6,7 @@ from singularity.context.models import (
     ContextLayer,
     ContextReference,
     ContextRenderPolicy,
-    ContextRuntime,
+    ContextSource,
     ContextSensitivity,
 )
 
@@ -29,7 +29,7 @@ def test_context_item_carries_production_ledger_fields() -> None:
         task_id="task_1",
         phase_id="inspect",
         layer=ContextLayer.EVIDENCE,
-        source_runtime=ContextRuntime.TOOL,
+        source_component=ContextSource.TOOL,
         item_type=ContextItemType.TOOL_OBSERVATION,
         content="readme content",
         authority=ContextAuthority.TOOL,

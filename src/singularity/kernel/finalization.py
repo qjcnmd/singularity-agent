@@ -27,7 +27,7 @@ class FinalReport:
     trace_summary: dict[str, Any] = field(default_factory=dict)
     config_summary: dict[str, Any] = field(default_factory=dict)
     workspace_summary: dict[str, Any] = field(default_factory=dict)
-    runtime_health_summary: dict[str, Any] = field(default_factory=dict)
+    component_health_summary: dict[str, Any] = field(default_factory=dict)
     shutdown_summary: dict[str, Any] = field(default_factory=dict)
     recovery_summary: dict[str, Any] = field(default_factory=dict)
     lifecycle_summary: dict[str, Any] = field(default_factory=dict)
@@ -52,7 +52,7 @@ class FinalReport:
             "trace_summary": self.trace_summary,
             "config_summary": self.config_summary,
             "workspace_summary": self.workspace_summary,
-            "runtime_health_summary": self.runtime_health_summary,
+            "component_health_summary": self.component_health_summary,
             "shutdown_summary": self.shutdown_summary,
             "recovery_summary": self.recovery_summary,
             "lifecycle_summary": self.lifecycle_summary,
@@ -71,7 +71,7 @@ class KernelFinalizer:
         *,
         context: KernelContext,
         planner_report: Any | None = None,
-        runtime_health_summary: dict[str, Any] | None = None,
+        component_health_summary: dict[str, Any] | None = None,
         shutdown_summary: Any | None = None,
         recovery_summary: dict[str, Any] | None = None,
         lifecycle_summary: dict[str, Any] | None = None,
@@ -101,7 +101,7 @@ class KernelFinalizer:
             trace_summary=trace_summary or dict(planner_payload.get("execution_trace_summary") or {}),
             config_summary=config_summary or {},
             workspace_summary=workspace_summary or {},
-            runtime_health_summary=runtime_health_summary or {},
+            component_health_summary=component_health_summary or {},
             shutdown_summary=shutdown_payload,
             recovery_summary=recovery_summary or {},
             lifecycle_summary=lifecycle_summary or {},

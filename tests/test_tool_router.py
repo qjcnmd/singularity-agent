@@ -5,9 +5,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from singularity.context import ContextManager
-from singularity.instructions import InstructionRuntime
-from singularity.model import MockModelProvider, ModelPurpose, ModelRuntime
-from singularity.planner import PlannerRuntime, TaskStatus
+from singularity.instructions import PromptAssemblyPipeline
+from singularity.model import MockModelProvider, ModelPurpose, ModelRunner
+from singularity.planner import Planner, TaskStatus
 from singularity.tools import ToolRegistry
 from singularity.tools.code_index import register_code_index_tools
 from singularity.tools.command import register_command_tools
@@ -20,7 +20,7 @@ from singularity.tools.models import (
     ToolExecutionBackendKind,
     ToolSpec,
 )
-from singularity.trace import TraceWriter
+from singularity.jsonl_trace import JsonlTraceRecorder
 
 
 class EmptyInput(BaseModel):
@@ -41,10 +41,10 @@ def _spec(
         handler=lambda _args: {},
         permission_level=permission,
         execution_backend=backend,
-        uses_edit_runtime=backend == ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
-        uses_mutation_runtime=permission == PermissionLevel.WRITE,
-        uses_command_runtime=permission == PermissionLevel.SHELL,
-        delegates_policy_constraints=backend == ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNTIME,
+        uses_edit_executor=backend == ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
+        uses_mutation_manager=permission == PermissionLevel.WRITE,
+        uses_command_executor=permission == PermissionLevel.SHELL,
+        delegates_policy_constraints=backend == ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNNER,
     )
 
 
@@ -60,41 +60,41 @@ def _tool_specs() -> list[ToolSpec]:
         _spec(
             "edit_apply",
             permission=PermissionLevel.WRITE,
-            backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
+            backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
         ),
         _spec(
             "apply_patch",
             permission=PermissionLevel.WRITE,
-            backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
+            backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
         ),
         _spec(
             "write_file",
             permission=PermissionLevel.WRITE,
-            backend=ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
+            backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
         ),
         _spec("inspect_diff"),
         _spec(
             "workspace_replace_text",
             permission=PermissionLevel.WRITE,
-            backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
+            backend=ToolExecutionBackendKind.DELEGATED_MUTATION_MANAGER,
         ),
         _spec(
             "run_command",
             permission=PermissionLevel.SHELL,
-            backend=ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
+            backend=ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
         ),
         _spec("plan_verification"),
         _spec(
             "run_verification",
             permission=PermissionLevel.SHELL,
-            backend=ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNTIME,
+            backend=ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNNER,
         ),
         _spec("get_verification_result"),
     ]
 
 
-def _planner(tmp_path: Path, phase: str, *, trace: TraceWriter | None = None) -> PlannerRuntime:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1", trace=trace)
+def _planner(tmp_path: Path, phase: str, *, trace: JsonlTraceRecorder | None = None) -> Planner:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1", trace=trace)
     planner.start_task("Change code")
     planner.state.status = TaskStatus(phase)
     planner.state.current_phase = phase
@@ -137,7 +137,7 @@ def test_tool_router_selects_minimal_tools_by_phase(tmp_path: Path) -> None:
     assert "workspace_replace_text" not in edit_decision.selected_tool_names
     assert "run_command" not in verification_decision.selected_tool_names
     assert any(item.reason_code == "low_level_internal_capability" for item in edit_decision.deferred_tools)
-    assert any(item.reason_code == "command_runtime_indirect" for item in verification_decision.deferred_tools)
+    assert any(item.reason_code == "command_executor_indirect" for item in verification_decision.deferred_tools)
 
 
 def test_registered_tool_pool_has_sufficient_facades_and_routes_internals_down(tmp_path: Path) -> None:
@@ -199,7 +199,7 @@ def test_registered_tool_pool_has_sufficient_facades_and_routes_internals_down(t
 
 
 def test_tool_router_blocks_write_tools_for_active_tests_write_constraint(tmp_path: Path) -> None:
-    trace = TraceWriter.create(tmp_path)
+    trace = JsonlTraceRecorder.create(tmp_path)
     planner = _planner(tmp_path, "applying_changes", trace=trace)
     assert planner.state is not None
     planner.state.constraints.append("不要修改 tests/")
@@ -254,9 +254,9 @@ def test_model_request_contains_only_selected_tool_schemas_not_router_internals(
         registry.register(tool_spec)
     planner = _planner(tmp_path, "running_verification")
     decision = planner.decide_tool_exposure(registry.list())
-    runtime = ModelRuntime.with_mock_provider(MockModelProvider(text="ok"), tool_registry=registry)
+    component = ModelRunner.with_mock_provider(MockModelProvider(text="ok"), tool_registry=registry)
     context = ContextManager(system_prompt="system", user_goal="verify")
-    request = runtime.build_request_from_context(
+    request = component.build_request_from_context(
         context,
         run_id="run_1",
         session_id="session_1",
@@ -265,7 +265,7 @@ def test_model_request_contains_only_selected_tool_schemas_not_router_internals(
         action_id="turn_1",
         purpose=ModelPurpose.PLAN_NEXT_ACTION,
         allowed_tool_names=decision.selected_tool_names,
-        instruction_runtime=InstructionRuntime(workspace_root=tmp_path),
+        prompt_assembly=PromptAssemblyPipeline(workspace_root=tmp_path),
         user_task="verify",
     )
 

@@ -12,13 +12,13 @@ This phase did not modify Rust, Desktop, Tauri, MCP, multi-agent, plugin marketp
 
 Before this loop, Singularity had:
 
-- `PlannerRuntime` and `_default_plan()` phase templates.
+- `Planner` and `_default_plan()` phase templates.
 - `TaskContract` acceptance criteria and evidence requirements from Phase 1C.
 - `FailureAnalysis` and repair plans from Phase 1E.
 
 The Phase 1F contract was still missing:
 
-- No `SemanticPlannerRuntime`.
+- No `SemanticPlanner`.
 - No `RollingPlan`, `PlanStep`, `PlanDependency`, `ExpectedEvidence`, or `FallbackStep`.
 - No initial rolling plan generated from `TaskContract`.
 - No repair rolling plan generated from `FailureAnalysis`.
@@ -33,14 +33,14 @@ The Phase 1F contract was still missing:
 4. Generate repair rolling plans from `FailureAnalysis` and bind repair steps to failed verification criteria.
 5. Persist `TaskState.rolling_plan`.
 6. Expose rolling plan in planner context.
-7. Extend `PlannerRuntime.filtered_tools()` so the current semantic step can expose required tools even when the phase template is narrower.
+7. Extend `Planner.filtered_tools()` so the current semantic step can expose required tools even when the phase template is narrower.
 8. Add tests for multi-requirement plans, repair-step criterion binding, context exposure, and failure-analysis repair rolling plans.
 
 ## Changes
 
 - `src/singularity/planner/semantic.py`
-  - Added Phase 1F semantic planner types and `SemanticPlannerRuntime`.
-- `src/singularity/planner/runtime.py`
+  - Added Phase 1F semantic planner types and `SemanticPlanner`.
+- `src/singularity/planner/engine.py`
   - Builds initial rolling plans in `start_task()`.
   - Updates rolling plans from failure analysis repair paths.
   - Adds `semantic_rolling_plan()`.
@@ -51,7 +51,7 @@ The Phase 1F contract was still missing:
   - Renders rolling plan into planner context.
 - `src/singularity/planner/__init__.py`
   - Exports semantic planner types.
-- `tests/test_semantic_planner_runtime.py`
+- `tests/test_semantic_planner.py`
   - Adds Phase 1F coverage.
 
 ## Verification
@@ -59,7 +59,7 @@ The Phase 1F contract was still missing:
 Targeted Phase 1F validation:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_semantic_planner_runtime.py tests\test_planner_runtime.py tests\test_agent.py tests\test_agent_task_outcome.py tests\test_verification_runtime.py tests\test_failure_analysis_runtime.py tests\test_task_controller.py --basetemp work/pytest-tmp
+.\.venv\Scripts\python.exe -m pytest tests\test_semantic_planner.py tests\test_planner.py tests\test_agent.py tests\test_agent_task_outcome.py tests\test_verification_runner.py tests\test_failure_analysis_pipeline.py tests\test_task_controller.py --basetemp work/pytest-tmp
 ```
 
 Result:
@@ -102,6 +102,6 @@ origin/main...HEAD = 0 0
 ## Risks
 
 - Rolling plans are deterministic and contract-aware; no new model planner call was added.
-- `PlannerRuntime` still owns deterministic safety gates. The rolling plan adds current-step capabilities but does not bypass policy or runtime authorization.
+- `Planner` still owns deterministic safety gates. The rolling plan adds current-step capabilities but does not bypass policy or component authorization.
 - Final report step-evidence rendering is enabled by the rolling plan structure, but full final report generation remains Phase 1G.
 - The existing untracked `docs/reports/codebase-fact-report.md` was left untouched and is not part of this phase.

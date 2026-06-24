@@ -22,7 +22,7 @@ SIDE_EFFECT_EVENT_TYPES = {
 }
 
 
-class TraceReplayRuntime:
+class TraceReplayHarness:
     def __init__(self, *, project_root: Path | str) -> None:
         self.project_root = Path(project_root)
 

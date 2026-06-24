@@ -162,7 +162,7 @@ class WorkspaceScanner:
                     description="WorkspaceScanner stat/hash classification.",
                 )
             ],
-            trust_level=TrustLevel.RUNTIME_GENERATED,
+            trust_level=TrustLevel.COMPONENT_GENERATED,
             backend=self.backend,
             source="workspace_scanner",
         )

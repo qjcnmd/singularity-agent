@@ -1,21 +1,21 @@
 import sys
 from pathlib import Path
 
-from singularity.command import CommandRequest, CommandRuntime, ExecutionStatus, SemanticStatus
-from singularity.planner import EvidenceLedger, PlannerRuntime, TaskState, TaskStatus
+from singularity.command import CommandRequest, CommandExecutor, ExecutionStatus, SemanticStatus
+from singularity.planner import EvidenceLedger, Planner, TaskState, TaskStatus
 from singularity.planner.finalizer import Finalizer
 from singularity.policy import (
     DecisionOutcome,
     PolicyConfig,
     PolicyConstraints,
     PolicyDecision,
-    PolicyRuntime,
+    PolicyEngine,
     SecurityMode,
 )
-from singularity.verification import FailureType, VerificationRuntime
+from singularity.verification import FailureType, VerificationRunner
 
 
-class SandboxRequiredPolicy(PolicyRuntime):
+class SandboxRequiredPolicy(PolicyEngine):
     def __init__(
         self,
         root: Path,
@@ -42,16 +42,16 @@ class SandboxRequiredPolicy(PolicyRuntime):
         )
 
 
-def test_command_runtime_routes_sandbox_required_command_without_real_workspace_write(tmp_path: Path) -> None:
-    runtime = CommandRuntime(
+def test_command_executor_routes_sandbox_required_command_without_real_workspace_write(tmp_path: Path) -> None:
+    component = CommandExecutor(
         tmp_path,
-        policy_runtime=SandboxRequiredPolicy(
+        policy_engine=SandboxRequiredPolicy(
             tmp_path,
             security_mode=SecurityMode.COMPAT,
         ),
     )
 
-    result = runtime.run(
+    result = component.run(
         CommandRequest(
             argv=[
                 sys.executable,
@@ -70,12 +70,12 @@ def test_command_runtime_routes_sandbox_required_command_without_real_workspace_
 
 
 def test_strict_sandbox_required_command_fails_closed_without_hard_isolation(tmp_path: Path) -> None:
-    runtime = CommandRuntime(
+    component = CommandExecutor(
         tmp_path,
-        policy_runtime=SandboxRequiredPolicy(tmp_path),
+        policy_engine=SandboxRequiredPolicy(tmp_path),
     )
 
-    result = runtime.run(
+    result = component.run(
         CommandRequest(
             argv=[sys.executable, "-c", "print('ok')"],
             cwd=".",
@@ -101,24 +101,24 @@ testpaths = ["tests"]
     tests_dir = tmp_path / "tests"
     tests_dir.mkdir()
     (tests_dir / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-    command_runtime = CommandRuntime(
+    command_executor = CommandExecutor(
         tmp_path,
-        policy_runtime=SandboxRequiredPolicy(
+        policy_engine=SandboxRequiredPolicy(
             tmp_path,
             security_mode=SecurityMode.COMPAT,
         ),
     )
-    runtime = VerificationRuntime(
+    component = VerificationRunner(
         tmp_path,
-        command_runtime=command_runtime,
-        policy_runtime=SandboxRequiredPolicy(
+        command_executor=command_executor,
+        policy_engine=SandboxRequiredPolicy(
             tmp_path,
             security_mode=SecurityMode.COMPAT,
         ),
     )
 
-    plan = runtime.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")
-    observation = runtime.run_plan(plan.id)
+    plan = component.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")
+    observation = component.run_plan(plan.id)
     results = observation["verification"]["results"]
 
     assert observation["verification"]["check_status"]
@@ -144,18 +144,18 @@ testpaths = ["tests"]
     )
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-    command_runtime = CommandRuntime(
+    command_executor = CommandExecutor(
         tmp_path,
-        policy_runtime=SandboxRequiredPolicy(tmp_path, hard_network=True),
+        policy_engine=SandboxRequiredPolicy(tmp_path, hard_network=True),
     )
-    runtime = VerificationRuntime(
+    component = VerificationRunner(
         tmp_path,
-        command_runtime=command_runtime,
-        policy_runtime=SandboxRequiredPolicy(tmp_path),
+        command_executor=command_executor,
+        policy_engine=SandboxRequiredPolicy(tmp_path),
     )
 
-    plan = runtime.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")
-    observation = runtime.run_plan(plan.id)
+    plan = component.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")
+    observation = component.run_plan(plan.id)
 
     assert any(
         check["failure_type"] == FailureType.SANDBOX_LIMITATION.value
@@ -164,7 +164,7 @@ testpaths = ["tests"]
 
 
 def test_planner_context_and_final_report_include_sandbox_summary(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session", task_id="task")
+    planner = Planner(tmp_path, session_id="session", task_id="task")
     planner.start_task("Sandbox summary")
     planner.update_from_command(
         {

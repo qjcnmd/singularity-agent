@@ -108,19 +108,19 @@ class ToolRegistry:
 
     def dispatch(self, tool_call: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(
-            "ToolRegistry.dispatch() cannot create a runtime. "
-            "Use ToolRuntime.execute_tool_call() or dispatch_for_tests(..., runtime=...)."
+            "ToolRegistry.dispatch() cannot create an executor. "
+            "Use ToolExecutor.execute_tool_call() or dispatch_for_tests(..., executor=...)."
         )
 
     def dispatch_for_tests(
         self,
         tool_call: dict[str, Any],
         *,
-        runtime: Any | None = None,
+        executor: Any | None = None,
     ) -> dict[str, Any]:
-        if runtime is None:
-            raise RuntimeError("dispatch_for_tests requires an explicit runtime.")
-        return runtime.execute_tool_call(tool_call).model_dump(mode="json")
+        if executor is None:
+            raise RuntimeError("dispatch_for_tests requires an explicit executor.")
+        return executor.execute_tool_call(tool_call).model_dump(mode="json")
 
     def list_by_capability(self, capability: Capability) -> list[ToolSpec]:
         return [
@@ -163,34 +163,34 @@ class ToolRegistry:
             return
         if (
             spec.permission_level == PermissionLevel.WRITE
-            and not spec.uses_mutation_runtime
+            and not spec.uses_mutation_manager
             and spec.execution_backend
             not in {
-                ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
-                ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME,
+                ToolExecutionBackendKind.DELEGATED_MUTATION_MANAGER,
+                ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
             }
         ):
-            raise ValueError("Write tools must declare a mutation runtime backend.")
-        if spec.execution_backend == ToolExecutionBackendKind.DELEGATED_EDIT_RUNTIME:
-            if not spec.uses_edit_runtime:
-                raise ValueError("Edit runtime tools must declare uses_edit_runtime=True.")
-            if not spec.uses_mutation_runtime:
-                raise ValueError("Edit runtime tools must delegate writes to mutation runtime.")
+            raise ValueError("Write tools must declare a mutation manager backend.")
+        if spec.execution_backend == ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR:
+            if not spec.uses_edit_executor:
+                raise ValueError("EditExecutor tools must declare uses_edit_executor=True.")
+            if not spec.uses_mutation_manager:
+                raise ValueError("EditExecutor tools must delegate writes to mutation manager.")
         if (
             spec.permission_level == PermissionLevel.SHELL
-            and not spec.uses_command_runtime
+            and not spec.uses_command_executor
             and spec.execution_backend
             not in {
-                ToolExecutionBackendKind.DELEGATED_COMMAND_RUNTIME,
-                ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNTIME,
+                ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
+                ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNNER,
             }
         ):
-            raise ValueError("Shell tools must declare a command runtime backend.")
+            raise ValueError("Shell tools must declare a command executor backend.")
         if (
             spec.delegates_policy_constraints
-            and spec.execution_backend != ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNTIME
+            and spec.execution_backend != ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNNER
         ):
-            raise ValueError("Only verification runtime tools can delegate policy constraints.")
+            raise ValueError("Only verification runner tools can delegate policy constraints.")
 
 
 def _forbid_additional_properties(schema: Any) -> None:

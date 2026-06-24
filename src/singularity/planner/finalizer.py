@@ -75,7 +75,7 @@ class Finalizer:
                 else {}
             ),
             instruction_prompt_summary=self._instruction_prompt_summary(evidence),
-            runtime_health_summary={
+            component_health_summary={
                 "project_index": self._project_index_summary(evidence),
             },
             review_summary=review_summary,
@@ -102,7 +102,7 @@ class Finalizer:
         high_risk_commands = [
             item
             for item in observations
-            if item.get("runtime") == "command"
+            if item.get("component") == "command"
             and item.get("risk_level") in {"high", "critical"}
         ]
         skipped = [
@@ -296,7 +296,7 @@ class Finalizer:
         }
 
 
-class FinalReportRuntime:
+class FinalReportRenderer:
     def validate(self, report: FinalReport) -> FinalReport:
         return FinalReport.from_dict(report.to_dict())
 

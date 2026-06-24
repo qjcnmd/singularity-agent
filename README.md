@@ -1,8 +1,6 @@
 # Singularity v0.1.0
 
-Singularity is a production-oriented local coding agent runtime. The v0.1.0 baseline ships the Python CLI runtime while the project prepares the Desktop Transition Runtime.
-
-v0.1.x is the CLI runtime baseline. The next architecture phase is Desktop Transition Runtime: a local RuntimeHost/daemon boundary around the existing Python runtime, not another round of CLI-only feature accumulation. The target product architecture is Rust Core + Tauri Desktop + TypeScript UI + Python Plugin Runtime, introduced in stages without deleting the current Python runtime.
+Singularity is a production-oriented local coding agent harness. The v0.1.x baseline ships a Python CLI and a Python `AgentHost` facade while the project prepares a future local daemon and desktop client. The core names follow common coding-agent harness vocabulary: loop, runner, executor, manager, controller, pipeline, store, recorder, checkpoint, harness, and registry.
 
 Project identity:
 
@@ -10,23 +8,19 @@ Project identity:
 - Python package: `singularity`
 - CLI names: `singularity-agent` and `sg`
 - environment prefix: `SINGULARITY_`
-- project runtime directory: `.singularity/`
+- project-local user data directory: `.singularity/`
 
-Documentation Runtime is the contract entrypoint for that transition:
+Architecture entrypoints:
 
-- `docs/architecture/runtime-map.md`
-- `docs/architecture/boundary-contracts.md`
-- `docs/architecture/state-model.md`
-- `docs/architecture/event-model.md`
-- `docs/architecture/tool-protocol.md`
-- `docs/architecture/policy-approval.md`
-- `docs/architecture/trace-audit.md`
-- `docs/architecture/desktop-architecture-strategy.md`
-- `docs/architecture/migration-to-desktop.md`
-- `docs/architecture/runtime-host-transition.md`
-- `docs/architecture/naming.md`
-- `docs/adr/`
-- `docs/schemas/`
+- naming and execution map: `docs/architecture/naming-and-runtime-map.md`
+- execution overview: `docs/architecture/execution-map.md`
+- agent loop: `src/singularity/agent_loop.py`
+- graph assembly: `src/singularity/kernel/graph.py`
+- run lifecycle: `src/singularity/kernel/agent_kernel.py`
+- model request path: `src/singularity/model/request_builder.py` and `src/singularity/model/runner.py`
+- tool execution path: `src/singularity/tool_protocol/engine.py` and `src/singularity/tools/executor.py`
+- context management path: `src/singularity/context/manager.py` and `src/singularity/context/store.py`
+- checkpoint and recovery path: `src/singularity/workspace_state/manager.py`, `src/singularity/workspace_state/store.py`, and `src/singularity/kernel/recovery.py`
 
 The retained compatibility read tools are still available:
 
@@ -38,82 +32,93 @@ They execute through the same production chain as every other tool call:
 
 ```text
 CLI
--> SingularityAgent
--> PlannerRuntime
--> ContextManager
--> ModelRuntime
--> ToolCallingProtocolRuntime
--> ToolRuntime
--> PolicyRuntime / ApprovalGate
--> MutationRuntime / CommandRuntime / VerificationRuntime
--> WorkspaceStateRuntime
--> Trace / Audit / FinalReport
+-> KernelBootstrap.boot()
+-> AgentGraphBuilder.build()
+-> AgentKernel.run_task()
+-> AgentLoop.run()
+-> RunController.start()
+-> Planner.step()
+-> ContextManager.build_bundle()
+-> PromptAssemblyPipeline.build()
+-> ModelTurnRequestBuilder.build()
+-> ModelRunner.run_turn()
+-> ToolProtocolEngine.process_model_turn()
+-> ToolExecutor.execute_tool_call()
+-> PolicyEngine / ApprovalGate
+-> WorkspaceMutationManager / CommandExecutor / VerificationRunner
+-> ContextManager.add_tool_protocol_result()
+-> WorkspaceStateManager
+-> TraceRecorder / AuditLog / FinalReport
 ```
 
-Runtime names tracked by Documentation Runtime:
+Architecture components tracked by `DocumentationPipeline`:
 
-<!-- runtime-names:start -->
+<!-- architecture-components:start -->
 - `CLI`
 - `KernelBootstrap`
 - `AgentKernel`
-- `RuntimeHost`
-- `SessionRuntime`
-- `SingularityAgent`
-- `PlannerRuntime`
+- `AgentHost`
+- `RunSession`
+- `AgentLoop`
+- `Planner`
 - `ContextManager`
-- `InstructionRuntime`
-- `ModelRuntime`
-- `ToolCallingProtocolRuntime`
+- `PromptAssemblyPipeline`
+- `ModelTurnRequestBuilder`
+- `ModelRunner`
+- `ToolProtocolEngine`
 - `ParallelToolExecutor`
-- `ToolRuntime`
+- `ToolExecutor`
 - `ToolRegistry`
-- `PluginRuntime`
-- `PolicyRuntime`
+- `PluginManager`
+- `PolicyEngine`
 - `ApprovalGate`
-- `MutationRuntime`
-- `CommandRuntime`
-- `VerificationRuntime`
-- `SandboxRuntime`
-- `WorkspaceStateRuntime`
-- `GitRuntime`
-- `TraceRuntime`
-- `Audit`
-- `MemoryRuntime`
-- `MemorySyncRuntime`
-- `RemoteApprovalRuntime`
-- `ProjectIndexRuntime`
-- `EditRuntime`
-- `ReviewRuntime`
-- `EvaluationRuntime`
+- `WorkspaceMutationManager`
+- `CommandExecutor`
+- `VerificationRunner`
+- `SandboxManager`
+- `WorkspaceStateManager`
+- `GitClient`
+- `TraceRecorder`
+- `AuditLog`
+- `MemoryLearningPipeline`
+- `MemoryBundleSync`
+- `RemoteApprovalExchange`
+- `ProjectIndex`
+- `EditExecutor`
+- `ReviewPipeline`
+- `EvaluationHarness`
 - `FinalReport`
-- `DocumentationRuntime`
-<!-- runtime-names:end -->
+- `DocumentationPipeline`
+<!-- architecture-components:end -->
 
-## Runtime Capability Status
+## Component Capability Status
 
 | Capability | Status | Source or boundary |
 | --- | --- | --- |
 | `CLI` | implemented | `src/singularity/cli.py` |
-| `KernelBootstrap` / `AgentKernel` | implemented | `src/singularity/kernel/bootstrap.py`, `src/singularity/kernel/runtime.py` |
-| `PlannerRuntime` | implemented | `src/singularity/planner/runtime.py` |
+| `KernelBootstrap` / `AgentKernel` | implemented | `src/singularity/kernel/bootstrap.py`, `src/singularity/kernel/agent_kernel.py` |
+| `AgentLoop` | implemented | `src/singularity/agent_loop.py`; owns turn orchestration only |
+| `Planner` | implemented | `src/singularity/planner/engine.py` |
 | `ContextManager` | implemented | `src/singularity/context/manager.py` |
-| `ContextRuntime` enum | implemented | `src/singularity/context/models.py` |
-| `ModelRuntime` | implemented | `src/singularity/model/runtime.py` |
-| `ToolCallingProtocolRuntime` / `ToolRuntime` | implemented | `src/singularity/tool_protocol/runtime.py`, `src/singularity/tools/runtime.py` |
+| `PromptAssemblyPipeline` / `ModelTurnRequestBuilder` | implemented | `src/singularity/instructions/prompt_assembly.py`, `src/singularity/model/request_builder.py` |
+| `ModelRunner` | implemented | `src/singularity/model/runner.py` |
+| `ToolProtocolEngine` / `ToolExecutor` | implemented | `src/singularity/tool_protocol/engine.py`, `src/singularity/tools/executor.py` |
 | `ParallelToolExecutor` | implemented | `src/singularity/tool_protocol/parallel.py`; only read-only idempotent tool groups run concurrently |
-| `PolicyRuntime` / `ApprovalGate` | implemented | `src/singularity/policy/engine.py`, `src/singularity/policy/approval.py` |
-| `MutationRuntime` / `CommandRuntime` / `VerificationRuntime` | implemented | `src/singularity/workspace/runtime.py`, `src/singularity/command/runtime.py`, `src/singularity/verification/runtime.py` |
-| `SandboxRuntime` | partial | `DockerSandboxBackend` provides hard isolation when available; `LocalStagingBackend` provides soft copy-on-write workspace isolation only |
-| `GitRuntime` | implemented | local-only status, diff, and commit wrapper in `src/singularity/git_runtime/`; no push, PR, or remote branch automation |
-| `RemoteApprovalRuntime` | implemented | file-backed request/grant exchange in `src/singularity/policy/remote.py`; no hidden network service |
-| `MemorySyncRuntime` | implemented | file-backed memory bundle export/import in `src/singularity/memory/sync.py`; remote entries import as reviewable candidates by default |
+| `PolicyEngine` / `ApprovalGate` | implemented | `src/singularity/policy/engine.py`, `src/singularity/policy/approval.py` |
+| `WorkspaceMutationManager` / `CommandExecutor` / `VerificationRunner` | implemented | `src/singularity/workspace/mutation_manager.py`, `src/singularity/command/executor.py`, `src/singularity/verification/runner.py` |
+| `SandboxManager` | partial | `DockerSandboxBackend` provides hard isolation when available; `LocalStagingBackend` provides soft copy-on-write workspace isolation only and hard-isolation requests fail closed |
+| `WorkspaceStateManager` | implemented | `src/singularity/workspace_state/manager.py`; checkpoints, journals, ownership, rollback planning, and recovery |
+| `GitClient` | implemented | local-only status, diff, and commit wrapper in `src/singularity/git_client/`; Push, pull, reset, remote branches, pull requests, and remote automation are out of scope |
+| `RemoteApprovalExchange` | implemented | file-backed request/grant exchange in `src/singularity/policy/remote.py`; no hidden network service |
+| `MemoryBundleSync` | implemented | file-backed memory bundle export/import in `src/singularity/memory/sync.py`; remote entries import as reviewable candidates by default |
+| `TraceRecorder` / `AuditLog` | implemented | `src/singularity/observability/recorder.py`, `src/singularity/policy/audit.py` |
 | `FinalReport` | implemented | kernel: `src/singularity/kernel/finalization.py`; planner: `src/singularity/planner/models.py` |
-| `EvaluationRuntime` | implemented | `src/singularity/evaluation/runtime.py` |
-| Python RuntimeHost facade | implemented | `src/singularity/runtime_host/` wraps `KernelBootstrap` / `AgentKernel`, projects `RunEvent` / `ApprovalEvent` / `ToolCallEvent`, reads artifacts by opaque ref, and is covered by `tests/test_runtime_host.py` |
-| RuntimeHost daemon / Rust Core / Tauri UI | planned | documented in `docs/architecture/runtime-host-transition.md` and ADRs; HTTP, WebSocket, JSON-RPC, Rust, and Tauri are not implemented in this Python CLI baseline |
+| `EvaluationHarness` | implemented | `src/singularity/evaluation/harness.py` |
+| Python `AgentHost` facade | implemented | `src/singularity/agent_host/` wraps `KernelBootstrap` / `AgentKernel`, projects run and approval events, reads artifacts by opaque ref, and is covered by `tests/test_agent_host.py` |
+| AgentHost daemon / Rust Core / Tauri UI | planned | documented in `docs/architecture/agent-host-transition.md` and ADRs; HTTP, WebSocket, JSON-RPC, Rust, and Tauri are not implemented in this Python CLI baseline |
 | web search / multi-agent execution | planned | intentionally not implemented in this release |
 
-Singularity implements `GitRuntime` as a local-only status/diff/commit wrapper, `RemoteApprovalRuntime` as a file-backed request/grant exchange, `MemorySyncRuntime` as a file-backed bundle exchange, and `ParallelToolExecutor` for read-only idempotent tool groups. It still does not implement web search or multi-agent execution in this release. Sandbox execution prefers `DockerSandboxBackend` as the real sandbox isolation backend when the Docker CLI and daemon are available, and otherwise keeps `LocalStagingBackend` for local copy-on-write staging. A request that requires hard isolation fails closed, and the runtime records `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` capability evidence in task state so sandbox downgrade never silently becomes a production isolation claim.
+Singularity implements `GitClient` as a local-only status/diff/commit wrapper, `RemoteApprovalExchange` as a file-backed request/grant exchange, `MemoryBundleSync` as a file-backed bundle exchange, and `ParallelToolExecutor` for read-only idempotent tool groups. It does not implement web search or multi-agent execution in this release. Sandbox execution prefers `DockerSandboxBackend` when Docker CLI and daemon are available, and otherwise keeps `LocalStagingBackend` for copy-on-write staging. A request that requires hard isolation fails closed, and Singularity records `hard_isolation`, `soft_workspace_isolation`, and `no_isolation` capability evidence in task state so sandbox downgrade is visible.
 
 ## Install
 
@@ -123,13 +128,13 @@ pip install -e .
 
 Configure the OpenAI-compatible provider through environment variables. The API key is intentionally not accepted as a CLI flag.
 
-Runtime configuration precedence is:
+Installation configuration precedence:
 
 ```text
 explicit CLI flag > SINGULARITY_* > .singularity/config.toml > defaults
 ```
 
-The optional `.singularity/config.toml` file may define non-secret runtime settings such as `max_turns`, `approval_mode`, `security_mode`, `model`, `base_url`, `raw_artifacts`, and `[project_index]` options. When `max_turns` is not set by CLI, environment, or config, the CLI derives an adaptive default from the goal length and long-task markers. The API key remains environment-only. Boot trace records an effective config event with a redacted value summary and config source map; final reports include the same effective config summary.
+The optional `.singularity/config.toml` file may define non-secret settings such as `max_turns`, `approval_mode`, `security_mode`, `model`, `base_url`, `raw_artifacts`, and `[project_index]` options. When `max_turns` is not set by CLI, environment, or config, the CLI derives an adaptive default from the goal length and long-task markers. The API key remains environment-only. Boot trace records an effective config event with a redacted value summary and config source map; final reports include the same effective config summary.
 
 PowerShell:
 
@@ -176,7 +181,7 @@ Supported session options:
 - `--max-turns`: Maximum model turns before the session stops. If omitted, CLI runs use an adaptive default based on the goal shape; explicit CLI, environment, and config values still take precedence.
 - `--approval-mode`: One of `interactive`, `review_all`, `auto_safe`, `read_only`, or `non_interactive`.
 - `--trace-dir`: Directory that contains per-run trace directories.
-- `--context-db`: Exact ContextStore SQLite path. Defaults to `<trace-run-dir>/context.sqlite3`.
+- `--context-db`: Exact `ObservationStore` SQLite path. Defaults to `<trace-run-dir>/context.sqlite3`.
 - `--model`: Overrides `SINGULARITY_MODEL` for this session.
 - `--base-url`: Overrides `SINGULARITY_BASE_URL` for this session.
 - `--raw-artifacts / --no-raw-artifacts`: Controls redacted raw model response artifacts. Raw payloads are never stored without redaction.
@@ -200,9 +205,9 @@ Project index commands:
 singularity-agent index build --json
 singularity-agent index refresh --json
 singularity-agent index explain
-singularity-agent index relevant "fix command runtime timeout handling"
-singularity-agent index impact src/singularity/command/runtime.py
-singularity-agent index tests src/singularity/command/runtime.py
+singularity-agent index relevant "fix command executor timeout handling"
+singularity-agent index impact src/singularity/command/executor.py
+singularity-agent index tests src/singularity/command/executor.py
 ```
 
 Local Git commands:
@@ -214,7 +219,7 @@ singularity-agent git diff --staged --json
 singularity-agent git commit --message "local checkpoint" --path src/example.py --json
 ```
 
-`GitRuntime` is local-only. It never pushes, opens pull requests, resets branches, or shells out through a user-provided command string.
+`GitClient` is local-only. It never pushes, pulls, opens pull requests, resets branches, or shells out through a user-provided command string.
 
 Local memory commands:
 
@@ -257,19 +262,19 @@ singularity-agent eval regression run golden.json --baseline-profile-json "{}" -
 singularity-agent eval report show work/evaluations/<eval_run_id>/report.md
 ```
 
-`benchmark` is an alias for `eval`. Suite, A/B, and regression commands default to deterministic offline scoring and trace replay; pass `--execute` to run declared hooks/tests through the runtime boundaries. Reports are written to `work/evaluations/<run_id>/` by default. The built-in Phase 1J Golden Task Set is checked in at `docs/evaluation/phase1j-golden-tasks.json`; each task declares expected files, commands, evidence, report sections, and trace artifacts. See `docs/evaluation-runtime.md` for the Benchmark Task schema, trace replay semantics, scoring fields, A/B profiles, Golden Task evidence, and regression report format.
+`benchmark` is an alias for `eval`. Suite, A/B, and regression commands default to deterministic offline scoring and trace replay; pass `--execute` to run declared hooks/tests through the command, verification, mutation, trace, memory, and planner boundaries. Reports are written to `work/evaluations/<run_id>/` by default. The built-in Phase 1J Golden Task Set is checked in at `docs/evaluation/phase1j-golden-tasks.json`; each task declares expected files, commands, evidence, report sections, and trace artifacts. See `docs/evaluation-harness.md`.
 
 `eval live quicksort` is the optional live-provider end-to-end smoke benchmark. It creates a controlled workspace under `work/evaluations-live/`, boots the real CLI kernel with the configured OpenAI-compatible provider, asks the agent to create `quicksort.py`, and independently runs `python quicksort.py` before reporting success.
 
 Exit code conventions:
 
 - `0`: Command completed successfully.
-- `1`: Main agent or CLI command failed, including provider, policy, validation, or runtime errors.
+- `1`: Main agent or CLI command failed, including provider, policy, validation, or execution errors.
 - `2`: `eval regression run --block-on-regression` detected a blocking regression.
 
 ## Approval Modes
 
-`PolicyRuntime` is the only runtime permission decision source. `ApprovalGate` resolves decisions that require local review.
+`PolicyEngine` is the single permission decision source. `ApprovalGate` resolves decisions that require local review.
 
 - `interactive`: Ask locally when a policy decision requires review.
 - `review_all`: Route all meaningful actions through review.
@@ -277,33 +282,34 @@ Exit code conventions:
 - `read_only`: Allow only workspace read capabilities such as file listing, file reading, and text search.
 - `non_interactive`: Fail closed when review or approval would be required.
 
-`ToolPolicy` remains as a registration sanity check and legacy compatibility surface. It is not the runtime allow/deny/review authority.
+`ToolPolicy` remains as a registration sanity check. It is not the session allow/deny/review authority.
 
-Remote approval grants imported through `approval remote import-grant` are still scoped `ApprovalGrant` records consumed by `PolicyRuntime`. The remote file format does not bypass policy evaluation, grant matching, single-use/session-only constraints, or audit logging.
+Remote approval grants imported through `approval remote import-grant` are scoped `ApprovalGrant` records consumed by `PolicyEngine`. The remote file format does not bypass policy evaluation, grant matching, single-use/session-only constraints, or audit logging.
 
 `ParallelToolExecutor` only runs batches scheduled as `parallel_readonly`. The scheduler requires provider parallel-tool support, multiple validated read-only calls, idempotent tool specs, and no mutation, command, verification, or unknown side-effect tools. Results are still bound and appended in original tool-call order.
 
-## Runtime Boundaries
+## Execution Boundaries
 
-`SingularityAgent` only orchestrates the session:
+`AgentLoop` only orchestrates the session:
 
 - `planner.step()`
 - `context.build_bundle()`
-- `model_runtime.run_turn()`
-- `ToolCallingProtocolRuntime.process_model_turn()`
+- `model_runner.build_request_from_context()`
+- `model_runner.run_turn()`
+- `ToolProtocolEngine.process_model_turn()`
 - final report production
 
-The agent does not execute tools directly, construct tool result messages by hand, make policy decisions, write raw tool trace records, or own protocol state.
+The agent loop does not execute tools directly, construct tool result messages by hand, make policy decisions, write raw tool trace records, or own protocol state.
 
-The CLI assembles `PlannerRuntime`, `ModelRuntime`, `ToolRuntime`, `ToolCallingProtocolRuntime`, `InstructionRuntime`, `PolicyRuntime`, and `ApprovalGate` before creating `SingularityAgent`. Direct `SingularityAgent` construction must inject those runtime dependencies instead of relying on a private fallback loop.
+The CLI and `KernelBootstrap` assemble `Planner`, `ModelRunner`, `ToolExecutor`, `ToolProtocolEngine`, `PromptAssemblyPipeline`, `PolicyEngine`, and `ApprovalGate` before creating `AgentLoop`. Direct `AgentLoop` construction must inject those dependencies instead of relying on a private fallback loop.
 
-`ToolRuntime` requires the session `PolicyRuntime`. It validates schemas and runtime boundaries, enforces policy decisions, resolves local approval grants, blocks dry-run side effects, executes the registered handler only after those gates pass, and records redacted structured trace events.
+`ToolExecutor` requires the session `PolicyEngine`. It validates schemas and execution boundaries, enforces policy decisions, resolves local approval grants, blocks dry-run side effects, executes the registered handler only after those gates pass, and records redacted structured trace events.
 
-Mutation, command, and verification tools are registered through their dedicated runtimes. Verification command discovery uses `python -m pytest tests --basetemp work/pytest-tmp` for this repository shape.
+Mutation, command, and verification tools are registered through their dedicated manager/executor/runner. Verification command discovery uses `python -m pytest tests --basetemp work/pytest-tmp` for this repository shape.
 
-`GitRuntime` owns local Git status, diff statistics, and local commits. It is intentionally separate from `LocalWorkspaceStateRuntime`, which remains the non-Git ownership, rollback, and recovery source of truth.
+`GitClient` owns local Git status, diff statistics, and local commits. It is intentionally separate from `WorkspaceStateManager`, which remains the non-Git ownership, rollback, and recovery source of truth.
 
-`EvaluationRuntime` is an orchestration runtime for local benchmark management, trace replay classification, scoring, A/B evaluation, regression detection, and report writing. It only runs executable hooks/tests or materializes inline snapshots when explicitly requested, and those actions remain behind `CommandRuntime`, `VerificationRuntime`, `MutationRuntime`, `ToolRuntime`, `MemoryRuntime`, `PlannerRuntime`, and trace boundaries.
+`EvaluationHarness` orchestrates local benchmark management, trace replay classification, scoring, A/B evaluation, regression detection, and report writing. It only runs executable hooks/tests or materializes inline snapshots when explicitly requested, and those actions remain behind `CommandExecutor`, `VerificationRunner`, `WorkspaceMutationManager`, `ToolExecutor`, `MemoryLearningPipeline`, `Planner`, and trace boundaries.
 
 ## Protocol, Context, And Trace State
 
@@ -319,9 +325,9 @@ Each CLI run creates a run/session directory. By default:
   tool_protocol.sqlite3
 ```
 
-`--trace-dir` controls the parent directory. `--context-db` can override only the context database path. `ToolCallingProtocolRuntime` uses `<trace-run-dir>/tool_protocol.sqlite3` unless an explicit state store is injected by tests or compatibility code.
+`--trace-dir` controls the parent directory. `--context-db` can override only the context database path. `ToolProtocolEngine` uses `<trace-run-dir>/tool_protocol.sqlite3` unless an explicit state store is injected by tests.
 
-All model tool calls flow through `ToolCallingProtocolRuntime`. Invalid tool calls produce synthetic protocol results. Replay handling distinguishes:
+All model tool calls flow through `ToolProtocolEngine`. Invalid tool calls produce synthetic protocol results. Replay handling distinguishes:
 
 - `read_only_replay`
 - `side_effect_replay`
@@ -329,7 +335,7 @@ All model tool calls flow through `ToolCallingProtocolRuntime`. Invalid tool cal
 
 Pending approvals are recoverable through protocol recovery reports. Singularity reports `pending_approval_count` and a resume action. Remote approval export/import is file-backed; the protocol recovery path does not contact a remote service.
 
-`ContextItem` and `ContextBundle` are the primary context state. `_messages` is only the provider projection cache. Tool results enter context through `add_tool_protocol_result()`; `add_tool_result()` remains as a compatibility adapter. Workspace health enters context through `add_workspace_state()` and is rendered as structured runtime context, not as a synthetic `workspace_health` tool result.
+`ContextItem` and `ContextBundle` are the primary context state. `_messages` is only the provider projection cache. Tool results enter context through `add_tool_protocol_result()`; `add_tool_result()` remains as a legacy method name for older in-process tests and is not a naming layer. Workspace health enters context through `add_workspace_state()` and is rendered as structured component context, not as a synthetic `workspace_health` tool result.
 
 Policy, planner, mutation, command, verification, and workspace-state observations use structured context items. Secrets are redacted before storage and rendering.
 
@@ -341,13 +347,13 @@ Singularity is local-first. It does not send telemetry to a remote trace backend
 
 Current safety boundaries:
 
-- Workspace reads are allowed according to `PolicyRuntime`.
-- Workspace writes must go through `MutationRuntime`.
-- Commands must go through `CommandRuntime`.
-- Verification must go through `VerificationRuntime`.
-- Sandbox-required commands must go through `SandboxRuntime`; Docker is used first for real sandbox isolation when available, otherwise local staging is used only for requests that do not require hard isolation.
-- Workspace state is tracked by `WorkspaceStateRuntime`.
-- Local Git status, diff, and commit operations are routed through `GitRuntime`; push and PR automation are intentionally absent.
+- Workspace reads are allowed according to `PolicyEngine`.
+- Workspace writes must go through `WorkspaceMutationManager`.
+- Commands must go through `CommandExecutor`.
+- Verification must go through `VerificationRunner`.
+- Sandbox-required commands must go through `SandboxManager`; Docker is used first for hard isolation when available, otherwise local staging is used only for requests that do not require hard isolation.
+- Workspace state is tracked by `WorkspaceStateManager`.
+- Local Git status, diff, and commit operations are routed through `GitClient`; push and PR automation are intentionally absent.
 - Remote approval and memory sync are explicit JSON file exchanges, not background network services.
 - Evaluation outputs are local files under `work/evaluations/` unless explicitly redirected.
 - Dry-run blocks real side effects before handlers run.
@@ -372,10 +378,3 @@ git diff --check
 ```
 
 The declared development dependency set includes `pytest`, `ruff`, `mypy`, and `pytest-cov`. Ruff is configured as a low-noise correctness gate, mypy is scoped to production-critical modules, and coverage is configured for reporting before a fail-under threshold is introduced.
-
-Before publishing, verify remote alignment with:
-
-```bash
-git status --short --branch
-git rev-list --left-right --count origin/main...HEAD
-```

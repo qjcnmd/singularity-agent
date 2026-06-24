@@ -14,7 +14,7 @@ from singularity.plugins.models import (
     PluginToolContribution,
     PluginType,
 )
-from singularity.plugins.runtime import PluginRuntime
+from singularity.plugins.manager import PluginManager
 from singularity.plugins.status import PluginLockStore, PluginStatusStore
 
 __all__ = [
@@ -29,7 +29,7 @@ __all__ = [
     "PluginLockStore",
     "PluginManifest",
     "PluginPermission",
-    "PluginRuntime",
+    "PluginManager",
     "PluginStatus",
     "PluginStatusStore",
     "PluginToolContribution",

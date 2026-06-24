@@ -1,24 +1,24 @@
 # Migration To Desktop
 
-The target architecture is Rust Core + Tauri Desktop + TypeScript UI + Python Plugin Runtime. This document defines the staged path without starting the Rust or Tauri implementation in v0.1.x.
+The target architecture is Rust Core + Tauri Desktop + TypeScript UI + Python Plugin Management. This document defines the staged path without starting the Rust or Tauri implementation in v0.1.x.
 
 ## Non-Goals For This Phase
 
 - no Tauri implementation
 - no Electron
 - no Rust rewrite
-- no deletion of the existing Python runtime
+- no deletion of the existing Python component
 - no remote approval server
 - no background remote memory sync daemon
 - no Git push, pull request, or branch automation
 
-## Phase 0: Documentation Runtime
+## Phase 0: Documentation Component
 
 Status: this phase.
 
 Deliverables:
 
-- runtime map
+- component map
 - boundary contracts
 - state model
 - event model
@@ -31,18 +31,18 @@ Deliverables:
 
 Exit criteria:
 
-- README and runtime-map agree on runtime names
+- README and component-map agree on component names
 - required docs/ADRs/schemas exist
 - README names Singularity as the active project identity
 - current tests remain green
 
-## Phase 1: Desktop Transition Runtime
+## Phase 1: Desktop Transition AgentHost
 
-Goal: make the existing Python runtime hostable without changing its behavior.
+Goal: make the existing Python component hostable without changing its behavior.
 
 Deliverables:
 
-- `RuntimeHost` facade over `KernelBootstrap` and `AgentKernel`
+- `AgentHost` facade over `KernelBootstrap` and `AgentKernel`
 - start/resume/cancel run API
 - submit approval API
 - state snapshot API
@@ -52,13 +52,13 @@ Deliverables:
 
 Rules:
 
-- CLI becomes one client of RuntimeHost
-- no UI code owns runtime objects
+- CLI becomes one client of AgentHost
+- no UI code owns component objects
 - Python remains the production execution path
 
 ## Phase 2: Local Daemon
 
-Goal: isolate long-running runtime state from CLI/UI process lifetime.
+Goal: isolate long-running session state from CLI/UI process lifetime.
 
 Deliverables:
 
@@ -77,7 +77,7 @@ Rules:
 
 ## Phase 3: Tauri Desktop And TypeScript UI
 
-Goal: ship desktop as a client over RuntimeHost/daemon.
+Goal: ship desktop as a client over AgentHost/daemon.
 
 Deliverables:
 
@@ -91,7 +91,7 @@ Deliverables:
 
 Rules:
 
-- Tauri invokes RuntimeHost/daemon commands, not Python internals
+- Tauri invokes AgentHost/daemon commands, not Python internals
 - TypeScript UI subscribes to run events and snapshots
 - UI never edits trace, context, protocol, policy, or workspace-state files directly
 - desktop clients use `singularity-agent` or `sg` commands for installed CLI interop, never bare `singularity`
@@ -113,13 +113,13 @@ Candidate Rust-owned areas:
 Python remains owner of:
 
 - planner/model/context/tool protocol until replaced intentionally
-- existing tool/runtime behavior
+- existing tool/agent behavior
 - plugin compatibility
 - evaluation/replay until ported
 
-## Phase 5: Python Plugin Runtime
+## Phase 5: Python Plugin Management
 
-Goal: make Python the explicit plugin runtime instead of an accidental monolith.
+Goal: make Python the explicit plugin component instead of an accidental monolith.
 
 Deliverables:
 
@@ -131,8 +131,8 @@ Deliverables:
 
 Rules:
 
-- plugins never receive core runtime objects
-- high-risk plugin tools still execute through ToolRuntime, PolicyRuntime, CommandRuntime, SandboxRuntime, and trace
+- plugins never receive core component objects
+- high-risk plugin tools still execute through ToolExecutor, PolicyEngine, CommandExecutor, SandboxManager, and trace
 - dependency installation remains explicit and reviewed
 
 ## Migration Invariants
@@ -141,8 +141,8 @@ Rules:
 - fail closed on missing policy, approval, or sandbox capability
 - no raw secret persistence
 - clients are replaceable
-- runtime state is resumable
-- every side effect has one owning runtime
+- session state is resumable
+- every side effect has one owning component
 - every phase leaves a runnable test behind
 
 ## Naming And Package
@@ -190,4 +190,4 @@ User directories on Linux-style systems:
 ~/.cache/singularity/
 ```
 
-Project-local runtime data uses `.singularity/`. RuntimeHost should expose state and artifacts by stable ids instead of requiring UI clients to parse local paths directly.
+Project-local user data uses `.singularity/`. AgentHost should expose state and artifacts by stable ids instead of requiring UI clients to parse local paths directly.

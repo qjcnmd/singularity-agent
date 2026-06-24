@@ -18,8 +18,8 @@ class ModelCriticOutcome:
 
 
 class ModelCritic:
-    def __init__(self, model_runtime: Any | None) -> None:
-        self.model_runtime = model_runtime
+    def __init__(self, model_runner: Any | None) -> None:
+        self.model_runner = model_runner
 
     def review(
         self,
@@ -28,11 +28,11 @@ class ModelCritic:
         bundle: dict[str, Any],
         request_context: dict[str, Any] | None = None,
     ) -> ModelCriticOutcome:
-        if self.model_runtime is None:
+        if self.model_runner is None:
             return ModelCriticOutcome(
                 status="model_critic_unavailable",
-                findings=[_degraded_finding("Model critic unavailable", "No model runtime was configured.")],
-                error="model_runtime_missing",
+                findings=[_degraded_finding("Model critic unavailable", "No model runner was configured.")],
+                error="model_runner_missing",
             )
         try:
             from singularity.model.models import ModelPurpose, ModelTurnRequest, ModelTurnStatus
@@ -55,7 +55,7 @@ class ModelCritic:
                     "review_stage": report.target.stage.value,
                 },
             )
-            result = self.model_runtime.run_turn(request)
+            result = self.model_runner.run_turn(request)
             if getattr(result, "status", None) != ModelTurnStatus.SUCCESS:
                 return ModelCriticOutcome(
                     status="model_critic_unavailable",

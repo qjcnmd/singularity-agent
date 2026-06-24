@@ -12,7 +12,7 @@ from singularity.interaction.models import InteractionMode
 from singularity.policy.config import ApprovalMode, PolicyConfig, SecurityMode
 
 if TYPE_CHECKING:
-    from singularity.model.config import ModelRuntimeConfig
+    from singularity.model.config import ModelRunnerConfig
 
 
 class Settings(BaseModel):
@@ -127,7 +127,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
 
 
 @dataclass(frozen=True)
-class ProductionRuntimeConfig:
+class ProductionConfig:
     project_root: Path
     max_turns: int = BASE_DEFAULT_MAX_TURNS
     profile: str | None = None
@@ -178,7 +178,7 @@ class ProductionRuntimeConfig:
         config_file: Path | str | None = None,
         cli_overrides: set[str] | None = None,
         default_max_turns: int | None = None,
-    ) -> "ProductionRuntimeConfig":
+    ) -> "ProductionConfig":
         root = Path(project_root).expanduser().resolve(strict=False)
         resolved_config_file = (
             Path(config_file).expanduser()
@@ -304,10 +304,10 @@ class ProductionRuntimeConfig:
             security_mode=self.security_mode,
         )
 
-    def to_model_runtime_config(self) -> "ModelRuntimeConfig":
-        from singularity.model.config import ModelRuntimeConfig
+    def to_model_runner_config(self) -> "ModelRunnerConfig":
+        from singularity.model.config import ModelRunnerConfig
 
-        config = ModelRuntimeConfig.from_env(
+        config = ModelRunnerConfig.from_env(
             base_url=self.base_url,
             model=self.model,
             store_raw_responses=self.raw_artifacts,
@@ -324,9 +324,9 @@ class ProductionRuntimeConfig:
         return self.project_index_db or (self.project_root / ".singularity" / "index.sqlite")
 
     def to_project_index_config(self):
-        from singularity.code_index import ProjectIndexRuntimeConfig
+        from singularity.code_index import ProjectIndexConfig
 
-        return ProjectIndexRuntimeConfig(
+        return ProjectIndexConfig(
             enabled=self.project_index_enabled,
             db_path=self.project_index_db_path(),
             build_on_boot=self.project_index_build_on_boot,

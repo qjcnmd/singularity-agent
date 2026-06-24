@@ -6,22 +6,22 @@ from typing import Any
 
 from typer.testing import CliRunner
 
-from singularity.agent import SingularityAgentRunStatus
+from singularity.agent_loop import AgentLoopStatus
 from singularity.cli import app
-from singularity.config import ProductionRuntimeConfig, adaptive_default_max_turns
+from singularity.config import ProductionConfig, adaptive_default_max_turns
 from singularity.context import ContextManager
-from singularity.context.models import ContextItemType, ContextRuntime
+from singularity.context.models import ContextItemType, ContextSource
 from singularity.model import (
     ModelMessage,
     ModelPurpose,
-    ModelRuntime,
+    ModelRunner,
     ModelTurnResult,
     ModelTurnStatus,
     ModelToolCall,
     ModelToolParseStatus,
     MockModelProvider,
 )
-from singularity.observability import TraceRuntime
+from singularity.observability import TraceRecorder
 from singularity.observability.artifacts import TraceArtifactStore
 from singularity.observability.models import TraceArtifactKind
 from singularity.policy import ApprovalMode, DecisionOutcome, SecurityMode
@@ -31,24 +31,24 @@ from singularity.tool_protocol.models import (
     ToolProtocolResultEnvelope,
     ToolProtocolTurnStatus,
 )
-from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
+from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tool_protocol.state import ToolProtocolStateStore
 from singularity.tools import (
     PermissionLevel,
     ToolExecutionBackendKind,
     ToolPolicy,
     ToolRegistry,
-    ToolRuntime,
+    ToolExecutor,
     ToolSideEffectKind,
     ToolSpec,
 )
-from tests.agent_runtime_helpers import make_agent_session
-from tests.test_tool_runtime_policy_approval import (
+from tests.agent_loop_helpers import make_agent_session
+from tests.test_tool_executor_policy_approval import (
     EmptyInput,
-    SequencedPolicyRuntime,
+    SequencedPolicyEngine,
     make_tool_call,
 )
-from tests.tool_runtime_helpers import make_test_policy_runtime
+from tests.tool_executor_helpers import make_test_policy_engine
 
 
 def test_cli_help_exposes_production_baseline_options_without_legacy_copy() -> None:
@@ -56,7 +56,7 @@ def test_cli_help_exposes_production_baseline_options_without_legacy_copy() -> N
 
     assert result.exit_code == 0
     output = result.output
-    assert "production-oriented local CLI coding agent runtime" in output
+    assert "production-oriented local CLI coding agent harness" in output
     assert "minimal" not in output.lower()
     assert "read-only agent loop" not in output.lower()
     for option in [
@@ -77,8 +77,8 @@ def test_cli_help_exposes_production_baseline_options_without_legacy_copy() -> N
         assert option in output
 
 
-def test_production_runtime_config_maps_cli_policy_and_model_overrides(tmp_path: Path) -> None:
-    config = ProductionRuntimeConfig.from_cli(
+def test_production_config_maps_cli_policy_and_model_overrides(tmp_path: Path) -> None:
+    config = ProductionConfig.from_cli(
         project_root=tmp_path,
         max_turns=3,
         profile="local-dev",
@@ -108,13 +108,13 @@ def test_production_runtime_config_maps_cli_policy_and_model_overrides(tmp_path:
     assert config.resume_session == "session_1"
     assert config.to_policy_config().approval_mode == ApprovalMode.READ_ONLY
     assert config.to_policy_config().security_mode == SecurityMode.COMPAT
-    model_config = config.to_model_runtime_config()
+    model_config = config.to_model_runner_config()
     assert model_config.default_model == "override-model"
     assert model_config.providers["openai_compatible"]["base_url"] == "https://example.test/v1"
     assert model_config.store_raw_responses is False
 
 
-def test_production_runtime_config_merges_cli_env_config_and_defaults(
+def test_production_config_merges_cli_env_config_and_defaults(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -141,7 +141,7 @@ max_files = 123
     monkeypatch.setenv("SINGULARITY_MODEL", "env-model")
     monkeypatch.setenv("SINGULARITY_PROJECT_INDEX_ENABLED", "true")
 
-    config = ProductionRuntimeConfig.from_cli(
+    config = ProductionConfig.from_cli(
         project_root=tmp_path,
         approval_mode="read_only",
         cli_overrides={"approval_mode"},
@@ -165,16 +165,16 @@ max_files = 123
     assert "api_key" not in json.dumps(effective).lower()
 
 
-def test_production_runtime_config_reports_custom_config_file_source(tmp_path: Path) -> None:
-    config_file = tmp_path / "runtime.toml"
+def test_production_config_reports_custom_config_file_source(tmp_path: Path) -> None:
+    config_file = tmp_path / "component.toml"
     config_file.write_text("max_turns = 9\n", encoding="utf-8")
 
-    config = ProductionRuntimeConfig.from_cli(project_root=tmp_path, config_file=config_file)
+    config = ProductionConfig.from_cli(project_root=tmp_path, config_file=config_file)
     effective = config.effective_config()
 
     assert config.max_turns == 9
-    assert effective["config_file"] == "runtime.toml"
-    assert effective["sources"]["max_turns"] == "config:runtime.toml"
+    assert effective["config_file"] == "component.toml"
+    assert effective["sources"]["max_turns"] == "config:component.toml"
 
 
 def test_adaptive_default_turn_budget_scales_long_tasks(tmp_path: Path) -> None:
@@ -193,7 +193,7 @@ def test_adaptive_default_turn_budget_scales_long_tasks(tmp_path: Path) -> None:
         == 16
     )
 
-    config = ProductionRuntimeConfig.from_cli(
+    config = ProductionConfig.from_cli(
         project_root=tmp_path,
         default_max_turns=adaptive_default_max_turns(
             "根据清单按阶段完成实现、测试、报告、提交、push、合并，并在每个阶段验证结果。"
@@ -204,30 +204,30 @@ def test_adaptive_default_turn_budget_scales_long_tasks(tmp_path: Path) -> None:
     assert config.effective_config()["sources"]["max_turns"] == "default:adaptive"
 
 
-def test_tool_policy_is_not_runtime_permission_decider(tmp_path: Path) -> None:
+def test_tool_policy_is_not_policy_engine_permission_decider(tmp_path: Path) -> None:
     calls: list[str] = []
     registry = ToolRegistry(tmp_path, include_default_tools=False)
     registry.register(
         ToolSpec(
-            name="write_via_policy_runtime",
+            name="write_via_policy_engine",
             description="write",
             input_model=EmptyInput,
             handler=lambda _args: calls.append("called") or {"ok": True},
             permission_level=PermissionLevel.WRITE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
-            uses_mutation_runtime=True,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_MANAGER,
+            uses_mutation_manager=True,
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
         )
     )
-    runtime = ToolRuntime(
+    component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.read_only(),
         trace=None,
         workspace_root=tmp_path,
-        policy_runtime=SequencedPolicyRuntime([DecisionOutcome.ALLOW]),  # type: ignore[arg-type]
+        policy_engine=SequencedPolicyEngine([DecisionOutcome.ALLOW]),  # type: ignore[arg-type]
     )
 
-    result = runtime.execute_tool_call(make_tool_call("write_via_policy_runtime"))
+    result = component.execute_tool_call(make_tool_call("write_via_policy_engine"))
 
     assert result.ok is True
     assert calls == ["called"]
@@ -244,21 +244,21 @@ def test_dry_run_blocks_side_effect_tools_before_handler(tmp_path: Path) -> None
             input_model=EmptyInput,
             handler=lambda _args: calls.append("called") or {"ok": True},
             permission_level=PermissionLevel.WRITE,
-            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME,
-            uses_mutation_runtime=True,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_MUTATION_MANAGER,
+            uses_mutation_manager=True,
             side_effects=ToolSideEffectKind.MUTATE_WORKSPACE,
         )
     )
-    runtime = ToolRuntime(
+    component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.coding_agent(),
         trace=None,
         workspace_root=tmp_path,
-        policy_runtime=SequencedPolicyRuntime([DecisionOutcome.ALLOW]),  # type: ignore[arg-type]
+        policy_engine=SequencedPolicyEngine([DecisionOutcome.ALLOW]),  # type: ignore[arg-type]
         dry_run=True,
     )
 
-    result = runtime.execute_tool_call(make_tool_call("mutate_for_real"))
+    result = component.execute_tool_call(make_tool_call("mutate_for_real"))
 
     assert result.ok is False
     assert result.error_code == "dry_run_blocked"
@@ -266,13 +266,13 @@ def test_dry_run_blocks_side_effect_tools_before_handler(tmp_path: Path) -> None
 
 
 def test_protocol_default_state_store_lives_in_trace_run_dir(tmp_path: Path) -> None:
-    trace = TraceRuntime.create(tmp_path, trace_dir=tmp_path / "trace-root")
-    runtime = ToolCallingProtocolRuntime(
+    trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "trace-root")
+    component = ToolProtocolEngine(
         registry=ToolRegistry(tmp_path),
         trace=trace,
     )
 
-    assert runtime.state_store.db_path == trace.store.run_dir / "tool_protocol.sqlite3"
+    assert component.state_store.db_path == trace.store.run_dir / "tool_protocol.sqlite3"
 
 
 def test_protocol_replay_classifies_read_only_side_effect_and_conflict(tmp_path: Path) -> None:
@@ -341,13 +341,13 @@ def test_protocol_recovery_reports_pending_approval(tmp_path: Path) -> None:
         }
     )
     store.upsert_record(call, batch_id="batch_review", phase=ToolCallPhase.WAITING_APPROVAL)
-    runtime = ToolCallingProtocolRuntime(
+    component = ToolProtocolEngine(
         registry=ToolRegistry(tmp_path),
         trace=None,
         state_store=store,
     )
 
-    recovered = runtime.recover_pending(run_id="run_1")
+    recovered = component.recover_pending(run_id="run_1")
 
     assert recovered.status == ToolProtocolTurnStatus.PENDING_APPROVAL
     assert recovered.pending_approval_count == 1
@@ -380,7 +380,7 @@ def test_context_protocol_result_is_default_structured_entry_without_raw_payload
     item = context.store.load_item(observation.id)
     assert item is not None
     assert item.item_type == ContextItemType.TOOL_OBSERVATION
-    assert item.source_runtime == ContextRuntime.TOOL_PROTOCOL
+    assert item.source_component == ContextSource.TOOL_PROTOCOL
 
 
 def test_workspace_state_uses_dedicated_context_item_not_tool_result() -> None:
@@ -388,7 +388,7 @@ def test_workspace_state_uses_dedicated_context_item_not_tool_result() -> None:
     item = context.add_workspace_state({"status": "clean", "secret": "sk-test-value"})
 
     assert item.item_type == ContextItemType.WORKSPACE_STATE
-    assert item.source_runtime == ContextRuntime.WORKSPACE_STATE
+    assert item.source_component == ContextSource.WORKSPACE_STATE
     assert all(message["role"] != "tool" for message in context.messages())
     stored = context.store.load_item(item.item_id)
     assert stored is not None
@@ -408,7 +408,7 @@ def test_sensitive_trace_artifacts_are_redacted_even_when_raw_artifacts_enabled(
     assert "sk-secret-value" not in artifact.path.read_text(encoding="utf-8")
 
 
-def test_min_agent_uses_injected_protocol_and_tool_runtime(tmp_path: Path) -> None:
+def test_min_agent_uses_injected_protocol_and_tool_executor(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("hello", encoding="utf-8")
     provider = SequencedChatProvider(
         {
@@ -434,40 +434,40 @@ def test_min_agent_uses_injected_protocol_and_tool_runtime(tmp_path: Path) -> No
         {"choices": [{"message": {"role": "assistant", "content": "done"}}]},
     )
     registry = ToolRegistry(tmp_path)
-    tool_runtime = ToolRuntime(
+    tool_executor = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.coding_agent(),
         trace=None,
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
-    protocol_runtime = CountingProtocolRuntime(registry=registry, trace=None)
+    tool_protocol = CountingProtocolEngine(registry=registry, trace=None)
     agent = make_agent_session(
         tmp_path,
         provider=provider,
         tools=registry,
-        trace=TraceRuntime.create(tmp_path),
+        trace=TraceRecorder.create(tmp_path),
         console=NullConsole(),
         max_turns=2,
-        tool_runtime=tool_runtime,
-        protocol_runtime=protocol_runtime,
+        tool_executor=tool_executor,
+        tool_protocol=tool_protocol,
     )
 
     result = agent.run("inspect")
 
-    assert result.status == SingularityAgentRunStatus.MAX_TURNS_EXCEEDED
-    assert protocol_runtime.calls == 1
-    assert protocol_runtime.tool_runtime_ids == [id(tool_runtime)]
+    assert result.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
+    assert tool_protocol.calls == 1
+    assert tool_protocol.tool_executor_ids == [id(tool_executor)]
 
 
-def test_read_only_tools_still_execute_through_protocol_runtime(tmp_path: Path) -> None:
+def test_read_only_tools_still_execute_through_tool_protocol(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("through production path", encoding="utf-8")
     request_context = ContextManager(system_prompt="system", user_goal="inspect")
-    runtime = ModelRuntime.with_mock_provider(
+    component = ModelRunner.with_mock_provider(
         MockModelProvider(text=""),
         tool_registry=ToolRegistry(tmp_path),
     )
-    request = runtime.build_request_from_context(
+    request = component.build_request_from_context(
         request_context,
         run_id="run_1",
         session_id="session_1",
@@ -492,25 +492,25 @@ def test_read_only_tools_still_execute_through_protocol_runtime(tmp_path: Path) 
             )
         ],
     )
-    protocol_runtime = ToolCallingProtocolRuntime(
+    tool_protocol = ToolProtocolEngine(
         registry=ToolRegistry(tmp_path),
         trace=None,
         state_store=ToolProtocolStateStore(tmp_path / "run" / "tool_protocol.sqlite3"),
     )
-    tool_runtime = ToolRuntime(
+    tool_executor = ToolExecutor(
         registry=ToolRegistry(tmp_path),
         policy=ToolPolicy.read_only(),
         trace=None,
         workspace_root=tmp_path,
-        policy_runtime=make_test_policy_runtime(tmp_path),
+        policy_engine=make_test_policy_engine(tmp_path),
     )
 
-    turn = protocol_runtime.process_model_turn(
+    turn = tool_protocol.process_model_turn(
         request=request,
         result=result,
         turn=1,
         context=request_context,
-        tool_runtime=tool_runtime,
+        tool_executor=tool_executor,
     )
 
     assert turn.executed_count == 1
@@ -522,16 +522,32 @@ def test_readme_documents_v010_production_architecture() -> None:
 
     assert "# Singularity v0.1.0" in readme
     assert "Project identity:" in readme
-    assert "production-oriented local coding agent runtime" in readme
-    assert "CLI\n-> SingularityAgent\n-> PlannerRuntime\n-> ContextManager\n-> ModelRuntime" in readme
-    assert "ToolCallingProtocolRuntime\n-> ToolRuntime\n-> PolicyRuntime / ApprovalGate" in readme
+    assert "production-oriented local coding agent harness" in readme
+    assert (
+        "CLI\n"
+        "-> KernelBootstrap.boot()\n"
+        "-> AgentGraphBuilder.build()\n"
+        "-> AgentKernel.run_task()\n"
+        "-> AgentLoop.run()\n"
+        "-> RunController.start()\n"
+        "-> Planner.step()\n"
+        "-> ContextManager.build_bundle()\n"
+        "-> PromptAssemblyPipeline.build()\n"
+        "-> ModelTurnRequestBuilder.build()\n"
+        "-> ModelRunner.run_turn()"
+    ) in readme
+    assert (
+        "ToolProtocolEngine.process_model_turn()\n"
+        "-> ToolExecutor.execute_tool_call()\n"
+        "-> PolicyEngine / ApprovalGate"
+    ) in readme
     assert "ParallelToolExecutor" in readme
     assert "list_files" in readme
     assert "read_file" in readme
     assert "search_text" in readme
-    assert "GitRuntime" in readme
-    assert "RemoteApprovalRuntime" in readme
-    assert "MemorySyncRuntime" in readme
+    assert "GitClient" in readme
+    assert "RemoteApprovalExchange" in readme
+    assert "MemoryBundleSync" in readme
     assert "approval modes" in readme.lower()
     assert "<trace-run-dir>/context.sqlite3" in readme
     assert "<trace-run-dir>/tool_protocol.sqlite3" in readme
@@ -540,18 +556,21 @@ def test_readme_documents_v010_production_architecture() -> None:
     assert "--resume" in readme
     assert "raw tool args" in readme
     assert "raw tool results" in readme
-    assert "real sandbox isolation" in readme
+    assert "DockerSandboxBackend" in readme
+    assert "hard isolation" in readme
+    assert "soft_workspace_isolation" in readme
+    assert "fails closed" in readme
 
 
-class CountingProtocolRuntime(ToolCallingProtocolRuntime):
+class CountingProtocolEngine(ToolProtocolEngine):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.calls = 0
-        self.tool_runtime_ids: list[int] = []
+        self.tool_executor_ids: list[int] = []
 
     def process_model_turn(self, **kwargs: Any) -> Any:
         self.calls += 1
-        self.tool_runtime_ids.append(id(kwargs["tool_runtime"]))
+        self.tool_executor_ids.append(id(kwargs["tool_executor"]))
         return super().process_model_turn(**kwargs)
 
 

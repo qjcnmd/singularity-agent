@@ -16,11 +16,11 @@ from singularity.evaluation import (
     WorkspaceSnapshot,
     WorkspaceSnapshotKind,
 )
-from singularity.observability import TraceEventType, TraceRuntime
+from singularity.observability import TraceEventType, TraceRecorder
 from singularity.kernel import CancellationError
 from singularity.kernel.finalization import FinalReport
 from singularity.kernel.models import RunStatus
-from singularity.planner import PlannerRuntime, TaskStatus
+from singularity.planner import Planner, TaskStatus
 from singularity.workspace_state import WorkspaceHealthReport, WorkspaceHealthStatus
 
 
@@ -50,7 +50,7 @@ def test_workspace_health_summary_lists_state_categories() -> None:
 
 
 def test_create_or_resume_planner_marks_conflicted_workspace_needs_review(tmp_path: Path) -> None:
-    planner = PlannerRuntime(tmp_path, session_id="session_1", task_id="task_1")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Resume task")
     planner.interrupt("pause")
     health = WorkspaceHealthReport(
@@ -127,7 +127,7 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
             recovered_previous_run=False,
             uncertain_transactions=[],
             workspace_lock_status="released",
-            runtime_health_summary={"planner": "ok"},
+            component_health_summary={"planner": "ok"},
             shutdown_summary={"cleanup_status": "completed"},
             recovery_summary={"recovered": False},
             lifecycle_summary={"events": 3},
@@ -218,7 +218,7 @@ def test_cli_run_accepts_project_root(monkeypatch, tmp_path: Path) -> None:
             recovered_previous_run=False,
             uncertain_transactions=[],
             workspace_lock_status="released",
-            runtime_health_summary={"planner": "ok"},
+            component_health_summary={"planner": "ok"},
             shutdown_summary={"cleanup_status": "completed"},
             recovery_summary={"recovered": False},
             lifecycle_summary={"events": 3},
@@ -298,7 +298,7 @@ def test_eval_live_quicksort_uses_kernel_and_independent_smoke(monkeypatch, tmp_
             recovered_previous_run=False,
             uncertain_transactions=[],
             workspace_lock_status="released",
-            runtime_health_summary={"planner": "ok"},
+            component_health_summary={"planner": "ok"},
             shutdown_summary={"cleanup_status": "completed"},
             recovery_summary={"recovered": False},
             lifecycle_summary={"events": 3},
@@ -376,7 +376,7 @@ def test_eval_live_quicksort_accepts_verified_artifact_when_agent_blocks_late(
             recovered_previous_run=False,
             uncertain_transactions=[],
             workspace_lock_status="released",
-            runtime_health_summary={"planner": "ok"},
+            component_health_summary={"planner": "ok"},
             shutdown_summary={"cleanup_status": "completed"},
             recovery_summary={"recovered": False},
             lifecycle_summary={"events": 3},
@@ -638,16 +638,16 @@ def _write_cli_task_set(path: Path) -> None:
 
 
 def _write_cli_trace(root: Path) -> Path:
-    trace = TraceRuntime.create(root, run_id="run_cli", session_id="session_cli")
+    trace = TraceRecorder.create(root, run_id="run_cli", session_id="session_cli")
     trace.emit(
         TraceEventType.MODEL_RESPONSE_RECEIVED,
-        runtime="model",
+        component="model",
         summary="Model response received.",
         payload={"usage": {"input_tokens": 10, "output_tokens": 5, "cost_estimate": 0.01}},
     )
     trace.emit(
         TraceEventType.VERIFICATION_CHECK_COMPLETED,
-        runtime="verification",
+        component="verification",
         summary="check passed",
         payload={"status": "passed"},
     )
@@ -681,7 +681,7 @@ def test_cli_eval_suite_run_writes_report_without_singularity_state(tmp_path: Pa
     assert not (tmp_path / ".singularity").exists()
     payload = json.loads((output_dir / "suite_cli" / "report.json").read_text(encoding="utf-8"))
     assert payload["run_id"] == "suite_cli"
-    assert payload["profile_reports"][0]["task_results"][0]["runtime_overrides"]["model"] == "default"
+    assert payload["profile_reports"][0]["task_results"][0]["agent_config_overrides"]["model"] == "default"
 
 
 def test_cli_eval_trace_replay_outputs_deterministic_hash(tmp_path: Path, monkeypatch) -> None:

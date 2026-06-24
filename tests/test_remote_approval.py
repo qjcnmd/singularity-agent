@@ -11,12 +11,12 @@ from singularity.policy import (
     PolicyConfig,
     PolicyDecision,
     PolicyRequest,
-    PolicyRuntime,
+    PolicyEngine,
     PolicySubject,
     ResourceRef,
-    RuntimeName,
+    PolicyComponent,
 )
-from singularity.policy.remote import RemoteApprovalRuntime
+from singularity.policy.remote import RemoteApprovalExchange
 
 
 def _request(tmp_path: Path) -> PolicyRequest:
@@ -25,10 +25,10 @@ def _request(tmp_path: Path) -> PolicyRequest:
         task_id="task",
         phase_id="phase",
         action_id="action",
-        runtime=RuntimeName.COMMAND,
+        component=PolicyComponent.COMMAND,
         operation=OperationKind.EXECUTE_COMMAND,
         capability=Capability.EXECUTE_COMMAND,
-        subject=PolicySubject(subject_type="runtime", name="CommandRuntime"),
+        subject=PolicySubject(subject_type="component", name="CommandExecutor"),
         resource=ResourceRef(resource_type="command", identifier="python -m pytest tests"),
         reason="run tests",
         workspace_root=str(tmp_path),
@@ -42,7 +42,7 @@ def test_remote_approval_exports_request_and_imports_scoped_grant(tmp_path: Path
         reason="command requires review",
         message="Approve test command?",
     )
-    remote = RemoteApprovalRuntime(tmp_path)
+    remote = RemoteApprovalExchange(tmp_path)
 
     exported = remote.export_request(request, decision)
 
@@ -79,7 +79,7 @@ def test_remote_approval_exports_request_and_imports_scoped_grant(tmp_path: Path
     )
 
     imported = remote.import_grant(grant_path)
-    policy = PolicyRuntime(PolicyConfig(workspace_root=tmp_path))
+    policy = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
     remote.register_grant(grant_path, policy)
 
     assert imported.approved_by == "remote-reviewer"

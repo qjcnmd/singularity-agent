@@ -5,22 +5,22 @@ from typing import Any
 
 from rich.console import Console
 
-from singularity.config import ProductionRuntimeConfig
+from singularity.config import ProductionConfig
 from singularity.interaction import (
     InteractionMode,
-    InteractionRuntime,
+    InteractionController,
     RichCliRenderer,
     RichInteractionProvider,
 )
-from singularity.observability import TraceRuntime
+from singularity.observability import TraceRecorder
 from singularity.policy import ApprovalMode
-from singularity.workspace_state import LocalWorkspaceStateRuntime
+from singularity.workspace_state import WorkspaceStateManager
 
 from singularity.kernel.cancellation import CancellationManager
 from singularity.kernel.exceptions import KernelBootstrapError
 from singularity.kernel.finalization import KernelFinalizer
-from singularity.kernel.graph import RuntimeFactory
-from singularity.kernel.health import RuntimeHealthChecker
+from singularity.kernel.graph import AgentGraphBuilder
+from singularity.kernel.health import ComponentHealthChecker
 from singularity.kernel.lifecycle import RunLifecycleManager
 from singularity.kernel.locks import WorkspaceLockManager
 from singularity.kernel.models import (
@@ -30,7 +30,7 @@ from singularity.kernel.models import (
     ShutdownReason,
 )
 from singularity.kernel.recovery import CrashRecoveryManager
-from singularity.kernel.runtime import AgentKernel
+from singularity.kernel.agent_kernel import AgentKernel
 from singularity.kernel.shutdown import ShutdownSummary
 
 
@@ -39,22 +39,22 @@ class KernelBootstrap:
         self,
         *,
         project_root: Path | str,
-        config: ProductionRuntimeConfig | None = None,
-        trace: TraceRuntime | None = None,
+        config: ProductionConfig | None = None,
+        trace: TraceRecorder | None = None,
         console: Console | None = None,
-        runtime_factory: RuntimeFactory | None = None,
+        component_factory: AgentGraphBuilder | None = None,
         workspace_lock: WorkspaceLockManager | None = None,
     ) -> None:
         self.project_root = Path(project_root).expanduser().resolve(strict=False)
         self.config = config
         self.trace = trace
         self.console = console or Console()
-        self.runtime_factory = runtime_factory or RuntimeFactory()
+        self.component_factory = component_factory or AgentGraphBuilder()
         self.workspace_lock = workspace_lock or WorkspaceLockManager(self.project_root)
 
     def boot(self, user_goal: str) -> AgentKernel:
-        config = self.config or ProductionRuntimeConfig.from_cli(project_root=self.project_root)
-        trace = self.trace or TraceRuntime.create(
+        config = self.config or ProductionConfig.from_cli(project_root=self.project_root)
+        trace = self.trace or TraceRecorder.create(
             self.project_root,
             run_id=config.resume_session,
             session_id=config.resume_session,
@@ -77,7 +77,7 @@ class KernelBootstrap:
             else None
         )
         cancellation = CancellationManager()
-        interaction_runtime = InteractionRuntime(
+        interaction_controller = InteractionController(
             mode=interaction_mode,
             trace=trace,
             provider=provider,
@@ -85,7 +85,7 @@ class KernelBootstrap:
             cancellation_manager=cancellation,
         )
         if hasattr(trace, "set_interaction_sink"):
-            trace.set_interaction_sink(interaction_runtime.consume_trace_event)
+            trace.set_interaction_sink(interaction_controller.consume_trace_event)
         lifecycle = RunLifecycleManager(identity=identity, trace=trace)
         run = lifecycle.create_run(user_goal)
         session = lifecycle.start_session()
@@ -99,8 +99,8 @@ class KernelBootstrap:
         trace.record("kernel.boot.started", {"run_id": identity.run_id, "session_id": identity.session_id})
         trace.emit(
             "context.observation_added",
-            runtime="config",
-            summary="Effective runtime config resolved.",
+            component="config",
+            summary="Effective component config resolved.",
             payload=config.effective_config(),
             ids={"run_id": identity.run_id, "session_id": identity.session_id},
         )
@@ -110,7 +110,7 @@ class KernelBootstrap:
                 read_only=config.approval_mode == ApprovalMode.READ_ONLY,
             )
             context.workspace_lock_status = "acquired"
-            recovery_workspace_state = LocalWorkspaceStateRuntime(self.project_root, trace=trace)
+            recovery_workspace_state = WorkspaceStateManager(self.project_root, trace=trace)
             try:
                 recovery = CrashRecoveryManager(
                     trace=trace,
@@ -120,16 +120,16 @@ class KernelBootstrap:
             finally:
                 recovery_workspace_state.close()
             context.recovered_previous_run = recovery.recovered
-            graph = self.runtime_factory.build(
+            graph = self.component_factory.build(
                 project_root=self.project_root,
                 config=config,
                 trace=trace,
                 identity=identity,
                 user_goal=user_goal,
-                interaction_runtime=interaction_runtime,
+                interaction_controller=interaction_controller,
             )
             context.components = dict(graph.components)
-            health = RuntimeHealthChecker(trace=trace).enforce(graph.components_for_health())
+            health = ComponentHealthChecker(trace=trace).enforce(graph.components_for_health())
             kernel = AgentKernel(
                 context=context,
                 graph=graph,
@@ -173,5 +173,5 @@ class KernelBootstrap:
             ) from exc
 
 
-def build_config_from_cli(**kwargs: Any) -> ProductionRuntimeConfig:
-    return ProductionRuntimeConfig.from_cli(**kwargs)
+def build_config_from_cli(**kwargs: Any) -> ProductionConfig:
+    return ProductionConfig.from_cli(**kwargs)

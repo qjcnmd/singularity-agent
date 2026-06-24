@@ -22,7 +22,7 @@ from singularity.code_index.models import (
     TrustLevel,
 )
 from singularity.code_index.query import ProjectIndexQueryService
-from singularity.code_index.runtime import ProjectIndexRuntime, ProjectIndexRuntimeConfig
+from singularity.code_index.index import ProjectIndex, ProjectIndexConfig
 from singularity.code_index.scanner import ScannerBudget, WorkspaceScanner
 from singularity.code_index.store import ProjectIndexStore
 
@@ -43,8 +43,8 @@ __all__ = [
     "ProjectImpactAnalyzer",
     "ProjectIndexObservation",
     "ProjectIndexQueryService",
-    "ProjectIndexRuntime",
-    "ProjectIndexRuntimeConfig",
+    "ProjectIndex",
+    "ProjectIndexConfig",
     "ProjectIndexStore",
     "ProjectRootRecord",
     "RelevantFileCandidate",

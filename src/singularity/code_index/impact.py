@@ -69,7 +69,7 @@ class ProjectImpactAnalyzer:
             freshness=freshness,
             confidence=0.82 if files else 0.45,
             evidence=[Evidence(source="project_index_impact", description="Impact from direct files, reverse dependencies, symbols, entrypoints, and tests.")],
-            trust_level=TrustLevel.RUNTIME_GENERATED,
+            trust_level=TrustLevel.COMPONENT_GENERATED,
             source="project_index_impact",
         )
 
@@ -105,7 +105,7 @@ class ProjectImpactAnalyzer:
             freshness=analysis.freshness,
             confidence=analysis.confidence,
             evidence=analysis.evidence,
-            trust_level=TrustLevel.RUNTIME_GENERATED,
+            trust_level=TrustLevel.COMPONENT_GENERATED,
             source="project_index_impact",
         )
 

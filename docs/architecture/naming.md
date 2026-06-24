@@ -11,7 +11,7 @@ Singularity is the only active project identity.
 | Primary CLI | `singularity-agent` |
 | Short CLI | `sg` |
 | Environment prefix | `SINGULARITY_` |
-| Project runtime directory | `.singularity/` |
+| Project component directory | `.singularity/` |
 | User config | `~/.config/singularity/` |
 | User data | `~/.local/share/singularity/` |
 | User cache | `~/.cache/singularity/` |
@@ -50,4 +50,4 @@ Secret values must not be logged or copied into generated config files.
 
 ## State Paths
 
-Project-local state uses `.singularity/`. Runtime and release commands use `singularity.json` for generated configuration. JSON schema ids use `https://singularity.local/...`.
+Project-local state uses `.singularity/`. Component and release commands use `singularity.json` for generated configuration. JSON schema ids use `https://singularity.local/...`.

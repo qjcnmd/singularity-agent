@@ -53,7 +53,7 @@ class CancellationReason(str, Enum):
     INTERNAL_ERROR = "internal_error"
 
 
-class RuntimeComponentName(str, Enum):
+class ComponentName(str, Enum):
     CONFIGURATION = "config"
     OBSERVABILITY = "trace"
     INTERACTION = "interaction"
@@ -67,7 +67,7 @@ class RuntimeComponentName(str, Enum):
     EDIT = "edit"
     TOOLS = "tools"
     PLUGINS = "plugins"
-    TOOL_RUNTIME = "tool_runtime"
+    TOOL_EXECUTOR = "tool_executor"
     TOOL_PROTOCOL = "tool_protocol"
     VERIFICATION = "verification"
     REVIEW = "review"
@@ -78,7 +78,7 @@ class RuntimeComponentName(str, Enum):
     PLANNER = "planner"
 
 
-class RuntimeComponentState(str, Enum):
+class ComponentState(str, Enum):
     PENDING = "pending"
     INITIALIZED = "initialized"
     READY = "ready"
@@ -163,7 +163,7 @@ class KernelContext:
     run: AgentRun
     session: AgentSession | None = None
     status: KernelStatus = KernelStatus.NEW
-    components: dict[RuntimeComponentName, RuntimeComponentState] = field(default_factory=dict)
+    components: dict[ComponentName, ComponentState] = field(default_factory=dict)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     workspace_lock_status: str = "not_acquired"
     recovered_previous_run: bool = False

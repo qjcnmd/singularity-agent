@@ -1,6 +1,6 @@
 # State Model
 
-This document defines the durable state vocabulary for current CLI runs and the future Desktop Transition Runtime.
+This document defines the durable state vocabulary for current CLI runs and the future Desktop Transition AgentHost.
 
 ## Identity
 
@@ -10,7 +10,7 @@ Every record that participates in a run should carry the smallest relevant ident
 - `session_id`: resumable local session scope.
 - `task_id`: planner task scope.
 - `phase_id`: planner/model/tool protocol phase.
-- `action_id`: planner action or runtime action.
+- `action_id`: planner action or component action.
 
 Desktop clients must treat these ids as opaque strings.
 
@@ -174,7 +174,7 @@ Contract:
 
 ## Workspace State
 
-Current source: `LocalWorkspaceStateRuntime`, workspace baseline, journal, artifacts.
+Current source: `WorkspaceStateManager`, workspace baseline, journal, artifacts.
 
 States:
 

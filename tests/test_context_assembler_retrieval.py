@@ -7,7 +7,7 @@ from singularity.context.models import (
     ContextLayer,
     ContextReference,
     ContextRenderPolicy,
-    ContextRuntime,
+    ContextSource,
     ContextSensitivity,
 )
 from singularity.context.tokens import TokenCounter
@@ -31,10 +31,10 @@ def item(
         task_id="task_1",
         phase_id=phase_id,
         layer=layer,
-        source_runtime=ContextRuntime.TOOL,
+        source_component=ContextSource.TOOL,
         item_type=item_type,
         content=content,
-        authority=ContextAuthority.RUNTIME,
+        authority=ContextAuthority.COMPONENT,
         sensitivity=sensitivity,
         importance=importance,
         pinned=pinned,
@@ -42,7 +42,7 @@ def item(
     )
 
 
-def test_assembler_prioritizes_pinned_phase_relevant_runtime_evidence() -> None:
+def test_assembler_prioritizes_pinned_phase_relevant_component_evidence() -> None:
     assembler = ContextAssembler(
         token_counter=TokenCounter(model="gpt-4o-mini"),
         model_context_window=180,

@@ -1,0 +1,694 @@
+from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
+
+from singularity.context import ContextManager
+from singularity.model import (
+    ModelMessage,
+    ModelPurpose,
+    ModelCapabilities,
+    ModelRunner,
+    ModelTurnRequest,
+    ModelTurnResult,
+    ModelTurnStatus,
+    ModelToolCall,
+    ModelToolParseStatus,
+    MockModelProvider,
+)
+from singularity.tool_protocol.models import ToolExecutionMode, ToolProtocolTurnStatus
+from singularity.tool_protocol.models import ToolCallFailureKind, ToolCallPhase
+from singularity.tool_protocol.engine import ToolProtocolEngine
+from singularity.tool_protocol.state import ToolProtocolStateStore
+from singularity.tools import ToolExecutionRequest, ToolPolicy, ToolRegistry, ToolResult, ToolExecutor
+from singularity.tools.command import register_command_tools
+from singularity.tools.models import PermissionLevel, ToolExecutionFailure, ToolSideEffectKind, ToolSpec
+from singularity.jsonl_trace import JsonlTraceRecorder
+from tests.tool_executor_helpers import make_test_policy_engine
+from tests.test_tool_executor_policy_approval import SequencedPolicyEngine
+from singularity.policy import DecisionOutcome
+
+
+def _make_request(tmp_path: Path) -> tuple[ModelTurnRequest, ContextManager]:
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    component = ModelRunner.with_mock_provider(
+        MockModelProvider(text="ok"),
+        tool_registry=ToolRegistry(tmp_path),
+    )
+    request = component.build_request_from_context(
+        context,
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="understanding_task",
+        action_id="action_1",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        allowed_tool_names=["read_file"],
+    )
+    return request, context
+
+
+def _make_tool_protocol(
+    tmp_path: Path,
+    *,
+    workspace_state_hook: Any | None = None,
+) -> tuple[ToolProtocolEngine, ToolExecutor]:
+    tool_executor = ToolExecutor(
+        registry=ToolRegistry(tmp_path),
+        policy=ToolPolicy.read_only(),
+        trace=JsonlTraceRecorder.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=ToolRegistry(tmp_path),
+        trace=JsonlTraceRecorder.create(tmp_path),
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+        workspace_state_hook=workspace_state_hook,
+    )
+    return tool_protocol, tool_executor
+
+
+class _EmptyInput(BaseModel):
+    pass
+
+
+class _TraceCollector:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def record(self, event: str, data: dict[str, Any]) -> None:
+        self.events.append((event, data))
+
+
+def _tool_result(call: ModelToolCall, *, response_id: str = "resp_tool") -> ModelTurnResult:
+    return ModelTurnResult(
+        request_id="req_1",
+        response_id=response_id,
+        status=ModelTurnStatus.SUCCESS,
+        assistant_message=ModelMessage.assistant_text(""),
+        tool_calls=[call],
+    )
+
+
+def test_tool_protocol_executes_tool_call_and_appends_tool_message(tmp_path: Path) -> None:
+    readme = tmp_path / "README.md"
+    readme.write_text("Singularity README content", encoding="utf-8")
+    request, context = _make_request(tmp_path)
+    response = ModelTurnResult(
+        request_id=request.request_id,
+        response_id="resp_1",
+        status=ModelTurnStatus.SUCCESS,
+        assistant_message=ModelMessage.assistant_text(""),
+        tool_calls=[
+            ModelToolCall(
+                tool_call_id="call_readme",
+                tool_name="read_file",
+                arguments={"path": "README.md", "max_bytes": 100},
+                raw_arguments='{"path":"README.md","max_bytes":100}',
+                parse_status=ModelToolParseStatus.VALID,
+            )
+        ],
+    )
+    tool_protocol, tool_executor = _make_tool_protocol(tmp_path)
+
+    result = tool_protocol.process_model_turn(
+        request=request,
+        result=response,
+        turn=1,
+        context=context,
+        tool_executor=tool_executor,
+    )
+
+    assert result.status == ToolProtocolTurnStatus.PROCESSED
+    assert result.executed_count == 1
+    assert result.appended_tool_message_count == 1
+    tool_message = context.messages()[-1]
+    assert tool_message["role"] == "tool"
+    payload = json.loads(tool_message["content"])
+    assert payload["tool_call_id"] == "call_readme"
+    assert payload["tool_name"] == "read_file"
+    assert payload["ok"] is True
+    assert "Singularity README content" in payload["content_preview"]
+    assert context.tool_observations[-1].turn == 1
+
+
+def test_tool_protocol_passes_structured_execution_request(tmp_path: Path) -> None:
+    request, context = _make_request(tmp_path)
+    response = ModelTurnResult(
+        request_id=request.request_id,
+        response_id="resp_request",
+        status=ModelTurnStatus.SUCCESS,
+        assistant_message=ModelMessage.assistant_text(""),
+        tool_calls=[
+            ModelToolCall(
+                tool_call_id="call_readme",
+                tool_name="read_file",
+                arguments={"path": "README.md"},
+                raw_arguments='{"path":"README.md"}',
+                parse_status=ModelToolParseStatus.VALID,
+            )
+        ],
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=ToolRegistry(tmp_path),
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+
+    class RequestOnlyExecutor:
+        def __init__(self) -> None:
+            self.requests: list[ToolExecutionRequest] = []
+
+        def execute_tool_call(self, _tool_call: dict[str, Any]) -> ToolResult:
+            raise AssertionError("protocol component should not pass provider dicts to ToolExecutor")
+
+        def execute_request(self, execution_request: ToolExecutionRequest) -> ToolResult:
+            self.requests.append(execution_request)
+            return ToolResult.success(content={"content": "ok"})
+
+    tool_executor = RequestOnlyExecutor()
+
+    result = tool_protocol.process_model_turn(
+        request=request,
+        result=response,
+        turn=1,
+        context=context,
+        tool_executor=tool_executor,  # type: ignore[arg-type]
+    )
+
+    assert result.status == ToolProtocolTurnStatus.PROCESSED
+    assert len(tool_executor.requests) == 1
+    execution_request = tool_executor.requests[0]
+    assert execution_request.tool_call_id == "call_readme"
+    assert execution_request.tool_name == "read_file"
+    assert execution_request.batch_id == result.batch_id
+    assert execution_request.run_id == context.run_id
+    assert execution_request.model_request_id == request.request_id
+    assert execution_request.model_response_id == response.response_id
+    assert execution_request.normalized_arguments["path"] == "README.md"
+    assert execution_request.normalized_arguments["max_bytes"] == 20000
+    assert execution_request.argument_digest
+
+
+def test_tool_protocol_executes_parallel_read_only_group_concurrently(tmp_path: Path) -> None:
+    barrier = threading.Barrier(2, timeout=3)
+    calls_started: list[str] = []
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+
+    def make_handler(name: str):
+        def handler(_args: _EmptyInput) -> dict[str, str]:
+            calls_started.append(name)
+            barrier.wait()
+            return {"tool": name}
+
+        return handler
+
+    for name in ("read_one", "read_two"):
+        registry.register(
+            ToolSpec(
+                name=name,
+                description=name,
+                input_model=_EmptyInput,
+                handler=make_handler(name),
+                permission_level=PermissionLevel.READ_ONLY,
+                side_effects=ToolSideEffectKind.READ_WORKSPACE,
+                idempotent=True,
+            )
+        )
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_executor = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    model_result = ModelTurnResult(
+        request_id="req_parallel",
+        response_id="resp_parallel",
+        status=ModelTurnStatus.SUCCESS,
+        assistant_message=ModelMessage.assistant_text(""),
+        tool_calls=[
+            ModelToolCall(
+                tool_call_id="call_read_one",
+                tool_name="read_one",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            ),
+            ModelToolCall(
+                tool_call_id="call_read_two",
+                tool_name="read_two",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            ),
+        ],
+        metadata={
+            "provider_capabilities": ModelCapabilities(
+                supports_parallel_tool_calls=True
+            ).to_dict()
+        },
+    )
+
+    result = tool_protocol.handle_model_turn_result(
+        model_result,
+        context=context,
+        tool_executor=tool_executor,
+        planner=None,
+        policy_engine=None,
+    )
+
+    assert result.status == ToolProtocolTurnStatus.PROCESSED
+    assert result.executed_count == 2
+    assert result.failed_count == 0
+    assert result.appended_tool_message_count == 2
+    assert result.metadata["execution_mode"] == ToolExecutionMode.PARALLEL_READONLY.value
+    assert sorted(calls_started) == ["read_one", "read_two"]
+    tool_payloads = [
+        json.loads(message["content"])
+        for message in context.messages()
+        if message["role"] == "tool"
+    ]
+    assert [payload["tool_call_id"] for payload in tool_payloads] == [
+        "call_read_one",
+        "call_read_two",
+    ]
+
+
+def test_tool_protocol_creates_synthetic_result_for_rejected_call(tmp_path: Path) -> None:
+    request, context = _make_request(tmp_path)
+    response = ModelTurnResult(
+        request_id=request.request_id,
+        response_id="resp_2",
+        status=ModelTurnStatus.SUCCESS,
+        assistant_message=ModelMessage.assistant_text(""),
+        tool_calls=[
+            ModelToolCall(
+                tool_call_id="call_missing",
+                tool_name="missing_tool",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.UNKNOWN_TOOL,
+                validation_errors=["unknown_tool"],
+            )
+        ],
+    )
+    tool_protocol, tool_executor = _make_tool_protocol(tmp_path)
+
+    result = tool_protocol.process_model_turn(
+        request=request,
+        result=response,
+        turn=1,
+        context=context,
+        tool_executor=tool_executor,
+    )
+
+    assert result.status == ToolProtocolTurnStatus.REJECTED
+    assert result.rejected_count == 1
+    tool_message = context.messages()[-1]
+    payload = json.loads(tool_message["content"])
+    assert payload["tool_call_id"] == "call_missing"
+    assert payload["tool_name"] == "missing_tool"
+    assert payload["ok"] is False
+    assert payload["status"] == "rejected"
+    assert payload["error_code"] == "unknown_tool"
+
+
+def test_tool_protocol_invokes_workspace_state_hook(tmp_path: Path) -> None:
+    request, context = _make_request(tmp_path)
+    response = ModelTurnResult(
+        request_id=request.request_id,
+        response_id="resp_3",
+        status=ModelTurnStatus.SUCCESS,
+        assistant_message=ModelMessage.assistant_text(""),
+        tool_calls=[
+            ModelToolCall(
+                tool_call_id="call_readme",
+                tool_name="read_file",
+                arguments={"path": "README.md"},
+                raw_arguments='{"path":"README.md"}',
+                parse_status=ModelToolParseStatus.VALID,
+            )
+        ],
+    )
+    hook_calls: list[tuple[str, int]] = []
+
+    def workspace_state_hook(hook_context: ContextManager, *, batch: Any, tool_call_id: str | None) -> None:
+        hook_calls.append((str(batch.batch_id), 7))
+        _ = tool_call_id
+        hook_context.add_workspace_state({"workspace_state": {"status": "clean"}})
+
+    tool_protocol, tool_executor = _make_tool_protocol(
+        tmp_path,
+        workspace_state_hook=workspace_state_hook,
+    )
+
+    result = tool_protocol.process_model_turn(
+        request=request,
+        result=response,
+        turn=7,
+        context=context,
+        tool_executor=tool_executor,
+    )
+
+    assert result.status == ToolProtocolTurnStatus.PROCESSED
+    assert len(hook_calls) == 1
+    tool_messages = [message for message in context.messages() if message["role"] == "tool"]
+    assert len(tool_messages) == 1
+    assert any(
+        message["role"] == "system" and "workspace_state" in str(message.get("content"))
+        for message in context.messages()
+    )
+
+
+def test_tool_protocol_appends_tool_message_when_tool_executor_fails(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="explode",
+            description="explode",
+            input_model=_EmptyInput,
+            handler=lambda _args: (_ for _ in ()).throw(
+                ToolExecutionFailure("API_KEY=super-secret", code="boom")
+            ),
+        )
+    )
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_executor = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=JsonlTraceRecorder.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=JsonlTraceRecorder.create(tmp_path),
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+
+    result = tool_protocol.handle_model_turn_result(
+        _tool_result(
+            ModelToolCall(
+                tool_call_id="call_explode",
+                tool_name="explode",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            )
+        ),
+        context=context,
+        tool_executor=tool_executor,
+        planner=None,
+        policy_engine=None,
+    )
+
+    assert result.failed_count == 1
+    assert result.appended_tool_message_count == 1
+    tool_message = [message for message in context.messages() if message["role"] == "tool"][-1]
+    payload = json.loads(tool_message["content"])
+    assert payload["tool_call_id"] == "call_explode"
+    assert payload["ok"] is False
+    assert payload["error_code"] == "boom"
+    assert "super-secret" not in tool_message["content"]
+
+
+def test_tool_protocol_marks_pending_approval_next_action(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="review_tool",
+            description="requires review",
+            input_model=_EmptyInput,
+            handler=lambda _args: {"ok": True},
+        )
+    )
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_executor = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.coding_agent(),
+        trace=JsonlTraceRecorder.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_engine=SequencedPolicyEngine([DecisionOutcome.REQUIRE_REVIEW]),
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=JsonlTraceRecorder.create(tmp_path),
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    component = ModelRunner.with_mock_provider(
+        MockModelProvider(text="ok"),
+        tool_registry=registry,
+    )
+    request = component.build_request_from_context(
+        context,
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        action_id="action_1",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        allowed_tool_names=["review_tool"],
+    )
+
+    result = tool_protocol.process_model_turn(
+        request=request,
+        result=_tool_result(
+            ModelToolCall(
+                tool_call_id="call_review",
+                tool_name="review_tool",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            )
+        ),
+        turn=1,
+        context=context,
+        tool_executor=tool_executor,
+    )
+
+    assert result.status == ToolProtocolTurnStatus.PENDING_APPROVAL
+    assert result.next_action == "pending_approval"
+
+
+def test_tool_protocol_marks_existing_context_tool_message_as_appended(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    call = ModelToolCall(
+        tool_call_id="call_readme",
+        tool_name="read_file",
+        arguments={"path": "README.md"},
+        raw_arguments='{"path":"README.md"}',
+        parse_status=ModelToolParseStatus.VALID,
+    )
+    model_result = _tool_result(call)
+    assistant_message = tool_protocol._assistant_message_from_model_result(model_result)
+    validation = tool_protocol.validate_batch(
+        model_result,
+        context=context,
+        assistant_message=assistant_message,
+    )
+    batch = tool_protocol.state_store.save_batch(validation.batch)
+    record = tool_protocol.state_store.upsert_record(
+        batch.tool_calls[0],
+        phase=ToolCallPhase.SUCCEEDED,
+    )
+    result = tool_protocol._synthetic_result(
+        batch.tool_calls[0],
+        error_kind=ToolCallFailureKind.replay_detected,
+        message="already appended",
+        error_code="replay_detected",
+    )
+    tool_protocol.state_store.bind_result(record.record_id, result=result)
+    context.add_tool_protocol_result(result)
+
+    observation_id = tool_protocol.append_results_to_context(
+        context,
+        envelope=batch.tool_calls[0],
+        result=result,
+    )
+
+    binding = tool_protocol.state_store.result_binding(record.record_id)
+    assert observation_id is None
+    assert binding is not None
+    assert binding.appended is True
+
+
+def test_tool_protocol_blocks_side_effect_replay_without_calling_handler(tmp_path: Path) -> None:
+    calls = []
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="write_file",
+            description="write",
+            input_model=_EmptyInput,
+            handler=lambda _args: calls.append("called") or {"ok": True},
+            permission_level=PermissionLevel.READ_ONLY,
+            side_effects=ToolSideEffectKind.EXECUTE_COMMAND,
+            idempotent=False,
+        )
+    )
+    context = ContextManager(system_prompt="system", user_goal="mutate")
+    tool_executor = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.coding_agent(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_engine=SequencedPolicyEngine([DecisionOutcome.ALLOW]),  # type: ignore[arg-type]
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    first_call = ModelToolCall(
+        tool_call_id="call_write",
+        tool_name="write_file",
+        arguments={},
+        raw_arguments="{}",
+        parse_status=ModelToolParseStatus.VALID,
+    )
+
+    first = tool_protocol.handle_model_turn_result(
+        _tool_result(first_call, response_id="resp_write_1"),
+        context=context,
+        tool_executor=tool_executor,
+        planner=None,
+        policy_engine=None,
+    )
+    calls.clear()
+    replay = tool_protocol.handle_model_turn_result(
+        _tool_result(first_call, response_id="resp_write_2"),
+        context=context,
+        tool_executor=tool_executor,
+        planner=None,
+        policy_engine=None,
+    )
+
+    assert first.executed_count == 1
+    assert replay.rejected_count == 1
+    assert calls == []
+    tool_payload = json.loads([message for message in context.messages() if message["role"] == "tool"][-1]["content"])
+    assert tool_payload["error_code"] == "side_effect_replay"
+
+
+def test_tool_protocol_appends_policy_and_sandbox_results_to_context(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+    register_command_tools(registry)
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_executor = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.coding_agent(),
+        trace=JsonlTraceRecorder.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=JsonlTraceRecorder.create(tmp_path),
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+
+    for response in [
+        _tool_result(
+            ModelToolCall(
+                tool_call_id="call_policy",
+                tool_name="run_command",
+                arguments={"argv": ["python", "-V"]},
+                raw_arguments='{"argv":["python","-V"]}',
+                parse_status=ModelToolParseStatus.VALID,
+            ),
+            response_id="resp_policy",
+        ),
+        _tool_result(
+            ModelToolCall(
+                tool_call_id="call_sandbox",
+                tool_name="start_process",
+                arguments={"argv": ["python", "-m", "http.server"]},
+                raw_arguments='{"argv":["python","-m","http.server"]}',
+                parse_status=ModelToolParseStatus.VALID,
+            ),
+            response_id="resp_sandbox",
+        ),
+    ]:
+        tool_protocol.handle_model_turn_result(
+            response,
+            context=context,
+            tool_executor=tool_executor,
+            planner=None,
+            policy_engine=None,
+        )
+
+    tool_payloads = [
+        json.loads(message["content"])
+        for message in context.messages()
+        if message["role"] == "tool"
+    ]
+    error_codes = {payload["tool_call_id"]: payload["error_code"] for payload in tool_payloads}
+    assert error_codes["call_policy"] == "policy_denied"
+    assert error_codes["call_sandbox"] in {"sandbox_required", "policy_denied"}
+
+
+def test_tool_protocol_traces_only_digests_not_raw_payloads(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("API_KEY=super-secret-value", encoding="utf-8")
+    request, context = _make_request(tmp_path)
+    trace = _TraceCollector()
+    tool_executor = ToolExecutor(
+        registry=ToolRegistry(tmp_path),
+        policy=ToolPolicy.read_only(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=ToolRegistry(tmp_path),
+        trace=trace,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+
+    tool_protocol.process_model_turn(
+        request=request,
+        result=ModelTurnResult(
+            request_id=request.request_id,
+            response_id="resp_trace",
+            status=ModelTurnStatus.SUCCESS,
+            assistant_message=ModelMessage.assistant_text(""),
+            tool_calls=[
+                ModelToolCall(
+                    tool_call_id="call_read_secret",
+                    tool_name="read_file",
+                    arguments={"path": "README.md"},
+                    raw_arguments='{"path":"README.md"}',
+                    parse_status=ModelToolParseStatus.VALID,
+                )
+            ],
+        ),
+        turn=1,
+        context=context,
+        tool_executor=tool_executor,
+    )
+
+    serialized = json.dumps(trace.events, ensure_ascii=False, default=str)
+    event_names = {event for event, _payload in trace.events}
+    assert "tool_protocol.call_validated" in event_names
+    assert "tool_protocol.call_scheduled" in event_names
+    assert "tool_protocol.result_bound" in event_names
+    assert "super-secret-value" not in serialized
+    assert "raw_result" not in serialized
+    assert "raw_arguments" not in serialized

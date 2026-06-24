@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from rich.console import Console
 
-from singularity.config import ProductionRuntimeConfig, adaptive_default_max_turns
+from singularity.config import ProductionConfig, adaptive_default_max_turns
 from singularity.evaluation.models import (
     BenchmarkAdapterKind,
     BenchmarkTask,
@@ -370,7 +370,7 @@ class LiveAgentEvalRunner:
             before_text_snapshot = _read_text_files(workspace)
             shutil.copytree(workspace, baseline_workspace, ignore=_copy_ignore)
             goal = _task_goal(task)
-            config = ProductionRuntimeConfig.from_cli(
+            config = ProductionConfig.from_cli(
                 project_root=workspace,
                 max_turns=self.max_turns or adaptive_default_max_turns(task.user_task),
                 model=self.model,

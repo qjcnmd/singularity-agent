@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from singularity.interaction import DecisionPrompt, InteractionRuntime
+from singularity.interaction import DecisionPrompt, InteractionController
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.policy.audit import redact_resource_identifier
 from singularity.policy.config import ApprovalMode, PolicyConfig
@@ -29,7 +29,7 @@ class ApprovalGate:
         config: PolicyConfig,
         *,
         trace: Any | None = None,
-        interaction: InteractionRuntime | None = None,
+        interaction: InteractionController | None = None,
     ) -> None:
         self.config = config
         self.trace = trace
@@ -69,7 +69,7 @@ class ApprovalGate:
                 summary=(
                     "Review required but approval mode is non_interactive."
                     if self.config.approval_mode == ApprovalMode.NON_INTERACTIVE
-                    else "Review required but no interaction runtime is configured."
+                    else "Review required but no InteractionController is configured."
                 ),
                 severity=TraceSeverity.WARNING,
             )
@@ -88,7 +88,7 @@ class ApprovalGate:
                 session_id=request.session_id,
                 scope=requirement.scope if requirement else approval_scope_for_request(request),
                 single_use=True,
-                reason=user_decision.reason or "approved once via interaction runtime",
+                reason=user_decision.reason or "approved once via InteractionController",
             )
             self._emit(
                 TraceEventType.APPROVAL_GRANTED,
@@ -112,7 +112,7 @@ class ApprovalGate:
                 TraceEventType.APPROVAL_DENIED,
                 request,
                 decision,
-                summary="Review required but interaction runtime failed closed.",
+                summary="Review required but InteractionController failed closed.",
                 severity=TraceSeverity.WARNING,
             )
             raise ApprovalRequired(decision.reason)
@@ -183,7 +183,7 @@ class ApprovalGate:
             return
         self.trace.emit(
             event_type,
-            runtime="approval",
+            component="approval",
             summary=summary,
             payload={
                 "request_id": request.request_id,

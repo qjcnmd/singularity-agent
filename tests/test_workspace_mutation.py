@@ -4,23 +4,23 @@ from pathlib import Path
 import pytest
 
 from singularity.context import ContextManager
-from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolRuntime, ToolSpec
+from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolExecutor, ToolSpec
 from singularity.policy import DecisionOutcome, OperationKind
 from singularity.tools.models import ToolExecutionBackendKind, ToolResult
-from singularity.trace import TraceWriter
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.workspace import (
     CreateFile,
     MutationError,
-    MutationRuntime,
+    WorkspaceMutationManager,
     ReplaceText,
     RollbackManager,
     WorkspacePathResolver,
     WorkspacePolicy,
 )
-from tests.tool_runtime_helpers import runtime_default_policy_runtime
+from tests.tool_executor_helpers import default_policy_engine
 from singularity.tools.mutation import register_mutation_tools
-from tests.test_tool_runtime_policy_approval import SequencedPolicyRuntime
-from singularity.workspace_state import LocalWorkspaceStateRuntime, WorkspaceHealthStatus
+from tests.test_tool_executor_policy_approval import SequencedPolicyEngine
+from singularity.workspace_state import WorkspaceStateManager, WorkspaceHealthStatus
 
 
 def tool_call(name: str, arguments: dict, *, tool_call_id: str = "call_1") -> dict:
@@ -57,14 +57,14 @@ def test_symlink_escape_is_rejected(tmp_path: Path) -> None:
 
 
 def test_policy_denies_secret_and_git_internal_paths(tmp_path: Path) -> None:
-    runtime = MutationRuntime(tmp_path)
+    component = WorkspaceMutationManager(tmp_path)
 
-    env_result = runtime.apply_operations(
+    env_result = component.apply_operations(
         [CreateFile(path=".env", content="TOKEN=value\n")],
         intent="create secret",
         created_by="test",
     )
-    git_result = runtime.apply_operations(
+    git_result = component.apply_operations(
         [CreateFile(path=".git/config", content="[core]\n")],
         intent="touch git",
         created_by="test",
@@ -78,9 +78,9 @@ def test_policy_denies_secret_and_git_internal_paths(tmp_path: Path) -> None:
 
 
 def test_policy_denies_singularity_state_dir(tmp_path: Path) -> None:
-    runtime = MutationRuntime(tmp_path)
+    component = WorkspaceMutationManager(tmp_path)
 
-    result = runtime.apply_operations(
+    result = component.apply_operations(
         [
             CreateFile(
                 path=".singularity/sessions/x/tamper.json",
@@ -100,10 +100,10 @@ def test_replace_text_generates_changeset_diff_apply_and_trace(tmp_path: Path) -
     source = tmp_path / "src" / "app.py"
     source.parent.mkdir()
     source.write_text("print('old')\n", encoding="utf-8")
-    trace = TraceWriter.create(tmp_path)
-    runtime = MutationRuntime(tmp_path, trace=trace)
+    trace = JsonlTraceRecorder.create(tmp_path)
+    component = WorkspaceMutationManager(tmp_path, trace=trace)
 
-    result = runtime.apply_operations(
+    result = component.apply_operations(
         [ReplaceText(path="src/app.py", old_text="old", new_text="new")],
         intent="rename output",
         created_by="test",
@@ -138,11 +138,11 @@ def test_snapshot_hash_mismatch_rejects_write(tmp_path: Path) -> None:
     source = tmp_path / "src" / "app.py"
     source.parent.mkdir()
     source.write_text("alpha\n", encoding="utf-8")
-    runtime = MutationRuntime(tmp_path)
-    snapshot = runtime.index.snapshot_file("src/app.py")
+    component = WorkspaceMutationManager(tmp_path)
+    snapshot = component.index.snapshot_file("src/app.py")
     source.write_text("changed by user\n", encoding="utf-8")
 
-    result = runtime.apply_operations(
+    result = component.apply_operations(
         [
             ReplaceText(
                 path="src/app.py",
@@ -167,9 +167,9 @@ def test_transaction_rolls_back_already_written_files_on_later_failure(
     second = tmp_path / "b.txt"
     first.write_text("one\n", encoding="utf-8")
     second.write_text("two\n", encoding="utf-8")
-    runtime = MutationRuntime(tmp_path)
+    component = WorkspaceMutationManager(tmp_path)
     calls = 0
-    original_atomic_write = runtime.atomic_writer.write_text
+    original_atomic_write = component.atomic_writer.write_text
 
     def fail_second_write(path: Path, text: str, *, snapshot):
         nonlocal calls
@@ -178,9 +178,9 @@ def test_transaction_rolls_back_already_written_files_on_later_failure(
             raise MutationError("atomic_write_failed", "simulated write failure")
         return original_atomic_write(path, text, snapshot=snapshot)
 
-    monkeypatch.setattr(runtime.atomic_writer, "write_text", fail_second_write)
+    monkeypatch.setattr(component.atomic_writer, "write_text", fail_second_write)
 
-    result = runtime.apply_operations(
+    result = component.apply_operations(
         [
             ReplaceText(path="a.txt", old_text="one", new_text="ONE"),
             ReplaceText(path="b.txt", old_text="two", new_text="TWO"),
@@ -198,8 +198,8 @@ def test_transaction_rolls_back_already_written_files_on_later_failure(
 def test_rollback_conflict_when_user_changes_file_after_transaction(tmp_path: Path) -> None:
     source = tmp_path / "app.py"
     source.write_text("old\n", encoding="utf-8")
-    runtime = MutationRuntime(tmp_path)
-    result = runtime.apply_operations(
+    component = WorkspaceMutationManager(tmp_path)
+    result = component.apply_operations(
         [ReplaceText(path="app.py", old_text="old", new_text="new")],
         intent="update app",
         created_by="test",
@@ -207,7 +207,7 @@ def test_rollback_conflict_when_user_changes_file_after_transaction(tmp_path: Pa
     assert result.ok is True
     source.write_text("user edit\n", encoding="utf-8")
 
-    rollback = RollbackManager(runtime).rollback(result.transaction_id)
+    rollback = RollbackManager(component).rollback(result.transaction_id)
 
     assert rollback.ok is False
     assert rollback.error_code == "rollback_conflict"
@@ -217,9 +217,9 @@ def test_rollback_conflict_when_user_changes_file_after_transaction(tmp_path: Pa
 def test_large_diff_is_truncated_and_saved_as_artifact(tmp_path: Path) -> None:
     source = tmp_path / "large.txt"
     source.write_text("".join(f"old {index}\n" for index in range(80)), encoding="utf-8")
-    runtime = MutationRuntime(tmp_path, diff_context_lines=1, max_inline_diff_lines=20)
+    component = WorkspaceMutationManager(tmp_path, diff_context_lines=1, max_inline_diff_lines=20)
 
-    result = runtime.apply_operations(
+    result = component.apply_operations(
         [
             ReplaceText(
                 path="large.txt",
@@ -243,9 +243,9 @@ def test_policy_require_review_is_expressed_for_project_config(tmp_path: Path) -
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text("[project]\nname = 'x'\n", encoding="utf-8")
     policy = WorkspacePolicy()
-    runtime = MutationRuntime(tmp_path, policy=policy)
+    component = WorkspaceMutationManager(tmp_path, policy=policy)
 
-    preview = runtime.preview_operations(
+    preview = component.preview_operations(
         [ReplaceText(path="pyproject.toml", old_text="x", new_text="y")],
         intent="change package metadata",
         created_by="test",
@@ -260,8 +260,8 @@ def test_policy_require_review_is_expressed_for_project_config(tmp_path: Path) -
 def test_mutation_observation_can_be_added_to_context_manager(tmp_path: Path) -> None:
     source = tmp_path / "app.py"
     source.write_text("old\n", encoding="utf-8")
-    runtime = MutationRuntime(tmp_path)
-    result = runtime.apply_operations(
+    component = WorkspaceMutationManager(tmp_path)
+    result = component.apply_operations(
         [ReplaceText(path="app.py", old_text="old", new_text="new")],
         intent="update app",
         created_by="test",
@@ -279,7 +279,7 @@ def test_mutation_observation_can_be_added_to_context_manager(tmp_path: Path) ->
     assert "app.py" in observation.preview
 
 
-def test_tool_runtime_rejects_write_tool_that_does_not_use_mutation_runtime(
+def test_tool_executor_rejects_write_tool_that_does_not_use_mutation_manager(
     tmp_path: Path,
 ) -> None:
     from pydantic import BaseModel
@@ -298,7 +298,7 @@ def test_tool_runtime_rejects_write_tool_that_does_not_use_mutation_runtime(
         return {"status": "wrote"}
 
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    with pytest.raises(ValueError, match="mutation runtime"):
+    with pytest.raises(ValueError, match="mutation manager"):
         registry.register(
             ToolSpec(
                 name="raw_write",
@@ -313,12 +313,12 @@ def test_tool_runtime_rejects_write_tool_that_does_not_use_mutation_runtime(
     assert not (tmp_path / "unsafe.txt").exists()
 
 
-def test_registered_mutation_tool_applies_through_runtime(tmp_path: Path) -> None:
+def test_registered_mutation_tool_applies_through_tool_executor(tmp_path: Path) -> None:
     source = tmp_path / "app.py"
     source.write_text("old\n", encoding="utf-8")
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    register_mutation_tools(registry, MutationRuntime(tmp_path))
-    runtime = ToolRuntime(
+    register_mutation_tools(registry, WorkspaceMutationManager(tmp_path))
+    component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy(
             allowed_permissions=frozenset({PermissionLevel.READ_ONLY, PermissionLevel.WRITE}),
@@ -326,10 +326,10 @@ def test_registered_mutation_tool_applies_through_runtime(tmp_path: Path) -> Non
         ),
         trace=None,
         workspace_root=tmp_path,
-        policy_runtime=runtime_default_policy_runtime(tmp_path),
+        policy_engine=default_policy_engine(tmp_path),
     )
 
-    result = runtime.execute_tool_call(
+    result = component.execute_tool_call(
         tool_call(
             "workspace_replace_text",
             {
@@ -347,21 +347,21 @@ def test_registered_mutation_tool_applies_through_runtime(tmp_path: Path) -> Non
 
 
 def test_workspace_create_file_tool_keeps_policy_mutation_and_state_path(tmp_path: Path) -> None:
-    trace = TraceWriter.create(tmp_path)
-    state = LocalWorkspaceStateRuntime(tmp_path, trace=trace)
+    trace = JsonlTraceRecorder.create(tmp_path)
+    state = WorkspaceStateManager(tmp_path, trace=trace)
     state.begin_session(task_id="task_1", session_id="session_1")
-    policy = SequencedPolicyRuntime([DecisionOutcome.ALLOW, DecisionOutcome.ALLOW])
+    policy = SequencedPolicyEngine([DecisionOutcome.ALLOW, DecisionOutcome.ALLOW])
     registry = ToolRegistry(tmp_path, include_default_tools=False)
     register_mutation_tools(
         registry,
-        MutationRuntime(
+        WorkspaceMutationManager(
             tmp_path,
             trace=trace,
-            state_runtime=state,
-            policy_runtime=policy,  # type: ignore[arg-type]
+            workspace_state_manager=state,
+            policy_engine=policy,  # type: ignore[arg-type]
         ),
     )
-    runtime = ToolRuntime(
+    component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy(
             allowed_permissions=frozenset({PermissionLevel.READ_ONLY, PermissionLevel.WRITE}),
@@ -369,10 +369,10 @@ def test_workspace_create_file_tool_keeps_policy_mutation_and_state_path(tmp_pat
         ),
         trace=trace,
         workspace_root=tmp_path,
-        policy_runtime=policy,  # type: ignore[arg-type]
+        policy_engine=policy,  # type: ignore[arg-type]
     )
 
-    result = runtime.execute_tool_call(
+    result = component.execute_tool_call(
         tool_call(
             "workspace_create_file",
             {
@@ -385,7 +385,7 @@ def test_workspace_create_file_tool_keeps_policy_mutation_and_state_path(tmp_pat
 
     assert result.ok is True
     assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "hello\n"
-    assert result.metadata["backend"] == ToolExecutionBackendKind.DELEGATED_MUTATION_RUNTIME.value
+    assert result.metadata["backend"] == ToolExecutionBackendKind.DELEGATED_MUTATION_MANAGER.value
     assert any(request.operation == OperationKind.CREATE_FILE for request in policy.requests)
     health = state.get_workspace_health()
     assert health.status == WorkspaceHealthStatus.DIRTY

@@ -101,7 +101,7 @@ class InstructionHierarchy:
         ):
             return InstructionConflict(
                 conflict_id=_new_id("conflict"),
-                higher_source_id="policy_runtime",
+                higher_source_id="policy_engine",
                 lower_source_id=source.source_id,
                 description="Model-generated content attempted to authorize itself.",
                 resolution="Model-generated text cannot grant approval or policy authority.",

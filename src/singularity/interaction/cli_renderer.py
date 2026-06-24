@@ -13,7 +13,7 @@ from singularity.interaction.models import (
     ClarificationRequest,
     DecisionPrompt,
     FinalReport,
-    RuntimeEvent,
+    InteractionEvent,
     UserDecision,
 )
 
@@ -23,10 +23,10 @@ class RichCliRenderer:
         self.console = console or Console()
         self.current_phase: str | None = None
 
-    def __call__(self, event: RuntimeEvent) -> None:
+    def __call__(self, event: InteractionEvent) -> None:
         self.handle(event)
 
-    def handle(self, event: RuntimeEvent) -> None:
+    def handle(self, event: InteractionEvent) -> None:
         event_type = event.event_type
         if event_type.startswith("progress."):
             self._render_progress(event)
@@ -72,20 +72,20 @@ class RichCliRenderer:
             )
         )
 
-    def _render_progress(self, event: RuntimeEvent) -> None:
+    def _render_progress(self, event: InteractionEvent) -> None:
         payload = event.payload
-        phase = str(payload.get("phase") or event.phase_id or "runtime")
+        phase = str(payload.get("phase") or event.phase_id or "component")
         current = payload.get("current")
         total = payload.get("total")
         suffix = f" {current}/{total}" if current is not None and total is not None else ""
         self.console.print(f"[cyan]{phase}[/cyan] {event.summary}{suffix}")
 
-    def _render_phase(self, event: RuntimeEvent) -> None:
+    def _render_phase(self, event: InteractionEvent) -> None:
         self.current_phase = event.phase_id or str(event.payload.get("phase") or "")
         style = "cyan" if event.event_type.endswith("started") else "green"
         self.console.print(f"[{style}]phase[/] {event.summary}")
 
-    def _render_plan(self, event: RuntimeEvent) -> None:
+    def _render_plan(self, event: InteractionEvent) -> None:
         payload = event.payload
         table = Table(title="plan", show_header=False)
         table.add_column("key", style="cyan")
@@ -101,17 +101,17 @@ class RichCliRenderer:
         else:
             self.console.print(f"[cyan]plan[/cyan] {event.summary}")
 
-    def _render_tool(self, event: RuntimeEvent) -> None:
+    def _render_tool(self, event: InteractionEvent) -> None:
         tool = event.payload.get("tool_name") or event.payload.get("name") or "<unknown>"
         style = "red" if event.event_type.endswith("failed") else "cyan"
         self.console.print(f"[{style}]tool[/] {tool}: {event.summary}")
 
-    def _render_patch(self, event: RuntimeEvent) -> None:
+    def _render_patch(self, event: InteractionEvent) -> None:
         payload = event.payload
         summary = payload.get("diff_summary") or payload.get("summary") or event.summary
         self.console.print(Panel(str(summary), title="patch summary", border_style="cyan"))
 
-    def _render_policy(self, event: RuntimeEvent) -> None:
+    def _render_policy(self, event: InteractionEvent) -> None:
         payload = event.payload
         risk = payload.get("risk_level") or payload.get("risk")
         outcome = payload.get("outcome")
@@ -125,7 +125,7 @@ class RichCliRenderer:
             lines.append(f"resource: {resource}")
         self.console.print(Panel("\n".join(lines), title="policy risk", border_style="yellow"))
 
-    def _render_decision_prompt(self, event: RuntimeEvent) -> None:
+    def _render_decision_prompt(self, event: InteractionEvent) -> None:
         prompt = ((event.payload or {}).get("prompt") or {})
         title = prompt.get("title") or "approval request"
         message = prompt.get("message") or event.summary
@@ -133,7 +133,7 @@ class RichCliRenderer:
         suffix = f"\nchoices: {choices}" if choices else ""
         self.console.print(Panel(f"{message}{suffix}", title=title, border_style="yellow"))
 
-    def _render_verification(self, event: RuntimeEvent) -> None:
+    def _render_verification(self, event: InteractionEvent) -> None:
         payload = event.payload
         status = payload.get("status") or payload.get("semantic_status") or event.event_type
         self.console.print(
@@ -144,14 +144,14 @@ class RichCliRenderer:
             )
         )
 
-    def _render_review(self, event: RuntimeEvent) -> None:
+    def _render_review(self, event: InteractionEvent) -> None:
         self.console.print(Panel(event.summary, title="review finding", border_style="yellow"))
 
-    def _render_rollback(self, event: RuntimeEvent) -> None:
+    def _render_rollback(self, event: InteractionEvent) -> None:
         reason = event.payload.get("reason") or event.summary
         self.console.print(Panel(str(reason), title="rollback reason", border_style="yellow"))
 
-    def _render_final_report_event(self, event: RuntimeEvent) -> None:
+    def _render_final_report_event(self, event: InteractionEvent) -> None:
         payload = (event.payload or {}).get("final_report")
         if isinstance(payload, dict) and payload.get("outcome"):
             self.render_final_report(FinalReport.from_dict(payload))
@@ -184,7 +184,7 @@ class RichInteractionProvider:
     def request_decision(self, prompt: DecisionPrompt) -> UserDecision:
         renderer = RichCliRenderer(self.console)
         renderer.handle(
-            RuntimeEvent(
+            InteractionEvent(
                 event_type="decision.prompted",
                 summary=prompt.message,
                 payload={"prompt": prompt.to_dict()},

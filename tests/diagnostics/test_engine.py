@@ -9,11 +9,11 @@ from singularity.diagnostics import (
     DiagnosticSeverity,
     DoctorEngine,
 )
-from singularity.release.paths import resolve_runtime_paths
+from singularity.release.paths import resolve_user_data_paths
 
 
 def test_doctor_engine_filters_and_converts_crashing_check_to_finding(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
+    paths = resolve_user_data_paths(home=tmp_path / "component")
 
     def ok_check(context: DiagnosticContext) -> DiagnosticFinding:
         return DiagnosticFinding(
@@ -59,7 +59,7 @@ def test_doctor_engine_filters_and_converts_crashing_check_to_finding(tmp_path):
 
 
 def test_diagnostic_result_json_shape_is_stable(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
+    paths = resolve_user_data_paths(home=tmp_path / "component")
     result = DoctorEngine.default().run(paths=paths, project_root=tmp_path, check_id="environment.python")
 
     payload = json.loads(result.to_json())
@@ -76,7 +76,7 @@ def test_diagnostic_result_json_shape_is_stable(tmp_path):
 
 
 def test_doctor_engine_reports_unknown_check_as_error(tmp_path):
-    paths = resolve_runtime_paths(home=tmp_path / "runtime")
+    paths = resolve_user_data_paths(home=tmp_path / "component")
 
     result = DoctorEngine.default().run(paths=paths, project_root=tmp_path, check_id="missing.check")
 

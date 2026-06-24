@@ -39,8 +39,8 @@ from singularity.sandbox.models import (
     SandboxViolation,
     default_sandbox_profile,
 )
-from singularity.sandbox.runtime import SandboxRuntime
-from singularity.sandbox.trace import SandboxTraceWriter
+from singularity.sandbox.manager import SandboxManager
+from singularity.sandbox.trace_recorder import SandboxJsonlTraceRecorder
 
 __all__ = [
     "DockerSandboxBackend",
@@ -67,11 +67,11 @@ __all__ = [
     "SandboxRequest",
     "SandboxResourceLimits",
     "SandboxResult",
-    "SandboxRuntime",
+    "SandboxManager",
     "SandboxSetupError",
     "SandboxStatus",
     "SandboxTimeout",
-    "SandboxTraceWriter",
+    "SandboxJsonlTraceRecorder",
     "SandboxUnavailable",
     "SandboxViolation",
     "SandboxViolationError",

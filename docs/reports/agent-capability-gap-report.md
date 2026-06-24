@@ -2,7 +2,7 @@
 
 Date: 2026-06-23
 Repository: `C:\Users\Lenovo\Desktop\Harness`
-Scope: Singularity Python runtime, CLI harness, tools, context, verification, trace, and desktop-ready runtime boundary.
+Scope: Singularity Python component, CLI harness, tools, context, verification, trace, and desktop-ready component boundary.
 
 ## External Parity Baseline
 
@@ -23,8 +23,8 @@ Acceptance benchmark:
 
 1. Locate relevant files from a natural-language coding task.
 2. Inspect code and plan.
-3. Apply a multi-file patch through mutation/edit runtimes.
-4. Run targeted verification through `VerificationRuntime`.
+3. Apply a multi-file patch through mutation/edit components.
+4. Run targeted verification through `VerificationRunner`.
 5. Replan after failed verification.
 6. Produce a final report grounded in changed files, verification, trace, and residual risks.
 
@@ -32,29 +32,29 @@ Current status:
 
 | Capability | Status | Evidence |
 | --- | --- | --- |
-| Code search / index | Implemented | `src/singularity/code_index/runtime.py`, `src/singularity/tools/code_index.py`, `tests/code_index/` |
-| Planning / completion gating | Implemented | `src/singularity/planner/runtime.py`, `src/singularity/task_controller.py`, `tests/test_agent_task_outcome.py` |
-| Multi-file mutation / patch | Implemented | `src/singularity/workspace/runtime.py`, `src/singularity/edit/runtime.py`, `tests/test_workspace_mutation.py`, `tests/edit/test_edit_runtime.py` |
-| Command execution | Implemented | `src/singularity/command/runtime.py`, `tests/test_command_runtime.py` |
-| Verification after change | Implemented | `src/singularity/verification/runtime.py`, `tests/test_verification_runtime.py` |
+| Code search / index | Implemented | `src/singularity/code_index/index.py`, `src/singularity/tools/code_index.py`, `tests/code_index/` |
+| Planning / completion gating | Implemented | `src/singularity/planner/engine.py`, `src/singularity/run_controller.py`, `tests/test_agent_task_outcome.py` |
+| Multi-file mutation / patch | Implemented | `src/singularity/workspace/mutation_manager.py`, `src/singularity/edit/executor.py`, `tests/test_workspace_mutation.py`, `tests/edit/test_edit_executor.py` |
+| Command execution | Implemented | `src/singularity/command/executor.py`, `tests/test_command_executor.py` |
+| Verification after change | Implemented | `src/singularity/verification/runner.py`, `tests/test_verification_runner.py` |
 | Failure repair planning | Implemented, not fully autonomous edit loop | `src/singularity/verification/repair.py`, `src/singularity/verification/failure_analysis.py`, `tests/test_agent_task_outcome.py` |
 | Final report | Implemented | `src/singularity/kernel/finalization.py`, `src/singularity/planner/finalizer.py` |
 
-Finding: the current agent loop is no longer demo-only for medium coding tasks. The highest real gap was not tool execution; it was the missing RuntimeHost/API boundary for CLI parity and future desktop clients.
+Finding: the current agent loop is no longer demo-only for medium coding tasks. The highest real gap was not tool execution; it was the missing AgentHost/API boundary for CLI parity and future desktop clients.
 
 ## Round 2: Tool / Patch / Command Audit
 
 Implemented:
 
-- `ToolRuntime` validates arguments, applies policy/approval, enforces planner authorization, dispatches handlers, and records trace.
-- Patch behavior is implemented through `EditRuntime` and `MutationRuntime`, not a fake standalone patch tool.
-- `CommandRuntime` owns cwd/env/output/timeout/sandbox/policy flow.
-- Verification-like commands are blocked from generic command tools and routed to `VerificationRuntime`.
+- `ToolExecutor` validates arguments, applies policy/approval, enforces planner authorization, dispatches handlers, and records trace.
+- Patch behavior is implemented through `EditExecutor` and `WorkspaceMutationManager`, not a fake standalone patch tool.
+- `CommandExecutor` owns cwd/env/output/timeout/sandbox/policy flow.
+- Verification-like commands are blocked from generic command tools and routed to `VerificationRunner`.
 
 Gaps:
 
 - Trace write failure is still best-effort and returns a warning rather than failing the task.
-- Policy and approval traces are no-op when no trace runtime is attached.
+- Policy and approval traces are no-op when no trace component is attached.
 - Some legacy trace fallback paths are intentionally compatible but less structured.
 
 Decision: no broad rewrite in this round. Existing tool execution is real; the safer next work is targeted hardening of trace/audit failure semantics.
@@ -65,9 +65,9 @@ Implemented:
 
 - `ContextManager` stores structured system/user/assistant/tool/context observations.
 - `ContextAssembler` performs layered retrieval and token-budget assembly.
-- `PlannerRuntime` persists state, evidence, recovery, completion assessment, and finalization.
-- `InstructionRuntime` and `ModelInputRenderer` support prompt manifests, stable-prefix hashing, and dynamic-tail hashing.
-- `ProjectIndexRuntime` provides read-only code intelligence and test-impact hints.
+- `Planner` persists state, evidence, recovery, completion assessment, and finalization.
+- `PromptAssemblyPipeline` and `ModelTurnRequestBuilder` support prompt manifests, stable-prefix hashing, and dynamic-tail hashing.
+- `ProjectIndex` provides read-only code intelligence and test-impact hints.
 
 Gaps:
 
@@ -81,38 +81,38 @@ Decision: keep the current architecture. Add focused integration tests before ch
 
 Implemented:
 
-- `VerificationRuntime` plans, runs, reruns, classifies failures, records completion assessment, and delegates process execution to `CommandRuntime`.
+- `VerificationRunner` plans, runs, reruns, classifies failures, records completion assessment, and delegates process execution to `CommandExecutor`.
 - Repair hints and repair budgets exist.
-- Evaluation runtime, trace replay, A/B, regression reporting, and checked-in golden tasks exist.
+- Evaluation component, trace replay, A/B, regression reporting, and checked-in golden tasks exist.
 
 Gaps:
 
 - Repair planning exists, but the general autonomous repair loop still depends on the model selecting and applying the next edit.
-- Evaluation is strong as a runtime contract, but not yet a default CI gate for every parity scenario.
+- Evaluation is strong as a component contract, but not yet a default CI gate for every parity scenario.
 
 Decision: keep existing golden-task framework and add future capability cases there instead of creating a parallel benchmark system.
 
-## Round 5: RuntimeHost / Desktop-Ready Audit
+## Round 5: AgentHost / Desktop-Ready Audit
 
 Before this round:
 
-- `RuntimeHost` was documented in ADRs and architecture docs.
+- `AgentHost` was documented in ADRs and architecture docs.
 - `RunEvent`, approval, tool-call, trace-span, and artifact schemas existed.
-- No production `RuntimeHost` class existed under `src/`.
+- No production `AgentHost` class existed under `src/`.
 
 Actual change:
 
-- Added `src/singularity/runtime_host/`.
-- Added in-process `RuntimeHost` facade over `KernelBootstrap -> AgentKernel`.
-- Added `SessionRuntime`, `RunEvent`, `ApprovalEvent`, `ToolCallEvent`, `RuntimeHostSnapshot`, and `RuntimeHostRunResult` projection models.
+- Added `src/singularity/agent_host/`.
+- Added in-process `AgentHost` facade over `KernelBootstrap -> AgentKernel`.
+- Added `RunSession`, `RunEvent`, `ApprovalEvent`, `ToolCallEvent`, `RunStateSnapshot`, and `HostedRunResult` projection models.
 - Added `start_run`, `resume_run`, `cancel_run`, `submit_approval`, `snapshot`, `events`, and `read_artifact`.
-- Added `tests/test_runtime_host.py`.
+- Added `tests/test_agent_host.py`.
 - Updated README and architecture docs to mark only the Python facade as implemented. Daemon, HTTP, WebSocket, JSON-RPC, Rust Core, and Tauri remain planned.
 
 Remaining risk:
 
 - CLI still calls `KernelBootstrap` directly.
-- RuntimeHost is synchronous and in-process.
+- AgentHost is synchronous and in-process.
 - No daemon transport, event fanout, idempotency store, health endpoint, or long-running async supervisor exists yet.
 
 ## Verification Commands
@@ -120,7 +120,7 @@ Remaining risk:
 Target test:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_runtime_host.py -q
+.\.venv\Scripts\python.exe -m pytest tests\test_agent_host.py -q
 ```
 
 Result:
@@ -132,7 +132,7 @@ Result:
 Recommended broader gate after this report:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_runtime_host.py tests\test_runtime_graph.py tests\test_agent_task_outcome.py tests\test_verification_runtime.py --basetemp work\pytest-tmp-runtime-host
+.\.venv\Scripts\python.exe -m pytest tests\test_agent_host.py tests\test_agent_graph.py tests\test_agent_task_outcome.py tests\test_verification_runner.py --basetemp work\pytest-tmp-agent-host
 ```
 
 Result:
@@ -163,8 +163,8 @@ compileall passed
 
 | Gap | Priority | Next action |
 | --- | --- | --- |
-| CLI does not yet use RuntimeHost | P0 | Route `singularity-agent run` through `RuntimeHost.start_run` without changing behavior |
-| RuntimeHost is not a daemon | P0 after CLI migration | Add local daemon transport around the Python facade |
+| CLI does not yet use AgentHost | P0 | Route `singularity-agent run` through `AgentHost.start_run` without changing behavior |
+| AgentHost is not a daemon | P0 after CLI migration | Add local daemon transport around the Python facade |
 | Trace write failure is best-effort | P1 | Add explicit trace-health diagnostics and fail-closed modes for policy/approval-critical paths |
 | Autonomous repair still depends on model action selection | P1 | Add golden tasks that require failed verification -> edit repair -> rerun |
-| MCP and multi-agent are planned only | P2 | Add through ToolRuntime/ToolBroker after RuntimeHost boundary is stable |
+| MCP and multi-agent are planned only | P2 | Add through ToolExecutor/ToolBroker after AgentHost boundary is stable |

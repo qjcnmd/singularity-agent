@@ -101,7 +101,7 @@ class NoProgressGuard:
         return None
 
 
-class RepairPlannerRuntime:
+class RepairPlanner:
     def plan(self, analysis: FailureAnalysis | list[FailureAnalysis]) -> RepairPlan:
         analyses = analysis if isinstance(analysis, list) else [analysis]
         if not analyses:
@@ -138,18 +138,18 @@ class RepairPlannerRuntime:
         )
 
 
-class FailureAnalysisRuntime:
+class FailureAnalysisPipeline:
     def __init__(
         self,
         *,
         no_progress_guard: NoProgressGuard | None = None,
         max_same_failure_retries: int = 2,
-        repair_planner: RepairPlannerRuntime | None = None,
+        repair_planner: RepairPlanner | None = None,
     ) -> None:
         self.no_progress_guard = no_progress_guard or NoProgressGuard(
             max_same_failure_retries=max_same_failure_retries
         )
-        self.repair_planner = repair_planner or RepairPlannerRuntime()
+        self.repair_planner = repair_planner or RepairPlanner()
 
     def analyze_result(
         self,
