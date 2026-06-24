@@ -577,10 +577,7 @@ class ContextManager:
             truncated=False,
             metadata={"synthetic": True, **(metadata or {})},
         )
-        observation = self.add_tool_protocol_result(envelope)
-        if turn:
-            observation.turn = turn
-        return observation
+        return self.add_tool_protocol_result(envelope, turn=turn)
 
     def add_trace_summary(self, lines: list[str]) -> None:
         if not lines:

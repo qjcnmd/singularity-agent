@@ -257,6 +257,18 @@ class AgentLoop:
 
         def on_max_turns(max_turns: int) -> AgentLoopResult:
             message = f"Stopped after max_turns={max_turns}; the model did not produce a final answer."
+            outcome = ExecutionOutcome(
+                status=ExecutionOutcomeStatus.BLOCKED,
+                source="agent_loop",
+                reason=message,
+                error_code="max_turns_exceeded",
+                next_action="blocked",
+                observation_summary=message,
+                retry_allowed=False,
+                metadata={"max_turns": max_turns},
+            )
+            controller.apply_outcome(outcome)
+            self._record_outcome_context(context, planner, outcome)
             self.trace.record("error", {"type": "MaxTurnsExceeded", "message": message})
             self.trace.record("final_answer", {"turn": max_turns, "content": message})
             return AgentLoopResult(
@@ -324,6 +336,40 @@ class AgentLoop:
             )
         report = planner.finalize()
         report.context_usage_diagnostic = context.context_usage_diagnostic()
+        if report.status != TaskStatus.COMPLETED:
+            retry_allowed = report.status in {
+                TaskStatus.INSPECTING_WORKSPACE,
+                TaskStatus.PLANNING_CHANGES,
+                TaskStatus.APPLYING_CHANGES,
+                TaskStatus.RUNNING_VERIFICATION,
+                TaskStatus.REPAIRING_FAILURES,
+                TaskStatus.FINALIZING,
+            }
+            outcome = ExecutionOutcome(
+                status=(
+                    ExecutionOutcomeStatus.REPLAN_REQUIRED
+                    if retry_allowed
+                    else ExecutionOutcomeStatus.BLOCKED
+                ),
+                source="completion",
+                reason=f"Final report did not complete: {report.status.value}.",
+                error_code="final_review_rejected",
+                missing_evidence=list(report.next_steps or ["final_report_completed"]),
+                next_action="continue" if retry_allowed else "blocked",
+                observation_summary=(
+                    f"Final report status={report.status.value}; "
+                    f"verification={report.verification_summary.get('status', 'unknown')}."
+                ),
+                retry_allowed=retry_allowed,
+                metadata={
+                    "final_report_status": report.status.value,
+                    "verification_summary": report.verification_summary,
+                    "review_summary": report.review_summary,
+                },
+            )
+            controller.apply_outcome(outcome)
+            self._record_outcome_context(context, planner, outcome)
+            return self._terminal_result_from_outcome(outcome, turn=turn)
         final_answer = "\n".join(
             [
                 f"status: {report.status.value}",

@@ -328,19 +328,17 @@ class ProcessSupervisor:
         else:
             raise ValueError("Command request must provide argv or shell.")
 
-        kwargs: dict[str, object] = {
-            "cwd": str(cwd),
-            "env": env,
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "shell": shell,
-        }
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            kwargs["start_new_session"] = True
-        return subprocess.Popen(command, **kwargs)
+        return subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=shell,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
+        )
 
     def kill_process_tree(
         self,
@@ -375,8 +373,13 @@ class ProcessSupervisor:
         *,
         reason: str,
     ) -> None:
+        killpg = getattr(os, "killpg", None)
+        getpgid = getattr(os, "getpgid", None)
+        if not callable(killpg) or not callable(getpgid):
+            process.terminate()
+            return
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            killpg(getpgid(pid), signal.SIGTERM)
         except ProcessLookupError:
             return
         except Exception:
@@ -387,7 +390,7 @@ class ProcessSupervisor:
         except subprocess.TimeoutExpired:
             pass
         try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            killpg(getpgid(pid), getattr(signal, "SIGKILL", signal.SIGTERM))
         except Exception:
             process.kill()
 

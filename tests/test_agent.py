@@ -4,6 +4,13 @@ from typing import Any
 from singularity.agent_loop import AgentLoopStatus
 from singularity.model import ModelError, ModelErrorKind
 from singularity.planner import Planner
+from singularity.review import (
+    ReviewDecision,
+    ReviewDecisionAction,
+    ReviewReport,
+    ReviewStage,
+    ReviewTarget,
+)
 from singularity.tools import ToolRegistry
 from singularity.tools.mutation import register_mutation_tools
 from singularity.jsonl_trace import JsonlTraceRecorder
@@ -271,6 +278,70 @@ def test_agent_returns_planner_final_report_when_completion_evidence_exists(tmp_
     assert "model says done" not in answer
 
 
+def test_agent_does_not_complete_when_final_review_rejects(tmp_path: Path) -> None:
+    class RejectingReviewPipeline:
+        def final_review(self, **_kwargs: object) -> ReviewReport:
+            return ReviewReport(
+                target=ReviewTarget(stage=ReviewStage.FINAL, task_id="task_1"),
+                input_summary="final review rejected",
+                decision=ReviewDecision(
+                    action=ReviewDecisionAction.REPAIR,
+                    reasons=["Final evidence needs repair."],
+                    repair_targets=["check_1"],
+                ),
+            )
+
+    planner = Planner(
+        tmp_path,
+        session_id="session_1",
+        task_id="task_1",
+        review_pipeline=RejectingReviewPipeline(),
+    )
+    provider = MockProvider(
+        {"choices": [{"message": {"role": "assistant", "content": "model says done"}}]},
+        {"choices": [{"message": {"role": "assistant", "content": "still done"}}]},
+    )
+    agent = make_agent_session(
+        tmp_path,
+        provider=provider,
+        max_turns=2,
+        planner=planner,
+    )
+
+    original_start = planner.start_task
+
+    def start_with_evidence(goal: str) -> Any:
+        state = original_start(goal)
+        planner.evidence.inspected_files.append("README.md")
+        planner.evidence.applied_changes.append(
+            {"changed_files": ["README.md"], "transaction_id": "tx_1"}
+        )
+        planner.state.linked_transactions.append("tx_1")
+        planner.evidence.verification_results.append(
+            {
+                "completion_assessment": {"status": "ready", "warnings": [], "remaining_risks": []},
+                "check_status": [{"check_id": "check_1", "status": "passed"}],
+            }
+        )
+        planner.state.final_assessment = {"status": "ready"}
+        return state
+
+    planner.start_task = start_with_evidence  # type: ignore[method-assign]
+
+    answer = agent.run("finish with facts")
+
+    assert answer.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
+    assert any(
+        outcome["error_code"] == "final_review_rejected"
+        for outcome in planner.evidence.task_outcomes
+    )
+    assert not any(
+        outcome["status"] == "success"
+        and outcome.get("metadata", {}).get("final_report_status") == "completed"
+        for outcome in planner.evidence.task_outcomes
+    )
+
+
 def test_agent_blocks_final_answer_when_completion_evidence_is_missing(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     provider = MockProvider(
@@ -295,5 +366,9 @@ def test_agent_blocks_final_answer_when_completion_evidence_is_missing(tmp_path:
     answer = agent.run("change code")
 
     assert answer.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
-    assert planner.evidence.task_outcomes[-1]["error_code"] == "completion_rejected"
+    assert any(
+        outcome["error_code"] == "completion_rejected"
+        for outcome in planner.evidence.task_outcomes
+    )
+    assert planner.evidence.task_outcomes[-1]["error_code"] == "max_turns_exceeded"
     assert "required_changes_applied" in planner.evidence.missing_evidence

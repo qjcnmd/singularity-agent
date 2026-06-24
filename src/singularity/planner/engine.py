@@ -302,17 +302,37 @@ class Planner:
         BudgetController(self.budget).record_tool_call()
         payload = result.model_dump(mode="json") if isinstance(result, ToolResult) else result
         content = payload.get("content")
-        self.evidence.tool_results.append(
-            {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "action_id": action_id,
-                "ok": payload.get("ok"),
-                "error_code": payload.get("error_code"),
+        metadata = self._dict_payload(payload.get("metadata"))
+        error = self._dict_payload(payload.get("error"))
+        failure = None
+        if payload.get("ok") is False:
+            failure = {
+                "code": payload.get("error_code"),
+                "message": error.get("message"),
+                "details": error.get("details"),
+                "backend": metadata.get("backend"),
+                "policy_decision_id": metadata.get("policy_decision_id"),
+                "approval_grant_id": metadata.get("approval_grant_id"),
             }
-        )
+        tool_result_entry = {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "action_id": action_id,
+            "ok": payload.get("ok"),
+            "status": "ok" if payload.get("ok") else "failed",
+            "error_code": payload.get("error_code"),
+            "failure": failure,
+        }
+        self.evidence.tool_results.append(tool_result_entry)
         if payload.get("ok") is False and payload.get("error_code"):
-            self.replan({"error_code": payload.get("error_code")})
+            self.replan(
+                {
+                    "error_code": payload.get("error_code"),
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "failure": failure,
+                }
+            )
         if tool_name == "read_file" and isinstance(content, dict):
             self.evidence.add_unique_file(str(content.get("path") or ""))
         elif tool_name == "list_files" and isinstance(content, dict):

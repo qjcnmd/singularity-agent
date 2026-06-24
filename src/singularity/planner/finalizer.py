@@ -16,9 +16,15 @@ class Finalizer:
     ) -> FinalReport:
         files_changed: set[str] = set()
         artifacts: set[str] = set()
+        changesets: set[str] = set()
+        transactions: set[str] = set()
         for change in evidence.applied_changes:
             for path in change.get("changed_files") or []:
                 files_changed.add(str(path))
+            if change.get("changeset_id"):
+                changesets.add(str(change["changeset_id"]))
+            if change.get("transaction_id"):
+                transactions.add(str(change["transaction_id"]))
             artifact = change.get("artifact_path")
             if artifact:
                 artifacts.add(str(artifact))
@@ -52,6 +58,7 @@ class Finalizer:
             else state.status
         )
         next_steps = [] if status == TaskStatus.COMPLETED else ["Resolve unmet completion criteria."]
+        transaction_refs = sorted(transactions | set(state.linked_transactions))
 
         return FinalReport(
             user_goal=state.user_goal,
@@ -62,7 +69,17 @@ class Finalizer:
             verification_summary=verification_summary,
             unresolved_issues=list(evidence.unresolved_failures),
             risks=list(evidence.risks),
-            rollback_status={"available": bool(files_changed), "transactions": state.linked_transactions},
+            rollback_status={
+                "available": bool(files_changed),
+                "transactions": transaction_refs,
+                "changesets": sorted(changesets),
+                "changed_files": sorted(files_changed),
+                "rollback_refs": [
+                    f"transaction:{transaction}"
+                    for transaction in transaction_refs
+                ],
+                "verification_state": verification_summary.get("status", "not_run"),
+            },
             policy_approval_summary=self._policy_summary(evidence),
             artifacts=sorted(artifacts),
             next_steps=next_steps,

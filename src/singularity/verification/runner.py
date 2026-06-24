@@ -146,11 +146,11 @@ class VerificationRunner:
 
     @staticmethod
     def _verification_commands(plan: VerificationPlan) -> dict[str, list[str]]:
-        return {
-            check.id: list(check.command.argv)
-            for check in plan.all_checks()
-            if check.command is not None
-        }
+        commands: dict[str, list[str]] = {}
+        for check in plan.all_checks():
+            if check.command is not None and check.command.argv is not None:
+                commands[check.id] = list(check.command.argv)
+        return commands
 
     def run_plan(
         self,

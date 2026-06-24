@@ -6,7 +6,7 @@ from singularity.agent_loop import AgentLoopStatus
 from singularity.command import CommandExecutor
 from singularity.context import ContextManager
 from singularity.edit import EditExecutor
-from singularity.planner import Planner
+from singularity.planner import Planner, TaskStatus
 from singularity.policy import (
     ApprovalMode,
     DecisionOutcome,
@@ -169,10 +169,12 @@ def test_malformed_tool_args_record_retryable_outcome(tmp_path: Path) -> None:
 
     assert result.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
     assert len(provider.calls) == 2
-    assert [item["status"] for item in planner.evidence.task_outcomes] == [
+    assert [item["status"] for item in planner.evidence.task_outcomes[:2]] == [
         "retryable",
         "replan_required",
     ]
+    assert planner.evidence.task_outcomes[-1]["status"] == "blocked"
+    assert planner.evidence.task_outcomes[-1]["error_code"] == "max_turns_exceeded"
     retryable = next(item for item in planner.evidence.task_outcomes if item["status"] == "retryable")
     assert retryable["error_code"] in {"invalid_json", "bad_arguments_json"}
     assert retryable["next_action"] == "retry"
@@ -214,11 +216,79 @@ def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> N
     assert planner.state is not None
     assert planner.state.current_phase == "repairing_failures"
     assert planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "failed"
-    rejected = planner.evidence.task_outcomes[-1]
+    rejected = next(
+        item
+        for item in reversed(planner.evidence.task_outcomes)
+        if item.get("error_code") == "completion_rejected"
+    )
     assert rejected["status"] == "replan_required"
     assert rejected["error_code"] == "completion_rejected"
     assert rejected["next_action"] == "continue"
     assert rejected["retry_allowed"] is True
+
+
+def test_tool_failure_then_verification_failure_replans_repairs_and_finalizes(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        raw_tool("call_bad_args", "read_file", "{not json"),
+        tool("call_read", "read_file", {"path": "README.md"}),
+        tool(
+            "call_create_bad",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": "print(1 / 0)\n",
+                "mode": "create",
+                "reason": "create failing smoke target",
+            },
+        ),
+        tool(
+            "call_verify_bad",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+        tool(
+            "call_repair",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": QUICK_SORT,
+                "mode": "overwrite",
+                "reason": "repair failing smoke target",
+            },
+        ),
+        tool(
+            "call_verify_fixed",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=6)
+
+    result = agent.run("implement quicksort.py and verify it")
+
+    assert result.status == AgentLoopStatus.COMPLETED
+    assert result.turn == 6
+    assert "status: completed" in result.final_answer
+    assert (tmp_path / "quicksort.py").read_text(encoding="utf-8") == QUICK_SORT
+    assert any(
+        item["status"] == "retryable"
+        and item["error_code"] in {"invalid_json", "bad_arguments_json"}
+        for item in planner.evidence.task_outcomes
+    )
+    assert planner.evidence.verification_results[-2]["completion_assessment"]["status"] == "failed"
+    assert planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "ready"
+    assert planner.state is not None
+    assert planner.state.status == TaskStatus.COMPLETED
 
 
 def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:

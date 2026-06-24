@@ -261,6 +261,7 @@ class ToolExecutor:
         cache_hit = False
         output_digest: str | None = None
         result: ToolResult
+        planner_updated = False
 
         try:
             self._throw_if_cancelled()
@@ -465,6 +466,7 @@ class ToolExecutor:
                 result=result,
                 action_id=planner_action_id,
             )
+            planner_updated = True
             if self._should_cache(spec) and result.ok and not self._is_sensitive_result(spec, result):
                 touched_paths = self._touched_paths(spec, validated_args)
                 self._cache.set(
@@ -497,6 +499,13 @@ class ToolExecutor:
                 self._annotate_result_metadata(result, request)
                 if spec is not None:
                     result.metadata.setdefault("backend", spec.execution_backend.value)
+                if not planner_updated:
+                    self._safe_update_planner(
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                        result=result,
+                        action_id=planner_action_id,
+                    )
                 self._record_trace(
                     request=request,
                     tool_call_id=tool_call_id,
@@ -599,6 +608,30 @@ class ToolExecutor:
             result=result,
             action_id=action_id,
         )
+
+    def _safe_update_planner(
+        self,
+        *,
+        tool_call_id: str | None,
+        tool_name: str,
+        result: ToolResult,
+        action_id: str | None,
+    ) -> None:
+        try:
+            self._update_planner(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                result=result,
+                action_id=action_id,
+            )
+        except Exception as exc:
+            self._emit_trace(
+                TraceEventType.TOOL_DISPATCH_FAILED,
+                summary=f"Planner observation update failed for tool {tool_name}.",
+                payload={"tool_name": tool_name, "error_type": type(exc).__name__},
+                ids={"action_id": action_id or tool_call_id},
+                severity=TraceSeverity.WARNING,
+            )
 
     def _record_planner_denial(self, tool_name: str, planner_decision: Any) -> None:
         self._emit_trace(

@@ -549,7 +549,11 @@ class WorkspaceMutationManager:
         path_filter = {self.resolver.resolve(path).relative_posix for path in paths or []}
         ids = [changeset_id] if scope == "changeset" and changeset_id else list(self._changeset_order)
         diffs: list[FileDiff] = []
-        classes = {"added_files": set(), "modified_files": set(), "deleted_files": set()}
+        classes: dict[str, set[str]] = {
+            "added_files": set(),
+            "modified_files": set(),
+            "deleted_files": set(),
+        }
         for item_id in ids:
             result = self._changeset_results.get(str(item_id))
             if result is None or not result.ok:
@@ -1104,10 +1108,10 @@ class WorkspaceMutationManager:
             return
         if isinstance(operation, ApplyUnifiedDiff):
             path = self.resolver.resolve(operation.path).relative_posix
-            text = final_texts.get(path)
+            current_text = final_texts.get(path)
             try:
                 final_texts[path] = apply_unified_diff_to_text(
-                    text or "",
+                    current_text or "",
                     operation.diff,
                     path=path,
                 )

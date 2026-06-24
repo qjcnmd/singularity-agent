@@ -5,6 +5,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,14 @@ class UnifiedDiffError(ValueError):
         super().__init__(message)
         self.code = code
         self.path = path
+
+
+class _UnifiedHunk(TypedDict):
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    lines: list[str]
 
 
 class DiffEngine:
@@ -253,9 +262,9 @@ def _parse_file_patch(lines: list[str]) -> UnifiedDiffFilePatch:
     )
 
 
-def _parse_unified_hunks(diff: str, *, path: str) -> list[dict[str, object]]:
-    hunks: list[dict[str, object]] = []
-    current: dict[str, object] | None = None
+def _parse_unified_hunks(diff: str, *, path: str) -> list[_UnifiedHunk]:
+    hunks: list[_UnifiedHunk] = []
+    current: _UnifiedHunk | None = None
     header = re.compile(
         r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
         r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
@@ -277,7 +286,7 @@ def _parse_unified_hunks(diff: str, *, path: str) -> list[dict[str, object]]:
         if current is None:
             continue
         if line.startswith((" ", "+", "-", "\\")):
-            current["lines"].append(line)  # type: ignore[index]
+            current["lines"].append(line)
     if not hunks:
         raise UnifiedDiffError("invalid_patch", "Unified diff contains no hunks.", path=path)
     return hunks

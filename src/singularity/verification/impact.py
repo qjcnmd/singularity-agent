@@ -93,7 +93,7 @@ class ImpactAnalyzer:
             config_changed or lock_changed or deploy_changed or public_api_changed
         )
         requires_typecheck = not docs_only and (
-            source_changed or config_changed or project_profile.typecheck_tools
+            source_changed or config_changed or bool(project_profile.typecheck_tools)
         )
 
         if docs_only:
