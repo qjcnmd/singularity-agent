@@ -59,7 +59,16 @@ class RichCliRenderer:
             self.console.print(
                 Panel(
                     self._report_text(report),
-                    title=f"final report: {report.outcome.value}",
+                    title=f"final report: {_outcome_value(report.outcome)}",
+                    border_style=border_style,
+                )
+            )
+            return
+        if isinstance(payload, dict) and payload.get("context_usage_diagnostic"):
+            self.console.print(
+                Panel(
+                    self._planner_report_text(payload),
+                    title="final report",
                     border_style=border_style,
                 )
             )
@@ -161,7 +170,7 @@ class RichCliRenderer:
     @staticmethod
     def _report_text(report: FinalReport) -> str:
         lines = [
-            f"outcome: {report.outcome.value}",
+            f"outcome: {_outcome_value(report.outcome)}",
             f"summary: {report.summary}",
         ]
         if report.verification_status:
@@ -175,6 +184,30 @@ class RichCliRenderer:
         if report.next_steps:
             lines.append("next_steps: " + "; ".join(report.next_steps))
         return "\n".join(lines)
+
+    @staticmethod
+    def _planner_report_text(payload: dict[str, Any]) -> str:
+        diagnostic = dict(payload.get("context_usage_diagnostic") or {})
+        attribution = dict(diagnostic.get("cache_attribution") or {})
+        lines = [
+            f"status: {payload.get('status', 'unknown')}",
+            "context_usage:",
+            f"  layer_token_usage: {diagnostic.get('layer_token_usage') or {}}",
+            f"  included_items: {len(diagnostic.get('included_item_ids') or [])}",
+            f"  excluded_items: {len(diagnostic.get('excluded_item_ids') or [])}",
+            f"  stale_items: {len(diagnostic.get('stale_item_ids') or [])}",
+            f"  summary_items: {len(diagnostic.get('summary_item_ids') or [])}",
+            f"  recent_tail_items: {len(diagnostic.get('recent_tail_item_ids') or [])}",
+            f"  cache_hit_ratio: {diagnostic.get('cache_hit_ratio', 0.0)}",
+            f"  cache_attribution_source: {attribution.get('source') or 'unknown'}",
+            f"  cache_miss_reasons: {diagnostic.get('cache_miss_reasons') or []}",
+        ]
+        return "\n".join(lines)
+
+
+def _outcome_value(outcome: Any) -> str:
+    value = getattr(outcome, "value", outcome)
+    return str(value)
 
 
 class RichInteractionProvider:

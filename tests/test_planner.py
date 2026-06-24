@@ -4,6 +4,8 @@ from pathlib import Path
 from singularity.planner import (
     ActionKind,
     Planner,
+    FinalReport,
+    FinalReportRenderer,
     ReplanDecisionKind,
     RiskDecisionKind,
     TaskContract,
@@ -457,6 +459,53 @@ def test_final_report_is_generated_from_evidence(tmp_path: Path) -> None:
     assert "## Final Review" in markdown
     assert "## Risks and Next Steps" in markdown
     assert "## Evidence Appendix" in markdown
+
+
+def test_final_report_markdown_includes_context_usage_diagnostic(tmp_path: Path) -> None:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    planner.start_task("Inspect context")
+    report = FinalReport(
+        user_goal="Inspect context",
+        status=TaskStatus.COMPLETED,
+        files_changed=[],
+        agent_changes=[],
+        command_side_effects=[],
+        verification_summary={"status": "ready"},
+        unresolved_issues=[],
+        risks=[],
+        rollback_status={},
+        policy_approval_summary={},
+        artifacts=[],
+        next_steps=[],
+        context_usage_diagnostic={
+            "layer_token_usage": {"recent_dialogue": 12},
+            "included_item_ids": ["included_1"],
+            "excluded_item_ids": ["excluded_1"],
+            "stale_item_ids": ["stale_1"],
+            "summary_item_ids": ["summary_1"],
+            "recent_tail_item_ids": ["tail_1"],
+            "cache_hit_ratio": 0.25,
+            "cache_attribution": {"source": "component_inferred"},
+            "cache_miss_reasons": ["context_shape_change"],
+        },
+    )
+
+    markdown = FinalReportRenderer().render_markdown(
+        report=report,
+        state=planner.state,
+        evidence=planner.evidence,
+    )
+
+    assert "## Context Usage" in markdown
+    assert "Layer token usage" in markdown
+    assert "Included items: 1" in markdown
+    assert "Excluded items: 1" in markdown
+    assert "Stale items: 1" in markdown
+    assert "Summary items: 1" in markdown
+    assert "Recent tail items: 1" in markdown
+    assert "Cache hit ratio: 0.25" in markdown
+    assert "Cache attribution source: component_inferred" in markdown
+    assert "context_shape_change" in markdown
 
 
 def test_final_review_rejects_before_completed(tmp_path: Path) -> None:

@@ -69,10 +69,13 @@ class Finalizer:
             sandbox_isolation_summary=self._sandbox_summary(evidence),
             execution_trace_summary=trace_summary
             or self._execution_trace_summary(evidence),
-            model_usage_summary=(
-                (trace_summary or {}).get("model_usage_summary")
-                if trace_summary
-                else {}
+            model_usage_summary=dict(
+                ((trace_summary or {}).get("model_usage_summary") if trace_summary else {})
+                or {}
+            ),
+            context_usage_diagnostic=dict(
+                ((trace_summary or {}).get("context_usage_diagnostic") if trace_summary else {})
+                or {}
             ),
             instruction_prompt_summary=self._instruction_prompt_summary(evidence),
             component_health_summary={
@@ -227,7 +230,7 @@ class Finalizer:
 
     @staticmethod
     def _instruction_prompt_summary(evidence: EvidenceLedger) -> dict[str, Any]:
-        summary = {
+        summary: dict[str, Any] = {
             "prompt_bundles_compiled_count": 0,
             "project_instruction_files_loaded_count": 0,
             "injection_warning_count": 0,
@@ -275,9 +278,12 @@ class Finalizer:
     def _review_summary(evidence: EvidenceLedger) -> dict[str, Any]:
         if not evidence.review_results:
             return {"status": "not_recorded", "latest_decision": None}
-        latest = evidence.review_results[-1]
-        decision = latest.get("decision") if isinstance(latest.get("decision"), dict) else {}
-        findings = latest.get("findings") if isinstance(latest.get("findings"), list) else []
+        latest_value = evidence.review_results[-1]
+        latest = latest_value if isinstance(latest_value, dict) else {}
+        decision_value = latest.get("decision")
+        decision = decision_value if isinstance(decision_value, dict) else {}
+        findings_value = latest.get("findings")
+        findings = findings_value if isinstance(findings_value, list) else []
         blocking = [item for item in findings if isinstance(item, dict) and item.get("blocking")]
         remaining_risks = [
             item.get("title")
@@ -352,6 +358,9 @@ class FinalReportRenderer:
             "",
             "## Results",
             *_results(report),
+            "",
+            "## Context Usage",
+            *_context_usage(report.context_usage_diagnostic),
             "",
             "## Failure / Repair History",
             f"- Failure analyses: {len(evidence.failure_analyses)}",
@@ -437,6 +446,23 @@ def _results(report: FinalReport) -> list[str]:
     if report.status == TaskStatus.COMPLETED:
         return ["- Acceptance evidence is complete and the final review accepted the run."]
     return ["- Acceptance evidence is incomplete or final review did not accept the run."]
+
+
+def _context_usage(diagnostic: dict[str, Any]) -> list[str]:
+    if not diagnostic:
+        return ["- Context usage diagnostic: not recorded"]
+    cache_attribution = dict(diagnostic.get("cache_attribution") or {})
+    return [
+        f"- Layer token usage: {diagnostic.get('layer_token_usage') or {}}",
+        f"- Included items: {len(diagnostic.get('included_item_ids') or [])}",
+        f"- Excluded items: {len(diagnostic.get('excluded_item_ids') or [])}",
+        f"- Stale items: {len(diagnostic.get('stale_item_ids') or [])}",
+        f"- Summary items: {len(diagnostic.get('summary_item_ids') or [])}",
+        f"- Recent tail items: {len(diagnostic.get('recent_tail_item_ids') or [])}",
+        f"- Cache hit ratio: {diagnostic.get('cache_hit_ratio', 0.0)}",
+        f"- Cache attribution source: {cache_attribution.get('source') or 'unknown'}",
+        f"- Cache miss reasons: {diagnostic.get('cache_miss_reasons') or []}",
+    ]
 
 
 def _risks_and_next_steps(report: FinalReport) -> list[str]:

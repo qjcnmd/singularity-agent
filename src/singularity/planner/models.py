@@ -519,6 +519,7 @@ class FinalReport:
     sandbox_isolation_summary: dict[str, Any] = field(default_factory=dict)
     execution_trace_summary: dict[str, Any] = field(default_factory=dict)
     model_usage_summary: dict[str, Any] = field(default_factory=dict)
+    context_usage_diagnostic: dict[str, Any] = field(default_factory=dict)
     instruction_prompt_summary: dict[str, Any] = field(default_factory=dict)
     component_health_summary: dict[str, Any] = field(default_factory=dict)
     shutdown_summary: dict[str, Any] = field(default_factory=dict)
@@ -541,6 +542,7 @@ class FinalReport:
             "sandbox_isolation_summary": self.sandbox_isolation_summary,
             "execution_trace_summary": self.execution_trace_summary,
             "model_usage_summary": self.model_usage_summary,
+            "context_usage_diagnostic": self.context_usage_diagnostic,
             "instruction_prompt_summary": self.instruction_prompt_summary,
             "component_health_summary": self.component_health_summary,
             "shutdown_summary": self.shutdown_summary,
@@ -567,6 +569,7 @@ class FinalReport:
             sandbox_isolation_summary=dict(payload.get("sandbox_isolation_summary") or {}),
             execution_trace_summary=dict(payload.get("execution_trace_summary") or {}),
             model_usage_summary=dict(payload.get("model_usage_summary") or {}),
+            context_usage_diagnostic=dict(payload.get("context_usage_diagnostic") or {}),
             instruction_prompt_summary=dict(payload.get("instruction_prompt_summary") or {}),
             component_health_summary=dict(payload.get("component_health_summary") or {}),
             shutdown_summary=dict(payload.get("shutdown_summary") or {}),

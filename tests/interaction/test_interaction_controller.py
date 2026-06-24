@@ -130,6 +130,40 @@ def test_renderer_outputs_user_visible_sections() -> None:
     assert "final report: success" in output
 
 
+def test_renderer_outputs_planner_context_usage_diagnostic() -> None:
+    console = Console(record=True, width=120)
+    renderer = RichCliRenderer(console)
+
+    renderer.render_final_report(
+        {
+            "status": "completed",
+            "context_usage_diagnostic": {
+                "layer_token_usage": {"recent_dialogue": 12},
+                "included_item_ids": ["included_1"],
+                "excluded_item_ids": ["excluded_1"],
+                "stale_item_ids": ["stale_1"],
+                "summary_item_ids": ["summary_1"],
+                "recent_tail_item_ids": ["tail_1"],
+                "cache_hit_ratio": 0.25,
+                "cache_attribution": {"source": "component_inferred"},
+                "cache_miss_reasons": ["context_shape_change"],
+            },
+        }
+    )
+
+    output = console.export_text()
+    assert "context_usage" in output
+    assert "layer_token_usage" in output
+    assert "included_items: 1" in output
+    assert "excluded_items: 1" in output
+    assert "stale_items: 1" in output
+    assert "summary_items: 1" in output
+    assert "recent_tail_items: 1" in output
+    assert "cache_hit_ratio: 0.25" in output
+    assert "cache_attribution_source: component_inferred" in output
+    assert "context_shape_change" in output
+
+
 def test_interactive_and_non_interactive_decisions_write_trace(tmp_path: Path) -> None:
     trace = TraceRecorder.create(tmp_path)
     interactive = InteractionController(trace=trace, provider=FakeProvider(decision="revise"))

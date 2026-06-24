@@ -9,11 +9,12 @@ from singularity.interaction.models import (
     ControlCommand,
     DecisionPrompt,
     FinalReport,
+    InteractionEvent,
     InteractionMode,
     OutcomeStatus,
     ProgressEvent,
-    InteractionEvent,
     UserDecision,
+    _enum_value,
 )
 from singularity.observability.models import TraceEvent, TraceEventType, TraceSeverity
 
@@ -277,7 +278,7 @@ class InteractionController:
         self.publish(
             InteractionEvent(
                 event_type=TraceEventType.FINAL_REPORT_COMPLETED.value,
-                summary=f"Final report completed: {report.outcome.value}.",
+                summary=f"Final report completed: {_enum_value(report.outcome)}.",
                 component="interaction",
                 payload={"final_report": report.to_dict()},
                 severity="warning"

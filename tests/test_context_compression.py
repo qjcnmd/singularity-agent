@@ -1,4 +1,5 @@
 import json
+import inspect
 import sqlite3
 
 import pytest
@@ -8,6 +9,11 @@ from singularity.context.compression import (
     ContextSummaryValidationError,
 )
 from singularity.context import ContextManager
+from singularity.context.compaction import (
+    ContextCompactionCommitter,
+    ContextCompactionExecutor,
+    ContextCompactionPlanner,
+)
 from singularity.context.models import (
     ContextAuthority,
     ContextFreshness,
@@ -442,6 +448,29 @@ def test_partial_compact_requires_explicit_turn_range_and_preserves_out_of_range
     context.add_assistant_message(
         {"role": "assistant", "content": "turn two " * 80, "metadata": {"turn": 2}}
     )
+    context.add_assistant_message(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_turn_2",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+            "metadata": {"turn": 2},
+        }
+    )
+    context.add_tool_result(
+        tool_call={
+            "id": "call_turn_2",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        },
+        result={"ok": True, "content": "tool turn two", "metadata": {}},
+        turn=2,
+    )
     one_id = [
         item.item_id
         for item in context.store.query_items(run_id=context.run_id)
@@ -459,10 +488,104 @@ def test_partial_compact_requires_explicit_turn_range_and_preserves_out_of_range
 
     assert context.store.load_item(one_id).freshness == ContextFreshness.STALE
     assert context.store.load_item(two_id).freshness == ContextFreshness.CURRENT
+    assert any(
+        message.get("role") == "assistant"
+        and any(call.get("id") == "call_turn_2" for call in message.get("tool_calls") or [])
+        for message in context._messages
+    )
+    assert any(
+        message.get("role") == "tool" and message.get("tool_call_id") == "call_turn_2"
+        for message in context._messages
+    )
     snapshot = context.store.latest_snapshot(context.run_id)
     assert snapshot is not None
     assert snapshot.metadata["compaction_plan"]["partial_range"] == {
         "start_turn": 1,
         "end_turn": 1,
         "checkpoint_id": None,
+    }
+
+
+def test_compaction_ownership_lives_in_role_objects() -> None:
+    assert "return self.manager._" not in inspect.getsource(ContextCompactionExecutor.render)
+    assert "return self.manager._" not in inspect.getsource(ContextCompactionCommitter.commit)
+    assert "bucketize_compaction_items" in ContextCompactionPlanner.__dict__
+    assert "run_llm_compaction" in ContextCompactionExecutor.__dict__
+    assert "recover_after_failure" in ContextCompactionCommitter.__dict__
+
+
+def test_partial_compact_checkpoint_id_has_metadata_path(tmp_path) -> None:
+    class GoodCompressionProvider:
+        def chat(self, *, messages, tools, tool_choice):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "goal": "inspect",
+                                    "current_state": "checkpoint compacted",
+                                    "completed_actions": [],
+                                    "pending_actions": [],
+                                    "verified_facts": [],
+                                    "failed_attempts": [],
+                                    "policy_constraints": [],
+                                    "workspace_changes": [],
+                                    "verification_status": "unknown",
+                                    "open_questions": [],
+                                    "reference_ids": [],
+                                    "omitted_item_ids": [],
+                                    "confidence": 0.8,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="inspect",
+        provider=GoodCompressionProvider(),
+        db_path=tmp_path / "context.sqlite3",
+        model_context_window=1000,
+        output_token_reserve=20,
+    )
+    context.add_assistant_message(
+        {
+            "role": "assistant",
+            "content": "checkpoint one " * 80,
+            "metadata": {"checkpoint_id": "checkpoint_a"},
+        }
+    )
+    context.add_assistant_message(
+        {
+            "role": "assistant",
+            "content": "checkpoint two " * 80,
+            "metadata": {"checkpoint_id": "checkpoint_b"},
+        }
+    )
+    checkpoint_a_id = [
+        item.item_id
+        for item in context.store.query_items(run_id=context.run_id)
+        if item.item_type == ContextItemType.ASSISTANT_MESSAGE
+        and item.metadata.get("checkpoint_id") == "checkpoint_a"
+    ][0]
+    checkpoint_b_id = [
+        item.item_id
+        for item in context.store.query_items(run_id=context.run_id)
+        if item.item_type == ContextItemType.ASSISTANT_MESSAGE
+        and item.metadata.get("checkpoint_id") == "checkpoint_b"
+    ][0]
+
+    assert context.partial_compact(PartialCompactionRange(checkpoint_id="checkpoint_a")) is True
+
+    assert context.store.load_item(checkpoint_a_id).freshness == ContextFreshness.STALE
+    assert context.store.load_item(checkpoint_b_id).freshness == ContextFreshness.CURRENT
+    snapshot = context.store.latest_snapshot(context.run_id)
+    assert snapshot is not None
+    assert snapshot.metadata["compaction_plan"]["partial_range"] == {
+        "start_turn": None,
+        "end_turn": None,
+        "checkpoint_id": "checkpoint_a",
     }

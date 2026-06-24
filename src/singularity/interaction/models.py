@@ -324,7 +324,7 @@ class FinalReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "title": self.title,
-            "outcome": self.outcome.value,
+            "outcome": _enum_value(self.outcome),
             "summary": self.summary,
             "completed_items": self.completed_items,
             "partial_items": self.partial_items,
@@ -370,6 +370,10 @@ def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:
     if text in enum_type.__members__:
         return enum_type[text]
     return enum_type(text)
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value))
 
 
 def _datetime(value: datetime | str) -> datetime:

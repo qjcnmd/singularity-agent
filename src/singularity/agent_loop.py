@@ -323,6 +323,7 @@ class AgentLoop:
                 turn=turn,
             )
         report = planner.finalize()
+        report.context_usage_diagnostic = context.context_usage_diagnostic()
         final_answer = "\n".join(
             [
                 f"status: {report.status.value}",
