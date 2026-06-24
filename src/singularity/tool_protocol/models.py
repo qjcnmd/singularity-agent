@@ -340,6 +340,80 @@ class ToolCallRecord(SerializableDataclass):
         )
 
 
+class ToolObservationVisibility(str, Enum):
+    FULL = "full"
+    SUMMARY = "summary"
+    REFERENCE_ONLY = "reference_only"
+
+
+@dataclass
+class ToolObservationView(SerializableDataclass):
+    tool_call_id: str
+    tool_name: str
+    ok: bool
+    status: str
+    visibility: ToolObservationVisibility = ToolObservationVisibility.SUMMARY
+    content_preview: str = ""
+    content_digest: str = ""
+    result_ref: str | None = None
+    error_code: str | None = None
+    error_kind: ToolCallFailureKind | None = None
+    reference_ids: list[str] = field(default_factory=list)
+    observation_id: str | None = None
+    truncated: bool = False
+    redacted: bool = False
+
+    def __post_init__(self) -> None:
+        self.visibility = _enum(ToolObservationVisibility, self.visibility)
+        if isinstance(self.error_kind, str):
+            self.error_kind = ToolCallFailureKind(self.error_kind)
+        self.reference_ids = list(self.reference_ids)
+
+    @classmethod
+    def from_protocol_result(
+        cls,
+        envelope: "ToolProtocolResultEnvelope",
+        *,
+        visibility: ToolObservationVisibility | str = ToolObservationVisibility.SUMMARY,
+    ) -> "ToolObservationView":
+        return cls(
+            tool_call_id=envelope.tool_call_id,
+            tool_name=envelope.tool_name,
+            ok=envelope.ok,
+            status=envelope.status,
+            visibility=_enum(ToolObservationVisibility, visibility),
+            content_preview=envelope.content_preview,
+            content_digest=envelope.content_digest,
+            result_ref=envelope.raw_result_ref,
+            error_code=envelope.error_code,
+            error_kind=envelope.error_kind,
+            reference_ids=envelope.artifact_refs,
+            observation_id=envelope.observation_id,
+            truncated=envelope.truncated,
+            redacted=envelope.redacted,
+        )
+
+    def to_model_payload(self) -> dict[str, Any]:
+        payload = {
+            "ok": self.ok,
+            "tool_name": self.tool_name,
+            "tool_call_id": self.tool_call_id,
+            "status": self.status,
+            "content_digest": self.content_digest,
+            "result_ref": self.result_ref,
+            "error_code": self.error_code,
+            "error_kind": self.error_kind.value if self.error_kind else None,
+            "reference_ids": self.reference_ids,
+            "observation_id": self.observation_id,
+            "truncated": self.truncated,
+            "redacted": self.redacted,
+        }
+        if self.visibility is not ToolObservationVisibility.REFERENCE_ONLY:
+            payload["content"] = self.content_preview
+            payload["content_preview"] = self.content_preview
+        return payload
+
+
 @dataclass
 class ToolProtocolResultEnvelope(SerializableDataclass):
     tool_call_id: str
@@ -365,30 +439,19 @@ class ToolProtocolResultEnvelope(SerializableDataclass):
         if isinstance(self.error_kind, str):
             self.error_kind = ToolCallFailureKind(self.error_kind)
 
+    def to_observation_view(
+        self,
+        *,
+        visibility: ToolObservationVisibility | str = ToolObservationVisibility.SUMMARY,
+    ) -> ToolObservationView:
+        return ToolObservationView.from_protocol_result(self, visibility=visibility)
+
     def to_context_message(self) -> dict[str, Any]:
         return {
             "role": "tool",
             "tool_call_id": self.tool_call_id,
             "name": self.tool_name,
-            "content": json.dumps(
-                {
-                    "ok": self.ok,
-                    "tool_name": self.tool_name,
-                    "tool_call_id": self.tool_call_id,
-                    "status": self.status,
-                    "content": self.content_preview,
-                    "content_preview": self.content_preview,
-                    "content_digest": self.content_digest,
-                    "result_ref": self.raw_result_ref,
-                    "error_code": self.error_code,
-                    "error_kind": self.error_kind.value if self.error_kind else None,
-                    "reference_ids": self.artifact_refs,
-                    "observation_id": self.observation_id,
-                    "truncated": self.truncated,
-                    "redacted": self.redacted,
-                },
-                ensure_ascii=False,
-            ),
+            "content": json.dumps(self.to_observation_view().to_model_payload(), ensure_ascii=False),
         }
 
     @classmethod

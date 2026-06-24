@@ -86,6 +86,7 @@ def test_tool_protocol_result_message_omits_internal_only_fields() -> None:
         content_preview='{"content":"README"}',
         content_digest="digest_1",
         raw_result_ref="result_ref_1",
+        artifact_refs=["artifact_1"],
         policy_decision_id="policy_decision_1",
         approval_grant_id="approval_grant_1",
         metadata={
@@ -103,13 +104,16 @@ def test_tool_protocol_result_message_omits_internal_only_fields() -> None:
     assert payload["tool_name"] == "read_file"
     assert payload["content_digest"] == "digest_1"
     assert payload["result_ref"] == "result_ref_1"
+    assert payload["reference_ids"] == ["artifact_1"]
     assert "policy_decision_id" not in payload
     assert "approval_grant_id" not in payload
     assert "metadata" not in payload
+    assert "artifact_refs" not in payload
     assert "raw_arguments" not in tool_message["content"]
     assert "internal_debug" not in tool_message["content"]
     assert observation.metadata["policy_decision_id"] == "policy_decision_1"
     assert observation.metadata["approval_grant_id"] == "approval_grant_1"
+    assert observation.raw_result == payload
 
 
 def test_add_memory_context_block_adds_untrusted_memory_item() -> None:

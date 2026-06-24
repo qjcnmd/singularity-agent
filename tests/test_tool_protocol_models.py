@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from singularity.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
@@ -7,7 +9,10 @@ from singularity.tool_protocol.models import (
     ToolCallPhase,
     ToolExecutionMode,
     ToolExecutionPlan,
+    ToolObservationView,
+    ToolObservationVisibility,
     ToolProtocolRecoveryReport,
+    ToolProtocolResultEnvelope,
     ToolProtocolTurnResult,
     ToolProtocolTurnStatus,
     ToolProtocolValidationResult,
@@ -117,6 +122,41 @@ def test_tool_protocol_result_envelope_builder_captures_ref_and_redaction_flags(
     assert envelope.redacted is True
     assert envelope.truncated is True
     assert envelope.artifact_refs == ["artifact_1"]
+
+
+def test_tool_protocol_result_envelope_uses_explicit_observation_view() -> None:
+    envelope = ToolProtocolResultEnvelope(
+        tool_call_id="call_1",
+        tool_name="read_file",
+        ok=True,
+        status="ok",
+        content_preview="README preview",
+        content_digest="digest_1",
+        raw_result_ref="raw_1",
+        artifact_refs=["artifact_1"],
+        observation_id="obs_1",
+        policy_decision_id="policy_1",
+        approval_grant_id="approval_1",
+        metadata={"raw_arguments": {"path": "README.md"}, "internal_debug": "hidden"},
+    )
+
+    view = envelope.to_observation_view()
+    payload = view.to_model_payload()
+    message_payload = json.loads(envelope.to_context_message()["content"])
+    ref_payload = envelope.to_observation_view(
+        visibility=ToolObservationVisibility.REFERENCE_ONLY
+    ).to_model_payload()
+
+    assert isinstance(view, ToolObservationView)
+    assert view.visibility == ToolObservationVisibility.SUMMARY
+    assert message_payload == payload
+    assert payload["content_preview"] == "README preview"
+    assert "policy_decision_id" not in payload
+    assert "approval_grant_id" not in payload
+    assert "metadata" not in payload
+    assert "content" not in ref_payload
+    assert "content_preview" not in ref_payload
+    assert ref_payload["result_ref"] == "raw_1"
 
 
 def test_protocol_status_and_report_models_are_serializable() -> None:

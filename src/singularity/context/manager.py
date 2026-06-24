@@ -376,6 +376,7 @@ class ContextManager:
             else envelope
         )
         payload = result_envelope.to_dict()
+        model_payload = result_envelope.to_observation_view().to_model_payload()
         preview = str(payload.get("content_preview") or "")
         sensitivity = self.classifier.classify(payload)
         rendered_preview = (
@@ -383,6 +384,11 @@ class ContextManager:
             if sensitivity in {ContextSensitivity.SECRET, ContextSensitivity.SENSITIVE}
             else preview
         )
+        if "content" in model_payload:
+            model_payload["content"] = rendered_preview
+        if "content_preview" in model_payload:
+            model_payload["content_preview"] = rendered_preview
+        model_payload["redacted"] = True
         raw_digest = digest_value(payload)
         metadata = {
             "status": payload.get("status"),
@@ -404,22 +410,7 @@ class ContextManager:
             tool_name=str(payload.get("tool_name") or "<unknown>"),
             tool_call_id=payload.get("tool_call_id"),
             ok=bool(payload.get("ok")),
-            raw_result={
-                "tool_call_id": payload.get("tool_call_id"),
-                "tool_name": payload.get("tool_name"),
-                "status": payload.get("status"),
-                "ok": bool(payload.get("ok")),
-                "content": rendered_preview,
-                "content_preview": rendered_preview,
-                "content_digest": payload.get("content_digest"),
-                "result_ref": payload.get("raw_result_ref"),
-                "artifact_refs": list(payload.get("artifact_refs") or []),
-                "error_code": payload.get("error_code"),
-                "error_kind": payload.get("error_kind"),
-                "observation_id": payload.get("observation_id"),
-                "truncated": bool(payload.get("truncated")),
-                "redacted": True,
-            },
+            raw_result=model_payload,
             preview=rendered_preview,
             truncated=bool(payload.get("truncated")),
             metadata=metadata,
