@@ -286,6 +286,24 @@ class ObservationStore:
             for row in rows
         ]
 
+    def record_event(
+        self,
+        run_id: str,
+        *,
+        event_type: str,
+        payload: dict[str, Any],
+        item_id: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._ensure_run(run_id)
+            self._append_event(
+                run_id,
+                event_type=event_type,
+                item_id=item_id,
+                payload=payload,
+            )
+            self._connection.commit()
+
     def save_observation(self, observation: ToolObservation) -> None:
         with self._lock:
             self._ensure_run(observation.run_id)
@@ -627,6 +645,37 @@ class ObservationStore:
                 "metadata": json.loads(row["metadata"] or "{}"),
             }
         )
+
+    def update_bundle_metadata(
+        self,
+        *,
+        bundle_id: str,
+        run_id: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self._connection.execute(
+                """
+                update context_bundles
+                set metadata = ?
+                where bundle_id = ? and run_id = ?
+                """,
+                (
+                    json.dumps(metadata, ensure_ascii=False, default=str),
+                    bundle_id,
+                    run_id,
+                ),
+            )
+            self._append_event(
+                run_id,
+                event_type="context.bundle_usage_recorded",
+                item_id=bundle_id,
+                payload={
+                    "cache": metadata.get("cache") or {},
+                    "context_usage_report": metadata.get("context_usage_report") or {},
+                },
+            )
+            self._connection.commit()
 
     def save_summary(
         self,

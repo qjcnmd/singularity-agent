@@ -269,6 +269,7 @@ def _model_usage_summary(events: list[TraceEvent]) -> dict[str, Any]:
         "cached_input_tokens": 0,
         "reasoning_tokens": 0,
         "request_cache_hit_rates": {},
+        "cache_miss_reasons": {},
         "run_cache_hit_rate": 0.0,
     }
     for event in events:
@@ -293,6 +294,9 @@ def _model_usage_summary(events: list[TraceEvent]) -> dict[str, Any]:
                     cached_tokens,
                     input_tokens,
                 )
+                reasons = event.payload.get("cache_miss_reasons") or (event.payload.get("cache") or {}).get("cache_miss_reasons") or []
+                if reasons:
+                    usage["cache_miss_reasons"][request_id] = [str(reason) for reason in reasons]
         elif event.event_type == TraceEventType.MODEL_REQUEST_FAILED:
             usage["failures"] += 1
         elif event.event_type == TraceEventType.MODEL_TOOL_CALL_PROPOSED:

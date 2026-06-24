@@ -82,6 +82,7 @@ class ModelRuntime:
         self.validator = ModelResponseValidator(tool_registry)
         self.budget_manager = ModelBudgetManager()
         self.turn_count = 0
+        self._last_cache_shape: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def with_mock_provider(
@@ -227,6 +228,7 @@ class ModelRuntime:
                     budget=request.budget,
                     latency_ms=latency_ms,
                 )
+                cache_metadata = self._cache_metadata(request, provider_response.usage)
                 event_ids.extend(
                     self._emit_output_rejected(request, provider_response, validation.errors)
                 )
@@ -244,9 +246,21 @@ class ModelRuntime:
                     latency_ms=latency_ms,
                     trace_event_ids=event_ids,
                     raw_response_ref=self._write_raw_artifact(request, provider_response),
+                    metadata={
+                        "cache": cache_metadata,
+                        "cache_miss_reasons": cache_metadata["cache_miss_reasons"],
+                    },
                 )
             raw_ref = self._write_raw_artifact(request, provider_response)
-            event_ids.extend(self._emit_response_received(request, provider_response, raw_ref))
+            cache_metadata = self._cache_metadata(request, provider_response.usage)
+            event_ids.extend(
+                self._emit_response_received(
+                    request,
+                    provider_response,
+                    raw_ref,
+                    cache_metadata=cache_metadata,
+                )
+            )
             for tool_call in tool_calls:
                 event_ids.extend(self._emit_tool_call(request, tool_call, provider))
             latency_ms = _latency_ms(started)
@@ -269,6 +283,14 @@ class ModelRuntime:
                 latency_ms=latency_ms,
                 trace_event_ids=event_ids,
                 raw_response_ref=raw_ref,
+                metadata={
+                    "cache": cache_metadata,
+                    "cache_miss_reasons": cache_metadata["cache_miss_reasons"],
+                    "context_bundle_metadata": {
+                        **dict(request.context_metadata.get("context_bundle_metadata") or {}),
+                        "cache": cache_metadata,
+                    },
+                },
             )
             if capability_adjustments:
                 result.metadata["capability_adjustments"] = capability_adjustments
@@ -637,6 +659,8 @@ class ModelRuntime:
         request: ModelTurnRequest,
         response: ProviderResponse,
         raw_ref: str | None,
+        *,
+        cache_metadata: dict[str, Any],
     ) -> list[str]:
         payload = {
             "request_id": request.request_id,
@@ -647,6 +671,8 @@ class ModelRuntime:
             "tool_call_count": len(response.tool_calls),
             "content_hash": _hash_text(response.message.text),
             "usage": response.usage.to_dict(),
+            "cache": cache_metadata,
+            "cache_miss_reasons": cache_metadata["cache_miss_reasons"],
             "raw_response_ref": raw_ref,
         }
         return self._emit(
@@ -655,6 +681,82 @@ class ModelRuntime:
             payload=payload,
             ids=self._trace_ids(request),
         )
+
+    def _cache_metadata(
+        self,
+        request: ModelTurnRequest,
+        usage: ModelUsage,
+    ) -> dict[str, Any]:
+        input_tokens = int(usage.input_tokens or 0)
+        cached_tokens = int(usage.cached_input_tokens or 0)
+        response_cache = dict((request.trace_metadata or {}).get("cache") or {})
+        shape = {
+            "stable_prefix_hash": request.context_metadata.get("stable_prefix_hash"),
+            "dynamic_tail_hash": request.context_metadata.get("dynamic_tail_hash"),
+            "tool_schema_hash": request.context_metadata.get("tool_schema_hash"),
+            "context_shape_hash": request.context_metadata.get("context_shape_hash"),
+            "context_ordering_hash": request.context_metadata.get("context_ordering_hash"),
+            "compression_snapshot_id": request.context_metadata.get("compression_snapshot_id"),
+        }
+        cache_key = f"{request.run_id}:{request.session_id}:{request.task_id}"
+        previous = self._last_cache_shape.get(cache_key)
+        reasons: list[str] = []
+        source = "unknown"
+        confidence = 0.0
+        evidence: list[str] = []
+        provider_name = response_cache.get("provider_name") or request.model_preferences.provider_name
+        model_name = response_cache.get("model_name") or request.model_preferences.model_name
+        if cached_tokens > 0:
+            source = "provider_native"
+            confidence = 1.0
+            evidence.append("usage.cached_input_tokens")
+        elif isinstance(response_cache.get("cache_attribution"), dict):
+            attribution = dict(response_cache.get("cache_attribution") or {})
+            source = str(attribution.get("source") or "runtime_inferred")
+            confidence = float(attribution.get("confidence") or 0.0)
+            reasons.extend(str(item) for item in attribution.get("reasons") or [])
+            evidence.extend(str(item) for item in attribution.get("evidence") or [])
+            provider_name = attribution.get("provider_name") or provider_name
+            model_name = attribution.get("model_name") or model_name
+        if cached_tokens == 0 and source == "unknown":
+            source = "runtime_inferred"
+            confidence = 0.35 if previous is not None else 0.2
+            if previous is None:
+                reasons.append("first_request")
+            else:
+                reasons.append("provider_cache_diagnostics_missing")
+        if input_tokens > 0 and cached_tokens == 0:
+            if previous is None:
+                reasons.append("first_request")
+            else:
+                if previous.get("tool_schema_hash") != shape.get("tool_schema_hash"):
+                    reasons.append("tool_schema_change")
+                if previous.get("context_shape_hash") != shape.get("context_shape_hash") or previous.get("dynamic_tail_hash") != shape.get("dynamic_tail_hash"):
+                    reasons.append("context_shape_change")
+                if previous.get("compression_snapshot_id") != shape.get("compression_snapshot_id"):
+                    reasons.append("compaction_change")
+                if previous.get("context_ordering_hash") != shape.get("context_ordering_hash"):
+                    reasons.append("ordering_change")
+                if not reasons:
+                    reasons.append("provider_cache_miss")
+        self._last_cache_shape[cache_key] = shape
+        reasons = list(dict.fromkeys(reasons))
+        evidence = list(dict.fromkeys(evidence))
+        return {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_tokens,
+            "cache_hit_ratio": _cache_ratio(cached_tokens, input_tokens),
+            "cache_miss_reasons": reasons,
+            "cache_attribution": {
+                "source": source,
+                "confidence": confidence,
+                "reasons": reasons,
+                "evidence": evidence,
+                "provider_name": provider_name,
+                "model_name": model_name,
+            },
+            **{key: value for key, value in shape.items() if value is not None},
+        }
 
     def _emit_tool_call(
         self,
@@ -795,6 +897,12 @@ def _hash_text(text: str) -> str:
     import hashlib
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _cache_ratio(cached_tokens: int, input_tokens: int) -> float:
+    if input_tokens <= 0:
+        return 0.0
+    return round(cached_tokens / input_tokens, 4)
 
 
 def _throw_if_cancelled(runtime: Any) -> None:

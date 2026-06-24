@@ -185,6 +185,7 @@ class SingularityAgent:
             )
             planner.record_instruction_prompt_observation(instruction_runtime.summary())
             result = model_runtime.run_turn(request)
+            context.record_model_usage(result)
             if result.status != ModelTurnStatus.SUCCESS:
                 self._record_model_failure(planner, result, turn=turn)
                 outcome = self._outcome_from_model_failure(result)

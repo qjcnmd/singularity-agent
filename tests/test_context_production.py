@@ -2,6 +2,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from singularity.context import (
     ReferenceResolver,
     TokenCounter,
 )
+from singularity.model import ModelUsage
 from singularity.provider import ToolChoiceMode
 
 
@@ -244,6 +246,32 @@ def test_observation_store_persists_result_digest_preview_and_references(tmp_pat
     assert reloaded.raw_digest == observation.raw_digest
     assert refs[0].path == "README.md"
     assert refs[0].digest == observation.raw_digest
+
+
+def test_context_bundle_metadata_records_model_cache_usage(tmp_path: Path) -> None:
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="user",
+        db_path=tmp_path / "context.sqlite3",
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+    bundle = context.build_bundle(persist=True)
+
+    context.record_model_usage(
+        SimpleNamespace(
+            usage=ModelUsage(input_tokens=100, output_tokens=5, cached_input_tokens=40),
+            metadata={"cache_miss_reasons": ["context_shape_change"]},
+        )
+    )
+
+    reloaded = context.store.latest_bundle(context.run_id)
+    assert reloaded.bundle_id == bundle.bundle_id
+    assert reloaded.metadata["cache"]["cached_input_tokens"] == 40
+    assert reloaded.metadata["cache"]["cache_hit_ratio"] == 0.4
+    assert reloaded.metadata["cache"]["cache_attribution"]["source"] == "provider_native"
+    assert reloaded.metadata["context_usage_report"]["cache_miss_reasons"] == [
+        "context_shape_change"
+    ]
 
 
 def test_observation_store_does_not_persist_raw_result_or_secret_metadata(tmp_path: Path) -> None:

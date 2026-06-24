@@ -314,3 +314,54 @@ def test_assembler_renders_tool_previews_with_reference_ids_not_raw_outputs() ->
     assert "short preview" in rendered
     assert "ref_readme" in rendered
     assert "raw raw raw" not in rendered
+
+
+def test_assembler_bounds_large_fragments_and_reports_context_shape() -> None:
+    assembler = ContextAssembler(
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+        model_context_window=2500,
+        output_token_reserve=20,
+    )
+    huge = item(
+        "workspace_big",
+        layer=ContextLayer.WORKSPACE_STATE,
+        item_type=ContextItemType.WORKSPACE_STATE,
+        content={"raw": "x" * 40000},
+        importance=0.9,
+    )
+
+    bundle = assembler.build_bundle(
+        items=[
+            item(
+                "system",
+                layer=ContextLayer.SYSTEM,
+                item_type=ContextItemType.SYSTEM_INSTRUCTION,
+                content="system",
+                pinned=True,
+            ),
+            item(
+                "goal",
+                layer=ContextLayer.USER_GOAL,
+                item_type=ContextItemType.USER_GOAL,
+                content="goal",
+                pinned=True,
+            ),
+            huge,
+        ],
+        run_id="run_1",
+        task_id="task_1",
+        phase_id="inspect",
+        model="gpt-4o-mini",
+        provider="mock",
+        render_policy=ContextRenderPolicy(),
+    )
+
+    rendered = "\n".join(str(message.get("content")) for message in bundle.messages)
+
+    assert "workspace_big" in rendered
+    assert "source=tool" in rendered
+    assert "digest=" in rendered
+    assert "[truncated:context_fragment_cap]" in rendered
+    assert bundle.metadata["context_shape_hash"]
+    assert bundle.metadata["context_ordering_hash"]
+    assert bundle.metadata["context_usage_report"]["included_item_ids"]

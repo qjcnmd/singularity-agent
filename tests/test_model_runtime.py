@@ -15,6 +15,7 @@ from singularity.model import (
     ModelTurnStatus,
     ModelToolCall,
     ModelToolParseStatus,
+    ModelUsage,
     ToolChoiceMode,
     ToolChoicePolicy,
 )
@@ -217,6 +218,82 @@ def test_model_runtime_respects_empty_allowed_tools_from_context(tmp_path: Path)
     assert result.status == ModelTurnStatus.INVALID
     assert result.validation is not None
     assert "unknown_tool" in result.validation.errors
+
+
+def test_model_runtime_records_cache_hit_ratio_in_result_and_trace(tmp_path: Path) -> None:
+    trace = TraceRuntime.create(tmp_path, run_id="run_1", session_id="session_1")
+    provider = MockModelProvider(
+        text="ok",
+        usage=ModelUsage(input_tokens=100, output_tokens=5, cached_input_tokens=75),
+    )
+    runtime = ModelRuntime.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        trace=trace,
+    )
+
+    result = runtime.run_turn(
+        ModelTurnRequest(
+            request_id="req_cache",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="phase",
+            action_id="action",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[{"role": "user", "content": "hello"}],
+            context_metadata={
+                "stable_prefix_hash": "stable",
+                "dynamic_tail_hash": "tail",
+                "tool_schema_hash": "tools",
+                "context_shape_hash": "shape",
+                "context_ordering_hash": "order",
+            },
+        )
+    )
+
+    assert result.metadata["cache"]["cache_hit_ratio"] == 0.75
+    response = [
+        event
+        for event in trace.store.query_events()
+        if event.event_type.value == "model.response.received"
+    ][0]
+    assert response.payload["cache"]["cached_input_tokens"] == 75
+    assert response.payload["cache"]["cache_attribution"]["source"] == "provider_native"
+
+
+def test_model_runtime_marks_cache_miss_reason_for_tool_schema_change(tmp_path: Path) -> None:
+    provider = MockModelProvider(
+        text="ok",
+        usage=ModelUsage(input_tokens=100, output_tokens=5, cached_input_tokens=0),
+    )
+    runtime = ModelRuntime.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+
+    def request(request_id: str, tool_hash: str) -> ModelTurnRequest:
+        return ModelTurnRequest(
+            request_id=request_id,
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="phase",
+            action_id=request_id,
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[{"role": "user", "content": "hello"}],
+            context_metadata={
+                "stable_prefix_hash": "stable",
+                "dynamic_tail_hash": "tail",
+                "tool_schema_hash": tool_hash,
+                "context_shape_hash": "shape",
+                "context_ordering_hash": "order",
+            },
+        )
+
+    first = runtime.run_turn(request("req_1", "tools_a"))
+    second = runtime.run_turn(request("req_2", "tools_b"))
+
+    assert first.metadata["cache_miss_reasons"] == ["first_request"]
+    assert "tool_schema_change" in second.metadata["cache_miss_reasons"]
+    assert second.metadata["cache"]["cache_attribution"]["source"] == "runtime_inferred"
 
 
 def test_model_runtime_downgrades_json_stream_and_parallel_tool_preferences(

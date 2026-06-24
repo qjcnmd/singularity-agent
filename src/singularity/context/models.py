@@ -86,6 +86,12 @@ class ContextSensitivity(str, Enum):
     SECRET = "secret"
 
 
+class CacheAttributionSource(str, Enum):
+    PROVIDER_NATIVE = "provider_native"
+    RUNTIME_INFERRED = "runtime_inferred"
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class ContextReference:
     ref_id: str
@@ -337,6 +343,25 @@ class ContextBundle:
 
 
 @dataclass
+class ContextUsageReport:
+    layer_token_usage: dict[str, int] = field(default_factory=dict)
+    included_item_ids: list[str] = field(default_factory=list)
+    excluded_item_ids: list[str] = field(default_factory=list)
+    stale_item_ids: list[str] = field(default_factory=list)
+    summary_item_ids: list[str] = field(default_factory=list)
+    recent_tail_item_ids: list[str] = field(default_factory=list)
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_hit_ratio: float = 0.0
+    cache_miss_reasons: list[str] = field(default_factory=list)
+    cache_attribution: "CacheAttribution" = field(default_factory=lambda: CacheAttribution())
+    recommendations: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_plain(self)
+
+
+@dataclass
 class ContextSnapshot:
     snapshot_id: str
     run_id: str
@@ -486,6 +511,113 @@ class ContextSummaryPayload:
     reference_ids: list[str]
     omitted_item_ids: list[str]
     confidence: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_plain(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ContextSummaryPayload":
+        return cls(
+            goal=str(payload.get("goal") or ""),
+            current_state=str(payload.get("current_state") or ""),
+            completed_actions=list(payload.get("completed_actions") or []),
+            pending_actions=list(payload.get("pending_actions") or []),
+            verified_facts=list(payload.get("verified_facts") or []),
+            failed_attempts=list(payload.get("failed_attempts") or []),
+            policy_constraints=[str(item) for item in payload.get("policy_constraints") or []],
+            workspace_changes=list(payload.get("workspace_changes") or []),
+            verification_status=str(payload.get("verification_status") or "unknown"),
+            open_questions=list(payload.get("open_questions") or []),
+            reference_ids=[str(item) for item in payload.get("reference_ids") or []],
+            omitted_item_ids=[str(item) for item in payload.get("omitted_item_ids") or []],
+            confidence=float(payload.get("confidence") or 0.5),
+        )
+
+
+@dataclass
+class CacheAttribution:
+    source: CacheAttributionSource | str = CacheAttributionSource.UNKNOWN
+    confidence: float = 0.0
+    reasons: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    provider_name: str | None = None
+    model_name: str | None = None
+
+    def __post_init__(self) -> None:
+        self.source = _enum(CacheAttributionSource, self.source)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_plain(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "CacheAttribution":
+        payload = payload or {}
+        return cls(
+            source=payload.get("source") or CacheAttributionSource.UNKNOWN,
+            confidence=float(payload.get("confidence") or 0.0),
+            reasons=[str(item) for item in payload.get("reasons") or []],
+            evidence=[str(item) for item in payload.get("evidence") or []],
+            provider_name=payload.get("provider_name"),
+            model_name=payload.get("model_name"),
+        )
+
+
+@dataclass
+class ContextSummaryEnvelope:
+    version: int = 1
+    summary_id: str = ""
+    summary_payload: ContextSummaryPayload | None = None
+    source_item_ids: list[str] = field(default_factory=list)
+    cache_attribution: CacheAttribution = field(default_factory=CacheAttribution)
+    previous_summary_digest: str | None = None
+    summary_digest: str = ""
+    rendered_summary: str = ""
+    created_at: str = field(default_factory=lambda: _now())
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.version = int(self.version or 1)
+        self.cache_attribution = (
+            self.cache_attribution
+            if isinstance(self.cache_attribution, CacheAttribution)
+            else CacheAttribution.from_dict(self.cache_attribution)
+        )
+        if self.summary_payload is not None and not isinstance(self.summary_payload, ContextSummaryPayload):
+            self.summary_payload = ContextSummaryPayload.from_dict(self.summary_payload)
+        if not self.summary_digest and self.summary_payload is not None:
+            self.summary_digest = digest_value(self.summary_payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_plain(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ContextSummaryEnvelope":
+        raw_payload = payload.get("summary_payload")
+        if raw_payload is None and isinstance(payload.get("payload"), dict):
+            raw_payload = payload.get("payload")
+        if raw_payload is None:
+            raw_payload = payload
+        summary_payload = (
+            ContextSummaryPayload.from_dict(raw_payload)
+            if isinstance(raw_payload, dict)
+            else None
+        )
+        return cls(
+            version=int(payload.get("version") or 1),
+            summary_id=str(payload.get("summary_id") or payload.get("id") or ""),
+            summary_payload=summary_payload,
+            source_item_ids=[str(item) for item in payload.get("source_item_ids") or []],
+            cache_attribution=CacheAttribution.from_dict(
+                payload.get("cache_attribution")
+                or payload.get("cache")
+                or {},
+            ),
+            previous_summary_digest=payload.get("previous_summary_digest"),
+            summary_digest=str(payload.get("summary_digest") or ""),
+            rendered_summary=str(payload.get("rendered_summary") or payload.get("summary_text") or ""),
+            created_at=str(payload.get("created_at") or _now()),
+            metadata=dict(payload.get("metadata") or {}),
+        )
 
 
 @dataclass

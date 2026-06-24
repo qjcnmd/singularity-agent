@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -16,9 +17,16 @@ from singularity.context.models import (
     ContextLayer,
     ContextRenderPolicy,
     ContextSensitivity,
+    ContextUsageReport,
+    CacheAttribution,
+    CacheAttributionSource,
 )
 from singularity.context.redaction import ContextRedactor
 from singularity.context.tokens import TokenCounter
+
+
+MAX_CONTEXT_FRAGMENT_TOKENS = 1000
+MAX_CONTEXT_FRAGMENT_BYTES = 12000
 
 
 class ContextOverflowError(ValueError):
@@ -72,7 +80,7 @@ class ContextAssembler:
             item
             for item in items
             if self._is_visible(item, policy)
-            and item.freshness != ContextFreshness.OBSOLETE
+            and item.freshness == ContextFreshness.CURRENT
         ]
         groups = self._groups_for_items(
             visible_items,
@@ -113,6 +121,14 @@ class ContextAssembler:
             and item.layer not in {ContextLayer.SYSTEM, ContextLayer.USER_GOAL}
         ]
         budget = self._budget_for_messages(messages, tool_tokens)
+        item_by_id = {item.item_id: item for item in items}
+        context_shape = self._context_shape(selected, item_by_id)
+        usage_report = self._usage_report(
+            items,
+            included_item_ids=included,
+            excluded_item_ids=excluded,
+            budget=budget,
+        )
         bundle = ContextBundle(
             bundle_id=f"bundle_{uuid4().hex[:12]}",
             run_id=run_id,
@@ -130,6 +146,22 @@ class ContextAssembler:
             metadata={
                 "exclusion_reasons": self._exclusion_reasons(items, included),
                 "lost_evidence_warning": self._lost_evidence_warning(items, included),
+                "context_shape_hash": _hash_json(context_shape),
+                "context_ordering_hash": _hash_json(included),
+                "context_shape": context_shape,
+                "cache": {
+                    "input_tokens": budget.message_tokens + budget.tool_schema_tokens,
+                    "cached_input_tokens": 0,
+                    "cache_hit_ratio": 0.0,
+                    "cache_miss_reasons": [],
+                    "cache_attribution": CacheAttribution(
+                        source=CacheAttributionSource.UNKNOWN,
+                        confidence=0.0,
+                        reasons=[],
+                        evidence=[],
+                    ).to_dict(),
+                },
+                "context_usage_report": usage_report.to_dict(),
             },
         )
         return bundle
@@ -247,11 +279,29 @@ class ContextAssembler:
             message = dict(item.content)
             if policy.redact_sensitive:
                 message["content"] = self.redactor.redact_value(message.get("content"))
+            if message.get("role") == "tool":
+                message["content"] = self._bounded_tool_content(
+                    str(message.get("content") or ""),
+                    max_tokens=policy.max_tool_preview_tokens,
+                )
+                return message
+            if (
+                item.layer not in {ContextLayer.SYSTEM, ContextLayer.USER_GOAL}
+                and not message.get("tool_calls")
+            ):
+                message["content"] = self._bounded_fragment(item, message.get("content"))
             return message
         if item.metadata.get("raw_message"):
             content = item.content
             if policy.redact_sensitive:
                 content = self.redactor.redact_value(content)
+            if item.layer not in {ContextLayer.SYSTEM, ContextLayer.USER_GOAL}:
+                raw = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
+                content = (
+                    f"{self._bounded_text(raw, max_tokens=MAX_CONTEXT_FRAGMENT_TOKENS)}\n"
+                    f"[context:{item.item_id} {item.layer.value}/{item.item_type.value} "
+                    f"source={item.source_runtime.value} digest={item.content_digest[:12]}]"
+                )
             return {
                 "role": str(item.metadata.get("role") or "system"),
                 "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str),
@@ -266,15 +316,19 @@ class ContextAssembler:
         if item.item_type == ContextItemType.TOOL_OBSERVATION:
             content = self._render_tool_observation(item, policy)
         elif item.layer == ContextLayer.COMPRESSED_HISTORY and item.item_type == ContextItemType.SUMMARY:
-            content = f"Context summary:\n{item.content}"
+            content = (
+                "Context summary:\n"
+                f"{self._bounded_text(str(item.content), max_tokens=160)}"
+            )
         elif item.layer not in {ContextLayer.SYSTEM, ContextLayer.USER_GOAL}:
             refs = [ref.ref_id for ref in item.references]
             payload = json.dumps(item.content, ensure_ascii=False, sort_keys=True, default=str)
             refs_text = f" refs={','.join(refs)}" if refs else ""
             content = (
                 f"[context:{item.item_id} {item.layer.value}/{item.item_type.value}"
-                f" source={item.source_runtime.value} fresh={item.freshness.value}{refs_text}] "
-                f"{payload}"
+                f" source={item.source_runtime.value} fresh={item.freshness.value}"
+                f" digest={item.content_digest[:12]}{refs_text}] "
+                f"{self._bounded_text(payload, max_tokens=MAX_CONTEXT_FRAGMENT_TOKENS)}"
             )
         if policy.redact_sensitive:
             content = self.redactor.redact_value(content)
@@ -289,25 +343,155 @@ class ContextAssembler:
         policy: ContextRenderPolicy,
     ) -> dict[str, Any]:
         content = item.content if isinstance(item.content, dict) else {"preview": item.content}
+        metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
         rendered = {
             "context_item_id": item.item_id,
             "tool_name": content.get("tool_name"),
             "tool_call_id": content.get("tool_call_id"),
             "ok": content.get("ok"),
-            "preview": content.get("preview") or content.get("content"),
+            "preview": self._bounded_text(
+                str(content.get("preview") or content.get("content") or ""),
+                max_tokens=policy.max_tool_preview_tokens,
+            ),
             "truncated": content.get("truncated"),
             "reference_ids": content.get("reference_ids")
             or [ref.ref_id for ref in item.references],
             "raw_digest": content.get("raw_digest"),
+            "artifact_refs": content.get("artifact_refs") or metadata.get("artifact_refs") or [],
+            "logs_ref": content.get("logs_ref") or metadata.get("logs_ref"),
         }
         if policy.include_raw_tool_outputs:
             rendered["raw_result"] = content.get("raw_result")
         return rendered
 
     def _is_visible(self, item: ContextItem, policy: ContextRenderPolicy) -> bool:
+        if item.pinned:
+            return True
         if item.sensitivity == ContextSensitivity.SECRET and not policy.include_secret_content:
             return policy.redact_sensitive
         return True
+
+    def _bounded_fragment(self, item: ContextItem, value: Any) -> str:
+        raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        bounded = self._bounded_text(raw, max_tokens=MAX_CONTEXT_FRAGMENT_TOKENS)
+        token_count = self.token_counter.count_text(bounded)
+        byte_count = len(bounded.encode("utf-8"))
+        return (
+            f"[context:{item.item_id} {item.layer.value}/{item.item_type.value} "
+            f"source={item.source_runtime.value} digest={item.content_digest[:12]} "
+            f"t={token_count} b={byte_count}] {bounded}"
+        )
+
+    def _bounded_text(self, text: str, *, max_tokens: int) -> str:
+        value = text
+        encoded = value.encode("utf-8")
+        truncated = False
+        if len(encoded) > MAX_CONTEXT_FRAGMENT_BYTES:
+            value = encoded[:MAX_CONTEXT_FRAGMENT_BYTES].decode("utf-8", errors="ignore")
+            truncated = True
+        for _ in range(4):
+            token_count = self.token_counter.count_text(value)
+            if token_count <= max_tokens:
+                break
+            keep = max(1, int(len(value) * max_tokens / max(token_count, 1)))
+            value = value[:keep]
+            truncated = True
+        if truncated:
+            value = value.rstrip() + "\n[truncated:context_fragment_cap]"
+        return value
+
+    def _bounded_tool_content(self, content: str, *, max_tokens: int) -> str:
+        if self.token_counter.count_text(content) <= max_tokens:
+            return content
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            return self._bounded_text(content, max_tokens=max_tokens)
+        if not isinstance(payload, dict):
+            return self._bounded_text(content, max_tokens=max_tokens)
+        for key in ("preview", "content", "content_preview"):
+            if isinstance(payload.get(key), str):
+                payload[key] = self._bounded_text(
+                    payload[key],
+                    max_tokens=max(32, max_tokens // 2),
+                )
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            payload["metadata"] = {
+                key: value
+                for key, value in metadata.items()
+                if key in {"status", "result_ref", "policy_decision_id", "tool_name"}
+            }
+        payload["truncated"] = True
+        payload["truncation_reason"] = payload.get("truncation_reason") or "context_fragment_cap"
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _context_shape(
+        self,
+        groups: list[_RenderGroup],
+        item_by_id: dict[str, ContextItem],
+    ) -> list[dict[str, Any]]:
+        shape: list[dict[str, Any]] = []
+        for group in groups:
+            for item_id in group.item_ids:
+                item = item_by_id.get(item_id)
+                if item is None:
+                    continue
+                shape.append(
+                    {
+                        "layer": item.layer.value,
+                        "item_type": item.item_type.value,
+                        "source_runtime": item.source_runtime.value,
+                        "role": group.messages[0].get("role") if group.messages else "",
+                    }
+                )
+        return shape
+
+    def _usage_report(
+        self,
+        items: list[ContextItem],
+        *,
+        included_item_ids: list[str],
+        excluded_item_ids: list[str],
+        budget: ContextBudgetPlan,
+    ) -> ContextUsageReport:
+        included = set(included_item_ids)
+        layer_tokens: dict[str, int] = {}
+        for item in items:
+            if item.item_id not in included:
+                continue
+            layer_tokens[item.layer.value] = layer_tokens.get(item.layer.value, 0) + int(item.token_count or 0)
+        stale = [
+            item.item_id
+            for item in items
+            if item.freshness != ContextFreshness.CURRENT and not item.pinned
+        ]
+        summary = [
+            item.item_id
+            for item in items
+            if item.item_id in included and item.layer == ContextLayer.COMPRESSED_HISTORY
+        ]
+        recent_tail = [
+            item.item_id
+            for item in items
+            if item.item_id in included and item.layer == ContextLayer.RECENT_DIALOGUE
+        ]
+        recommendations: list[str] = []
+        if excluded_item_ids:
+            recommendations.append("compact_or_retrieve_excluded_context")
+        if stale:
+            recommendations.append("avoid_reintroducing_stale_items")
+        return ContextUsageReport(
+            layer_token_usage=layer_tokens,
+            included_item_ids=list(included_item_ids),
+            excluded_item_ids=list(excluded_item_ids),
+            stale_item_ids=stale,
+            summary_item_ids=summary,
+            recent_tail_item_ids=recent_tail,
+            input_tokens=budget.message_tokens + budget.tool_schema_tokens,
+            cache_miss_reasons=[],
+            recommendations=recommendations,
+        )
 
     def _score_item(self, item: ContextItem, phase_id: str) -> float:
         score = float(item.importance)
@@ -523,3 +707,8 @@ def _layer_order(layer: ContextLayer) -> int:
         ContextLayer.PLANNER_STATE: 4,
     }
     return order.get(layer, 50)
+
+
+def _hash_json(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

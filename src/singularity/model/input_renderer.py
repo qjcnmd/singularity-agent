@@ -105,6 +105,8 @@ class ModelInputRenderer:
             dynamic_messages = messages[2:]
 
         tool_schema_hash = self.tool_renderer.schema_hash(tools)
+        context_bundle = getattr(context, "last_bundle", None)
+        context_bundle_metadata = dict(getattr(context_bundle, "metadata", None) or {})
         prompt_metadata = (
             {
                 "prompt_manifest_id": prompt_bundle.manifest.manifest_id,
@@ -122,6 +124,12 @@ class ModelInputRenderer:
             "dynamic_tail_hash": _messages_hash(dynamic_messages),
             "tool_schema_hash": tool_schema_hash,
             "tool_names": [tool.name for tool in tools],
+            "context_bundle_id": getattr(context_bundle, "bundle_id", None),
+            "context_bundle_digest": getattr(context_bundle, "bundle_digest", None),
+            "compression_snapshot_id": getattr(context_bundle, "compression_snapshot_id", None),
+            "context_shape_hash": context_bundle_metadata.get("context_shape_hash"),
+            "context_ordering_hash": context_bundle_metadata.get("context_ordering_hash"),
+            "context_bundle_metadata": context_bundle_metadata,
         }
         rendered_tool_names = [tool.name for tool in tools]
         return ModelTurnRequest(
