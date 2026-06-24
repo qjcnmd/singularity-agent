@@ -1,5 +1,8 @@
+import json
+
 from singularity.context import ContextManager
 from singularity.memory.models import MemoryContextBlock
+from singularity.tool_protocol.models import ToolProtocolResultEnvelope
 
 
 def test_context_manager_initializes_system_and_user_messages() -> None:
@@ -71,6 +74,42 @@ def test_long_tool_result_is_truncated_in_message_but_raw_result_is_preserved() 
     assert '"truncated": true' in tool_message["content"]
     assert long_content not in tool_message["content"]
     assert "x" * 4000 in tool_message["content"]
+
+
+def test_tool_protocol_result_message_omits_internal_only_fields() -> None:
+    context = ContextManager(system_prompt="system rules", user_goal="inspect project")
+    envelope = ToolProtocolResultEnvelope(
+        tool_call_id="call_internal",
+        tool_name="read_file",
+        ok=True,
+        status="ok",
+        content_preview='{"content":"README"}',
+        content_digest="digest_1",
+        raw_result_ref="result_ref_1",
+        policy_decision_id="policy_decision_1",
+        approval_grant_id="approval_grant_1",
+        metadata={
+            "cache_hit": True,
+            "raw_arguments": {"path": "README.md"},
+            "internal_debug": {"policy": "allow"},
+        },
+    )
+
+    observation = context.add_tool_protocol_result(envelope)
+
+    tool_message = context.messages()[-1]
+    payload = json.loads(tool_message["content"])
+    assert payload["tool_call_id"] == "call_internal"
+    assert payload["tool_name"] == "read_file"
+    assert payload["content_digest"] == "digest_1"
+    assert payload["result_ref"] == "result_ref_1"
+    assert "policy_decision_id" not in payload
+    assert "approval_grant_id" not in payload
+    assert "metadata" not in payload
+    assert "raw_arguments" not in tool_message["content"]
+    assert "internal_debug" not in tool_message["content"]
+    assert observation.metadata["policy_decision_id"] == "policy_decision_1"
+    assert observation.metadata["approval_grant_id"] == "approval_grant_1"
 
 
 def test_add_memory_context_block_adds_untrusted_memory_item() -> None:

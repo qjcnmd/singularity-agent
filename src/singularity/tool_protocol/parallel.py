@@ -4,8 +4,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
-from singularity.tool_protocol.models import ToolCallEnvelope
+from singularity.tool_protocol.models import ToolCallBatch, ToolCallEnvelope
 from singularity.tools import ToolResult, ToolRuntime
+from singularity.tools.models import ToolExecutionRequest
 
 
 @dataclass(frozen=True)
@@ -25,13 +26,14 @@ class ParallelToolExecutor:
         calls: list[ToolCallEnvelope],
         *,
         tool_runtime: ToolRuntime,
+        batch: ToolCallBatch | None = None,
     ) -> list[ParallelToolExecutionResult]:
         if not calls:
             return []
         worker_count = min(len(calls), self.max_workers or len(calls))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
-                executor.submit(tool_runtime.execute_tool_call, call.to_provider_tool_call()): (index, call)
+                executor.submit(_execute_call, tool_runtime, call, batch): (index, call)
                 for index, call in enumerate(calls)
             }
             results: list[ParallelToolExecutionResult | None] = [None] * len(calls)
@@ -47,3 +49,13 @@ class ParallelToolExecutor:
                     )
                 results[index] = ParallelToolExecutionResult(call=call, result=result)
             return [item for item in results if item is not None]
+
+
+def _execute_call(
+    tool_runtime: ToolRuntime,
+    call: ToolCallEnvelope,
+    batch: ToolCallBatch | None,
+) -> ToolResult:
+    if hasattr(tool_runtime, "execute_request"):
+        return tool_runtime.execute_request(ToolExecutionRequest.from_envelope(call, batch=batch))
+    return tool_runtime.execute_tool_call(call.to_provider_tool_call())

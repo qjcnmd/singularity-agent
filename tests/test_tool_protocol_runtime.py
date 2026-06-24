@@ -24,7 +24,7 @@ from singularity.tool_protocol.models import ToolExecutionMode, ToolProtocolTurn
 from singularity.tool_protocol.models import ToolCallFailureKind, ToolCallPhase
 from singularity.tool_protocol.runtime import ToolCallingProtocolRuntime
 from singularity.tool_protocol.state import ToolProtocolStateStore
-from singularity.tools import ToolPolicy, ToolRegistry, ToolRuntime
+from singularity.tools import ToolExecutionRequest, ToolPolicy, ToolRegistry, ToolResult, ToolRuntime
 from singularity.tools.command import register_command_tools
 from singularity.tools.models import PermissionLevel, ToolExecutionFailure, ToolSideEffectKind, ToolSpec
 from singularity.trace import TraceWriter
@@ -135,6 +135,64 @@ def test_protocol_runtime_executes_tool_call_and_appends_tool_message(tmp_path: 
     assert payload["ok"] is True
     assert "Singularity README content" in payload["content_preview"]
     assert context.tool_observations[-1].turn == 1
+
+
+def test_protocol_runtime_passes_structured_execution_request(tmp_path: Path) -> None:
+    request, context = _make_request(tmp_path)
+    response = ModelTurnResult(
+        request_id=request.request_id,
+        response_id="resp_request",
+        status=ModelTurnStatus.SUCCESS,
+        assistant_message=ModelMessage.assistant_text(""),
+        tool_calls=[
+            ModelToolCall(
+                tool_call_id="call_readme",
+                tool_name="read_file",
+                arguments={"path": "README.md"},
+                raw_arguments='{"path":"README.md"}',
+                parse_status=ModelToolParseStatus.VALID,
+            )
+        ],
+    )
+    protocol_runtime = ToolCallingProtocolRuntime(
+        registry=ToolRegistry(tmp_path),
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+
+    class RequestOnlyRuntime:
+        def __init__(self) -> None:
+            self.requests: list[ToolExecutionRequest] = []
+
+        def execute_tool_call(self, _tool_call: dict[str, Any]) -> ToolResult:
+            raise AssertionError("protocol runtime should not pass provider dicts to ToolRuntime")
+
+        def execute_request(self, execution_request: ToolExecutionRequest) -> ToolResult:
+            self.requests.append(execution_request)
+            return ToolResult.success(content={"content": "ok"})
+
+    tool_runtime = RequestOnlyRuntime()
+
+    result = protocol_runtime.process_model_turn(
+        request=request,
+        result=response,
+        turn=1,
+        context=context,
+        tool_runtime=tool_runtime,  # type: ignore[arg-type]
+    )
+
+    assert result.status == ToolProtocolTurnStatus.PROCESSED
+    assert len(tool_runtime.requests) == 1
+    execution_request = tool_runtime.requests[0]
+    assert execution_request.tool_call_id == "call_readme"
+    assert execution_request.tool_name == "read_file"
+    assert execution_request.batch_id == result.batch_id
+    assert execution_request.run_id == context.run_id
+    assert execution_request.model_request_id == request.request_id
+    assert execution_request.model_response_id == response.response_id
+    assert execution_request.normalized_arguments["path"] == "README.md"
+    assert execution_request.normalized_arguments["max_bytes"] == 20000
+    assert execution_request.argument_digest
 
 
 def test_protocol_runtime_executes_parallel_read_only_group_concurrently(tmp_path: Path) -> None:

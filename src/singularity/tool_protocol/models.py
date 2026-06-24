@@ -384,15 +384,8 @@ class ToolProtocolResultEnvelope(SerializableDataclass):
                     "error_kind": self.error_kind.value if self.error_kind else None,
                     "reference_ids": self.artifact_refs,
                     "observation_id": self.observation_id,
-                    "policy_decision_id": self.policy_decision_id,
-                    "approval_grant_id": self.approval_grant_id,
                     "truncated": self.truncated,
                     "redacted": self.redacted,
-                    "metadata": {
-                        key: value
-                        for key, value in self.metadata.items()
-                        if key not in {"raw_result", "raw_args", "raw_arguments", "result"}
-                    },
                 },
                 ensure_ascii=False,
             ),

@@ -28,7 +28,7 @@ from singularity.tool_protocol.scheduler import ToolProtocolScheduler
 from singularity.tool_protocol.state import ToolProtocolStateStore
 from singularity.tool_protocol.trace import ToolProtocolTrace
 from singularity.tool_protocol.validator import ToolProtocolValidator
-from singularity.tools import ToolRegistry, ToolRuntime
+from singularity.tools import ToolExecutionRequest, ToolRegistry, ToolRuntime
 
 
 class ToolCallingProtocolRuntime:
@@ -90,6 +90,7 @@ class ToolCallingProtocolRuntime:
         policy_runtime: PolicyRuntime | None,
     ) -> ToolProtocolTurnResult:
         self._throw_if_cancelled()
+        # Compatibility parameter only; execution policy is enforced by ToolRuntime.
         _ = policy_runtime
         assistant_message = self._assistant_message_from_model_result(model_result)
         if assistant_message is None:
@@ -161,7 +162,6 @@ class ToolCallingProtocolRuntime:
             context=context,
             tool_runtime=tool_runtime,
             planner=planner,
-            policy_runtime=policy_runtime,
             turn=turn,
         )
         self._throw_if_cancelled()
@@ -216,11 +216,10 @@ class ToolCallingProtocolRuntime:
         context: ContextManager,
         tool_runtime: ToolRuntime,
         planner: PlannerRuntime | None,
-        policy_runtime: PolicyRuntime | None,
         turn: int = 0,
     ) -> ToolProtocolTurnResult:
         self._throw_if_cancelled()
-        _ = planner, policy_runtime
+        _ = planner
         executed_count = 0
         failed_count = 0
         rejected_count = 0
@@ -419,7 +418,8 @@ class ToolCallingProtocolRuntime:
                     ids=self._trace_ids(batch, call=call),
                 )
                 self._throw_if_cancelled()
-                tool_result = tool_runtime.execute_tool_call(call.to_provider_tool_call())
+                execution_request = ToolExecutionRequest.from_envelope(call, batch=batch)
+                tool_result = tool_runtime.execute_request(execution_request)
                 self._throw_if_cancelled()
                 protocol_result = self.result_builder.build(
                     envelope=call,
@@ -479,6 +479,8 @@ class ToolCallingProtocolRuntime:
                         "tool_call_id": call.tool_call_id,
                         "tool_name": call.tool_name,
                         "content_digest": protocol_result.content_digest,
+                        "policy_decision_id": protocol_result.policy_decision_id,
+                        "policy_decision_id": protocol_result.policy_decision_id,
                         "observation_id": protocol_result.observation_id,
                     },
                     ids=self._trace_ids(batch, call=call),
@@ -656,7 +658,11 @@ class ToolCallingProtocolRuntime:
                 pending_calls.append(call)
                 pending_records[call.tool_call_id] = record
 
-            for execution in self.parallel_executor.execute(pending_calls, tool_runtime=tool_runtime):
+            for execution in self.parallel_executor.execute(
+                pending_calls,
+                tool_runtime=tool_runtime,
+                batch=batch,
+            ):
                 self._throw_if_cancelled()
                 call = execution.call
                 record = pending_records[call.tool_call_id]
@@ -707,6 +713,7 @@ class ToolCallingProtocolRuntime:
                         "status": protocol_result.status,
                         "error_code": protocol_result.error_code,
                         "content_digest": protocol_result.content_digest,
+                        "policy_decision_id": protocol_result.policy_decision_id,
                     },
                     ids=self._trace_ids(batch, call=call),
                     severity=TraceSeverity.INFO if protocol_result.ok else TraceSeverity.WARNING,
@@ -718,6 +725,7 @@ class ToolCallingProtocolRuntime:
                         "tool_call_id": call.tool_call_id,
                         "tool_name": call.tool_name,
                         "content_digest": protocol_result.content_digest,
+                        "policy_decision_id": protocol_result.policy_decision_id,
                         "observation_id": protocol_result.observation_id,
                     },
                     ids=self._trace_ids(batch, call=call),

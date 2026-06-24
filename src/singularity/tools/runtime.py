@@ -42,6 +42,7 @@ from singularity.tools.models import (
     ToolError,
     ToolExecutionBackendKind,
     ToolExecutionFailure,
+    ToolExecutionRequest,
     ToolResult,
     ToolSensitivityLevel,
     ToolSideEffectKind,
@@ -238,12 +239,15 @@ class ToolRuntime:
         self.cancellation_token: Any | None = None
 
     def execute_tool_call(self, tool_call: dict[str, Any]) -> ToolResult:
+        return self.execute_request(ToolExecutionRequest.from_provider_tool_call(tool_call))
+
+    def execute_request(self, request: ToolExecutionRequest | dict[str, Any]) -> ToolResult:
+        request = self._normalize_execution_request(request)
         self._throw_if_cancelled()
         started_at = datetime.now(UTC).isoformat()
         started = time.perf_counter()
-        tool_call_id = tool_call.get("id")
-        function = tool_call.get("function") or {}
-        tool_name = function.get("name") or "<unknown>"
+        tool_call_id = request.tool_call_id
+        tool_name = request.tool_name or "<unknown>"
         spec: ToolSpec | None = None
         validated_args: dict[str, Any] | None = None
         planner_action_id: str | None = None
@@ -262,15 +266,20 @@ class ToolRuntime:
                 output_digest = self._result_digest(result)
                 return result
 
-            raw_arguments = function.get("arguments") or "{}"
             try:
-                arguments = self._parse_arguments(raw_arguments)
+                arguments = self._arguments_for_execution_validation(request)
             except json.JSONDecodeError as exc:
                 self._emit_trace(
                     TraceEventType.TOOL_VALIDATION_FAILED,
                     summary=f"Tool {tool_name} arguments were invalid JSON.",
-                    payload={"tool_name": tool_name, "tool_call_id": tool_call_id},
-                    ids={"action_id": tool_call_id},
+                    payload={
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "batch_id": request.batch_id,
+                        "argument_digest": request.argument_digest,
+                        "validation_scope": "execution_validation",
+                    },
+                    ids=self._request_trace_ids(request, action_id=tool_call_id),
                     severity=TraceSeverity.ERROR,
                 )
                 result = ToolResult.failure(
@@ -286,9 +295,12 @@ class ToolRuntime:
                 payload={
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
+                    "batch_id": request.batch_id,
+                    "argument_digest": request.argument_digest,
+                    "validation_scope": "execution_validation",
                     "arguments": self._argument_trace_summary(arguments),
                 },
-                ids={"action_id": tool_call_id},
+                ids=self._request_trace_ids(request, action_id=tool_call_id),
             )
             try:
                 validated = spec.input_model.model_validate(arguments)
@@ -305,9 +317,12 @@ class ToolRuntime:
                     payload={
                         "tool_name": tool_name,
                         "tool_call_id": tool_call_id,
+                        "batch_id": request.batch_id,
+                        "argument_digest": request.argument_digest,
+                        "validation_scope": "execution_validation",
                         "errors": result.error.details if result.error else None,
                     },
-                    ids={"action_id": tool_call_id},
+                    ids=self._request_trace_ids(request, action_id=tool_call_id),
                     severity=TraceSeverity.ERROR,
                 )
                 return result
@@ -392,6 +407,10 @@ class ToolRuntime:
                 if cached is not None:
                     cache_hit = True
                     cached.metadata["cache_hit"] = True
+                    if approval_grant_id:
+                        cached.metadata["approval_grant_id"] = approval_grant_id
+                    if policy_decision_id:
+                        cached.metadata["policy_decision_id"] = policy_decision_id
                     result = cached
                     output_digest = result.metadata.get("output_digest") or self._result_digest(result)
                     self._remember_replay(tool_call_id, args_fingerprint, spec, result)
@@ -413,9 +432,11 @@ class ToolRuntime:
                     "permission_level": spec.permission_level.value,
                     "risk_tags": list(spec.risk_tags),
                     "backend": spec.execution_backend.value,
+                    "batch_id": request.batch_id,
+                    "argument_digest": request.argument_digest,
                     "arguments": self._argument_trace_summary(validated_args),
                 },
-                ids={"action_id": planner_action_id or tool_call_id},
+                ids=self._request_trace_ids(request, action_id=planner_action_id or tool_call_id),
             )
             self._throw_if_cancelled()
             result, output_digest = self._execute_handler(spec, validated)
@@ -459,9 +480,11 @@ class ToolRuntime:
                 result.metadata.setdefault("cache_hit", cache_hit)
                 result.metadata.setdefault("duration_seconds", duration_seconds)
                 result.metadata.setdefault("output_digest", output_digest)
+                self._annotate_result_metadata(result, request)
                 if spec is not None:
                     result.metadata.setdefault("backend", spec.execution_backend.value)
                 self._record_trace(
+                    request=request,
                     tool_call_id=tool_call_id,
                     tool_name=tool_name,
                     spec=spec,
@@ -476,6 +499,53 @@ class ToolRuntime:
 
     def invalidate_paths(self, paths: list[str]) -> None:
         self._cache.invalidate_paths(paths)
+
+    @staticmethod
+    def _normalize_execution_request(
+        request: ToolExecutionRequest | dict[str, Any],
+    ) -> ToolExecutionRequest:
+        if isinstance(request, ToolExecutionRequest):
+            return request
+        return ToolExecutionRequest.from_provider_tool_call(request)
+
+    def _arguments_for_execution_validation(self, request: ToolExecutionRequest) -> Any:
+        parsed = self._parse_arguments(request.raw_arguments)
+        if request.normalized_arguments and parsed != request.normalized_arguments:
+            return request.normalized_arguments
+        return parsed
+
+    @staticmethod
+    def _request_trace_ids(
+        request: ToolExecutionRequest,
+        *,
+        action_id: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "run_id": request.run_id,
+            "session_id": request.session_id,
+            "task_id": request.task_id,
+            "phase_id": request.phase_id,
+            "action_id": action_id,
+        }
+
+    @staticmethod
+    def _annotate_result_metadata(
+        result: ToolResult,
+        request: ToolExecutionRequest,
+    ) -> None:
+        for key in (
+            "batch_id",
+            "run_id",
+            "session_id",
+            "task_id",
+            "phase_id",
+            "model_request_id",
+            "model_response_id",
+            "argument_digest",
+        ):
+            value = getattr(request, key)
+            if value:
+                result.metadata.setdefault(key, value)
 
     def _throw_if_cancelled(self) -> None:
         token = getattr(self, "cancellation_token", None)
@@ -915,6 +985,7 @@ class ToolRuntime:
     def _record_trace(
         self,
         *,
+        request: ToolExecutionRequest,
         tool_call_id: str | None,
         tool_name: str,
         spec: ToolSpec | None,
@@ -936,6 +1007,15 @@ class ToolRuntime:
         payload = {
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
+            "batch_id": request.batch_id,
+            "run_id": request.run_id,
+            "session_id": request.session_id,
+            "task_id": request.task_id,
+            "phase_id": request.phase_id,
+            "model_request_id": request.model_request_id,
+            "model_response_id": request.model_response_id,
+            "argument_digest": request.argument_digest,
+            "policy_decision_id": result.metadata.get("policy_decision_id"),
             "argument_summary": args_summary,
             "permission_level": spec.permission_level.value if spec is not None else None,
             "risk_tags": list(spec.risk_tags) if spec is not None else [],
@@ -956,7 +1036,7 @@ class ToolRuntime:
             TraceEventType.TOOL_DISPATCH_COMPLETED if result.ok else TraceEventType.TOOL_DISPATCH_FAILED,
             summary=f"Tool {tool_name} {'completed' if result.ok else 'failed'}.",
             payload=payload,
-            ids={"action_id": tool_call_id},
+            ids=self._request_trace_ids(request, action_id=tool_call_id),
             severity=TraceSeverity.INFO if result.ok else TraceSeverity.ERROR,
         )
 
