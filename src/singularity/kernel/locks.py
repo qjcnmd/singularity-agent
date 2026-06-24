@@ -65,6 +65,8 @@ class WorkspaceLockManager:
                 "updated_at": _now(),
                 "read_only": read_only,
             }
+            holder_pid = os.getpid()
+            holder_hostname = socket.gethostname()
             holders.append(holder)
             self._write_payload(
                 {
@@ -77,8 +79,8 @@ class WorkspaceLockManager:
                 run_id=run_id,
                 read_only=read_only,
                 lock_path=self.lock_path,
-                pid=holder["pid"],
-                hostname=holder["hostname"],
+                pid=holder_pid,
+                hostname=holder_hostname,
             )
             return self._handle
 

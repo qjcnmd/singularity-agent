@@ -33,7 +33,7 @@ _TRACE_REDACTOR = TraceRedactor()
 
 class PolicyAuditWriter:
     def __init__(self, config: PolicyConfig) -> None:
-        self.path = Path(config.audit_log_path)
+        self.path = _audit_log_path(config)
 
     def append(
         self,
@@ -46,6 +46,7 @@ class PolicyAuditWriter:
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         request_payload = redact(request.to_dict())
+        resource_summaries = _resource_summaries(request)
         entry = PolicyAuditEntry(
             timestamp=datetime.now(UTC).isoformat(),
             session_id=request.session_id,
@@ -57,7 +58,9 @@ class PolicyAuditWriter:
             component=request.component,
             operation=request.operation,
             capability=request.capability,
-            resource_summary=redact_resource_identifier(request.resource.identifier),
+            resource_summary=", ".join(resource_summaries)
+            if resource_summaries
+            else redact_resource_identifier(request.resource.identifier),
             normalized_input_hash=stable_hash(request_payload),
             risk_level=decision.risk_level,
             risk_tags=decision.risk_tags,
@@ -75,6 +78,7 @@ class PolicyAuditWriter:
         payload["request_summary"] = redact(
             {
                 "resource": redact_resource_identifier(request.resource.identifier),
+                "resources": resource_summaries,
                 "reason": request.reason,
                 "metadata": request.metadata,
             }
@@ -102,6 +106,26 @@ def redact(value: Any) -> Any:
     if isinstance(value, list):
         return [redact(item) for item in value]
     if isinstance(value, str):
-        redacted = _TRACE_REDACTOR.redact_text(value)
-        return SECRET_VALUE_RE.sub(lambda match: (match.group(1) if match.group(1) else "") + "[REDACTED]", redacted)
+        redacted_text = _TRACE_REDACTOR.redact_text(value)
+        return SECRET_VALUE_RE.sub(lambda match: (match.group(1) if match.group(1) else "") + "[REDACTED]", redacted_text)
     return value
+
+
+def _audit_log_path(config: PolicyConfig) -> Path:
+    if config.audit_log_path is None:
+        return Path(config.workspace_root) / ".singularity" / "policy" / "audit.jsonl"
+    return Path(config.audit_log_path)
+
+
+def _resource_summaries(request: PolicyRequest) -> list[str]:
+    resources = request.metadata.get("resources")
+    if not isinstance(resources, list):
+        return []
+    summaries: list[str] = []
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        identifier = item.get("normalized_identifier") or item.get("identifier")
+        if identifier is not None:
+            summaries.append(redact_resource_identifier(str(identifier)))
+    return summaries

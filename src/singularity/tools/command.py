@@ -64,22 +64,12 @@ class CommandToolHandlers:
 
     def run_command(self, args: RunCommandInput) -> dict[str, Any]:
         request = self._request(args)
-        if self.component.policy.requires_verification_runner(request):
-            raise ToolExecutionFailure(
-                "Verification-like commands must use VerificationRunner tools.",
-                code="verification_runner_required",
-                details={"suggested_tool": "run_verification"},
-            )
+        self.validate_direct_command(request)
         return self.component.run(request).to_observation()
 
     def start_process(self, args: RunCommandInput) -> dict[str, Any]:
         request = self._request(args)
-        if self.component.policy.requires_verification_runner(request):
-            raise ToolExecutionFailure(
-                "Verification-like commands must use VerificationRunner tools.",
-                code="verification_runner_required",
-                details={"suggested_tool": "run_verification"},
-            )
+        self.validate_direct_command(request)
         session = self.component.start_process(request)
         return {"process_session": session.to_dict()}
 
@@ -97,6 +87,14 @@ class CommandToolHandlers:
                 session.to_dict() for session in self.component.list_processes()
             ]
         }
+
+    def validate_direct_command(self, request: CommandRequest) -> None:
+        if self.component.policy.requires_verification_runner(request):
+            raise ToolExecutionFailure(
+                "Verification-like commands must use VerificationRunner tools.",
+                code="verification_runner_required",
+                details={"suggested_tool": "run_verification"},
+            )
 
     @staticmethod
     def _request(args: RunCommandInput) -> CommandRequest:

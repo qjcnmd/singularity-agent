@@ -1,6 +1,6 @@
 # Phase 1D Task Controller
 
-Phase 1D adds a thin task lifecycle controller above the existing planner, model, tool protocol, verification, and review runtimes.
+Phase 1D adds a thin task lifecycle controller above the existing planner, model runner, tool protocol engine, verification runner, and review pipeline.
 
 ## Types
 

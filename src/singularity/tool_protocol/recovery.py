@@ -113,7 +113,22 @@ class ToolProtocolRecoveryManager:
         session_id: str | None = None,
         task_id: str | None = None,
     ) -> ToolProtocolRecoveryReport:
-        return self._build_turn_result(run_id, session_id=session_id, task_id=task_id).recovery_report
+        return self._build_recovery_report(run_id, session_id=session_id, task_id=task_id).report
+
+    def _build_recovery_report(
+        self,
+        run_id: str,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> ToolProtocolRecoveryResult:
+        batches = self._batches_for_run(run_id, session_id=session_id, task_id=task_id)
+        report, status = self._inspect_batches(batches)
+        return ToolProtocolRecoveryResult(
+            status=status,
+            report=report,
+            batch_id=batches[0].batch_id if batches else None,
+        )
 
     def _build_turn_result(
         self,
@@ -123,6 +138,20 @@ class ToolProtocolRecoveryManager:
         task_id: str | None = None,
     ) -> ToolProtocolTurnResult:
         batches = self._batches_for_run(run_id, session_id=session_id, task_id=task_id)
+        report, status = self._inspect_batches(batches)
+        pending_approval_count = sum(
+            1 for warning in report.warnings if warning.startswith("pending approval:")
+        )
+        return ToolProtocolTurnResult(
+            status=status,
+            batch_id=batches[0].batch_id if batches else None,
+            pending_approval_count=pending_approval_count,
+            appended_tool_message_count=len(report.recovered_call_ids),
+            next_action=report.next_action,
+            recovery_report=report.to_dict(),
+        )
+
+    def _inspect_batches(self, batches: list[Any]) -> tuple[ToolProtocolRecoveryReport, ToolProtocolTurnStatus]:
         pending_call_ids: list[str] = []
         running_call_ids: list[str] = []
         pending_approval_call_ids: list[str] = []
@@ -179,14 +208,7 @@ class ToolProtocolRecoveryManager:
             ],
             next_action=next_action,
         )
-        return ToolProtocolTurnResult(
-            status=status,
-            batch_id=batches[0].batch_id if batches else None,
-            pending_approval_count=len(set(pending_approval_call_ids)),
-            appended_tool_message_count=len(recovered_call_ids),
-            next_action=next_action,
-            recovery_report=report.to_dict(),
-        )
+        return report, status
 
     def _batches_for_run(
         self,

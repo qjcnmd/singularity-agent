@@ -89,7 +89,7 @@ def test_agent_kernel_finalizes_failed_run_before_reraising(
     assert report.diagnostics_count == 1
 
 
-def test_agent_kernel_maps_blocked_agent_result_to_failed_run(
+def test_agent_kernel_preserves_blocked_agent_result(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -107,9 +107,9 @@ def test_agent_kernel_maps_blocked_agent_result_to_failed_run(
 
     result = kernel.run_task("Build kernel")
 
-    assert result.status == RunStatus.FAILED
-    assert kernel.context.run.status == RunStatus.FAILED
-    assert kernel.final_report().shutdown_reason == ShutdownReason.ERROR.value
+    assert result.status == RunStatus.BLOCKED
+    assert kernel.context.run.status == RunStatus.BLOCKED
+    assert kernel.final_report().shutdown_reason == ShutdownReason.BLOCKED.value
 
 
 def test_agent_kernel_maps_max_turns_to_failed_run(

@@ -240,7 +240,7 @@ def _discover(
 ) -> list[DiscoveredPlugin]:
     return discover_plugins(
         project_root,
-        runtime_paths=resolve_user_data_paths(mode=mode, home=home, project_root=project_root),
+        user_data_paths=resolve_user_data_paths(mode=mode, home=home, project_root=project_root),
     )
 
 

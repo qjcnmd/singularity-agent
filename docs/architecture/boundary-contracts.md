@@ -92,7 +92,7 @@ Forbidden tool behavior:
 
 ## Policy Boundary
 
-`PolicyEngine` owns allow, deny, review, ask-user, escalate, and sandbox-required decisions. `ApprovalGate` only resolves local review prompts into scoped grants.
+`PolicyEngine` owns allow, deny, review, ask-user, escalate, and sandbox-required decisions. `ApprovalGate` owns the approval gate: local review prompts, scoped grant storage, matching, and single-use consumption.
 
 Policy inputs must include component, operation, capability, subject, resource, risk tags, reversibility, network/workspace/secret flags, and reason.
 

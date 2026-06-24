@@ -85,6 +85,17 @@ class RunLifecycleManager:
         self._event("lifecycle.run.cancelled", {"reason": reason})
         return run
 
+    def mark_blocked(self, reason: str) -> AgentRun:
+        run = self._run()
+        run.status = RunStatus.BLOCKED
+        run.ended_at = _now()
+        run.error = {"type": "Blocked", "message": reason}
+        if self.session is not None:
+            self.session.status = SessionStatus.CLOSED
+            self.session.ended_at = _now()
+        self._event("lifecycle.run.blocked", {"reason": reason})
+        return run
+
     def summary(self) -> dict[str, Any]:
         return {
             "run_status": self.run.status.value if self.run else None,

@@ -155,7 +155,7 @@ Result:
 ```text
 717 passed, 5 skipped
 Ruff passed
-mypy passed
+focused mypy gate passed
 compileall passed
 ```
 

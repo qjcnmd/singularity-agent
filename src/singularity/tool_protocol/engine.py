@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from typing import Any
 
 from singularity.context import ContextManager
 from singularity.model import ModelCapabilities, ModelRole, ModelTurnResult
 from singularity.observability.models import TraceSeverity
 from singularity.planner import Planner
-from singularity.policy import PolicyEngine
 from singularity.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
@@ -38,7 +38,7 @@ class ToolProtocolEngine:
         registry: ToolRegistry,
         trace: Any | None = None,
         state_store: ToolProtocolStateStore | None = None,
-        workspace_state_hook: Any | None = None,
+        workspace_state_hook: Callable[..., None] | None = None,
         result_builder: ToolProtocolResultBuilder | None = None,
         parallel_executor: ParallelToolExecutor | None = None,
     ) -> None:
@@ -66,7 +66,6 @@ class ToolProtocolEngine:
         context: ContextManager,
         tool_executor: ToolExecutor,
         planner: Planner | None = None,
-        policy_engine: PolicyEngine | None = None,
     ) -> ToolProtocolTurnResult:
         return self.handle_model_turn_result(
             result,
@@ -75,7 +74,6 @@ class ToolProtocolEngine:
             context=context,
             tool_executor=tool_executor,
             planner=planner,
-            policy_engine=policy_engine,
         )
 
     def handle_model_turn_result(
@@ -87,11 +85,8 @@ class ToolProtocolEngine:
         context: ContextManager,
         tool_executor: ToolExecutor,
         planner: Planner | None,
-        policy_engine: PolicyEngine | None,
     ) -> ToolProtocolTurnResult:
         self._throw_if_cancelled()
-        # Compatibility parameter only; execution policy is enforced by ToolExecutor.
-        _ = policy_engine
         assistant_message = self._assistant_message_from_model_result(model_result)
         if assistant_message is None:
             return ToolProtocolTurnResult(
@@ -480,7 +475,6 @@ class ToolProtocolEngine:
                         "tool_name": call.tool_name,
                         "content_digest": protocol_result.content_digest,
                         "policy_decision_id": protocol_result.policy_decision_id,
-                        "policy_decision_id": protocol_result.policy_decision_id,
                         "observation_id": protocol_result.observation_id,
                     },
                     ids=self._trace_ids(batch, call=call),
@@ -841,7 +835,10 @@ class ToolProtocolEngine:
         batch: ToolCallBatch,
         tool_call_id: str | None,
     ) -> None:
-        self.workspace_state_hook(
+        hook = self.workspace_state_hook
+        if hook is None:
+            return
+        hook(
             context,
             batch=batch,
             tool_call_id=tool_call_id,

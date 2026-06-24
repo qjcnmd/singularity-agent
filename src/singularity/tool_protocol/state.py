@@ -229,9 +229,12 @@ class ToolProtocolStateStore:
                 error_message=error_message,
                 tool_result_digest=tool_result_digest,
             )
+        record_row = self._record_row_by_id(record.record_id)
+        if record_row is None:
+            raise ToolProtocolStateError(f"unknown_record_id: {record.record_id}")
         return self.upsert_record(
             record.envelope,
-            batch_id=str(self._record_row_by_id(record.record_id)["batch_id"]),
+            batch_id=str(record_row["batch_id"]),
             phase=phase,
             previous_phase=record.phase,
             policy_decision_id=policy_decision_id,

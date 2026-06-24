@@ -12,7 +12,7 @@ Project identity:
 
 Architecture entrypoints:
 
-- naming and execution map: `docs/architecture/naming-and-runtime-map.md`
+- naming and concept map: `docs/architecture/naming-and-concept-map.md`
 - execution overview: `docs/architecture/execution-map.md`
 - agent loop: `src/singularity/agent_loop.py`
 - graph assembly: `src/singularity/kernel/graph.py`
@@ -38,13 +38,15 @@ CLI
 -> AgentLoop.run()
 -> RunController.start()
 -> Planner.step()
+-> ModelRunner.build_request_from_context()
+-> ModelTurnRequestBuilder.build_request()
+-> PromptAssemblyPipeline.build_for_model_turn()
+-> ContextManager.messages()
 -> ContextManager.build_bundle()
--> PromptAssemblyPipeline.build()
--> ModelTurnRequestBuilder.build()
 -> ModelRunner.run_turn()
 -> ToolProtocolEngine.process_model_turn()
--> ToolExecutor.execute_tool_call()
--> PolicyEngine / ApprovalGate
+-> ToolExecutor.execute_request()
+-> PolicyEngine.enforce() / ApprovalGate.consume_matching_grant() / ApprovalGate.resolve()
 -> WorkspaceMutationManager / CommandExecutor / VerificationRunner
 -> ContextManager.add_tool_protocol_result()
 -> WorkspaceStateManager
@@ -284,7 +286,7 @@ Exit code conventions:
 
 `ToolPolicy` remains as a registration sanity check. It is not the session allow/deny/review authority.
 
-Remote approval grants imported through `approval remote import-grant` are scoped `ApprovalGrant` records consumed by `PolicyEngine`. The remote file format does not bypass policy evaluation, grant matching, single-use/session-only constraints, or audit logging.
+Remote approval grants imported through `approval remote import-grant` are scoped `ApprovalGrant` records stored and consumed by `ApprovalGate` after `PolicyEngine` returns a review decision. The remote file format does not bypass policy evaluation, grant matching, or single-use/session-only constraints.
 
 `ParallelToolExecutor` only runs batches scheduled as `parallel_readonly`. The scheduler requires provider parallel-tool support, multiple validated read-only calls, idempotent tool specs, and no mutation, command, verification, or unknown side-effect tools. Results are still bound and appended in original tool-call order.
 
@@ -293,8 +295,10 @@ Remote approval grants imported through `approval remote import-grant` are scope
 `AgentLoop` only orchestrates the session:
 
 - `planner.step()`
-- `context.build_bundle()`
 - `model_runner.build_request_from_context()`
+- `ModelTurnRequestBuilder.build_request()`
+- `PromptAssemblyPipeline.build_for_model_turn()`
+- `ContextManager.messages()` / `ContextManager.build_bundle()`
 - `model_runner.run_turn()`
 - `ToolProtocolEngine.process_model_turn()`
 - final report production
@@ -303,7 +307,7 @@ The agent loop does not execute tools directly, construct tool result messages b
 
 The CLI and `KernelBootstrap` assemble `Planner`, `ModelRunner`, `ToolExecutor`, `ToolProtocolEngine`, `PromptAssemblyPipeline`, `PolicyEngine`, and `ApprovalGate` before creating `AgentLoop`. Direct `AgentLoop` construction must inject those dependencies instead of relying on a private fallback loop.
 
-`ToolExecutor` requires the session `PolicyEngine`. It validates schemas and execution boundaries, enforces policy decisions, resolves local approval grants, blocks dry-run side effects, executes the registered handler only after those gates pass, and records redacted structured trace events.
+`ToolExecutor` requires the session `PolicyEngine` and uses `ApprovalGate` for grant matching, local approval prompts, and grant consumption. It validates schemas and execution boundaries, enforces policy decisions, blocks dry-run side effects, executes the registered handler only after those gates pass, and records redacted structured trace events.
 
 Mutation, command, and verification tools are registered through their dedicated manager/executor/runner. Verification command discovery uses `python -m pytest tests --basetemp work/pytest-tmp` for this repository shape.
 
@@ -374,7 +378,8 @@ Use the repository validation command:
 python -m pytest tests --basetemp work/pytest-tmp
 python -m ruff check .
 python -m mypy
+python -m mypy src/singularity
 git diff --check
 ```
 
-The declared development dependency set includes `pytest`, `ruff`, `mypy`, and `pytest-cov`. Ruff is configured as a low-noise correctness gate, mypy is scoped to production-critical modules, and coverage is configured for reporting before a fail-under threshold is introduced.
+The declared development dependency set includes `pytest`, `ruff`, `mypy`, and `pytest-cov`. Ruff is configured as a low-noise correctness gate. `python -m mypy` is a focused type gate over the stable utility files plus the core agent harness files listed in `[tool.mypy].files`; it is not a full `src/singularity` type pass. `python -m mypy src/singularity` is the documented full-source type-debt target and must be reported separately until the full package is type-clean. Coverage is configured for reporting before a fail-under threshold is introduced.

@@ -6,6 +6,7 @@ from typing import Any, Callable, TypeVar
 
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.planner import Planner, PlannerStore
+from singularity.context.models import ToolObservation
 
 
 class RunLifecycleStatus(str, Enum):
@@ -95,10 +96,16 @@ class RunOutcomeReducer:
         self,
         current_status: RunLifecycleStatus,
         protocol_result: Any,
+        *,
+        observations: list[ToolObservation] | None = None,
     ) -> RunControlEvent:
         next_action = str(getattr(protocol_result, "next_action", "") or "request_model")
         pending = int(getattr(protocol_result, "pending_approval_count", 0) or 0)
         to_status = self._status_for_protocol_next_action(next_action, pending, current_status)
+        outcome = self.protocol_result_to_outcome(
+            protocol_result,
+            observations=observations or [],
+        )
         return RunControlEvent(
             kind=RunControlEventKind.PROTOCOL_NEXT_ACTION,
             from_status=current_status,
@@ -111,8 +118,159 @@ class RunOutcomeReducer:
                 "protocol_status": str(
                     getattr(getattr(protocol_result, "status", None), "value", getattr(protocol_result, "status", ""))
                 ),
+                "execution_outcome": outcome.to_dict() if outcome is not None else None,
             },
         )
+
+    def protocol_result_to_outcome(
+        self,
+        protocol_result: Any,
+        *,
+        observations: list[ToolObservation],
+    ) -> ExecutionOutcome | None:
+        error_codes = [
+            str(observation.error_code)
+            for observation in observations
+            if getattr(observation, "error_code", None)
+        ]
+        next_action = str(getattr(protocol_result, "next_action", "") or "continue")
+        status = str(
+            getattr(
+                getattr(protocol_result, "status", None),
+                "value",
+                getattr(protocol_result, "status", ""),
+            )
+        )
+        failed_count = int(getattr(protocol_result, "failed_count", 0) or 0)
+        rejected_count = int(getattr(protocol_result, "rejected_count", 0) or 0)
+        pending_count = int(getattr(protocol_result, "pending_approval_count", 0) or 0)
+        summary = self._protocol_observation_summary(observations, protocol_result)
+
+        if pending_count or next_action == "pending_approval" or "approval_required" in error_codes:
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.APPROVAL_REQUIRED,
+                source="protocol",
+                reason="Tool execution is waiting for approval.",
+                error_code="approval_required",
+                next_action="wait_for_approval",
+                observation_summary=summary,
+                retry_allowed=False,
+            )
+        if "policy_ask_user_required" in error_codes:
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
+                source="tool",
+                reason="Policy requires user input.",
+                error_code="policy_ask_user_required",
+                next_action="ask_user",
+                observation_summary=summary,
+                retry_allowed=False,
+            )
+        blocked_codes = {
+            "policy_denied",
+            "approval_denied",
+            "action_not_allowed",
+            "risk_escalated",
+            "sandbox_required",
+            "policy_escalation_required",
+        }
+        if any(code in blocked_codes for code in error_codes):
+            code = next(code for code in error_codes if code in blocked_codes)
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.BLOCKED,
+                source="tool",
+                reason=f"Tool execution blocked: {code}.",
+                error_code=code,
+                next_action="blocked",
+                observation_summary=summary,
+                retry_allowed=False,
+            )
+        replan_codes = {
+            "snapshot_mismatch",
+            "external_change_detected",
+            "file_changed",
+            "rollback_conflict",
+            "semantic_failure",
+            "verification_failed",
+            "blocked_by_verification",
+            "command_not_found",
+            "timeout",
+        }
+        if any(code in replan_codes for code in error_codes):
+            code = next(code for code in error_codes if code in replan_codes)
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.REPLAN_REQUIRED,
+                source="tool",
+                reason=f"Tool result requires replanning: {code}.",
+                error_code=code,
+                next_action="replan",
+                observation_summary=summary,
+                retry_allowed=True,
+            )
+        retryable_codes = {
+            "bad_arguments_json",
+            "invalid_json",
+            "arguments_not_object",
+            "validation_error",
+            "schema_mismatch",
+            "unknown_tool",
+            "tool_not_found",
+            "disallowed_tool",
+            "protocol_violation",
+            "internal_error",
+        }
+        if any(code in retryable_codes for code in error_codes):
+            code = next(code for code in error_codes if code in retryable_codes)
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.RETRYABLE,
+                source="protocol" if "json" in code or "schema" in code else "tool",
+                reason=f"Tool call can be retried after correction: {code}.",
+                error_code=code,
+                next_action="retry",
+                observation_summary=summary,
+                retry_allowed=True,
+            )
+        if next_action == "fail_safe" or status in {"failed", "invalid_assistant"}:
+            metadata = getattr(protocol_result, "metadata", {}) or {}
+            reason = metadata.get("reason") if isinstance(metadata, dict) else None
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.RETRYABLE,
+                source="protocol",
+                reason="Protocol fail-safe requested another model turn.",
+                error_code=str(reason or "protocol_fail_safe"),
+                next_action="retry",
+                observation_summary=summary,
+                retry_allowed=True,
+            )
+        if failed_count or rejected_count or next_action == "recover":
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.RETRYABLE,
+                source="protocol",
+                reason="Protocol reported recoverable tool failure.",
+                error_code=error_codes[0] if error_codes else "tool_failure",
+                next_action="retry",
+                observation_summary=summary,
+                retry_allowed=True,
+            )
+        return None
+
+    @staticmethod
+    def _protocol_observation_summary(
+        observations: list[ToolObservation],
+        protocol_result: Any,
+    ) -> str:
+        if observations:
+            parts: list[str] = []
+            for observation in observations[-3:]:
+                status = "ok" if observation.ok else (observation.error_code or "failed")
+                preview = str(observation.preview or "").replace("\n", " ")[:160]
+                parts.append(f"{observation.tool_name}:{status}:{preview}")
+            if parts:
+                return "; ".join(parts)
+        summary = getattr(protocol_result, "summary", None)
+        if summary:
+            return str(summary)
+        return f"Tool Protocol next_action={getattr(protocol_result, 'next_action', 'continue')}"
 
     @staticmethod
     def _running_status_for_nonterminal(
@@ -147,7 +305,7 @@ class RunCheckpointStore:
         self.store = store
 
     def checkpoint(self, planner: Planner) -> None:
-        planner._persist()  # type: ignore[attr-defined]
+        planner.checkpoint()
 
     def load(self, session_id: str):
         return self.store.load(session_id)
@@ -187,9 +345,29 @@ class RunController:
         self.planner.record_execution_outcome(resolved)
         return self.apply_event(event)
 
-    def apply_protocol_result(self, protocol_result: Any) -> RunControlEvent:
-        event = self.reducer.reduce_protocol_result(self.current_status, protocol_result)
+    def apply_protocol_result(
+        self,
+        protocol_result: Any,
+        *,
+        observations: list[ToolObservation] | None = None,
+    ) -> RunControlEvent:
+        event = self.reducer.reduce_protocol_result(
+            self.current_status,
+            protocol_result,
+            observations=observations,
+        )
         return self.apply_event(event)
+
+    def reduce_protocol_result(
+        self,
+        protocol_result: Any,
+        *,
+        observations: list[ToolObservation] | None = None,
+    ) -> ExecutionOutcome | None:
+        return self.reducer.protocol_result_to_outcome(
+            protocol_result,
+            observations=observations or [],
+        )
 
     def dispatch_protocol_recovery(self, recovery_manager: Any, *, run_id: str) -> RunControlEvent:
         task_state = self.planner.state
@@ -313,14 +491,9 @@ class RunController:
             return
         self.planner.state.lifecycle_status = status.value
         self.planner.state.touch()
-        self.planner._persist()  # type: ignore[attr-defined]
+        self.planner.checkpoint()
 
     def _record_event(self, payload: dict[str, Any]) -> None:
         if self.trace is not None and hasattr(self.trace, "record"):
             self.trace.record("task_lifecycle", payload)
-        if hasattr(self.planner, "_record_event"):
-            self.planner._record_event(  # type: ignore[attr-defined]
-                decision="task_lifecycle",
-                reason=payload["reason"],
-                extra={"task_event": payload},
-            )
+        self.planner.record_task_lifecycle_event(payload)

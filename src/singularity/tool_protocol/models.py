@@ -25,7 +25,7 @@ def _digest(value: Any) -> str:
 def _to_plain(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return {key: _to_plain(item) for key, item in asdict(value).items()}
     if isinstance(value, list):
         return [_to_plain(item) for item in value]

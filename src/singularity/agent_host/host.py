@@ -104,10 +104,10 @@ class AgentHost:
         if kernel is None:
             raise AgentHostError(f"Unknown active run: {run_id}")
         approval_grant = ApprovalGrant.from_dict(grant) if isinstance(grant, dict) else grant
-        policy_engine = getattr(kernel.graph, "policy_engine", None)
-        if policy_engine is None or not hasattr(policy_engine, "register_grant"):
-            raise AgentHostError("Active run does not expose PolicyEngine.register_grant.")
-        policy_engine.register_grant(approval_grant)
+        approval_gate = getattr(kernel.graph, "approval_gate", None)
+        if approval_gate is None or not hasattr(approval_gate, "register_grant"):
+            raise AgentHostError("Active run does not expose ApprovalGate.register_grant.")
+        approval_gate.register_grant(approval_grant)
         event = ApprovalEvent.from_grant(approval_grant)
         trace = getattr(kernel.graph, "trace", None)
         if trace is not None and hasattr(trace, "emit"):

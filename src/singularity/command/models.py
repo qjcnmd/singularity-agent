@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from singularity.observability.redaction import TraceRedactor
@@ -16,6 +16,9 @@ _SECRET_ARG_FLAG_RE = re.compile(
     r"^--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)$",
     re.IGNORECASE,
 )
+
+EnumT = TypeVar("EnumT", bound=Enum)
+
 
 class CommandPurpose(str, Enum):
     READ_ONLY_COMMAND = "READ_ONLY_COMMAND"
@@ -151,12 +154,12 @@ class CommandRequest:
     argv: list[str] | None = None
     shell: str | None = None
     cwd: str = "."
-    purpose: CommandPurpose | str = CommandPurpose.UNKNOWN
+    purpose: CommandPurpose = CommandPurpose.UNKNOWN
     timeout_seconds: float | None = None
     idle_timeout_seconds: float | None = None
     env_request: dict[str, str] = field(default_factory=dict)
-    network_mode: NetworkMode | str = NetworkMode.DISABLED
-    filesystem_mode: FilesystemMode | str = FilesystemMode.READ_ONLY_WORKSPACE
+    network_mode: NetworkMode = NetworkMode.DISABLED
+    filesystem_mode: FilesystemMode = FilesystemMode.READ_ONLY_WORKSPACE
     resource_limits: ResourceLimits = field(default_factory=ResourceLimits)
     expected_outputs: list[str] = field(default_factory=list)
     risk_acceptance_reason: str | None = None
@@ -501,7 +504,7 @@ class ProcessStopResult:
         }
 
 
-def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:
+def _enum(enum_type: type[EnumT], value: EnumT | str) -> EnumT:
     if isinstance(value, enum_type):
         return value
     try:

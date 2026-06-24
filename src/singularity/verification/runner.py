@@ -29,7 +29,7 @@ from singularity.policy import (
 )
 from singularity.policy.audit import redact
 from singularity.observability.models import TraceEventType, TraceSeverity
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.verification.assessor import CompletionAssessor
 from singularity.verification.discovery import ProjectDetector
 from singularity.verification.failure_analysis import FailureAnalysisPipeline, RepairPlanner
@@ -58,7 +58,7 @@ class VerificationRunner:
         workspace_root: Path | str,
         *,
         command_executor: CommandExecutor | None = None,
-        trace: JsonlTraceRecorder | None = None,
+        trace: TraceEmitterProtocol | None = None,
         policy: VerificationPolicy | None = None,
         planner: Any | None = None,
         policy_engine: PolicyEngine | None = None,

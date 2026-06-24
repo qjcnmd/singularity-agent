@@ -9,8 +9,8 @@ from rich.console import Console
 from rich.panel import Panel
 
 from singularity.cli_paths import resolve_project_root
+from singularity.policy.approval import ApprovalGate
 from singularity.policy.config import PolicyConfig
-from singularity.policy.engine import PolicyEngine
 from singularity.policy.remote import RemoteApprovalExchange
 
 
@@ -52,8 +52,8 @@ def import_remote_grant(
 
     project_root = resolve_project_root(project_root)
     remote = RemoteApprovalExchange(project_root)
-    policy = PolicyEngine(PolicyConfig(workspace_root=project_root))
-    grant = remote.register_grant(grant_json, policy)
+    approval_gate = ApprovalGate(PolicyConfig(workspace_root=project_root))
+    grant = remote.register_grant(grant_json, approval_gate)
     _print(
         {
             "ok": True,
@@ -61,7 +61,7 @@ def import_remote_grant(
             "request_id": grant.request_id,
             "decision_id": grant.decision_id,
             "approved_by": grant.approved_by,
-            "approval_grants_path": str(policy.config.approval_grants_path),
+            "approval_grants_path": str(approval_gate.config.approval_grants_path),
         },
         json_output=json_output,
         title="remote approval grant",

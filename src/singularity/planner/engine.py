@@ -45,7 +45,7 @@ from singularity.tools.router import (
     target_paths_from_tool_arguments,
     write_blocked_by_user_constraint,
 )
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.observability.protocols import TraceRecorderProtocol
 from singularity.execution_outcome import ExecutionOutcome
 
 
@@ -56,7 +56,7 @@ class Planner:
         *,
         session_id: str | None = None,
         task_id: str | None = None,
-        trace: JsonlTraceRecorder | None = None,
+        trace: TraceRecorderProtocol | None = None,
         store: PlannerStore | None = None,
         review_pipeline: Any | None = None,
         final_report_renderer: FinalReportRenderer | None = None,
@@ -163,6 +163,16 @@ class Planner:
             extra={"clarification": revision, "effective_goal": state.effective_goal},
         )
         return state
+
+    def checkpoint(self) -> None:
+        self._persist()
+
+    def record_task_lifecycle_event(self, payload: dict[str, Any]) -> None:
+        self._record_event(
+            decision="task_lifecycle",
+            reason=str(payload.get("reason") or "Task lifecycle updated."),
+            extra={"task_event": payload},
+        )
 
     def step(self) -> AgentAction:
         self._throw_if_cancelled()
@@ -312,7 +322,8 @@ class Planner:
         elif tool_name == "search_text" and isinstance(content, dict):
             self.evidence.search_results.extend(content.get("matches") or [])
         elif tool_name.startswith("index_") and isinstance(content, dict):
-            observation = content.get("project_index") if isinstance(content.get("project_index"), dict) else content
+            project_index = content.get("project_index")
+            observation = project_index if isinstance(project_index, dict) else content
             self.record_project_index_observation(observation)
         elif tool_name in DIFF_TOOLS and isinstance(content, dict):
             self.record_diff_observation(content, tool_call_id=tool_call_id)
@@ -410,7 +421,8 @@ class Planner:
         verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else payload
         if not isinstance(verification, dict):
             return
-        plan_payload = verification.get("plan") if isinstance(verification.get("plan"), dict) else {}
+        plan = verification.get("plan")
+        plan_payload = plan if isinstance(plan, dict) else {}
         plan_id = plan_payload.get("verification_plan_id")
         if plan_id and any(
             (existing.get("plan") or {}).get("verification_plan_id") == plan_id
@@ -579,7 +591,8 @@ class Planner:
 
     def record_instruction_prompt_observation(self, observation: dict[str, Any]) -> None:
         self._throw_if_cancelled()
-        payload = {
+        prompt_hash_references = self._string_list(observation.get("prompt_hash_references"))
+        payload: dict[str, Any] = {
             "prompt_bundles_compiled_count": int(observation.get("prompt_bundles_compiled_count") or 0),
             "project_instruction_files_loaded_count": int(observation.get("project_instruction_files_loaded_count") or 0),
             "injection_warning_count": int(observation.get("injection_warning_count") or 0),
@@ -587,14 +600,14 @@ class Planner:
             "developer_message_folded_count": int(observation.get("developer_message_folded_count") or 0),
             "prompt_budget_exceeded_count": int(observation.get("prompt_budget_exceeded_count") or 0),
             "untrusted_context_sections_count": int(observation.get("untrusted_context_sections_count") or 0),
-            "prompt_hash_references": list(observation.get("prompt_hash_references") or []),
+            "prompt_hash_references": prompt_hash_references,
         }
         self.evidence.instruction_prompt_observations = [payload]
         self._persist()
         self._record_event(
             decision="instruction_prompt_observation",
             reason="Instruction prompt observation recorded.",
-            evidence_refs=payload["prompt_hash_references"],
+            evidence_refs=prompt_hash_references,
             extra={"instruction_prompt_observation": payload},
         )
 
@@ -653,10 +666,11 @@ class Planner:
 
     def record_project_index_observation(self, observation: dict[str, Any]) -> None:
         self._throw_if_cancelled()
-        payload = {
+        relevant_files = self._dict_list(observation.get("relevant_files"))[:20]
+        payload: dict[str, Any] = {
             "index_id": observation.get("index_id"),
             "summary": observation.get("summary") or {},
-            "relevant_files": list(observation.get("relevant_files") or [])[:20],
+            "relevant_files": relevant_files,
             "context_candidates": list(observation.get("context_candidates") or [])[:20],
             "impact": observation.get("impact"),
             "test_impact": observation.get("test_impact"),
@@ -665,7 +679,7 @@ class Planner:
             "truncated": bool(observation.get("truncated")),
         }
         self.evidence.project_index_observations.append(payload)
-        for candidate in payload["relevant_files"]:
+        for candidate in relevant_files:
             path = candidate.get("path")
             if path:
                 self.evidence.relevant_symbols.append(
@@ -686,11 +700,12 @@ class Planner:
         tool_call_id: str | None = None,
     ) -> None:
         self._throw_if_cancelled()
-        payload = {
+        changed_files = self._string_list(observation.get("changed_files"))
+        payload: dict[str, Any] = {
             "tool_call_id": tool_call_id,
             "scope": observation.get("scope") or "current_run",
             "changeset_id": observation.get("changeset_id"),
-            "changed_files": list(observation.get("changed_files") or []),
+            "changed_files": changed_files,
             "added_files": list(observation.get("added_files") or []),
             "modified_files": list(observation.get("modified_files") or []),
             "deleted_files": list(observation.get("deleted_files") or []),
@@ -700,10 +715,10 @@ class Planner:
         }
         if payload not in self.evidence.diff_observations:
             self.evidence.diff_observations.append(payload)
-        if payload["changed_files"] and self.state is not None:
+        if changed_files and self.state is not None:
             self._record_dynamic_retrieval(
                 trigger="diff_observation",
-                changed_files=payload["changed_files"],
+                changed_files=changed_files,
             )
         self._persist()
 
@@ -764,10 +779,10 @@ class Planner:
         self._throw_if_cancelled()
         if not isinstance(observation, dict):
             return
-        decision = observation.get("decision") if isinstance(observation.get("decision"), dict) else {}
-        target = observation.get("target") if isinstance(observation.get("target"), dict) else {}
-        findings = observation.get("findings") if isinstance(observation.get("findings"), list) else []
-        payload = {
+        decision = self._dict_payload(observation.get("decision"))
+        target = self._dict_payload(observation.get("target"))
+        findings = self._dict_list(observation.get("findings"))
+        payload: dict[str, Any] = {
             "review_id": observation.get("review_id"),
             "target": target,
             "decision": decision,
@@ -1416,6 +1431,26 @@ class Planner:
         return result if isinstance(result, dict) else {}
 
     @staticmethod
+    def _dict_payload(value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _dict_list(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, dict)]
+
+    @staticmethod
+    def _string_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list | tuple | set):
+            return [str(item) for item in value if item is not None]
+        return [str(value)]
+
+    @staticmethod
     def _append_unique(values: list[str], value: Any) -> None:
         if value is None:
             return
@@ -1490,7 +1525,7 @@ def create_or_resume_planner(
     session_id: str | None,
     task_id: str,
     user_goal: str,
-    trace: JsonlTraceRecorder | None,
+    trace: TraceRecorderProtocol | None,
     workspace_health: Any,
     fallback_session_id: str | None = None,
 ) -> Planner:

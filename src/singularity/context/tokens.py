@@ -10,10 +10,11 @@ class TokenizerUnavailableError(RuntimeError):
 
 class TokenCounter:
     def __init__(self, *, model: str = "gpt-4o-mini") -> None:
+        self.encoding: Any | None = None
+        self.unavailable_error: TokenizerUnavailableError | None = None
         try:
             import tiktoken
         except ModuleNotFoundError as exc:
-            self.encoding = None
             self.model = model
             self.unavailable_error = TokenizerUnavailableError(
                 "Precise token counting requires the 'tiktoken' package. "
@@ -27,7 +28,6 @@ class TokenCounter:
         except KeyError:
             self.encoding = tiktoken.get_encoding("o200k_base")
         except Exception as exc:
-            self.encoding = None
             self.model = model
             self.unavailable_error = TokenizerUnavailableError(
                 "Precise token counting could not initialize locally. "
@@ -36,7 +36,6 @@ class TokenCounter:
             self.unavailable_error.__cause__ = exc
             return
         self.model = model
-        self.unavailable_error = None
 
     def count_text(self, text: str) -> int:
         if self.encoding is None:

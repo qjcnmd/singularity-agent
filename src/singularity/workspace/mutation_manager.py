@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.observability.models import TraceEventType
 from singularity.policy import (
     Capability,
@@ -221,7 +221,7 @@ class WorkspaceMutationManager:
         workspace_root: Path | str,
         *,
         policy: WorkspacePolicy | None = None,
-        trace: JsonlTraceRecorder | None = None,
+        trace: TraceEmitterProtocol | None = None,
         diff_context_lines: int = 3,
         max_inline_diff_lines: int = 200,
         verification_hook: Any | None = None,

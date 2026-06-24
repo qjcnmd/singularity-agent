@@ -117,7 +117,7 @@ class ModelTurnRequestBuilder:
             else {}
         )
         render_metadata = {
-            "input_renderer": "model_input_renderer/v1",
+            "model_turn_request_builder": "model_turn_request_builder/v1",
             "stable_prefix_message_count": len(stable_messages),
             "dynamic_tail_message_count": len(dynamic_messages),
             "stable_prefix_hash": _messages_hash(stable_messages),

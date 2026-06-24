@@ -188,7 +188,6 @@ def test_tool_tool_protocol_checks_cancellation_before_tool_handler(tmp_path: Pa
             context=context,
             tool_executor=tool_executor,
             planner=None,
-            policy_engine=None,
         )
 
     assert calls == []

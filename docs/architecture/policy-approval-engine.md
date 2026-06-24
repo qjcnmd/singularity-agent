@@ -32,9 +32,9 @@ allow, deny, require_review, ask_user, escalate, sandbox_required
 It also records risk level, risk tags, user-facing reason, constraints, rule ids, optional approval requirement, audit severity, and compact context summary.
 
 `ApprovalGrant` is a scoped approval, not a boolean. The current CLI gate only creates single-use, session-only grants from a local user action. The grant scope contains capabilities, path globs, command patterns, network hosts, duration limits, file limits, and single-use/session-only flags. Model text such as "the user approved" is never accepted as approval.
-Grant consumption is owned by `PolicyEngine`, so a local approval is converted into one audited allow decision without re-running the same policy request through risk classification and rules.
+Grant storage and consumption are owned by `ApprovalGate`. `PolicyEngine` remains the risk and policy decision source; after it returns `REQUIRE_REVIEW`, the gate can consume a matching grant or resolve a new local approval.
 
-File-backed remote grants use the same `ApprovalGrant` object and are registered into `PolicyEngine` through `approval remote import-grant`. Import validates the request id, decision id, grant shape, and reviewer identity before persisting the grant. The next matching policy request still consumes the grant through the normal single-use/session-only matching path and writes the same audit trail as a local approval.
+File-backed remote grants use the same `ApprovalGrant` object and are registered into `ApprovalGate` through `approval remote import-grant`. Import validates the request id, decision id, grant shape, and reviewer identity before persisting the grant. The next matching policy request still passes through `PolicyEngine`; if it requires review, `ApprovalGate` consumes the grant through the normal single-use/session-only matching path.
 
 `PolicyAuditWriter` writes append-only JSONL to:
 

@@ -1,6 +1,6 @@
-# Naming And Execution Map
+# Naming And Concept Map
 
-This document maps common coding-agent harness terms to the current Singularity implementation. The filename keeps the historical "runtime map" lookup term, but the architecture vocabulary is no longer centered on `Runtime`. Components use role names that describe ownership: loop, runner, executor, manager, controller, pipeline, store, recorder, registry, checkpoint, and harness.
+This document maps common coding-agent harness terms to the current Singularity implementation. The architecture vocabulary uses role names that describe ownership: loop, runner, executor, manager, controller, pipeline, store, recorder, registry, checkpoint, and harness.
 
 Architecture components tracked by `DocumentationPipeline`:
 
@@ -64,7 +64,7 @@ Architecture components tracked by `DocumentationPipeline`:
 | Sandbox manager | `SandboxManager` | `src/singularity/sandbox/manager.py` | Selects Docker or local staging backend for `hard_isolation`, `soft_workspace_isolation`, or `no_isolation`; fails closed when required isolation is unavailable |
 | Checkpointing / recovery | `WorkspaceStateManager`, `RunCheckpointStore`, `CrashRecoveryManager` | `src/singularity/workspace_state/manager.py`, `src/singularity/run_controller.py`, `src/singularity/kernel/recovery.py` | Session baselines, ownership journal, rollback plan, interrupted-run recovery |
 | Observability / tracing | `TraceRecorder`, `TraceStore`, `TraceTimelineBuilder`, `AuditLog` | `src/singularity/observability/recorder.py`, `src/singularity/observability/store.py`, `src/singularity/observability/timeline.py`, `src/singularity/policy/audit.py` | Structured events, spans, artifacts, timelines, audit decisions |
-| Policy and approval | `PolicyEngine`, `ApprovalGate`, `RiskClassifier`, `ApprovalGrant` | `src/singularity/policy/engine.py`, `src/singularity/policy/approval.py`, `src/singularity/policy/risk.py`, `src/singularity/policy/models.py` | Risk assessment, policy decision, local review, grant registration and audit |
+| Policy and approval | `PolicyEngine`, `ApprovalGate`, `RiskClassifier`, `ApprovalGrant` | `src/singularity/policy/engine.py`, `src/singularity/policy/approval.py`, `src/singularity/policy/risk.py`, `src/singularity/policy/models.py` | Risk assessment, policy decision, local review, grant registration and consumption |
 | Memory store and learning | `MemoryStore`, `MemoryLearningPipeline`, `MemoryBundleSync` | `src/singularity/memory/store.py`, `src/singularity/memory/pipeline.py`, `src/singularity/memory/sync.py` | Candidate extraction, selected memory retrieval, local bundle import/export |
 | Evaluation harness | `EvaluationHarness`, `BenchmarkTask`, `EvalReport` | `src/singularity/evaluation/harness.py`, `src/singularity/evaluation/models.py`, `src/singularity/evaluation/reports.py` | Offline scoring, trace replay, suites, A/B runs, regression reports |
 | Project index | `ProjectIndex` | `src/singularity/code_index/index.py` | Code intelligence, impact/test mapping, retrieval hints |
@@ -81,13 +81,15 @@ CLI
 -> AgentLoop.run()
 -> RunController.start()
 -> Planner.step()
+-> ModelRunner.build_request_from_context()
+-> ModelTurnRequestBuilder.build_request()
+-> PromptAssemblyPipeline.build_for_model_turn()
+-> ContextManager.messages()
 -> ContextManager.build_bundle()
--> PromptAssemblyPipeline.build()
--> ModelTurnRequestBuilder.build()
 -> ModelRunner.run_turn()
 -> ToolProtocolEngine.process_model_turn()
--> ToolExecutor.execute_tool_call()
--> PolicyEngine.enforce() / ApprovalGate.request_decision()
+-> ToolExecutor.execute_request()
+-> PolicyEngine.enforce() / ApprovalGate.consume_matching_grant() / ApprovalGate.resolve()
 -> WorkspaceMutationManager / CommandExecutor / VerificationRunner / SandboxManager
 -> ContextManager.add_tool_protocol_result()
 -> TraceRecorder.emit()
@@ -134,4 +136,4 @@ CLI
 
 ## Remaining Non-Architecture Uses
 
-`RuntimeError` and `RuntimeWarning` remain Python built-in exception/warning names. They are language/runtime primitives, not Singularity architecture names. The required document filename `naming-and-runtime-map.md` remains as the user-requested lookup target while its contents define the replacement vocabulary.
+`RuntimeError` and `RuntimeWarning` remain Python built-in exception/warning names. They are language primitives, not Singularity architecture names.

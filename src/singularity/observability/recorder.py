@@ -90,7 +90,7 @@ class TraceRecorder:
             redacted_payload = self.redactor.redact_payload(raw_payload)
             event = TraceEvent(
                 event_id=f"event_{uuid4().hex[:12]}",
-                event_type=event_type,
+                event_type=_trace_event_type(event_type),
                 run_id=str(ids.get("run_id") or self.run_id),
                 session_id=str(ids.get("session_id") or self.session_id),
                 task_id=ids.get("task_id"),
@@ -100,7 +100,7 @@ class TraceRecorder:
                 timestamp=datetime.now(UTC),
                 monotonic_ms=max(0, int((time.perf_counter() - self._started) * 1000)),
                 component=component,
-                severity=severity,
+                severity=_trace_severity(severity),
                 summary=self.redactor.redact_text(summary),
                 payload=redacted_payload,
                 artifact_refs=artifact_refs or [],
@@ -455,7 +455,10 @@ class TraceRecorder:
                 event_type = TraceEventType.PLANNER_COMPLETION_ASSESSED
             else:
                 event_type = TraceEventType.VERIFICATION_EVIDENCE_RECORDED
-            failed = data.get("status") in {"failed", "blocked", "timeout"} or data.get("failure_type")
+            failed = bool(
+                data.get("status") in {"failed", "blocked", "timeout"}
+                or data.get("failure_type")
+            )
             return (
                 TraceEventType.VERIFICATION_FAILED if failed else event_type,
                 "verification",
@@ -517,6 +520,14 @@ TraceRecorder = TraceRecorder
 def _new_run_id() -> str:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"{timestamp}-{uuid4().hex[:8]}"
+
+
+def _trace_event_type(value: TraceEventType | str) -> TraceEventType:
+    return value if isinstance(value, TraceEventType) else TraceEventType(str(value))
+
+
+def _trace_severity(value: TraceSeverity | str) -> TraceSeverity:
+    return value if isinstance(value, TraceSeverity) else TraceSeverity(str(value))
 
 
 def _legacy_artifacts(data: dict[str, Any]) -> list[str]:

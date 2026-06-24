@@ -74,7 +74,7 @@ class ModelRunner:
         self.trace = trace
         self.converter = MessageConverter()
         self.tool_renderer = ModelToolRenderer(tool_registry)
-        self.input_renderer = ModelTurnRequestBuilder(
+        self.request_builder = ModelTurnRequestBuilder(
             registry=registry,
             tool_renderer=self.tool_renderer,
         )
@@ -143,7 +143,7 @@ class ModelRunner:
         supports_developer_message: bool | None = None,
         strict_tools: bool = False,
     ) -> ModelTurnRequest:
-        return self.input_renderer.build_request(
+        return self.request_builder.build_request(
             context,
             run_id=run_id,
             session_id=session_id,
@@ -202,7 +202,7 @@ class ModelRunner:
                 provider,
             )
             estimated_usage = self.budget_manager.check_budget(
-                messages=request.messages,  # type: ignore[arg-type]
+                messages=request.messages,
                 tools=request.tools,
                 budget=request.budget,
             )
@@ -357,7 +357,7 @@ class ModelRunner:
             provider_request = ProviderRequest(
                 request_id=request.request_id,
                 purpose=request.purpose.value,
-                messages=request.messages,  # type: ignore[arg-type]
+                messages=request.messages,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 preferences=preferences,
@@ -585,7 +585,7 @@ class ModelRunner:
         if not self.config.allow_remote_provider:
             return None
         policy = self.config.context_export_policy
-        text = "\n".join(message.text for message in request.messages)  # type: ignore[union-attr]
+        text = "\n".join(message.text for message in request.messages)
         if policy.deny_secret_like_content and any(
             pattern.search(text) for pattern in SECRET_PATTERNS
         ):

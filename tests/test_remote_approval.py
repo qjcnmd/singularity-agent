@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from singularity.policy import (
+    ApprovalGate,
     ApprovalGrant,
     ApprovalScope,
     Capability,
@@ -11,7 +12,6 @@ from singularity.policy import (
     PolicyConfig,
     PolicyDecision,
     PolicyRequest,
-    PolicyEngine,
     PolicySubject,
     ResourceRef,
     PolicyComponent,
@@ -79,8 +79,8 @@ def test_remote_approval_exports_request_and_imports_scoped_grant(tmp_path: Path
     )
 
     imported = remote.import_grant(grant_path)
-    policy = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
-    remote.register_grant(grant_path, policy)
+    approval_gate = ApprovalGate(PolicyConfig(workspace_root=tmp_path))
+    remote.register_grant(grant_path, approval_gate)
 
     assert imported.approved_by == "remote-reviewer"
-    assert policy.find_matching_grant(request) is not None
+    assert approval_gate.find_matching_grant(request) is not None

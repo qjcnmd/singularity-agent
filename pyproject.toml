@@ -85,12 +85,35 @@ warn_unused_configs = true
 ignore_missing_imports = true
 check_untyped_defs = false
 follow_imports = "skip"
+# Focused type gate over stable utilities plus the core agent harness path.
+# `python -m mypy src/singularity` is tracked as a separate full-source backlog
+# check until the package is type-clean.
 files = [
+    "src/singularity/agent_loop.py",
     "src/singularity/cli_paths.py",
     "src/singularity/code_index/index.py",
+    "src/singularity/context/manager.py",
     "src/singularity/git_client",
+    "src/singularity/instructions/prompt_assembly.py",
+    "src/singularity/kernel/agent_kernel.py",
+    "src/singularity/kernel/graph.py",
+    "src/singularity/kernel/lifecycle.py",
+    "src/singularity/kernel/models.py",
     "src/singularity/model/providers.py",
+    "src/singularity/model/request_builder.py",
+    "src/singularity/model/runner.py",
+    "src/singularity/observability/models.py",
+    "src/singularity/observability/recorder.py",
+    "src/singularity/policy/approval.py",
+    "src/singularity/policy/audit.py",
+    "src/singularity/policy/engine.py",
+    "src/singularity/policy/models.py",
+    "src/singularity/policy/risk.py",
+    "src/singularity/planner/engine.py",
+    "src/singularity/run_controller.py",
+    "src/singularity/tool_protocol/engine.py",
     "src/singularity/tool_protocol/parallel.py",
+    "src/singularity/tools/executor.py",
 ]
 
 [tool.coverage.run]

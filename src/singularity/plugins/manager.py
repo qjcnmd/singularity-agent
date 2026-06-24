@@ -39,13 +39,13 @@ class PluginManager:
         self,
         project_root: Path | str,
         *,
-        runtime_paths: UserDataPaths | None = None,
+        user_data_paths: UserDataPaths | None = None,
         mode: UserDataMode | str | None = None,
         home: Path | str | None = None,
         trace: Any | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve(strict=False)
-        self.component_paths = runtime_paths
+        self.user_data_paths = user_data_paths
         self.mode = mode
         self.home = home
         self.trace = trace
@@ -57,7 +57,7 @@ class PluginManager:
     def discover(self) -> list[DiscoveredPlugin]:
         self.discovered = discover_plugins(
             self.project_root,
-            runtime_paths=self.component_paths,
+            user_data_paths=self.user_data_paths,
             mode=self.mode,
             home=self.home,
         )

@@ -48,7 +48,7 @@ class EvaluationHarness:
         self.mutation_manager = mutation_manager
         self.scoring = ScoringEngine()
         self.patch_quality = PatchQualityEvaluator()
-        self.replay_runtime = TraceReplayHarness(project_root=self.project_root)
+        self.trace_replay_harness = TraceReplayHarness(project_root=self.project_root)
         self.executor = BenchmarkTaskExecutor(
             project_root=self.project_root,
             command_executor=command_executor,
@@ -153,7 +153,7 @@ class EvaluationHarness:
         execution_evidence: dict[str, Any] = {}
         score_delta = 0.0
         if trace_run_dir is not None:
-            replay = self.replay_runtime.replay(trace_run_dir, profile=profile)
+            replay = self.trace_replay_harness.replay(trace_run_dir, profile=profile)
             verification = replay.verification
             assertions = {}
             diff = {}

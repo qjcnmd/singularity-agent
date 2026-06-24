@@ -38,8 +38,8 @@ def test_agent_host_reads_artifacts_by_opaque_ref(tmp_path: Path) -> None:
 
 def test_agent_host_start_run_wraps_kernel_without_exposing_agent_graph(tmp_path: Path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_kernel", session_id="session_kernel")
-    policy = _PolicyEngine()
-    kernel = _Kernel(trace=trace, policy=policy)
+    approval_gate = _ApprovalGate()
+    kernel = _Kernel(trace=trace, approval_gate=approval_gate)
     host = AgentHost(tmp_path, bootstrap_factory=lambda **_kwargs: _Bootstrap(kernel))
     config = ProductionConfig.from_cli(
         project_root=tmp_path,
@@ -58,10 +58,10 @@ def test_agent_host_start_run_wraps_kernel_without_exposing_agent_graph(tmp_path
     assert "policy_engine" not in snapshot
 
 
-def test_agent_host_registers_approval_grants_through_policy_engine(tmp_path: Path) -> None:
+def test_agent_host_registers_approval_grants_through_approval_gate(tmp_path: Path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_approval", session_id="session_approval")
-    policy = _PolicyEngine()
-    kernel = _Kernel(trace=trace, policy=policy)
+    approval_gate = _ApprovalGate()
+    kernel = _Kernel(trace=trace, approval_gate=approval_gate)
     host = AgentHost(tmp_path, bootstrap_factory=lambda **_kwargs: _Bootstrap(kernel))
     config = ProductionConfig.from_cli(
         project_root=tmp_path,
@@ -80,7 +80,7 @@ def test_agent_host_registers_approval_grants_through_policy_engine(tmp_path: Pa
 
     event = host.submit_approval("run_approval", grant.to_dict())
 
-    assert policy.registered == [grant.grant_id]
+    assert approval_gate.registered == [grant.grant_id]
     assert event.to_dict()["status"] == "granted"
     assert host.events("run_approval")[-1].event_type == "approval.granted"
 
@@ -122,10 +122,10 @@ class _Bootstrap:
 
 
 class _Kernel:
-    def __init__(self, *, trace: TraceRecorder, policy: "_PolicyEngine") -> None:
+    def __init__(self, *, trace: TraceRecorder, approval_gate: "_ApprovalGate") -> None:
         identity = RunIdentity(run_id=trace.run_id, session_id=trace.session_id, task_id="task_kernel")
         self.context = SimpleNamespace(identity=identity)
-        self.graph = SimpleNamespace(trace=trace, policy_engine=policy)
+        self.graph = SimpleNamespace(trace=trace, approval_gate=approval_gate)
         self.cancelled = False
         self.closed = False
 
@@ -149,7 +149,7 @@ class _Kernel:
         self.closed = True
 
 
-class _PolicyEngine:
+class _ApprovalGate:
     def __init__(self) -> None:
         self.registered: list[str] = []
 

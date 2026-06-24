@@ -207,7 +207,7 @@ class ModelTurnRequest(SerializableDataclass):
     phase_id: str
     action_id: str
     purpose: ModelPurpose
-    messages: list[ModelMessage | dict[str, Any]]
+    messages: list[ModelMessage]
     tools: list[ModelToolSchema] = field(default_factory=list)
     tool_choice: ToolChoicePolicy = field(default_factory=ToolChoicePolicy)
     model_preferences: ModelPreferences = field(default_factory=ModelPreferences)
@@ -232,8 +232,14 @@ class ModelTurnRequest(SerializableDataclass):
             phase_id="model",
             action_id=request_id,
             purpose=purpose,
-            messages=messages,
+            messages=[
+                ModelMessage.from_dict(message) if isinstance(message, dict) else message
+                for message in messages
+            ],
         )
+
+    def __post_init__(self) -> None:
+        self.messages = [_model_message_from_payload(message) for message in self.messages]
 
 
 @dataclass
@@ -281,13 +287,50 @@ class ModelTurnResult(SerializableDataclass):
 def _to_plain(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return {key: _to_plain(item) for key, item in asdict(value).items()}
     if isinstance(value, list):
         return [_to_plain(item) for item in value]
     if isinstance(value, dict):
         return {key: _to_plain(item) for key, item in value.items()}
     return value
+
+
+def _content_blocks_from_payload(content: Any) -> list[ContentBlock]:
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [ContentBlock.from_text(content)]
+    if isinstance(content, ContentBlock):
+        return [content]
+    if not isinstance(content, list):
+        return [ContentBlock.from_text(str(content))]
+
+    blocks: list[ContentBlock] = []
+    for item in content:
+        if isinstance(item, ContentBlock):
+            blocks.append(item)
+        elif isinstance(item, str):
+            blocks.append(ContentBlock.from_text(item))
+        elif isinstance(item, dict):
+            block_payload = dict(item)
+            block_payload.setdefault("type", ContentBlockType.TEXT.value)
+            blocks.append(ContentBlock.from_dict(block_payload))
+        else:
+            blocks.append(ContentBlock.from_text(str(item)))
+    return blocks
+
+
+def _model_message_from_payload(payload: ModelMessage | dict[str, Any]) -> ModelMessage:
+    if isinstance(payload, ModelMessage):
+        return payload
+    return ModelMessage(
+        role=ModelRole(payload["role"]),
+        content=_content_blocks_from_payload(payload.get("content")),
+        name=payload.get("name"),
+        tool_call_id=payload.get("tool_call_id"),
+        metadata=dict(payload.get("metadata") or {}),
+    )
 
 
 def _from_payload(cls: Any, payload: dict[str, Any]) -> Any:
@@ -299,13 +342,7 @@ def _from_payload(cls: Any, payload: dict[str, Any]) -> Any:
             metadata=dict(payload.get("metadata") or {}),
         )
     if cls is ModelMessage:
-        return ModelMessage(
-            role=ModelRole(payload["role"]),
-            content=[ContentBlock.from_dict(item) for item in payload.get("content") or []],
-            name=payload.get("name"),
-            tool_call_id=payload.get("tool_call_id"),
-            metadata=dict(payload.get("metadata") or {}),
-        )
+        return _model_message_from_payload(payload)
     if cls is ModelToolSchema:
         return ModelToolSchema(
             name=str(payload["name"]),
@@ -361,10 +398,7 @@ def _from_payload(cls: Any, payload: dict[str, Any]) -> Any:
             phase_id=str(payload["phase_id"]),
             action_id=str(payload["action_id"]),
             purpose=ModelPurpose(payload["purpose"]),
-            messages=[
-                ModelMessage.from_dict(item) if isinstance(item, dict) and "role" in item and "content" in item and isinstance(item.get("content"), list) else item
-                for item in payload.get("messages") or []
-            ],
+            messages=[_model_message_from_payload(item) for item in payload.get("messages") or []],
             tools=[ModelToolSchema.from_dict(item) for item in payload.get("tools") or []],
             tool_choice=ToolChoicePolicy.from_dict(payload.get("tool_choice") or {}),
             model_preferences=ModelPreferences.from_dict(payload.get("model_preferences") or {}),

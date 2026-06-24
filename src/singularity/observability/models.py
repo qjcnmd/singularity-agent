@@ -5,9 +5,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from singularity.observability.exceptions import TraceSerializationError
+
+_EnumT = TypeVar("_EnumT", bound=Enum)
 
 
 class TraceSeverity(str, Enum):
@@ -188,7 +190,7 @@ class TraceArtifactKind(str, Enum):
 @dataclass(frozen=True)
 class TraceEvent:
     event_id: str
-    event_type: TraceEventType | str
+    event_type: TraceEventType
     run_id: str
     session_id: str
     task_id: str | None
@@ -198,7 +200,7 @@ class TraceEvent:
     timestamp: datetime
     monotonic_ms: int
     component: str
-    severity: TraceSeverity | str
+    severity: TraceSeverity
     summary: str
     payload: dict[str, Any] = field(default_factory=dict)
     artifact_refs: list[str] = field(default_factory=list)
@@ -218,9 +220,11 @@ class TraceEvent:
         object.__setattr__(self, "timestamp", _datetime(self.timestamp))
 
     def to_dict(self) -> dict[str, Any]:
+        event_type = _enum(TraceEventType, self.event_type)
+        severity = _enum(TraceSeverity, self.severity)
         return {
             "event_id": self.event_id,
-            "event_type": self.event_type.value,
+            "event_type": event_type.value,
             "run_id": self.run_id,
             "session_id": self.session_id,
             "task_id": self.task_id,
@@ -230,7 +234,7 @@ class TraceEvent:
             "timestamp": self.timestamp.isoformat(),
             "monotonic_ms": self.monotonic_ms,
             "component": self.component,
-            "severity": self.severity.value,
+            "severity": severity.value,
             "summary": self.summary,
             "payload": self.payload,
             "artifact_refs": self.artifact_refs,
@@ -274,7 +278,7 @@ class TraceSpan:
     started_at: datetime
     ended_at: datetime | None
     duration_ms: int | None
-    status: TraceStatus | str
+    status: TraceStatus
     error_type: str | None
     error_message: str | None
     attributes: dict[str, Any] = field(default_factory=dict)
@@ -287,6 +291,7 @@ class TraceSpan:
         object.__setattr__(self, "status", _enum(TraceStatus, self.status))
 
     def to_dict(self) -> dict[str, Any]:
+        status = _enum(TraceStatus, self.status)
         return {
             "span_id": self.span_id,
             "parent_span_id": self.parent_span_id,
@@ -300,7 +305,7 @@ class TraceSpan:
             "started_at": self.started_at.isoformat(),
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
             "duration_ms": self.duration_ms,
-            "status": self.status.value,
+            "status": status.value,
             "error_type": self.error_type,
             "error_message": self.error_message,
             "attributes": self.attributes,
@@ -318,7 +323,7 @@ class TraceArtifact:
     run_id: str
     session_id: str
     task_id: str | None
-    kind: TraceArtifactKind | str
+    kind: TraceArtifactKind
     path: Path
     relative_path: str
     size_bytes: int
@@ -334,13 +339,14 @@ class TraceArtifact:
         object.__setattr__(self, "path", Path(self.path))
 
     def to_dict(self) -> dict[str, Any]:
+        kind = _enum(TraceArtifactKind, self.kind)
         return {
             "artifact_id": self.artifact_id,
             "artifact_ref": self.artifact_id,
             "run_id": self.run_id,
             "session_id": self.session_id,
             "task_id": self.task_id,
-            "kind": self.kind.value,
+            "kind": kind.value,
             "relative_path": self.relative_path,
             "relative_handle": self.relative_path,
             "size_bytes": self.size_bytes,
@@ -439,7 +445,7 @@ class TraceSummary:
         return cls(**payload)
 
 
-def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:
+def _enum(enum_type: type[_EnumT], value: _EnumT | str) -> _EnumT:
     if isinstance(value, enum_type):
         return value
     text = str(value)

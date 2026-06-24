@@ -19,7 +19,12 @@ from singularity.observability.models import (
     TraceTimelineItem,
 )
 from singularity.observability.redaction import TraceRedactor
-from singularity.observability.recorder import TraceRecorder, TraceRecorder
+from singularity.observability.protocols import (
+    TraceEmitterProtocol,
+    TraceRecorderProtocol,
+    TraceStorageProtocol,
+)
+from singularity.observability.recorder import TraceRecorder
 from singularity.observability.spans import SpanManager
 from singularity.observability.store import TraceStore
 from singularity.observability.summary import TraceSummaryBuilder
@@ -35,14 +40,16 @@ __all__ = [
     "TraceArtifactStore",
     "TraceEvent",
     "TraceEventType",
+    "TraceEmitterProtocol",
+    "TraceRecorderProtocol",
     "TraceRedactionError",
     "TraceRedactor",
-    "TraceRecorder",
     "TraceSerializationError",
     "TraceSeverity",
     "TraceSpan",
     "TraceSpanError",
     "TraceStatus",
+    "TraceStorageProtocol",
     "TraceStore",
     "TraceStoreError",
     "TraceSummary",

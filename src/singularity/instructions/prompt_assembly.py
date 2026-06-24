@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from singularity.instructions.compiler import PromptCompiler
 from singularity.instructions.prompt_config import PromptAssemblyConfig
@@ -21,6 +21,17 @@ from singularity.model.models import ModelPurpose
 from singularity.observability.models import TraceArtifactKind, TraceEventType, TraceSeverity, TraceStatus
 
 
+class PromptAssemblySummary(TypedDict):
+    prompt_bundles_compiled_count: int
+    project_instruction_files_loaded_count: int
+    injection_warning_count: int
+    conflict_count: int
+    developer_message_folded_count: int
+    prompt_budget_exceeded_count: int
+    untrusted_context_sections_count: int
+    prompt_hash_references: list[str]
+
+
 class PromptAssemblyPipeline:
     def __init__(
         self,
@@ -36,7 +47,7 @@ class PromptAssemblyPipeline:
         self.detector = PromptInjectionDetector()
         self.resolver = InstructionResolver(detector=self.detector)
         self.compiler = PromptCompiler(config=self.config)
-        self._summary = {
+        self._summary: PromptAssemblySummary = {
             "prompt_bundles_compiled_count": 0,
             "project_instruction_files_loaded_count": 0,
             "injection_warning_count": 0,
@@ -158,7 +169,7 @@ class PromptAssemblyPipeline:
                     self.trace.end_span(span_id, status=TraceStatus.FAILED, error=exc)
                 raise
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self) -> PromptAssemblySummary:
         return {
             **self._summary,
             "prompt_hash_references": list(self._summary["prompt_hash_references"]),

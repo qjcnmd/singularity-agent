@@ -68,7 +68,7 @@ def test_model_runner_uses_provider_capability_for_developer_folding(tmp_path: P
     assert request.messages[0].metadata["prompt_manifest_id"]
 
 
-def test_model_input_renderer_keeps_stable_prefix_metadata_and_dynamic_tail(
+def test_model_turn_request_builder_keeps_stable_prefix_metadata_and_dynamic_tail(
     tmp_path: Path,
 ) -> None:
     context = ContextManager(system_prompt="legacy system", user_goal="Inspect project")
@@ -98,7 +98,10 @@ def test_model_input_renderer_keeps_stable_prefix_metadata_and_dynamic_tail(
     )
 
     assert [tool.name for tool in request.tools] == ["read_file", "search_text"]
-    assert request.context_metadata["input_renderer"] == "model_input_renderer/v1"
+    assert (
+        request.context_metadata["model_turn_request_builder"]
+        == "model_turn_request_builder/v1"
+    )
     assert request.context_metadata["stable_prefix_message_count"] >= 3
     assert request.context_metadata["dynamic_tail_message_count"] >= 1
     assert request.context_metadata["tool_schema_hash"] == request.trace_metadata["tool_schema_hash"]
@@ -106,7 +109,7 @@ def test_model_input_renderer_keeps_stable_prefix_metadata_and_dynamic_tail(
     assert request.messages[-1].role.value == "tool"
 
 
-def test_model_input_renderer_hashes_ignore_ephemeral_prompt_ids(
+def test_model_turn_request_builder_hashes_ignore_ephemeral_prompt_ids(
     tmp_path: Path,
 ) -> None:
     context = ContextManager(system_prompt="legacy system", user_goal="Inspect project")

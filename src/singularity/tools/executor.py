@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import ValidationError
 
@@ -23,12 +23,12 @@ from singularity.policy import (
     OperationKind,
     PolicyDecision,
     PolicyRequest,
-    PolicyEngine,
     PolicySubject,
     ResourceRef,
     PolicyComponent,
 )
 from singularity.policy.audit import redact_resource_identifier
+from singularity.policy.config import PolicyConfig
 from singularity.policy.exceptions import (
     ApprovalDenied,
     ApprovalRequired,
@@ -50,7 +50,7 @@ from singularity.tools.models import (
 )
 from singularity.tools.policy import ToolPolicy
 from singularity.tools.registry import ToolRegistry
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.observability.protocols import TraceEmitterProtocol
 
 
 @dataclass
@@ -206,16 +206,23 @@ class IdempotencyLedger:
         )
 
 
+class ToolPolicyEngineProtocol(Protocol):
+    config: PolicyConfig
+
+    def enforce(self, request: PolicyRequest) -> PolicyDecision:
+        ...
+
+
 class ToolExecutor:
     def __init__(
         self,
         *,
         registry: ToolRegistry,
         policy: ToolPolicy,
-        trace: JsonlTraceRecorder | None,
+        trace: TraceEmitterProtocol | None,
         workspace_root: Path,
         planner: Any | None = None,
-        policy_engine: PolicyEngine | None = None,
+        policy_engine: ToolPolicyEngineProtocol | None = None,
         approval_gate: ApprovalGate | Any | None = None,
         standalone_can_execute: bool = True,
         dry_run: bool = False,
@@ -353,6 +360,13 @@ class ToolExecutor:
             dry_run_error = self._dry_run_error(spec)
             if dry_run_error is not None:
                 result = dry_run_error
+                output_digest = self._result_digest(result)
+                self._remember_replay(tool_call_id, args_fingerprint, spec, result)
+                return result
+
+            delegated_preflight_error = self._preflight_delegated_handler(spec, validated)
+            if delegated_preflight_error is not None:
+                result = delegated_preflight_error
                 output_digest = self._result_digest(result)
                 self._remember_replay(tool_call_id, args_fingerprint, spec, result)
                 return result
@@ -626,10 +640,14 @@ class ToolExecutor:
             tool_call_id=tool_call_id,
         )
         decision = self.policy_engine.enforce(request)
-        self._record_policy_trace(request, decision)
         if decision.outcome == DecisionOutcome.ALLOW:
             return None, decision.approval_grant_id, decision.decision_id
         if decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate is not None:
+            if hasattr(self.approval_gate, "consume_matching_grant"):
+                existing_grant = self.approval_gate.consume_matching_grant(request)
+                if existing_grant is not None:
+                    allowed = _decision_allowed_by_grant(decision, existing_grant.grant_id)
+                    return None, existing_grant.grant_id, allowed.decision_id
             try:
                 grant = self.approval_gate.resolve(request, decision)
             except (
@@ -645,18 +663,18 @@ class ToolExecutor:
             if grant is None:
                 self._record_policy_observation(request, decision)
                 return self._policy_failure(request, decision), None, decision.decision_id
-            if hasattr(self.policy_engine, "register_grant"):
-                self.policy_engine.register_grant(grant)
-            if hasattr(self.policy_engine, "consume_grant"):
-                second = self.policy_engine.consume_grant(request, decision, grant)
-                self._record_policy_trace(request, second)
-                return None, grant.grant_id, second.decision_id
-            second = self.policy_engine.enforce(request)
-            self._record_policy_trace(request, second)
-            if second.outcome == DecisionOutcome.ALLOW:
-                return None, second.approval_grant_id or grant.grant_id, second.decision_id
-            self._record_policy_observation(request, second)
-            return self._policy_failure(request, second), None, second.decision_id
+            if hasattr(self.approval_gate, "register_grant"):
+                self.approval_gate.register_grant(grant)
+            consumed_grant = (
+                self.approval_gate.consume_grant(grant)
+                if hasattr(self.approval_gate, "consume_grant")
+                else grant
+            )
+            if consumed_grant is None:
+                self._record_policy_observation(request, decision)
+                return self._policy_failure(request, decision), None, decision.decision_id
+            allowed = _decision_allowed_by_grant(decision, consumed_grant.grant_id)
+            return None, consumed_grant.grant_id, allowed.decision_id
         self._record_policy_observation(request, decision)
         return self._policy_failure(request, decision), None, decision.decision_id
 
@@ -681,6 +699,17 @@ class ToolExecutor:
     ) -> PolicyRequest:
         resources = self._resources_for(spec, validated_args)
         resource = resources[0] if resources else ResourceRef("workspace", tool_name, workspace_relative=True)
+        resource_details = [item.to_dict() for item in resources] or [resource.to_dict()]
+        related_resources = resource_details[1:]
+        if related_resources and not resource.metadata.get("related_resources"):
+            resource = ResourceRef(
+                resource.resource_type,
+                resource.identifier,
+                normalized_identifier=resource.normalized_identifier,
+                workspace_relative=resource.workspace_relative,
+                sensitive=resource.sensitive,
+                metadata={**resource.metadata, "related_resources": related_resources},
+            )
         operation = spec.operation or OperationKind.READ_FILE
         capability = spec.capabilities[0] if spec.capabilities else Capability.READ_WORKSPACE
         return PolicyRequest(
@@ -705,6 +734,8 @@ class ToolExecutor:
                 "timeout": spec.timeout_seconds,
                 "max_output_chars": spec.max_output_chars,
                 "backend": spec.execution_backend.value,
+                "resources": resource_details,
+                **self._policy_argument_metadata(validated_args),
             },
             touches_workspace=capability
             in {
@@ -715,7 +746,9 @@ class ToolExecutor:
                 Capability.DELETE_FILE,
                 Capability.MOVE_FILE,
             },
-            touches_secrets=resource.sensitive or capability in {Capability.READ_SECRET, Capability.READ_ENV},
+            touches_secrets=any(item.sensitive for item in resources)
+            or resource.sensitive
+            or capability in {Capability.READ_SECRET, Capability.READ_ENV},
             destructive=capability == Capability.DELETE_FILE,
             long_running=operation == OperationKind.START_LONG_PROCESS,
             workspace_root=str(self.workspace_root),
@@ -725,6 +758,25 @@ class ToolExecutor:
         if spec.resource_resolver is not None:
             return spec.resource_resolver(args, self.workspace_root)
         return [_default_resource(spec, args)]
+
+    @staticmethod
+    def _policy_argument_metadata(args: dict[str, Any]) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        for key in (
+            "argv",
+            "shell",
+            "filesystem_mode",
+            "network_mode",
+            "purpose",
+            "risk_acceptance_reason",
+        ):
+            if key in args:
+                metadata[key] = args[key]
+        if args.get("argv"):
+            metadata["command"] = " ".join(str(part) for part in args["argv"])
+        elif args.get("shell"):
+            metadata["command"] = str(args["shell"])
+        return metadata
 
     def _record_policy_observation(self, request: PolicyRequest, decision: PolicyDecision) -> None:
         if self.planner is None or not hasattr(self.planner, "record_policy_observation"):
@@ -736,33 +788,12 @@ class ToolExecutor:
                 "operation": request.operation.value,
                 "reason": decision.reason,
                 "risk_level": decision.risk_level.value,
-                    "resource": redact_resource_identifier(request.resource.identifier),
+                "resource": redact_resource_identifier(request.resource.identifier),
+                "resources": _redacted_resource_details(
+                    request.metadata.get("resources")
+                ),
                 "decision_id": decision.decision_id,
             }
-        )
-
-    def _record_policy_trace(self, request: PolicyRequest, decision: PolicyDecision) -> None:
-        if self.trace is None:
-            return
-        self.trace.record(
-            "policy",
-            {
-                "request_id": request.request_id,
-                "decision_id": decision.decision_id,
-                "component": request.component.value,
-                "operation": request.operation.value,
-                "capability": request.capability.value,
-                "resource": redact_resource_identifier(request.resource.identifier),
-                "outcome": decision.outcome.value,
-                "risk_level": decision.risk_level.value,
-                "risk_tags": [
-                    tag.value if hasattr(tag, "value") else str(tag)
-                    for tag in decision.risk_tags
-                ],
-                "reason": decision.reason,
-                "rule_ids": decision.rule_ids,
-                "approval_required": decision.required_approval is not None,
-            },
         )
 
     def _delegates_policy_decision(self, spec: ToolSpec, result: ToolResult) -> bool:
@@ -771,6 +802,28 @@ class ToolExecutor:
         if not spec.delegates_policy_constraints:
             return False
         return spec.execution_backend == ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNNER
+
+    def _preflight_delegated_handler(
+        self,
+        spec: ToolSpec,
+        validated_args: Any,
+    ) -> ToolResult | None:
+        if spec.execution_backend != ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR:
+            return None
+        owner = getattr(spec.handler, "__self__", None)
+        validator = getattr(owner, "validate_direct_command", None)
+        request_builder = getattr(owner, "_request", None)
+        if not callable(validator) or not callable(request_builder):
+            return None
+        try:
+            validator(request_builder(validated_args))
+        except ToolExecutionFailure as exc:
+            return ToolResult.failure(
+                code=exc.code,
+                message=exc.message,
+                details=exc.details,
+            )
+        return None
 
     def _execute_handler(self, spec: ToolSpec, validated_args: Any) -> tuple[ToolResult, str]:
         if (
@@ -1122,7 +1175,7 @@ class ToolExecutor:
             details={
                 "tool_name": spec.name,
                 "permission_level": spec.permission_level.value,
-                "side_effects": spec.side_effects.value,
+                "side_effects": spec.side_effects.value if spec.side_effects else None,
                 "backend": spec.execution_backend.value,
             },
         )
@@ -1330,7 +1383,11 @@ class ToolExecutor:
             else None
         )
         payload["metadata"] = {
-            key: value
+            key: (
+                _redacted_resource_details(value)
+                if key == "resources"
+                else value
+            )
             for key, value in payload.get("metadata", {}).items()
             if key != "arguments"
         }
@@ -1353,6 +1410,31 @@ class ToolExecutor:
                 and spec.idempotency_policy.replay_returns_previous
             ),
         )
+
+
+def _redacted_resource_details(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    resources: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        identifier = item.get("identifier")
+        normalized_identifier = item.get("normalized_identifier")
+        resources.append(
+            {
+                **item,
+                "identifier": redact_resource_identifier(str(identifier))
+                if identifier is not None
+                else "",
+                "normalized_identifier": (
+                    redact_resource_identifier(str(normalized_identifier))
+                    if normalized_identifier is not None
+                    else None
+                ),
+            }
+        )
+    return resources
 
 
 def _default_resource(spec: ToolSpec, args: dict[str, Any]) -> ResourceRef:
@@ -1419,3 +1501,12 @@ def _policy_error_code(outcome: DecisionOutcome) -> str:
         DecisionOutcome.ESCALATE: "policy_escalation_required",
     }
     return mapping.get(outcome, "policy_denied")
+
+
+def _decision_allowed_by_grant(decision: PolicyDecision, grant_id: str) -> PolicyDecision:
+    return decision.model_copy_with(
+        outcome=DecisionOutcome.ALLOW,
+        reason="Action allowed by matching ApprovalGrant.",
+        approval_grant_id=grant_id,
+        required_approval=None,
+    )

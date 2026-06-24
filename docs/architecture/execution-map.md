@@ -130,7 +130,7 @@ Keep this list in sync with the matching block in `README.md`.
 | ToolProtocolEngine | Tool-call validation, scheduling, replay detection, pending approval recovery, result binding | Handler execution for sequential calls, approval UI, direct storage writes outside protocol state |
 | ParallelToolExecutor | Concurrent execution of validated read-only idempotent tool groups | Mutations, commands, verification, approval handling, result ordering decisions |
 | ToolExecutor / ToolRegistry | Tool exposure, schema validation, policy request construction, handler dispatch after gates | Filesystem mutation, command execution, verification planning, Git operations |
-| PolicyEngine / ApprovalGate | Permission decisions, scoped local approval grants, fail-closed review behavior, audit records | Tool execution, UI layout, command spawning, remote grant file transport |
+| PolicyEngine / ApprovalGate | Permission decisions, approval gate, scoped grant storage and consumption, fail-closed review behavior, audit records | Tool execution, UI layout, command spawning, remote grant file transport |
 | WorkspaceMutationManager | Model-authored workspace edits, changesets, atomic apply, rollback metadata | Shell execution, verification command choice, Git commit/push/reset |
 | CommandExecutor | Process planning, env policy, resource limits, command output, side-effect ownership | Model-authored file edits, test selection, policy bypass, hard sandbox fallback |
 | VerificationRunner | Project detection, check planning, impact analysis, result classification, repair hints | Direct subprocess calls, mutation writes, approval grants |

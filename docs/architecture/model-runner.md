@@ -7,13 +7,17 @@ The compact boundary is:
 ```txt
 AgentLoop
   -> Planner.step()
-  -> ContextManager.messages()
   -> ModelRunner.build_request_from_context()
+  -> ModelTurnRequestBuilder.build_request()
+  -> PromptAssemblyPipeline.build_for_model_turn()
+  -> ContextManager.messages()
+  -> ContextManager.build_bundle()
   -> ModelProviderRegistry
   -> ModelProvider.complete()
   -> ModelResponseValidator
   -> canonical ModelToolCall list
-  -> ToolExecutor.execute_tool_call()
+  -> ToolProtocolEngine.process_model_turn()
+  -> ToolExecutor.execute_request()
 ```
 
 `ModelRunner` does not execute tools, mutate files, run commands, stage commits, push branches, or implement a GitClient. It only prepares model requests and returns structured model turn results.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, TypedDict
 
 from singularity.observability.models import (
     TraceArtifact,
@@ -11,6 +11,21 @@ from singularity.observability.models import (
     TraceSpan,
     TraceSummary,
 )
+
+
+class ModelUsageSummary(TypedDict):
+    requests: int
+    responses: int
+    failures: int
+    tool_calls_proposed: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cached_input_tokens: int
+    reasoning_tokens: int
+    request_cache_hit_rates: dict[str, float]
+    cache_miss_reasons: dict[str, list[str]]
+    run_cache_hit_rate: float
 
 
 class TraceSummaryBuilder:
@@ -134,7 +149,7 @@ class TraceSummaryBuilder:
             ),
             critical_events=critical,
             key_artifacts=key_artifacts,
-            model_usage_summary=model_usage_summary,
+            model_usage_summary=dict(model_usage_summary),
         )
 
     def final_report_summary(
@@ -257,8 +272,8 @@ def _first(values: list[Any]) -> Any | None:
     return None
 
 
-def _model_usage_summary(events: list[TraceEvent]) -> dict[str, Any]:
-    usage = {
+def _model_usage_summary(events: list[TraceEvent]) -> ModelUsageSummary:
+    usage: ModelUsageSummary = {
         "requests": 0,
         "responses": 0,
         "failures": 0,

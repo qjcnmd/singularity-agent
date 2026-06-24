@@ -75,16 +75,17 @@ class AgentKernel:
         self._interaction_report: InteractionFinalReport | None = None
         self._finalizing_during_shutdown = False
         self._resources_closed = False
-        self.interaction_controller = getattr(self.graph, "interaction_controller", None)
-        if self.interaction_controller is None:
-            self.interaction_controller = InteractionController(
+        interaction_controller = getattr(self.graph, "interaction_controller", None)
+        if interaction_controller is None:
+            interaction_controller = InteractionController(
                 trace=getattr(self.graph, "trace", None),
                 cancellation_manager=self.cancellation,
             )
             try:
-                setattr(self.graph, "interaction_controller", self.interaction_controller)
+                setattr(self.graph, "interaction_controller", interaction_controller)
             except Exception:
                 pass
+        self.interaction_controller: InteractionController = interaction_controller
         self.interaction_controller.cancellation_manager = self.cancellation
         self.graph.install_cancellation_tokens(self.cancellation.child_token)
 
@@ -120,6 +121,20 @@ class AgentKernel:
                 self.lifecycle.mark_completed(final_answer)
                 shutdown_reason = ShutdownReason.NORMAL
                 result_status = RunStatus.COMPLETED
+            elif agent_result.status == AgentLoopStatus.BLOCKED:
+                self.lifecycle.mark_blocked(
+                    f"{agent_result.status.value}: {agent_result.error_code or final_answer}"
+                )
+                self.context.diagnostics.append(
+                    {
+                        "type": "AgentLoopStatus",
+                        "status": agent_result.status.value,
+                        "error_code": agent_result.error_code,
+                        "message": final_answer,
+                    }
+                )
+                shutdown_reason = ShutdownReason.BLOCKED
+                result_status = RunStatus.BLOCKED
             else:
                 self.lifecycle.mark_failed(
                     f"{agent_result.status.value}: {agent_result.error_code or final_answer}"

@@ -343,7 +343,8 @@ class ContextAssembler:
         policy: ContextRenderPolicy,
     ) -> dict[str, Any]:
         content = item.content if isinstance(item.content, dict) else {"preview": item.content}
-        metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
+        metadata_value = content.get("metadata")
+        metadata = metadata_value if isinstance(metadata_value, dict) else {}
         rendered = {
             "context_item_id": item.item_id,
             "tool_name": content.get("tool_name"),
@@ -675,7 +676,6 @@ def _layer_weight(layer: ContextLayer) -> float:
         ContextLayer.VERIFICATION: 34,
         ContextLayer.FAILURE_MEMORY: 32,
         ContextLayer.WORKSPACE_STATE: 30,
-        ContextLayer.MUTATION if hasattr(ContextLayer, "MUTATION") else ContextLayer.EVIDENCE: 28,
         ContextLayer.EVIDENCE: 26,
         ContextLayer.TOOL_OBSERVATIONS: 24,
         ContextLayer.COMPRESSED_HISTORY: 22,

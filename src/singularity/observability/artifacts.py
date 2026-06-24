@@ -49,7 +49,7 @@ class TraceArtifactStore:
     ) -> TraceArtifact:
         output = self.redactor.redact_text(text)
         return self.write_bytes_artifact(
-            kind=kind,
+            kind=kind if isinstance(kind, TraceArtifactKind) else TraceArtifactKind(str(kind)),
             data=output.encode("utf-8"),
             task_id=task_id,
             summary=summary,
@@ -79,7 +79,7 @@ class TraceArtifactStore:
         path.write_bytes(data)
         return self._artifact(
             artifact_id=artifact_id,
-            kind=kind,
+            kind=kind if isinstance(kind, TraceArtifactKind) else TraceArtifactKind(str(kind)),
             path=path,
             task_id=task_id,
             content_type=content_type,
@@ -122,7 +122,7 @@ class TraceArtifactStore:
         content_type = mimetypes.guess_type(str(source))[0] or "application/octet-stream"
         return self._artifact(
             artifact_id=artifact_id,
-            kind=kind,
+            kind=kind if isinstance(kind, TraceArtifactKind) else TraceArtifactKind(str(kind)),
             path=path,
             task_id=task_id,
             content_type=content_type,
@@ -162,7 +162,7 @@ class TraceArtifactStore:
             run_id=self.run_id,
             session_id=self.session_id,
             task_id=task_id,
-            kind=kind,
+            kind=kind if isinstance(kind, TraceArtifactKind) else TraceArtifactKind(str(kind)),
             path=path,
             relative_path=relative,
             size_bytes=len(data),

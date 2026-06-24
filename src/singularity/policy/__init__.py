@@ -27,6 +27,7 @@ from singularity.policy.models import (
     RiskLevel,
     RiskTag,
     PolicyComponent,
+    approval_scope_for_request,
 )
 from singularity.policy.risk import RiskAssessment, RiskClassifier
 from singularity.policy.remote import RemoteApprovalExport, RemoteApprovalExchange
@@ -39,6 +40,7 @@ __all__ = [
     "ApprovalRequired",
     "ApprovalRequirement",
     "ApprovalScope",
+    "approval_scope_for_request",
     "Capability",
     "DecisionOutcome",
     "OperationKind",

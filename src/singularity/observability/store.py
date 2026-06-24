@@ -75,7 +75,7 @@ class TraceStore:
             started_at=latest.started_at,
             ended_at=ended_at or datetime.now(UTC),
             duration_ms=duration_ms,
-            status=status,
+            status=status if isinstance(status, TraceStatus) else TraceStatus(str(status)),
             error_type=error_type,
             error_message=error_message,
             attributes=latest.attributes,

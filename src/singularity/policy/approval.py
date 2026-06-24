@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
+import json
+import os
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Protocol, cast
 
 from singularity.interaction import DecisionPrompt, InteractionController
 from singularity.observability.models import TraceEventType, TraceSeverity
@@ -23,6 +27,14 @@ from singularity.policy.models import (
 )
 
 
+class _FcntlModule(Protocol):
+    LOCK_EX: int
+    LOCK_UN: int
+
+    def flock(self, file_descriptor: int, operation: int) -> None:
+        ...
+
+
 class ApprovalGate:
     def __init__(
         self,
@@ -34,6 +46,60 @@ class ApprovalGate:
         self.config = config
         self.trace = trace
         self.interaction = interaction
+        self._grants_lock_path = _approval_grants_path(self.config).with_suffix(".lock")
+        self._grants: list[ApprovalGrant] = self._load_grants()
+
+    def register_grant(self, grant: ApprovalGrant) -> None:
+        with _file_lock(self._grants_lock_path):
+            self._grants = self._load_grants_unlocked()
+            existing = next(
+                (
+                    index
+                    for index, candidate in enumerate(self._grants)
+                    if candidate.grant_id == grant.grant_id
+                ),
+                None,
+            )
+            if existing is None:
+                self._grants.append(grant)
+            else:
+                self._grants[existing] = grant
+            self._persist_grants_unlocked()
+
+    def find_matching_grant(self, request: PolicyRequest) -> ApprovalGrant | None:
+        with _file_lock(self._grants_lock_path):
+            self._grants = self._load_grants_unlocked()
+            return self._find_matching_grant_unlocked(request)
+
+    def consume_matching_grant(self, request: PolicyRequest) -> ApprovalGrant | None:
+        with _file_lock(self._grants_lock_path):
+            self._grants = self._load_grants_unlocked()
+            grant = self._find_matching_grant_unlocked(request)
+            if grant is None:
+                return None
+            grant.consume()
+            self._persist_grants_unlocked()
+            return grant
+
+    def consume_grant(self, grant: ApprovalGrant) -> ApprovalGrant | None:
+        with _file_lock(self._grants_lock_path):
+            self._grants = self._load_grants_unlocked()
+            current = next(
+                (
+                    candidate
+                    for candidate in self._grants
+                    if candidate.grant_id == grant.grant_id
+                ),
+                None,
+            )
+            if current is None:
+                self._grants.append(grant)
+                current = grant
+            if current.consumed:
+                return None
+            current.consume()
+            self._persist_grants_unlocked()
+            return current
 
     def resolve(
         self,
@@ -203,3 +269,78 @@ class ApprovalGate:
             },
             severity=severity,
         )
+
+    def _find_matching_grant_unlocked(self, request: PolicyRequest) -> ApprovalGrant | None:
+        workspace_root = request.workspace_root or self.config.workspace_root
+        for grant in self._grants:
+            if grant.matches(request, workspace_root=Path(workspace_root)):
+                return grant
+        return None
+
+    def _load_grants(self) -> list[ApprovalGrant]:
+        with _file_lock(self._grants_lock_path):
+            return self._load_grants_unlocked()
+
+    def _load_grants_unlocked(self) -> list[ApprovalGrant]:
+        path = _approval_grants_path(self.config)
+        if not path.exists():
+            return []
+        grants: list[ApprovalGrant] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                grants.append(ApprovalGrant.from_dict(json.loads(line)))
+        return grants
+
+    def _persist_grants_unlocked(self) -> None:
+        path = _approval_grants_path(self.config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = "".join(
+            json.dumps(grant.to_dict(), ensure_ascii=False, sort_keys=True) + "\n"
+            for grant in self._grants
+        )
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(text, encoding="utf-8")
+        tmp_path.replace(path)
+
+
+@contextmanager
+def _file_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        _lock_file(handle)
+        try:
+            yield
+        finally:
+            _unlock_file(handle)
+
+
+def _lock_file(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    import fcntl
+
+    posix_lock = cast(_FcntlModule, fcntl)
+    posix_lock.flock(handle.fileno(), posix_lock.LOCK_EX)
+
+
+def _unlock_file(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    posix_lock = cast(_FcntlModule, fcntl)
+    posix_lock.flock(handle.fileno(), posix_lock.LOCK_UN)
+
+
+def _approval_grants_path(config: PolicyConfig) -> Path:
+    if config.approval_grants_path is None:
+        return Path(config.workspace_root) / ".singularity" / "policy" / "approval_grants.jsonl"
+    return Path(config.approval_grants_path)

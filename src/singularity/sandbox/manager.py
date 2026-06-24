@@ -3,9 +3,10 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from singularity.observability.models import TraceEventType, TraceSeverity
+from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.policy.config import SecurityMode
 from singularity.policy.models import PolicyDecision
 from singularity.sandbox.backends import SandboxBackend, default_sandbox_backends
@@ -23,13 +24,25 @@ from singularity.sandbox.models import (
 from singularity.sandbox.trace_recorder import SandboxJsonlTraceRecorder
 
 
+class SandboxAppendTraceRecorderProtocol(Protocol):
+    def append(
+        self,
+        *,
+        prepared: Any | None,
+        result: SandboxResult,
+        capabilities: Any | None = None,
+        request: SandboxRequest | None = None,
+    ) -> None:
+        ...
+
+
 class SandboxManager:
     def __init__(
         self,
         workspace_root: Path | str,
         *,
         backends: list[SandboxBackend] | None = None,
-        trace: SandboxJsonlTraceRecorder | None = None,
+        trace: SandboxAppendTraceRecorderProtocol | TraceEmitterProtocol | None = None,
         security_mode: SecurityMode | str = SecurityMode.COMPAT,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
@@ -123,7 +136,7 @@ class SandboxManager:
             return result
         except Exception as exc:
             if _is_cancellation_error(exc):
-                if prepared is not None:
+                if prepared is not None and backend is not None:
                     try:
                         backend.cleanup(prepared)
                     except Exception:
@@ -326,8 +339,9 @@ class SandboxManager:
         capabilities: Any | None,
         request: SandboxRequest | None = None,
     ) -> None:
-        if hasattr(self.trace, "append"):
-            self.trace.append(
+        append = getattr(self.trace, "append", None)
+        if callable(append):
+            append(
                 prepared=prepared,
                 result=result,
                 capabilities=capabilities,
@@ -364,9 +378,10 @@ class SandboxManager:
         payload: dict[str, Any] | None = None,
         severity: TraceSeverity = TraceSeverity.INFO,
     ) -> None:
-        if not hasattr(self.trace, "emit"):
+        emit = getattr(self.trace, "emit", None)
+        if not callable(emit):
             return
-        self.trace.emit(
+        emit(
             event_type,
             component="sandbox",
             summary=summary,

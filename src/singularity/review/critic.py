@@ -35,7 +35,14 @@ class ModelCritic:
                 error="model_runner_missing",
             )
         try:
-            from singularity.model.models import ModelPurpose, ModelTurnRequest, ModelTurnStatus
+            from singularity.model.models import (
+                ContentBlock,
+                ModelMessage,
+                ModelPurpose,
+                ModelRole,
+                ModelTurnRequest,
+                ModelTurnStatus,
+            )
 
             ids = dict(request_context or {})
             request_id = str(ids.get("request_id") or f"critic_{report.review_id}")
@@ -48,7 +55,10 @@ class ModelCritic:
                 action_id=str(ids.get("action_id") or report.target.verification_id or report.target.patch_id or report.review_id),
                 purpose=ModelPurpose.CLASSIFY_ERROR,
                 messages=[
-                    {"role": "user", "content": _critic_prompt(report, bundle)}
+                    ModelMessage(
+                        role=ModelRole.USER,
+                        content=[ContentBlock.from_text(_critic_prompt(report, bundle))],
+                    )
                 ],
                 context_metadata={
                     "review_id": report.review_id,

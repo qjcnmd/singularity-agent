@@ -46,7 +46,7 @@ Result: passed.
 .\.venv\Scripts\python.exe -m mypy
 ```
 
-Result: `Success: no issues found in 7 source files`.
+Result: focused mypy gate reported `Success: no issues found in 7 source files`.
 
 ```powershell
 .\.venv\Scripts\python.exe -m singularity.cli eval task validate docs\evaluation\phase1j-golden-tasks.json --json

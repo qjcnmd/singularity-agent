@@ -1,6 +1,6 @@
 # Tool Execution Architecture
 
-Singularity v0.0.16 makes the tool layer a production boundary without rewriting the agent loop or context manager. The model still proposes OpenAI-style `tool_calls`; `agent.py` still forwards each call to `ToolExecutor.execute_tool_call`; `ContextManager` still stores the returned `ToolResult` as an observation.
+Singularity makes the tool layer a production boundary without moving tool execution into the model layer. The model still proposes OpenAI-style `tool_calls`; `AgentLoop` passes the model turn to `ToolProtocolEngine.process_model_turn()`, the protocol engine converts calls into `ToolExecutionRequest` objects, and `ToolExecutor.execute_request()` performs the actual tool execution. `ContextManager` stores the bound `ToolProtocolResultEnvelope` as a `ToolObservation`.
 
 ## Contract
 
@@ -25,7 +25,7 @@ Local tool plugins enter the system at this boundary. `PluginManager` activates 
 
 ## Component Pipeline
 
-`ToolExecutor.execute_tool_call()` follows a fixed sequence:
+`ToolExecutor.execute_request()` follows a fixed sequence. `execute_tool_call()` remains a thin wrapper for direct provider-style tool call dictionaries.
 
 ```txt
 resolve registered tool
@@ -36,7 +36,7 @@ check component backend contract
 check ToolPolicy admission
 build PolicyRequest from ToolSpec shape and resolved resources
 PolicyEngine.enforce()
-ApprovalGate.resolve() when review is required and a gate is configured
+ApprovalGate.consume_matching_grant() or ApprovalGate.resolve() when review is required and a gate is configured
 Planner.authorize_tool_call()
 read-only cache lookup
 backend guard
@@ -50,11 +50,11 @@ trace/audit record
 
 `ToolExecutor` does not create its own session policy component. CLI and tests must inject the active `PolicyEngine`; construction fails if it is missing. The component also does not mutate files directly, run commands directly, choose verification commands, or implement a GitClient. Those behaviors remain delegated to WorkspaceMutationManager, Command Execution, and VerificationRunner.
 
-Plugin-provided tools are not a bypass. Once registered, they follow the same `ToolExecutor.execute_tool_call()` pipeline as built-in tools. High-risk plugin tools must still declare valid `ToolSpec` backend metadata, and registry admission rejects write or shell tools that do not delegate to the appropriate component.
+Plugin-provided tools are not a bypass. Once registered, they follow the same `ToolExecutor.execute_request()` pipeline as built-in tools. High-risk plugin tools must still declare valid `ToolSpec` backend metadata, and registry admission rejects write or shell tools that do not delegate to the appropriate component.
 
 ## Policy, Approval, Planner
 
-The component builds a `PolicyRequest` from each `ToolSpec` using declared `operation`, `capabilities`, and `resource_resolver`. `PolicyEngine.enforce()` is the hard policy boundary. If policy returns `REQUIRE_REVIEW` and an `ApprovalGate` is configured, the gate produces an `ApprovalGrant`, the grant is registered on `PolicyEngine`, and the same request is enforced again so the grant is consumed by the policy layer.
+The component builds a `PolicyRequest` from each `ToolSpec` using declared `operation`, `capabilities`, and `resource_resolver`. `PolicyEngine.enforce()` is the hard risk and policy decision boundary. If policy returns `REQUIRE_REVIEW` and an `ApprovalGate` is configured, `ApprovalGate` consumes a matching existing grant or resolves a new one, registers it in the grant store, and returns the consumed grant to `ToolExecutor`; `PolicyEngine` does not store or consume approval grants.
 
 `SANDBOX_REQUIRED` fails closed in the tool layer unless the tool explicitly declares the verification delegated backend and `delegates_policy_constraints=true`. The current use case is verification: `run_verification` and `rerun_check` can pass sandbox constraints to `VerificationRunner` / `CommandExecutor`, where sandbox enforcement belongs. Registry admission rejects this flag on non-verification backends.
 

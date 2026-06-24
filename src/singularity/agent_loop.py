@@ -18,7 +18,7 @@ from singularity.policy import PolicyEngine
 from singularity.run_controller import RunController
 from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tools import ToolRegistry, ToolExecutor
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.observability.protocols import TraceStorageProtocol
 
 
 SYSTEM_PROMPT = """You are Singularity, a local coding agent harness.
@@ -88,7 +88,7 @@ class AgentLoop:
         provider: OpenAICompatibleProvider | None = None,
         model_runner: ModelRunner,
         tools: ToolRegistry,
-        trace: JsonlTraceRecorder,
+        trace: TraceStorageProtocol,
         console: Console,
         max_turns: int,
         planner: Planner,
@@ -183,7 +183,7 @@ class AgentLoop:
                 user_task=effective_goal,
                 strict_tools=self.strict,
             )
-            planner.record_instruction_prompt_observation(prompt_assembly.summary())
+            planner.record_instruction_prompt_observation(dict(prompt_assembly.summary()))
             result = model_runner.run_turn(request)
             context.record_model_usage(result)
             if result.status != ModelTurnStatus.SUCCESS:
@@ -218,7 +218,6 @@ class AgentLoop:
                 context=context,
                 tool_executor=tool_executor,
                 planner=planner,
-                policy_engine=self.policy_engine,
             )
             if protocol_result.next_action == "finalize":
                 final = self._attempt_finalize(
@@ -232,16 +231,16 @@ class AgentLoop:
                     return final
                 return None
 
-            controller.apply_protocol_result(protocol_result)
-            outcome = self._reduce_protocol_result(
+            observations = context.tool_observations[observation_start:]
+            controller.apply_protocol_result(protocol_result, observations=observations)
+            reduced_outcome = controller.reduce_protocol_result(
                 protocol_result,
-                context=context,
-                observation_start=observation_start,
+                observations=observations,
             )
-            if outcome is not None:
-                controller.apply_outcome(outcome)
-                self._record_outcome_context(context, planner, outcome)
-                terminal = self._terminal_result_from_outcome(outcome, turn=turn)
+            if reduced_outcome is not None:
+                controller.apply_outcome(reduced_outcome)
+                self._record_outcome_context(context, planner, reduced_outcome)
+                terminal = self._terminal_result_from_outcome(reduced_outcome, turn=turn)
                 if terminal is not None:
                     return terminal
             if self._should_auto_finalize_after_tools(planner, protocol_result):
@@ -369,132 +368,6 @@ class AgentLoop:
             return False
         return True
 
-    def _reduce_protocol_result(
-        self,
-        protocol_result: Any,
-        *,
-        context: ContextManager,
-        observation_start: int,
-    ) -> ExecutionOutcome | None:
-        observations = context.tool_observations[observation_start:]
-        error_codes = [
-            str(observation.error_code)
-            for observation in observations
-            if getattr(observation, "error_code", None)
-        ]
-        next_action = str(getattr(protocol_result, "next_action", "") or "continue")
-        status = str(getattr(getattr(protocol_result, "status", None), "value", getattr(protocol_result, "status", "")))
-        failed_count = int(getattr(protocol_result, "failed_count", 0) or 0)
-        rejected_count = int(getattr(protocol_result, "rejected_count", 0) or 0)
-        pending_count = int(getattr(protocol_result, "pending_approval_count", 0) or 0)
-        summary = self._observation_summary(observations, protocol_result)
-
-        if pending_count or next_action == "pending_approval" or "approval_required" in error_codes:
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.APPROVAL_REQUIRED,
-                source="protocol",
-                reason="Tool execution is waiting for approval.",
-                error_code="approval_required",
-                next_action="wait_for_approval",
-                observation_summary=summary,
-                retry_allowed=False,
-            )
-        if "policy_ask_user_required" in error_codes:
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
-                source="tool",
-                reason="Policy requires user input.",
-                error_code="policy_ask_user_required",
-                next_action="ask_user",
-                observation_summary=summary,
-                retry_allowed=False,
-            )
-        blocked_codes = {
-            "policy_denied",
-            "approval_denied",
-            "action_not_allowed",
-            "risk_escalated",
-            "sandbox_required",
-            "policy_escalation_required",
-        }
-        if any(code in blocked_codes for code in error_codes):
-            code = next(code for code in error_codes if code in blocked_codes)
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.BLOCKED,
-                source="tool",
-                reason=f"Tool execution blocked: {code}.",
-                error_code=code,
-                next_action="blocked",
-                observation_summary=summary,
-                retry_allowed=False,
-            )
-        replan_codes = {
-            "snapshot_mismatch",
-            "external_change_detected",
-            "file_changed",
-            "rollback_conflict",
-            "semantic_failure",
-            "verification_failed",
-            "blocked_by_verification",
-            "command_not_found",
-            "timeout",
-        }
-        if any(code in replan_codes for code in error_codes):
-            code = next(code for code in error_codes if code in replan_codes)
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.REPLAN_REQUIRED,
-                source="tool",
-                reason=f"Tool result requires replanning: {code}.",
-                error_code=code,
-                next_action="replan",
-                observation_summary=summary,
-                retry_allowed=True,
-            )
-        retryable_codes = {
-            "bad_arguments_json",
-            "invalid_json",
-            "arguments_not_object",
-            "validation_error",
-            "schema_mismatch",
-            "unknown_tool",
-            "tool_not_found",
-            "disallowed_tool",
-            "protocol_violation",
-            "internal_error",
-        }
-        if any(code in retryable_codes for code in error_codes):
-            code = next(code for code in error_codes if code in retryable_codes)
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.RETRYABLE,
-                source="protocol" if "json" in code or "schema" in code else "tool",
-                reason=f"Tool call can be retried after correction: {code}.",
-                error_code=code,
-                next_action="retry",
-                observation_summary=summary,
-                retry_allowed=True,
-            )
-        if next_action == "fail_safe" or status in {"failed", "invalid_assistant"}:
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.RETRYABLE,
-                source="protocol",
-                reason="Protocol fail-safe requested another model turn.",
-                error_code=str((getattr(protocol_result, "metadata", {}) or {}).get("reason") or "protocol_fail_safe"),
-                next_action="retry",
-                observation_summary=summary,
-                retry_allowed=True,
-            )
-        if failed_count or rejected_count or next_action == "recover":
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.RETRYABLE,
-                source="protocol",
-                reason="Protocol reported recoverable tool failure.",
-                error_code=error_codes[0] if error_codes else "tool_failure",
-                next_action="retry",
-                observation_summary=summary,
-                retry_allowed=True,
-            )
-        return None
-
     def _outcome_from_model_failure(self, result: Any) -> ExecutionOutcome:
         message = (
             result.error.message
@@ -570,20 +443,6 @@ class AgentLoop:
                 "status": planner.state.status.value if planner.state else "unknown",
                 "execution_outcome": outcome.to_dict(),
             }
-        )
-
-    @staticmethod
-    def _observation_summary(observations: list[Any], protocol_result: Any) -> str:
-        if observations:
-            parts = []
-            for observation in observations[-3:]:
-                status = "ok" if observation.ok else (observation.error_code or "failed")
-                preview = str(observation.preview or "").replace("\n", " ")[:160]
-                parts.append(f"{observation.tool_name}:{status}:{preview}")
-            return "; ".join(parts)
-        return (
-            f"protocol next_action={getattr(protocol_result, 'next_action', None)} "
-            f"status={getattr(getattr(protocol_result, 'status', None), 'value', getattr(protocol_result, 'status', None))}"
         )
 
     def _context_db_path(self) -> Any:

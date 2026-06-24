@@ -7,13 +7,14 @@ from pydantic import BaseModel, ConfigDict
 
 from singularity.policy import (
     ApprovalGate,
-    ApprovalGrant,
     ApprovalMode,
+    approval_scope_for_request,
     DecisionOutcome,
     PolicyConfig,
     PolicyDecision,
     PolicyRequest,
     RiskLevel,
+    ResourceRef,
 )
 from singularity.interaction import InteractionController, UserDecision
 from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor, ToolSpec
@@ -36,7 +37,6 @@ class SequencedPolicyEngine:
     def __init__(self, outcomes: list[DecisionOutcome]) -> None:
         self.outcomes = outcomes
         self.requests: list[PolicyRequest] = []
-        self.registered: list[ApprovalGrant] = []
 
     @property
     def config(self) -> PolicyConfig:
@@ -54,10 +54,6 @@ class SequencedPolicyEngine:
 
     def enforce(self, request: PolicyRequest) -> PolicyDecision:
         return self.evaluate(request)
-
-    def register_grant(self, grant: ApprovalGrant) -> None:
-        self.registered.append(grant)
-
 
 class ApprovingProvider:
     def request_decision(self, prompt):
@@ -99,16 +95,14 @@ def component_with_policy(
         policy=ToolPolicy.read_only(),
         trace=JsonlTraceRecorder.create(tmp_path),
         workspace_root=tmp_path,
-        policy_engine=policy_engine,  # type: ignore[arg-type]
+        policy_engine=policy_engine,
         approval_gate=approval_gate,
     )
 
 
 def test_require_review_uses_approval_gate_and_consumes_grant(tmp_path: Path) -> None:
     calls: list[str] = []
-    policy_engine = SequencedPolicyEngine(
-        [DecisionOutcome.REQUIRE_REVIEW, DecisionOutcome.ALLOW]
-    )
+    policy_engine = SequencedPolicyEngine([DecisionOutcome.REQUIRE_REVIEW])
     gate = ApprovalGate(
         PolicyConfig(workspace_root=tmp_path, approval_mode=ApprovalMode.INTERACTIVE),
         interaction=InteractionController(provider=ApprovingProvider()),
@@ -121,8 +115,8 @@ def test_require_review_uses_approval_gate_and_consumes_grant(tmp_path: Path) ->
 
     assert result.ok is True
     assert calls == ["called"]
-    assert len(policy_engine.registered) == 1
-    assert result.metadata["approval_grant_id"] == policy_engine.registered[0].grant_id
+    assert result.metadata["approval_grant_id"].startswith("grant_")
+    assert gate.find_matching_grant(policy_engine.requests[0]) is None
 
 
 def test_tool_executor_requires_injected_policy_engine(tmp_path: Path) -> None:
@@ -180,3 +174,48 @@ def test_non_allow_policy_outcomes_do_not_call_handler(tmp_path: Path) -> None:
         assert result.ok is False
         assert result.error_code == code
         assert calls == []
+
+
+def test_tool_policy_request_preserves_all_resolved_resources(tmp_path: Path) -> None:
+    policy_engine = SequencedPolicyEngine([DecisionOutcome.ALLOW])
+
+    class MoveInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        path: str
+        new_path: str
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="workspace_move_policy_test",
+            description="move",
+            input_model=MoveInput,
+            handler=lambda _args: {"ok": "yes"},
+            resource_resolver=lambda args, _root: [
+                ResourceRef("file", args["path"], workspace_relative=True),
+                ResourceRef("file", args["new_path"], workspace_relative=True),
+            ],
+        )
+    )
+    component = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=JsonlTraceRecorder.create(tmp_path),
+        workspace_root=tmp_path,
+        policy_engine=policy_engine,
+    )
+
+    result = component.execute_tool_call(
+        make_tool_call(
+            "workspace_move_policy_test",
+            {"path": "old.txt", "new_path": "new.txt"},
+        )
+    )
+
+    assert result.ok is True
+    request = policy_engine.requests[0]
+    resources = request.metadata["resources"]
+    assert [item["identifier"] for item in resources] == ["old.txt", "new.txt"]
+    assert request.resource.metadata["related_resources"][0]["identifier"] == "new.txt"
+    assert approval_scope_for_request(request).path_globs == ["old.txt", "new.txt"]

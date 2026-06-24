@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from singularity.policy import (
+    ApprovalGate,
     ApprovalGrant,
     ApprovalScope,
     ApprovalMode,
@@ -117,6 +118,7 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
     assert denied.reason == "Review required but approval mode is non_interactive."
 
     interactive = PolicyEngine(PolicyConfig(workspace_root=tmp_path, security_mode="compat"))
+    gate = ApprovalGate(PolicyConfig(workspace_root=tmp_path, security_mode="compat"))
     pending = interactive.evaluate(command)
     grant = ApprovalGrant(
         decision_id=pending.decision_id,
@@ -129,9 +131,9 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
             single_use=True,
         ),
     )
-    interactive.register_grant(grant)
+    gate.register_grant(grant)
 
-    allowed = interactive.enforce(command)
+    consumed = gate.consume_matching_grant(command)
     other = req(
         tmp_path,
         operation=OperationKind.MUTATE_FILE,
@@ -140,9 +142,10 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
         identifier="src/other.py",
     )
 
-    assert allowed.outcome == DecisionOutcome.ALLOW
-    assert interactive.find_matching_grant(other) is None
-    assert interactive.find_matching_grant(command) is None
+    assert consumed is not None
+    assert consumed.grant_id == grant.grant_id
+    assert gate.find_matching_grant(other) is None
+    assert gate.find_matching_grant(command) is None
 
 
 def test_policy_grants_persist_across_process_restarts(tmp_path: Path) -> None:
@@ -152,7 +155,7 @@ def test_policy_grants_persist_across_process_restarts(tmp_path: Path) -> None:
         approval_grants_path=grant_path,
         security_mode="compat",
     )
-    first = PolicyEngine(config)
+    first = ApprovalGate(config)
     request = req(
         tmp_path,
         operation=OperationKind.MUTATE_FILE,
@@ -160,7 +163,7 @@ def test_policy_grants_persist_across_process_restarts(tmp_path: Path) -> None:
         resource_type="file",
         identifier="src/app.py",
     )
-    pending = first.evaluate(request)
+    pending = PolicyEngine(config).evaluate(request)
     grant = ApprovalGrant(
         decision_id=pending.decision_id,
         request_id=request.request_id,
@@ -174,12 +177,12 @@ def test_policy_grants_persist_across_process_restarts(tmp_path: Path) -> None:
     )
 
     first.register_grant(grant)
-    restarted = PolicyEngine(config)
-    allowed = restarted.enforce(request)
+    restarted = ApprovalGate(config)
+    consumed = restarted.consume_matching_grant(request)
 
-    assert allowed.outcome == DecisionOutcome.ALLOW
-    assert allowed.approval_grant_id == grant.grant_id
-    assert PolicyEngine(config).find_matching_grant(request) is None
+    assert consumed is not None
+    assert consumed.grant_id == grant.grant_id
+    assert ApprovalGate(config).find_matching_grant(request) is None
 
 
 def test_single_use_grant_cannot_be_consumed_twice_by_stale_process(tmp_path: Path) -> None:
@@ -207,16 +210,16 @@ def test_single_use_grant_cannot_be_consumed_twice_by_stale_process(tmp_path: Pa
             single_use=True,
         ),
     )
-    writer = PolicyEngine(config)
+    writer = ApprovalGate(config)
     writer.register_grant(grant)
-    stale = PolicyEngine(config)
-    first = PolicyEngine(config)
+    stale = ApprovalGate(config)
+    first = ApprovalGate(config)
 
-    assert first.enforce(request).outcome == DecisionOutcome.ALLOW
-    second = stale.enforce(request)
+    assert first.consume_matching_grant(request) is not None
+    second = stale.consume_matching_grant(request)
 
-    assert second.outcome == DecisionOutcome.REQUIRE_REVIEW
-    assert PolicyEngine(config).find_matching_grant(request) is None
+    assert second is None
+    assert ApprovalGate(config).find_matching_grant(request) is None
 
 
 def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path: Path) -> None:
@@ -245,7 +248,7 @@ def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path:
             single_use=True,
         ),
     )
-    component = PolicyEngine(config)
+    component = ApprovalGate(config)
     component.register_grant(grant)
     other_session = PolicyRequest(
         session_id="other_session",
@@ -261,7 +264,7 @@ def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path:
         workspace_root=request.workspace_root,
     )
 
-    assert PolicyEngine(config).find_matching_grant(other_session) is None
+    assert ApprovalGate(config).find_matching_grant(other_session) is None
 
 
 def test_session_only_grant_without_session_id_fails_closed(tmp_path: Path) -> None:
@@ -289,10 +292,10 @@ def test_session_only_grant_without_session_id_fails_closed(tmp_path: Path) -> N
             single_use=True,
         ),
     )
-    component = PolicyEngine(config)
+    component = ApprovalGate(config)
     component.register_grant(grant)
 
-    assert PolicyEngine(config).find_matching_grant(request) is None
+    assert ApprovalGate(config).find_matching_grant(request) is None
 
 
 def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
@@ -338,11 +341,9 @@ def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
     assert network.outcome == DecisionOutcome.DENY
 
 
-def test_consume_grant_allows_without_reevaluating_policy(tmp_path: Path) -> None:
-    audit_path = tmp_path / "policy.jsonl"
-    component = PolicyEngine(
-        PolicyConfig(workspace_root=tmp_path, audit_log_path=audit_path)
-    )
+def test_approval_gate_consumes_grant_without_reevaluating_policy(tmp_path: Path) -> None:
+    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
+    gate = ApprovalGate(PolicyConfig(workspace_root=tmp_path))
     request = req(
         tmp_path,
         operation=OperationKind.EXECUTE_COMMAND,
@@ -361,14 +362,12 @@ def test_consume_grant_allows_without_reevaluating_policy(tmp_path: Path) -> Non
             single_use=True,
         ),
     )
-    audit_path.unlink()
+    gate.register_grant(grant)
+    consumed = gate.consume_grant(grant)
 
-    allowed = component.consume_grant(request, pending, grant)
-
-    assert allowed.outcome == DecisionOutcome.ALLOW
-    assert allowed.approval_grant_id == grant.grant_id
-    assert grant.consumed is True
-    assert len(audit_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert consumed is not None
+    assert consumed.grant_id == grant.grant_id
+    assert consumed.consumed is True
 
 
 def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: Path) -> None:

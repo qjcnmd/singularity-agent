@@ -54,7 +54,7 @@ Result: `693 passed, 5 skipped`.
 .\.venv\Scripts\python.exe -m mypy
 ```
 
-Results: compileall passed, Ruff passed, mypy reported `Success: no issues found in 7 source files`.
+Results: compileall passed, Ruff passed, and the focused mypy gate reported `Success: no issues found in 7 source files`.
 
 ```powershell
 .\.venv\Scripts\python.exe -m singularity.cli eval task validate docs\evaluation\phase1j-golden-tasks.json --json

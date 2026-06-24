@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.observability.protocols import TraceRecorderProtocol
 from singularity.workspace.pathing import (
     ResolvedWorkspacePath,
     WorkspacePathResolver,
@@ -162,7 +162,7 @@ class WorkspaceStateManager:
         self,
         workspace_root: Path | str,
         *,
-        trace: JsonlTraceRecorder | None = None,
+        trace: TraceRecorderProtocol | None = None,
         policy: WorkspaceStatePolicy | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)

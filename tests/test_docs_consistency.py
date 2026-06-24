@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 REQUIRED_ARCHITECTURE_DOCS = [
     "execution-map.md",
-    "naming-and-runtime-map.md",
+    "naming-and-concept-map.md",
     "boundary-contracts.md",
     "state-model.md",
     "event-model.md",
@@ -90,7 +90,7 @@ def test_readme_uses_singularity_identity() -> None:
 
 def test_readme_component_names_match_naming_map() -> None:
     readme_names = _component_names(ROOT / "README.md")
-    naming_map_names = _component_names(ROOT / "docs" / "architecture" / "naming-and-runtime-map.md")
+    naming_map_names = _component_names(ROOT / "docs" / "architecture" / "naming-and-concept-map.md")
 
     assert readme_names == naming_map_names
     assert "ContextManager" in readme_names
@@ -130,7 +130,7 @@ def test_git_client_docs_match_local_only_contract() -> None:
         path.read_text(encoding="utf-8")
         for path in [
             ROOT / "README.md",
-            ROOT / "docs" / "architecture" / "naming-and-runtime-map.md",
+            ROOT / "docs" / "architecture" / "naming-and-concept-map.md",
             ROOT / "docs" / "architecture" / "command-execution.md",
             ROOT / "docs" / "architecture" / "code-index.md",
             ROOT / "docs" / "architecture" / "verification-runner.md",
@@ -145,7 +145,7 @@ def test_git_client_docs_match_local_only_contract() -> None:
 
 def test_config_and_sandbox_docs_match_implemented_evidence() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    naming_map = (ROOT / "docs" / "architecture" / "naming-and-runtime-map.md").read_text(
+    naming_map = (ROOT / "docs" / "architecture" / "naming-and-concept-map.md").read_text(
         encoding="utf-8"
     )
     sandbox = (ROOT / "docs" / "architecture" / "sandbox-isolation.md").read_text(

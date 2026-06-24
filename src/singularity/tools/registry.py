@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from pathlib import Path
 from typing import Any
 
@@ -60,8 +61,8 @@ class ToolRegistry:
     def get_record(self, name: str) -> RegisteredToolRecord | None:
         return self._records.get(name)
 
-    def list(self) -> list[ToolSpec]:
-        return list(self._tools.values())
+    def list(self) -> builtins.list[ToolSpec]:
+        return builtins.list(self._tools.values())
 
     def list_records(
         self,
@@ -69,8 +70,8 @@ class ToolRegistry:
         origin: ToolOriginKind | str | None = None,
         include_disabled: bool = True,
         admitted_only: bool = False,
-    ) -> list[RegisteredToolRecord]:
-        records = list(self._records.values())
+    ) -> builtins.list[RegisteredToolRecord]:
+        records = builtins.list(self._records.values())
         if origin is not None:
             origin_kind = origin if isinstance(origin, ToolOriginKind) else ToolOriginKind(str(origin))
             records = [record for record in records if record.origin.kind == origin_kind]
@@ -80,14 +81,14 @@ class ToolRegistry:
             records = [record for record in records if record.admitted]
         return records
 
-    def list_model_visible(self) -> list[ToolSpec]:
+    def list_model_visible(self) -> builtins.list[ToolSpec]:
         return [
             record.spec
             for record in self.list_records(include_disabled=False, admitted_only=True)
         ]
 
-    def to_openai_tools(self, *, strict: bool = False) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
+    def to_openai_tools(self, *, strict: bool = False) -> builtins.list[dict[str, Any]]:
+        tools: builtins.list[dict[str, Any]] = []
         for spec in self.list_model_visible():
             parameters = spec.input_model.model_json_schema()
             function: dict[str, Any] = {
@@ -100,10 +101,10 @@ class ToolRegistry:
             tools.append({"type": "function", "function": function})
         return tools
 
-    def openai_tools(self, *, strict: bool = False) -> list[dict[str, Any]]:
+    def openai_tools(self, *, strict: bool = False) -> builtins.list[dict[str, Any]]:
         return self.to_openai_tools(strict=strict)
 
-    def schema_export(self, *, strict: bool = False) -> list[dict[str, Any]]:
+    def schema_export(self, *, strict: bool = False) -> builtins.list[dict[str, Any]]:
         return self.to_openai_tools(strict=strict)
 
     def dispatch(self, tool_call: dict[str, Any]) -> dict[str, Any]:
@@ -122,21 +123,21 @@ class ToolRegistry:
             raise RuntimeError("dispatch_for_tests requires an explicit executor.")
         return executor.execute_tool_call(tool_call).model_dump(mode="json")
 
-    def list_by_capability(self, capability: Capability) -> list[ToolSpec]:
+    def list_by_capability(self, capability: Capability) -> builtins.list[ToolSpec]:
         return [
             spec
             for spec in self._tools.values()
             if capability in spec.capabilities
         ]
 
-    def list_by_side_effect(self, side_effect: ToolSideEffectKind) -> list[ToolSpec]:
+    def list_by_side_effect(self, side_effect: ToolSideEffectKind) -> builtins.list[ToolSpec]:
         return [
             spec
             for spec in self._tools.values()
             if spec.side_effects == side_effect
         ]
 
-    def list_policy_shapes(self) -> list[dict[str, Any]]:
+    def list_policy_shapes(self) -> builtins.list[dict[str, Any]]:
         return [
             {
                 "tool_name": spec.name,

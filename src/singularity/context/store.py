@@ -928,7 +928,7 @@ class ObservationStore:
             );
             """
         )
-        self._mark_migration("0001_context_runtime")
+        self._mark_migration("0001_context_management")
         self._migrate_context_references()
         self._migrate_legacy_snapshots()
         self._ensure_observation_sensitivity_column()

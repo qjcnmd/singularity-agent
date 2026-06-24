@@ -102,9 +102,12 @@ class RiskClassifier:
         reasons: list[str] = []
         level = RiskLevel.NONE
 
-        if request.resource.resource_type in {"file", "directory", "workspace", "config"}:
+        path_resources = _request_resources(request)
+        if not path_resources and request.resource.resource_type in {"file", "directory", "workspace", "config"}:
+            path_resources = [request.resource]
+        for path_resource in path_resources:
             path_level, path_tags, path_reasons = self._classify_path(
-                request.resource,
+                path_resource,
                 operation=request.operation,
             )
             level = max_level(level, path_level)
@@ -311,6 +314,35 @@ def _metadata_argv(value: object) -> list[str] | None:
     if not isinstance(value, list):
         return None
     return [str(item) for item in value]
+
+
+def _request_resources(request: PolicyRequest) -> list[ResourceRef]:
+    resources = request.metadata.get("resources")
+    if not isinstance(resources, list):
+        return []
+    refs: list[ResourceRef] = []
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        resource_type = str(item.get("resource_type") or "workspace")
+        if resource_type not in {"file", "directory", "workspace", "config"}:
+            continue
+        metadata = item.get("metadata")
+        refs.append(
+            ResourceRef(
+                resource_type,
+                str(item.get("identifier") or ""),
+                normalized_identifier=(
+                    str(item["normalized_identifier"])
+                    if item.get("normalized_identifier") is not None
+                    else None
+                ),
+                workspace_relative=bool(item.get("workspace_relative")),
+                sensitive=bool(item.get("sensitive")),
+                metadata=metadata if isinstance(metadata, dict) else {},
+            )
+        )
+    return refs
 
 
 def _is_verification(program: str, lowered: str, argv: list[str]) -> bool:

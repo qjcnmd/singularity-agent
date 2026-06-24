@@ -23,6 +23,7 @@ class RunStatus(str, Enum):
     CREATED = "created"
     RUNNING = "running"
     COMPLETED = "completed"
+    BLOCKED = "blocked"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -39,6 +40,7 @@ class SessionStatus(str, Enum):
 
 class ShutdownReason(str, Enum):
     NORMAL = "normal"
+    BLOCKED = "blocked"
     CANCELLED = "cancelled"
     ERROR = "error"
     BOOTSTRAP_FAILED = "bootstrap_failed"

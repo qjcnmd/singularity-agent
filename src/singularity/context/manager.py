@@ -281,6 +281,7 @@ class ContextManager:
                 )
             )
         previous_bundle = self.store.latest_bundle(self.run_id)
+        latest_snapshot = self.store.latest_snapshot(self.run_id)
         bundle = self.assembler.build_bundle(
             items=items,
             run_id=self.run_id,
@@ -290,11 +291,7 @@ class ContextManager:
             provider=getattr(getattr(self.provider, "settings", None), "base_url", "") or "",
             tools=tools,
             render_policy=render_policy or self.render_policy,
-            compression_snapshot_id=(
-                self.store.latest_snapshot(self.run_id).snapshot_id
-                if self.store.latest_snapshot(self.run_id)
-                else None
-            ),
+            compression_snapshot_id=latest_snapshot.snapshot_id if latest_snapshot else None,
         )
         self._annotate_bundle_cache(bundle, previous_bundle=previous_bundle)
         self.last_budget = bundle.budget
@@ -1616,7 +1613,8 @@ class ContextManager:
         if item.item_type == ContextItemType.TOOL_OBSERVATION:
             content = payload.get("content")
             tool_payload = _json_object(content) if isinstance(content, str) else payload
-            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            metadata_value = payload.get("metadata")
+            metadata = metadata_value if isinstance(metadata_value, dict) else {}
             return {
                 **base,
                 "tool_name": payload.get("name") or payload.get("tool_name") or tool_payload.get("tool_name"),
@@ -1671,7 +1669,7 @@ class ContextManager:
         }
 
     def _run_llm_compaction(self, plan: _CompactionPlan) -> dict[str, Any]:
-        compression_messages = [
+        compression_messages: list[dict[str, Any]] = [
             {
                 "role": "system",
                 "content": (
@@ -1709,6 +1707,7 @@ class ContextManager:
         if self.model_runner is not None:
             from singularity.model import (
                 ModelBudget,
+                ModelMessage,
                 ModelPurpose,
                 ModelTurnRequest,
                 ToolChoiceMode as ContextToolChoiceMode,
@@ -1716,6 +1715,9 @@ class ContextManager:
             )
 
             request_id = f"model_compact_{uuid4().hex[:12]}"
+            model_messages = [
+                ModelMessage.from_dict(message) for message in compression_messages
+            ]
             result = self.model_runner.run_turn(
                 ModelTurnRequest(
                     request_id=request_id,
@@ -1725,7 +1727,7 @@ class ContextManager:
                     phase_id="context_compaction",
                     action_id=request_id,
                     purpose=ModelPurpose.COMPACT_CONTEXT,
-                    messages=compression_messages,
+                    messages=model_messages,
                     tools=[],
                     tool_choice=ToolChoicePolicy(mode=ContextToolChoiceMode.NONE),
                     budget=ModelBudget(),
@@ -1735,7 +1737,10 @@ class ContextManager:
             )
             content = result.assistant_message.text if result.assistant_message else ""
         else:
-            response = self.provider.chat(
+            provider = self.provider
+            if provider is None:
+                return {}
+            response = provider.chat(
                 messages=compression_messages,
                 tools=[],
                 tool_choice=ToolChoiceMode.NONE,
@@ -2166,7 +2171,7 @@ class ContextManager:
 
 
 def _plain(value: Any) -> Any:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
     if hasattr(value, "to_dict"):
         return value.to_dict()
@@ -2185,7 +2190,8 @@ def _safe_message(message: dict[str, Any]) -> dict[str, Any]:
 def _safe_tool_call(tool_call: Any) -> dict[str, Any]:
     if not isinstance(tool_call, dict):
         return {"id": "", "type": "function", "function": {"name": "<unknown>", "arguments": "{}"}}
-    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    function_value = tool_call.get("function")
+    function = function_value if isinstance(function_value, dict) else {}
     return {
         "id": str(tool_call.get("id") or ""),
         "type": str(tool_call.get("type") or "function"),

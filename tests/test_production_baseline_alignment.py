@@ -531,15 +531,17 @@ def test_readme_documents_v010_production_architecture() -> None:
         "-> AgentLoop.run()\n"
         "-> RunController.start()\n"
         "-> Planner.step()\n"
+        "-> ModelRunner.build_request_from_context()\n"
+        "-> ModelTurnRequestBuilder.build_request()\n"
+        "-> PromptAssemblyPipeline.build_for_model_turn()\n"
+        "-> ContextManager.messages()\n"
         "-> ContextManager.build_bundle()\n"
-        "-> PromptAssemblyPipeline.build()\n"
-        "-> ModelTurnRequestBuilder.build()\n"
         "-> ModelRunner.run_turn()"
     ) in readme
     assert (
         "ToolProtocolEngine.process_model_turn()\n"
-        "-> ToolExecutor.execute_tool_call()\n"
-        "-> PolicyEngine / ApprovalGate"
+        "-> ToolExecutor.execute_request()\n"
+        "-> PolicyEngine.enforce() / ApprovalGate.consume_matching_grant() / ApprovalGate.resolve()"
     ) in readme
     assert "ParallelToolExecutor" in readme
     assert "list_files" in readme

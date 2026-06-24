@@ -35,7 +35,7 @@ from singularity.command.models import (
 from singularity.command.output import OutputCollector, OutputSnapshot, SecretRedactor
 from singularity.command.policy import CommandPolicy
 from singularity.observability.models import TraceEventType, TraceSeverity
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.policy import (
     Capability,
     DecisionOutcome,
@@ -119,7 +119,7 @@ class CommandExecutor:
         *,
         policy: CommandPolicy | None = None,
         backend: ExecutionBackend | None = None,
-        trace: JsonlTraceRecorder | None = None,
+        trace: TraceEmitterProtocol | None = None,
         env_policy: EnvPolicy | None = None,
         workspace_state_manager: "WorkspaceStateManager | None" = None,
         planner: Any | None = None,
@@ -1200,8 +1200,8 @@ class CommandExecutor:
         except OSError as exc:
             return {"available": False, "reason": str(exc)}
 
-        branch = None
-        head = head_text
+        branch: str | None = None
+        head: str | None = head_text
         if head_text.startswith("ref: "):
             ref = head_text.removeprefix("ref: ").strip()
             branch = ref.removeprefix("refs/heads/")

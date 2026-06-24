@@ -58,7 +58,7 @@ class DefaultLocalPolicyRules:
             request_id=request.request_id,
             outcome=result.outcome,
             risk_level=risk.level,
-            risk_tags=risk.tags,
+            risk_tags=list(risk.tags),
             reason=result.reason,
             user_message=result.user_message,
             constraints=result.constraints,

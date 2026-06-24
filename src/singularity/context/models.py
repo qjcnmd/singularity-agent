@@ -102,7 +102,7 @@ class ContextReference:
     line_end: int | None = None
     digest: str | None = None
     observed_at: str = field(default_factory=lambda: _now())
-    freshness: ContextFreshness | str = ContextFreshness.CURRENT
+    freshness: ContextFreshness = ContextFreshness.CURRENT
     source_item_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
     observation_id: str = ""
@@ -150,18 +150,18 @@ class ContextItem:
     session_id: str
     task_id: str
     phase_id: str
-    layer: ContextLayer | str
-    source_component: ContextSource | str
-    item_type: ContextItemType | str
+    layer: ContextLayer
+    source_component: ContextSource
+    item_type: ContextItemType
     content: Any
     content_digest: str = ""
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
     importance: float = 0.5
     relevance_score: float | None = None
-    authority: ContextAuthority | str = ContextAuthority.COMPONENT
-    freshness: ContextFreshness | str = ContextFreshness.CURRENT
-    sensitivity: ContextSensitivity | str = ContextSensitivity.WORKSPACE
+    authority: ContextAuthority = ContextAuthority.COMPONENT
+    freshness: ContextFreshness = ContextFreshness.CURRENT
+    sensitivity: ContextSensitivity = ContextSensitivity.WORKSPACE
     token_count: int = 0
     references: list[ContextReference] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -423,7 +423,7 @@ class ToolObservation:
     error_code: str | None = None
     tool_version: str | None = None
     truncation_reason: str | None = None
-    sensitivity: ContextSensitivity | str = ContextSensitivity.WORKSPACE
+    sensitivity: ContextSensitivity = ContextSensitivity.WORKSPACE
 
     def __post_init__(self) -> None:
         self.sensitivity = _enum(ContextSensitivity, self.sensitivity)
@@ -536,7 +536,7 @@ class ContextSummaryPayload:
 
 @dataclass
 class CacheAttribution:
-    source: CacheAttributionSource | str = CacheAttributionSource.UNKNOWN
+    source: CacheAttributionSource = CacheAttributionSource.UNKNOWN
     confidence: float = 0.0
     reasons: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
@@ -659,7 +659,7 @@ def digest_value(value: Any) -> str:
 def _to_plain(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return {key: _to_plain(item) for key, item in asdict(value).items()}
     if isinstance(value, list):
         return [_to_plain(item) for item in value]

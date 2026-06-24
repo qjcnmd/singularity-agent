@@ -7,8 +7,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
+
+_EnumT = TypeVar("_EnumT", bound=Enum)
 
 
 class PolicyComponent(str, Enum):
@@ -165,9 +167,9 @@ class PolicyRequest:
     task_id: str
     phase_id: str
     action_id: str
-    component: PolicyComponent | str
-    operation: OperationKind | str
-    capability: Capability | str
+    component: PolicyComponent
+    operation: OperationKind
+    capability: Capability
     subject: PolicySubject
     resource: ResourceRef
     reason: str
@@ -225,7 +227,7 @@ class PolicyRequest:
 
 @dataclass(frozen=True)
 class ApprovalScope:
-    capabilities: list[Capability | str] = field(default_factory=list)
+    capabilities: list[Capability] = field(default_factory=list)
     path_globs: list[str] = field(default_factory=list)
     command_patterns: list[str] = field(default_factory=list)
     network_hosts: list[str] = field(default_factory=list)
@@ -351,9 +353,9 @@ class ApprovalGrant:
 @dataclass(frozen=True)
 class PolicyDecision:
     request_id: str
-    outcome: DecisionOutcome | str
+    outcome: DecisionOutcome
     reason: str
-    risk_level: RiskLevel | str = RiskLevel.NONE
+    risk_level: RiskLevel = RiskLevel.NONE
     risk_tags: list[RiskTag | str] = field(default_factory=list)
     user_message: str = ""
     constraints: PolicyConstraints = field(default_factory=PolicyConstraints)
@@ -396,8 +398,8 @@ class PolicyDecision:
                 scope=approval_scope_for_request(request),
                 review_kind=review_kind,
                 details={
-                    "component": request.component.value,
-                    "operation": request.operation.value,
+                    "component": _value(request.component),
+                    "operation": _value(request.operation),
                     "resource": request.resource.identifier,
                 },
             ),
@@ -405,7 +407,7 @@ class PolicyDecision:
         )
 
     def model_copy_with(self, **updates: Any) -> "PolicyDecision":
-        payload = {
+        payload: dict[str, Any] = {
             "request_id": self.request_id,
             "outcome": self.outcome,
             "risk_level": self.risk_level,
@@ -501,14 +503,18 @@ def approval_scope_for_request(request: PolicyRequest) -> ApprovalScope:
     path_globs: list[str] = []
     command_patterns: list[str] = []
     network_hosts: list[str] = []
-    if request.resource.resource_type in {"file", "directory", "workspace", "config"}:
-        path_globs.append(request.resource.normalized_identifier or request.resource.identifier)
-    elif request.resource.resource_type == "command":
-        command_patterns.append(request.resource.identifier)
-    elif request.resource.resource_type == "network":
-        network_hosts.append(
-            str(request.resource.metadata.get("host") or request.resource.identifier)
-        )
+    resources = _request_resource_refs(request)
+    if not resources:
+        resources = [request.resource]
+    for resource in resources:
+        if resource.resource_type in {"file", "directory", "workspace", "config"}:
+            path_globs.append(resource.normalized_identifier or resource.identifier)
+        elif resource.resource_type == "command":
+            command_patterns.append(resource.identifier)
+        elif resource.resource_type == "network":
+            network_hosts.append(
+                str(resource.metadata.get("host") or resource.identifier)
+            )
     return ApprovalScope(
         capabilities=[request.capability],
         path_globs=path_globs,
@@ -523,11 +529,11 @@ def approval_scope_for_request(request: PolicyRequest) -> ApprovalScope:
 def policy_context_summary(
     request: PolicyRequest, outcome: DecisionOutcome, reason: str
 ) -> str:
-    component_label = request.component.value.replace("_", " ").title().replace(" ", "")
+    component_label = _value(request.component).replace("_", " ").title().replace(" ", "")
     return f"[policy] {component_label} {outcome.value.replace('_', ' ')}: {reason}"
 
 
-def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:
+def _enum(enum_type: type[_EnumT], value: _EnumT | str) -> _EnumT:
     if isinstance(value, enum_type):
         return value
     text = str(value)
@@ -538,6 +544,32 @@ def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:
 
 def _value(value: Any) -> Any:
     return value.value if isinstance(value, Enum) else value
+
+
+def _request_resource_refs(request: PolicyRequest) -> list[ResourceRef]:
+    resources = request.metadata.get("resources")
+    if not isinstance(resources, list):
+        return []
+    refs: list[ResourceRef] = []
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata")
+        refs.append(
+            ResourceRef(
+                str(item.get("resource_type") or "workspace"),
+                str(item.get("identifier") or ""),
+                normalized_identifier=(
+                    str(item["normalized_identifier"])
+                    if item.get("normalized_identifier") is not None
+                    else None
+                ),
+                workspace_relative=bool(item.get("workspace_relative")),
+                sensitive=bool(item.get("sensitive")),
+                metadata=metadata if isinstance(metadata, dict) else {},
+            )
+        )
+    return refs
 
 
 def _matches_any(value: str, patterns: list[str]) -> bool:

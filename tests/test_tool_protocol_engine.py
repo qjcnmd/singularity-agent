@@ -266,7 +266,6 @@ def test_tool_protocol_executes_parallel_read_only_group_concurrently(tmp_path: 
         context=context,
         tool_executor=tool_executor,
         planner=None,
-        policy_engine=None,
     )
 
     assert result.status == ToolProtocolTurnStatus.PROCESSED
@@ -411,7 +410,6 @@ def test_tool_protocol_appends_tool_message_when_tool_executor_fails(tmp_path: P
         context=context,
         tool_executor=tool_executor,
         planner=None,
-        policy_engine=None,
     )
 
     assert result.failed_count == 1
@@ -570,7 +568,6 @@ def test_tool_protocol_blocks_side_effect_replay_without_calling_handler(tmp_pat
         context=context,
         tool_executor=tool_executor,
         planner=None,
-        policy_engine=None,
     )
     calls.clear()
     replay = tool_protocol.handle_model_turn_result(
@@ -578,7 +575,6 @@ def test_tool_protocol_blocks_side_effect_replay_without_calling_handler(tmp_pat
         context=context,
         tool_executor=tool_executor,
         planner=None,
-        policy_engine=None,
     )
 
     assert first.executed_count == 1
@@ -632,7 +628,6 @@ def test_tool_protocol_appends_policy_and_sandbox_results_to_context(tmp_path: P
             context=context,
             tool_executor=tool_executor,
             planner=None,
-            policy_engine=None,
         )
 
     tool_payloads = [

@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from singularity.context.models import (
+    CacheAttribution,
     ContextItem,
     ContextSummaryEnvelope,
     ContextSummaryPayload,
@@ -78,7 +79,9 @@ class ContextCompressor:
             summary_id=str(payload.get("summary_id") or payload.get("id") or ""),
             summary_payload=summary,
             source_item_ids=[str(item) for item in summary.omitted_item_ids],
-            cache_attribution=payload.get("cache_attribution") or {},
+            cache_attribution=CacheAttribution.from_dict(
+                payload.get("cache_attribution") if isinstance(payload.get("cache_attribution"), dict) else {}
+            ),
             previous_summary_digest=payload.get("previous_summary_digest"),
             rendered_summary=str(
                 payload.get("rendered_summary")

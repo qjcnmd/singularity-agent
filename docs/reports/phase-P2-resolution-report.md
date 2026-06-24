@@ -35,7 +35,7 @@ Result: `31 passed, 1 skipped`.
 .\.venv\Scripts\python.exe -m ruff check .
 ```
 
-Result: passed.
+Result: focused mypy gate passed.
 
 ```powershell
 .\.venv\Scripts\python.exe -m mypy

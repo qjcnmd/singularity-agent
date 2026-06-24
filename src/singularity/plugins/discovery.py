@@ -25,14 +25,14 @@ ENV_PLUGIN_PATH = "SINGULARITY_PLUGIN_PATH"
 def discover_plugins(
     project_root: Path | str,
     *,
-    runtime_paths: UserDataPaths | None = None,
+    user_data_paths: UserDataPaths | None = None,
     mode: UserDataMode | str | None = None,
     home: Path | str | None = None,
 ) -> list[DiscoveredPlugin]:
     """Discover plugin manifests without importing plugin code."""
 
     project_root = Path(project_root).resolve(strict=False)
-    paths = runtime_paths or resolve_user_data_paths(
+    paths = user_data_paths or resolve_user_data_paths(
         mode=mode,
         home=home,
         project_root=project_root,
@@ -46,7 +46,7 @@ def discover_plugins(
 
 def _discovery_roots(
     project_root: Path,
-    runtime_paths: UserDataPaths,
+    user_data_paths: UserDataPaths,
 ) -> list[tuple[str, Path]]:
     roots: list[tuple[str, Path]] = [
         ("project", project_root / ".singularity" / "plugins"),
@@ -54,7 +54,7 @@ def _discovery_roots(
     for raw in os.getenv(ENV_PLUGIN_PATH, "").split(os.pathsep):
         if raw.strip():
             roots.append(("env", Path(raw).expanduser()))
-    roots.append(("user", runtime_paths.config_dir / "plugins"))
+    roots.append(("user", user_data_paths.config_dir / "plugins"))
     return roots
 
 

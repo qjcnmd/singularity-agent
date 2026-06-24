@@ -1,6 +1,6 @@
 # Policy And Approval Contract
 
-`PolicyEngine` is the single component permission decision source. `ApprovalGate` resolves local review prompts into scoped grants. This contract is binding for CLI, future daemon, and desktop UI.
+`PolicyEngine` is the single component permission decision source. `ApprovalGate` owns the approval gate: local review prompts, scoped grant storage, matching, and single-use consumption. This contract is binding for CLI, future daemon, and desktop UI.
 
 ## Decision Inputs
 

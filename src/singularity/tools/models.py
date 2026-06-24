@@ -288,12 +288,12 @@ class ToolSpec(BaseModel):
         default=None,
         exclude=True,
     )
-    side_effects: ToolSideEffectKind | str | None = None
-    sensitivity: ToolSensitivityLevel | str = ToolSensitivityLevel.WORKSPACE
+    side_effects: ToolSideEffectKind | None = None
+    sensitivity: ToolSensitivityLevel = ToolSensitivityLevel.WORKSPACE
     cache_policy: ToolCachePolicy | None = None
     idempotency_policy: ToolIdempotencyPolicy | None = None
     retry_policy: ToolRetryPolicy = Field(default_factory=ToolRetryPolicy)
-    execution_backend: ToolExecutionBackendKind | str = ToolExecutionBackendKind.IN_PROCESS
+    execution_backend: ToolExecutionBackendKind = ToolExecutionBackendKind.IN_PROCESS
     approval_profile: dict[str, Any] = Field(default_factory=dict)
     artifact_policy: dict[str, Any] = Field(default_factory=dict)
     streamable: bool = False

@@ -15,7 +15,6 @@ DETECT_SOURCE_TYPES = {
     InstructionSourceType.README,
     InstructionSourceType.TOOL_OUTPUT,
     InstructionSourceType.COMMAND_OUTPUT,
-    InstructionSourceType.RETRIEVED_CONTENT if hasattr(InstructionSourceType, "RETRIEVED_CONTENT") else InstructionSourceType.PROJECT_FILE,
     InstructionSourceType.MODEL_OUTPUT,
     InstructionSourceType.CONTEXT_SUMMARY,
     InstructionSourceType.PROJECT_INSTRUCTION_FILE,

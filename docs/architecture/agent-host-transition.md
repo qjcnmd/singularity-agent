@@ -29,7 +29,7 @@ The current in-process facade exposes:
 - `AgentHost.events(...)`
 - `AgentHost.read_artifact(...)`
 
-It projects `TraceEvent` into `RunEvent` with per-run sequence numbers, registers `ApprovalGrant` through the active `PolicyEngine`, and reads artifacts only by opaque artifact ref. It does not implement daemon transport or make CLI use AgentHost yet.
+It projects `TraceEvent` into `RunEvent` with per-run sequence numbers, registers `ApprovalGrant` through the active `ApprovalGate`, and reads artifacts only by opaque artifact ref. It does not implement daemon transport or make CLI use AgentHost yet.
 
 ## Current To Target Boundary
 
