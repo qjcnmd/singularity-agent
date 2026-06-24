@@ -274,6 +274,45 @@ def test_context_bundle_metadata_records_model_cache_usage(tmp_path: Path) -> No
     ]
 
 
+def test_context_usage_diagnostic_exposes_layer_tail_and_cache_attribution(tmp_path: Path) -> None:
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="user",
+        db_path=tmp_path / "context.sqlite3",
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+    context.add_assistant_message({"role": "assistant", "content": "recent answer"})
+    bundle = context.build_bundle(persist=True)
+
+    context.record_model_usage(
+        SimpleNamespace(
+            usage=ModelUsage(input_tokens=120, output_tokens=5, cached_input_tokens=0),
+            metadata={
+                "cache": {
+                    "cache_miss_reasons": ["provider_cache_diagnostics_missing"],
+                    "cache_attribution": {
+                        "source": "component_inferred",
+                        "confidence": 0.35,
+                        "reasons": ["provider_cache_diagnostics_missing"],
+                        "evidence": ["context_shape_hash"],
+                    },
+                },
+                "cache_miss_reasons": ["provider_cache_diagnostics_missing"],
+            },
+        )
+    )
+
+    diagnostic = context.context_usage_diagnostic()
+
+    assert diagnostic["bundle_id"] == bundle.bundle_id
+    assert diagnostic["layer_token_usage"]
+    assert diagnostic["included_item_ids"]
+    assert "recent_tail_item_ids" in diagnostic
+    assert diagnostic["cache_hit_ratio"] == 0.0
+    assert diagnostic["cache_attribution"]["source"] == "component_inferred"
+    assert diagnostic["cache_miss_reasons"] == ["provider_cache_diagnostics_missing"]
+
+
 def test_observation_store_does_not_persist_raw_result_or_secret_metadata(tmp_path: Path) -> None:
     db_path = tmp_path / "context.sqlite3"
     context = ContextManager(

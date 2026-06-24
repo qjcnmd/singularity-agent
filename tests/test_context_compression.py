@@ -14,6 +14,7 @@ from singularity.context.models import (
     ContextItem,
     ContextItemType,
     ContextLayer,
+    PartialCompactionRange,
     ContextSource,
     ContextSensitivity,
     MutationEvidence,
@@ -396,3 +397,72 @@ def test_forced_compaction_generates_unique_versioned_summary_ids(tmp_path) -> N
     summary_ids = [row[0] for row in summary_rows]
     assert len(summary_ids) == 2
     assert summary_ids[0] != summary_ids[1]
+
+
+def test_partial_compact_requires_explicit_turn_range_and_preserves_out_of_range_items(tmp_path) -> None:
+    class GoodCompressionProvider:
+        def chat(self, *, messages, tools, tool_choice):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "goal": "inspect",
+                                    "current_state": "partial history compacted",
+                                    "completed_actions": [],
+                                    "pending_actions": [],
+                                    "verified_facts": [],
+                                    "failed_attempts": [],
+                                    "policy_constraints": [],
+                                    "workspace_changes": [],
+                                    "verification_status": "unknown",
+                                    "open_questions": [],
+                                    "reference_ids": [],
+                                    "omitted_item_ids": [],
+                                    "confidence": 0.8,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="inspect",
+        provider=GoodCompressionProvider(),
+        db_path=tmp_path / "context.sqlite3",
+        model_context_window=1000,
+        output_token_reserve=20,
+    )
+    context.add_assistant_message(
+        {"role": "assistant", "content": "turn one " * 80, "metadata": {"turn": 1}}
+    )
+    context.add_assistant_message(
+        {"role": "assistant", "content": "turn two " * 80, "metadata": {"turn": 2}}
+    )
+    one_id = [
+        item.item_id
+        for item in context.store.query_items(run_id=context.run_id)
+        if item.item_type == ContextItemType.ASSISTANT_MESSAGE
+        and item.metadata.get("turn") == 1
+    ][0]
+    two_id = [
+        item.item_id
+        for item in context.store.query_items(run_id=context.run_id)
+        if item.item_type == ContextItemType.ASSISTANT_MESSAGE
+        and item.metadata.get("turn") == 2
+    ][0]
+
+    assert context.partial_compact(PartialCompactionRange(start_turn=1, end_turn=1)) is True
+
+    assert context.store.load_item(one_id).freshness == ContextFreshness.STALE
+    assert context.store.load_item(two_id).freshness == ContextFreshness.CURRENT
+    snapshot = context.store.latest_snapshot(context.run_id)
+    assert snapshot is not None
+    assert snapshot.metadata["compaction_plan"]["partial_range"] == {
+        "start_turn": 1,
+        "end_turn": 1,
+        "checkpoint_id": None,
+    }

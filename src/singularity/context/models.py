@@ -92,6 +92,26 @@ class CacheAttributionSource(str, Enum):
     UNKNOWN = "unknown"
 
 
+@dataclass(frozen=True)
+class PartialCompactionRange:
+    start_turn: int | None = None
+    end_turn: int | None = None
+    checkpoint_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.start_turn is None and self.end_turn is None and not self.checkpoint_id:
+            raise ValueError("PartialCompactionRange requires a turn range or checkpoint_id.")
+        if (
+            self.start_turn is not None
+            and self.end_turn is not None
+            and self.start_turn > self.end_turn
+        ):
+            raise ValueError("PartialCompactionRange start_turn cannot exceed end_turn.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_plain(self)
+
+
 @dataclass
 class ContextReference:
     ref_id: str

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
@@ -27,6 +27,7 @@ from singularity.context.tokens import TokenCounter
 
 MAX_CONTEXT_FRAGMENT_TOKENS = 1000
 MAX_CONTEXT_FRAGMENT_BYTES = 12000
+LATEST_PROTOCOL_GROUP_SCORE_BONUS = 1000.0
 
 
 class ContextOverflowError(ValueError):
@@ -224,6 +225,7 @@ class ContextAssembler:
 
         grouped_ids: set[str] = set()
         groups: list[_RenderGroup] = []
+        protocol_group_indices: list[int] = []
         for assistant in assistant_items:
             assistant_message = self._message_for_item(assistant, render_policy)
             call_ids = [
@@ -237,20 +239,26 @@ class ContextAssembler:
                 continue
             grouped_ids.add(assistant.item_id)
             grouped_ids.update(tool.item_id for tool in tools)
-            groups.append(
-                _RenderGroup(
-                    item_ids=[assistant.item_id, *[tool.item_id for tool in tools]],
-                    messages=[
-                        assistant_message,
-                        *[self._message_for_item(tool, render_policy) for tool in tools],
-                    ],
-                    score=max(
-                        self._score_item(assistant, phase_id),
-                        *[self._score_item(tool, phase_id) for tool in tools],
-                    ),
-                    layer=assistant.layer,
-                    required=assistant.pinned or any(tool.pinned for tool in tools),
-                )
+            group = _RenderGroup(
+                item_ids=[assistant.item_id, *[tool.item_id for tool in tools]],
+                messages=[
+                    assistant_message,
+                    *[self._message_for_item(tool, render_policy) for tool in tools],
+                ],
+                score=max(
+                    self._score_item(assistant, phase_id),
+                    *[self._score_item(tool, phase_id) for tool in tools],
+                ),
+                layer=assistant.layer,
+                required=assistant.pinned or any(tool.pinned for tool in tools),
+            )
+            groups.append(group)
+            protocol_group_indices.append(len(groups) - 1)
+        if protocol_group_indices:
+            latest_protocol_index = protocol_group_indices[-1]
+            groups[latest_protocol_index] = replace(
+                groups[latest_protocol_index],
+                score=groups[latest_protocol_index].score + LATEST_PROTOCOL_GROUP_SCORE_BONUS,
             )
         for call_id, tool in tool_by_call.items():
             if tool.item_id not in grouped_ids:

@@ -25,6 +25,8 @@ class ModelUsageSummary(TypedDict):
     reasoning_tokens: int
     request_cache_hit_rates: dict[str, float]
     cache_miss_reasons: dict[str, list[str]]
+    cache_attribution_sources: dict[str, str]
+    cache_attribution_source_counts: dict[str, int]
     run_cache_hit_rate: float
 
 
@@ -285,6 +287,12 @@ def _model_usage_summary(events: list[TraceEvent]) -> ModelUsageSummary:
         "reasoning_tokens": 0,
         "request_cache_hit_rates": {},
         "cache_miss_reasons": {},
+        "cache_attribution_sources": {},
+        "cache_attribution_source_counts": {
+            "provider_native": 0,
+            "component_inferred": 0,
+            "unknown": 0,
+        },
         "run_cache_hit_rate": 0.0,
     }
     for event in events:
@@ -312,6 +320,12 @@ def _model_usage_summary(events: list[TraceEvent]) -> ModelUsageSummary:
                 reasons = event.payload.get("cache_miss_reasons") or (event.payload.get("cache") or {}).get("cache_miss_reasons") or []
                 if reasons:
                     usage["cache_miss_reasons"][request_id] = [str(reason) for reason in reasons]
+                attribution = (event.payload.get("cache") or {}).get("cache_attribution") or {}
+                attribution_source = str(attribution.get("source") or "unknown")
+                if attribution_source not in usage["cache_attribution_source_counts"]:
+                    attribution_source = "unknown"
+                usage["cache_attribution_sources"][request_id] = attribution_source
+                usage["cache_attribution_source_counts"][attribution_source] += 1
         elif event.event_type == TraceEventType.MODEL_REQUEST_FAILED:
             usage["failures"] += 1
         elif event.event_type == TraceEventType.MODEL_TOOL_CALL_PROPOSED:

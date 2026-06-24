@@ -156,3 +156,63 @@ def test_model_usage_summary_reports_request_and_run_cache_hit_rates(tmp_path) -
         "req_2": 0.75,
     }
     assert usage["run_cache_hit_rate"] == 0.5
+
+
+def test_model_usage_summary_preserves_cache_attribution_sources(tmp_path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
+    trace.emit(
+        TraceEventType.MODEL_RESPONSE_RECEIVED,
+        component="model",
+        summary="native cache response",
+        ids={"task_id": "task_1"},
+        payload={
+            "request_id": "req_native",
+            "usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 40,
+            },
+            "cache": {
+                "cache_miss_reasons": [],
+                "cache_attribution": {
+                    "source": "provider_native",
+                    "confidence": 1.0,
+                    "reasons": ["usage.cached_input_tokens"],
+                    "evidence": ["usage.cached_input_tokens"],
+                },
+            },
+        },
+    )
+    trace.emit(
+        TraceEventType.MODEL_RESPONSE_RECEIVED,
+        component="model",
+        summary="inferred miss response",
+        ids={"task_id": "task_1"},
+        payload={
+            "request_id": "req_inferred",
+            "usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 0,
+            },
+            "cache": {
+                "cache_miss_reasons": ["context_shape_change"],
+                "cache_attribution": {
+                    "source": "component_inferred",
+                    "confidence": 0.35,
+                    "reasons": ["context_shape_change"],
+                    "evidence": ["context_shape_hash"],
+                },
+            },
+        },
+    )
+
+    usage = trace.final_report_summary(task_id="task_1")["model_usage_summary"]
+
+    assert usage["cache_attribution_sources"] == {
+        "req_native": "provider_native",
+        "req_inferred": "component_inferred",
+    }
+    assert usage["cache_attribution_source_counts"] == {
+        "provider_native": 1,
+        "component_inferred": 1,
+        "unknown": 0,
+    }
