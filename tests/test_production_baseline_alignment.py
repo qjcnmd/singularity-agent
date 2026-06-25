@@ -11,6 +11,7 @@ from singularity.cli import app
 from singularity.config import ProductionConfig, adaptive_default_max_turns
 from singularity.context import ContextManager
 from singularity.context.models import ContextItemType, ContextSource
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import (
     ModelMessage,
     ModelPurpose,
@@ -336,6 +337,16 @@ def test_protocol_default_state_store_lives_in_trace_run_dir(tmp_path: Path) -> 
     )
 
     assert component.state_store.db_path == trace.store.run_dir / "tool_protocol.sqlite3"
+
+
+def test_protocol_default_state_store_for_legacy_trace_uses_run_directory(tmp_path: Path) -> None:
+    trace = JsonlTraceRecorder.create(tmp_path)
+    component = ToolProtocolEngine(
+        registry=ToolRegistry(tmp_path),
+        trace=trace,
+    )
+
+    assert component.state_store.db_path == trace.path.parent / trace.run_id / "tool_protocol.sqlite3"
 
 
 def test_protocol_replay_classifies_read_only_side_effect_and_conflict(tmp_path: Path) -> None:

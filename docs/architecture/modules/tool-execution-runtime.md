@@ -60,6 +60,7 @@ It is not responsible for exposing schemas to the model, building the model requ
 - `src/singularity/tool_protocol/result.py`: `ToolProtocolResultBuilder.build()` creates result envelopes.
 - `src/singularity/tool_protocol/models.py`: `ToolCallEnvelope`, `ToolProtocolResultEnvelope`, `ToolObservationView`, `ToolProtocolTurnResult`.
 - `src/singularity/tool_protocol/state.py`: `ToolProtocolStateStore` persists batches, call records, phase transitions, result binding, and appended context-message ids.
+- `ToolProtocolEngine` creates its default `ToolProtocolStateStore` under the active `TraceStore.run_dir` when a structured trace store is available. For legacy trace recorders with only `trace.path` and `trace.run_id`, it derives a per-run directory next to the trace path and stores `tool_protocol.sqlite3` there. Without trace data, it falls back to `<project_root>/.singularity/runs/default/tool_protocol.sqlite3`.
 - `src/singularity/tools/executor.py`: `ToolExecutor.execute_tool_call()` and `execute_request()`.
 - `src/singularity/tools/models.py`: `ToolExecutionRequest`, `ToolResult`, `ToolError`, `ToolSpec`.
 - `src/singularity/planner/engine.py`: `Planner.update_from_tool_result()`.

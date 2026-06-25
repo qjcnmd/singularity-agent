@@ -331,6 +331,8 @@ Each CLI run creates a run/session directory. By default:
 
 `--trace-dir` controls the parent directory. `--context-db` can override only the context database path. `ToolProtocolEngine` uses `<trace-run-dir>/tool_protocol.sqlite3` unless an explicit state store is injected by tests.
 
+These SQLite files are generated runtime state, not source fixtures. Keep them under ignored trace or temporary directories such as `work/`, `.singularity/`, or pytest `tmp_path`; do not commit generated context, tool protocol, index, or workspace-state databases.
+
 All model tool calls flow through `ToolProtocolEngine`. Invalid tool calls produce synthetic protocol results. Replay handling distinguishes:
 
 - `read_only_replay`

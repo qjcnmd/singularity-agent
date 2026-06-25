@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from singularity.context import ContextManager
@@ -1009,12 +1010,24 @@ def _provider_capabilities_from_result(model_result: ModelTurnResult) -> ModelCa
 
 
 def _default_state_path(registry: ToolRegistry, trace: Any | None) -> Any:
+    run_dir = _trace_run_dir(trace)
+    if run_dir is not None:
+        return run_dir / "tool_protocol.sqlite3"
+    return registry.project_root / ".singularity" / "runs" / "default" / "tool_protocol.sqlite3"
+
+
+def _trace_run_dir(trace: Any | None) -> Path | None:
     store = getattr(trace, "store", None)
     run_dir = getattr(store, "run_dir", None)
     if run_dir is not None:
-        return run_dir / "tool_protocol.sqlite3"
+        return Path(run_dir)
     path = getattr(trace, "path", None)
     run_id = getattr(trace, "run_id", None)
     if path is not None and run_id:
-        return path.parent / "tool_protocol.sqlite3"
-    return registry.project_root / ".singularity" / "runs" / "default" / "tool_protocol.sqlite3"
+        trace_path = Path(path)
+        if trace_path.name == "events.jsonl" and trace_path.parent.name == str(run_id):
+            return trace_path.parent
+        if trace_path.name == str(run_id):
+            return trace_path
+        return trace_path.parent / str(run_id)
+    return None

@@ -12,6 +12,7 @@ from singularity.instructions import PromptAssemblyPipeline
 from singularity.model import ModelRunner
 from singularity.planner import Planner
 from singularity.tool_protocol.engine import ToolProtocolEngine
+from singularity.tool_protocol.state import ToolProtocolStateStore
 from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.workspace_state import WorkspaceStateManager
@@ -63,6 +64,7 @@ def make_agent_session(
     resolved_tool_protocol = tool_protocol or ToolProtocolEngine(
         registry=registry,
         trace=resolved_trace,
+        state_store=ToolProtocolStateStore(_tool_protocol_state_path(workspace_root, resolved_trace)),
         workspace_state_hook=hook,
     )
     if hook is not None and getattr(resolved_tool_protocol, "workspace_state_hook", None) is None:
@@ -87,6 +89,14 @@ def make_agent_session(
         context_db_path=context_db_path,
         strict=strict,
     )
+
+
+def _tool_protocol_state_path(workspace_root: Path, trace: Any) -> Path:
+    run_dir = getattr(getattr(trace, "store", None), "run_dir", None)
+    if run_dir is not None:
+        return Path(run_dir) / "tool_protocol.sqlite3"
+    run_id = str(getattr(trace, "run_id", "default"))
+    return workspace_root / ".singularity" / "runs" / run_id / "tool_protocol.sqlite3"
 
 
 def _workspace_state_context_hook(workspace_state_manager: WorkspaceStateManager):

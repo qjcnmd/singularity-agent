@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shlex
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from pydantic import BaseModel
@@ -955,10 +956,11 @@ class _MockProvider:
 
 class _FakeTrace:
     """Minimal trace stub for AgentLoop-level tests."""
-    def __init__(self) -> None:
+    def __init__(self, root: Path) -> None:
         self.events: list[dict[str, Any]] = []
         self.run_id = "test_run"
-        self.path = Path(".")
+        self.store = SimpleNamespace(run_dir=root / ".singularity" / "runs" / self.run_id)
+        self.path = self.store.run_dir / "events.jsonl"
 
     def record(self, event: str, payload: dict[str, Any]) -> None:
         self.events.append({"event": event, **payload})
@@ -1057,7 +1059,7 @@ class TestAgentLoopContractIntegration:
             command_result(syntax_req, command_id="cmd_syntax", exit_code=0,
                            semantic_status=SemanticStatus.SUCCEEDED, output=""),
         ])
-        trace = _FakeTrace()
+        trace = _FakeTrace(tmp_path)
         runner = VerificationRunner(tmp_path, command_executor=fake, planner=planner, trace=trace)
 
         # Exercise the full chain: plan → authorize → run → step_evidence → satisfaction → finalize
@@ -1157,7 +1159,7 @@ class TestAgentLoopContractIntegration:
             command_result(syntax_req, command_id="cmd_syntax", exit_code=0,
                            semantic_status=SemanticStatus.SUCCEEDED, output=""),
         ])
-        trace = _FakeTrace()
+        trace = _FakeTrace(tmp_path)
         vrunner = VerificationRunner(tmp_path, command_executor=fake, planner=planner, trace=trace)
 
         tools = ToolRegistry(tmp_path)
@@ -1214,7 +1216,7 @@ class TestAgentLoopContractIntegration:
         from tests.agent_loop_helpers import make_agent_session
 
         planner = Planner(tmp_path, session_id="s1", task_id="t1")
-        trace = _FakeTrace()
+        trace = _FakeTrace(tmp_path)
 
         # Start with missing evidence (no changes verified)
         planner.start_task("fix the bug")
