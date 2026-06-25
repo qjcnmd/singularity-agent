@@ -298,6 +298,39 @@ class Planner:
             )
             return decision
 
+        # During repair phase, constrain run_verification / rerun_check to the
+        # active VerificationContract's allowed commands.
+        if tool_name in {"run_verification", "rerun_check"} and repair_allowed:
+            smoke_commands = normalized_args.get("smoke_commands")
+            if isinstance(smoke_commands, list) and smoke_commands:
+                vcontract = self._active_repair_verification_contract()
+                disallowed = [
+                    cmd
+                    for cmd in smoke_commands
+                    if isinstance(cmd, list) and not vcontract.is_command_allowed(cmd)
+                ]
+                if disallowed:
+                    decision = AuthorizationDecision(
+                        allowed=False,
+                        error_code="verification_contract_command_not_allowed",
+                        reason=(
+                            "Verification command is not in the active VerificationContract: "
+                            + "; ".join(" ".join(str(c) for c in cmd) for cmd in disallowed[:3])
+                        ),
+                    )
+                    self._record_event(
+                        action_id=tool_call_id,
+                        action_kind=self.policy.action_for_tool(tool_name).value,
+                        decision="deny",
+                        reason=decision.reason,
+                        extra={
+                            "reason_code": decision.error_code,
+                            "disallowed_commands": disallowed,
+                            "verification_contract": vcontract.to_dict(),
+                        },
+                    )
+                    return decision
+
         risk = self.risk.evaluate_action(
             tool_name=tool_name,
             arguments=normalized_args,
@@ -1373,10 +1406,17 @@ class Planner:
             return {}
         if not self.evidence.repair_plans:
             return {}
-        latest = self.evidence.repair_plans[-1]
-        if not isinstance(latest, dict):
-            return {}
-        return _repair_contract_payload(latest)
+        # Search backwards for a repair plan that carries a repair_contract.
+        # VerificationRunner may append additional repair_plans (from its own
+        # failure analysis) that don't carry a contract — we must find the
+        # authoritative one from the FailureAnalyzer/RepairPlanner path.
+        for plan in reversed(self.evidence.repair_plans):
+            if not isinstance(plan, dict):
+                continue
+            contract = _repair_contract_payload(plan)
+            if contract:
+                return contract
+        return {}
 
     def _active_repair_allowed_tools(self) -> set[str]:
         contract = self._active_repair_contract()
@@ -1414,7 +1454,14 @@ class Planner:
         return VerificationContract.empty()
 
     def assess_verification_contract_satisfaction(self) -> ContractSatisfaction:
-        """Evaluate whether the active verification contract is satisfied."""
+        """Evaluate whether the active verification contract is satisfied.
+
+        Uses step-level evidence (step_id → check_id → status) when available.
+        Falls back to blocking when step_evidence is absent but contract has
+        steps — cannot assume satisfaction without evidence.
+        """
+        from singularity.failure_analysis import StepEvidence
+
         contract = self._active_repair_verification_contract()
         if not contract.steps:
             return ContractSatisfaction(
@@ -1436,35 +1483,80 @@ class Planner:
                 reason="no_verification_results",
             )
         latest = verification_results[-1]
-        check_status = latest.get("check_status") or []
-        passed_checks = {
-            item.get("check_id")
-            for item in check_status
-            if isinstance(item, dict) and item.get("status") == "passed"
-        }
-        failed_checks = {
-            item.get("check_id")
-            for item in check_status
-            if isinstance(item, dict)
-            and item.get("status") in {"failed", "blocked", "timeout", "flaky"}
-        }
+        # Primary path: use step_evidence from the observation
+        raw_step_evidence = (latest.get("verification") or latest).get("step_evidence") or []
+        if raw_step_evidence:
+            return self._satisfaction_from_step_evidence(
+                contract=contract,
+                step_evidence_raw=raw_step_evidence,
+            )
+        # Fallback: no step_evidence but contract has steps → cannot determine
+        # satisfaction from global status alone; require step-level alignment.
+        return ContractSatisfaction(
+            contract_id=contract.contract_id,
+            satisfied=False,
+            completed_steps=[],
+            failed_steps=[step.step_id for step in contract.steps if step.required],
+            skipped_steps=[step.step_id for step in contract.steps if not step.required],
+            reason="step_evidence_missing",
+        )
+
+    @staticmethod
+    def _satisfaction_from_step_evidence(
+        *,
+        contract: VerificationContract,
+        step_evidence_raw: list[dict[str, Any]],
+    ) -> ContractSatisfaction:
+        from singularity.failure_analysis import StepEvidence
+
+        evidence_by_step: dict[str, dict[str, Any]] = {}
+        for item in step_evidence_raw:
+            if isinstance(item, dict) and item.get("step_id"):
+                evidence_by_step[item["step_id"]] = item
+
         completed: list[str] = []
         failed: list[str] = []
         skipped: list[str] = []
+        step_evidence: list[StepEvidence] = []
         for step in contract.steps:
-            if step.step_id in passed_checks:
+            ev = evidence_by_step.get(step.step_id)
+            if ev is None:
+                # Step not covered by evidence
+                if step.required:
+                    failed.append(step.step_id)
+                    step_evidence.append(StepEvidence(
+                        step_id=step.step_id, check_id=None, command_id=None,
+                        status="no_evidence",
+                    ))
+                else:
+                    skipped.append(step.step_id)
+                    step_evidence.append(StepEvidence(
+                        step_id=step.step_id, check_id=None, command_id=None,
+                        status="skipped",
+                    ))
+                continue
+            status = str(ev.get("status") or "unknown")
+            evidence_entry = StepEvidence(
+                step_id=step.step_id,
+                check_id=ev.get("check_id"),
+                command_id=ev.get("command_id"),
+                status=status,
+                artifact_ref=ev.get("artifact_ref"),
+            )
+            step_evidence.append(evidence_entry)
+            if status == "passed":
                 completed.append(step.step_id)
-            elif step.step_id in failed_checks:
-                failed.append(step.step_id)
+            elif status in {"failed", "blocked", "timeout", "flaky", "not_executed"}:
+                if step.required:
+                    failed.append(step.step_id)
+                else:
+                    skipped.append(step.step_id)
             elif not step.required:
                 skipped.append(step.step_id)
             else:
                 failed.append(step.step_id)
-        assessment_status = (latest.get("completion_assessment") or {}).get("status")
-        satisfied = (
-            not failed
-            and assessment_status in {"ready", "ready_with_warnings"}
-        )
+
+        satisfied = not failed
         return ContractSatisfaction(
             contract_id=contract.contract_id,
             satisfied=satisfied,
@@ -1472,6 +1564,7 @@ class Planner:
             failed_steps=failed,
             skipped_steps=skipped,
             reason=None if satisfied else f"failed_steps={len(failed)}",
+            step_evidence=step_evidence,
         )
 
     def _record_repair_signal_consumed(

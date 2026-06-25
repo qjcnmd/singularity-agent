@@ -96,9 +96,13 @@ class VerificationRunner:
         smoke_commands: list[list[str]] | None = None,
         transaction_id: str | None = None,
         changeset_id: str | None = None,
+        verification_contract: Any | None = None,
     ) -> VerificationPlan:
         self._throw_if_cancelled()
         resolved_smoke_commands = smoke_commands or self._contract_smoke_commands()
+        # Auto-load verification contract from planner when not provided
+        if verification_contract is None:
+            verification_contract = self._active_verification_contract()
         profile = ProjectDetector(self.workspace_root).detect()
         impact = ImpactAnalyzer().analyze(
             changed_files=changed_files,
@@ -114,6 +118,7 @@ class VerificationRunner:
             smoke_commands=resolved_smoke_commands,
             transaction_id=transaction_id,
             changeset_id=changeset_id,
+            verification_contract=verification_contract,
         )
         self._plans[plan.id] = plan
         self._results.setdefault(plan.id, [])
@@ -138,6 +143,16 @@ class VerificationRunner:
             return [list(command) for command in self.planner.contract_smoke_commands()]
         except Exception:
             return []
+
+    def _active_verification_contract(self) -> Any | None:
+        """Retrieve the active VerificationContract from the planner, if any."""
+        if self.planner is None or not hasattr(self.planner, "_active_repair_verification_contract"):
+            return None
+        try:
+            contract = self.planner._active_repair_verification_contract()
+            return contract if contract.steps else None
+        except Exception:
+            return None
 
     def _task_contract_payload(self) -> dict[str, Any] | None:
         state = getattr(self.planner, "state", None)
@@ -268,6 +283,7 @@ class VerificationRunner:
         smoke_commands: list[list[str]],
         transaction_id: str | None,
         changeset_id: str | None,
+        verification_contract: Any | None = None,
     ) -> VerificationPlan:
         required: list[VerificationCheck] = []
         optional: list[VerificationCheck] = []
@@ -281,6 +297,7 @@ class VerificationRunner:
         )
         explicit_smoke = bool(smoke_commands)
         for index, argv in enumerate(smoke_commands, start=1):
+            step_id = _resolve_contract_step_id(argv, verification_contract)
             required.append(
                 self._check(
                     kind=CheckKind.VERIFICATION_SMOKE,
@@ -294,6 +311,7 @@ class VerificationRunner:
                     required=True,
                     source="input:smoke_commands",
                     risk_tags=["verification_smoke", "explicit"],
+                    contract_step_id=step_id,
                 )
             )
         python_sources = [
@@ -926,6 +944,7 @@ class VerificationRunner:
         source: str,
         skip_reason: str | None = None,
         risk_tags: list[str] | None = None,
+        contract_step_id: str | None = None,
     ) -> VerificationCheck:
         timeout = command.resource_limits.timeout_seconds if command else 0.0
         return VerificationCheck(
@@ -942,6 +961,7 @@ class VerificationRunner:
             ),
             source=source,
             skip_reason=skip_reason,
+            contract_step_id=contract_step_id,
         )
 
     @staticmethod
@@ -1103,6 +1123,7 @@ class VerificationRunner:
             if result.status
             in {CheckStatus.FAILED, CheckStatus.BLOCKED, CheckStatus.TIMEOUT, CheckStatus.FLAKY}
         ]
+        step_evidence = _build_step_evidence(plan, results)
         payload = {
             "verification": {
                 "plan": plan.to_dict(),
@@ -1123,6 +1144,7 @@ class VerificationRunner:
                     for hint in result.repair_hints
                 ],
                 "completion_assessment": assessment.to_dict(),
+                "step_evidence": step_evidence,
             }
         }
         if failure_analyses:
@@ -1221,3 +1243,59 @@ def _safe_subset(value: Any, allowed: set[str]) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     return {key: value[key] for key in sorted(allowed) if key in value}
+
+
+def _resolve_contract_step_id(
+    argv: list[str],
+    verification_contract: Any | None,
+) -> str | None:
+    """Match a smoke command argv to a VerificationContract step."""
+    if verification_contract is None:
+        return None
+    step_for_command = getattr(verification_contract, "step_for_command", None)
+    if callable(step_for_command):
+        step = step_for_command(argv)
+        return step.step_id if step is not None else None
+    # Fallback for dict-based contract
+    steps = verification_contract.get("steps") if isinstance(verification_contract, dict) else None
+    if not steps:
+        return None
+    import shlex
+
+    argv_str = " ".join(str(item) for item in argv)
+    for step in steps:
+        if isinstance(step, dict) and step.get("command") == argv_str:
+            return step.get("step_id")
+    return None
+
+
+def _build_step_evidence(
+    plan: VerificationPlan,
+    results: list[VerificationResult],
+) -> list[dict[str, Any]]:
+    """Build step-level evidence by matching checks with contract_step_id to results."""
+    result_by_check: dict[str, VerificationResult] = {
+        result.check_id: result for result in results
+    }
+    step_evidence: list[dict[str, Any]] = []
+    for check in plan.all_checks():
+        if check.contract_step_id is None:
+            continue
+        result = result_by_check.get(check.id)
+        if result is not None:
+            step_evidence.append({
+                "step_id": check.contract_step_id,
+                "check_id": result.check_id,
+                "command_id": result.evidence.command_id,
+                "status": result.status.value,
+                "artifact_ref": result.evidence.artifact_path,
+            })
+        else:
+            step_evidence.append({
+                "step_id": check.contract_step_id,
+                "check_id": check.id,
+                "command_id": None,
+                "status": "not_executed",
+                "artifact_ref": None,
+            })
+    return step_evidence

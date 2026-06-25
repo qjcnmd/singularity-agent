@@ -63,10 +63,36 @@ class VerificationStep:
     kind: str = "smoke"
     required: bool = True
 
+    @property
+    def command_argv(self) -> list[str]:
+        """Normalized argv for command matching."""
+        import shlex
+
+        text = self.command.strip()
+        if not text:
+            return []
+        try:
+            return shlex.split(text)
+        except ValueError:
+            return text.split()
+
+    def matches_command(self, argv: list[str] | None) -> bool:
+        """Check whether an argv matches this step's command (order-insensitive args for tail)."""
+        if not argv:
+            return False
+        step_argv = self.command_argv
+        if not step_argv:
+            return False
+        # Prefix match: the executing command must start with the step's command
+        if len(argv) < len(step_argv):
+            return False
+        return argv[: len(step_argv)] == step_argv
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "step_id": self.step_id,
             "command": self.command,
+            "command_argv": self.command_argv,
             "kind": self.kind,
             "required": self.required,
         }
@@ -142,6 +168,48 @@ class VerificationContract:
     def is_valid(self) -> bool:
         return bool(self.steps) and not self.validation_errors
 
+    @property
+    def allowed_commands(self) -> list[list[str]]:
+        """All allowed command argvs from contract steps."""
+        return [step.command_argv for step in self.steps if step.command_argv]
+
+    def is_command_allowed(self, argv: list[str] | None) -> bool:
+        """Check whether a command argv matches any step in this contract."""
+        if not argv:
+            return False
+        if not self.steps:
+            return True  # empty contract = no constraint
+        return any(step.matches_command(argv) for step in self.steps)
+
+    def step_for_command(self, argv: list[str] | None) -> VerificationStep | None:
+        """Find the contract step that matches the given command argv."""
+        if not argv:
+            return None
+        for step in self.steps:
+            if step.matches_command(argv):
+                return step
+        return None
+
+
+@dataclass(frozen=True)
+class StepEvidence:
+    """Evidence linking a verification step to its execution result."""
+
+    step_id: str
+    check_id: str | None
+    command_id: str | None
+    status: str
+    artifact_ref: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step_id": self.step_id,
+            "check_id": self.check_id,
+            "command_id": self.command_id,
+            "status": self.status,
+            "artifact_ref": self.artifact_ref,
+        }
+
 
 @dataclass(frozen=True)
 class ContractSatisfaction:
@@ -153,6 +221,7 @@ class ContractSatisfaction:
     failed_steps: list[str]
     skipped_steps: list[str]
     reason: str | None = None
+    step_evidence: list[StepEvidence] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -162,6 +231,7 @@ class ContractSatisfaction:
             "failed_steps": self.failed_steps,
             "skipped_steps": self.skipped_steps,
             "reason": self.reason,
+            "step_evidence": [item.to_dict() for item in self.step_evidence],
         }
 
 

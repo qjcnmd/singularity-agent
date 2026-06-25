@@ -208,6 +208,7 @@ class VerificationCheck:
     policy_reasons: list[str] = field(default_factory=list)
     skip_reason: str | None = None
     source: str | None = None
+    contract_step_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -230,6 +231,7 @@ class VerificationCheck:
             "policy_reasons": self.policy_reasons,
             "skip_reason": self.skip_reason,
             "source": self.source,
+            "contract_step_id": self.contract_step_id,
         }
 
 
