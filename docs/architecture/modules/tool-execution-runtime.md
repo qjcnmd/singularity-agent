@@ -5,6 +5,7 @@ Source paths:
 - src/singularity/tool_protocol/engine.py
 - src/singularity/tool_protocol/result.py
 - src/singularity/tool_protocol/models.py
+- src/singularity/tool_protocol/state.py
 - src/singularity/tools/executor.py
 - src/singularity/tools/models.py
 - src/singularity/planner/engine.py
@@ -18,8 +19,15 @@ Symbols:
 - ToolProtocolEngine.append_results_to_context
 - ToolProtocolResultBuilder
 - ToolProtocolResultBuilder.build
+- ToolProtocolStateStore
+- ToolProtocolStateStore.save_batch
+- ToolProtocolStateStore.upsert_record
+- ToolProtocolStateStore.bind_result
+- ToolProtocolStateStore.transition
+- ToolProtocolStateStore.mark_result_appended
 - ToolCallEnvelope
 - ToolProtocolResultEnvelope
+- ToolObservationView
 - ToolExecutor
 - ToolExecutor.execute_tool_call
 - ToolExecutor.execute_request
@@ -29,6 +37,14 @@ Symbols:
 - Planner.update_from_tool_result
 - ContextManager
 - ContextManager.add_tool_protocol_result
+
+Field checks:
+- ToolCallEnvelope: protocol_version, run_id, session_id, task_id, phase_id, model_request_id, model_response_id, assistant_message_id, tool_call_id, tool_name, raw_arguments, parsed_arguments, normalized_arguments, argument_digest, tool_schema_hash, allowed_tool_names, proposed_at, proposed_by_model, parse_status, validation_errors, metadata, phase
+- ToolExecutionRequest: tool_call_id, tool_name, raw_arguments, normalized_arguments, batch_id, run_id, session_id, task_id, phase_id, model_request_id, model_response_id, argument_digest, metadata
+- ToolResult: ok, content, error_code, error, truncated, metadata
+- ToolProtocolResultEnvelope: tool_call_id, tool_name, ok, status, error_code, error_kind, content_preview, content_digest, raw_result_ref, artifact_refs, observation_id, policy_decision_id, approval_grant_id, truncated, redacted, metadata
+- ToolObservationView: tool_call_id, tool_name, ok, status, visibility, content_preview, content_digest, result_ref, error_code, error_kind, reference_ids, observation_id, truncated, redacted
+- ToolProtocolTurnResult: status, batch_id, executed_count, failed_count, rejected_count, pending_approval_count, appended_tool_message_count, next_action, recovery_report, metadata
 
 ## Module Boundary
 
@@ -43,6 +59,7 @@ It is not responsible for exposing schemas to the model, building the model requ
 - `src/singularity/tool_protocol/engine.py`: `ToolProtocolEngine` controls validation, schedule, execution, replay, and context append.
 - `src/singularity/tool_protocol/result.py`: `ToolProtocolResultBuilder.build()` creates result envelopes.
 - `src/singularity/tool_protocol/models.py`: `ToolCallEnvelope`, `ToolProtocolResultEnvelope`, `ToolObservationView`, `ToolProtocolTurnResult`.
+- `src/singularity/tool_protocol/state.py`: `ToolProtocolStateStore` persists batches, call records, phase transitions, result binding, and appended context-message ids.
 - `src/singularity/tools/executor.py`: `ToolExecutor.execute_tool_call()` and `execute_request()`.
 - `src/singularity/tools/models.py`: `ToolExecutionRequest`, `ToolResult`, `ToolError`, `ToolSpec`.
 - `src/singularity/planner/engine.py`: `Planner.update_from_tool_result()`.
@@ -62,12 +79,12 @@ It is not responsible for exposing schemas to the model, building the model requ
 10. `ToolProtocolResultBuilder.build()` creates `ToolProtocolResultEnvelope`.
 11. `ToolProtocolStateStore` binds the result and transitions call phase.
 12. `ToolProtocolEngine.append_results_to_context()` calls `ContextManager.add_tool_protocol_result()`.
-13. `ToolExecutor._safe_update_planner()` or `_update_planner()` calls `Planner.update_from_tool_result()`.
+13. If `AgentGraphBuilder._wire_planner()` has bound `planner` onto the shared `ToolExecutor`, `ToolExecutor._safe_update_planner()` or `_update_planner()` calls `Planner.update_from_tool_result()`.
 14. `AgentLoop` reduces the `ToolProtocolTurnResult` and either continues, finalizes, blocks, or triggers failure analysis.
 
 ## Runtime Objects Passed
 
-- `ToolCallEnvelope`: `tool_call_id`, `tool_name`, `raw_arguments`, `arguments`, `argument_digest`, `validation_errors`, model/run ids, and metadata.
+- `ToolCallEnvelope`: `tool_call_id`, `tool_name`, `raw_arguments`, `parsed_arguments`, `normalized_arguments`, `argument_digest`, `validation_errors`, model/run ids, and metadata.
 - `ToolExecutionRequest`: `tool_call_id`, `tool_name`, `raw_arguments`, `normalized_arguments`, `batch_id`, `run_id`, `session_id`, `task_id`, `phase_id`, `model_request_id`, `model_response_id`, `argument_digest`, `metadata`.
 - `ToolResult`: `ok`, `content`, `error_code`, `error`, `truncated`, `metadata`.
 - `ToolProtocolResultEnvelope`: `tool_call_id`, `tool_name`, `ok`, `status`, `content_preview`, `content_digest`, `raw_result_ref`, `artifact_refs`, `observation_id`, `truncated`, `redacted`, `error_code`, `error_kind`, `policy_decision_id`, `approval_grant_id`, `metadata`.
@@ -84,14 +101,17 @@ The model sees tool execution results only after `ContextManager.add_tool_protoc
 
 The model payload includes bounded/redacted result fields such as `tool_call_id`, `tool_name`, `ok`, `status`, `content`, `content_preview`, `content_digest`, `result_ref`, `reference_ids`, `truncated`, and `redacted`.
 
-Tests in `tests/test_context.py` confirm that policy decision ids, approval grant ids, raw arguments, internal debug metadata, and raw metadata do not enter the tool message content.
+`ToolProtocolResultEnvelope.raw_result_ref` is projected as model-visible `result_ref`. `ToolProtocolResultEnvelope.artifact_refs` is projected as model-visible `reference_ids`; the model payload does not include an `artifact_refs` key.
+
+Tests in `tests/test_context.py` and `tests/test_tool_protocol_models.py` confirm that policy decision ids, approval grant ids, raw arguments, internal debug metadata, raw metadata, and the envelope-level `artifact_refs` key do not enter the tool message content.
 
 ## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
 
 Internal-only execution data includes:
 
 - `ToolExecutionRequest.batch_id`, run/session/task/phase ids, model request/response ids, `argument_digest`, and metadata;
-- `ToolResult.metadata` entries such as `duration_seconds`, `output_digest`, `backend`, `policy_decision_id`, `approval_grant_id`, and cache flags;
+- `ToolResult.metadata` entries such as `duration_seconds`, `backend`, `policy_decision_id`, `approval_grant_id`, and cache flags;
+- `ToolResult.metadata.output_digest` as execution metadata, although the same value can become model-visible as `result_ref` when `ToolProtocolEngine` passes it through `ToolProtocolResultEnvelope.raw_result_ref`;
 - `ToolProtocolResultEnvelope.policy_decision_id`, `approval_grant_id`, and `metadata`;
 - `ToolProtocolStateStore` batch, record, phase, replay, and result binding rows;
 - trace payloads emitted by `ToolExecutor` and `ToolProtocolEngine`;

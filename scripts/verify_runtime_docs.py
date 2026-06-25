@@ -52,6 +52,7 @@ class RuntimeDoc:
     doc_id: str
     source_paths: list[str]
     symbols: list[str]
+    field_checks: dict[str, list[str]]
     headings: set[str]
 
 
@@ -98,6 +99,7 @@ def _load_docs(errors: list[str]) -> list[RuntimeDoc]:
                 doc_id=doc_id,
                 source_paths=_extract_list(text, "Source paths:"),
                 symbols=_extract_list(text, "Symbols:"),
+                field_checks=_extract_field_checks(text),
                 headings=_extract_headings(text),
             )
         )
@@ -135,6 +137,16 @@ def _verify_doc(doc: RuntimeDoc, errors: list[str]) -> None:
         if symbol not in available:
             errors.append(f"{label}: symbol not found in listed source paths: {symbol}")
 
+    if doc.field_checks:
+        class_fields = _class_fields_in_sources(existing_sources)
+        for class_name, fields in doc.field_checks.items():
+            if class_name not in class_fields:
+                errors.append(f"{label}: field check class not found in listed source paths: {class_name}")
+                continue
+            for field_name in fields:
+                if field_name not in class_fields[class_name]:
+                    errors.append(f"{label}: field not found on {class_name}: {field_name}")
+
 
 def _extract_doc_id(text: str) -> str:
     match = re.search(r"^Runtime flow doc id:\s*([A-Za-z0-9_.-]+)\s*$", text, re.MULTILINE)
@@ -158,6 +170,22 @@ def _extract_list(text: str, marker: str) -> list[str]:
             if line.startswith("#"):
                 break
     return values
+
+
+def _extract_field_checks(text: str) -> dict[str, list[str]]:
+    checks: dict[str, list[str]] = {}
+    for value in _extract_list(text, "Field checks:"):
+        if ":" not in value:
+            continue
+        class_name, raw_fields = value.split(":", 1)
+        fields = [
+            field.strip().strip("`")
+            for field in raw_fields.split(",")
+            if field.strip()
+        ]
+        if fields:
+            checks[class_name.strip().strip("`")] = fields
+    return checks
 
 
 def _extract_headings(text: str) -> set[str]:
@@ -185,9 +213,32 @@ def _symbols_in_sources(paths: list[Path]) -> set[str]:
                 for child in node.body:
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         symbols.add(f"{node.name}.{child.name}")
+                    elif isinstance(child, ast.Assign):
+                        for target in child.targets:
+                            if isinstance(target, ast.Name):
+                                symbols.add(f"{node.name}.{target.id}")
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 symbols.add(node.name)
     return symbols
+
+
+def _class_fields_in_sources(paths: list[Path]) -> dict[str, set[str]]:
+    fields_by_class: dict[str, set[str]] = {}
+    for path in paths:
+        if path.suffix != ".py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            fields = fields_by_class.setdefault(node.name, set())
+            for child in node.body:
+                if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+                    fields.add(child.target.id)
+    return fields_by_class
 
 
 def _rel(path: Path) -> str:

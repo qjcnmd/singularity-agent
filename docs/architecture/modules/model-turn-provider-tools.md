@@ -18,6 +18,7 @@ Symbols:
 - ModelToolSchema
 - ModelMessage
 - ModelTurnResult
+- ProviderRequest
 - ModelRunner
 - ModelRunner.build_request_from_context
 - ModelRunner.run_turn
@@ -30,6 +31,15 @@ Symbols:
 - MessageConverter.to_provider_messages
 - PromptAssemblyPipeline
 - PromptAssemblyPipeline.build_for_model_turn
+
+Field checks:
+- ModelTurnRequest: request_id, run_id, session_id, task_id, phase_id, action_id, purpose, messages, tools, tool_choice, model_preferences, budget, context_metadata, policy_metadata, trace_metadata
+- ModelMessage: role, content, name, tool_call_id, metadata
+- ContentBlock: type, text, artifact_ref, metadata
+- ModelToolSchema: name, description, parameters_schema, capability_tags, risk_tags, metadata
+- ToolChoicePolicy: mode, tool_name, allowed_tool_names, max_tool_calls
+- ModelTurnResult: request_id, response_id, status, assistant_message, tool_calls, usage, finish_reason, validation, error, provider_name, model_name, latency_ms, trace_event_ids, raw_response_ref, metadata
+- ProviderRequest: request_id, purpose, messages, tools, tool_choice, preferences, policy_metadata, trace_metadata
 
 ## Module Boundary
 
@@ -46,8 +56,8 @@ It is not responsible for executing tools returned by the model or deciding whet
 - `src/singularity/model/request_builder.py`: `ModelTurnRequestBuilder.build_request()`.
 - `src/singularity/model/tools.py`: `ModelToolRenderer`.
 - `src/singularity/model/messages.py`: `MessageConverter`.
-- `src/singularity/model/runner.py`: request creation, capability adjustment, send, validation, trace.
-- `src/singularity/model/providers.py`: provider request conversion and OpenAI-compatible payload conversion.
+- `src/singularity/model/runner.py`: request creation, capability adjustment, `ProviderRequest` creation, send, validation, trace.
+- `src/singularity/model/providers.py`: `ProviderRequest`, provider request conversion, and OpenAI-compatible payload conversion.
 - `src/singularity/instructions/prompt_assembly.py`: `PromptAssemblyPipeline.build_for_model_turn()`.
 
 ## Runtime Call Chain
@@ -61,7 +71,7 @@ It is not responsible for executing tools returned by the model or deciding whet
 7. If prompt assembly is configured, `PromptAssemblyPipeline.build_for_model_turn()` creates the stable prompt prefix.
 8. `ContextManager.messages(tools=provider_tools, planner_context=..., persist=True)` provides dynamic tail messages.
 9. `ModelTurnRequestBuilder` returns `ModelTurnRequest`.
-10. `ModelRunner.run_turn()` validates and adjusts the request, then sends it through the selected provider.
+10. `ModelRunner.run_turn()` validates and adjusts the request, then `_send_with_retry()` wraps it in `ProviderRequest`.
 11. Provider code converts `ModelMessage` and `ModelToolSchema` into provider payload messages and tools.
 12. Provider response is normalized into `ModelTurnResult`, including assistant message, parsed tool calls, usage, status, and provider metadata.
 
@@ -72,6 +82,7 @@ It is not responsible for executing tools returned by the model or deciding whet
 - `ContentBlock`: `type`, `text`, `artifact_ref`, `metadata`.
 - `ModelToolSchema`: `name`, `description`, `parameters_schema`, `capability_tags`, `risk_tags`, `metadata`.
 - `ToolChoicePolicy`: `mode`, `tool_name`, `allowed_tool_names`, `max_tool_calls`.
+- `ProviderRequest`: `request_id`, `purpose`, `messages`, `tools`, `tool_choice`, `preferences`, `policy_metadata`, `trace_metadata`.
 - `ModelTurnResult`: `request_id`, `response_id`, `status`, `assistant_message`, `tool_calls`, `usage`, `finish_reason`, `validation`, `error`, `provider_name`, `model_name`, `latency_ms`, `trace_event_ids`, `raw_response_ref`, `metadata`.
 
 ## Model-Visible Objects (模型实际可见对象)
@@ -81,9 +92,13 @@ The provider-visible request includes:
 - messages converted from `ModelTurnRequest.messages`: role, content, optional name, optional `tool_call_id`, and provider-compatible assistant tool calls when present;
 - tools converted from `ModelTurnRequest.tools`: function name, description, parameters, optional strict flag;
 - tool choice converted from `ToolChoicePolicy`;
-- preferences such as model, temperature, top_p, max output tokens, json mode, and stream when provider supports them.
+- provider request preferences such as model, temperature, top_p, max output tokens, json mode, and stream.
 
 The model sees prompt assembly output, rendered context messages, planner context that was intentionally rendered into messages, and provider tool schemas.
+
+For the OpenAI-compatible HTTP payload, preferences are projected as `model`, optional `temperature`, optional `top_p`, optional `max_tokens`, and optional JSON `response_format`. `stream` selects the provider call path; it is not message content or provider function schema.
+
+`MessageConverter.to_provider_messages()` may produce an intermediate `metadata` key for local conversion state such as developer-message fallback. `_model_messages_to_openai()` removes that key before the OpenAI-compatible or legacy chat provider payload is sent, except that assistant `metadata["tool_calls"]` is safely converted into provider-compatible `tool_calls`.
 
 ## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
 
@@ -92,11 +107,12 @@ Internal-only request data includes:
 - `ModelTurnRequest.context_metadata`: context budget, prompt ids/hashes, stable/dynamic hashes, tool schema hash, bundle id, bundle digest, compression snapshot id, context shape hash, ordering hash, and bundle metadata;
 - `ModelTurnRequest.policy_metadata`;
 - `ModelTurnRequest.trace_metadata`;
-- `ModelToolSchema.metadata`;
+- `ModelMessage.metadata`, except the special assistant `tool_calls` projection described above;
+- `ModelToolSchema.metadata`, except that `metadata["strict"]` can affect whether the provider function schema includes `strict: true`;
 - request/response trace events and raw response references;
 - model validation and budget diagnostics.
 
-These fields may be carried to provider-adapter code as request metadata for observability, but they are not provider message content or provider function schema.
+These fields may be carried to provider-adapter code as request metadata for observability. In the OpenAI-compatible provider, `ProviderRequest.policy_metadata` and `ProviderRequest.trace_metadata` are not included in the HTTP JSON payload, and the metadata dicts themselves are not provider message content or provider function schema.
 
 ## State Transitions And Failure Paths
 

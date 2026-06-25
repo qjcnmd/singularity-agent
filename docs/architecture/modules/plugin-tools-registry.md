@@ -18,16 +18,29 @@ Symbols:
 - PluginManager.activate
 - PluginStatusStore
 - PluginStatusStore.enabled_for
+- PluginLockStore
 - PluginLoader
 - PluginLoader.load
 - PluginHost
 - PluginHost.register_tool
+- DiscoveredPlugin
+- PluginDiagnostic
 - PluginToolContribution
+- PluginLockEntry
 - PluginStatus
 - ToolOrigin
 - ToolSpec
 - ToolRegistry
 - ToolRegistry.register
+
+Field checks:
+- DiscoveredPlugin: manifest, manifest_path, plugin_dir, source, manifest_hash, diagnostics
+- PluginStatus: enabled, version, path, manifest_hash, approved_permissions, config, compatibility_status
+- PluginToolContribution: plugin_id, local_name, exposed_name, required_permissions, spec
+- PluginDiagnostic: plugin_id, severity, code, message, path, details
+- PluginLockEntry: plugin_id, version, path, manifest_hash, compatibility_status, enabled
+- ToolOrigin: kind, plugin_id, local_tool_name, exposed_name, manifest_hash, source_path, required_permissions, approved_permissions, activation_hash, schema_digest
+- ToolSpec: name, version, description, input_model, output_model, handler, permission_level, risk_tags, timeout_seconds, max_output_chars, cacheable, idempotent, uses_edit_executor, uses_mutation_manager, uses_command_executor, delegates_policy_constraints, capabilities, operation, resource_resolver, side_effects, sensitivity, cache_policy, idempotency_policy, execution_backend, approval_profile, artifact_policy, enabled
 
 ## Module Boundary
 
@@ -41,7 +54,7 @@ It is not responsible for executing plugin tools differently after registration.
 
 - `src/singularity/kernel/graph.py`: `_build_tools_protocol()` creates `PluginManager` after built-in tool registration and before `ToolExecutor`.
 - `src/singularity/plugins/manager.py`: `PluginManager.activate()`, `_admit_tool_contribution()`, and `_tool_origin()`.
-- `src/singularity/plugins/status.py`: `PluginStatusStore.enabled_for()`.
+- `src/singularity/plugins/status.py`: `PluginStatusStore.get()`, `PluginStatusStore.enabled_for()`, and `PluginLockStore`.
 - `src/singularity/plugins/loader.py`: `PluginLoader.load()` imports and calls plugin registration entrypoints.
 - `src/singularity/plugins/host.py`: `PluginHost.register_tool()` builds `PluginToolContribution`.
 - `src/singularity/plugins/models.py`: plugin manifest/status/contribution models.
@@ -52,8 +65,8 @@ It is not responsible for executing plugin tools differently after registration.
 1. `AgentGraphBuilder._build_tools_protocol()` registers built-in tool groups into `ToolRegistry`.
 2. It constructs `PluginManager(project_root, trace=trace)`.
 3. `PluginManager.activate(registry=tools, policy_engine=policy_engine)` calls `discover()`.
-4. For each discovered plugin, `PluginStatusStore.get(plugin_id)` checks whether it is enabled.
-5. `PluginStatusStore.enabled_for(plugin)` rejects status records whose path or `manifest_hash` no longer matches the discovered plugin.
+4. For each discovered plugin, `PluginStatusStore.get(plugin_id)` reads the persisted status and skips absent or disabled entries.
+5. `PluginStatusStore.enabled_for(plugin)` rechecks enabled status and rejects status records whose path or `manifest_hash` no longer matches the discovered plugin.
 6. `check_plugin()` and duplicate id checks produce diagnostics.
 7. `_policy_gate()` optionally calls `PolicyEngine.enforce()` before loading plugin code.
 8. `PluginLoader.load()` calls the plugin registration entrypoint with `PluginHost`.
@@ -86,10 +99,12 @@ Plugin identity is not emitted by `ModelToolRenderer.to_provider_tools()`. `Mode
 Internal-only plugin data includes:
 
 - `PluginStatus.path`, `manifest_hash`, `approved_permissions`, and `config`;
-- activation lock entries written by `PluginLockStore`;
+- `PluginLockEntry` records written by `PluginLockStore`;
 - `PluginDiagnostic` details;
 - `ToolOrigin` plugin metadata;
-- plugin trace events: `PLUGIN_DISCOVERED`, `PLUGIN_CHECK_FAILED`, `PLUGIN_TOOL_REGISTERED`, and `PLUGIN_ACTIVATED`;
+- plugin manager trace events: `PLUGIN_DISCOVERED`, `PLUGIN_CHECK_FAILED`, `PLUGIN_TOOL_REGISTERED`, and `PLUGIN_ACTIVATED`;
+- plugin loader trace events: `PLUGIN_LOAD_STARTED`, `PLUGIN_LOAD_COMPLETED`, and `PLUGIN_LOAD_FAILED`;
+- plugin host custom trace events: `PLUGIN_EVENT`;
 - `_policy_gate()` policy request/decision ids.
 
 ## State Transitions And Failure Paths
@@ -98,6 +113,7 @@ Internal-only plugin data includes:
 - Path or manifest hash mismatch produces `plugin_status_mismatch` and prevents registration.
 - Duplicate enabled plugin ids produce `duplicate_plugin_id_enabled`.
 - Policy gate denial produces `plugin_policy_denied`.
+- Policy gate exceptions produce `plugin_policy_gate_failed`.
 - Loader failure keeps diagnostics and prevents contribution registration.
 - Contribution identity/name mismatch prevents registration.
 - Undeclared or unapproved permissions prevent registration.
