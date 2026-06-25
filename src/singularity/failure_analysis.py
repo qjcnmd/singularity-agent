@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -23,6 +24,34 @@ from singularity.observability.models import TraceEventType, TraceSeverity
 
 SUMMARY_LIMIT = 700
 TAIL_LIMIT = 400
+MIN_REPAIR_CONFIDENCE = 0.45
+FAILURE_CATEGORY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,80}$")
+BLOCKED_FAILURE_CATEGORIES = {
+    "approval_required",
+    "permission_denied",
+    "policy_blocked",
+    "policy_denied",
+    "risk_escalated",
+    "sandbox_required",
+    "missing_information",
+    "user_input_required",
+    "failure_analysis_unavailable",
+    "failure_analysis_invalid_json",
+    "failure_analysis_schema_invalid",
+    "low_confidence",
+}
+ACTION_TYPES = {"inspect", "analyze", "edit", "verify", "ask_user"}
+TOOL_HINTS = {
+    "apply_patch",
+    "get_verification_result",
+    "inspect_diff",
+    "read_file",
+    "run_verification",
+    "search_text",
+    "workspace_health",
+    "write_file",
+}
+INTERNAL_VERIFICATION_REFS = {"final_review"}
 
 
 @dataclass(frozen=True)
@@ -32,6 +61,7 @@ class FailureAnalysisRequest:
     session_id: str
     task_id: str
     phase_id: str
+    workspace_root: str
     failure_source: str
     failure_summary: str
     failure_sources: list[dict[str, Any]]
@@ -65,6 +95,7 @@ class FailureAnalysisRequest:
             session_id=session_id,
             task_id=task_id,
             phase_id=phase_id,
+            workspace_root=str(getattr(planner, "workspace_root", "") or ""),
             failure_source=failure_source,
             failure_summary=summary,
             failure_sources=failure_sources,
@@ -85,8 +116,7 @@ class FailureAnalysisRequest:
         payload: dict[str, Any] = {
             "source": self.failure_source,
             "summary": self.failure_summary,
-            "refs": self.failure_evidence_refs,
-            "failures": self.failure_sources,
+            "failures": _fingerprint_sources(self.failure_sources),
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
@@ -94,6 +124,7 @@ class FailureAnalysisRequest:
     def failure_evidence_refs(self) -> list[str]:
         refs: list[str] = []
         for source in self.failure_sources:
+            _append_unique(refs, source.get("outcome_ref"))
             _append_unique(refs, source.get("tool_call_id"))
             _append_unique(refs, source.get("command_id"))
             _append_unique(refs, source.get("check_id"))
@@ -108,6 +139,16 @@ class FailureAnalysisRequest:
                     _append_unique(refs, check_id)
         return refs or self.evidence_refs
 
+    @property
+    def allowed_target_files(self) -> list[str]:
+        files: list[str] = []
+        for path in self.changed_files:
+            _append_unique(files, _normalize_workspace_path(path, workspace_root=self.workspace_root))
+        for source in self.failure_sources:
+            for path in _paths_from_failure_source(source):
+                _append_unique(files, _normalize_workspace_path(path, workspace_root=self.workspace_root))
+        return files
+
     def to_model_payload(self) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
@@ -118,6 +159,7 @@ class FailureAnalysisRequest:
             "recent_tail": self.recent_tail[-8:],
             "verification_log_refs": self.verification_log_refs[-10:],
             "changed_files": self.changed_files[-30:],
+            "allowed_target_files": self.allowed_target_files[-30:],
             "evidence_refs": self.evidence_refs[-30:],
         }
 
@@ -128,6 +170,7 @@ class FailureAnalysisRequest:
             "session_id": self.session_id,
             "task_id": self.task_id,
             "phase_id": self.phase_id,
+            "workspace_root": self.workspace_root,
             "failure_source": self.failure_source,
             "failure_summary": self.failure_summary,
             "failure_sources": self.failure_sources,
@@ -164,20 +207,40 @@ class FailureAnalysisResult:
         request: FailureAnalysisRequest,
         raw_response_ref: str | None = None,
     ) -> "FailureAnalysisResult":
-        affected = _strings(payload.get("affected_files")) or list(request.changed_files)
+        needs_user_input = _bool_required(payload, "needs_user_input")
+        confidence = _confidence_required(payload.get("confidence"))
+        category = _required_text(payload, "failure_category")
+        if not FAILURE_CATEGORY_PATTERN.match(category):
+            raise ValueError(f"invalid failure_category: {category!r}")
+        root_cause = _required_text(payload, "root_cause")
+        evidence_refs = _strings_required(payload, "evidence_refs")
+        _validate_evidence_refs(evidence_refs, request=request)
+        affected = _validated_affected_files(payload.get("affected_files"), request=request)
+        next_actions = _strings_required(payload, "next_actions")
+        verification_plan = _strings_required(payload, "verification_plan") if not needs_user_input else _strings(
+            payload.get("verification_plan")
+        )
+        _validate_verification_plan(verification_plan, needs_user_input=needs_user_input)
+        blocked_reason = _text(payload.get("blocked_reason")) or None
+        if needs_user_input and not blocked_reason:
+            raise ValueError("blocked_reason is required when needs_user_input=true")
+        if not needs_user_input and confidence < MIN_REPAIR_CONFIDENCE:
+            raise ValueError(f"confidence below repair threshold: {confidence}")
+        if not needs_user_input and not affected:
+            raise ValueError("affected_files must identify at least one workspace target")
         return cls(
             analysis_id=str(payload.get("analysis_id") or f"failure_{uuid4().hex[:12]}"),
             request_id=request.request_id,
-            root_cause=_text(payload.get("root_cause") or request.failure_summary),
-            failure_category=_text(payload.get("failure_category") or "unknown_failure"),
+            root_cause=root_cause,
+            failure_category=category,
             affected_files=affected[:20],
-            evidence_refs=(_strings(payload.get("evidence_refs")) or request.evidence_refs)[:30],
-            repair_strategy=_text(payload.get("repair_strategy") or "repair_then_verify"),
-            next_actions=_strings(payload.get("next_actions"))[:12],
-            verification_plan=_strings(payload.get("verification_plan"))[:12],
-            confidence=_confidence(payload.get("confidence")),
-            needs_user_input=bool(payload.get("needs_user_input")),
-            blocked_reason=payload.get("blocked_reason"),
+            evidence_refs=evidence_refs[:30],
+            repair_strategy=_required_text(payload, "repair_strategy"),
+            next_actions=next_actions[:12],
+            verification_plan=verification_plan[:12],
+            confidence=confidence,
+            needs_user_input=needs_user_input,
+            blocked_reason=blocked_reason,
             raw_response_ref=raw_response_ref,
         )
 
@@ -194,7 +257,7 @@ class FailureAnalysisResult:
             request_id=request.request_id,
             root_cause=reason,
             failure_category=category,
-            affected_files=list(request.changed_files),
+            affected_files=list(request.allowed_target_files),
             evidence_refs=list(request.evidence_refs),
             repair_strategy="blocked",
             next_actions=[reason],
@@ -253,6 +316,85 @@ class RepairActionCandidate:
 
 
 @dataclass(frozen=True)
+class RepairContract:
+    contract_id: str
+    analysis_id: str
+    failure_category: str
+    target_files: list[str]
+    evidence_refs: list[str]
+    action_candidates: list[RepairActionCandidate]
+    verification_plan: list[str]
+    confidence: float
+    allowed_tool_names: list[str]
+    needs_user_input: bool = False
+    blocked_reason: str | None = None
+    validation_errors: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_analysis(
+        cls,
+        analysis: FailureAnalysisResult,
+        *,
+        action_candidates: list[RepairActionCandidate],
+    ) -> "RepairContract":
+        allowed = _allowed_tools_from_candidates(action_candidates)
+        if analysis.verification_plan:
+            allowed.extend(["run_verification", "get_verification_result"])
+        errors = _repair_contract_errors(
+            analysis=analysis,
+            action_candidates=action_candidates,
+            allowed_tool_names=allowed,
+        )
+        return cls(
+            contract_id=f"repair_contract_{uuid4().hex[:12]}",
+            analysis_id=analysis.analysis_id,
+            failure_category=analysis.failure_category,
+            target_files=list(analysis.affected_files),
+            evidence_refs=list(analysis.evidence_refs),
+            action_candidates=list(action_candidates),
+            verification_plan=list(analysis.verification_plan),
+            confidence=analysis.confidence,
+            allowed_tool_names=sorted(dict.fromkeys(allowed)),
+            needs_user_input=analysis.needs_user_input or bool(errors) or bool(analysis.blocked_reason),
+            blocked_reason=analysis.blocked_reason or ("; ".join(errors) if errors else None),
+            validation_errors=errors,
+        )
+
+    @classmethod
+    def blocked(cls, analysis: FailureAnalysisResult, *, reason: str) -> "RepairContract":
+        return cls(
+            contract_id=f"repair_contract_{uuid4().hex[:12]}",
+            analysis_id=analysis.analysis_id,
+            failure_category=analysis.failure_category,
+            target_files=list(analysis.affected_files),
+            evidence_refs=list(analysis.evidence_refs),
+            action_candidates=[],
+            verification_plan=list(analysis.verification_plan),
+            confidence=analysis.confidence,
+            allowed_tool_names=[],
+            needs_user_input=True,
+            blocked_reason=reason,
+            validation_errors=[reason],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract_id": self.contract_id,
+            "analysis_id": self.analysis_id,
+            "failure_category": self.failure_category,
+            "target_files": self.target_files,
+            "evidence_refs": self.evidence_refs,
+            "action_candidates": [item.to_dict() for item in self.action_candidates],
+            "verification_plan": self.verification_plan,
+            "confidence": self.confidence,
+            "allowed_tool_names": self.allowed_tool_names,
+            "needs_user_input": self.needs_user_input,
+            "blocked_reason": self.blocked_reason,
+            "validation_errors": self.validation_errors,
+        }
+
+
+@dataclass(frozen=True)
 class RepairPlan:
     plan_id: str
     analysis_id: str
@@ -265,6 +407,7 @@ class RepairPlan:
     confidence: float
     needs_user_input: bool = False
     blocked_reason: str | None = None
+    repair_contract: RepairContract | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -281,6 +424,71 @@ class RepairPlan:
             "confidence": self.confidence,
             "needs_user_input": self.needs_user_input,
             "blocked_reason": self.blocked_reason,
+            "repair_contract": self.repair_contract.to_dict() if self.repair_contract else None,
+        }
+
+
+@dataclass(frozen=True)
+class RepairReplanSignal:
+    signal_id: str
+    repair_plan_id: str
+    analysis_id: str
+    contract_id: str
+    failure_fingerprint: str
+    failure_category: str
+    target_files: list[str]
+    action_candidates: list[dict[str, Any]]
+    verification_plan: list[str]
+    confidence: float
+    needs_user_input: bool
+    blocked_reason: str | None
+    repair_contract: RepairContract
+    error_code: str
+    verification_failed: bool = True
+
+    @classmethod
+    def from_contract(
+        cls,
+        *,
+        request: FailureAnalysisRequest,
+        analysis: FailureAnalysisResult,
+        plan: RepairPlan,
+        contract: RepairContract,
+    ) -> "RepairReplanSignal":
+        return cls(
+            signal_id=f"repair_signal_{uuid4().hex[:12]}",
+            repair_plan_id=plan.plan_id,
+            analysis_id=analysis.analysis_id,
+            contract_id=contract.contract_id,
+            failure_fingerprint=request.fingerprint,
+            failure_category=analysis.failure_category,
+            target_files=list(contract.target_files),
+            action_candidates=[item.to_dict() for item in contract.action_candidates],
+            verification_plan=list(contract.verification_plan),
+            confidence=contract.confidence,
+            needs_user_input=contract.needs_user_input,
+            blocked_reason=contract.blocked_reason,
+            repair_contract=contract,
+            error_code=analysis.failure_category or "repair_planned",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "signal_id": self.signal_id,
+            "repair_plan_id": self.repair_plan_id,
+            "analysis_id": self.analysis_id,
+            "contract_id": self.contract_id,
+            "failure_fingerprint": self.failure_fingerprint,
+            "failure_category": self.failure_category,
+            "target_files": self.target_files,
+            "action_candidates": self.action_candidates,
+            "verification_plan": self.verification_plan,
+            "confidence": self.confidence,
+            "needs_user_input": self.needs_user_input,
+            "blocked_reason": self.blocked_reason,
+            "repair_contract": self.repair_contract.to_dict(),
+            "error_code": self.error_code,
+            "verification_failed": self.verification_failed,
         }
 
 
@@ -308,12 +516,21 @@ class FailureAnalyzer:
             return FailureAnalysisResult.blocked(
                 request=request,
                 reason=f"failure_analysis_invalid_json: {exc}",
+                category="failure_analysis_invalid_json",
             )
-        analysis = FailureAnalysisResult.from_model_payload(
-            payload,
-            request=request,
-            raw_response_ref=result.raw_response_ref,
-        )
+        try:
+            analysis = FailureAnalysisResult.from_model_payload(
+                payload,
+                request=request,
+                raw_response_ref=result.raw_response_ref,
+            )
+        except ValueError as exc:
+            self._record("failed", request=request, error=str(exc))
+            return FailureAnalysisResult.blocked(
+                request=request,
+                reason=f"failure_analysis_schema_invalid: {exc}",
+                category="failure_analysis_schema_invalid",
+            )
         self._record("completed", request=request, analysis=analysis)
         return analysis
 
@@ -399,16 +616,10 @@ class FailureAnalyzer:
 
 
 class RepairPlanner:
-    blocked_categories = {
-        "approval_required",
-        "permission_denied",
-        "policy_blocked",
-        "policy_denied",
-        "risk_escalated",
-        "sandbox_required",
-        "missing_information",
-        "user_input_required",
-    }
+    blocked_categories = BLOCKED_FAILURE_CATEGORIES
+
+    def __init__(self, *, trace: Any | None = None) -> None:
+        self.trace = trace
 
     def plan(self, analysis: FailureAnalysisResult) -> RepairPlan:
         blocked = (
@@ -420,6 +631,8 @@ class RepairPlanner:
             )
         )
         if blocked or analysis.needs_user_input:
+            contract = RepairContract.blocked(analysis, reason=blocked or "user_input_required")
+            self._record_contract_validation(contract)
             return RepairPlan(
                 plan_id=f"repair_{uuid4().hex[:12]}",
                 analysis_id=analysis.analysis_id,
@@ -432,8 +645,26 @@ class RepairPlanner:
                 confidence=analysis.confidence,
                 needs_user_input=True,
                 blocked_reason=blocked or "user_input_required",
+                repair_contract=contract,
             )
         candidates = _action_candidates(analysis)
+        contract = RepairContract.from_analysis(analysis, action_candidates=candidates)
+        self._record_contract_validation(contract)
+        if contract.needs_user_input or contract.blocked_reason:
+            return RepairPlan(
+                plan_id=f"repair_{uuid4().hex[:12]}",
+                analysis_id=analysis.analysis_id,
+                strategy="blocked",
+                summary=analysis.root_cause,
+                action_candidates=[],
+                next_actions=analysis.next_actions,
+                verification_plan=analysis.verification_plan,
+                evidence_refs=analysis.evidence_refs,
+                confidence=analysis.confidence,
+                needs_user_input=True,
+                blocked_reason=contract.blocked_reason or "repair_contract_invalid",
+                repair_contract=contract,
+            )
         return RepairPlan(
             plan_id=f"repair_{uuid4().hex[:12]}",
             analysis_id=analysis.analysis_id,
@@ -444,6 +675,7 @@ class RepairPlanner:
             verification_plan=analysis.verification_plan,
             evidence_refs=analysis.evidence_refs,
             confidence=analysis.confidence,
+            repair_contract=contract,
         )
 
     def to_replan_signal(
@@ -452,16 +684,17 @@ class RepairPlanner:
         request: FailureAnalysisRequest,
         analysis: FailureAnalysisResult,
         plan: RepairPlan,
-    ) -> dict[str, Any]:
-        return {
-            "error_code": analysis.failure_category or "repair_planned",
-            "failure_fingerprint": request.fingerprint,
-            "verification_failed": True,
-            "repair_plan_id": plan.plan_id,
-            "analysis_id": analysis.analysis_id,
-            "action_hints": [item.to_dict() for item in plan.action_candidates],
-            "needs_user_input": plan.needs_user_input,
-        }
+    ) -> RepairReplanSignal:
+        contract = plan.repair_contract or RepairContract.from_analysis(
+            analysis,
+            action_candidates=plan.action_candidates,
+        )
+        return RepairReplanSignal.from_contract(
+            request=request,
+            analysis=analysis,
+            plan=plan,
+            contract=contract,
+        )
 
     @staticmethod
     def blocked_outcome(plan: RepairPlan) -> ExecutionOutcome:
@@ -474,6 +707,21 @@ class RepairPlanner:
             observation_summary=plan.summary,
             retry_allowed=False,
             metadata={"repair_plan": plan.to_dict()},
+        )
+
+    def _record_contract_validation(self, contract: RepairContract) -> None:
+        if self.trace is None or not hasattr(self.trace, "record"):
+            return
+        self.trace.record(
+            "repair_contract_validation",
+            {
+                "contract_id": contract.contract_id,
+                "analysis_id": contract.analysis_id,
+                "valid": not contract.validation_errors and not contract.blocked_reason,
+                "validation_errors": contract.validation_errors,
+                "needs_user_input": contract.needs_user_input,
+                "blocked_reason": contract.blocked_reason,
+            },
         )
 
 
@@ -552,8 +800,59 @@ def _failure_summary(
     return _limit(str(first.get("failure_type") or first.get("error_code") or first), SUMMARY_LIMIT)
 
 
+def _fingerprint_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fingerprints: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in sources:
+        item = _fingerprint_source(source)
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        fingerprints.append(item)
+    return fingerprints
+
+
+def _fingerprint_source(source: dict[str, Any]) -> dict[str, Any]:
+    evidence_raw = source.get("evidence")
+    evidence: dict[str, Any] = evidence_raw if isinstance(evidence_raw, dict) else {}
+    assessment_raw = source.get("completion_assessment")
+    assessment: dict[str, Any] = assessment_raw if isinstance(assessment_raw, dict) else {}
+    parsed_messages: list[str] = []
+    for parsed in evidence.get("parsed_failures") or []:
+        if isinstance(parsed, dict):
+            _append_unique(parsed_messages, parsed.get("message"))
+    repair_targets: list[str] = []
+    for path in _paths_from_failure_source(source):
+        _append_unique(repair_targets, _normalize_workspace_path(path, workspace_root=""))
+    return {
+        "kind": source.get("kind"),
+        "outcome_ref": source.get("outcome_ref"),
+        "status": source.get("status") or assessment.get("status"),
+        "error_code": source.get("error_code"),
+        "failure_type": source.get("failure_type"),
+        "exit_code": source.get("exit_code") or evidence.get("exit_code"),
+        "command_preview": _stable_command_preview(
+            source.get("command_preview") or evidence.get("command")
+        ),
+        "parsed_messages": parsed_messages[:5],
+        "repair_targets": repair_targets[:5],
+    }
+
+
+def _stable_command_preview(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, list | tuple):
+        return " ".join(str(item) for item in value)
+    text = str(value)
+    text = text.replace("\\", "/")
+    return re.sub(r"[A-Za-z]:/[^\\s\"']+", "<path>", text)
+
+
 def _safe_outcome(outcome: ExecutionOutcome) -> dict[str, Any]:
     payload = outcome.to_dict()
+    payload["outcome_ref"] = f"execution_outcome:{payload.get('error_code') or payload.get('status')}"
     payload["metadata"] = _trim_dict(payload.get("metadata") or {})
     return payload
 
@@ -716,6 +1015,184 @@ def _json_payload(text: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("model response JSON was not an object")
     return value
+
+
+def _required_text(payload: dict[str, Any], field_name: str) -> str:
+    value = payload.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return _limit(value.strip(), SUMMARY_LIMIT)
+
+
+def _bool_required(payload: dict[str, Any], field_name: str) -> bool:
+    value = payload.get(field_name)
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _strings_required(payload: dict[str, Any], field_name: str) -> list[str]:
+    if field_name not in payload:
+        raise ValueError(f"{field_name} is required")
+    values = _strings(payload.get(field_name))
+    if not values:
+        raise ValueError(f"{field_name} must contain at least one item")
+    return [_limit(item.strip(), SUMMARY_LIMIT) for item in values if item.strip()]
+
+
+def _confidence_required(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError("confidence must be numeric")
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("confidence must be numeric") from exc
+    if confidence < 0.0 or confidence > 1.0:
+        raise ValueError("confidence must be between 0 and 1")
+    return confidence
+
+
+def _validate_evidence_refs(refs: list[str], *, request: FailureAnalysisRequest) -> None:
+    known = set(request.evidence_refs) | set(request.context_references) | set(request.verification_log_refs)
+    known.update(request.failure_evidence_refs)
+    if not refs:
+        raise ValueError("evidence_refs must not be empty")
+    if known and not any(ref in known for ref in refs):
+        raise ValueError("evidence_refs must reference supplied failure evidence")
+
+
+def _validated_affected_files(value: Any, *, request: FailureAnalysisRequest) -> list[str]:
+    raw_paths = _strings(value)
+    allowed = {path for path in request.allowed_target_files if path}
+    if not raw_paths:
+        return []
+    resolved: list[str] = []
+    for raw_path in raw_paths:
+        normalized = _normalize_workspace_path(raw_path, workspace_root=request.workspace_root)
+        if not normalized:
+            raise ValueError(f"affected_files contains an invalid workspace path: {raw_path}")
+        if allowed and normalized not in allowed:
+            raise ValueError(f"affected_files contains unauthorized target: {raw_path}")
+        _append_unique(resolved, normalized)
+    return resolved
+
+
+def _validate_verification_plan(plan: list[str], *, needs_user_input: bool) -> None:
+    if needs_user_input:
+        return
+    if not plan:
+        raise ValueError("verification_plan must contain at least one executable verification step")
+    for item in plan:
+        text = item.strip()
+        if not text:
+            raise ValueError("verification_plan contains an empty step")
+        if text in INTERNAL_VERIFICATION_REFS:
+            continue
+        if len(text.split()) < 2:
+            raise ValueError(f"verification_plan step is not executable enough: {text}")
+
+
+def _repair_contract_errors(
+    *,
+    analysis: FailureAnalysisResult,
+    action_candidates: list[RepairActionCandidate],
+    allowed_tool_names: list[str],
+) -> list[str]:
+    errors: list[str] = []
+    if not FAILURE_CATEGORY_PATTERN.match(analysis.failure_category):
+        errors.append("invalid_failure_category")
+    if analysis.confidence < MIN_REPAIR_CONFIDENCE:
+        errors.append("low_confidence")
+    if not analysis.needs_user_input and not analysis.evidence_refs:
+        errors.append("missing_evidence_refs")
+    if not analysis.needs_user_input and not analysis.affected_files:
+        errors.append("missing_target_files")
+    if not analysis.needs_user_input and not action_candidates:
+        errors.append("missing_action_candidates")
+    for candidate in action_candidates:
+        errors.extend(_repair_action_candidate_errors(candidate, target_files=analysis.affected_files))
+    if not analysis.needs_user_input:
+        try:
+            _validate_verification_plan(analysis.verification_plan, needs_user_input=False)
+        except ValueError as exc:
+            errors.append(str(exc))
+    if any(tool not in TOOL_HINTS for tool in allowed_tool_names):
+        errors.append("unsupported_tool_hint")
+    return sorted(dict.fromkeys(errors))
+
+
+def _repair_action_candidate_errors(
+    candidate: RepairActionCandidate,
+    *,
+    target_files: list[str],
+) -> list[str]:
+    errors: list[str] = []
+    if candidate.action_type not in ACTION_TYPES:
+        errors.append(f"invalid_action_type:{candidate.action_type}")
+    if not candidate.rationale.strip():
+        errors.append("missing_action_rationale")
+    if candidate.confidence < 0.0 or candidate.confidence > 1.0:
+        errors.append("invalid_action_confidence")
+    for tool in candidate.tool_hints:
+        if tool not in TOOL_HINTS:
+            errors.append(f"unsupported_tool_hint:{tool}")
+    if candidate.action_type in {"edit", "inspect"} and not candidate.target_file:
+        errors.append("missing_target_file")
+    if candidate.target_file and target_files and candidate.target_file not in target_files:
+        errors.append(f"unauthorized_candidate_target:{candidate.target_file}")
+    return errors
+
+
+def _allowed_tools_from_candidates(candidates: list[RepairActionCandidate]) -> list[str]:
+    allowed: list[str] = []
+    for candidate in candidates:
+        for tool in candidate.tool_hints:
+            _append_unique(allowed, tool)
+    return allowed
+
+
+def _paths_from_failure_source(source: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    _append_unique(paths, source.get("target_file"))
+    for key in ("affected_files", "changed_files", "suspect_files"):
+        for path in source.get(key) or []:
+            _append_unique(paths, path)
+    evidence = source.get("evidence")
+    if isinstance(evidence, dict):
+        for parsed in evidence.get("parsed_failures") or []:
+            if isinstance(parsed, dict):
+                _append_unique(paths, parsed.get("file"))
+        for path in evidence.get("sandbox_changed_files") or []:
+            _append_unique(paths, path)
+    for hint in source.get("repair_hints") or []:
+        if isinstance(hint, dict):
+            _append_unique(paths, hint.get("target_file"))
+    for status in source.get("check_status") or []:
+        if isinstance(status, dict):
+            _append_unique(paths, status.get("file"))
+    return paths
+
+
+def _normalize_workspace_path(path: Any, *, workspace_root: str) -> str | None:
+    text = str(path or "").strip().replace("\\", "/")
+    if not text:
+        return None
+    if text.startswith("workspace:"):
+        text = text.removeprefix("workspace:")
+    if text.startswith("file://"):
+        text = text.removeprefix("file://")
+    candidate = Path(text)
+    if candidate.is_absolute():
+        if not workspace_root:
+            return None
+        try:
+            return candidate.resolve(strict=False).relative_to(Path(workspace_root).resolve(strict=False)).as_posix()
+        except ValueError:
+            return None
+    normalized = Path(text).as_posix()
+    if normalized.startswith("../") or normalized == ".." or "/../" in normalized or normalized.startswith("/"):
+        return None
+    return normalized
 
 
 def _trim_dict(value: dict[str, Any]) -> dict[str, Any]:

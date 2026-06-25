@@ -330,15 +330,30 @@ class Finalizer:
             else latest_analysis.get("root_cause_text") if isinstance(latest_analysis, dict) else None
         )
         candidates = latest_plan.get("action_candidates") if isinstance(latest_plan, dict) else []
+        contract = latest_plan.get("repair_contract") if isinstance(latest_plan, dict) else {}
+        contract = contract if isinstance(contract, dict) else {}
+        validation_errors = contract.get("validation_errors") or []
+        blocked_reason = (
+            latest_plan.get("blocked_reason")
+            if isinstance(latest_plan, dict)
+            else None
+        ) or contract.get("blocked_reason")
         return {
             "failure_analysis_count": len(evidence.failure_analyses),
             "repair_plan_count": len(evidence.repair_plans),
+            "repair_attempt_count": len(evidence.repair_plans),
             "latest_analysis_id": latest_analysis.get("analysis_id") if isinstance(latest_analysis, dict) else None,
             "latest_repair_plan_id": latest_plan.get("plan_id") if isinstance(latest_plan, dict) else None,
+            "latest_repair_contract_id": contract.get("contract_id"),
             "latest_root_cause": root_cause,
             "latest_failure_category": latest_analysis.get("failure_category") if isinstance(latest_analysis, dict) else None,
             "latest_repair_strategy": latest_plan.get("strategy") if isinstance(latest_plan, dict) else None,
             "latest_action_candidate_count": len(candidates or []),
+            "latest_target_files": contract.get("target_files") or [],
+            "latest_verification_plan": contract.get("verification_plan") or [],
+            "latest_contract_confidence": contract.get("confidence"),
+            "latest_contract_validation_errors": validation_errors,
+            "latest_blocked_reason": blocked_reason,
             "needs_user_input": bool(latest_plan.get("needs_user_input")) if isinstance(latest_plan, dict) else False,
         }
 
@@ -407,8 +422,12 @@ class FinalReportRenderer:
             f"- Failure analyses: {len(evidence.failure_analyses)}",
             f"- Repair plans: {len(evidence.repair_plans)}",
             f"- Latest root cause: {report.failure_repair_summary.get('latest_root_cause') or '-'}",
+            f"- Latest repair contract: {report.failure_repair_summary.get('latest_repair_contract_id') or '-'}",
             f"- Latest repair strategy: {report.failure_repair_summary.get('latest_repair_strategy') or '-'}",
             f"- Repair action candidates: {report.failure_repair_summary.get('latest_action_candidate_count', 0)}",
+            f"- Repair attempts: {report.failure_repair_summary.get('repair_attempt_count', 0)}",
+            f"- Blocked reason: {report.failure_repair_summary.get('latest_blocked_reason') or '-'}",
+            f"- Contract validation errors: {report.failure_repair_summary.get('latest_contract_validation_errors') or []}",
             f"- Unresolved issues: {len(report.unresolved_issues)}",
             "",
             "## Final Review",

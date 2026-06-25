@@ -355,7 +355,8 @@ def test_agent_does_not_complete_when_final_review_rejects(tmp_path: Path) -> No
 
     answer = agent.run("finish with facts")
 
-    assert answer.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
+    assert answer.status == AgentLoopStatus.BLOCKED
+    assert answer.error_code == "repair_budget_exceeded"
     assert any(
         outcome["error_code"] == "final_review_rejected"
         for outcome in planner.evidence.task_outcomes
@@ -363,6 +364,9 @@ def test_agent_does_not_complete_when_final_review_rejects(tmp_path: Path) -> No
     assert provider.calls[1]["tools"] == []
     assert planner.evidence.failure_analyses[-1]["failure_category"] == "final_review_failure"
     assert planner.evidence.repair_plans[-1]["strategy"] == "repair the final evidence and rerun final review"
+    assert planner.evidence.repair_plans[-1]["repair_contract"]["failure_category"] == "final_review_failure"
+    assert planner.evidence.repair_plans[-1]["repair_contract"]["target_files"] == ["README.md"]
+    assert "repair_contract" in json.dumps(provider.calls[2]["messages"], ensure_ascii=False)
     assert not any(
         outcome["status"] == "success"
         and outcome.get("metadata", {}).get("final_report_status") == "completed"

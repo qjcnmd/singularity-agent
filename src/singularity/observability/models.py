@@ -115,6 +115,8 @@ class TraceEventType(str, Enum):
     FAILURE_ANALYSIS_REQUESTED = "failure_analysis.requested"
     FAILURE_ANALYSIS_COMPLETED = "failure_analysis.completed"
     FAILURE_ANALYSIS_FAILED = "failure_analysis.failed"
+    REPAIR_CONTRACT_VALIDATION = "repair.contract_validation"
+    REPAIR_SIGNAL_CONSUMED = "repair.signal_consumed"
     CONTEXT_SNAPSHOT_CREATED = "context.snapshot_created"
     CONTEXT_COMPACTED = "context.compacted"
     CONTEXT_OBSERVATION_ADDED = "context.observation_added"

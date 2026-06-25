@@ -174,6 +174,9 @@ class SemanticPlanner:
         analysis = failure_analysis.to_dict() if hasattr(failure_analysis, "to_dict") else dict(failure_analysis)
         criterion = _failed_criterion(contract, analysis)
         target = _first_suspect_file(analysis)
+        failure_category = str(analysis.get("failure_category") or analysis.get("failure_type") or "failed verification")
+        allowed_capabilities = _repair_capabilities(analysis)
+        verification_plan = [str(item) for item in analysis.get("verification_plan") or [] if item]
         expected = [
             ExpectedEvidence(
                 evidence_key=item,
@@ -184,19 +187,27 @@ class SemanticPlanner:
         ]
         step = PlanStep(
             step_id=f"repair_{analysis.get('check_id') or uuid4().hex[:8]}",
-            title=f"Repair {target or 'failed verification'}",
+            title=f"Repair {failure_category}: {target or 'failed verification'}",
             kind="repair",
             acceptance_criterion_id=criterion.criterion_id if criterion else None,
-            allowed_capabilities=["apply_patch", "inspect_diff", "read_file", "run_verification"],
+            allowed_capabilities=allowed_capabilities,
             expected_evidence=expected,
             fallback_steps=[
                 FallbackStep(
                     "repair_step_failed",
                     "replan_or_ask_user",
-                    ["read_file", "search_text", "run_verification"],
+                    sorted({"read_file", "search_text", "run_verification", *allowed_capabilities}),
                 )
             ],
         )
+        if verification_plan:
+            step.expected_evidence.append(
+                ExpectedEvidence(
+                    evidence_key="repair_contract_verification_plan",
+                    acceptance_criterion_id=criterion.criterion_id if criterion else None,
+                    description="Repair must execute: " + "; ".join(verification_plan[:3]),
+                )
+            )
         return RollingPlan(
             plan_id=f"rolling_repair_{uuid4().hex[:12]}",
             user_goal=contract.user_goal,
@@ -263,5 +274,22 @@ def _failed_criterion(contract: TaskContract, analysis: dict[str, Any]) -> Accep
 
 
 def _first_suspect_file(analysis: dict[str, Any]) -> str | None:
-    suspects = analysis.get("suspect_files") or []
+    suspects = (
+        analysis.get("target_files")
+        or analysis.get("affected_files")
+        or analysis.get("suspect_files")
+        or []
+    )
     return str(suspects[0]) if suspects else None
+
+
+def _repair_capabilities(analysis: dict[str, Any]) -> list[str]:
+    capabilities = {str(item) for item in analysis.get("allowed_tool_names") or [] if item}
+    for candidate in analysis.get("action_candidates") or []:
+        if isinstance(candidate, dict):
+            capabilities.update(str(item) for item in candidate.get("tool_hints") or [] if item)
+    if analysis.get("verification_plan"):
+        capabilities.update({"get_verification_result", "run_verification"})
+    if not capabilities:
+        capabilities.update({"apply_patch", "inspect_diff", "read_file", "run_verification"})
+    return sorted(capabilities)

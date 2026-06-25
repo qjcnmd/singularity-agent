@@ -37,6 +37,9 @@ class PlannerContextRenderer:
                     ),
                     "failure_analysis": evidence.failure_analyses[-3:],
                     "repair_plan": evidence.repair_plans[-1] if evidence.repair_plans else None,
+                    "repair_contract": self._repair_contract_summary(
+                        evidence.repair_plans[-1] if evidence.repair_plans else {}
+                    ),
                     "unresolved_failures": evidence.unresolved_failures[-10:],
                     "missing_evidence": evidence.missing_evidence[-10:],
                     "task_outcomes": evidence.task_outcomes[-10:],
@@ -87,6 +90,28 @@ class PlannerContextRenderer:
             "plan_id": rolling_plan.get("plan_id"),
             "current_step_id": rolling_plan.get("current_step_id"),
             "steps": rolling_plan.get("steps") or [],
+        }
+
+    @staticmethod
+    def _repair_contract_summary(repair_plan: dict) -> dict:
+        if not isinstance(repair_plan, dict):
+            return {}
+        contract = repair_plan.get("repair_contract")
+        if not isinstance(contract, dict):
+            return {}
+        return {
+            "contract_id": contract.get("contract_id"),
+            "analysis_id": contract.get("analysis_id"),
+            "failure_category": contract.get("failure_category"),
+            "target_files": contract.get("target_files") or [],
+            "evidence_refs": contract.get("evidence_refs") or [],
+            "action_candidates": contract.get("action_candidates") or [],
+            "verification_plan": contract.get("verification_plan") or [],
+            "allowed_tool_names": contract.get("allowed_tool_names") or [],
+            "confidence": contract.get("confidence"),
+            "needs_user_input": bool(contract.get("needs_user_input")),
+            "blocked_reason": contract.get("blocked_reason"),
+            "validation_errors": contract.get("validation_errors") or [],
         }
 
     @staticmethod

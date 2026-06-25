@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
@@ -136,8 +137,11 @@ class AgentLoop:
             model_runner=model_runner,
             trace=trace,
         )
-        self.repair_planner = repair_planner or RepairPlanner()
+        self.repair_planner = repair_planner or RepairPlanner(trace=trace)
         self._failure_analysis_fingerprints: set[str] = set()
+        self._failure_replan_signals: dict[str, Any] = {}
+        self._failure_analysis_snapshots: dict[str, dict[str, int]] = {}
+        self._completion_rejection_state: dict[str, dict[str, Any]] = {}
         self.strict = strict
 
     def run(self, user_goal: str) -> AgentLoopResult:
@@ -588,7 +592,28 @@ class AgentLoop:
             outcome=outcome,
             turn=turn,
         )
-        if not request.has_failure or request.fingerprint in self._failure_analysis_fingerprints:
+        if not request.has_failure:
+            return None
+        snapshot = self._failure_snapshot(planner)
+        if request.fingerprint in self._failure_analysis_fingerprints:
+            if not self._duplicate_failure_has_new_evidence(request.fingerprint, snapshot):
+                return None
+            signal_payload = self._failure_replan_signals.get(request.fingerprint)
+            if signal_payload is None:
+                return None
+            self._failure_analysis_snapshots[request.fingerprint] = snapshot
+            decision = planner.replan(signal_payload)
+            if getattr(getattr(decision, "decision", None), "value", "") == "ask_user":
+                return ExecutionOutcome(
+                    status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
+                    source="failure_analysis",
+                    reason=decision.reason,
+                    error_code="repair_budget_exceeded",
+                    next_action="ask_user",
+                    observation_summary=decision.reason,
+                    retry_allowed=False,
+                    metadata={"replan_signal": signal_payload},
+                )
             return None
         self._failure_analysis_fingerprints.add(request.fingerprint)
         analysis = self.failure_analyzer.analyze(request)
@@ -598,21 +623,24 @@ class AgentLoop:
             analysis=analysis,
             plan=repair_plan,
         )
+        replan_signal_payload = replan_signal.to_dict()
         planner.record_failure_analysis(
             analysis,
             repair_plan,
-            replan_signal=replan_signal,
+            replan_signal=replan_signal_payload,
         )
         context.add_failure(
             {
                 "failure_analysis": analysis.to_dict(),
                 "repair_plan": repair_plan.to_dict(),
-                "replan_signal": replan_signal,
+                "replan_signal": replan_signal_payload,
             }
         )
+        self._failure_analysis_snapshots[request.fingerprint] = snapshot
         if repair_plan.needs_user_input or repair_plan.blocked_reason:
             return self.repair_planner.blocked_outcome(repair_plan)
-        decision = planner.replan(replan_signal)
+        self._failure_replan_signals[request.fingerprint] = replan_signal_payload
+        decision = planner.replan(replan_signal_payload)
         if getattr(getattr(decision, "decision", None), "value", "") == "ask_user":
             return ExecutionOutcome(
                 status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
@@ -622,28 +650,131 @@ class AgentLoop:
                 next_action="ask_user",
                 observation_summary=decision.reason,
                 retry_allowed=False,
-                metadata={"repair_plan": repair_plan.to_dict()},
+                metadata={"repair_plan": repair_plan.to_dict(), "replan_signal": replan_signal_payload},
             )
         return None
 
-    @staticmethod
-    def _should_analyze_outcome(planner: Planner, outcome: ExecutionOutcome) -> bool:
+    def _should_analyze_outcome(self, planner: Planner, outcome: ExecutionOutcome) -> bool:
         if outcome.status != ExecutionOutcomeStatus.REPLAN_REQUIRED:
             return False
         if outcome.error_code in {
             "approval_required",
             "approval_denied",
+            "permission_denied",
+            "policy_blocked",
             "policy_denied",
             "policy_ask_user_required",
             "action_not_allowed",
             "risk_escalated",
             "sandbox_required",
+            "sandbox_capability_failed",
+            "sandbox_violation",
             "policy_escalation_required",
         }:
             return False
         if outcome.error_code == "completion_rejected":
-            return False
+            return self._should_escalate_completion_rejection(planner, outcome)
         return True
+
+    def _should_escalate_completion_rejection(self, planner: Planner, outcome: ExecutionOutcome) -> bool:
+        missing = sorted(str(item) for item in outcome.missing_evidence)
+        key = json.dumps({"missing": missing}, ensure_ascii=False, sort_keys=True)
+        phase = getattr(getattr(planner, "state", None), "current_phase", "")
+        snapshot = self._evidence_snapshot(planner)
+        previous = self._completion_rejection_state.get("latest")
+        if not previous or previous.get("key") != key:
+            self._completion_rejection_state["latest"] = {
+                "key": key,
+                "count": 1,
+                "phase": phase,
+                "snapshot": snapshot,
+            }
+            return False
+        count = int(previous.get("count") or 0) + 1
+        phase_stalled = previous.get("phase") == phase
+        evidence_stalled = previous.get("snapshot") == snapshot
+        self._completion_rejection_state["latest"] = {
+            "key": key,
+            "count": count,
+            "phase": phase,
+            "snapshot": snapshot,
+        }
+        return count >= 2 and phase_stalled and evidence_stalled
+
+    @staticmethod
+    def _evidence_snapshot(planner: Planner) -> dict[str, int]:
+        evidence = planner.evidence
+        return {
+            "inspected_files": len(evidence.inspected_files),
+            "applied_changes": len(evidence.applied_changes),
+            "command_results": len(evidence.command_results),
+            "verification_results": len(evidence.verification_results),
+            "tool_results": len(evidence.tool_results),
+            "edit_results": len(evidence.edit_results),
+            "review_results": len(evidence.review_results),
+        }
+
+    @staticmethod
+    def _failure_snapshot(planner: Planner) -> dict[str, int]:
+        evidence = planner.evidence
+        return {
+            "failed_command_results": len(
+                [
+                    item
+                    for item in evidence.command_results
+                    if item.get("semantic_status") not in {None, "succeeded", "SUCCEEDED"}
+                    or item.get("error_code")
+                ]
+            ),
+            "failed_verification_results": len(
+                [
+                    item
+                    for item in evidence.verification_results
+                    if isinstance(item, dict)
+                    and (
+                        (item.get("completion_assessment") or {}).get("status")
+                        in {"failed", "blocked", "needs_review"}
+                        or any(
+                            result.get("status") in {"failed", "blocked", "timeout", "flaky"}
+                            for result in item.get("results") or []
+                            if isinstance(result, dict)
+                        )
+                    )
+                ]
+            ),
+            "failed_tool_results": len(
+                [
+                    item
+                    for item in evidence.tool_results
+                    if item.get("ok") is False or item.get("error_code")
+                ]
+            ),
+            "failed_edit_results": len(
+                [
+                    item
+                    for item in evidence.edit_results
+                    if item.get("error_code") or item.get("status") in {"failed", "blocked"}
+                ]
+            ),
+            "failed_review_results": len(
+                [
+                    item
+                    for item in evidence.review_results
+                    if isinstance(item.get("decision"), dict)
+                    and item["decision"].get("action") in {
+                        "repair",
+                        "reject",
+                        "needs_human_approval",
+                    }
+                ]
+            ),
+        }
+
+    def _duplicate_failure_has_new_evidence(self, fingerprint: str, snapshot: dict[str, int]) -> bool:
+        previous = self._failure_analysis_snapshots.get(fingerprint)
+        if previous is None:
+            return True
+        return any(snapshot.get(key, 0) > previous.get(key, 0) for key in snapshot)
 
     @staticmethod
     def _has_repairable_planner_failure(planner: Planner) -> bool:
@@ -651,6 +782,8 @@ class AgentLoop:
             return False
         latest = planner.evidence.verification_results[-1] if planner.evidence.verification_results else {}
         assessment = latest.get("completion_assessment") if isinstance(latest, dict) else {}
+        if isinstance(assessment, dict) and assessment.get("status") in {"ready", "ready_with_warnings"}:
+            return False
         if isinstance(assessment, dict) and assessment.get("status") in {"failed", "blocked", "needs_review"}:
             return True
         for failure in planner.evidence.unresolved_failures[-5:]:
@@ -664,9 +797,16 @@ class AgentLoop:
             if code not in {
                 "approval_required",
                 "approval_denied",
+                "permission_denied",
+                "policy_blocked",
                 "policy_denied",
+                "policy_ask_user_required",
+                "action_not_allowed",
                 "risk_escalated",
                 "sandbox_required",
+                "sandbox_capability_failed",
+                "sandbox_violation",
+                "policy_escalation_required",
             }:
                 return True
         return False

@@ -6,6 +6,7 @@ from singularity.agent_loop import AgentLoopStatus
 from singularity.command import CommandExecutor
 from singularity.context import ContextManager
 from singularity.edit import EditExecutor
+from singularity.model import ModelError, ModelErrorKind
 from singularity.planner import Planner, TaskStatus
 from singularity.policy import (
     ApprovalMode,
@@ -30,7 +31,7 @@ from tests.agent_loop_helpers import make_agent_session
 
 
 class FakeProvider:
-    def __init__(self, *responses: dict[str, Any]) -> None:
+    def __init__(self, *responses: Any) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, Any]] = []
 
@@ -42,7 +43,10 @@ class FakeProvider:
         tool_choice: Any = None,
     ) -> dict[str, Any]:
         self.calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 class DenyMutationPolicyEngine:
@@ -319,7 +323,14 @@ def test_tool_failure_then_verification_failure_replans_repairs_and_finalizes(tm
     assert provider.calls[4]["tools"] == []
     repair_context = json.dumps(provider.calls[5]["messages"], ensure_ascii=False)
     assert "repair_plan" in repair_context
+    assert "repair_contract" in repair_context
+    assert "target_files" in repair_context
+    assert "allowed_tool_names" in repair_context
     assert "ZeroDivisionError" in repair_context
+    contract = planner.evidence.repair_plans[-1]["repair_contract"]
+    repair_tool_names = {item["function"]["name"] for item in provider.calls[5]["tools"]}
+    assert repair_tool_names <= set(contract["allowed_tool_names"])
+    assert {"run_verification", "write_file"} <= repair_tool_names
     trace_events = [
         json.loads(line)["event"]
         for trace_path in (tmp_path / ".singularity" / "runs").glob("*.jsonl")
@@ -327,6 +338,8 @@ def test_tool_failure_then_verification_failure_replans_repairs_and_finalizes(tm
     ]
     assert "failure_analysis_requested" in trace_events
     assert "failure_analysis_completed" in trace_events
+    assert "repair_contract_validation" in trace_events
+    assert "repair_signal_consumed" in trace_events
     assert planner.state is not None
     assert planner.state.status == TaskStatus.COMPLETED
 
@@ -379,6 +392,264 @@ def test_unrepairable_verification_failure_blocks_with_user_input_required(tmp_p
     assert planner.state.status == TaskStatus.BLOCKED
     assert planner.evidence.failure_analyses[-1]["needs_user_input"] is True
     assert planner.evidence.repair_plans[-1]["blocked_reason"] == "missing expected behavior"
+
+
+def test_invalid_analyzer_json_blocks_without_repairing(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        tool("call_read_1", "read_file", {"path": "README.md"}),
+        tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
+        tool(
+            "call_create_bad",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": "print(1 / 0)\n",
+                "mode": "create",
+                "reason": "create failing smoke target",
+            },
+        ),
+        tool(
+            "call_verify_bad",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+        assistant("not json"),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=6)
+
+    result = agent.run("implement quicksort.py and verify it")
+
+    assert result.status == AgentLoopStatus.BLOCKED
+    assert result.error_code == "failure_analysis_user_input_required"
+    assert planner.evidence.failure_analyses[-1]["failure_category"] == "failure_analysis_invalid_json"
+    assert planner.evidence.repair_plans[-1]["needs_user_input"] is True
+    assert planner.evidence.repair_plans[-1]["repair_contract"]["validation_errors"]
+
+
+def test_analyzer_model_failure_blocks_with_user_input_required(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        tool("call_read_1", "read_file", {"path": "README.md"}),
+        tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
+        tool(
+            "call_create_bad",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": "print(1 / 0)\n",
+                "mode": "create",
+                "reason": "create failing smoke target",
+            },
+        ),
+        tool(
+            "call_verify_bad",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+        ModelError(
+            kind=ModelErrorKind.NETWORK_ERROR,
+            message="failure analyzer provider unavailable",
+            retryable=False,
+        ),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=6)
+
+    result = agent.run("implement quicksort.py and verify it")
+
+    assert result.status == AgentLoopStatus.BLOCKED
+    assert result.error_code == "failure_analysis_user_input_required"
+    assert planner.evidence.failure_analyses[-1]["failure_category"] == "failure_analysis_unavailable"
+    assert "failure analyzer provider unavailable" in planner.evidence.repair_plans[-1]["blocked_reason"]
+
+
+def test_low_confidence_analysis_blocks_repair_contract(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        tool("call_read_1", "read_file", {"path": "README.md"}),
+        tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
+        tool(
+            "call_create_bad",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": "print(1 / 0)\n",
+                "mode": "create",
+                "reason": "create failing smoke target",
+            },
+        ),
+        tool(
+            "call_verify_bad",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+        analysis_response(
+            root_cause="The failure might be in quicksort.py but confidence is too low.",
+            failure_category="unit_test_failure",
+            affected_files=["quicksort.py"],
+            evidence_refs=["call_verify_bad"],
+            repair_strategy="guess at a repair",
+            next_actions=["Patch quicksort.py."],
+            verification_plan=["python quicksort.py"],
+            confidence=0.1,
+        ),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=6)
+
+    result = agent.run("implement quicksort.py and verify it")
+
+    assert result.status == AgentLoopStatus.BLOCKED
+    assert result.error_code == "failure_analysis_user_input_required"
+    assert planner.evidence.failure_analyses[-1]["failure_category"] == "failure_analysis_schema_invalid"
+    assert "confidence below repair threshold" in planner.evidence.repair_plans[-1]["blocked_reason"]
+
+
+def test_unauthorized_affected_files_block_repair_contract(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        tool("call_read_1", "read_file", {"path": "README.md"}),
+        tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
+        tool(
+            "call_create_bad",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": "print(1 / 0)\n",
+                "mode": "create",
+                "reason": "create failing smoke target",
+            },
+        ),
+        tool(
+            "call_verify_bad",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+        analysis_response(
+            root_cause="The model tries to edit an unrelated file.",
+            failure_category="unit_test_failure",
+            affected_files=["other.py"],
+            evidence_refs=["call_verify_bad"],
+            repair_strategy="patch unrelated file",
+            next_actions=["Patch other.py."],
+            verification_plan=["python quicksort.py"],
+            confidence=0.9,
+        ),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=6)
+
+    result = agent.run("implement quicksort.py and verify it")
+
+    assert result.status == AgentLoopStatus.BLOCKED
+    assert result.error_code == "failure_analysis_user_input_required"
+    assert planner.evidence.failure_analyses[-1]["failure_category"] == "failure_analysis_schema_invalid"
+    assert "unauthorized target" in planner.evidence.repair_plans[-1]["blocked_reason"]
+
+
+def test_repeated_completion_rejected_escalates_to_failure_analyzer(tmp_path: Path) -> None:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        assistant("done without evidence"),
+        assistant("still done without evidence"),
+        analysis_response(
+            root_cause="The model repeatedly finalized without required evidence.",
+            failure_category="missing_information",
+            affected_files=[],
+            evidence_refs=["execution_outcome:completion_rejected"],
+            repair_strategy="ask for missing evidence decision",
+            next_actions=["Ask the user whether to continue without evidence."],
+            verification_plan=[],
+            confidence=0.3,
+            needs_user_input=True,
+            blocked_reason="missing required completion evidence",
+        ),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=3)
+
+    result = agent.run("change code")
+
+    assert result.status == AgentLoopStatus.BLOCKED
+    assert result.error_code == "failure_analysis_user_input_required"
+    assert provider.calls[2]["tools"] == []
+    assert planner.evidence.failure_analyses[-1]["failure_category"] == "missing_information"
+    assert planner.evidence.repair_plans[-1]["blocked_reason"] == "missing required completion evidence"
+
+
+def test_repeated_failure_fingerprint_budget_blocks_after_second_failed_verification(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        tool("call_read_1", "read_file", {"path": "README.md"}),
+        tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
+        tool(
+            "call_create_bad",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": "print(1 / 0)\n",
+                "mode": "create",
+                "reason": "create failing smoke target",
+            },
+        ),
+        tool(
+            "call_verify_bad",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+        analysis_response(
+            root_cause="quicksort.py raises ZeroDivisionError during smoke verification.",
+            failure_category="unit_test_failure",
+            affected_files=["quicksort.py"],
+            evidence_refs=["call_verify_bad"],
+            repair_strategy="patch quicksort.py and rerun verification",
+            next_actions=["Rerun python quicksort.py without changing the file."],
+            verification_plan=["python quicksort.py"],
+            confidence=0.9,
+        ),
+        tool(
+            "call_verify_bad_again",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=6)
+
+    result = agent.run("implement quicksort.py and verify it")
+
+    assert result.status == AgentLoopStatus.BLOCKED
+    assert result.error_code == "repair_budget_exceeded"
+    assert planner.state is not None
+    assert planner.state.status == TaskStatus.BLOCKED
+    assert "repeated_failure" in planner.state.blocked_reasons
+    llm_analyses = [item for item in planner.evidence.failure_analyses if item.get("request_id")]
+    assert len(llm_analyses) == 1
 
 
 def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:
@@ -483,6 +754,8 @@ def make_task_agent(
     max_turns: int = 6,
 ):
     trace = JsonlTraceRecorder.create(tmp_path)
+    if planner.trace is None:
+        planner.trace = trace
     policy = policy_engine or PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,

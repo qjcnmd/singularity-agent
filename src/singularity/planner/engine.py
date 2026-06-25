@@ -213,6 +213,24 @@ class Planner:
         plan = self._plan()
         phase = plan.phase(state.current_phase)
         normalized_args = self.policy.normalize_arguments(arguments or {})
+        repair_allowed = self._active_repair_allowed_tools()
+        if repair_allowed and tool_name not in repair_allowed:
+            decision = AuthorizationDecision(
+                allowed=False,
+                error_code="repair_contract_tool_not_allowed",
+                reason=f"{tool_name} is not allowed by the active repair contract.",
+            )
+            self._record_event(
+                action_id=tool_call_id,
+                action_kind=self.policy.action_for_tool(tool_name).value,
+                decision="deny",
+                reason=decision.reason,
+                extra={
+                    "reason_code": decision.error_code,
+                    "repair_contract": self._active_repair_contract(),
+                },
+            )
+            return decision
         if not self.policy.is_allowed(phase=phase, tool_name=tool_name, spec=spec):
             decision = AuthorizationDecision(
                 allowed=False,
@@ -228,6 +246,35 @@ class Planner:
             return decision
 
         target_paths = target_paths_from_tool_arguments(tool_name, normalized_args)
+        repair_targets = self._active_repair_target_files()
+        if (
+            repair_targets
+            and tool_name in (MUTATION_TOOLS | EDIT_PLAN_TOOLS)
+            and target_paths
+        ):
+            outside_targets = [
+                path
+                for path in target_paths
+                if _normalize_planner_path(path) not in repair_targets
+            ]
+            if outside_targets:
+                decision = AuthorizationDecision(
+                    allowed=False,
+                    error_code="repair_contract_target_not_allowed",
+                    reason="Mutation target is outside the active repair contract.",
+                )
+                self._record_event(
+                    action_id=tool_call_id,
+                    action_kind=self.policy.action_for_tool(tool_name).value,
+                    decision="deny",
+                    reason=decision.reason,
+                    extra={
+                        "reason_code": decision.error_code,
+                        "blocked_paths": outside_targets,
+                        "repair_contract": self._active_repair_contract(),
+                    },
+                )
+                return decision
         if write_blocked_by_user_constraint(spec, self._active_user_constraints(), target_paths):
             decision = AuthorizationDecision(
                 allowed=False,
@@ -668,11 +715,15 @@ class Planner:
         analysis: Any,
         repair_plan: Any,
         *,
-        replan_signal: dict[str, Any] | None = None,
+        replan_signal: Any | None = None,
     ) -> None:
         self._throw_if_cancelled()
         analysis_payload = analysis.to_dict() if hasattr(analysis, "to_dict") else dict(analysis)
         repair_payload = repair_plan.to_dict() if hasattr(repair_plan, "to_dict") else dict(repair_plan)
+        replan_payload = _dict_like(replan_signal)
+        repair_contract = _repair_contract_payload(repair_payload, replan_payload)
+        if repair_contract and not repair_payload.get("repair_contract"):
+            repair_payload["repair_contract"] = repair_contract
         analysis_id = analysis_payload.get("analysis_id")
         if not analysis_id or not any(
             existing.get("analysis_id") == analysis_id
@@ -687,8 +738,15 @@ class Planner:
 
         state = self._state()
         plan = self._plan()
-        blocked_reason = repair_payload.get("blocked_reason")
-        if repair_payload.get("needs_user_input") or blocked_reason:
+        blocked_reason = (
+            repair_payload.get("blocked_reason")
+            or (repair_contract or {}).get("blocked_reason")
+        )
+        if (
+            repair_payload.get("needs_user_input")
+            or blocked_reason
+            or (repair_contract or {}).get("needs_user_input")
+        ):
             state.status = TaskStatus.BLOCKED
             if blocked_reason:
                 self._append_unique(state.blocked_reasons, blocked_reason)
@@ -700,7 +758,7 @@ class Planner:
             plan.current_phase = "repairing_failures"
             if state.task_contract:
                 state.rolling_plan = self.semantic_planner.repair_plan(
-                    analysis_payload,
+                    repair_contract or repair_payload or analysis_payload,
                     task_contract=state.task_contract,
                 ).to_dict()
             self._record_dynamic_retrieval(
@@ -713,10 +771,11 @@ class Planner:
             decision="failure_analysis",
             reason=str(analysis_payload.get("root_cause_text") or "Failure analysis recorded."),
             evidence_refs=list(analysis_payload.get("evidence_refs") or []),
-            replan_decision=replan_signal,
+            replan_decision=replan_payload,
             extra={
                 "failure_analysis": analysis_payload,
                 "repair_plan": repair_payload,
+                "repair_contract": repair_contract,
             },
         )
 
@@ -903,15 +962,38 @@ class Planner:
             extra={"review_observation": payload},
         )
 
-    def replan(self, signal: dict[str, Any]) -> ReplanDecision:
+    def replan(self, signal: Any) -> ReplanDecision:
         self._throw_if_cancelled()
+        signal_payload = _dict_like(signal)
         state = self._state()
-        fingerprint = signal.get("failure_fingerprint")
+        repair_contract = _repair_contract_payload(signal_payload)
+        blocked_reason = _repair_contract_blocked_reason(repair_contract, signal_payload)
+        if blocked_reason:
+            state.status = TaskStatus.BLOCKED
+            self._append_unique(state.blocked_reasons, blocked_reason)
+            decision = ReplanDecision(
+                decision=ReplanDecisionKind.ASK_USER,
+                reason=blocked_reason,
+                next_action=ActionKind.ASK_USER,
+            )
+            self._persist()
+            self._record_event(
+                decision="replan",
+                reason=decision.reason,
+                replan_decision=decision.to_dict(),
+                extra={
+                    "replan_signal": signal_payload,
+                    "repair_contract": repair_contract,
+                },
+            )
+            self._record_repair_signal_consumed(signal_payload, decision)
+            return decision
+        fingerprint = signal_payload.get("failure_fingerprint")
         if fingerprint:
             count = BudgetController(self.budget).record_failure(str(fingerprint))
             if count >= self.budget.max_repeated_failures:
                 state.status = TaskStatus.BLOCKED
-                state.blocked_reasons.append("repeated_failure")
+                self._append_unique(state.blocked_reasons, "repeated_failure")
                 decision = ReplanDecision(
                     decision=ReplanDecisionKind.ASK_USER,
                     reason="Repeated failure budget exceeded.",
@@ -922,9 +1004,14 @@ class Planner:
                     decision="replan",
                     reason=decision.reason,
                     replan_decision=decision.to_dict(),
+                    extra={
+                        "replan_signal": signal_payload,
+                        "repair_contract": repair_contract,
+                    },
                 )
+                self._record_repair_signal_consumed(signal_payload, decision)
                 return decision
-        decision = self.replanner.decide(signal)
+        decision = self.replanner.decide(signal_payload)
         if decision.decision == ReplanDecisionKind.READ_FRESH_FILE:
             state.status = TaskStatus.INSPECTING_WORKSPACE
             state.current_phase = "inspecting_workspace"
@@ -933,6 +1020,7 @@ class Planner:
             state.status = TaskStatus.REPAIRING_FAILURES
             state.current_phase = "repairing_failures"
             self._plan().current_phase = "repairing_failures"
+            self._consume_repair_signal(signal_payload)
         elif decision.decision == ReplanDecisionKind.REQUIRE_REVIEW:
             state.status = TaskStatus.NEEDS_REVIEW
         self._persist()
@@ -940,7 +1028,12 @@ class Planner:
             decision="replan",
             reason=decision.reason,
             replan_decision=decision.to_dict(),
+            extra={
+                "replan_signal": signal_payload,
+                "repair_contract": repair_contract,
+            },
         )
+        self._record_repair_signal_consumed(signal_payload, decision)
         return decision
 
     def assess_completion(self, *, mark_blocked: bool = True) -> dict[str, Any]:
@@ -1186,6 +1279,9 @@ class Planner:
         current_step = self.semantic_rolling_plan().current_step()
         if current_step is not None:
             allowed.update(current_step.allowed_capabilities)
+        repair_allowed = self._active_repair_allowed_tools()
+        if repair_allowed:
+            allowed &= repair_allowed
         decision = self.tool_router.decide(
             phase=phase.phase_id,
             phase_allowed_tool_names=allowed,
@@ -1227,6 +1323,9 @@ class Planner:
             current_step = self.semantic_rolling_plan().current_step()
             if current_step is not None:
                 allowed.update(current_step.allowed_capabilities)
+            repair_allowed = self._active_repair_allowed_tools()
+            if repair_allowed:
+                allowed &= repair_allowed
         return [
             tool
             for tool in tools
@@ -1247,6 +1346,68 @@ class Planner:
         state.rolling_plan = plan.to_dict()
         self._persist()
         return plan
+
+    def _consume_repair_signal(self, signal: dict[str, Any]) -> None:
+        contract = _repair_contract_payload(signal)
+        if not contract or not self._state().task_contract:
+            return
+        self._state().rolling_plan = self.semantic_planner.repair_plan(
+            contract,
+            task_contract=self._state().task_contract,
+        ).to_dict()
+
+    def _active_repair_contract(self) -> dict[str, Any]:
+        if self.state is None or self.state.current_phase != "repairing_failures":
+            return {}
+        if not self.evidence.repair_plans:
+            return {}
+        latest = self.evidence.repair_plans[-1]
+        if not isinstance(latest, dict):
+            return {}
+        return _repair_contract_payload(latest)
+
+    def _active_repair_allowed_tools(self) -> set[str]:
+        contract = self._active_repair_contract()
+        if not contract or contract.get("needs_user_input") or contract.get("blocked_reason"):
+            return set()
+        tools = {str(item) for item in contract.get("allowed_tool_names") or [] if item}
+        if tools:
+            return tools
+        for candidate in contract.get("action_candidates") or []:
+            if isinstance(candidate, dict):
+                tools.update(str(item) for item in candidate.get("tool_hints") or [] if item)
+        return tools
+
+    def _active_repair_target_files(self) -> set[str]:
+        contract = self._active_repair_contract()
+        if not contract or contract.get("needs_user_input") or contract.get("blocked_reason"):
+            return set()
+        return {
+            _normalize_planner_path(item)
+            for item in contract.get("target_files") or []
+            if item
+        }
+
+    def _record_repair_signal_consumed(
+        self,
+        signal: dict[str, Any],
+        decision: ReplanDecision,
+    ) -> None:
+        if self.trace is None:
+            return
+        payload = {
+            "signal_id": signal.get("signal_id"),
+            "repair_plan_id": signal.get("repair_plan_id"),
+            "analysis_id": signal.get("analysis_id"),
+            "contract_id": signal.get("contract_id"),
+            "failure_category": signal.get("failure_category"),
+            "target_files": signal.get("target_files") or [],
+            "verification_plan": signal.get("verification_plan") or [],
+            "confidence": signal.get("confidence"),
+            "decision": decision.to_dict(),
+        }
+        if hasattr(self.trace, "record"):
+            self.trace.record("repair_signal_consumed", payload)
 
     def _maybe_advance_after_tool(self, tool_name: str) -> None:
         state = self._state()
@@ -1594,6 +1755,58 @@ class Planner:
             "文件",
         }
         return any(marker in lowered for marker in markers)
+
+
+def _dict_like(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if hasattr(value, "to_dict"):
+        payload = value.to_dict()
+        return payload if isinstance(payload, dict) else {}
+    return value if isinstance(value, dict) else {}
+
+
+def _repair_contract_payload(*payloads: dict[str, Any]) -> dict[str, Any]:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        contract = payload.get("repair_contract")
+        if isinstance(contract, dict):
+            return contract
+        if "contract_id" in payload and "action_candidates" in payload:
+            return payload
+    return {}
+
+
+def _repair_contract_blocked_reason(
+    contract: dict[str, Any],
+    signal: dict[str, Any],
+) -> str | None:
+    blocked_reason = (
+        contract.get("blocked_reason")
+        or signal.get("blocked_reason")
+    )
+    if blocked_reason:
+        return str(blocked_reason)
+    if contract.get("needs_user_input") or signal.get("needs_user_input"):
+        return "repair_contract_requires_user_input"
+    validation_errors = contract.get("validation_errors")
+    if validation_errors:
+        return f"repair_contract_invalid: {validation_errors}"
+    try:
+        confidence = float(contract.get("confidence", signal.get("confidence", 1.0)))
+    except (TypeError, ValueError):
+        return "repair_contract_invalid_confidence"
+    if confidence < 0.45:
+        return "repair_contract_low_confidence"
+    return None
+
+
+def _normalize_planner_path(path: Any) -> str:
+    text = str(path or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
 
 
 def create_or_resume_planner(
