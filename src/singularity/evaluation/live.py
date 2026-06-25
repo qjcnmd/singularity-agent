@@ -1364,7 +1364,8 @@ def _failure_repair_count(payload: dict[str, Any]) -> int:
     if not isinstance(failure_repair, dict):
         return 0
     return _safe_int(
-        failure_repair.get("repair_attempt_count")
+        failure_repair.get("repair_execution_count")
+        or failure_repair.get("repair_attempt_count")
         or failure_repair.get("repair_plan_count")
         or failure_repair.get("failure_analysis_count")
     )
@@ -1451,6 +1452,10 @@ def _repair_verification_contract(payload: dict[str, Any]) -> dict[str, Any]:
         "latest_target_files": list(failure_repair.get("latest_target_files") or []),
         "latest_blocked_reason": failure_repair.get("latest_blocked_reason"),
         "needs_user_input": bool(failure_repair.get("needs_user_input")),
+        "repair_plan_count": _safe_int(failure_repair.get("repair_plan_count")),
+        "repair_attempt_count": _safe_int(failure_repair.get("repair_attempt_count")),
+        "repair_execution_count": _safe_int(failure_repair.get("repair_execution_count")),
+        "repair_blocked_count": _safe_int(failure_repair.get("repair_blocked_count")),
     }
 
 

@@ -340,13 +340,45 @@ class Finalizer:
             if isinstance(latest_plan, dict)
             else None
         ) or contract.get("blocked_reason")
+
+        # Classify plans: blocked (needs_user_input / blocked_reason) vs executable
+        plan_blocked_count = 0
+        plan_executable_count = 0
+        for plan in evidence.repair_plans:
+            if not isinstance(plan, dict):
+                continue
+            plan_contract = plan.get("repair_contract")
+            plan_contract = plan_contract if isinstance(plan_contract, dict) else {}
+            is_blocked = (
+                bool(plan.get("needs_user_input"))
+                or bool(plan.get("blocked_reason"))
+                or bool(plan_contract.get("needs_user_input"))
+                or bool(plan_contract.get("blocked_reason"))
+            )
+            if is_blocked:
+                plan_blocked_count += 1
+            else:
+                plan_executable_count += 1
+
+        # Count actual repair executions: plans that led to subsequent verification.
+        # A plan is "executed" when a verification result appears after it in the
+        # evidence timeline, indicating the repair was actually attempted and verified.
+        repair_execution_count = _count_repair_executions(evidence)
+
+        # Extract verification contract: prefer from latest plan's repair_contract,
+        # fall back to scanning all plans for the most recent contract with steps.
         vcontract = contract.get("verification_contract") or {}
         vcontract = vcontract if isinstance(vcontract, dict) else {}
+        if not vcontract.get("steps"):
+            vcontract = _extract_latest_verification_contract(evidence)
         vcontract_steps = vcontract.get("steps") or []
+
         return {
             "failure_analysis_count": len(evidence.failure_analyses),
             "repair_plan_count": len(evidence.repair_plans),
-            "repair_attempt_count": len(evidence.repair_plans),
+            "repair_attempt_count": plan_executable_count,
+            "repair_execution_count": repair_execution_count,
+            "repair_blocked_count": plan_blocked_count,
             "latest_analysis_id": latest_analysis.get("analysis_id") if isinstance(latest_analysis, dict) else None,
             "latest_repair_plan_id": latest_plan.get("plan_id") if isinstance(latest_plan, dict) else None,
             "latest_repair_contract_id": contract.get("contract_id"),
@@ -544,3 +576,72 @@ def _risks_and_next_steps(report: FinalReport) -> list[str]:
     lines = [f"- Risk: {risk}" for risk in report.risks[:10]]
     lines.extend(f"- Next step: {step}" for step in report.next_steps[:10])
     return lines or ["- No unresolved risks or next steps recorded."]
+
+
+def _count_repair_executions(evidence: EvidenceLedger) -> int:
+    """Count repair plans that were actually executed and followed by verification.
+
+    A plan is considered "executed" when it is not blocked AND a verification
+    result appears after it in the evidence timeline, confirming the repair was
+    attempted and verified.
+    """
+    plan_ids: list[str] = []
+    for plan in evidence.repair_plans:
+        if not isinstance(plan, dict):
+            continue
+        plan_contract = plan.get("repair_contract")
+        plan_contract = plan_contract if isinstance(plan_contract, dict) else {}
+        is_blocked = (
+            bool(plan.get("needs_user_input"))
+            or bool(plan.get("blocked_reason"))
+            or bool(plan_contract.get("needs_user_input"))
+            or bool(plan_contract.get("blocked_reason"))
+        )
+        if not is_blocked:
+            plan_id = plan.get("plan_id")
+            if plan_id:
+                plan_ids.append(str(plan_id))
+    if not plan_ids:
+        return 0
+    # A plan is "executed" if any verification result references its analysis_id
+    # or if verification results exist after the plan was created.
+    executed: set[str] = set()
+    for verification in evidence.verification_results:
+        if not isinstance(verification, dict):
+            continue
+        for fa in verification.get("failure_analysis") or []:
+            if isinstance(fa, dict):
+                analysis_id = fa.get("analysis_id")
+                for plan in evidence.repair_plans:
+                    if isinstance(plan, dict) and plan.get("analysis_id") == analysis_id:
+                        plan_id = plan.get("plan_id")
+                        if plan_id and plan_id in plan_ids:
+                            executed.add(plan_id)
+        # If completion_assessment exists, the latest executable plan was executed
+        assessment = verification.get("completion_assessment")
+        if isinstance(assessment, dict) and assessment.get("status"):
+            for plan_id in plan_ids:
+                executed.add(plan_id)
+    # Fallback: if there are executable plans and any verification result at all,
+    # count the latest executable plan as executed.
+    if not executed and plan_ids and evidence.verification_results:
+        executed.add(plan_ids[-1])
+    return len(executed)
+
+
+def _extract_latest_verification_contract(evidence: EvidenceLedger) -> dict[str, Any]:
+    """Extract the most recent VerificationContract from repair plans.
+
+    Scans repair_plans backwards for the latest plan whose repair_contract
+    carries a verification_contract with steps.
+    """
+    for plan in reversed(evidence.repair_plans):
+        if not isinstance(plan, dict):
+            continue
+        contract = plan.get("repair_contract")
+        if not isinstance(contract, dict):
+            continue
+        vcontract = contract.get("verification_contract")
+        if isinstance(vcontract, dict) and vcontract.get("steps"):
+            return vcontract
+    return {}
