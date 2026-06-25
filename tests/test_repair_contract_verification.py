@@ -6,6 +6,7 @@ evidence backfill, and Planner authorization of verification commands.
 """
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from singularity.command import CommandRequest, SemanticStatus
+from singularity.agent_loop import AgentLoopStatus
 from singularity.failure_analysis import (
     BLOCKED_FAILURE_CATEGORIES,
     MIN_REPAIR_CONFIDENCE,
@@ -930,3 +932,361 @@ class TestFinalizerContractSummary:
         summary = finalizer._failure_repair_summary(planner.evidence)
         assert summary["verification_contract_id"] is not None
         assert summary["verification_contract_step_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# AgentLoop-level integration tests
+# ---------------------------------------------------------------------------
+
+
+class _MockProvider:
+    """Minimal chat provider for AgentLoop tests."""
+    def __init__(self, *responses: dict[str, Any]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    def chat(
+        self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        self.calls.append({"messages": messages, "tools": tools})
+        return self.responses.pop(0)
+
+
+class _FakeTrace:
+    """Minimal trace stub for AgentLoop-level tests."""
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+        self.run_id = "test_run"
+        self.path = Path(".")
+
+    def record(self, event: str, payload: dict[str, Any]) -> None:
+        self.events.append({"event": event, **payload})
+
+    def emit(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+def _make_agent_loop_planner(
+    tmp_path: Path,
+    *,
+    phase: str = "repairing_failures",
+    task_status: Any = TaskStatus.REPAIRING_FAILURES,
+    inject_repair_plan: bool = True,
+    inject_evidence: bool = True,
+) -> tuple[Any, VerificationContract]:
+    """Create a Planner already in a repair phase with a repair plan."""
+    planner = Planner(tmp_path, session_id="s1", task_id="t1")
+    planner.start_task("fix the bug")
+    planner.state.status = task_status
+    planner.state.current_phase = phase
+    planner.plan.current_phase = phase
+
+    contract = VerificationContract.from_plan_strings(["pytest tests/"])
+    if inject_repair_plan:
+        rp_dict = RepairPlan(
+            plan_id="rp_1", analysis_id="a1", strategy="repair_then_verify",
+            summary="fix", action_candidates=[], next_actions=["fix"],
+            verification_plan=["pytest tests/"], evidence_refs=["ev_1"],
+            confidence=0.8,
+            repair_contract=RepairContract(
+                contract_id="rc_1", analysis_id="a1",
+                failure_category="unit_test_failure", target_files=["src/app.py"],
+                evidence_refs=["ev_1"], action_candidates=[
+                    RepairActionCandidate(
+                        candidate_id="c1", action_type="verify",
+                        target_file="src/app.py", rationale="rerun tests",
+                        tool_hints=["run_verification", "get_verification_result"],
+                    )
+                ],
+                verification_plan=["pytest tests/"], confidence=0.8,
+                allowed_tool_names=["run_verification", "get_verification_result", "read_file"],
+                verification_contract=contract,
+            ),
+            verification_contract=contract,
+        ).to_dict()
+        planner.evidence.repair_plans.append(rp_dict)
+
+    if inject_evidence:
+        planner.evidence.inspected_files.append("src/app.py")
+        planner.evidence.applied_changes.append(
+            {"changed_files": ["src/app.py"], "transaction_id": "tx_1"}
+        )
+        planner.state.linked_transactions.append("tx_1")
+
+    return planner, contract
+
+
+def _make_verification_spec(name: str) -> ToolSpec:
+    """Create a minimal ToolSpec for authorization testing."""
+    return ToolSpec(
+        name=name,
+        version="0.0.1",
+        description=f"Test {name}",
+        input_model=_EmptyInput,
+        handler=lambda args: {},
+        permission_level="shell",
+        capabilities=(),
+        operation="verification",
+        resource_resolver=lambda _a, _r: [],
+        side_effects="execute_command",
+        sensitivity="workspace",
+        risk_tags=("verification_runner",),
+        uses_command_executor=True,
+    )
+
+
+class TestAgentLoopContractIntegration:
+    """Full chain: failure analysis → contract → verification → step_evidence → satisfaction → FinalReport."""
+
+    def test_full_chain_verification_contract_satisfaction(self, tmp_path: Path) -> None:
+        """Planner-level: VerificationRunner with contract produces step_evidence → satisfaction → FinalReport.
+
+        Uses Planner + VerificationRunner directly (no AgentLoop) to avoid mock
+        provider complexity.  The authorization, step_evidence, satisfaction, and
+        FinalReport paths are all exercised through their real implementations.
+        """
+        contract = VerificationContract.from_plan_strings(["pytest tests/"])
+        planner = _make_agent_loop_planner(tmp_path)[0]
+
+        smoke_req = CommandRequest(argv=["python", "-m", "pytest", "tests/"])
+        syntax_req = CommandRequest(argv=["python", "-m", "py_compile", "src/app.py"])
+        fake = FakeCommandExecutor([
+            command_result(smoke_req, command_id="cmd_pass", exit_code=0,
+                           semantic_status=SemanticStatus.SUCCEEDED, output="1 passed"),
+            command_result(syntax_req, command_id="cmd_syntax", exit_code=0,
+                           semantic_status=SemanticStatus.SUCCEEDED, output=""),
+        ])
+        trace = _FakeTrace()
+        runner = VerificationRunner(tmp_path, command_executor=fake, planner=planner, trace=trace)
+
+        # Exercise the full chain: plan → authorize → run → step_evidence → satisfaction → finalize
+        vplan = runner.plan_verification(
+            changed_files=["src/app.py"],
+            task_intent="fix test",
+            smoke_commands=[["pytest", "tests/"]],
+            verification_contract=contract,
+        )
+        # Simulate authorization: contract command is allowed
+        spec = _make_verification_spec("run_verification")
+        decision = planner.authorize_tool_call(
+            tool_name="run_verification",
+            tool_call_id="tc_chain",
+            spec=spec,
+            arguments={"smoke_commands": [["pytest", "tests/"]]},
+        )
+        assert decision.allowed, f"Expected allowed, got: {decision.error_code}"
+        runner.run_plan(vplan.id)
+
+        # Step evidence in planner evidence
+        assert planner.evidence.verification_results
+        latest = planner.evidence.verification_results[-1]
+        step_evidence = latest.get("step_evidence") or latest.get("verification", {}).get("step_evidence") or []
+        assert len(step_evidence) >= 1
+        our_step = next((se for se in step_evidence if se["step_id"] == contract.steps[0].step_id), None)
+        assert our_step is not None
+        assert our_step["status"] == "passed"
+
+        # Verify satisfaction
+        satisfaction = planner.assess_verification_contract_satisfaction()
+        assert satisfaction.satisfied, f"Expected satisfied, got: {satisfaction.to_dict()}"
+        assert contract.steps[0].step_id in satisfaction.completed_steps
+
+        # FinalReport includes contract_satisfaction
+        report = planner.finalize()
+        cs = report.contract_satisfaction
+        assert cs.get("satisfied") is True, f"contract_satisfaction not satisfied: {cs}"
+
+    def test_external_command_rejected(self, tmp_path: Path) -> None:
+        """Planner-level: model tries a command NOT in the VerificationContract → rejected by authorize_tool_call."""
+        planner, contract = _make_agent_loop_planner(tmp_path)
+        spec = _make_verification_spec("run_verification")
+
+        decision = planner.authorize_tool_call(
+            tool_name="run_verification",
+            tool_call_id="tc_bad",
+            spec=spec,
+            arguments={"smoke_commands": [["python", "-m", "black", "--check", "."]]},
+        )
+        assert not decision.allowed
+        assert decision.error_code == "verification_contract_command_not_allowed"
+
+        # Verify that the Planner's active contract correctly rejects the command
+        vcontract = planner.get_active_verification_contract()
+        assert not vcontract.is_command_allowed(["python", "-m", "black", "--check", "."])
+        assert vcontract.is_command_allowed(["pytest", "tests/"])
+
+    def test_missing_step_evidence_blocks_completion(self, tmp_path: Path) -> None:
+        """AgentLoop-level: no step_evidence → completion blocked by contract_satisfaction check."""
+        from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
+        from singularity.tools.verification import register_verification_tools
+        from tests.agent_loop_helpers import make_agent_session
+
+        # Same setup but with a contract that doesn't match the smoke command
+        planner, contract = _make_agent_loop_planner(tmp_path, inject_repair_plan=False)
+
+        # Inject a repair plan with a contract that doesn't match any smoke command
+        rp_no_contract = RepairPlan(
+            plan_id="rp_no_match", analysis_id="a1", strategy="repair_then_verify",
+            summary="fix", action_candidates=[], next_actions=["fix"],
+            verification_plan=["unknown_command_xyz"], evidence_refs=["ev_1"],
+            confidence=0.8,
+            repair_contract=RepairContract(
+                contract_id="rc_no_match", analysis_id="a1",
+                failure_category="unit_test_failure", target_files=["src/app.py"],
+                evidence_refs=["ev_1"], action_candidates=[
+                    RepairActionCandidate(
+                        candidate_id="c1", action_type="verify",
+                        target_file="src/app.py", rationale="rerun tests",
+                        tool_hints=["run_verification"],
+                    )
+                ],
+                verification_plan=["unknown_command_xyz"], confidence=0.8,
+                allowed_tool_names=["run_verification"],
+                verification_contract=VerificationContract.from_plan_strings(["unknown_command_xyz"]),
+            ),
+            verification_contract=VerificationContract.from_plan_strings(["unknown_command_xyz"]),
+        ).to_dict()
+        planner.evidence.repair_plans.append(rp_no_contract)
+
+        smoke_req = CommandRequest(argv=["python", "-m", "pytest", "tests/"])
+        syntax_req = CommandRequest(argv=["python", "-m", "py_compile", "src/app.py"])
+        fake = FakeCommandExecutor([
+            command_result(smoke_req, command_id="cmd_pass", exit_code=0,
+                           semantic_status=SemanticStatus.SUCCEEDED, output="1 passed"),
+            command_result(syntax_req, command_id="cmd_syntax", exit_code=0,
+                           semantic_status=SemanticStatus.SUCCEEDED, output=""),
+        ])
+        trace = _FakeTrace()
+        vrunner = VerificationRunner(tmp_path, command_executor=fake, planner=planner, trace=trace)
+
+        tools = ToolRegistry(tmp_path)
+        register_verification_tools(tools, vrunner)
+
+        provider = _MockProvider(
+            {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_verify",
+                            "type": "function",
+                            "function": {
+                                "name": "run_verification",
+                                "arguments": json.dumps({"smoke_commands": [["pytest", "tests/"]]}),
+                            },
+                        }],
+                    }
+                }]
+            },
+            {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "All done.",
+                    }
+                }]
+            },
+        )
+
+        agent = make_agent_session(
+            tmp_path,
+            provider=provider,
+            tools=tools,
+            planner=planner,
+            trace=trace,
+            max_turns=3,
+        )
+
+        answer = agent.run("fix the bug")
+
+        # Contract satisfaction should be unsatisfied (no step_evidence)
+        satisfaction = planner.assess_verification_contract_satisfaction()
+        assert not satisfaction.satisfied, f"Expected unsatisfied, got: {satisfaction.to_dict()}"
+
+        # Should NOT have completed
+        assert answer.status != AgentLoopStatus.COMPLETED
+
+    def test_completion_rejected_escalates_only_after_repeated_stall(self, tmp_path: Path) -> None:
+        """AgentLoop-level: completion_rejected escalates to FailureAnalyzer only on 2nd+ stall."""
+        from singularity.tools import ToolRegistry
+        from tests.agent_loop_helpers import make_agent_session
+
+        planner = Planner(tmp_path, session_id="s1", task_id="t1")
+        trace = _FakeTrace()
+
+        # Start with missing evidence (no changes verified)
+        planner.start_task("fix the bug")
+        planner.evidence.inspected_files.append("src/app.py")
+
+        # Inject a repair plan with verification contract
+        contract = VerificationContract.from_plan_strings(["pytest tests/"])
+        rp_dict = RepairPlan(
+            plan_id="rp_stall", analysis_id="a1", strategy="repair_then_verify",
+            summary="fix", action_candidates=[], next_actions=["fix"],
+            verification_plan=["pytest tests/"], evidence_refs=["ev_1"],
+            confidence=0.8,
+            repair_contract=RepairContract(
+                contract_id="rc_stall", analysis_id="a1",
+                failure_category="unit_test_failure", target_files=["src/app.py"],
+                evidence_refs=["ev_1"], action_candidates=[],
+                verification_plan=["pytest tests/"], confidence=0.8,
+                allowed_tool_names=["run_verification", "get_verification_result", "read_file"],
+                verification_contract=contract,
+            ),
+            verification_contract=contract,
+        ).to_dict()
+        planner.evidence.repair_plans.append(rp_dict)
+        planner.state.status = TaskStatus.REPAIRING_FAILURES
+        planner.state.current_phase = "repairing_failures"
+        planner.plan.current_phase = "repairing_failures"
+
+        tools = ToolRegistry(tmp_path)
+
+        analysis_json = json.dumps({
+            "root_cause": "Completion stalled without evidence.",
+            "failure_category": "completion_stalled",
+            "affected_files": ["src/app.py"],
+            "evidence_refs": ["ev_1"],
+            "repair_strategy": "verify first then finalize",
+            "next_actions": ["Run verification and provide step evidence."],
+            "verification_plan": ["pytest tests/"],
+            "confidence": 0.8,
+            "needs_user_input": False,
+        })
+
+        # Turn 1: model tries to finalize → completion_rejected (no FailureAnalyzer)
+        # Turn 2: model tries again → completion_rejected escalation → FailureAnalyzer invoked
+        # The FailureAnalyzer issues its own model_runner.run_turn() call
+        # → provider's 3rd response goes to that call
+        # Turn 3: model tries after replan to REPAIRING_FAILURES
+        provider = _MockProvider(
+            {"choices": [{"message": {"role": "assistant", "content": "I'm done."}}]},
+            {"choices": [{"message": {"role": "assistant", "content": "I'm still done."}}]},
+            {"choices": [{"message": {"role": "assistant", "content": analysis_json}}]},
+            {"choices": [{"message": {"role": "assistant", "content": "Trying to fix."}}]},
+        )
+
+        agent = make_agent_session(
+            tmp_path,
+            provider=provider,
+            tools=tools,
+            planner=planner,
+            trace=trace,
+            max_turns=4,
+        )
+
+        answer = agent.run("fix the bug")
+
+        # Turn 1: completion_rejected → no failure analysis (first rejection)
+        # Turn 2: completion_rejected again with same snapshot → escalation → FailureAnalyzer invoked
+        # The failure analyzer result should be in evidence
+        assert len(planner.evidence.failure_analyses) >= 1, (
+            f"Expected at least 1 failure analysis from escalation, "
+            f"got {len(planner.evidence.failure_analyses)}"
+        )
+        # The repair plan from the escalation should be in evidence
+        assert len(planner.evidence.repair_plans) >= 2, (
+            f"Expected at least 2 repair plans (1 injected + 1 from escalation), "
+            f"got {len(planner.evidence.repair_plans)}"
+        )

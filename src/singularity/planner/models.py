@@ -527,6 +527,7 @@ class FinalReport:
     lifecycle_summary: dict[str, Any] = field(default_factory=dict)
     review_summary: dict[str, Any] = field(default_factory=dict)
     failure_repair_summary: dict[str, Any] = field(default_factory=dict)
+    contract_satisfaction: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -551,6 +552,7 @@ class FinalReport:
             "lifecycle_summary": self.lifecycle_summary,
             "review_summary": self.review_summary,
             "failure_repair_summary": self.failure_repair_summary,
+            "contract_satisfaction": self.contract_satisfaction,
             "artifacts": self.artifacts,
             "next_steps": self.next_steps,
         }
@@ -579,6 +581,7 @@ class FinalReport:
             lifecycle_summary=dict(payload.get("lifecycle_summary") or {}),
             review_summary=dict(payload.get("review_summary") or {}),
             failure_repair_summary=dict(payload.get("failure_repair_summary") or {}),
+            contract_satisfaction=dict(payload.get("contract_satisfaction") or {}),
             artifacts=list(payload.get("artifacts") or []),
             next_steps=list(payload.get("next_steps") or []),
         )

@@ -1164,10 +1164,12 @@ class Planner:
             else None
         )
         final_review = self._run_final_review(trace_summary=trace_summary)
+        contract_satisfaction = self.assess_verification_contract_satisfaction().to_dict()
         report = self.finalizer.build(
             state=self._state(),
             evidence=self.evidence,
             trace_summary=trace_summary,
+            contract_satisfaction=contract_satisfaction,
         )
         output_dir = self.store.session_dir(self.session_id)
         artifact_ref = (output_dir / "final_report.md").relative_to(self.workspace_root).as_posix()
@@ -1402,7 +1404,13 @@ class Planner:
         ).to_dict()
 
     def _active_repair_contract(self) -> dict[str, Any]:
-        if self.state is None or self.state.current_phase != "repairing_failures":
+        # The contract is most relevant during repair, but satisfaction
+        # assessment and finalization also need access after phase advancement.
+        if self.state is None or self.state.current_phase not in {
+            "repairing_failures",
+            "finalizing",
+            "running_verification",
+        }:
             return {}
         if not self.evidence.repair_plans:
             return {}
@@ -1439,6 +1447,15 @@ class Planner:
             for item in contract.get("target_files") or []
             if item
         }
+
+    def get_active_verification_contract(self) -> VerificationContract:
+        """Public entrypoint: return the active VerificationContract for the current repair phase.
+
+        External callers (e.g. VerificationRunner) should use this instead of
+        reaching into private methods.  Delegates to
+        :meth:`_active_repair_verification_contract`.
+        """
+        return self._active_repair_verification_contract()
 
     def _active_repair_verification_contract(self) -> VerificationContract:
         """Extract the structured verification contract from the active repair."""

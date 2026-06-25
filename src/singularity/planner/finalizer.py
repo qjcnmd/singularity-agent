@@ -13,6 +13,7 @@ class Finalizer:
         state: TaskState,
         evidence: EvidenceLedger,
         trace_summary: dict[str, Any] | None = None,
+        contract_satisfaction: dict[str, Any] | None = None,
     ) -> FinalReport:
         files_changed: set[str] = set()
         artifacts: set[str] = set()
@@ -100,6 +101,7 @@ class Finalizer:
             },
             review_summary=review_summary,
             failure_repair_summary=self._failure_repair_summary(evidence),
+            contract_satisfaction=contract_satisfaction or {},
         )
 
     @staticmethod

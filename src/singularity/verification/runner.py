@@ -145,14 +145,30 @@ class VerificationRunner:
             return []
 
     def _active_verification_contract(self) -> Any | None:
-        """Retrieve the active VerificationContract from the planner, if any."""
-        if self.planner is None or not hasattr(self.planner, "_active_repair_verification_contract"):
+        """Retrieve the active VerificationContract from the planner, if any.
+
+        Prefers the public ``get_active_verification_contract()`` method;
+        falls back to ``_active_repair_verification_contract()`` for backward
+        compatibility with older Planner instances.
+        """
+        if self.planner is None:
             return None
-        try:
-            contract = self.planner._active_repair_verification_contract()
-            return contract if contract.steps else None
-        except Exception:
-            return None
+        # Prefer public API
+        getter = getattr(self.planner, "get_active_verification_contract", None)
+        if callable(getter):
+            try:
+                contract = getter()
+                return contract if contract.steps else None
+            except Exception:
+                pass
+        # Fallback to private method for backward compat
+        if hasattr(self.planner, "_active_repair_verification_contract"):
+            try:
+                contract = self.planner._active_repair_verification_contract()
+                return contract if contract.steps else None
+            except Exception:
+                return None
+        return None
 
     def _task_contract_payload(self) -> dict[str, Any] | None:
         state = getattr(self.planner, "state", None)
