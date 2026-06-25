@@ -156,6 +156,7 @@ Run a manifest-driven live-provider eval:
 
 ```bash
 singularity-agent eval live run docs/evaluation/live-agent-minimal-tasks.json --json
+singularity-agent eval live run docs/evaluation/live-agent-minimal-tasks.json --baseline-result work/evaluations-live/previous/result.json
 ```
 
 Run a private BenchmarkTask set through the private adapter:
@@ -164,9 +165,13 @@ Run a private BenchmarkTask set through the private adapter:
 singularity-agent eval live private private-benchmark.json --json
 ```
 
-The live manifest schema is intentionally small: each task declares `task_id`, a `repo` or `fixture` workspace, optional `start_commit` or `prepare_commands`, `user_task`, `allowed_paths`, `verification_command`, and `success`. Use `verification_prepare_commands` only for evaluator-owned hidden setup that must run after the agent finishes and before independent verification, such as applying a benchmark test patch without exposing it to the model; when hidden setup is present, the exact `verification_command` is also kept out of the model task. Each task runs in an isolated directory under `work/evaluations-live/<run_id>/<task_id>/workspace`; the runner boots the real Singularity kernel, runs the independent verification command, and writes `result.json` with completion, test, usage, cache-hit, tool-call, changed-file, duration, and error fields. Default pytest does not run this path; use the command above only when live provider environment variables are intentionally configured.
+The live manifest schema is the production benchmark layer for coding-agent behavior. Each task declares `task_id`, `description`, a `repo` or `fixture` workspace, optional `start_commit` or `prepare_commands`, `user_task`, `allowed_paths`, `allowed_tools`, `tool_policy` or `strategy`, `expected_file_changes`, `verification_command`, `completion_standard`, `risk_tags`, and `success`. Use `verification_prepare_commands` only for evaluator-owned hidden setup that must run after the agent finishes and before independent verification, such as applying a benchmark test patch without exposing it to the model; when hidden setup is present, the exact `verification_command` is also kept out of the model task.
 
-Live evaluation also writes a clean verification workspace per task. The runner records the agent workspace patch as `patch.diff`, reapplies the changed files onto the clean verification workspace, then records public and hidden check results under `checks.public` and `checks.hidden`. A task is successful only when the agent completes, the patch is applicable, changed files stay inside `allowed_paths`, and the independent verification criteria pass in the verification workspace.
+Each task runs in an isolated directory under `work/evaluations-live/<run_id>/<task_id>/workspace`. The runner boots the real Singularity kernel through `KernelBootstrap(...).boot(goal)` and then calls `AgentKernel.run_task(goal)`, which drives the real `AgentLoop`. The benchmark layer does not call Planner, ToolExecutor, or VerificationRunner directly to fake outcomes.
+
+Live evaluation also writes a clean verification workspace per task. The runner records the agent workspace patch as `patch.diff`, reapplies changed files onto the clean verification workspace, then records public and hidden check results under `checks.public` and `checks.hidden`. A task is successful only when the agent completion semantics, allowed path scope, expected file changes, patch applicability where a patch is expected, and independent verification criteria all pass. Rejection and policy-block tasks can express success with `agent_status` or `policy_blocks_min` criteria instead of pretending they are normal edit tasks.
+
+The live runner writes stable `result.json`, `report.json`, and `report.md` files. Per-task results include `status`, `turn_count`, `tool_calls`, `files_changed`, `verification_result`, `contract_satisfaction`, `final_report_status`, `failure_repair_count`, `policy_blocks`, `token_usage`, `cache_usage`, `trace_artifact_refs`, and `agent_loop_ref`. Suite summaries include success rate, verification pass rate, average turns, average tool calls, failure reasons, repair count, policy blocks, and miscompletion count. With `--baseline-result`, or when a previous run result is available under the same output root, the runner also writes `regression.json` and `regression.md`.
 
 Run A/B or regression checks:
 

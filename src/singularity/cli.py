@@ -1055,6 +1055,10 @@ def eval_live_run(
         str | None,
         typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this live eval."),
     ] = None,
+    baseline_result: Annotated[
+        Path | None,
+        typer.Option("--baseline-result", help="Explicit previous live eval result.json for regression comparison."),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
 ) -> None:
     """Run a manifest-driven live-provider agent evaluation."""
@@ -1066,6 +1070,7 @@ def eval_live_run(
         max_turns=max_turns,
         model=model,
         base_url=base_url,
+        baseline_result_path=baseline_result,
         console=console,
     ).run(manifest)
     if json_output:
@@ -1099,6 +1104,10 @@ def eval_live_private(
         str | None,
         typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this live eval."),
     ] = None,
+    baseline_result: Annotated[
+        Path | None,
+        typer.Option("--baseline-result", help="Explicit previous live eval result.json for regression comparison."),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
 ) -> None:
     """Run private BenchmarkTask definitions through the live agent eval runner."""
@@ -1110,6 +1119,7 @@ def eval_live_private(
         max_turns=max_turns,
         model=model,
         base_url=base_url,
+        baseline_result_path=baseline_result,
         console=console,
     ).run(manifest)
     if json_output:

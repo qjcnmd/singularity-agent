@@ -6,10 +6,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 
 SCHEMA_VERSION = "evaluation.benchmark_task/v1"
+EnumT = TypeVar("EnumT", bound=Enum)
 
 
 class TaskDifficulty(str, Enum):
@@ -91,7 +92,7 @@ class TaskInput:
 
 @dataclass(frozen=True)
 class WorkspaceSnapshot:
-    kind: WorkspaceSnapshotKind | str
+    kind: WorkspaceSnapshotKind
     git_ref: str | None = None
     archive_path: str | Path | None = None
     inline_files: dict[str, str] = field(default_factory=dict)
@@ -128,7 +129,7 @@ class WorkspaceSnapshot:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "WorkspaceSnapshot":
         return cls(
-            kind=payload.get("kind", ""),
+            kind=_enum(WorkspaceSnapshotKind, str(payload.get("kind", ""))),
             git_ref=payload.get("git_ref"),
             archive_path=payload.get("archive_path"),
             inline_files={str(key): str(value) for key, value in _dict(payload.get("inline_files")).items()},
@@ -139,7 +140,7 @@ class WorkspaceSnapshot:
 
 @dataclass(frozen=True)
 class ExpectedOutcome:
-    kind: ExpectedOutcomeKind | str
+    kind: ExpectedOutcomeKind
     weight: float = 1.0
     command: str | None = None
     assertion: str | None = None
@@ -171,7 +172,7 @@ class ExpectedOutcome:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ExpectedOutcome":
         return cls(
-            kind=payload.get("kind", ""),
+            kind=_enum(ExpectedOutcomeKind, str(payload.get("kind", ""))),
             weight=float(payload.get("weight", 1.0)),
             command=payload.get("command"),
             assertion=payload.get("assertion"),
@@ -279,16 +280,21 @@ class BenchmarkTask:
     task_id: str
     version: str
     title: str
-    task_type: BenchmarkTaskKind | str = BenchmarkTaskKind.SINGULARITY_INTERNAL
-    visibility: BenchmarkVisibility | str = BenchmarkVisibility.PRIVATE
-    adapter: BenchmarkAdapterKind | str = BenchmarkAdapterKind.SINGULARITY_PRIVATE
-    input: TaskInput | dict[str, Any] | str | None = None
-    workspace_snapshot: WorkspaceSnapshot | dict[str, Any] | None = None
-    expected_outcomes: list[ExpectedOutcome | dict[str, Any]] = field(default_factory=list)
-    evaluation_hooks: list[EvaluationHook | dict[str, Any]] = field(default_factory=list)
+    task_type: BenchmarkTaskKind = BenchmarkTaskKind.SINGULARITY_INTERNAL
+    visibility: BenchmarkVisibility = BenchmarkVisibility.PRIVATE
+    adapter: BenchmarkAdapterKind = BenchmarkAdapterKind.SINGULARITY_PRIVATE
+    input: TaskInput = field(init=False)
+    workspace_snapshot: WorkspaceSnapshot = field(init=False)
+    expected_outcomes: list[ExpectedOutcome] = field(default_factory=list, init=False)
+    evaluation_hooks: list[EvaluationHook] = field(default_factory=list, init=False)
+    allowed_tools: list[str] = field(default_factory=list)
+    strategy: dict[str, Any] = field(default_factory=dict)
+    expected_file_changes: list[str] = field(default_factory=list)
+    completion_standard: str = ""
+    risk_tags: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     profiles: dict[str, Any] = field(default_factory=dict)
-    golden_contract: GoldenTaskContract | dict[str, Any] | None = None
+    golden_contract: GoldenTaskContract | None = field(default=None, init=False)
     description: str = ""
     owner: str | None = None
     created_at: str | None = None
@@ -309,6 +315,11 @@ class BenchmarkTask:
         workspace_snapshot: WorkspaceSnapshot | dict[str, Any] | None = None,
         expected_outcomes: list[ExpectedOutcome | dict[str, Any]] | None = None,
         evaluation_hooks: list[EvaluationHook | dict[str, Any]] | None = None,
+        allowed_tools: list[str] | None = None,
+        strategy: dict[str, Any] | None = None,
+        expected_file_changes: list[str] | None = None,
+        completion_standard: str = "",
+        risk_tags: list[str] | None = None,
         tags: list[str] | None = None,
         profiles: dict[str, Any] | None = None,
         golden_contract: GoldenTaskContract | dict[str, Any] | None = None,
@@ -336,6 +347,23 @@ class BenchmarkTask:
             self,
             "evaluation_hooks",
             [_hook(item) for item in (evaluation_hooks or [])],
+        )
+        object.__setattr__(self, "allowed_tools", sorted(dict.fromkeys(allowed_tools or [])))
+        object.__setattr__(self, "strategy", _dict(strategy))
+        object.__setattr__(
+            self,
+            "expected_file_changes",
+            sorted(dict.fromkeys(str(item) for item in (expected_file_changes or []))),
+        )
+        object.__setattr__(
+            self,
+            "completion_standard",
+            str(completion_standard or ""),
+        )
+        object.__setattr__(
+            self,
+            "risk_tags",
+            sorted(dict.fromkeys(str(item) for item in (risk_tags or []))),
         )
         object.__setattr__(self, "tags", list(tags or []))
         object.__setattr__(self, "profiles", _dict(profiles))
@@ -392,6 +420,16 @@ class BenchmarkTask:
             payload["description"] = self.description
         if self.evaluation_hooks:
             payload["evaluation_hooks"] = [item.to_dict() for item in self.evaluation_hooks]
+        if self.allowed_tools:
+            payload["allowed_tools"] = list(self.allowed_tools)
+        if self.strategy:
+            payload["strategy"] = _copy_jsonish(self.strategy)
+        if self.expected_file_changes:
+            payload["expected_file_changes"] = list(self.expected_file_changes)
+        if self.completion_standard:
+            payload["completion_standard"] = self.completion_standard
+        if self.risk_tags:
+            payload["risk_tags"] = list(self.risk_tags)
         if self.profiles:
             payload["profiles"] = _copy_jsonish(self.profiles)
         if self.golden_contract is not None:
@@ -417,6 +455,13 @@ class BenchmarkTask:
             workspace_snapshot=payload.get("workspace_snapshot"),
             expected_outcomes=list(payload.get("expected_outcomes") or []),
             evaluation_hooks=list(payload.get("evaluation_hooks") or []),
+            allowed_tools=[str(item) for item in payload.get("allowed_tools") or []],
+            strategy=_dict(payload.get("strategy")),
+            expected_file_changes=[
+                str(item) for item in payload.get("expected_file_changes") or []
+            ],
+            completion_standard=str(payload.get("completion_standard", "")),
+            risk_tags=[str(item) for item in payload.get("risk_tags") or []],
             tags=list(payload.get("tags") or []),
             profiles=_dict(payload.get("profiles")),
             golden_contract=payload.get("golden_contract"),
@@ -622,9 +667,9 @@ def _golden_contract(
     return GoldenTaskContract.from_dict(value)
 
 
-def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:
+def _enum(enum_type: type[EnumT], value: EnumT | str) -> EnumT:
     if isinstance(value, enum_type):
-        return value
+        return cast(EnumT, value)
     return enum_type(str(value))
 
 

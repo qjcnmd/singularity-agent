@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from singularity.evaluation.live import (
     LIVE_RESULT_SCHEMA_VERSION,
@@ -16,6 +17,7 @@ from singularity.evaluation.live import (
 )
 from singularity.kernel.finalization import FinalReport
 from singularity.kernel.models import RunStatus
+from tests.agent_loop_helpers import make_agent_session
 
 
 def test_load_live_eval_manifest_example() -> None:
@@ -24,11 +26,19 @@ def test_load_live_eval_manifest_example() -> None:
     assert manifest.schema_version == LIVE_TASK_SET_SCHEMA_VERSION
     assert [task.task_id for task in manifest.tasks] == [
         "live.create_quicksort",
+        "live.modify_existing_code",
         "live.fix_math_test",
-        "live.repair_slugger",
+        "live.reject_out_of_scope_change",
+        "live.verification_contract",
+        "live.completion_rejected_repair",
+        "live.policy_blocked",
     ]
     assert manifest.tasks[0].workspace.kind == "fixture"
     assert manifest.tasks[0].allowed_paths == ["quicksort.py"]
+    assert manifest.tasks[0].expected_file_changes == ["quicksort.py"]
+    assert manifest.tasks[0].completion_standard
+    assert "smoke-test" in manifest.tasks[0].risk_tags
+    assert manifest.tasks[-1].tool_policy == "read_only"
 
 
 def test_private_adapter_converts_benchmark_tasks_to_live_manifest(tmp_path: Path) -> None:
@@ -55,6 +65,11 @@ def test_private_adapter_converts_benchmark_tasks_to_live_manifest(tmp_path: Pat
                             "kind": "inline_files",
                             "inline_files": {"math_utils.py": "def add(a, b):\n    return a - b\n"},
                         },
+                        "allowed_tools": ["read_file", "write_file", "run_verification"],
+                        "strategy": {"tool_policy": "read_write", "approval_mode": "auto_safe"},
+                        "expected_file_changes": ["math_utils.py"],
+                        "completion_standard": "Focused pytest passes.",
+                        "risk_tags": ["test-repair"],
                         "expected_outcomes": [
                             {"kind": "test", "weight": 1.0, "command": f"{json.dumps(sys.executable)} -m pytest tests/test_math.py"}
                         ],
@@ -91,6 +106,10 @@ def test_private_adapter_converts_benchmark_tasks_to_live_manifest(tmp_path: Pat
     assert manifest.tasks[0].task_id == "private.fix_bug"
     assert manifest.tasks[0].workspace.kind == "fixture"
     assert manifest.tasks[0].allowed_paths == ["math_utils.py"]
+    assert manifest.tasks[0].allowed_tools == ["read_file", "run_verification", "write_file"]
+    assert manifest.tasks[0].expected_file_changes == ["math_utils.py"]
+    assert manifest.tasks[0].completion_standard == "Focused pytest passes."
+    assert manifest.tasks[0].risk_tags == ["test-repair"]
     assert manifest.tasks[0].verification_command == f"{json.dumps(sys.executable)} -m pytest tests/test_math.py"
     assert manifest.tasks[1].task_id == "private.repo_issue"
     assert manifest.tasks[1].workspace.kind == "repo"
@@ -114,6 +133,9 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         error_summary="",
         workspace=str(tmp_path),
         trace=str(tmp_path / "trace"),
+        status="success",
+        turn_count=2,
+        final_report_status="completed",
     )
     second = LiveEvalTaskResult(
         task_id="two",
@@ -130,6 +152,9 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         error_summary="agent status: failed",
         workspace=str(tmp_path),
         trace=str(tmp_path / "trace2"),
+        status="verification_failed",
+        turn_count=3,
+        final_report_status="completed",
     )
     blocked = LiveEvalTaskResult(
         task_id="blocked",
@@ -146,6 +171,8 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         error_summary="infrastructure blocked",
         workspace=str(tmp_path),
         trace=str(tmp_path / "trace3"),
+        status="infrastructure_blocked",
+        turn_count=0,
     )
 
     summary = summarize_live_results([first, second, blocked])
@@ -164,6 +191,14 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         "request_cache_hit_rate": 0.5,
         "run_cache_hit_rate": 0.5,
         "tool_calls": 5,
+        "success_rate": 0.5,
+        "verification_pass_rate": 1.0,
+        "average_turns": 2.5,
+        "average_tool_calls": 2.5,
+        "failure_repair_count": 0,
+        "policy_blocks": 0,
+        "miscompletion_count": 1,
+        "failure_reasons": {"verification_failed": 1},
     }
 
 
@@ -210,6 +245,7 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
             trace_summary={
                 "tool_calls": 2,
                 "model_usage_summary": {
+                    "requests": 2,
                     "input_tokens": 10,
                     "cached_input_tokens": 4,
                     "request_cache_hit_rates": {"req_1": 0.4},
@@ -254,12 +290,198 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     assert task["cached_tokens"] == 4
     assert task["request_cache_hit_rate"] == 0.4
     assert task["run_cache_hit_rate"] == 0.4
+    assert task["status"] == "success"
+    assert task["turn_count"] == 2
     assert task["tool_calls"] == 2
     assert task["files_changed"] == ["done.txt"]
     assert task["patch"]["applicable"] is True
     assert "done.txt" in task["patch"]["diff"]
     assert task["checks"]["public"]["passed"] is True
+    assert task["verification_result"]["status"] == "passed"
+    assert task["contract_satisfaction"]["status"] == "satisfied"
+    assert task["final_report_status"] == "finalized"
+    assert task["token_usage"]["input_tokens"] == 10
+    assert task["cache_usage"]["run_cache_hit_rate"] == 0.4
+    assert task["agent_loop_ref"].endswith("AgentLoop.run")
     assert Path(result["result_path"]).exists()
+    assert Path(result["report_path"]).exists()
+    assert Path(result["markdown_path"]).exists()
+    assert "Live Agent Evaluation" in Path(result["markdown_path"]).read_text(encoding="utf-8")
+
+
+def test_live_eval_runner_compares_against_previous_run(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest = LiveEvalManifest.from_dict(
+        {
+            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.regression",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Write done.txt with ok.",
+                    "allowed_paths": ["done.txt"],
+                    "expected_file_changes": ["done.txt"],
+                    "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').read_text(encoding='utf-8') == 'ok'\"",
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1, "input_tokens": 10}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path, should_write: bool) -> None:
+            self.project_root = project_root
+            self.should_write = should_write
+
+        def run_task(self, _goal: str) -> FakeResult:
+            if self.should_write:
+                (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        should_write = True
+
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root, self.should_write)
+
+    output_root = tmp_path / "out"
+    first = LiveAgentEvalRunner(
+        output_root=output_root,
+        run_id="baseline",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+    FakeBootstrap.should_write = False
+    second = LiveAgentEvalRunner(
+        output_root=output_root,
+        run_id="candidate",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    assert first["summary"]["success_count"] == 1
+    assert second["summary"]["success_count"] == 0
+    assert second["regression"]["summary"]["regression_count"] == 1
+    assert second["regression"]["task_diffs"][0]["task_id"] == "fake.regression"
+    assert Path(second["regression_path"]).exists()
+    assert Path(second["regression_markdown_path"]).exists()
+
+
+def test_live_eval_runner_can_drive_real_agent_loop(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest = LiveEvalManifest.from_dict(
+        {
+            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.real_agent_loop",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Say done without modifying files.",
+                    "allowed_paths": ["."],
+                    "verification_command": f"{py} -c \"print('ok')\"",
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+    calls: list[str] = []
+
+    class MockProvider:
+        def chat(self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+            _ = messages, tools
+            calls.append("chat")
+            return {"choices": [{"message": {"role": "assistant", "content": "done"}}]}
+
+    class FakeKernel:
+        graph = None
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, goal: str):
+            agent = make_agent_session(
+                self.project_root,
+                provider=MockProvider(),
+                max_turns=1,
+            )
+            agent_result = agent.run(goal)
+
+            class FakeGraph:
+                trace = agent.trace
+
+            self.graph = FakeGraph()
+
+            class Result:
+                status = RunStatus.COMPLETED
+                final_report = FinalReport(
+                    run_id="run_1",
+                    session_id="session_1",
+                    task_id="task_1",
+                    kernel_status="finalized",
+                    shutdown_reason="normal",
+                    diagnostics_count=0,
+                        cleanup_status="completed",
+                        recovered_previous_run=False,
+                        uncertain_transactions=[],
+                        workspace_lock_status="released",
+                        trace_summary={"tool_calls": 0, "model_usage_summary": {"requests": 1, "input_tokens": 1}},
+                    )
+                final_answer = agent_result.final_answer
+
+            return Result()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = LiveAgentEvalRunner(
+        output_root=tmp_path / "out",
+        run_id="real_loop",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    assert calls == ["chat"]
+    assert result["tasks"][0]["success"] is True
+    assert result["tasks"][0]["agent_loop_ref"] == "KernelBootstrap.boot -> AgentKernel.run_task -> AgentLoop.run"
 
 
 def test_live_eval_prepare_failure_returns_structured_result(tmp_path: Path) -> None:

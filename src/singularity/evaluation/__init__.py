@@ -35,6 +35,9 @@ from singularity.evaluation.live import (
     SingularityPrivateBenchmarkAdapter,
     SweBenchAdapter,
     TerminalBenchAdapter,
+    compare_live_eval_results,
+    live_eval_report_markdown,
+    live_eval_regression_markdown,
     load_live_eval_manifest,
     summarize_live_results,
 )
@@ -79,6 +82,9 @@ __all__ = [
     "TraceReplayHarness",
     "WorkspaceSnapshot",
     "WorkspaceSnapshotKind",
+    "compare_live_eval_results",
+    "live_eval_report_markdown",
+    "live_eval_regression_markdown",
     "load_live_eval_manifest",
     "summarize_live_results",
 ]

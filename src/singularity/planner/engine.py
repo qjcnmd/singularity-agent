@@ -94,6 +94,7 @@ class Planner:
         self.budget = ExecutionBudget()
         self.final_report: FinalReport | None = None
         self.actions: dict[str, AgentAction] = {}
+        self._benchmark_constraints: dict[str, Any] = {}
 
     def start_task(
         self,
@@ -126,11 +127,44 @@ class Planner:
             self.state.completion_criteria.required_changes_applied = False
             self.state.completion_criteria.required_verifications_passed = False
         self.plan = self._default_plan(self.state.task_id)
+        if self._benchmark_constraints:
+            self.state.task_contract = {
+                **self.state.task_contract,
+                "benchmark_constraints": dict(self._benchmark_constraints),
+            }
         self.evidence = EvidenceLedger(assumptions=list(self.state.assumptions))
         self.budget = ExecutionBudget()
         self._persist()
         self._record_event(decision="start_task", reason="Task initialized.")
         return self.state
+
+    def apply_benchmark_constraints(self, constraints: dict[str, Any]) -> None:
+        self._throw_if_cancelled()
+        allowed_tools = sorted(
+            dict.fromkeys(str(item) for item in constraints.get("allowed_tools") or [])
+        )
+        expected_file_changes = sorted(
+            dict.fromkeys(str(item) for item in constraints.get("expected_file_changes") or [])
+        )
+        payload = {
+            "allowed_tools": allowed_tools,
+            "expected_file_changes": expected_file_changes,
+            "completion_standard": str(constraints.get("completion_standard") or ""),
+            "risk_tags": [str(item) for item in constraints.get("risk_tags") or []],
+            "task_id": str(constraints.get("task_id") or ""),
+        }
+        self._benchmark_constraints = payload
+        if self.state is not None:
+            self.state.task_contract = {
+                **self.state.task_contract,
+                "benchmark_constraints": dict(payload),
+            }
+            self._persist()
+        if self.trace is not None:
+            self.trace.record(
+                "planner.benchmark_constraints_applied",
+                {"benchmark_constraints": payload},
+            )
 
     def contract_smoke_commands(self) -> list[list[str]]:
         contract = self._contract()
@@ -232,6 +266,24 @@ class Planner:
                 extra={
                     "reason_code": decision.error_code,
                     "repair_contract": self._active_repair_contract(),
+                },
+            )
+            return decision
+        benchmark_allowed = self._benchmark_allowed_tools()
+        if benchmark_allowed and tool_name not in benchmark_allowed:
+            decision = AuthorizationDecision(
+                allowed=False,
+                error_code="benchmark_tool_not_allowed",
+                reason=f"{tool_name} is not allowed by the active benchmark task.",
+            )
+            self._record_event(
+                action_id=tool_call_id,
+                action_kind=self.policy.action_for_tool(tool_name).value,
+                decision="deny",
+                reason=decision.reason,
+                extra={
+                    "reason_code": decision.error_code,
+                    "benchmark_constraints": self._benchmark_constraints,
                 },
             )
             return decision
@@ -1329,6 +1381,9 @@ class Planner:
         repair_allowed = self._active_repair_allowed_tools()
         if repair_allowed:
             allowed &= repair_allowed
+        benchmark_allowed = self._benchmark_allowed_tools()
+        if benchmark_allowed:
+            allowed &= benchmark_allowed
         decision = self.tool_router.decide(
             phase=phase.phase_id,
             phase_allowed_tool_names=allowed,
@@ -1373,6 +1428,9 @@ class Planner:
             repair_allowed = self._active_repair_allowed_tools()
             if repair_allowed:
                 allowed &= repair_allowed
+            benchmark_allowed = self._benchmark_allowed_tools()
+            if benchmark_allowed:
+                allowed &= benchmark_allowed
         return [
             tool
             for tool in tools
@@ -1437,6 +1495,13 @@ class Planner:
             if isinstance(candidate, dict):
                 tools.update(str(item) for item in candidate.get("tool_hints") or [] if item)
         return tools
+
+    def _benchmark_allowed_tools(self) -> set[str]:
+        return {
+            str(item)
+            for item in self._benchmark_constraints.get("allowed_tools") or []
+            if item
+        }
 
     def _active_repair_target_files(self) -> set[str]:
         contract = self._active_repair_contract()

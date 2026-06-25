@@ -10,6 +10,11 @@ from singularity.evaluation.execution import (
     EvaluationArtifactWriter,
     BenchmarkTaskExecutor,
 )
+from singularity.evaluation.live import (
+    LiveAgentEvalRunner,
+    LiveEvalManifest,
+    SingularityPrivateBenchmarkAdapter,
+)
 from singularity.evaluation.patch_quality import PatchQualityEvaluator
 from singularity.evaluation.replay import TraceReplayHarness
 from singularity.evaluation.reports import (
@@ -139,6 +144,53 @@ class EvaluationHarness:
             run_id=run_id,
             json_text=regression.to_json(),
             markdown_text=regression.to_markdown(),
+        )
+
+    def run_agent_benchmark_suite(
+        self,
+        *,
+        manifest: LiveEvalManifest,
+        run_id: str | None = None,
+        output_root: Path | str | None = None,
+        max_turns: int | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        baseline_result_path: Path | str | None = None,
+        bootstrap_cls: Any | None = None,
+    ) -> dict[str, Any]:
+        """Run coding-agent benchmarks through KernelBootstrap -> AgentKernel -> AgentLoop."""
+        return LiveAgentEvalRunner(
+            output_root=output_root or self.output_root,
+            run_id=run_id,
+            max_turns=max_turns,
+            model=model,
+            base_url=base_url,
+            baseline_result_path=baseline_result_path,
+            bootstrap_cls=bootstrap_cls,
+        ).run(manifest)
+
+    def run_private_agent_benchmark_suite(
+        self,
+        *,
+        task_set: Path | str,
+        run_id: str | None = None,
+        output_root: Path | str | None = None,
+        max_turns: int | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        baseline_result_path: Path | str | None = None,
+        bootstrap_cls: Any | None = None,
+    ) -> dict[str, Any]:
+        manifest = SingularityPrivateBenchmarkAdapter().load(task_set)
+        return self.run_agent_benchmark_suite(
+            manifest=manifest,
+            run_id=run_id,
+            output_root=output_root,
+            max_turns=max_turns,
+            model=model,
+            base_url=base_url,
+            baseline_result_path=baseline_result_path,
+            bootstrap_cls=bootstrap_cls,
         )
 
     def _evaluate_task(

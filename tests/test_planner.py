@@ -74,6 +74,38 @@ def test_start_task_builds_state_plan_and_persists(tmp_path: Path) -> None:
     assert (tmp_path / ".singularity" / "planner" / "session_1" / "planner_events.jsonl").exists()
 
 
+def test_benchmark_constraints_limit_tool_exposure_and_authorization(tmp_path: Path) -> None:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    planner.apply_benchmark_constraints(
+        {
+            "task_id": "bench.task",
+            "allowed_tools": ["read_file"],
+            "expected_file_changes": ["app.py"],
+            "completion_standard": "Only read during this benchmark step.",
+            "risk_tags": ["policy-blocked"],
+        }
+    )
+    state = planner.start_task("Exercise benchmark constraints")
+    state.current_phase = "applying_changes"
+
+    tools = [
+        {"function": {"name": "read_file"}},
+        {"function": {"name": "write_file"}},
+    ]
+
+    assert planner.filtered_tools(tools) == [{"function": {"name": "read_file"}}]
+    decision = planner.authorize_tool_call(
+        tool_name="write_file",
+        tool_call_id="call_write",
+        spec=spec("write_file", permission=PermissionLevel.WRITE),
+        arguments={"path": "app.py"},
+    )
+
+    assert decision.allowed is False
+    assert decision.error_code == "benchmark_tool_not_allowed"
+    assert state.task_contract["benchmark_constraints"]["allowed_tools"] == ["read_file"]
+
+
 def test_sandbox_required_policy_observation_is_not_unresolved_failure(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Run verification")
