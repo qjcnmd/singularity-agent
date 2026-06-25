@@ -848,9 +848,23 @@ def test_cli_eval_live_private_uses_private_benchmark_adapter(tmp_path: Path, mo
 
     monkeypatch.setattr("singularity.cli.LiveAgentEvalRunner", FakeRunner)
 
-    result = runner.invoke(app, ["eval", "live", "private", str(task_set), "--run-id", "private_cli", "--json"])
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "live",
+            "private",
+            str(task_set),
+            "--run-id",
+            "private_cli",
+            "--project-root",
+            str(tmp_path),
+            "--json",
+        ],
+    )
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["run_id"] == "private_cli"
     assert seen["task_id"] == "private.cli"
     assert seen["verification_command"] == "python -m pytest tests/test_app.py"
+    assert seen["kwargs"]["env_root"] == tmp_path.resolve()

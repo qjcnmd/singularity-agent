@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import time
 import difflib
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -244,6 +245,10 @@ class LiveEvalTaskResult:
     token_usage: dict[str, Any] = field(default_factory=dict)
     cache_usage: dict[str, Any] = field(default_factory=dict)
     trace_artifact_refs: list[str] = field(default_factory=list)
+    reproducible_environment: dict[str, Any] = field(default_factory=dict)
+    result_extraction: dict[str, Any] = field(default_factory=dict)
+    task_verification_result: dict[str, Any] = field(default_factory=dict)
+    repair_verification_contract: dict[str, Any] = field(default_factory=dict)
     agent_loop_ref: str = "KernelBootstrap.boot -> AgentKernel.run_task -> AgentLoop.run"
 
     def to_dict(self) -> dict[str, Any]:
@@ -277,6 +282,10 @@ class LiveEvalTaskResult:
             "token_usage": self.token_usage,
             "cache_usage": self.cache_usage,
             "trace_artifact_refs": list(self.trace_artifact_refs),
+            "reproducible_environment": self.reproducible_environment,
+            "result_extraction": self.result_extraction,
+            "task_verification_result": self.task_verification_result,
+            "repair_verification_contract": self.repair_verification_contract,
             "agent_loop_ref": self.agent_loop_ref,
         }
 
@@ -348,6 +357,7 @@ class LiveAgentEvalRunner:
         model: str | None = None,
         base_url: str | None = None,
         baseline_result_path: Path | str | None = None,
+        env_root: Path | str | None = None,
         bootstrap_cls: Any | None = None,
         console: Console | None = None,
     ) -> None:
@@ -357,6 +367,11 @@ class LiveAgentEvalRunner:
         self.model = model
         self.base_url = base_url
         self.baseline_result_path = Path(baseline_result_path) if baseline_result_path else None
+        self.env_root = (
+            Path(env_root).expanduser().resolve(strict=False)
+            if env_root is not None
+            else Path.cwd().resolve(strict=False)
+        )
         if bootstrap_cls is None:
             from singularity.kernel import KernelBootstrap
 
@@ -442,9 +457,41 @@ class LiveAgentEvalRunner:
         policy_blocks = 0
         trace_artifact_refs: list[str] = []
         contract_satisfaction: dict[str, Any] = {}
+        reproducible_environment: dict[str, Any] = {}
         try:
             _reset_dir(task_dir, root=self.run_dir)
             self._materialize_workspace(task, workspace=workspace, manifest_base=manifest_base)
+            config = ProductionConfig.from_cli(
+                project_root=workspace,
+                max_turns=self.max_turns or adaptive_default_max_turns(task.user_task),
+                model=self.model,
+                base_url=self.base_url,
+                env_root=self.env_root,
+                approval_mode=_approval_mode_for_task(task),
+                security_mode=_security_mode_for_task(task),
+                interaction_mode=InteractionMode.NON_INTERACTIVE,
+                raw_artifacts=False,
+                profile=f"live-eval:{task.task_id}:{task.tool_policy}",
+                cli_overrides={
+                    "max_turns",
+                    "model",
+                    "base_url",
+                    "approval_mode",
+                    "security_mode",
+                    "interaction_mode",
+                    "raw_artifacts",
+                    "profile",
+                },
+            )
+            reproducible_environment = _reproducible_environment(
+                task,
+                workspace=workspace,
+                manifest_base=manifest_base,
+                output_root=self.output_root,
+                baseline_result_path=self.baseline_result_path,
+                config=config,
+                max_turns=config.max_turns,
+            )
             for command in task.prepare_commands:
                 prepared = _run_shell(command, cwd=workspace, timeout_seconds=120, redactor=self.redactor)
                 if not prepared.passed:
@@ -465,32 +512,12 @@ class LiveAgentEvalRunner:
                         success=False,
                         tests_passed=False,
                         infrastructure_blocked=False,
+                        reproducible_environment=reproducible_environment,
                     )
             before_snapshot = _snapshot_files(workspace)
             before_text_snapshot = _read_text_files(workspace)
             shutil.copytree(workspace, baseline_workspace, ignore=_copy_ignore)
             goal = _task_goal(task)
-            config = ProductionConfig.from_cli(
-                project_root=workspace,
-                max_turns=self.max_turns or adaptive_default_max_turns(task.user_task),
-                model=self.model,
-                base_url=self.base_url,
-                approval_mode=_approval_mode_for_task(task),
-                security_mode=_security_mode_for_task(task),
-                interaction_mode=InteractionMode.NON_INTERACTIVE,
-                raw_artifacts=False,
-                profile=f"live-eval:{task.task_id}:{task.tool_policy}",
-                cli_overrides={
-                    "max_turns",
-                    "model",
-                    "base_url",
-                    "approval_mode",
-                    "security_mode",
-                    "interaction_mode",
-                    "raw_artifacts",
-                    "profile",
-                },
-            )
             kernel = self.bootstrap_cls(project_root=workspace, config=config, console=self.console).boot(goal)
             _apply_benchmark_constraints(kernel, task)
             agent_result = kernel.run_task(goal)
@@ -518,6 +545,7 @@ class LiveAgentEvalRunner:
                     final_report_status=_final_report_status(final_report_payload, agent_status=agent_status),
                     policy_blocks=policy_blocks,
                     patch=patch_payload,
+                    final_report_payload=final_report_payload,
                 )
                 return self._task_result(
                     task=task,
@@ -543,6 +571,7 @@ class LiveAgentEvalRunner:
                     policy_blocks=policy_blocks,
                     trace_artifact_refs=trace_artifact_refs,
                     contract_satisfaction=contract_satisfaction,
+                    reproducible_environment=reproducible_environment,
                 )
             files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
             patch_payload = _patch_payload(before_text_snapshot, workspace)
@@ -573,6 +602,19 @@ class LiveAgentEvalRunner:
                 if not prepared.passed:
                     errors.append(f"verification prepare failed: {prepared.error_summary or command}")
                     checks = _checks_payload(public_verification, prepared)
+                    allowed_ok = _allowed_scope_ok(files_changed, task.allowed_paths)
+                    contract_satisfaction = _contract_satisfaction(
+                        task,
+                        files_changed=files_changed,
+                        allowed_scope=allowed_ok,
+                        verification=prepared,
+                        public_verification=public_verification,
+                        agent_status=agent_status,
+                        final_report_status=_final_report_status(final_report_payload, agent_status=agent_status),
+                        policy_blocks=policy_blocks,
+                        patch=patch_payload,
+                        final_report_payload=final_report_payload,
+                    )
                     return self._task_result(
                         task=task,
                         workspace=workspace,
@@ -589,6 +631,15 @@ class LiveAgentEvalRunner:
                         success=False,
                         tests_passed=False,
                         infrastructure_blocked=False,
+                        agent_status=agent_status,
+                        final_report_payload=final_report_payload,
+                        trace_summary=trace_summary,
+                        turn_count=turn_count,
+                        failure_repair_count=failure_repair_count,
+                        policy_blocks=policy_blocks,
+                        trace_artifact_refs=trace_artifact_refs,
+                        contract_satisfaction=contract_satisfaction,
+                        reproducible_environment=reproducible_environment,
                     )
             hidden_verification = _run_shell(
                 task.verification_command,
@@ -634,6 +685,7 @@ class LiveAgentEvalRunner:
                 final_report_status=_final_report_status(final_report_payload, agent_status=agent_status),
                 policy_blocks=policy_blocks,
                 patch=patch_payload,
+                final_report_payload=final_report_payload,
             )
             success_ok = bool(
                 agent_completed
@@ -682,6 +734,7 @@ class LiveAgentEvalRunner:
             policy_blocks=policy_blocks,
             trace_artifact_refs=trace_artifact_refs,
             contract_satisfaction=contract_satisfaction,
+            reproducible_environment=reproducible_environment,
         )
 
     def _materialize_workspace(self, task: LiveEvalTask, *, workspace: Path, manifest_base: Path) -> None:
@@ -727,6 +780,7 @@ class LiveAgentEvalRunner:
         policy_blocks: int = 0,
         trace_artifact_refs: list[str] | None = None,
         contract_satisfaction: dict[str, Any] | None = None,
+        reproducible_environment: dict[str, Any] | None = None,
     ) -> LiveEvalTaskResult:
         request_rates = _float_map(usage.get("request_cache_hit_rates") or {})
         final_report_payload = final_report_payload or {}
@@ -763,6 +817,8 @@ class LiveAgentEvalRunner:
             "cache_miss_reasons": dict(usage.get("cache_miss_reasons") or {}),
             "cache_attribution_sources": dict(usage.get("cache_attribution_sources") or {}),
         }
+        extraction = _result_extraction(final_report_payload, trace_summary)
+        repair_contract = _repair_verification_contract(final_report_payload)
         return LiveEvalTaskResult(
             task_id=task.task_id,
             success=success,
@@ -796,6 +852,7 @@ class LiveAgentEvalRunner:
                 final_report_status=final_report_status,
                 policy_blocks=policy_blocks,
                 patch=patch,
+                final_report_payload=final_report_payload,
             ),
             final_report_status=final_report_status,
             failure_repair_count=failure_repair_count or _failure_repair_count(final_report_payload),
@@ -803,6 +860,10 @@ class LiveAgentEvalRunner:
             token_usage=token_usage,
             cache_usage=cache_usage,
             trace_artifact_refs=list(trace_artifact_refs or _trace_artifact_refs(final_report_payload, trace_summary)),
+            reproducible_environment=reproducible_environment or {},
+            result_extraction=extraction,
+            task_verification_result=verification_result,
+            repair_verification_contract=repair_contract,
         )
 
 
@@ -1092,6 +1153,94 @@ def _task_goal(task: LiveEvalTask) -> str:
     )
 
 
+def _reproducible_environment(
+    task: LiveEvalTask,
+    *,
+    workspace: Path,
+    manifest_base: Path,
+    output_root: Path,
+    baseline_result_path: Path | None,
+    config: ProductionConfig,
+    max_turns: int,
+) -> dict[str, Any]:
+    effective = config.effective_config()
+    return {
+        "schema_version": "evaluation.live_agent_environment/v1",
+        "task_id": task.task_id,
+        "workspace": _workspace_environment(task, manifest_base=manifest_base),
+        "workspace_path": str(workspace),
+        "prepare_commands": list(task.prepare_commands),
+        "verification_command": task.verification_command,
+        "verification_prepare_commands": list(task.verification_prepare_commands),
+        "verification_timeout_seconds": task.verification_timeout_seconds,
+        "allowed_paths": list(task.allowed_paths),
+        "allowed_tools": list(task.allowed_tools),
+        "expected_file_changes": list(task.expected_file_changes),
+        "completion_standard": task.completion_standard,
+        "risk_tags": list(task.risk_tags),
+        "model_profile": {
+            "model": config.model or os.getenv("SINGULARITY_MODEL") or None,
+            "base_url": _redacted_url(config.base_url or os.getenv("SINGULARITY_BASE_URL") or ""),
+            "profile": config.profile,
+            "max_turns": max_turns,
+            "sources": {
+                "model": effective.get("sources", {}).get("model"),
+                "base_url": effective.get("sources", {}).get("base_url"),
+                "env_file": effective.get("sources", {}).get("env_file"),
+            },
+        },
+        "policy": {
+            "tool_policy": task.tool_policy,
+            "approval_mode": config.approval_mode.value,
+            "security_mode": config.security_mode.value,
+            "interaction_mode": config.interaction_mode.value,
+            "sandbox_strategy": task.strategy.get("sandbox_strategy") or config.security_mode.value,
+        },
+        "baseline_artifacts": {
+            "baseline_result_path": str(baseline_result_path) if baseline_result_path else None,
+            "output_root": str(output_root),
+        },
+        "runtime": {
+            "python": sys.version.split()[0],
+            "platform": sys.platform,
+            "agent_loop_ref": "KernelBootstrap.boot -> AgentKernel.run_task -> AgentLoop.run",
+        },
+    }
+
+
+def _workspace_environment(task: LiveEvalTask, *, manifest_base: Path) -> dict[str, Any]:
+    if task.workspace.kind == "fixture":
+        return {
+            "type": "fixture",
+            "file_count": len(task.workspace.files),
+            "file_names": sorted(task.workspace.files),
+            "source": "manifest.inline_files",
+        }
+    source = task.workspace.path or ""
+    source_path = Path(source).resolve(strict=False) if source else None
+    try:
+        source_ref = source_path.relative_to(manifest_base.resolve(strict=False)).as_posix() if source_path else ""
+    except ValueError:
+        source_ref = str(source_path) if source_path else ""
+    return {
+        "type": "repo",
+        "source": source_ref,
+        "start_commit": task.workspace.start_commit,
+    }
+
+
+def _redacted_url(value: str) -> str | None:
+    if not value:
+        return None
+    redacted = TraceRedactor().redact_text(value)
+    if "@" in redacted:
+        scheme, _, rest = redacted.partition("://")
+        if rest:
+            rest = rest.split("@", 1)[-1]
+            return f"{scheme}://[REDACTED]@{rest}" if scheme else f"[REDACTED]@{rest}"
+    return redacted
+
+
 def _trace_path(kernel: Any) -> str:
     trace = getattr(getattr(kernel, "graph", None), "trace", None)
     store = getattr(trace, "store", None)
@@ -1217,12 +1366,14 @@ def _failure_repair_count(payload: dict[str, Any]) -> int:
     return _safe_int(
         failure_repair.get("repair_attempt_count")
         or failure_repair.get("repair_plan_count")
+        or failure_repair.get("failure_analysis_count")
     )
 
 
 def _policy_blocks(payload: dict[str, Any], trace_summary: dict[str, Any]) -> int:
     planner = payload.get("planner_summary") if isinstance(payload, dict) else {}
     policy = payload.get("policy_summary") if isinstance(payload, dict) else {}
+    shutdown = payload.get("shutdown_summary") if isinstance(payload, dict) else {}
     if isinstance(planner, dict):
         execution = planner.get("execution_trace_summary")
         if isinstance(execution, dict) and execution.get("policy_denials") is not None:
@@ -1235,6 +1386,10 @@ def _policy_blocks(payload: dict[str, Any], trace_summary: dict[str, Any]) -> in
         )
         if value is not None:
             return _safe_int(value)
+    if isinstance(shutdown, dict):
+        failures = shutdown.get("component_failures") or shutdown.get("policy_failures") or []
+        if isinstance(failures, list):
+            return len([item for item in failures if "policy" in str(item).lower()])
     return _safe_int(trace_summary.get("policy_denials"))
 
 
@@ -1242,8 +1397,12 @@ def _trace_artifact_refs(payload: dict[str, Any], trace_summary: dict[str, Any])
     refs: list[str] = []
     for value in trace_summary.get("key_artifacts") or []:
         refs.append(str(value))
+    for value in payload.get("artifacts") or []:
+        refs.append(str(value))
     planner = payload.get("planner_summary") if isinstance(payload, dict) else {}
     if isinstance(planner, dict):
+        for value in planner.get("artifacts") or []:
+            refs.append(str(value))
         artifact = planner.get("artifact_ref")
         if artifact:
             refs.append(str(artifact))
@@ -1252,6 +1411,67 @@ def _trace_artifact_refs(payload: dict[str, Any], trace_summary: dict[str, Any])
             for value in execution.get("key_artifacts") or []:
                 refs.append(str(value))
     return sorted(dict.fromkeys(refs))
+
+
+def _result_extraction(payload: dict[str, Any], trace_summary: dict[str, Any]) -> dict[str, Any]:
+    planner = payload.get("planner_summary") if isinstance(payload, dict) else {}
+    policy = payload.get("policy_summary") if isinstance(payload, dict) else {}
+    return {
+        "schema_version": "evaluation.live_agent_result_extraction/v1",
+        "status_source": "kernel.final_report.planner_summary.status"
+        if isinstance(planner, dict) and planner.get("status")
+        else "kernel.run_result.status",
+        "verification_source": "post_agent_independent_verification",
+        "planner_summary_present": isinstance(planner, dict) and bool(planner),
+        "failure_repair_source": "kernel.final_report.planner_summary.failure_repair_summary",
+        "policy_blocks_source": "kernel.final_report.policy_summary/execution_trace_summary/trace_summary",
+        "trace_artifact_source": "kernel.final_report.artifacts/planner_summary.artifacts/trace_summary.key_artifacts",
+        "contract_satisfaction_source": "live_eval.task_contract_plus_independent_verification",
+        "repair_verification_contract_source": (
+            "kernel.final_report.planner_summary.failure_repair_summary"
+        ),
+        "raw_policy_summary_keys": sorted(policy) if isinstance(policy, dict) else [],
+        "raw_trace_summary_keys": sorted(trace_summary),
+    }
+
+
+def _repair_verification_contract(payload: dict[str, Any]) -> dict[str, Any]:
+    planner = payload.get("planner_summary") if isinstance(payload, dict) else {}
+    failure_repair = planner.get("failure_repair_summary") if isinstance(planner, dict) else {}
+    if not isinstance(failure_repair, dict) or not failure_repair:
+        return {"status": "not_recorded", "source": "kernel.final_report.planner_summary.failure_repair_summary"}
+    return {
+        "status": failure_repair.get("verification_contract_status") or "recorded",
+        "source": "kernel.final_report.planner_summary.failure_repair_summary",
+        "contract_id": failure_repair.get("verification_contract_id"),
+        "step_count": _safe_int(failure_repair.get("verification_contract_step_count")),
+        "validation_errors": list(failure_repair.get("verification_contract_validation_errors") or []),
+        "latest_repair_contract_id": failure_repair.get("latest_repair_contract_id"),
+        "latest_verification_plan": list(failure_repair.get("latest_verification_plan") or []),
+        "latest_target_files": list(failure_repair.get("latest_target_files") or []),
+        "latest_blocked_reason": failure_repair.get("latest_blocked_reason"),
+        "needs_user_input": bool(failure_repair.get("needs_user_input")),
+    }
+
+
+def _repair_phase_contract_satisfaction(payload: dict[str, Any]) -> dict[str, Any]:
+    planner = payload.get("planner_summary") if isinstance(payload, dict) else {}
+    satisfaction = planner.get("contract_satisfaction") if isinstance(planner, dict) else {}
+    if not isinstance(satisfaction, dict) or not satisfaction:
+        return {
+            "status": "not_recorded",
+            "source": "kernel.final_report.planner_summary.contract_satisfaction",
+        }
+    satisfied = satisfaction.get("satisfied")
+    return {
+        "status": "satisfied" if satisfied is True else "unsatisfied" if satisfied is False else "recorded",
+        "source": "kernel.final_report.planner_summary.contract_satisfaction",
+        "contract_id": satisfaction.get("contract_id"),
+        "completed_steps": list(satisfaction.get("completed_steps") or []),
+        "failed_steps": list(satisfaction.get("failed_steps") or []),
+        "skipped_steps": list(satisfaction.get("skipped_steps") or []),
+        "reason": satisfaction.get("reason"),
+    }
 
 
 def _result_status(
@@ -1290,6 +1510,7 @@ def _contract_satisfaction(
     final_report_status: str,
     policy_blocks: int,
     patch: dict[str, Any],
+    final_report_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     expected_changes = list(task.expected_file_changes or [])
     changed = set(files_changed)
@@ -1359,9 +1580,13 @@ def _contract_satisfaction(
         )
     required = [item for item in checks if item.get("required")]
     passed = [item for item in required if item.get("passed")]
+    repair_contract = _repair_phase_contract_satisfaction(final_report_payload or {})
     return {
         "status": "satisfied" if len(passed) == len(required) else "unsatisfied",
         "score": round(len(passed) / len(required), 4) if required else 1.0,
+        "scope": "live_task_contract",
+        "task_level_verdict_source": "post_agent_independent_verification",
+        "repair_phase_contract_satisfaction": repair_contract,
         "checks": checks,
     }
 

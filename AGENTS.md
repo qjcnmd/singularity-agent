@@ -42,3 +42,41 @@ Do not read `.env` unless the user explicitly asks for environment diagnosis and
 ## Scope Discipline
 
 For code tasks, start from the mapped subsystem and its tests. Keep edits inside the task boundary, preserve existing runtime layering, and avoid unrelated cleanup.
+## Mandatory Real Model Validation
+
+Singularity is a production-grade local CLI coding agent harness. Any change that affects agent capability, execution behavior, model interaction, prompt assembly, context management, tool exposure, tool execution, planner behavior, repair flow, verification flow, evaluation harness, CLI task execution, tracing, reporting, policy/approval, or benchmark behavior must be validated with at least one real model call.
+
+Fake providers, mock providers, unit tests, and synthetic harness tests are allowed as supporting tests, but they do not satisfy final validation for agent-capability changes.
+
+Required rule:
+
+1. Before finalizing the task, run the relevant unit/static checks and at least one real-model Singularity agent validation through the real execution chain.
+2. The real validation must enter the actual AgentLoop path, such as:
+   `KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop.run`.
+3. Do not bypass AgentLoop by directly invoking Planner, ToolExecutor, VerificationRunner, FailureAnalyzer, RepairPlanner, or EvaluationHarness internals to claim real agent validation.
+4. Use the project’s existing `.env` / configuration loading path for provider credentials. Never print, copy, commit, expose, or include API keys or secrets in logs, reports, traces, markdown, screenshots, or final output.
+5. When checking environment readiness, only report redacted status, for example:
+   `SINGULARITY_API_KEY=present(redacted)`, `SINGULARITY_BASE_URL=present`, `SINGULARITY_MODEL=present`.
+6. For benchmark/evaluation work, run a real live benchmark whenever possible, preferably:
+   `python -m singularity eval live run docs/evaluation/live-agent-minimal-tasks.json --run-id <meaningful-run-id>`
+   or the closest valid project CLI command if the CLI entrypoint differs.
+7. For non-evaluation agent changes, run the smallest real task that exercises the changed path, but it must still use the real model provider and real AgentLoop.
+8. Final output must include:
+
+   * the exact real-model command run;
+   * the redacted provider/model/config status;
+   * whether the call entered AgentLoop;
+   * result/report/trace artifact paths when produced;
+   * status, turn count, tool calls, verification result, and failure summary when available.
+9. If the real model validation cannot run, the final output must explicitly classify the blocker:
+
+   * `.env` not found or not loaded;
+   * required env var missing;
+   * authentication/provider error;
+   * base_url/network error;
+   * model name/config error;
+   * sandbox/permission error;
+   * AgentLoop/runtime error;
+   * verification failure;
+   * user explicitly prohibited real model calls.
+10. Do not silently replace real validation with fake-provider tests. If real validation is blocked, say it is blocked and explain the exact blocker. The task is not fully validated until a real model call succeeds or the blocker is fixed.

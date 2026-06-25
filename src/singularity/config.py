@@ -15,6 +15,12 @@ if TYPE_CHECKING:
     from singularity.model.config import ModelRunnerConfig
 
 
+@dataclass(frozen=True)
+class EnvFileLoadResult:
+    found: bool = False
+    loaded: bool = False
+
+
 class Settings(BaseModel):
     base_url: str
     api_key: str
@@ -176,10 +182,15 @@ class ProductionConfig:
         project_index_max_file_size: int | None = None,
         project_index_max_total_bytes: int | None = None,
         config_file: Path | str | None = None,
+        env_root: Path | str | None = None,
         cli_overrides: set[str] | None = None,
         default_max_turns: int | None = None,
     ) -> "ProductionConfig":
         root = Path(project_root).expanduser().resolve(strict=False)
+        env_base = Path(env_root).expanduser().resolve(strict=False) if env_root is not None else root
+        env_file = env_base / ".env"
+        env_load = _load_project_env(env_file)
+        env_file_source = f"project:{_display_config_path(env_file, root)}" if env_load.found else None
         resolved_config_file = (
             Path(config_file).expanduser()
             if config_file is not None
@@ -257,6 +268,8 @@ class ProductionConfig:
         if default_max_turns is not None:
             defaults["max_turns"] = max(1, int(default_max_turns))
             default_sources["max_turns"] = "default:adaptive"
+        if env_file_source:
+            default_sources["env_file"] = env_file_source
 
         for name, default in defaults.items():
             raw_value, source = _resolve_config_value(
@@ -294,7 +307,10 @@ class ProductionConfig:
             project_index_max_file_size=values["project_index_max_file_size"],
             project_index_max_total_bytes=values["project_index_max_total_bytes"],
             config_file=resolved_config_file if resolved_config_file.exists() else None,
-            config_sources=sources,
+            config_sources={
+                **sources,
+                **({"env_file": env_file_source} if env_file_source else {}),
+            },
         )
 
     def to_policy_config(self) -> PolicyConfig:
@@ -381,6 +397,43 @@ def _read_config_file(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _load_project_env(path: Path) -> EnvFileLoadResult:
+    if not path.exists():
+        return EnvFileLoadResult()
+    loaded = False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return EnvFileLoadResult()
+    for line in lines:
+        parsed = _parse_env_line(line)
+        if parsed is None:
+            continue
+        name, value = parsed
+        if name not in os.environ:
+            os.environ[name] = value
+            loaded = True
+    return EnvFileLoadResult(found=True, loaded=loaded)
+
+
+def _parse_env_line(line: str) -> tuple[str, str] | None:
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return None
+    if text.lower().startswith("export "):
+        text = text[7:].lstrip()
+    if "=" not in text:
+        return None
+    name, value = text.split("=", 1)
+    name = name.strip()
+    if not name or not name.replace("_", "").isalnum() or name[0].isdigit():
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return name, value
+
+
 def _flatten_config(data: dict[str, Any]) -> dict[str, Any]:
     flattened = dict(data)
     project_index = flattened.pop("project_index", None)
@@ -451,6 +504,10 @@ def _optional_path(value: Any) -> Path | None:
 def _config_file_handle(path: Path | None, root: Path) -> str | None:
     if path is None:
         return None
+    return _display_config_path(path, root)
+
+
+def _display_config_path(path: Path, root: Path) -> str:
     try:
         return path.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
     except ValueError:

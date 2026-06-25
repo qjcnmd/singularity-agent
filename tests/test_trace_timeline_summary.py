@@ -158,6 +158,21 @@ def test_model_usage_summary_reports_request_and_run_cache_hit_rates(tmp_path) -
     assert usage["run_cache_hit_rate"] == 0.5
 
 
+def test_context_cache_usage_event_is_registered(tmp_path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
+
+    trace.emit(
+        TraceEventType.CONTEXT_CACHE_USAGE_RECORDED,
+        component="context",
+        summary="Cache usage recorded.",
+        ids={"task_id": "task_1"},
+        payload={"input_tokens": 100, "cached_input_tokens": 25},
+    )
+
+    events = trace.timeline(task_id="task_1")
+    assert events[-1].event_type == TraceEventType.CONTEXT_CACHE_USAGE_RECORDED.value
+
+
 def test_model_usage_summary_preserves_cache_attribution_sources(tmp_path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
     trace.emit(

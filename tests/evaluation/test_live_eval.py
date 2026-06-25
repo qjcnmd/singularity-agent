@@ -41,6 +41,22 @@ def test_load_live_eval_manifest_example() -> None:
     assert manifest.tasks[-1].tool_policy == "read_only"
 
 
+def test_live_eval_sanitized_baseline_example_is_safe_and_shape_current() -> None:
+    path = Path("docs/evaluation/live-agent-baseline-example.json")
+    text = path.read_text(encoding="utf-8")
+    payload = json.loads(text)
+
+    assert payload["schema_version"] == LIVE_RESULT_SCHEMA_VERSION
+    assert "SINGULARITY_API_KEY" not in text
+    assert "api_key" not in text.lower()
+    assert "sk-" not in text
+    task = payload["tasks"][0]
+    assert task["reproducible_environment"]["schema_version"] == "evaluation.live_agent_environment/v1"
+    assert task["result_extraction"]["schema_version"] == "evaluation.live_agent_result_extraction/v1"
+    assert task["task_verification_result"] == task["verification_result"]
+    assert task["repair_verification_contract"]["status"] == "not_recorded"
+
+
 def test_private_adapter_converts_benchmark_tasks_to_live_manifest(tmp_path: Path) -> None:
     task_set = tmp_path / "private.json"
     task_set.write_text(
@@ -243,6 +259,7 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
             uncertain_transactions=[],
             workspace_lock_status="released",
             trace_summary={
+                "key_artifacts": ["trace/artifacts/model.json"],
                 "tool_calls": 2,
                 "model_usage_summary": {
                     "requests": 2,
@@ -252,6 +269,24 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
                     "run_cache_hit_rate": 0.4,
                 },
             },
+            planner_summary={
+                "status": "completed",
+                "failure_repair_summary": {
+                    "repair_attempt_count": 1,
+                    "verification_contract_id": "vc_1",
+                    "verification_contract_step_count": 1,
+                    "verification_contract_status": "satisfied",
+                    "latest_repair_contract_id": "rc_1",
+                    "latest_verification_plan": ["python -m pytest tests/test_app.py"],
+                    "latest_target_files": ["done.txt"],
+                },
+                "execution_trace_summary": {
+                    "policy_denials": 2,
+                    "key_artifacts": ["planner/artifact.json"],
+                },
+                "artifacts": ["planner/report.md"],
+            },
+            policy_summary={"denied_actions_count": 2},
         )
 
     class FakeKernel:
@@ -299,9 +334,27 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     assert task["checks"]["public"]["passed"] is True
     assert task["verification_result"]["status"] == "passed"
     assert task["contract_satisfaction"]["status"] == "satisfied"
-    assert task["final_report_status"] == "finalized"
+    assert task["final_report_status"] == "completed"
+    assert task["failure_repair_count"] == 1
+    assert task["policy_blocks"] == 2
+    assert task["trace_artifact_refs"] == [
+        "planner/artifact.json",
+        "planner/report.md",
+        "trace/artifacts/model.json",
+    ]
     assert task["token_usage"]["input_tokens"] == 10
     assert task["cache_usage"]["run_cache_hit_rate"] == 0.4
+    assert task["task_verification_result"] == task["verification_result"]
+    assert task["repair_verification_contract"]["contract_id"] == "vc_1"
+    assert task["repair_verification_contract"]["latest_repair_contract_id"] == "rc_1"
+    assert task["repair_verification_contract"]["step_count"] == 1
+    assert task["result_extraction"]["planner_summary_present"] is True
+    assert task["result_extraction"]["failure_repair_source"].endswith("failure_repair_summary")
+    assert task["reproducible_environment"]["workspace"]["type"] == "fixture"
+    assert task["reproducible_environment"]["verification_command"] == manifest.tasks[0].verification_command
+    env_base_url = task["reproducible_environment"]["model_profile"]["base_url"]
+    assert env_base_url is None or "sk-" not in env_base_url
+    assert "env_file" in task["reproducible_environment"]["model_profile"]["sources"]
     assert task["agent_loop_ref"].endswith("AgentLoop.run")
     assert Path(result["result_path"]).exists()
     assert Path(result["report_path"]).exists()
@@ -397,6 +450,232 @@ def test_live_eval_runner_compares_against_previous_run(tmp_path: Path) -> None:
     assert second["regression"]["task_diffs"][0]["task_id"] == "fake.regression"
     assert Path(second["regression_path"]).exists()
     assert Path(second["regression_markdown_path"]).exists()
+
+
+def test_live_eval_reports_completion_rejected_repair_and_verification_contract(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest = LiveEvalManifest.from_dict(
+        {
+            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.completion_repair",
+                    "workspace": {"type": "fixture", "files": {"app.py": "def answer():\n    return 0\n"}},
+                    "user_task": "Repair app.answer and do not finish before verification evidence exists.",
+                    "allowed_paths": ["app.py"],
+                    "expected_file_changes": ["app.py"],
+                    "verification_command": f"{py} -c \"from app import answer; assert answer() == 42\"",
+                    "completion_standard": "Premature completion is rejected, repair plan records a verification contract, and verification passes.",
+                    "risk_tags": ["completion-rejected-repair", "verification-contract"],
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={
+                "tool_calls": 4,
+                "key_artifacts": ["trace/final-review.json"],
+                "model_usage_summary": {"requests": 3, "input_tokens": 120, "cached_input_tokens": 20},
+            },
+            planner_summary={
+                "status": "completed",
+                "verification_summary": {"status": "ready"},
+                "failure_repair_summary": {
+                    "failure_analysis_count": 1,
+                    "repair_plan_count": 1,
+                    "repair_attempt_count": 1,
+                    "latest_failure_category": "completion_stalled",
+                    "latest_repair_strategy": "repair_then_verify",
+                    "latest_repair_contract_id": "repair_contract_1",
+                    "latest_verification_plan": [f"{py} -c \"from app import answer; assert answer() == 42\""],
+                    "latest_target_files": ["app.py"],
+                    "verification_contract_id": "verification_contract_1",
+                    "verification_contract_step_count": 1,
+                    "verification_contract_status": "satisfied",
+                    "verification_contract_validation_errors": [],
+                },
+                "contract_satisfaction": {
+                    "contract_id": "verification_contract_1",
+                    "satisfied": True,
+                    "completed_steps": ["step_1"],
+                    "failed_steps": [],
+                    "reason": None,
+                },
+                "execution_trace_summary": {
+                    "policy_denials": 0,
+                    "key_artifacts": ["planner/repair-plan.json"],
+                },
+            },
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "app.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = LiveAgentEvalRunner(
+        output_root=tmp_path / "out",
+        run_id="completion_repair",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["success"] is True
+    assert task["failure_repair_count"] == 1
+    assert task["turn_count"] == 3
+    assert task["tool_calls"] == 4
+    assert task["contract_satisfaction"]["status"] == "satisfied"
+    assert task["repair_verification_contract"]["contract_id"] == "verification_contract_1"
+    assert task["repair_verification_contract"]["status"] == "satisfied"
+    assert task["repair_verification_contract"]["latest_target_files"] == ["app.py"]
+    assert task["result_extraction"]["repair_verification_contract_source"].endswith("failure_repair_summary")
+    assert task["trace_artifact_refs"] == ["planner/repair-plan.json", "trace/final-review.json"]
+    report_text = Path(result["markdown_path"]).read_text(encoding="utf-8")
+    assert "completion_repair" in report_text
+    result_text = Path(result["result_path"]).read_text(encoding="utf-8")
+    assert "verification_contract_1" in result_text
+
+
+def test_live_eval_uses_env_root_for_fixture_workspace_config(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("SINGULARITY_API_KEY", raising=False)
+    monkeypatch.delenv("SINGULARITY_BASE_URL", raising=False)
+    monkeypatch.delenv("SINGULARITY_MODEL", raising=False)
+    env_root = tmp_path / "repo"
+    env_root.mkdir()
+    (env_root / ".env").write_text(
+        "\n".join(
+            [
+                "SINGULARITY_API_KEY=sk-local-test-secret",
+                "SINGULARITY_BASE_URL=https://provider.example/v1",
+                "SINGULARITY_MODEL=env-root-model",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    py = json.dumps(sys.executable)
+    manifest = LiveEvalManifest.from_dict(
+        {
+            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.env_root",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Write done.txt.",
+                    "allowed_paths": ["done.txt"],
+                    "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').read_text(encoding='utf-8') == 'ok'\"",
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1, "input_tokens": 10}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+            self.config = kwargs["config"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            assert self.config.model == "env-root-model"
+            assert self.config.base_url == "https://provider.example/v1"
+            return FakeKernel(self.project_root)
+
+    result = LiveAgentEvalRunner(
+        output_root=tmp_path / "out",
+        run_id="env_root",
+        env_root=env_root,
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    env = task["reproducible_environment"]["model_profile"]
+    assert env["model"] == "env-root-model"
+    assert env["base_url"] == "https://provider.example/v1"
+    assert env["sources"]["model"] == "env:SINGULARITY_MODEL"
+    assert env["sources"]["base_url"] == "env:SINGULARITY_BASE_URL"
+    assert env["sources"]["env_file"].replace("\\", "/").endswith("/repo/.env")
+    assert "sk-local-test-secret" not in json.dumps(result)
 
 
 def test_live_eval_runner_can_drive_real_agent_loop(tmp_path: Path) -> None:

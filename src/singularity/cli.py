@@ -1060,10 +1060,12 @@ def eval_live_run(
         typer.Option("--baseline-result", help="Explicit previous live eval result.json for regression comparison."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Run a manifest-driven live-provider agent evaluation."""
 
     manifest = load_live_eval_manifest(task_set)
+    env_root = resolve_project_root(project_root)
     result = LiveAgentEvalRunner(
         output_root=output_dir,
         run_id=run_id,
@@ -1071,6 +1073,7 @@ def eval_live_run(
         model=model,
         base_url=base_url,
         baseline_result_path=baseline_result,
+        env_root=env_root,
         console=console,
     ).run(manifest)
     if json_output:
@@ -1109,10 +1112,12 @@ def eval_live_private(
         typer.Option("--baseline-result", help="Explicit previous live eval result.json for regression comparison."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Run private BenchmarkTask definitions through the live agent eval runner."""
 
     manifest = SingularityPrivateBenchmarkAdapter().load(task_set)
+    env_root = resolve_project_root(project_root)
     result = LiveAgentEvalRunner(
         output_root=output_dir,
         run_id=run_id,
@@ -1120,6 +1125,7 @@ def eval_live_private(
         model=model,
         base_url=base_url,
         baseline_result_path=baseline_result,
+        env_root=env_root,
         console=console,
     ).run(manifest)
     if json_output:
@@ -1153,6 +1159,7 @@ def eval_live_quicksort(
         typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this live benchmark."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
 ) -> None:
     """Run the live provider through a controlled quicksort create-and-verify task."""
 
@@ -1162,6 +1169,7 @@ def eval_live_quicksort(
         max_turns=max_turns,
         model=model,
         base_url=base_url,
+        project_root=resolve_project_root(project_root),
     )
     if json_output:
         _write_stdout(json_dumps(result))
@@ -1178,6 +1186,7 @@ def _run_live_quicksort_benchmark(
     max_turns: int,
     model: str | None,
     base_url: str | None,
+    project_root: Path | None = None,
 ) -> dict[str, object]:
     resolved_run_id = run_id or f"live_quicksort_{uuid4().hex[:8]}"
     root = (output_dir or (Path.cwd() / "work" / "evaluations-live")).expanduser().resolve(strict=False)
@@ -1199,6 +1208,7 @@ def _run_live_quicksort_benchmark(
         max_turns=max_turns,
         model=model,
         base_url=base_url,
+        env_root=project_root or Path.cwd(),
         approval_mode=ApprovalMode.AUTO_SAFE,
         security_mode=SecurityMode.COMPAT,
         profile="live-quicksort",

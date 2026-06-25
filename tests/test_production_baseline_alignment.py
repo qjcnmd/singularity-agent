@@ -177,6 +177,69 @@ def test_production_config_reports_custom_config_file_source(tmp_path: Path) -> 
     assert effective["sources"]["max_turns"] == "config:component.toml"
 
 
+def test_production_config_loads_project_env_without_leaking_api_key(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("SINGULARITY_API_KEY", raising=False)
+    monkeypatch.delenv("SINGULARITY_BASE_URL", raising=False)
+    monkeypatch.delenv("SINGULARITY_MODEL", raising=False)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "SINGULARITY_API_KEY=sk-local-test-secret",
+                "SINGULARITY_BASE_URL=https://example.invalid/v1",
+                "SINGULARITY_MODEL=env-file-model",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = ProductionConfig.from_cli(project_root=tmp_path)
+    effective = config.effective_config()
+
+    assert config.model == "env-file-model"
+    assert config.base_url == "https://example.invalid/v1"
+    assert effective["sources"]["model"] == "env:SINGULARITY_MODEL"
+    assert effective["sources"]["base_url"] == "env:SINGULARITY_BASE_URL"
+    assert effective["sources"]["env_file"] == "project:.env"
+    dumped = json.dumps(effective)
+    assert "sk-local-test-secret" not in dumped
+    assert "api_key" not in dumped.lower()
+
+
+def test_production_config_loads_env_from_explicit_root_for_fixture_workspace(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("SINGULARITY_API_KEY", raising=False)
+    monkeypatch.delenv("SINGULARITY_BASE_URL", raising=False)
+    monkeypatch.delenv("SINGULARITY_MODEL", raising=False)
+    repo_root = tmp_path / "repo"
+    workspace = tmp_path / "eval-workspace"
+    repo_root.mkdir()
+    workspace.mkdir()
+    (repo_root / ".env").write_text(
+        "\n".join(
+            [
+                "SINGULARITY_API_KEY=sk-local-test-secret",
+                "SINGULARITY_BASE_URL=https://example.invalid/v1",
+                "SINGULARITY_MODEL=env-root-model",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = ProductionConfig.from_cli(project_root=workspace, env_root=repo_root)
+    effective = config.effective_config()
+
+    assert config.model == "env-root-model"
+    assert config.base_url == "https://example.invalid/v1"
+    assert effective["sources"]["env_file"].replace("\\", "/").endswith("/repo/.env")
+    dumped = json.dumps(effective)
+    assert "sk-local-test-secret" not in dumped
+    assert "api_key" not in dumped.lower()
+
+
 def test_adaptive_default_turn_budget_scales_long_tasks(tmp_path: Path) -> None:
     assert adaptive_default_max_turns("inspect README") == 8
     assert (

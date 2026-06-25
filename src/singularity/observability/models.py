@@ -129,6 +129,7 @@ class TraceEventType(str, Enum):
     CONTEXT_ITEM_SUPERSEDED = "context.item_superseded"
     CONTEXT_BUNDLE_BUILT = "context.bundle_built"
     CONTEXT_BUNDLE_OVERFLOW = "context.bundle_overflow"
+    CONTEXT_CACHE_USAGE_RECORDED = "context.cache_usage_recorded"
     CONTEXT_SNAPSHOT_SAVED = "context.snapshot_saved"
     CONTEXT_COMPACTION_REQUESTED = "context.compaction_requested"
     CONTEXT_COMPACTION_COMPLETED = "context.compaction_completed"
