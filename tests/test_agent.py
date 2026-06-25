@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any
 
@@ -297,9 +298,33 @@ def test_agent_does_not_complete_when_final_review_rejects(tmp_path: Path) -> No
         task_id="task_1",
         review_pipeline=RejectingReviewPipeline(),
     )
+    analysis_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "root_cause": "Final review rejected the report.",
+                            "failure_category": "final_review_failure",
+                            "affected_files": ["README.md"],
+                            "evidence_refs": ["check_1"],
+                            "repair_strategy": "repair the final evidence and rerun final review",
+                            "next_actions": ["Address final review repair target check_1."],
+                            "verification_plan": ["final_review"],
+                            "confidence": 0.8,
+                            "needs_user_input": False,
+                        }
+                    ),
+                }
+            }
+        ]
+    }
     provider = MockProvider(
         {"choices": [{"message": {"role": "assistant", "content": "model says done"}}]},
+        analysis_response,
         {"choices": [{"message": {"role": "assistant", "content": "still done"}}]},
+        analysis_response,
     )
     agent = make_agent_session(
         tmp_path,
@@ -335,6 +360,9 @@ def test_agent_does_not_complete_when_final_review_rejects(tmp_path: Path) -> No
         outcome["error_code"] == "final_review_rejected"
         for outcome in planner.evidence.task_outcomes
     )
+    assert provider.calls[1]["tools"] == []
+    assert planner.evidence.failure_analyses[-1]["failure_category"] == "final_review_failure"
+    assert planner.evidence.repair_plans[-1]["strategy"] == "repair the final evidence and rerun final review"
     assert not any(
         outcome["status"] == "success"
         and outcome.get("metadata", {}).get("final_report_status") == "completed"

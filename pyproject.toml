@@ -93,6 +93,7 @@ files = [
     "src/singularity/cli_paths.py",
     "src/singularity/code_index/index.py",
     "src/singularity/context/manager.py",
+    "src/singularity/failure_analysis.py",
     "src/singularity/git_client",
     "src/singularity/instructions/prompt_assembly.py",
     "src/singularity/kernel/agent_kernel.py",

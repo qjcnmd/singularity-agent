@@ -215,10 +215,146 @@ def test_context_manager_records_invalid_compression_response_and_continues(tmp_
         {"role": "user", "content": "inspect"},
     ]
     assert context.store.latest_snapshot(context.run_id) is None
-    assert any(
-        event["event_type"] == "context.compaction_failed"
-        for event in context.store.events_for_run(context.run_id)
+    failed = [
+        event for event in context.store.events_for_run(context.run_id)
+        if event["event_type"] == "context.compaction_failed"
+    ]
+    assert failed
+    assert failed[-1]["payload"]["stage"] == "render"
+    assert failed[-1]["payload"]["fallback_result"]["mode"] == "minimal_context"
+
+
+def test_compaction_plan_preparation_failure_records_stage_and_builds_fallback(tmp_path) -> None:
+    class GoodCompressionProvider:
+        def chat(self, *, messages, tools, tool_choice):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "goal": "inspect",
+                                    "current_state": "ready",
+                                    "completed_actions": [],
+                                    "pending_actions": [],
+                                    "verified_facts": [],
+                                    "failed_attempts": [],
+                                    "policy_constraints": [],
+                                    "workspace_changes": [],
+                                    "verification_status": "unknown",
+                                    "open_questions": [],
+                                    "reference_ids": [],
+                                    "omitted_item_ids": [],
+                                    "confidence": 0.8,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="inspect",
+        provider=GoodCompressionProvider(),
+        db_path=tmp_path / "context.sqlite3",
+        model_context_window=100,
+        output_token_reserve=20,
     )
+    context.add_assistant_message({"role": "assistant", "content": "history " * 200})
+
+    def fail_prepare(*, focused_item_ids=None, partial_range=None):
+        raise RuntimeError("planner unavailable")
+
+    original_latest_snapshot = context.store.latest_snapshot
+
+    def fail_latest_snapshot(run_id):
+        context.store.latest_snapshot = original_latest_snapshot
+        raise RuntimeError("snapshot unavailable")
+
+    context.compaction_planner.prepare = fail_prepare
+    context.store.latest_snapshot = fail_latest_snapshot
+
+    messages = context.messages(persist=True)
+
+    assert messages[:2] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "inspect"},
+    ]
+    failed = [
+        event for event in context.store.events_for_run(context.run_id)
+        if event["event_type"] == "context.compaction_failed"
+    ]
+    assert failed[-1]["payload"]["stage"] == "plan_preparation"
+    assert failed[-1]["payload"]["error_type"] == "RuntimeError"
+    assert failed[-1]["payload"]["focused_item_ids"] == []
+    assert failed[-1]["payload"]["partial_range"] is None
+    assert failed[-1]["payload"]["plan"] is None
+    assert failed[-1]["payload"]["fallback_result"]["mode"] == "minimal_context"
+    assert failed[-1]["payload"]["fallback_result"]["errors"][0]["stage"] == "latest_snapshot"
+    assert context.build_bundle(persist=False).messages[:2] == messages[:2]
+
+
+def test_compaction_event_recording_failure_does_not_interrupt_messages(tmp_path) -> None:
+    class RaisingTrace:
+        def emit(self, *args, **kwargs):
+            raise OSError("trace sink unavailable")
+
+    class GoodCompressionProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, *, messages, tools, tool_choice):
+            self.calls += 1
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "goal": "inspect",
+                                    "current_state": "ready",
+                                    "completed_actions": [],
+                                    "pending_actions": [],
+                                    "verified_facts": [],
+                                    "failed_attempts": [],
+                                    "policy_constraints": [],
+                                    "workspace_changes": [],
+                                    "verification_status": "unknown",
+                                    "open_questions": [],
+                                    "reference_ids": [],
+                                    "omitted_item_ids": [],
+                                    "confidence": 0.8,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    provider = GoodCompressionProvider()
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="inspect",
+        provider=provider,
+        db_path=tmp_path / "context.sqlite3",
+        model_context_window=100,
+        output_token_reserve=20,
+        trace=RaisingTrace(),
+    )
+    context.add_assistant_message({"role": "assistant", "content": "history " * 200})
+
+    messages = context.messages(persist=True)
+
+    assert messages[:2] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "inspect"},
+    ]
+    assert provider.calls == 0
+    events = context.store.events_for_run(context.run_id)
+    failed = [event for event in events if event["event_type"] == "context.compaction_failed"]
+    assert failed[-1]["payload"]["stage"] == "event_recording"
+    assert any(event["event_type"] == "context.event_recording_failed" for event in events)
 
 
 def test_context_manager_marks_omitted_items_stale_and_avoids_repeat_compaction(tmp_path) -> None:
@@ -350,6 +486,168 @@ def test_context_continues_tool_edit_and_verification_after_compaction(tmp_path)
     assert "new result" in rendered
     assert "app.py" in rendered
     assert "pytest" in rendered
+
+
+def test_commit_failure_falls_back_and_keeps_later_tool_edit_verification_context(tmp_path) -> None:
+    class GoodCompressionProvider:
+        def chat(self, *, messages, tools, tool_choice):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "goal": "inspect",
+                                    "current_state": "ready",
+                                    "completed_actions": [],
+                                    "pending_actions": [],
+                                    "verified_facts": [],
+                                    "failed_attempts": [],
+                                    "policy_constraints": [],
+                                    "workspace_changes": [],
+                                    "verification_status": "unknown",
+                                    "open_questions": [],
+                                    "reference_ids": [],
+                                    "omitted_item_ids": [],
+                                    "confidence": 0.8,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="inspect",
+        provider=GoodCompressionProvider(),
+        db_path=tmp_path / "context.sqlite3",
+        model_context_window=800,
+        output_token_reserve=20,
+    )
+    context.build_bundle(persist=True)
+    context.add_assistant_message({"role": "assistant", "content": "history " * 1000})
+
+    original_save_snapshot = context.store.save_snapshot
+
+    def fail_save_snapshot(snapshot):
+        context.store.save_snapshot = original_save_snapshot
+        raise RuntimeError("snapshot write failed")
+
+    context.store.save_snapshot = fail_save_snapshot
+
+    messages = context.messages(persist=True)
+
+    assert messages[:2] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "inspect"},
+    ]
+    failed = [
+        event for event in context.store.events_for_run(context.run_id)
+        if event["event_type"] == "context.compaction_failed"
+    ]
+    assert failed[-1]["payload"]["stage"] == "commit"
+    assert failed[-1]["payload"]["fallback_result"]["mode"] == "minimal_context"
+    cache = context.last_bundle.metadata["cache"]
+    assert cache["cache_miss_reasons"]
+    assert context.last_bundle.metadata["context_usage_report"]["cache_miss_reasons"] == cache["cache_miss_reasons"]
+
+    context.add_tool_result(
+        tool_call={"id": "call_read", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+        result={"ok": True, "content": "post failure result"},
+    )
+    context.add_mutation_evidence(
+        MutationEvidence(
+            transaction_id="tx_after_failure",
+            files_changed=["after.py"],
+            diff_summary="updated after.py",
+            rollback_ref="rollback_after",
+            status="applied",
+        )
+    )
+    context.add_verification_evidence(
+        VerificationEvidence(
+            check_id="pytest_after",
+            command="pytest",
+            status="passed",
+            failure_summary=None,
+            parsed_failures=[],
+            repair_hints=[],
+            logs_ref="log_after",
+            confidence=0.9,
+        )
+    )
+
+    rendered = "\n".join(str(message.get("content")) for message in context.messages())
+
+    assert "post failure result" in rendered
+    assert "after.py" in rendered
+    assert "pytest_after" in rendered
+
+
+def test_compaction_failure_returns_minimal_messages_when_fallback_bundle_fails(tmp_path) -> None:
+    class GoodCompressionProvider:
+        def chat(self, *, messages, tools, tool_choice):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "goal": "inspect",
+                                    "current_state": "ready",
+                                    "completed_actions": [],
+                                    "pending_actions": [],
+                                    "verified_facts": [],
+                                    "failed_attempts": [],
+                                    "policy_constraints": [],
+                                    "workspace_changes": [],
+                                    "verification_status": "unknown",
+                                    "open_questions": [],
+                                    "reference_ids": [],
+                                    "omitted_item_ids": [],
+                                    "confidence": 0.8,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="inspect",
+        provider=GoodCompressionProvider(),
+        db_path=tmp_path / "context.sqlite3",
+        model_context_window=100,
+        output_token_reserve=20,
+    )
+    context.add_assistant_message({"role": "assistant", "content": "history " * 200})
+
+    def fail_prepare(*, focused_item_ids=None, partial_range=None):
+        raise RuntimeError("planner unavailable")
+
+    original_build_bundle = context.build_bundle
+
+    def fail_build_bundle_once(**kwargs):
+        context.build_bundle = original_build_bundle
+        raise RuntimeError("bundle unavailable")
+
+    context.compaction_planner.prepare = fail_prepare
+    context.build_bundle = fail_build_bundle_once
+
+    messages = context.messages(persist=True)
+
+    assert messages[:2] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "inspect"},
+    ]
+    failed = [
+        event for event in context.store.events_for_run(context.run_id)
+        if event["event_type"] == "context.compaction_failed"
+    ]
+    assert failed[-1]["payload"]["stage"] == "fallback_build_bundle"
+    assert failed[-1]["payload"]["fallback_result"]["mode"] == "minimal_messages"
 
 
 def test_forced_compaction_generates_unique_versioned_summary_ids(tmp_path) -> None:

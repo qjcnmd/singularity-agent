@@ -206,6 +206,16 @@ def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> N
                 "smoke_commands": [["python", "quicksort.py"]],
             },
         ),
+        analysis_response(
+            root_cause="quicksort.py raises ZeroDivisionError during smoke verification.",
+            failure_category="unit_test_failure",
+            affected_files=["quicksort.py"],
+            evidence_refs=["call_verify"],
+            repair_strategy="patch the failing file and rerun the smoke command",
+            next_actions=["Patch quicksort.py.", "Rerun python quicksort.py."],
+            verification_plan=["python quicksort.py"],
+            confidence=0.9,
+        ),
         assistant("done despite failing verification"),
     )
     agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=5)
@@ -225,6 +235,8 @@ def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> N
     assert rejected["error_code"] == "completion_rejected"
     assert rejected["next_action"] == "continue"
     assert rejected["retry_allowed"] is True
+    assert planner.evidence.failure_analyses[-1]["failure_category"] == "unit_test_failure"
+    assert planner.evidence.repair_plans[-1]["strategy"] == "patch the failing file and rerun the smoke command"
 
 
 def test_tool_failure_then_verification_failure_replans_repairs_and_finalizes(tmp_path: Path) -> None:
@@ -251,6 +263,19 @@ def test_tool_failure_then_verification_failure_replans_repairs_and_finalizes(tm
                 "task_intent": "verify quicksort script",
                 "smoke_commands": [["python", "quicksort.py"]],
             },
+        ),
+        analysis_response(
+            root_cause="quicksort.py raises ZeroDivisionError during smoke verification.",
+            failure_category="unit_test_failure",
+            affected_files=["quicksort.py"],
+            evidence_refs=["call_verify_bad"],
+            repair_strategy="replace the failing smoke target with a real quicksort implementation",
+            next_actions=[
+                "Patch quicksort.py to remove the division by zero.",
+                "Rerun python quicksort.py through VerificationRunner.",
+            ],
+            verification_plan=["python quicksort.py"],
+            confidence=0.91,
         ),
         tool(
             "call_repair",
@@ -287,8 +312,73 @@ def test_tool_failure_then_verification_failure_replans_repairs_and_finalizes(tm
     )
     assert planner.evidence.verification_results[-2]["completion_assessment"]["status"] == "failed"
     assert planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "ready"
+    assert planner.evidence.failure_analyses[-1]["failure_category"] == "unit_test_failure"
+    assert planner.evidence.repair_plans[-1]["strategy"] == (
+        "replace the failing smoke target with a real quicksort implementation"
+    )
+    assert provider.calls[4]["tools"] == []
+    repair_context = json.dumps(provider.calls[5]["messages"], ensure_ascii=False)
+    assert "repair_plan" in repair_context
+    assert "ZeroDivisionError" in repair_context
+    trace_events = [
+        json.loads(line)["event"]
+        for trace_path in (tmp_path / ".singularity" / "runs").glob("*.jsonl")
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert "failure_analysis_requested" in trace_events
+    assert "failure_analysis_completed" in trace_events
     assert planner.state is not None
     assert planner.state.status == TaskStatus.COMPLETED
+
+
+def test_unrepairable_verification_failure_blocks_with_user_input_required(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        tool("call_read_1", "read_file", {"path": "README.md"}),
+        tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
+        tool(
+            "call_create_bad",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": "print(1 / 0)\n",
+                "mode": "create",
+                "reason": "create failing smoke target",
+            },
+        ),
+        tool(
+            "call_verify_bad",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+        analysis_response(
+            root_cause="The verification output does not identify a safe repair target.",
+            failure_category="missing_information",
+            affected_files=[],
+            evidence_refs=["call_verify_bad"],
+            repair_strategy="ask the user for the intended behavior before editing",
+            next_actions=["Ask for the expected quicksort.py behavior."],
+            verification_plan=[],
+            confidence=0.2,
+            needs_user_input=True,
+            blocked_reason="missing expected behavior",
+        ),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=6)
+
+    result = agent.run("implement quicksort.py and verify it")
+
+    assert result.status == AgentLoopStatus.BLOCKED
+    assert result.error_code == "failure_analysis_user_input_required"
+    assert planner.state is not None
+    assert planner.state.status == TaskStatus.BLOCKED
+    assert planner.evidence.failure_analyses[-1]["needs_user_input"] is True
+    assert planner.evidence.repair_plans[-1]["blocked_reason"] == "missing expected behavior"
 
 
 def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:
@@ -322,6 +412,8 @@ def test_policy_denial_blocks_without_bypassing_policy(tmp_path: Path) -> None:
     assert result.status == AgentLoopStatus.BLOCKED
     assert result.error_code == "policy_denied"
     assert not (tmp_path / "quicksort.py").exists()
+    assert planner.evidence.failure_analyses == []
+    assert planner.evidence.repair_plans == []
     assert any(
         request.operation in {OperationKind.CREATE_FILE, OperationKind.MUTATE_FILE}
         for request in policy.requests
@@ -426,6 +518,11 @@ def make_task_agent(
 
 def assistant(content: str) -> dict[str, Any]:
     return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+def analysis_response(**payload: Any) -> dict[str, Any]:
+    payload.setdefault("needs_user_input", False)
+    return assistant(json.dumps(payload))
 
 
 def tool(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:

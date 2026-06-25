@@ -1252,13 +1252,16 @@ class ObservationStore:
     def _emit_trace(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.trace is None or not hasattr(self.trace, "emit"):
             return
-        self.trace.emit(
-            event_type,
-            component="context",
-            summary=event_type,
-            payload=payload,
-            ids={"run_id": payload.get("run_id")},
-        )
+        try:
+            self.trace.emit(
+                event_type,
+                component="context",
+                summary=event_type,
+                payload=payload,
+                ids={"run_id": payload.get("run_id")},
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _now() -> str:

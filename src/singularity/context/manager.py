@@ -9,10 +9,12 @@ from uuid import uuid4
 
 from singularity.context.assembler import ContextAssembler, ContextBudget
 from singularity.context.compaction import (
+    COMPACTION_RECENT_TAIL_MESSAGES,
     CompactionPlan,
     ContextCompactionCommitter,
     ContextCompactionExecutor,
     ContextCompactionPlanner,
+    safe_base_messages,
     safe_message,
 )
 from singularity.context.compression import ContextCompressor
@@ -163,16 +165,36 @@ class ContextManager:
         allow_compression: bool | None = None,
     ) -> list[dict[str, Any]]:
         should_compress = persist if allow_compression is None else allow_compression
-        if should_compress and self.assembler.needs_compression(messages=self._messages, tools=tools):
-            self._compress_if_possible()
-        bundle = self.build_bundle(
+        compaction_attempted = should_compress and self.assembler.needs_compression(
+            messages=self._messages,
             tools=tools,
-            planner_context=planner_context,
-            phase_id=phase_id or self.phase_id,
-            render_policy=render_policy,
-            persist=persist,
         )
-        return bundle.messages
+        if compaction_attempted:
+            self._compress_if_possible()
+        try:
+            bundle = self.build_bundle(
+                tools=tools,
+                planner_context=planner_context,
+                phase_id=phase_id or self.phase_id,
+                render_policy=render_policy,
+                persist=persist,
+            )
+            return bundle.messages
+        except Exception as exc:
+            if not compaction_attempted:
+                raise
+            messages = self._fallback_messages_for_compaction_failure(tools=tools)
+            failure_payload = self.compaction_committer.failure_payload(
+                None,
+                exc,
+                stage="fallback_build_bundle",
+                fallback_result={
+                    "mode": "minimal_messages",
+                    "message_count": len(messages),
+                },
+            )
+            self._observe_compaction_failed(None, failure_payload)
+            return messages
 
     def build_bundle(
         self,
@@ -933,31 +955,115 @@ class ContextManager:
     ) -> bool:
         if self.provider is None and self.model_runner is None:
             return False
-        plan = self.compaction_planner.prepare(
-            focused_item_ids=focused_item_ids,
-            partial_range=partial_range,
-        )
-        self._observe_compaction(plan)
-        if not force and not plan.omitted_item_ids and self._summary is not None:
-            self.compaction_committer.apply_compacted_messages(
-                self._summary_payload,
-                recent_tail=plan.recent_tail,
-                summary_text=self._summary,
+        try:
+            plan = self.compaction_planner.prepare(
+                focused_item_ids=focused_item_ids,
+                partial_range=partial_range,
             )
+        except Exception as exc:
+            return self._handle_compaction_failure(
+                None,
+                exc,
+                stage="plan_preparation",
+                focused_item_ids=focused_item_ids,
+                partial_range=partial_range,
+            )
+        try:
+            self._observe_compaction(plan)
+        except Exception as exc:
+            return self._handle_compaction_failure(
+                plan,
+                exc,
+                stage="event_recording",
+                focused_item_ids=focused_item_ids,
+                partial_range=partial_range,
+            )
+        if not force and not plan.omitted_item_ids and self._summary is not None:
+            try:
+                self.compaction_committer.apply_compacted_messages(
+                    self._summary_payload,
+                    recent_tail=plan.recent_tail,
+                    summary_text=self._summary,
+                )
+            except Exception as exc:
+                return self._handle_compaction_failure(
+                    plan,
+                    exc,
+                    stage="recovery",
+                    focused_item_ids=focused_item_ids,
+                    partial_range=partial_range,
+                )
             return False
         try:
             context = self.compaction_executor.render(plan)
-            committed = self.compaction_committer.commit(plan, context=context)
-            self._observe_compaction_committed(plan, committed)
-            return True
         except Exception as exc:
-            failure_payload = self.compaction_committer.failure_payload(plan, exc)
-            self._observe_compaction_failed(plan, failure_payload)
-            self.compaction_committer.recover_after_failure(plan)
-            return False
+            return self._handle_compaction_failure(
+                plan,
+                exc,
+                stage="render",
+                focused_item_ids=focused_item_ids,
+                partial_range=partial_range,
+            )
+        try:
+            committed = self.compaction_committer.commit(plan, context=context)
+        except Exception as exc:
+            return self._handle_compaction_failure(
+                plan,
+                exc,
+                stage="commit",
+                focused_item_ids=focused_item_ids,
+                partial_range=partial_range,
+            )
+        self._observe_compaction_committed(plan, committed)
+        return True
+
+    def _handle_compaction_failure(
+        self,
+        plan: CompactionPlan | None,
+        exc: Exception,
+        *,
+        stage: str,
+        focused_item_ids: set[str] | None = None,
+        partial_range: PartialCompactionRange | None = None,
+    ) -> bool:
+        try:
+            fallback_result = self.compaction_committer.recover_after_failure(plan)
+        except Exception as recovery_exc:
+            recent_tail = (
+                plan.recent_tail
+                if plan is not None
+                else self._messages[2:][-COMPACTION_RECENT_TAIL_MESSAGES:]
+            )
+            self._messages = [
+                *safe_base_messages(self._messages, self.user_goal),
+                *[safe_message(message) for message in recent_tail],
+            ]
+            fallback_result = {
+                "mode": "minimal_context",
+                "snapshot_id": None,
+                "message_count": len(self._messages),
+                "recent_tail_count": len(recent_tail),
+                "errors": [
+                    {
+                        "stage": "recovery",
+                        "error_type": type(recovery_exc).__name__,
+                        "message": str(recovery_exc),
+                    }
+                ],
+            }
+        failure_payload = self.compaction_committer.failure_payload(
+            plan,
+            exc,
+            stage=stage,
+            focused_item_ids=focused_item_ids,
+            partial_range=partial_range,
+            fallback_result=fallback_result,
+        )
+        self._observe_compaction_failed(plan, failure_payload)
+        return False
 
     def _observe_compaction(self, plan: CompactionPlan) -> None:
-        self._emit_context_event(
+        trace_error = self._emit_context_event(
             "context.compaction_requested",
             {
                 "message_count": len(self._messages),
@@ -971,6 +1077,8 @@ class ContextManager:
                 "cache_attribution": plan.cache_attribution.to_dict(),
             },
         )
+        if trace_error is not None:
+            raise trace_error
 
     def _observe_compaction_committed(self, plan: CompactionPlan, committed: ContextSnapshot) -> None:
         self._emit_context_event(
@@ -985,13 +1093,34 @@ class ContextManager:
             },
         )
 
-    def _observe_compaction_failed(self, plan: CompactionPlan, failure_payload: dict[str, Any]) -> None:
-        self.store.record_event(
-            self.run_id,
-            event_type="context.compaction_failed",
-            payload=failure_payload,
-        )
+    def _observe_compaction_failed(
+        self,
+        plan: CompactionPlan | None,
+        failure_payload: dict[str, Any],
+    ) -> None:
+        try:
+            self.store.record_event(
+                self.run_id,
+                event_type="context.compaction_failed",
+                payload=failure_payload,
+            )
+        except Exception:
+            pass
         self._emit_context_event("context.compaction_failed", failure_payload)
+
+    def _fallback_messages_for_compaction_failure(
+        self,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        base = safe_base_messages(self._messages, self.user_goal)
+        tail = [
+            safe_message(message)
+            for message in self._messages[2:][-COMPACTION_RECENT_TAIL_MESSAGES:]
+        ]
+        messages, budget = self.assembler.assemble(messages=[*base, *tail], tools=tools)
+        self.last_budget = budget
+        return messages
 
     def _tool_message(self, observation: ToolObservation) -> dict[str, Any]:
         raw_result = observation.raw_result
@@ -1103,24 +1232,40 @@ class ContextManager:
             )
         ]
 
-    def _emit_context_event(self, event_type: str, payload: dict[str, Any]) -> None:
+    def _emit_context_event(self, event_type: str, payload: dict[str, Any]) -> Exception | None:
         if self.trace is None:
-            return
-        if hasattr(self.trace, "emit"):
-            self.trace.emit(
-                event_type,
-                component="context",
-                summary=event_type,
-                payload=payload,
-                ids={
-                    "run_id": self.run_id,
-                    "session_id": self.session_id,
-                    "task_id": self.task_id,
-                    "phase_id": self.phase_id,
-                },
-            )
-        elif hasattr(self.trace, "record"):
-            self.trace.record(event_type, payload)
+            return None
+        try:
+            if hasattr(self.trace, "emit"):
+                self.trace.emit(
+                    event_type,
+                    component="context",
+                    summary=event_type,
+                    payload=payload,
+                    ids={
+                        "run_id": self.run_id,
+                        "session_id": self.session_id,
+                        "task_id": self.task_id,
+                        "phase_id": self.phase_id,
+                    },
+                )
+            elif hasattr(self.trace, "record"):
+                self.trace.record(event_type, payload)
+        except Exception as exc:
+            try:
+                self.store.record_event(
+                    self.run_id,
+                    event_type="context.event_recording_failed",
+                    payload={
+                        "event_type": event_type,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+            except Exception:
+                pass
+            return exc
+        return None
 
     @staticmethod
     def _now() -> str:

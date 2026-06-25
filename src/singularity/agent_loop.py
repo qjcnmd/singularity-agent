@@ -9,6 +9,7 @@ from rich.console import Console
 
 from singularity.context import ContextManager
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
+from singularity.failure_analysis import FailureAnalysisRequest, FailureAnalyzer, RepairPlanner
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.interaction import InteractionController, ProgressEvent
 from singularity.model import ModelErrorKind, ModelPurpose, ModelRunner, ModelTurnStatus
@@ -99,6 +100,8 @@ class AgentLoop:
         interaction_controller: InteractionController | None = None,
         context_manager: ContextManager | None = None,
         context_db_path: Path | None = None,
+        failure_analyzer: FailureAnalyzer | None = None,
+        repair_planner: RepairPlanner | None = None,
         strict: bool = False,
     ) -> None:
         if model_runner is None:
@@ -129,6 +132,12 @@ class AgentLoop:
         self.interaction_controller = interaction_controller
         self.context_manager = context_manager
         self.context_db_path = context_db_path
+        self.failure_analyzer = failure_analyzer or FailureAnalyzer(
+            model_runner=model_runner,
+            trace=trace,
+        )
+        self.repair_planner = repair_planner or RepairPlanner()
+        self._failure_analysis_fingerprints: set[str] = set()
         self.strict = strict
 
     def run(self, user_goal: str) -> AgentLoopResult:
@@ -240,7 +249,32 @@ class AgentLoop:
             if reduced_outcome is not None:
                 controller.apply_outcome(reduced_outcome)
                 self._record_outcome_context(context, planner, reduced_outcome)
+                blocked = self._maybe_analyze_failure(
+                    planner,
+                    context,
+                    outcome=reduced_outcome,
+                    failure_source="tool",
+                    turn=turn,
+                )
+                if blocked is not None:
+                    controller.apply_outcome(blocked)
+                    self._record_outcome_context(context, planner, blocked)
+                    terminal = self._terminal_result_from_outcome(blocked, turn=turn)
+                    if terminal is not None:
+                        return terminal
                 terminal = self._terminal_result_from_outcome(reduced_outcome, turn=turn)
+                if terminal is not None:
+                    return terminal
+            blocked = self._maybe_analyze_failure(
+                planner,
+                context,
+                failure_source="verification",
+                turn=turn,
+            )
+            if blocked is not None:
+                controller.apply_outcome(blocked)
+                self._record_outcome_context(context, planner, blocked)
+                terminal = self._terminal_result_from_outcome(blocked, turn=turn)
                 if terminal is not None:
                     return terminal
             if self._should_auto_finalize_after_tools(planner, protocol_result):
@@ -312,6 +346,17 @@ class AgentLoop:
             )
             controller.apply_outcome(outcome)
             self._record_outcome_context(context, planner, outcome)
+            blocked = self._maybe_analyze_failure(
+                planner,
+                context,
+                outcome=outcome,
+                failure_source="completion",
+                turn=turn,
+            )
+            if blocked is not None:
+                controller.apply_outcome(blocked)
+                self._record_outcome_context(context, planner, blocked)
+                return self._terminal_result_from_outcome(blocked, turn=turn)
             return None
         if (
             planner.state is not None
@@ -369,6 +414,17 @@ class AgentLoop:
             )
             controller.apply_outcome(outcome)
             self._record_outcome_context(context, planner, outcome)
+            blocked = self._maybe_analyze_failure(
+                planner,
+                context,
+                outcome=outcome,
+                failure_source="completion_review",
+                turn=turn,
+            )
+            if blocked is not None:
+                controller.apply_outcome(blocked)
+                self._record_outcome_context(context, planner, blocked)
+                return self._terminal_result_from_outcome(blocked, turn=turn)
             return self._terminal_result_from_outcome(outcome, turn=turn)
         final_answer = "\n".join(
             [
@@ -511,6 +567,109 @@ class AgentLoop:
             "validation": result.validation.to_dict() if result.validation else None,
         }
         self.trace.record("model_failure", details)
+
+    def _maybe_analyze_failure(
+        self,
+        planner: Planner,
+        context: ContextManager,
+        *,
+        failure_source: str,
+        turn: int,
+        outcome: ExecutionOutcome | None = None,
+    ) -> ExecutionOutcome | None:
+        if outcome is not None and not self._should_analyze_outcome(planner, outcome):
+            return None
+        if outcome is None and not self._has_repairable_planner_failure(planner):
+            return None
+        request = FailureAnalysisRequest.from_planner(
+            planner,
+            context,
+            failure_source=failure_source,
+            outcome=outcome,
+            turn=turn,
+        )
+        if not request.has_failure or request.fingerprint in self._failure_analysis_fingerprints:
+            return None
+        self._failure_analysis_fingerprints.add(request.fingerprint)
+        analysis = self.failure_analyzer.analyze(request)
+        repair_plan = self.repair_planner.plan(analysis)
+        replan_signal = self.repair_planner.to_replan_signal(
+            request=request,
+            analysis=analysis,
+            plan=repair_plan,
+        )
+        planner.record_failure_analysis(
+            analysis,
+            repair_plan,
+            replan_signal=replan_signal,
+        )
+        context.add_failure(
+            {
+                "failure_analysis": analysis.to_dict(),
+                "repair_plan": repair_plan.to_dict(),
+                "replan_signal": replan_signal,
+            }
+        )
+        if repair_plan.needs_user_input or repair_plan.blocked_reason:
+            return self.repair_planner.blocked_outcome(repair_plan)
+        decision = planner.replan(replan_signal)
+        if getattr(getattr(decision, "decision", None), "value", "") == "ask_user":
+            return ExecutionOutcome(
+                status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
+                source="failure_analysis",
+                reason=decision.reason,
+                error_code="repair_budget_exceeded",
+                next_action="ask_user",
+                observation_summary=decision.reason,
+                retry_allowed=False,
+                metadata={"repair_plan": repair_plan.to_dict()},
+            )
+        return None
+
+    @staticmethod
+    def _should_analyze_outcome(planner: Planner, outcome: ExecutionOutcome) -> bool:
+        if outcome.status != ExecutionOutcomeStatus.REPLAN_REQUIRED:
+            return False
+        if outcome.error_code in {
+            "approval_required",
+            "approval_denied",
+            "policy_denied",
+            "policy_ask_user_required",
+            "action_not_allowed",
+            "risk_escalated",
+            "sandbox_required",
+            "policy_escalation_required",
+        }:
+            return False
+        if outcome.error_code == "completion_rejected":
+            return False
+        return True
+
+    @staticmethod
+    def _has_repairable_planner_failure(planner: Planner) -> bool:
+        if planner.state is None:
+            return False
+        latest = planner.evidence.verification_results[-1] if planner.evidence.verification_results else {}
+        assessment = latest.get("completion_assessment") if isinstance(latest, dict) else {}
+        if isinstance(assessment, dict) and assessment.get("status") in {"failed", "blocked", "needs_review"}:
+            return True
+        for failure in planner.evidence.unresolved_failures[-5:]:
+            if not isinstance(failure, dict):
+                return True
+            code = (
+                failure.get("error_code")
+                or (failure.get("execution_outcome") or {}).get("error_code")
+                or failure.get("status")
+            )
+            if code not in {
+                "approval_required",
+                "approval_denied",
+                "policy_denied",
+                "risk_escalated",
+                "sandbox_required",
+            }:
+                return True
+        return False
 
     def _publish_progress(self, turn: int) -> None:
         if self.interaction_controller is None:

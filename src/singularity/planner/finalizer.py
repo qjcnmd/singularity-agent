@@ -99,6 +99,7 @@ class Finalizer:
                 "project_index": self._project_index_summary(evidence),
             },
             review_summary=review_summary,
+            failure_repair_summary=self._failure_repair_summary(evidence),
         )
 
     @staticmethod
@@ -318,6 +319,29 @@ class Finalizer:
             "remaining_risks": remaining_risks,
         }
 
+    @staticmethod
+    def _failure_repair_summary(evidence: EvidenceLedger) -> dict[str, Any]:
+        latest_analysis = evidence.failure_analyses[-1] if evidence.failure_analyses else {}
+        latest_plan = evidence.repair_plans[-1] if evidence.repair_plans else {}
+        root = latest_analysis.get("root_cause") if isinstance(latest_analysis, dict) else {}
+        root_cause = (
+            root.get("description")
+            if isinstance(root, dict)
+            else latest_analysis.get("root_cause_text") if isinstance(latest_analysis, dict) else None
+        )
+        candidates = latest_plan.get("action_candidates") if isinstance(latest_plan, dict) else []
+        return {
+            "failure_analysis_count": len(evidence.failure_analyses),
+            "repair_plan_count": len(evidence.repair_plans),
+            "latest_analysis_id": latest_analysis.get("analysis_id") if isinstance(latest_analysis, dict) else None,
+            "latest_repair_plan_id": latest_plan.get("plan_id") if isinstance(latest_plan, dict) else None,
+            "latest_root_cause": root_cause,
+            "latest_failure_category": latest_analysis.get("failure_category") if isinstance(latest_analysis, dict) else None,
+            "latest_repair_strategy": latest_plan.get("strategy") if isinstance(latest_plan, dict) else None,
+            "latest_action_candidate_count": len(candidates or []),
+            "needs_user_input": bool(latest_plan.get("needs_user_input")) if isinstance(latest_plan, dict) else False,
+        }
+
 
 class FinalReportRenderer:
     def validate(self, report: FinalReport) -> FinalReport:
@@ -382,6 +406,9 @@ class FinalReportRenderer:
             "## Failure / Repair History",
             f"- Failure analyses: {len(evidence.failure_analyses)}",
             f"- Repair plans: {len(evidence.repair_plans)}",
+            f"- Latest root cause: {report.failure_repair_summary.get('latest_root_cause') or '-'}",
+            f"- Latest repair strategy: {report.failure_repair_summary.get('latest_repair_strategy') or '-'}",
+            f"- Repair action candidates: {report.failure_repair_summary.get('latest_action_candidate_count', 0)}",
             f"- Unresolved issues: {len(report.unresolved_issues)}",
             "",
             "## Final Review",

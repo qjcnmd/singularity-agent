@@ -466,6 +466,24 @@ class TraceRecorder:
                 TraceSeverity.WARNING if failed else TraceSeverity.INFO,
                 ids,
             )
+        if event in {
+            "failure_analysis_requested",
+            "failure_analysis_completed",
+            "failure_analysis_failed",
+        }:
+            event_type = {
+                "failure_analysis_requested": TraceEventType.FAILURE_ANALYSIS_REQUESTED,
+                "failure_analysis_completed": TraceEventType.FAILURE_ANALYSIS_COMPLETED,
+                "failure_analysis_failed": TraceEventType.FAILURE_ANALYSIS_FAILED,
+            }[event]
+            failed = event == "failure_analysis_failed"
+            return (
+                event_type,
+                "failure_analysis",
+                str(data.get("error") or data.get("failure_source") or event),
+                TraceSeverity.ERROR if failed else TraceSeverity.INFO,
+                ids,
+            )
         return TraceEventType.CONTEXT_OBSERVATION_ADDED, event, str(event), TraceSeverity.INFO, ids
 
     def _legacy_payload(self, event: str, data: dict[str, Any]) -> dict[str, Any]:

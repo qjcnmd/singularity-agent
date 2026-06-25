@@ -900,21 +900,59 @@ class ContextCompactionCommitter:
             summary_text=summary_text,
         )
 
-    def recover_after_failure(self, plan: CompactionPlan) -> None:
-        snapshot = self.manager.store.latest_snapshot(self.manager.run_id)
+    def recover_after_failure(self, plan: CompactionPlan | None) -> dict[str, Any]:
+        recovery_errors: list[dict[str, str]] = []
+        try:
+            snapshot = self.manager.store.latest_snapshot(self.manager.run_id)
+        except Exception as exc:
+            snapshot = None
+            recovery_errors.append(
+                {
+                    "stage": "latest_snapshot",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
         if snapshot is not None and snapshot.retained_messages:
             self.manager._summary = snapshot.summary
             self.manager._messages = list(snapshot.retained_messages)
             envelope_payload = snapshot.metadata.get("summary_envelope")
             if isinstance(envelope_payload, dict):
-                envelope = ContextSummaryEnvelope.from_dict(envelope_payload)
-                self.manager._summary_envelope = envelope
-                self.manager._summary_payload = envelope.summary_payload
-            return
+                try:
+                    envelope = ContextSummaryEnvelope.from_dict(envelope_payload)
+                except Exception as exc:
+                    recovery_errors.append(
+                        {
+                            "stage": "summary_envelope",
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    )
+                else:
+                    self.manager._summary_envelope = envelope
+                    self.manager._summary_payload = envelope.summary_payload
+            return {
+                "mode": "latest_snapshot",
+                "snapshot_id": snapshot.snapshot_id,
+                "message_count": len(snapshot.retained_messages),
+                "errors": recovery_errors,
+            }
+        recent_tail = (
+            plan.recent_tail
+            if plan is not None
+            else self.manager._messages[2:][-COMPACTION_RECENT_TAIL_MESSAGES:]
+        )
         self.manager._messages = [
             *safe_base_messages(self.manager._messages, self.manager.user_goal),
-            *[safe_message(message) for message in plan.recent_tail],
+            *[safe_message(message) for message in recent_tail],
         ]
+        return {
+            "mode": "minimal_context",
+            "snapshot_id": None,
+            "message_count": len(self.manager._messages),
+            "recent_tail_count": len(recent_tail),
+            "errors": recovery_errors,
+        }
 
     def compacted_messages(
         self,
@@ -965,12 +1003,24 @@ class ContextCompactionCommitter:
         return f"summary_{self.manager.run_id}"
 
     @staticmethod
-    def failure_payload(plan: CompactionPlan, exc: Exception) -> dict[str, Any]:
+    def failure_payload(
+        plan: CompactionPlan | None,
+        exc: Exception,
+        *,
+        stage: str,
+        focused_item_ids: set[str] | None = None,
+        partial_range: PartialCompactionRange | None = None,
+        fallback_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return {
+            "stage": stage,
             "error_type": type(exc).__name__,
             "message": str(exc),
             "fallback": "latest_snapshot_or_deterministic_tail",
-            "plan": plan_metadata(plan),
+            "focused_item_ids": sorted(focused_item_ids or []),
+            "partial_range": partial_range.to_dict() if partial_range is not None else None,
+            "fallback_result": fallback_result or {},
+            "plan": plan_metadata(plan) if plan is not None else None,
         }
 
 

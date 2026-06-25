@@ -17,6 +17,8 @@ class SerializableDataclass:
 
 class ModelPurpose(str, Enum):
     PLAN_NEXT_ACTION = "plan_next_action"
+    FAILURE_ANALYSIS = "failure_analysis"
+    REPAIR_PLANNING = "repair_planning"
     REPAIR_AFTER_FAILURE = "repair_after_failure"
     SUMMARIZE_CONTEXT = "summarize_context"
     FINAL_ANSWER = "final_answer"

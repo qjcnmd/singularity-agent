@@ -663,6 +663,63 @@ class Planner:
             extra={"execution_outcome": payload},
         )
 
+    def record_failure_analysis(
+        self,
+        analysis: Any,
+        repair_plan: Any,
+        *,
+        replan_signal: dict[str, Any] | None = None,
+    ) -> None:
+        self._throw_if_cancelled()
+        analysis_payload = analysis.to_dict() if hasattr(analysis, "to_dict") else dict(analysis)
+        repair_payload = repair_plan.to_dict() if hasattr(repair_plan, "to_dict") else dict(repair_plan)
+        analysis_id = analysis_payload.get("analysis_id")
+        if not analysis_id or not any(
+            existing.get("analysis_id") == analysis_id
+            for existing in self.evidence.failure_analyses
+        ):
+            self.evidence.failure_analyses.append(analysis_payload)
+        plan_id = repair_payload.get("plan_id")
+        if not plan_id or not any(
+            existing.get("plan_id") == plan_id for existing in self.evidence.repair_plans
+        ):
+            self.evidence.repair_plans.append(repair_payload)
+
+        state = self._state()
+        plan = self._plan()
+        blocked_reason = repair_payload.get("blocked_reason")
+        if repair_payload.get("needs_user_input") or blocked_reason:
+            state.status = TaskStatus.BLOCKED
+            if blocked_reason:
+                self._append_unique(state.blocked_reasons, blocked_reason)
+            for action in repair_payload.get("next_actions") or []:
+                self._append_unique(state.open_questions, action)
+        else:
+            state.status = TaskStatus.REPAIRING_FAILURES
+            state.current_phase = "repairing_failures"
+            plan.current_phase = "repairing_failures"
+            if state.task_contract:
+                state.rolling_plan = self.semantic_planner.repair_plan(
+                    analysis_payload,
+                    task_contract=state.task_contract,
+                ).to_dict()
+            self._record_dynamic_retrieval(
+                trigger="failure_analysis",
+                failure_analysis=analysis_payload,
+                changed_files=self._changed_files(),
+            )
+        self._persist()
+        self._record_event(
+            decision="failure_analysis",
+            reason=str(analysis_payload.get("root_cause_text") or "Failure analysis recorded."),
+            evidence_refs=list(analysis_payload.get("evidence_refs") or []),
+            replan_decision=replan_signal,
+            extra={
+                "failure_analysis": analysis_payload,
+                "repair_plan": repair_payload,
+            },
+        )
+
     def _route_after_missing_evidence(self, missing: list[Any]) -> None:
         names = {str(item) for item in missing}
         state = self._state()
