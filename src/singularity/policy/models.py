@@ -286,6 +286,7 @@ class ApprovalGrant:
     single_use: bool = True
     consumed: bool = False
     reason: str = ""
+    operator_signature: str | None = None
 
     def matches(self, request: PolicyRequest, *, workspace_root: Path | str | None) -> bool:
         if self.consumed:
@@ -323,6 +324,7 @@ class ApprovalGrant:
             "single_use": self.single_use,
             "consumed": self.consumed,
             "reason": self.reason,
+            "operator_signature": self.operator_signature,
         }
 
     @classmethod
@@ -334,10 +336,10 @@ class ApprovalGrant:
         if raw_grant_id:
             grant_id = str(raw_grant_id)
         else:
-            # P0-3: Generate a deterministic grant_id from the decision,
-            # request, and approver so repeated imports of the same grant
-            # produce the same ID and cannot amplify a single approval into
-            # multiple consumable grants.
+            # Grant identity: generate a deterministic grant_id from the
+            # decision, request, and approver so repeated imports of the same
+            # grant produce the same ID and cannot amplify a single approval
+            # into multiple consumable grants.
             deterministic = f"{decision_id}:{request_id}:{approved_by}"
             grant_id = f"grant_{hashlib.sha256(deterministic.encode('utf-8')).hexdigest()[:12]}"
         return cls(
@@ -361,6 +363,7 @@ class ApprovalGrant:
             single_use=bool(payload.get("single_use", True)),
             consumed=bool(payload.get("consumed", False)),
             reason=str(payload.get("reason") or ""),
+            operator_signature=payload.get("operator_signature"),
         )
 
 

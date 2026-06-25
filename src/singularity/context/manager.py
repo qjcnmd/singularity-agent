@@ -467,15 +467,13 @@ class ContextManager:
         model_payload = result_envelope.to_observation_view().to_model_payload()
         preview = str(payload.get("content_preview") or "")
         sensitivity = self.classifier.classify(payload)
-        rendered_preview = (
-            self.redactor.redact_text(preview)
-            if sensitivity in {ContextSensitivity.SECRET, ContextSensitivity.SENSITIVE}
-            else preview
-        )
+        rendered_preview = self.redactor.redact_text(preview)
         if "content" in model_payload:
             model_payload["content"] = rendered_preview
         if "content_preview" in model_payload:
             model_payload["content_preview"] = rendered_preview
+        if isinstance(model_payload.get("error_code"), str):
+            model_payload["error_code"] = self.redactor.redact_text(model_payload["error_code"])
         model_payload["redacted"] = True
         raw_digest = digest_value(payload)
         metadata = {

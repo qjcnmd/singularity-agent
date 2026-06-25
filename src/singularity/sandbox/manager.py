@@ -180,21 +180,19 @@ class SandboxManager:
             and not capabilities.network_isolation
         ):
             # Fail-closed: the profile denies network access but the selected
-            # backend cannot enforce network isolation. Record a violation
-            # instead of silently running with an unenforced denial.
-            violations.append(
-                SandboxViolation(
-                    violation_type="network_denial_unenforced",
-                    message=(
-                        f"Backend {backend.name()} cannot enforce denied network mode; "
-                        "network access is not isolated."
-                    ),
-                    severity="warning",
-                    evidence={
-                        "backend": backend.name(),
-                        "network_mode": request.profile.network.mode.value,
-                    },
-                )
+            # backend cannot enforce network isolation. Refuse to run rather
+            # than silently executing with an unenforced denial.
+            raise SandboxCapabilityError(
+                f"Backend {backend.name()} cannot enforce denied network mode; "
+                "network access is not isolated."
+            )
+        if (
+            request.profile.filesystem.mode == SandboxFilesystemMode.READ_ONLY_WORKSPACE
+            and not capabilities.readonly_mount
+        ):
+            raise SandboxCapabilityError(
+                "Backend cannot enforce read-only workspace; "
+                "write operations would not be blocked."
             )
         if request.profile.resources.max_memory_mb is not None and not capabilities.memory_limit:
             raise SandboxCapabilityError("Backend cannot enforce memory limits.")

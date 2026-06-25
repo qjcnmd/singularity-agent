@@ -142,7 +142,7 @@ def test_sandbox_required_without_backend_does_not_execute(tmp_path: Path) -> No
 
 
 def test_default_approval_grants_path_lives_outside_workspace(tmp_path: Path) -> None:
-    # P0-1: Default grant store must live under the policy home
+    # Trust boundary: default grant store must live under the policy home
     # (``~/.singularity/policy/`` in production, redirected via
     # ``SINGULARITY_POLICY_HOME`` in tests) so the model cannot forge grants
     # via shell writes inside the workspace. We use a subdirectory as the
@@ -159,7 +159,7 @@ def test_default_approval_grants_path_lives_outside_workspace(tmp_path: Path) ->
 
 
 def test_default_audit_log_path_lives_outside_workspace(tmp_path: Path) -> None:
-    # P0-1: Default audit log path must also live outside the workspace.
+    # Trust boundary: default audit log path must also live outside the workspace.
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     config = PolicyConfig(workspace_root=workspace)
@@ -170,7 +170,7 @@ def test_default_audit_log_path_lives_outside_workspace(tmp_path: Path) -> None:
 
 
 def test_grant_store_inside_workspace_is_untrusted(tmp_path: Path) -> None:
-    # P0-1: Grant stores inside the workspace are untrusted.
+    # Trust boundary: grant stores inside the workspace are untrusted.
     inside_config = PolicyConfig(
         workspace_root=tmp_path,
         approval_grants_path=tmp_path / ".singularity" / "policy" / "approval_grants.jsonl",
@@ -187,10 +187,10 @@ def test_grant_store_inside_workspace_is_untrusted(tmp_path: Path) -> None:
 
 
 def test_repeated_import_without_grant_id_does_not_amplify(tmp_path: Path) -> None:
-    # P0-3: Repeated import of the same grant payload (without grant_id)
-    # must not amplify a single approval into multiple consumable grants.
-    # ``ApprovalGrant.from_dict`` generates a deterministic grant_id from
-    # ``decision_id`` + ``request_id`` + ``approved_by``, and
+    # Grant identity: repeated import of the same grant payload (without
+    # grant_id) must not amplify a single approval into multiple consumable
+    # grants. ``ApprovalGrant.from_dict`` generates a deterministic grant_id
+    # from ``decision_id`` + ``request_id`` + ``approved_by``, and
     # ``register_grant`` dedups by grant_id OR decision_id, so the second
     # import replaces the first instead of appending a new consumable grant.
     from singularity.policy import ApprovalGrant, ApprovalScope
@@ -252,10 +252,11 @@ def test_repeated_import_without_grant_id_does_not_amplify(tmp_path: Path) -> No
 
 
 def test_register_grant_dedups_by_decision_id(tmp_path: Path) -> None:
-    # P0-3: Even when two grants carry different grant_ids, registering a
-    # grant with the same decision_id as an existing one must replace the
-    # prior entry instead of appending a second consumable grant. This
-    # prevents a reviewer from inflating a single decision into many grants.
+    # Grant identity: even when two grants carry different grant_ids,
+    # registering a grant with the same decision_id as an existing one must
+    # replace the prior entry instead of appending a second consumable grant.
+    # This prevents a reviewer from inflating a single decision into many
+    # grants.
     from singularity.policy import ApprovalGrant, ApprovalScope
 
     grants_path = tmp_path / "outside_grants.jsonl"

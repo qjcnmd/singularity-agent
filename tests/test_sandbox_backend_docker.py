@@ -79,7 +79,7 @@ def test_docker_backend_builds_cli_command_with_staged_workspace_and_limits(
     assert result.stdout == "ok\n"
     command = completed_commands[0]
     assert command[:3] == ["docker", "run", "--rm"]
-    # Security hardening params (P1-3): --name, --user, --cap-drop=ALL,
+    # Sandbox hardening params: --name, --user, --cap-drop=ALL,
     # --security-opt no-new-privileges, --init must be present.
     assert "--name" in command
     assert command[command.index("--name") + 1] == f"singularity-{prepared.sandbox_id}"

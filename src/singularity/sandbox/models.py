@@ -299,6 +299,7 @@ class SandboxArtifact:
     kind: str = "generic"
     sha256: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    redacted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -311,6 +312,7 @@ class SandboxArtifact:
             "kind": self.kind,
             "sha256": self.sha256,
             "metadata": self.metadata,
+            "redacted": self.redacted,
         }
 
 

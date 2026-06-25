@@ -19,7 +19,7 @@ tempfile.tempdir = str(_PYTEST_TEMP_ROOT)
 def _isolate_policy_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Redirect default policy paths to a per-test tmp directory.
 
-    P0-1 moved default approval-grant and audit-log paths to
+    Trust boundary: default approval-grant and audit-log paths were moved to
     ``~/.singularity/policy/``. Tests must not write to the real home
     directory, so each test gets an isolated policy home under ``tmp_path``
     via the ``SINGULARITY_POLICY_HOME`` environment variable. This only

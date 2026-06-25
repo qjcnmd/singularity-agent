@@ -10,6 +10,10 @@ Source paths:
 - src/singularity/tools/models.py
 - src/singularity/planner/engine.py
 - src/singularity/context/manager.py
+- src/singularity/sandbox/manager.py
+- src/singularity/sandbox/artifacts.py
+- src/singularity/sandbox/exceptions.py
+- src/singularity/sandbox/models.py
 
 Symbols:
 - ToolProtocolEngine
@@ -37,6 +41,12 @@ Symbols:
 - Planner.update_from_tool_result
 - ContextManager
 - ContextManager.add_tool_protocol_result
+- SandboxManager
+- SandboxManager.ensure_capabilities
+- SandboxArtifactCollector
+- SandboxArtifactCollector.collect
+- SandboxCapabilityError
+- SandboxCapabilities
 
 Field checks:
 - ToolCallEnvelope: protocol_version, run_id, session_id, task_id, phase_id, model_request_id, model_response_id, assistant_message_id, tool_call_id, tool_name, raw_arguments, parsed_arguments, normalized_arguments, argument_digest, tool_schema_hash, allowed_tool_names, proposed_at, proposed_by_model, parse_status, validation_errors, metadata, phase
@@ -45,6 +55,7 @@ Field checks:
 - ToolProtocolResultEnvelope: tool_call_id, tool_name, ok, status, error_code, error_kind, content_preview, content_digest, raw_result_ref, artifact_refs, observation_id, policy_decision_id, approval_grant_id, truncated, redacted, metadata
 - ToolObservationView: tool_call_id, tool_name, ok, status, visibility, content_preview, content_digest, result_ref, error_code, error_kind, reference_ids, observation_id, truncated, redacted
 - ToolProtocolTurnResult: status, batch_id, executed_count, failed_count, rejected_count, pending_approval_count, appended_tool_message_count, next_action, recovery_report, metadata
+- SandboxCapabilities: filesystem_isolation, copy_on_write, readonly_mount, network_isolation, env_isolation, process_tree_kill, timeout, output_limit, memory_limit, process_limit, artifact_capture, change_detection
 
 ## Module Boundary
 
@@ -65,6 +76,10 @@ It is not responsible for exposing schemas to the model, building the model requ
 - `src/singularity/tools/models.py`: `ToolExecutionRequest`, `ToolResult`, `ToolError`, `ToolSpec`.
 - `src/singularity/planner/engine.py`: `Planner.update_from_tool_result()`.
 - `src/singularity/context/manager.py`: `ContextManager.add_tool_protocol_result()`.
+- `src/singularity/sandbox/manager.py`: `SandboxManager.ensure_capabilities()` enforces capability fail-closed checks before sandboxed execution.
+- `src/singularity/sandbox/artifacts.py`: `SandboxArtifactCollector.collect()` captures stdout/stderr logs and workspace file artifacts with redaction.
+- `src/singularity/sandbox/exceptions.py`: `SandboxCapabilityError` raised when a backend cannot enforce a required isolation capability.
+- `src/singularity/sandbox/models.py`: `SandboxCapabilities` (with `readonly_mount`, `network_isolation`), `SandboxNetworkMode.DENIED`, `SandboxFilesystemMode.READ_ONLY_WORKSPACE`.
 
 ## Runtime Call Chain
 
@@ -106,6 +121,10 @@ The model payload includes bounded/redacted result fields such as `tool_call_id`
 
 Tests in `tests/test_context.py` and `tests/test_tool_protocol_models.py` confirm that policy decision ids, approval grant ids, raw arguments, internal debug metadata, raw metadata, and the envelope-level `artifact_refs` key do not enter the tool message content.
 
+### Protocol Result Unified Redaction
+
+`ContextManager.add_tool_protocol_result()` redacts the model-visible payload unconditionally across all sensitivity levels, matching `add_tool_result()`. Regardless of the `SensitivityClassifier.classify()` result (SECRET/SENSITIVE/WORKSPACE/PUBLIC), `ContextRedactor.redact_text()` is applied to `content_preview` to produce `rendered_preview`, which is then written back into both `model_payload["content"]` and `model_payload["content_preview"]`. When `error_code` is a string it is also passed through `redact_text()`. The payload always carries `redacted: True`. This closes the trust-boundary gap where protocol results previously escaped redaction on lower-sensitivity classifications.
+
 ## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
 
 Internal-only execution data includes:
@@ -131,6 +150,21 @@ Internal-only execution data includes:
 - Handler exceptions return `internal_error` unless cancellation is raised.
 - Protocol validation errors create synthetic `ToolProtocolResultEnvelope` values.
 - `ToolProtocolTurnResult` can be processed, pending approval, rejected, invalid assistant, or no tool calls.
+
+## Sandbox Fail-Closed Semantics
+
+Sandboxed execution is governed by `SandboxManager.ensure_capabilities()`, which refuses to run rather than silently executing with unenforced isolation. The checks raise `SandboxCapabilityError` (caught by `SandboxManager.execute()`, which returns a `BACKEND_UNAVAILABLE` result and emits a `SANDBOX_CAPABILITY_FAILED` trace event) instead of appending a `SandboxViolation`:
+
+- Network DENIED fail-closed: when `request.profile.network.mode == SandboxNetworkMode.DENIED` and the selected backend reports `capabilities.network_isolation` is False, `ensure_capabilities()` raises `SandboxCapabilityError("Backend ... cannot enforce denied network mode; network access is not isolated.")`. The previous behavior of appending a violation and continuing is no longer used; a denied network profile that cannot be enforced fails closed.
+- READ_ONLY_WORKSPACE capability check: when `request.profile.filesystem.mode == SandboxFilesystemMode.READ_ONLY_WORKSPACE` and `capabilities.readonly_mount` is False, `ensure_capabilities()` raises `SandboxCapabilityError("Backend cannot enforce read-only workspace; write operations would not be blocked.")`.
+- The same fail-closed raise applies to required hard network isolation (`require_hard_isolation` without `network_isolation`), memory limits (`max_memory_mb` without `memory_limit`), and process limits (`max_processes` without `process_limit`).
+
+### Sandbox Artifact Redaction
+
+`SandboxArtifactCollector.collect()` (constructed by sandbox backends with a `ContextRedactor`) redacts captured artifacts before persistence:
+
+- Stdout/stderr are written as `stdout.log` / `stderr.log` text artifacts with `redacted=True`.
+- Workspace file artifacts collected via `_write_file_artifact()` are read as bytes; when the bytes decode as UTF-8, the text is passed through `ContextRedactor.redact_text()` before being written and `redacted=True` is set on the `SandboxArtifact`. Non-UTF-8 (binary) files are stored as-is with `redacted=False`. Artifact collection is bounded by `SandboxResourceLimits.max_artifact_bytes` and constrained to paths inside `workspace_root`.
 
 ## Current Structure Assessment
 
@@ -209,7 +243,9 @@ Update this document when changing:
 - `ToolExecutor.execute_request()` admission, cache, replay, handler, output limit, or trace behavior;
 - `ToolProtocolEngine` validation, scheduling, replay, result binding, or context append behavior;
 - `Planner.update_from_tool_result()`;
-- `ContextManager.add_tool_protocol_result()`.
+- `ContextManager.add_tool_protocol_result()` redaction behavior or sensitivity handling;
+- `SandboxManager.ensure_capabilities()` fail-closed checks, `SandboxCapabilities` fields, or `SandboxNetworkMode`/`SandboxFilesystemMode` enforcement;
+- `SandboxArtifactCollector` artifact capture or redaction behavior.
 
 ## Verification
 
@@ -218,4 +254,4 @@ Update this document when changing:
 
 ## Last Verified Against
 
-Last verified against commit `0179eeb36ed7723b5dbc922310871c83931f1df6` on 2026-06-25.
+Last verified against commit `bd75275daccd357b25b5741734ac2740b3a2690f` on 2026-06-25 (Trust Boundary Contract: `ContextManager.add_tool_protocol_result()` now redacts unconditionally across all sensitivity levels matching `add_tool_result()`; sandbox fail-closed semantics in `SandboxManager.ensure_capabilities()` raise `SandboxCapabilityError` for unenforced `SandboxNetworkMode.DENIED` and `SandboxFilesystemMode.READ_ONLY_WORKSPACE` (`readonly_mount`) instead of appending violations; `SandboxArtifactCollector` redacts UTF-8 file artifacts via `ContextRedactor.redact_text()`).

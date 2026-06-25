@@ -41,6 +41,7 @@ from singularity.command import (
 )
 from singularity.sandbox import (
     SandboxManager,
+    SandboxNetworkMode,
     SandboxProfileName,
     SandboxRequest,
     default_sandbox_profile,
@@ -341,6 +342,11 @@ def _command_result(
 
 
 def _sandbox_request(tmp_path: Path) -> SandboxRequest:
+    profile = default_sandbox_profile(
+        SandboxProfileName.ISOLATED_VERIFICATION,
+        workspace_root=tmp_path,
+    )
+    profile.network.mode = SandboxNetworkMode.ALLOWED
     return SandboxRequest(
         sandbox_id="sandbox_manager",
         session_id="session",
@@ -349,8 +355,5 @@ def _sandbox_request(tmp_path: Path) -> SandboxRequest:
         command=[sys.executable, "-c", "print('component')"],
         cwd=tmp_path,
         workspace_root=tmp_path,
-        profile=default_sandbox_profile(
-            SandboxProfileName.ISOLATED_VERIFICATION,
-            workspace_root=tmp_path,
-        ),
+        profile=profile,
     )

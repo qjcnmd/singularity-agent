@@ -18,6 +18,7 @@ Symbols:
 - ContextManager._observe_compaction_committed
 - ContextManager._observe_compaction_failed
 - ContextManager._fallback_messages_for_compaction_failure
+- ContextManager.add_tool_protocol_result
 - CompactionGroup
 - CompactionPlan
 - ContextCompactionPlanner
@@ -89,6 +90,10 @@ It is not responsible for generating the main task model request except through 
 3. `ContextRedactor.redact_text(preview)` is applied unconditionally to `rendered_preview` for every sensitivity level, including PUBLIC and WORKSPACE, so secret patterns matching `SECRET_PATTERNS` are replaced with `<redacted:<digest>>` markers regardless of the classified level.
 4. `ObservationStore.save_observation()` re-runs `SensitivityClassifier.classify()` on `observation.raw_result` and, when the result is SECRET/SENSITIVE and `allow_raw_secret_storage` is False, re-applies `ContextRedactor` to preview and stored result.
 5. `ObservationStore._stored_observation_result()` always wraps the stored raw result through `ContextRedactor.redact_value()`, and `_stored_observation_metadata()` / `_stored_observation_preview()` always redact metadata dicts and previews via `redact_value()` / `redact_text()`.
+
+### Protocol Result Redaction Consistency
+
+`ContextManager.add_tool_protocol_result()` applies the same unconditional redaction contract as `add_tool_result()`. After `SensitivityClassifier.classify()` assigns a `ContextSensitivity` for the `ToolObservation.sensitivity` field, `ContextRedactor.redact_text()` is applied to the envelope `content_preview` regardless of the classified level (SECRET/SENSITIVE/WORKSPACE/PUBLIC). The redacted text is written back into both `model_payload["content"]` and `model_payload["content_preview"]`, string `error_code` values are passed through `redact_text()`, and the payload always carries `redacted: True`. The resulting `ToolObservation` is persisted via `ObservationStore.save_observation()` and appended as a tool message, so protocol-path results no longer escape redaction on lower-sensitivity classifications.
 
 ## Runtime Objects Passed
 
@@ -170,7 +175,8 @@ Update this document when changing:
 - LLM summary prompt or validation in compaction/compression;
 - snapshot, summary, observation, or bundle persistence in `ObservationStore`;
 - fallback/recovery behavior in `ContextManager` or `ContextCompactionCommitter`;
-- context usage/cache reporting fields.
+- context usage/cache reporting fields;
+- `ContextManager.add_tool_result()` or `ContextManager.add_tool_protocol_result()` redaction behavior or sensitivity handling.
 
 ## Verification
 
@@ -179,4 +185,4 @@ Update this document when changing:
 
 ## Last Verified Against
 
-Last verified against commit `0179eeb36ed7723b5dbc922310871c83931f1df6` on 2026-06-25.
+Last verified against commit `bd75275daccd357b25b5741734ac2740b3a2690f` on 2026-06-25 (Trust Boundary Contract: `ContextManager.add_tool_protocol_result()` redaction consistency — unconditional `ContextRedactor.redact_text()` across all sensitivity levels matching `add_tool_result()`, `redacted: True` always set on the protocol-path `ToolObservation`).

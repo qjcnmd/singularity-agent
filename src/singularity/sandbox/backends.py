@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from singularity.context.redaction import ContextRedactor
 from singularity.observability.redaction import TraceRedactor
 from singularity.sandbox.artifacts import SandboxArtifactCollector
 from singularity.sandbox.environment import SandboxEnvironmentBuilder
@@ -49,7 +50,8 @@ class LocalStagingBackend:
     def __init__(self) -> None:
         self.filesystem = SandboxFilesystemManager()
         self.environment = SandboxEnvironmentBuilder()
-        self.artifacts = SandboxArtifactCollector()
+        self.artifact_redactor = ContextRedactor()
+        self.artifacts = SandboxArtifactCollector(self.artifact_redactor)
         self.redactor = TraceRedactor()
 
     def name(self) -> str:
@@ -194,6 +196,14 @@ class LocalStagingBackend:
         capabilities = self.capabilities()
         if request.profile.network.require_hard_isolation and not capabilities.network_isolation:
             raise SandboxCapabilityError("Backend cannot enforce required network isolation.")
+        if (
+            request.profile.filesystem.mode == SandboxFilesystemMode.READ_ONLY_WORKSPACE
+            and not capabilities.readonly_mount
+        ):
+            raise SandboxCapabilityError(
+                "Backend cannot enforce read-only workspace; "
+                "write operations would not be blocked."
+            )
         if request.profile.resources.max_memory_mb is not None and not capabilities.memory_limit:
             raise SandboxCapabilityError("Backend cannot enforce memory limits.")
         if request.profile.resources.max_processes is not None and not capabilities.process_limit:
@@ -243,7 +253,8 @@ class DockerSandboxBackend:
         self.image = image
         self.filesystem = SandboxFilesystemManager()
         self.environment = SandboxEnvironmentBuilder()
-        self.artifacts = SandboxArtifactCollector()
+        self.artifact_redactor = ContextRedactor()
+        self.artifacts = SandboxArtifactCollector(self.artifact_redactor)
         self.redactor = TraceRedactor()
 
     def name(self) -> str:
@@ -253,7 +264,7 @@ class DockerSandboxBackend:
         return SandboxCapabilities(
             filesystem_isolation=True,
             copy_on_write=True,
-            readonly_mount=False,
+            readonly_mount=True,
             network_isolation=True,
             env_isolation=True,
             process_tree_kill=True,

@@ -124,10 +124,10 @@ def test_require_review_uses_approval_gate_and_consumes_grant(tmp_path: Path) ->
 
 
 def test_untrusted_grant_store_inside_workspace_is_not_consumed(tmp_path: Path) -> None:
-    # P0-1: Grants persisted inside the workspace are untrusted and must not
-    # be auto-consumed by ToolExecutor. The pre-registered grant below lives
-    # inside the workspace, so the executor must fall through to resolve(),
-    # which fails closed without an interaction provider.
+    # Trust boundary: grants persisted inside the workspace are untrusted and
+    # must not be auto-consumed by ToolExecutor. The pre-registered grant
+    # below lives inside the workspace, so the executor must fall through to
+    # resolve(), which fails closed without an interaction provider.
     from singularity.policy import (
         ApprovalGrant,
         ApprovalScope,

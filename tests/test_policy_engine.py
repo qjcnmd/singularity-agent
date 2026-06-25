@@ -404,8 +404,9 @@ def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: P
 
 
 def test_policy_hard_denies_writes_to_workspace_policy_dir(tmp_path: Path) -> None:
-    # P0-1: Writes to <workspace>/.singularity/policy/ must be hard-denied so
-    # the model cannot forge approval grants or audit entries via shell writes.
+    # Trust boundary: writes to <workspace>/.singularity/policy/ must be
+    # hard-denied so the model cannot forge approval grants or audit entries
+    # via shell writes.
     component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
 
     policy_grants_path = tmp_path / ".singularity" / "policy" / "approval_grants.jsonl"
@@ -436,7 +437,7 @@ def test_policy_hard_denies_writes_to_workspace_policy_dir(tmp_path: Path) -> No
 
 
 def test_policy_allows_reads_outside_policy_dir(tmp_path: Path) -> None:
-    # P0-1: Reads of normal workspace files must still be allowed.
+    # Trust boundary: reads of normal workspace files must still be allowed.
     component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
     read = component.evaluate(
         req(

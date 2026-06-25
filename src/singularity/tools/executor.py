@@ -730,10 +730,11 @@ class ToolExecutor:
         if decision.outcome == DecisionOutcome.ALLOW:
             return None, decision.approval_grant_id, decision.decision_id
         if decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate is not None:
-            # P0-1: Only consume pre-existing grants when the grant store is
-            # trusted (i.e. lives outside the model-writable workspace). Grants
-            # persisted inside the workspace could have been forged by the model
-            # via shell writes and must not auto-approve subsequent actions.
+            # Trust boundary: only consume pre-existing grants when the grant
+            # store is trusted (i.e. lives outside the model-writable
+            # workspace). Grants persisted inside the workspace could have been
+            # forged by the model via shell writes and must not auto-approve
+            # subsequent actions.
             grant_store_trusted = True
             if hasattr(self.approval_gate, "is_grant_store_trusted"):
                 grant_store_trusted = self.approval_gate.is_grant_store_trusted(self.workspace_root)

@@ -9,6 +9,7 @@ Source paths:
 - src/singularity/policy/config.py
 - src/singularity/policy/rules.py
 - src/singularity/policy/remote.py
+- src/singularity/policy/operator_key.py
 - src/singularity/tools/executor.py
 - src/singularity/planner/engine.py
 
@@ -39,6 +40,14 @@ Symbols:
 - RemoteApprovalExchange.import_grant
 - RemoteApprovalExchange.export_grant
 - RemoteApprovalExchange.register_grant
+- _validate_scope_convergence
+- _operator_signature_payload
+- default_operator_key_path
+- load_operator_key
+- generate_operator_key
+- sign_grant
+- verify_grant_signature
+- operator_fingerprint
 - ToolExecutor
 - Planner
 - Planner.authorize_tool_call
@@ -54,13 +63,14 @@ It is not responsible for provider tool schema exposure or for executing the han
 
 ## Current Source Locations
 
-- `src/singularity/policy/models.py`: `PolicyRequest`, `PolicyDecision`, `ApprovalRequirement`, `ApprovalGrant` (with `from_dict` deterministic id), `PolicyAuditEntry`.
+- `src/singularity/policy/models.py`: `PolicyRequest`, `PolicyDecision`, `ApprovalRequirement`, `ApprovalGrant` (with `from_dict` deterministic id and `operator_signature` field), `PolicyAuditEntry`.
 - `src/singularity/policy/engine.py`: `PolicyEngine.evaluate()` and `enforce()`.
 - `src/singularity/policy/approval.py`: `ApprovalGate.resolve()`, `register_grant()` (dedup by `grant_id` OR `decision_id`), `is_grant_store_trusted()`, `grants_store_path()`, and grant persistence.
-- `src/singularity/policy/config.py`: `PolicyConfig` and `_default_policy_home()` (resolves `SINGULARITY_POLICY_HOME` or `Path.home()`; default grant/audit paths live under `<policy_home>/.singularity/policy/`).
+- `src/singularity/policy/config.py`: `PolicyConfig` (with `operator_key_path` field) and `_default_policy_home()` (resolves `SINGULARITY_POLICY_HOME` or `Path.home()`; default grant/audit paths live under `<policy_home>/.singularity/policy/`).
 - `src/singularity/policy/rules.py`: `DefaultLocalPolicyRules._decide()` and `_targets_workspace_policy_dir()` hard-deny writes to `<workspace>/.singularity/policy/`.
 - `src/singularity/policy/audit.py`: JSONL audit writer and redaction.
-- `src/singularity/policy/remote.py`: `RemoteApprovalExchange.import_grant()` (validates `request_digest` and scope convergence), `export_grant()`, `register_grant()`.
+- `src/singularity/policy/operator_key.py`: operator key management for remote approval grant signing. `default_operator_key_path()` (respects `SINGULARITY_POLICY_HOME`), `load_operator_key()`, `generate_operator_key()`, `sign_grant()` (HMAC-SHA256), `verify_grant_signature()` (constant-time compare via `hmac.compare_digest`), `operator_fingerprint()`.
+- `src/singularity/policy/remote.py`: `RemoteApprovalExchange.import_grant()` (validates `operator_signature`, `request_digest`, and scope convergence; ignores explicit `grant_id`), `export_grant()` (signs grant with operator key), `register_grant()`.
 - `src/singularity/tools/executor.py`: `_enforce_policy()` builds request, checks grant store trustworthiness before consuming grants, and turns outcomes into tool failures or grants.
 - `src/singularity/planner/engine.py`: `Planner.authorize_tool_call()` and `record_policy_observation()`.
 
@@ -75,7 +85,7 @@ It is not responsible for provider tool schema exposure or for executing the han
 7. `ToolExecutor` checks `ApprovalGate.is_grant_store_trusted(workspace_root)` before consuming any grant. When the configured grant store resolves inside the workspace, grants are treated as untrusted (model-forgeable) and `consume_matching_grant()` is skipped; execution falls through to `resolve()`.
 8. When the store is trusted, `ToolExecutor` checks `ApprovalGate.find_matching_grant()` or `consume_matching_grant()` against grants persisted under `<policy_home>/.singularity/policy/approval_grants.jsonl`.
 9. Without a grant, `ApprovalGate.resolve()` either returns a new `ApprovalGrant` or raises `PolicyDenied`, `ApprovalRequired`, `PolicyAskUserRequired`, `PolicyEscalationRequired`, `SandboxRequired`, or `ApprovalDenied`.
-10. Remote approvals flow through `RemoteApprovalExchange.import_grant()`, which validates the `request_digest` against a recomputed `stable_hash({"request", "decision"})`, checks `grant.scope` is a subset of `decision.required_approval.scope`, then registers the grant via `ApprovalGate.register_grant()`.
+10. Remote approvals flow through `RemoteApprovalExchange.import_grant()`, which first verifies the `operator_signature` (HMAC-SHA256 over the canonical grant payload using the operator key at `PolicyConfig.operator_key_path`), then validates the `request_digest` against a recomputed `stable_hash({"request", "decision"})`, checks `grant.scope` is a subset of `decision.required_approval.scope` via `_validate_scope_convergence()` across eight dimensions (capabilities/path_globs/command_patterns/network_hosts/single_use/session_only/max_duration_seconds/max_files), and ignores any explicit `grant_id` in favor of deterministic derivation, then registers the grant via `ApprovalGate.register_grant()`. `export_grant()` signs the grant payload with the operator key before writing.
 11. `ApprovalGate.register_grant()` dedups by `grant_id` OR `decision_id`: a single decision can only have one active grant, so repeated imports of the same grant (which resolve to the same deterministic `grant_id` via `ApprovalGrant.from_dict`) replace the prior entry instead of appending.
 12. `ToolExecutor` converts blocked outcomes into `ToolResult.failure()`.
 13. `Planner.record_policy_observation()` can store policy observations into planner evidence and context.
@@ -86,7 +96,7 @@ It is not responsible for provider tool schema exposure or for executing the han
 - `PolicyRequest`: `request_id`, `session_id`, `task_id`, `phase_id`, `action_id`, `component`, `operation`, `capability`, `subject`, `resource`, `reason`, `proposed_by_model`, `risk_tags`, `metadata`, `evidence_refs`, `reversible`, `requires_network`, `touches_workspace`, `touches_secrets`, `destructive`, `long_running`, `interactive`, `workspace_root`.
 - `PolicyDecision`: `decision_id`, `request_id`, `outcome`, `reason`, `risk_level`, `risk_tags`, `user_message`, `constraints`, `required_approval`, `rule_ids`, `audit_severity`, `context_summary`, `approval_grant_id`.
 - `ApprovalRequirement`: `message`, `scope`, `review_kind`, `details`.
-- `ApprovalGrant`: `grant_id`, `decision_id`, `request_id`, `approved_by`, `scope`, `session_id`, `approved_at`, `expires_at`, `single_use`, `consumed`, `reason`. `ApprovalGrant.from_dict()` generates a deterministic `grant_id` from `sha256(decision_id + ":" + request_id + ":" + approved_by)[:12]` when the payload omits `grant_id`, so repeated imports of the same grant collapse to a single entry instead of minting new random ids.
+- `ApprovalGrant`: `grant_id`, `decision_id`, `request_id`, `approved_by`, `scope`, `session_id`, `approved_at`, `expires_at`, `single_use`, `consumed`, `reason`, `operator_signature`. `ApprovalGrant.from_dict()` generates a deterministic `grant_id` from `sha256(decision_id + ":" + request_id + ":" + approved_by)[:12]` when the payload omits `grant_id`, so repeated imports of the same grant collapse to a single entry instead of minting new random ids. `operator_signature` is an HMAC-SHA256 hex digest produced by `sign_grant()` over the canonical grant payload; `import_grant()` ignores explicit `grant_id` values and always uses deterministic derivation.
 - `PolicyAuditEntry`: timestamp and normalized request/decision summary for audit logs.
 
 ## Model-Visible Objects (模型实际可见对象)
@@ -109,7 +119,8 @@ Internal-only data includes:
 - `PolicyDecision.required_approval`, constraints, rule ids, audit severity, and approval grant id;
 - `PolicyAuditEntry` JSONL rows persisted under `<policy_home>/.singularity/policy/audit.jsonl` (outside the workspace by default);
 - approval grants persisted under `<policy_home>/.singularity/policy/approval_grants.jsonl` (outside the workspace by default; `PolicyConfig.approval_grants_path` may override it, but `ApprovalGate.is_grant_store_trusted()` will report stores inside the workspace as untrusted);
-- remote approval request/grant exchange files carrying `request_digest`, request payload, decision payload, and grant payload;
+- remote approval request/grant exchange files carrying `request_digest`, request payload, decision payload, grant payload, and `operator_signature` (HMAC-SHA256 over the canonical grant payload);
+- the operator key at `<policy_home>/.singularity/policy/operator.pem` (never logged, printed, or committed; used only for HMAC signing/verification);
 - trace event ids, policy decision ids, approval grant ids, and redacted resource identifiers;
 - `ApprovalGate` interaction prompts and user decisions.
 
@@ -123,7 +134,7 @@ Internal-only data includes:
 - `ApprovalGate.resolve()` can return an `ApprovalGrant`, raise an approval-required error, or raise a denial/user-input/sandbox/escalation exception.
 - Matching grants can be consumed and written back as consumed.
 - `ApprovalGate.register_grant()` dedups by `grant_id` OR `decision_id`: a second grant sharing either value replaces the prior entry, so one decision cannot accumulate multiple active grants.
-- `RemoteApprovalExchange.import_grant()` raises `ValueError` when `request_digest` is missing or does not match the recomputed `stable_hash({"request", "decision"})`, when `grant.scope` exceeds `decision.required_approval.scope` (capabilities/path_globs/command_patterns/network_hosts), or when envelope and grant `request_id`/`decision_id` disagree.
+- `RemoteApprovalExchange.import_grant()` raises `ValueError` when `operator_signature` is missing or fails `verify_grant_signature()` (constant-time HMAC-SHA256 comparison), when `request_digest` is missing or does not match the recomputed `stable_hash({"request", "decision"})`, when `grant.scope` exceeds `decision.required_approval.scope` across any of the eight convergence dimensions (capabilities/path_globs/command_patterns/network_hosts/single_use/session_only/max_duration_seconds/max_files — enforced by `_validate_scope_convergence()`), or when envelope and grant `request_id`/`decision_id` disagree. Explicit `grant_id` values in the payload are always ignored in favor of deterministic derivation.
 - `Planner.authorize_tool_call()` can still deny after policy allow if the tool is not phase-allowed, violates an active repair contract, violates benchmark constraints, violates user constraints, or risk escalates.
 - Policy and approval events are emitted with warning severity when blocked.
 
@@ -160,8 +171,9 @@ Update this document when changing:
 - `ApprovalGate.resolve()`, `register_grant()`, grant matching/consumption, or grant store trust checks;
 - `_default_policy_home()` or default grant/audit path resolution;
 - `_targets_workspace_policy_dir()` or the workspace policy dir hard-deny rule;
-- `RemoteApprovalExchange.import_grant()` digest/scope validation or `export_grant()`;
-- `ApprovalGrant.from_dict()` deterministic id generation;
+- `RemoteApprovalExchange.import_grant()` digest/scope/operator-signature validation or `export_grant()` signing;
+- `ApprovalGrant.from_dict()` deterministic id generation or `operator_signature` field handling;
+- operator key management in `singularity.policy.operator_key` (path resolution, signing, verification);
 - policy handling in `ToolExecutor`;
 - planner authorization or policy observation recording;
 - redaction of policy/audit/approval payloads.
@@ -173,4 +185,4 @@ Update this document when changing:
 
 ## Last Verified Against
 
-Last verified against commit `0179eeb36ed7723b5dbc922310871c83931f1df6` on 2026-06-25 (P0-1/P0-2/P0-3 approval hardening: grant store relocated outside workspace, workspace policy dir write hard-deny, remote grant digest + scope convergence validation, deterministic grant_id + decision_id dedup).
+Last verified against commit `bd75275daccd357b25b5741734ac2740b3a2690f` on 2026-06-25 (Trust Boundary Contract: operator HMAC signature chain on remote approval grants via `singularity.policy.operator_key` — `sign_grant`/`verify_grant_signature` (HMAC-SHA256, constant-time compare), `import_grant` requires `operator_signature` and forces deterministic `grant_id` derivation by ignoring payload-supplied ids, `export_grant` attaches the signature, `_validate_scope_convergence` covers 8 dimensions — capabilities/path_globs/command_patterns/network_hosts/single_use/session_only/max_duration_seconds/max_files; P0-1/P0-2/P0-3 approval hardening retained: grant store relocated outside workspace, workspace policy dir write hard-deny, remote grant digest validation, deterministic grant_id + decision_id dedup).

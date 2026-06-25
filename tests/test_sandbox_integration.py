@@ -22,9 +22,11 @@ class SandboxRequiredPolicy(PolicyEngine):
         *,
         hard_network: bool = False,
         security_mode: SecurityMode = SecurityMode.STRICT,
+        network_allowed: bool = False,
     ) -> None:
         super().__init__(PolicyConfig(workspace_root=root, security_mode=security_mode))
         self.hard_network = hard_network
+        self.network_allowed = network_allowed
 
     def enforce(self, request):  # type: ignore[no-untyped-def]
         return PolicyDecision(
@@ -34,7 +36,7 @@ class SandboxRequiredPolicy(PolicyEngine):
             constraints=PolicyConstraints(
                 sandbox_required=True,
                 filesystem_mode="copy_on_write_workspace",
-                network_allowed=False,
+                network_allowed=self.network_allowed,
                 max_duration_seconds=request.metadata.get("timeout"),
                 max_output_chars=20000,
                 allowed_hosts=["hard-network-required"] if self.hard_network else [],
@@ -48,6 +50,7 @@ def test_command_executor_routes_sandbox_required_command_without_real_workspace
         policy_engine=SandboxRequiredPolicy(
             tmp_path,
             security_mode=SecurityMode.COMPAT,
+            network_allowed=True,
         ),
     )
 
@@ -106,6 +109,7 @@ testpaths = ["tests"]
         policy_engine=SandboxRequiredPolicy(
             tmp_path,
             security_mode=SecurityMode.COMPAT,
+            network_allowed=True,
         ),
     )
     component = VerificationRunner(
@@ -114,6 +118,7 @@ testpaths = ["tests"]
         policy_engine=SandboxRequiredPolicy(
             tmp_path,
             security_mode=SecurityMode.COMPAT,
+            network_allowed=True,
         ),
     )
 

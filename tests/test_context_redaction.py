@@ -1,11 +1,13 @@
 import json
 import sqlite3
+from typing import Any
 
 from singularity.context import ContextManager
 from singularity.context.models import ContextSensitivity
 from singularity.context.redaction import ContextRedactor, SensitivityClassifier
 from singularity.context.tokens import TokenCounter
 from singularity.provider import ToolChoiceMode
+from singularity.tool_protocol.models import ToolProtocolResultEnvelope
 
 
 def test_context_redactor_classifies_and_redacts_secret_patterns() -> None:
@@ -231,3 +233,69 @@ class _CompressionProvider:
                 }
             ]
         }
+
+
+class _StubClassifier:
+    def __init__(self, level: ContextSensitivity) -> None:
+        self.level = level
+
+    def classify(self, value: Any) -> ContextSensitivity:
+        return self.level
+
+
+def test_add_tool_protocol_result_redacts_all_sensitivity_levels(tmp_path) -> None:
+    for level in (ContextSensitivity.WORKSPACE, ContextSensitivity.PUBLIC):
+        context = ContextManager(
+            system_prompt="system",
+            user_goal="inspect",
+            db_path=tmp_path / f"context_{level.value}.sqlite3",
+            token_counter=TokenCounter(model="gpt-4o-mini"),
+        )
+        context.classifier = _StubClassifier(level)
+        envelope = ToolProtocolResultEnvelope(
+            tool_call_id="call_secret",
+            tool_name="read_file",
+            ok=True,
+            status="ok",
+            content_preview="loaded key sk-test123 for upload",
+            content_digest="digest_1",
+        )
+
+        observation = context.add_tool_protocol_result(envelope)
+
+        tool_message = context.messages()[-1]
+        payload = json.loads(tool_message["content"])
+        assert observation.sensitivity == level
+        assert "sk-test123" not in observation.preview
+        assert "sk-test123" not in tool_message["content"]
+        assert "<redacted:" in observation.preview
+        assert payload["redacted"] is True
+        assert payload["content_preview"] == observation.preview
+        context.close()
+
+
+def test_add_tool_protocol_result_redacts_error_code_field(tmp_path) -> None:
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="inspect",
+        db_path=tmp_path / "context_error.sqlite3",
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+    envelope = ToolProtocolResultEnvelope(
+        tool_call_id="call_err",
+        tool_name="read_file",
+        ok=False,
+        status="error",
+        error_code="auth failed for token sk-test123",
+        content_preview="permission denied",
+        content_digest="digest_err",
+    )
+
+    observation = context.add_tool_protocol_result(envelope)
+
+    tool_message = context.messages()[-1]
+    payload = json.loads(tool_message["content"])
+    assert "sk-test123" not in tool_message["content"]
+    assert "<redacted:" in payload["error_code"]
+    assert payload["redacted"] is True
+    context.close()

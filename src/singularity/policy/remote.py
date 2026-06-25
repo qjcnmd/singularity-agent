@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from singularity.policy.approval import ApprovalGate
 from singularity.policy.models import (
@@ -21,6 +22,11 @@ from singularity.policy.models import (
     PolicySubject,
     ResourceRef,
     stable_hash,
+)
+from singularity.policy.operator_key import (
+    load_operator_key,
+    sign_grant,
+    verify_grant_signature,
 )
 
 
@@ -52,11 +58,18 @@ class RemoteApprovalExchange:
     scoped grant back into the local ApprovalGate.
     """
 
-    def __init__(self, workspace_root: Path | str, *, approval_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace_root: Path | str,
+        *,
+        approval_dir: Path | None = None,
+        operator_key_path: Path | None = None,
+    ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)
         self.approval_dir = approval_dir or (
             self.workspace_root / ".singularity" / "remote" / "approvals"
         )
+        self.operator_key_path = operator_key_path
 
     def export_request(
         self,
@@ -104,12 +117,21 @@ class RemoteApprovalExchange:
     ) -> Path:
         """Build a grant payload from an exported request and a grant.
 
-        P0-2/P0-3: The grant payload carries the original request/decision
-        and ``request_digest`` so the importer can validate integrity and
-        scope convergence. Reviewers should use this helper to produce
+        Remote grant integrity and identity: the grant payload carries the
+        original request/decision and ``request_digest`` so the importer can
+        validate integrity and scope convergence. The grant is also signed
+        with the operator key so importers can verify it was produced by a
+        trusted operator and not forged by a process with write access to
+        the grant store. Reviewers should use this helper to produce
         well-formed grant files.
         """
         request_export = _read_json(request_export_path)
+        grant_dict = grant.to_dict()
+        # Operator signature: bind the grant payload to the operator key so
+        # importers can verify the grant was produced by a trusted operator.
+        operator_key = load_operator_key(self.operator_key_path)
+        signature_payload = _operator_signature_payload(grant_dict)
+        grant_dict["operator_signature"] = sign_grant(signature_payload, operator_key)
         grant_payload: dict[str, object] = {
             "schema_version": GRANT_SCHEMA,
             "created_at": _now(),
@@ -118,7 +140,7 @@ class RemoteApprovalExchange:
             "request": request_export.get("request"),
             "decision": request_export.get("decision"),
             "request_digest": request_export.get("request_digest"),
-            "grant": grant.to_dict(),
+            "grant": grant_dict,
         }
         path = output_path or self.approval_dir / f"{grant.grant_id}.grant.json"
         _write_json(path, grant_payload)
@@ -131,7 +153,28 @@ class RemoteApprovalExchange:
         grant_payload = payload.get("grant")
         if not isinstance(grant_payload, dict):
             raise ValueError("Remote approval grant payload must contain a grant object.")
-        grant = ApprovalGrant.from_dict(grant_payload)
+
+        # Operator signature: required for all imported grants. This binds
+        # the approver identity to a cryptographic secret held outside the
+        # workspace, preventing grant forgery by processes that can write
+        # to the grant store. A missing or invalid signature is rejected
+        # before any further validation.
+        operator_signature = grant_payload.get("operator_signature")
+        if not isinstance(operator_signature, str) or not operator_signature:
+            raise ValueError("Remote approval grant must include operator_signature.")
+        operator_key = load_operator_key(self.operator_key_path)
+        signature_payload = _operator_signature_payload(grant_payload)
+        if not verify_grant_signature(signature_payload, operator_signature, operator_key):
+            raise ValueError("Remote approval grant operator_signature verification failed.")
+
+        # Force ignore explicit grant_id: always use deterministic derivation
+        # so a forged grant_id cannot collide with or override existing grants.
+        # The deterministic id is derived from decision_id + request_id +
+        # approved_by inside ``ApprovalGrant.from_dict``.
+        grant_payload_for_import = dict(grant_payload)
+        grant_payload_for_import.pop("grant_id", None)
+        grant = ApprovalGrant.from_dict(grant_payload_for_import)
+
         request_id = payload.get("request_id")
         decision_id = payload.get("decision_id")
         if request_id and grant.request_id != request_id:
@@ -141,9 +184,9 @@ class RemoteApprovalExchange:
         if not grant.approved_by.strip():
             raise ValueError("Remote approval grant must identify approved_by.")
 
-        # P0-2: Validate request_digest to prevent tampering with the
-        # request/decision payload. The digest must be present and match the
-        # recomputed hash of the request and decision payloads.
+        # Remote grant integrity: validate request_digest to prevent tampering
+        # with the request/decision payload. The digest must be present and
+        # match the recomputed hash of the request and decision payloads.
         request_payload = payload.get("request")
         decision_payload = payload.get("decision")
         request_digest = payload.get("request_digest")
@@ -157,8 +200,9 @@ class RemoteApprovalExchange:
         if recomputed_digest != request_digest:
             raise ValueError("Remote approval grant request_digest does not match payload.")
 
-        # P0-2: Validate scope convergence. The grant scope must be a subset
-        # of the required approval scope from the decision payload.
+        # Remote grant integrity: validate scope convergence. The grant scope
+        # must be a subset of the required approval scope from the decision
+        # payload.
         _validate_scope_convergence(grant, decision_payload)
 
         return grant
@@ -169,12 +213,44 @@ class RemoteApprovalExchange:
         return grant
 
 
+def _operator_signature_payload(grant_dict: dict[str, Any]) -> dict[str, Any]:
+    """Build the canonical payload signed by the operator key.
+
+    The signature covers the grant fields that bind the approver to the
+    approval decision and scope. The ``operator_signature`` field itself
+    is excluded so the signature is stable across export/import.
+    """
+    scope = grant_dict.get("scope")
+    if not isinstance(scope, dict):
+        scope = {}
+    return {
+        "decision_id": grant_dict.get("decision_id", ""),
+        "request_id": grant_dict.get("request_id", ""),
+        "approved_by": grant_dict.get("approved_by", ""),
+        "scope": scope,
+        "single_use": grant_dict.get("single_use", True),
+        "session_only": scope.get("session_only", True),
+    }
+
+
 def _validate_scope_convergence(grant: ApprovalGrant, decision_payload: dict[str, object]) -> None:
-    """P0-2: Ensure the grant scope is a subset of the required approval scope.
+    """Remote grant integrity: ensure the grant scope is a subset of the required approval scope.
 
     Without this check, a malicious reviewer could attach a wide-open scope
     (e.g. ``path_globs=["*"]``) to a grant that was only approved for a single
     file, amplifying a single approval into blanket access.
+
+    Convergence is enforced across eight dimensions so the grant can never be
+    wider than what the required approval permitted:
+
+    - ``capabilities``: grant capabilities must be a subset of required.
+    - ``path_globs``: grant path globs must be a subset of required.
+    - ``command_patterns``: grant command patterns must be a subset of required.
+    - ``network_hosts``: grant network hosts must be a subset of required.
+    - ``single_use``: when required is single-use, the grant must also be.
+    - ``session_only``: when required is session-only, the grant must also be.
+    - ``max_duration_seconds``: grant must not exceed the required duration cap.
+    - ``max_files``: grant must not exceed the required file count cap.
     """
     required_approval = decision_payload.get("required_approval")
     if not isinstance(required_approval, dict):
@@ -217,6 +293,36 @@ def _validate_scope_convergence(grant: ApprovalGrant, decision_payload: dict[str
         raise ValueError(
             "Remote approval grant network_hosts exceed the required approval scope."
         )
+
+    # Grant must be at least as restrictive as required: if required is
+    # single_use, the grant must also be single_use.
+    required_single_use = required_scope.get("single_use")
+    if required_single_use is True and not grant.scope.single_use:
+        raise ValueError(
+            "Remote approval grant single_use must be True when required scope is single_use."
+        )
+
+    required_session_only = required_scope.get("session_only")
+    if required_session_only is True and not grant.scope.session_only:
+        raise ValueError(
+            "Remote approval grant session_only must be True when required scope is session_only."
+        )
+
+    required_max_duration = required_scope.get("max_duration_seconds")
+    if required_max_duration is not None:
+        grant_max_duration = grant.scope.max_duration_seconds
+        if grant_max_duration is None or grant_max_duration > required_max_duration:
+            raise ValueError(
+                "Remote approval grant max_duration_seconds exceeds the required approval scope."
+            )
+
+    required_max_files = required_scope.get("max_files")
+    if required_max_files is not None:
+        grant_max_files = grant.scope.max_files
+        if grant_max_files is None or grant_max_files > required_max_files:
+            raise ValueError(
+                "Remote approval grant max_files exceeds the required approval scope."
+            )
 
 
 def _policy_request_from_dict(payload: dict[str, object]) -> PolicyRequest:

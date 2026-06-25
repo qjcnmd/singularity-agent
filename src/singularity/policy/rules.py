@@ -85,8 +85,8 @@ class DefaultLocalPolicyRules:
         if disabled is not None:
             return disabled
 
-        # P0-1: Hard-deny any write/command operation that targets the
-        # workspace-local policy directory. This prevents the model from
+        # Trust boundary: hard-deny any write/command operation that targets
+        # the workspace-local policy directory. This prevents the model from
         # forging approval grants or audit entries through shell writes.
         if _targets_workspace_policy_dir(request, config):
             return RuleResult(
@@ -460,10 +460,10 @@ _POLICY_DIR_WRITE_OPERATIONS = {
 def _targets_workspace_policy_dir(request: PolicyRequest, config: PolicyConfig) -> bool:
     """Detect attempts to write to ``<workspace>/.singularity/policy/``.
 
-    P0-1: The workspace-local policy directory previously stored approval
-    grants and audit logs. Allowing the model to write there would let it
-    forge grants and bypass human approval. This guard hard-denies any
-    write or command operation whose target path resolves under that
+    Trust boundary: the workspace-local policy directory previously stored
+    approval grants and audit logs. Allowing the model to write there would
+    let it forge grants and bypass human approval. This guard hard-denies
+    any write or command operation whose target path resolves under that
     directory, and also blocks command strings that reference it.
     """
     if request.operation not in _POLICY_DIR_WRITE_OPERATIONS:

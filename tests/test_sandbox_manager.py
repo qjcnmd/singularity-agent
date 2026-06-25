@@ -39,8 +39,12 @@ def sandbox_request(tmp_path: Path) -> SandboxRequest:
 
 def test_sandbox_manager_selects_local_backend_and_writes_trace(tmp_path: Path) -> None:
     component = SandboxManager(tmp_path, backends=[LocalStagingBackend()])
+    request = sandbox_request(tmp_path)
+    # LocalStagingBackend cannot enforce network denial. Use ALLOWED so the
+    # command actually executes; this test verifies trace writing, not isolation.
+    request.profile.network.mode = SandboxNetworkMode.ALLOWED
 
-    result = component.run(sandbox_request(tmp_path))
+    result = component.run(request)
 
     assert result.status == SandboxStatus.SUCCESS
     assert result.backend_name == "local_staging"
@@ -139,6 +143,9 @@ def test_sandbox_manager_selects_later_backend_when_first_lacks_required_capabil
 def test_sandbox_manager_skips_default_docker_for_unsupported_project_toolchain(tmp_path: Path) -> None:
     request = sandbox_request(tmp_path)
     request.command = ["node", "--version"]
+    # Use ALLOWED network so backend selection is driven by toolchain support,
+    # not network isolation capability.
+    request.profile.network.mode = SandboxNetworkMode.ALLOWED
     docker = DockerSandboxBackend()
     docker.is_available = lambda: True  # type: ignore[method-assign]
     windows = WindowsRestrictedTokenBackend()
@@ -179,8 +186,10 @@ def test_sandbox_manager_skips_backend_when_availability_probe_fails(tmp_path: P
         tmp_path,
         backends=[BrokenAvailabilityBackend(), LocalStagingBackend()],
     )
+    request = sandbox_request(tmp_path)
+    request.profile.network.mode = SandboxNetworkMode.ALLOWED
 
-    result = component.run(sandbox_request(tmp_path))
+    result = component.run(request)
 
     assert result.status == SandboxStatus.SUCCESS
     assert result.backend_name == "local_staging"
@@ -198,8 +207,10 @@ def test_sandbox_manager_returns_structured_failure_when_backend_setup_raises(tm
             raise RuntimeError("setup boom")
 
     component = SandboxManager(tmp_path, backends=[SetupFailureBackend()])
+    request = sandbox_request(tmp_path)
+    request.profile.network.mode = SandboxNetworkMode.ALLOWED
 
-    result = component.run(sandbox_request(tmp_path))
+    result = component.run(request)
 
     assert result.status == SandboxStatus.SETUP_FAILED
     assert result.backend_name == "setup_failure"
@@ -281,6 +292,7 @@ def test_sandbox_output_and_log_artifacts_are_redacted(tmp_path: Path) -> None:
         "-c",
         "print('OPENAI_API_KEY=sk-sandbox-secret')",
     ]
+    request.profile.network.mode = SandboxNetworkMode.ALLOWED
     component = SandboxManager(tmp_path, backends=[LocalStagingBackend()])
 
     result = component.run(request)
@@ -354,11 +366,11 @@ def test_read_only_filesystem_mode_maps_to_read_only_workspace(tmp_path: Path) -
     assert request.profile.filesystem.mode == SandboxFilesystemMode.READ_ONLY_WORKSPACE
 
 
-def test_network_denied_fail_closed_produces_violation_on_local_backend(tmp_path: Path) -> None:
+def test_network_denied_fail_closed_on_local_backend(tmp_path: Path) -> None:
     # LocalStagingBackend has network_isolation=False. When the profile
     # denies network access (mode=DENIED), the manager must fail-closed by
-    # recording a SandboxViolation rather than silently running with an
-    # unenforced denial.
+    # refusing to execute rather than silently running with an unenforced
+    # denial.
     component = SandboxManager(tmp_path, backends=[LocalStagingBackend()])
     request = sandbox_request(tmp_path)
     # The default ISOLATED_VERIFICATION profile already sets network.mode=DENIED.
@@ -367,8 +379,30 @@ def test_network_denied_fail_closed_produces_violation_on_local_backend(tmp_path
 
     result = component.run(request)
 
-    violation_types = [violation.violation_type for violation in result.violations]
-    assert "network_denial_unenforced" in violation_types
+    assert result.status == SandboxStatus.BACKEND_UNAVAILABLE
+    assert result.metadata["error_code"] == "sandbox_unavailable"
+    # The command must not have executed: no stdout and no sandbox workspace
+    # side effects.
+    assert result.stdout == ""
+    assert not (tmp_path / "work" / "sandboxes" / "sandbox_manager").exists()
+
+
+def test_read_only_workspace_fails_closed_on_local_backend(tmp_path: Path) -> None:
+    # LocalStagingBackend reports readonly_mount=False (it only does chmod,
+    # which the same user can undo). READ_ONLY_WORKSPACE must fail-closed
+    # rather than silently running with an unenforced read-only mask.
+    component = SandboxManager(tmp_path, backends=[LocalStagingBackend()])
+    request = sandbox_request(tmp_path)
+    # Bypass the network check (tested above) to isolate the readonly check.
+    request.profile.network.mode = SandboxNetworkMode.ALLOWED
+    request.profile.filesystem.mode = SandboxFilesystemMode.READ_ONLY_WORKSPACE
+
+    result = component.run(request)
+
+    assert result.status == SandboxStatus.BACKEND_UNAVAILABLE
+    assert result.metadata["error_code"] == "sandbox_unavailable"
+    assert result.stdout == ""
+    assert not (tmp_path / "work" / "sandboxes" / "sandbox_manager").exists()
 
 
 def test_capability_summary_reflects_selected_backend_not_union(tmp_path: Path) -> None:

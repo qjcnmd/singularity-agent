@@ -113,8 +113,9 @@ def redact(value: Any) -> Any:
 
 def _audit_log_path(config: PolicyConfig) -> Path:
     if config.audit_log_path is None:
-        # P0-1: Default audit log must live outside the model-writable
-        # workspace so the model cannot tamper with audit entries.
+        # Trust boundary: default audit log must live outside the
+        # model-writable workspace so the model cannot tamper with audit
+        # entries.
         from singularity.policy.config import _default_policy_home
         return _default_policy_home() / ".singularity" / "policy" / "audit.jsonl"
     return Path(config.audit_log_path)

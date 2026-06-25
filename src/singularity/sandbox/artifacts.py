@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 from uuid import uuid4
 
+from singularity.context.redaction import ContextRedactor
 from singularity.sandbox.models import (
     SandboxArtifact,
     SandboxResourceLimits,
@@ -11,6 +12,9 @@ from singularity.sandbox.models import (
 
 
 class SandboxArtifactCollector:
+    def __init__(self, redactor: ContextRedactor | None = None) -> None:
+        self.redactor = redactor or ContextRedactor()
+
     def collect(
         self,
         *,
@@ -56,15 +60,11 @@ class SandboxArtifactCollector:
             if budget is not None and used + size > budget:
                 continue
             artifacts.append(
-                SandboxArtifact(
-                    artifact_id=f"artifact_{uuid4().hex[:12]}",
+                self._write_file_artifact(
                     sandbox_id=sandbox_id,
-                    path=candidate,
-                    relative_path=candidate.relative_to(workspace_root).as_posix(),
-                    size_bytes=size,
-                    kind=self._kind_for(candidate),
-                    sha256=hashlib.sha256(candidate.read_bytes()).hexdigest(),
-                    metadata={},
+                    root=artifact_root,
+                    workspace_root=workspace_root,
+                    source=candidate,
                 )
             )
             used += size
@@ -92,6 +92,47 @@ class SandboxArtifactCollector:
             kind=kind,
             sha256=hashlib.sha256(data).hexdigest(),
             metadata={},
+            redacted=True,
+        )
+
+    def _write_file_artifact(
+        self,
+        *,
+        sandbox_id: str,
+        root: Path,
+        workspace_root: Path,
+        source: Path,
+    ) -> SandboxArtifact:
+        raw_bytes = source.read_bytes()
+        relative_path = source.relative_to(workspace_root).as_posix()
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            stored_bytes = raw_bytes
+            redacted = False
+        else:
+            stored_bytes = self.redactor.redact_text(text).encode("utf-8")
+            redacted = True
+        target_dir = root / "files"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / source.name
+        counter = 0
+        while target_path.exists():
+            counter += 1
+            target_path = (
+                target_dir / f"{source.stem}_{counter}{source.suffix}"
+            )
+        target_path.write_bytes(stored_bytes)
+        return SandboxArtifact(
+            artifact_id=f"artifact_{uuid4().hex[:12]}",
+            sandbox_id=sandbox_id,
+            path=target_path,
+            relative_path=relative_path,
+            size_bytes=len(stored_bytes),
+            kind=self._kind_for(source),
+            sha256=hashlib.sha256(stored_bytes).hexdigest(),
+            metadata={},
+            redacted=redacted,
         )
 
     @staticmethod
