@@ -95,6 +95,35 @@ class RemoteApprovalExchange:
         decision = _policy_decision_from_dict(_read_json(decision_path))
         return self.export_request(request, decision, output_path=output_path)
 
+    def export_grant(
+        self,
+        request_export_path: Path,
+        grant: ApprovalGrant,
+        *,
+        output_path: Path | None = None,
+    ) -> Path:
+        """Build a grant payload from an exported request and a grant.
+
+        P0-2/P0-3: The grant payload carries the original request/decision
+        and ``request_digest`` so the importer can validate integrity and
+        scope convergence. Reviewers should use this helper to produce
+        well-formed grant files.
+        """
+        request_export = _read_json(request_export_path)
+        grant_payload: dict[str, object] = {
+            "schema_version": GRANT_SCHEMA,
+            "created_at": _now(),
+            "request_id": request_export.get("request", {}).get("request_id", ""),
+            "decision_id": request_export.get("decision", {}).get("decision_id", ""),
+            "request": request_export.get("request"),
+            "decision": request_export.get("decision"),
+            "request_digest": request_export.get("request_digest"),
+            "grant": grant.to_dict(),
+        }
+        path = output_path or self.approval_dir / f"{grant.grant_id}.grant.json"
+        _write_json(path, grant_payload)
+        return path
+
     def import_grant(self, path: Path) -> ApprovalGrant:
         payload = _read_json(path)
         if payload.get("schema_version") != GRANT_SCHEMA:
@@ -111,12 +140,83 @@ class RemoteApprovalExchange:
             raise ValueError("Remote approval grant decision_id does not match envelope.")
         if not grant.approved_by.strip():
             raise ValueError("Remote approval grant must identify approved_by.")
+
+        # P0-2: Validate request_digest to prevent tampering with the
+        # request/decision payload. The digest must be present and match the
+        # recomputed hash of the request and decision payloads.
+        request_payload = payload.get("request")
+        decision_payload = payload.get("decision")
+        request_digest = payload.get("request_digest")
+        if not request_digest:
+            raise ValueError("Remote approval grant must include request_digest.")
+        if not isinstance(request_payload, dict) or not isinstance(decision_payload, dict):
+            raise ValueError("Remote approval grant must include request and decision payloads.")
+        recomputed_digest = stable_hash(
+            {"request": request_payload, "decision": decision_payload}
+        )
+        if recomputed_digest != request_digest:
+            raise ValueError("Remote approval grant request_digest does not match payload.")
+
+        # P0-2: Validate scope convergence. The grant scope must be a subset
+        # of the required approval scope from the decision payload.
+        _validate_scope_convergence(grant, decision_payload)
+
         return grant
 
     def register_grant(self, path: Path, approval_gate: ApprovalGate) -> ApprovalGrant:
         grant = self.import_grant(path)
         approval_gate.register_grant(grant)
         return grant
+
+
+def _validate_scope_convergence(grant: ApprovalGrant, decision_payload: dict[str, object]) -> None:
+    """P0-2: Ensure the grant scope is a subset of the required approval scope.
+
+    Without this check, a malicious reviewer could attach a wide-open scope
+    (e.g. ``path_globs=["*"]``) to a grant that was only approved for a single
+    file, amplifying a single approval into blanket access.
+    """
+    required_approval = decision_payload.get("required_approval")
+    if not isinstance(required_approval, dict):
+        return
+    required_scope = required_approval.get("scope")
+    if not isinstance(required_scope, dict):
+        return
+
+    required_capabilities = {
+        str(item) for item in _list_payload(required_scope.get("capabilities"))
+    }
+    required_path_globs = {
+        str(item) for item in _list_payload(required_scope.get("path_globs"))
+    }
+    required_command_patterns = {
+        str(item) for item in _list_payload(required_scope.get("command_patterns"))
+    }
+    required_network_hosts = {
+        str(item) for item in _list_payload(required_scope.get("network_hosts"))
+    }
+
+    grant_capabilities = {capability.value for capability in grant.scope.capabilities}
+    if required_capabilities and not grant_capabilities.issubset(required_capabilities):
+        raise ValueError(
+            "Remote approval grant capabilities exceed the required approval scope."
+        )
+    if required_path_globs and not set(grant.scope.path_globs).issubset(required_path_globs):
+        raise ValueError(
+            "Remote approval grant path_globs exceed the required approval scope."
+        )
+    if required_command_patterns and not set(grant.scope.command_patterns).issubset(
+        required_command_patterns
+    ):
+        raise ValueError(
+            "Remote approval grant command_patterns exceed the required approval scope."
+        )
+    if required_network_hosts and not set(grant.scope.network_hosts).issubset(
+        required_network_hosts
+    ):
+        raise ValueError(
+            "Remote approval grant network_hosts exceed the required approval scope."
+        )
 
 
 def _policy_request_from_dict(payload: dict[str, object]) -> PolicyRequest:

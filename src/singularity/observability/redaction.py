@@ -31,7 +31,16 @@ PRIVATE_KEY_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 TOKEN_VALUE_RE = re.compile(
-    r"\b(sk-[A-Za-z0-9._\-]+|gh[pousr]_[A-Za-z0-9_]+|npm_[A-Za-z0-9_]+)\b"
+    r"\b("
+    r"sk-[A-Za-z0-9._\-]+"
+    r"|gh[pousr]_[A-Za-z0-9_]+"
+    r"|npm_[A-Za-z0-9_]+"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+    r"|xox[baprs]-[A-Za-z0-9-]+"
+    r"|sk_live_[A-Za-z0-9]+"
+    r"|AIza[0-9A-Za-z_-]{35}"
+    r")\b"
 )
 SAFE_NUMERIC_METRIC_KEYS = {
     "input_tokens",

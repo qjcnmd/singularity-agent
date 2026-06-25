@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -216,6 +217,9 @@ class MutationJournal:
 
 
 class WorkspaceMutationManager:
+    _MAX_HISTORY = 1000
+    _MAX_BEFORE_ARTIFACTS = 100
+
     def __init__(
         self,
         workspace_root: Path | str,
@@ -248,10 +252,10 @@ class WorkspaceMutationManager:
             PolicyConfig.default_for_workspace(self.workspace_root)
         )
         self.project_index = project_index
-        self._journals: dict[str, MutationJournal] = {}
-        self._changesets: dict[str, ChangeSet] = {}
-        self._changeset_transactions: dict[str, str] = {}
-        self._changeset_results: dict[str, MutationResult] = {}
+        self._journals: "OrderedDict[str, MutationJournal]" = OrderedDict()
+        self._changesets: "OrderedDict[str, ChangeSet]" = OrderedDict()
+        self._changeset_transactions: "OrderedDict[str, str]" = OrderedDict()
+        self._changeset_results: "OrderedDict[str, MutationResult]" = OrderedDict()
         self._changeset_order: list[str] = []
 
     def preview_operations(
@@ -606,9 +610,51 @@ class WorkspaceMutationManager:
         if result.status == "rolled_back":
             if result.changeset_id in self._changeset_order:
                 self._changeset_order.remove(result.changeset_id)
+            self._evict_history_if_needed()
             return
         if result.ok and result.changeset_id not in self._changeset_order:
             self._changeset_order.append(result.changeset_id)
+        self._evict_history_if_needed()
+
+    def _evict_history_if_needed(self) -> None:
+        while len(self._changeset_order) > self._MAX_HISTORY:
+            oldest = self._changeset_order.pop(0)
+            self._changesets.pop(oldest, None)
+            transaction_id = self._changeset_transactions.pop(oldest, None)
+            self._changeset_results.pop(oldest, None)
+            if transaction_id is not None:
+                self._journals.pop(transaction_id, None)
+        while len(self._journals) > self._MAX_HISTORY:
+            self._journals.popitem(last=False)
+        while len(self._changesets) > self._MAX_HISTORY:
+            self._changesets.popitem(last=False)
+        while len(self._changeset_transactions) > self._MAX_HISTORY:
+            self._changeset_transactions.popitem(last=False)
+        while len(self._changeset_results) > self._MAX_HISTORY:
+            self._changeset_results.popitem(last=False)
+
+    def _cleanup_old_before_artifacts(self) -> None:
+        journals_root = self.workspace_root / ".singularity" / "journals"
+        if not journals_root.exists():
+            return
+        tx_dirs: list[tuple[int, Path]] = []
+        for entry in journals_root.iterdir():
+            if not entry.is_dir():
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            tx_dirs.append((stat.st_mtime_ns, entry))
+        if len(tx_dirs) <= self._MAX_BEFORE_ARTIFACTS:
+            return
+        tx_dirs.sort(key=lambda item: item[0])
+        for _, tx_dir in tx_dirs[: len(tx_dirs) - self._MAX_BEFORE_ARTIFACTS]:
+            for before_file in tx_dir.glob("*.before"):
+                try:
+                    before_file.unlink()
+                except OSError:
+                    pass
 
     def _artifact_refs(self, *, ids: list[str], diffs: list[FileDiff]) -> list[str]:
         refs = [f"workspace:{path}" for path in sorted({diff.path for diff in diffs})]
@@ -629,6 +675,7 @@ class WorkspaceMutationManager:
         journal = MutationJournal(self, transaction_id)
         self._journals[transaction_id] = journal
         self._changesets[changeset.id] = changeset
+        self._evict_history_if_needed()
         git_before = collect_git_state(self.workspace_root)
         applied: list[JournalEntry] = []
         self._emit_observability(
@@ -766,6 +813,7 @@ class WorkspaceMutationManager:
         )
         self._changeset_transactions[changeset.id] = transaction_id
         self._remember_changeset_result(result)
+        self._cleanup_old_before_artifacts()
         if self.planner is not None:
             self.planner.update_from_mutation(result.observation | {"transaction_id": transaction_id}, tool_call_id=tool_call_id)
         return result

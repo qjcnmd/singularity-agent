@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from singularity.policy.config import ApprovalMode, PolicyConfig, SecurityMode
 from singularity.policy.models import (
@@ -82,6 +84,16 @@ class DefaultLocalPolicyRules:
         disabled = _disabled_by_config(request, config)
         if disabled is not None:
             return disabled
+
+        # P0-1: Hard-deny any write/command operation that targets the
+        # workspace-local policy directory. This prevents the model from
+        # forging approval grants or audit entries through shell writes.
+        if _targets_workspace_policy_dir(request, config):
+            return RuleResult(
+                DecisionOutcome.DENY,
+                "Writes to the workspace policy directory are denied to prevent approval forgery.",
+                "hard_deny_workspace_policy_dir_write",
+            )
 
         if RiskTag.SECRETS_EXFILTRATION in tags or (
             RiskTag.SECRET_ACCESS in tags and RiskTag.NETWORK in tags
@@ -429,3 +441,85 @@ def _severity(outcome: DecisionOutcome, risk_level: RiskLevel) -> str:
     if risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
         return "warning"
     return "info"
+
+
+_POLICY_DIR_WRITE_OPERATIONS = {
+    OperationKind.MUTATE_FILE,
+    OperationKind.CREATE_FILE,
+    OperationKind.DELETE_FILE,
+    OperationKind.ROLLBACK,
+    OperationKind.CHANGE_CONFIG,
+    OperationKind.EXECUTE_COMMAND,
+    OperationKind.EXECUTE_PROJECT_CODE,
+    OperationKind.START_LONG_PROCESS,
+    OperationKind.VERIFICATION,
+    OperationKind.PACKAGE_INSTALL,
+}
+
+
+def _targets_workspace_policy_dir(request: PolicyRequest, config: PolicyConfig) -> bool:
+    """Detect attempts to write to ``<workspace>/.singularity/policy/``.
+
+    P0-1: The workspace-local policy directory previously stored approval
+    grants and audit logs. Allowing the model to write there would let it
+    forge grants and bypass human approval. This guard hard-denies any
+    write or command operation whose target path resolves under that
+    directory, and also blocks command strings that reference it.
+    """
+    if request.operation not in _POLICY_DIR_WRITE_OPERATIONS:
+        return False
+
+    workspace_root = Path(config.workspace_root).expanduser().resolve(strict=False)
+    policy_dir = workspace_root / ".singularity" / "policy"
+
+    candidate_identifiers: list[str] = []
+    if request.resource.resource_type in {"file", "directory", "workspace", "config"}:
+        candidate_identifiers.append(
+            request.resource.normalized_identifier or request.resource.identifier
+        )
+    resources_raw = request.metadata.get("resources")
+    if isinstance(resources_raw, list):
+        for item in resources_raw:
+            if not isinstance(item, dict):
+                continue
+            resource_type = str(item.get("resource_type") or "")
+            if resource_type and resource_type not in {"file", "directory", "workspace", "config"}:
+                continue
+            identifier = item.get("normalized_identifier") or item.get("identifier")
+            if identifier:
+                candidate_identifiers.append(str(identifier))
+
+    for identifier in candidate_identifiers:
+        raw = Path(str(identifier)).expanduser()
+        candidate = raw if raw.is_absolute() else workspace_root / raw
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            continue
+        if _is_within_policy_dir(resolved, policy_dir):
+            return True
+
+    command_text = str(
+        request.metadata.get("command")
+        or request.metadata.get("shell")
+        or (request.resource.identifier if request.resource.resource_type == "command" else "")
+        or ""
+    )
+    if command_text and _command_references_policy_dir(command_text):
+        return True
+
+    return False
+
+
+def _is_within_policy_dir(path: Path, policy_dir: Path) -> bool:
+    try:
+        path_key = os.path.normcase(os.path.normpath(str(path.resolve(strict=False))))
+        dir_key = os.path.normcase(os.path.normpath(str(policy_dir.resolve(strict=False))))
+        return os.path.commonpath([path_key, dir_key]) == dir_key
+    except (OSError, ValueError):
+        return False
+
+
+def _command_references_policy_dir(command: str) -> bool:
+    normalized = command.replace("\\", "/").lower()
+    return ".singularity/policy/" in normalized

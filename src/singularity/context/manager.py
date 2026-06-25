@@ -363,11 +363,7 @@ class ContextManager:
         tool_call_id = tool_call.get("id")
         preview, truncated, truncation_reason = self._preview_result(result)
         sensitivity = self.classifier.classify(result)
-        rendered_preview = (
-            self.redactor.redact_text(preview)
-            if sensitivity in {ContextSensitivity.SECRET, ContextSensitivity.SENSITIVE}
-            else preview
-        )
+        rendered_preview = self.redactor.redact_text(preview)
         raw_digest = digest_value(result)
         references = self._references_for_result(result, raw_digest=raw_digest)
         metadata = dict(result.get("metadata") or {})

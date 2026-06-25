@@ -390,3 +390,67 @@ def test_workspace_create_file_tool_keeps_policy_mutation_and_state_path(tmp_pat
     health = state.get_workspace_health()
     assert health.status == WorkspaceHealthStatus.DIRTY
     assert health.agent_changes == ["created.txt"]
+
+
+def test_mutation_manager_history_containers_are_bounded(tmp_path: Path) -> None:
+    component = WorkspaceMutationManager(tmp_path)
+    component._MAX_HISTORY = 5  # small limit for fast testing
+
+    for index in range(12):
+        result = component.apply_operations(
+            [CreateFile(path=f"file_{index}.txt", content=f"content_{index}\n")],
+            intent=f"create file {index}",
+            created_by="test",
+        )
+        assert result.ok is True
+
+    # All five containers must stay within the configured limit.
+    assert len(component._changeset_order) <= component._MAX_HISTORY
+    assert len(component._changesets) <= component._MAX_HISTORY
+    assert len(component._changeset_transactions) <= component._MAX_HISTORY
+    assert len(component._changeset_results) <= component._MAX_HISTORY
+    assert len(component._journals) <= component._MAX_HISTORY
+
+    # The most recent changesets are retained; the oldest are evicted.
+    retained_ids = set(component._changeset_order)
+    assert len(retained_ids) == component._MAX_HISTORY
+    # Oldest changesets should no longer be in the order list.
+    for index in range(12 - component._MAX_HISTORY):
+        changeset_was_evicted = True
+        for remaining in retained_ids:
+            result_entry = component._changeset_results.get(remaining)
+            if result_entry is None:
+                continue
+            if f"file_{index}.txt" in result_entry.affected_files:
+                changeset_was_evicted = False
+                break
+        assert changeset_was_evicted, f"file_{index}.txt should have been evicted"
+
+
+def test_mutation_manager_cleans_old_before_artifacts_after_commit(tmp_path: Path) -> None:
+    component = WorkspaceMutationManager(tmp_path)
+    component._MAX_BEFORE_ARTIFACTS = 3  # small limit for fast testing
+
+    journals_root = tmp_path / ".singularity" / "journals"
+
+    # Create a file, then modify it repeatedly so each commit produces a .before artifact.
+    component.apply_operations(
+        [CreateFile(path="mutable.txt", content="v0\n")],
+        intent="create",
+        created_by="test",
+    )
+
+    for index in range(7):
+        result = component.apply_operations(
+            [ReplaceText(path="mutable.txt", old_text=f"v{index}", new_text=f"v{index + 1}")],
+            intent=f"modify {index}",
+            created_by="test",
+        )
+        assert result.ok is True
+
+    before_files = list(journals_root.rglob("*.before"))
+    assert len(before_files) > 0
+    # After cleanup, only .before artifacts from the most recent N transactions should remain.
+    tx_dirs_with_before = {parent for parent in (f.parent for f in before_files)}
+    assert len(tx_dirs_with_before) <= component._MAX_BEFORE_ARTIFACTS
+

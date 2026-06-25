@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -326,13 +327,26 @@ class ApprovalGrant:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ApprovalGrant":
+        decision_id = str(payload["decision_id"])
+        request_id = str(payload["request_id"])
+        approved_by = str(payload["approved_by"])
+        raw_grant_id = payload.get("grant_id")
+        if raw_grant_id:
+            grant_id = str(raw_grant_id)
+        else:
+            # P0-3: Generate a deterministic grant_id from the decision,
+            # request, and approver so repeated imports of the same grant
+            # produce the same ID and cannot amplify a single approval into
+            # multiple consumable grants.
+            deterministic = f"{decision_id}:{request_id}:{approved_by}"
+            grant_id = f"grant_{hashlib.sha256(deterministic.encode('utf-8')).hexdigest()[:12]}"
         return cls(
-            decision_id=str(payload["decision_id"]),
-            request_id=str(payload["request_id"]),
-            approved_by=str(payload["approved_by"]),
+            decision_id=decision_id,
+            request_id=request_id,
+            approved_by=approved_by,
             session_id=payload.get("session_id"),
             approved_at=str(payload.get("approved_at") or datetime.now(UTC).isoformat()),
-            grant_id=str(payload.get("grant_id") or f"grant_{uuid4().hex[:12]}"),
+            grant_id=grant_id,
             scope=ApprovalScope(
                 capabilities=payload.get("scope", {}).get("capabilities") or [],
                 path_globs=payload.get("scope", {}).get("path_globs") or [],

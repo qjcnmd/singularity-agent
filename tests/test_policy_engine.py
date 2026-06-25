@@ -98,11 +98,13 @@ def test_policy_denies_outside_delete_and_read_only_mutation(tmp_path: Path) -> 
 
 
 def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_path: Path) -> None:
+    grants_path = tmp_path / "policy" / "grants.jsonl"
     component = PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
             approval_mode=ApprovalMode.NON_INTERACTIVE,
             security_mode="compat",
+            approval_grants_path=grants_path,
         )
     )
     command = req(
@@ -117,8 +119,8 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
     assert denied.outcome == DecisionOutcome.DENY
     assert denied.reason == "Review required but approval mode is non_interactive."
 
-    interactive = PolicyEngine(PolicyConfig(workspace_root=tmp_path, security_mode="compat"))
-    gate = ApprovalGate(PolicyConfig(workspace_root=tmp_path, security_mode="compat"))
+    interactive = PolicyEngine(PolicyConfig(workspace_root=tmp_path, security_mode="compat", approval_grants_path=grants_path))
+    gate = ApprovalGate(PolicyConfig(workspace_root=tmp_path, security_mode="compat", approval_grants_path=grants_path))
     pending = interactive.evaluate(command)
     grant = ApprovalGrant(
         decision_id=pending.decision_id,
@@ -342,8 +344,9 @@ def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
 
 
 def test_approval_gate_consumes_grant_without_reevaluating_policy(tmp_path: Path) -> None:
-    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
-    gate = ApprovalGate(PolicyConfig(workspace_root=tmp_path))
+    grants_path = tmp_path / "policy" / "grants.jsonl"
+    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path, approval_grants_path=grants_path))
+    gate = ApprovalGate(PolicyConfig(workspace_root=tmp_path, approval_grants_path=grants_path))
     request = req(
         tmp_path,
         operation=OperationKind.EXECUTE_COMMAND,
@@ -398,3 +401,50 @@ def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: P
     assert verification.constraints.filesystem_mode == "copy_on_write_workspace"
     assert generated.outcome == DecisionOutcome.SANDBOX_REQUIRED
     assert generated.constraints.hard_isolation_required is True
+
+
+def test_policy_hard_denies_writes_to_workspace_policy_dir(tmp_path: Path) -> None:
+    # P0-1: Writes to <workspace>/.singularity/policy/ must be hard-denied so
+    # the model cannot forge approval grants or audit entries via shell writes.
+    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
+
+    policy_grants_path = tmp_path / ".singularity" / "policy" / "approval_grants.jsonl"
+    mutate = component.evaluate(
+        req(
+            tmp_path,
+            operation=OperationKind.CREATE_FILE,
+            capability=Capability.CREATE_FILE,
+            resource_type="file",
+            identifier=str(policy_grants_path),
+        )
+    )
+    assert mutate.outcome == DecisionOutcome.DENY
+    assert "hard_deny_workspace_policy_dir_write" in mutate.rule_ids
+
+    # Command strings referencing the policy dir are also denied.
+    command = component.evaluate(
+        req(
+            tmp_path,
+            operation=OperationKind.EXECUTE_COMMAND,
+            capability=Capability.EXECUTE_COMMAND,
+            resource_type="command",
+            identifier='bash -c "echo fake > .singularity/policy/approval_grants.jsonl"',
+        )
+    )
+    assert command.outcome == DecisionOutcome.DENY
+    assert "hard_deny_workspace_policy_dir_write" in command.rule_ids
+
+
+def test_policy_allows_reads_outside_policy_dir(tmp_path: Path) -> None:
+    # P0-1: Reads of normal workspace files must still be allowed.
+    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
+    read = component.evaluate(
+        req(
+            tmp_path,
+            operation=OperationKind.READ_FILE,
+            capability=Capability.READ_WORKSPACE,
+            resource_type="file",
+            identifier="src/app.py",
+        )
+    )
+    assert read.outcome == DecisionOutcome.ALLOW

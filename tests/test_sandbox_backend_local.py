@@ -6,6 +6,7 @@ import pytest
 from singularity.sandbox import (
     LocalStagingBackend,
     SandboxCapabilityError,
+    SandboxFilesystemMode,
     SandboxNetworkMode,
     SandboxNetworkPolicy,
     SandboxProfileName,
@@ -47,7 +48,10 @@ def request_for(
 def test_local_backend_capabilities_are_honest() -> None:
     capabilities = LocalStagingBackend().capabilities()
 
-    assert capabilities.filesystem_isolation is True
+    # Local staging has no true filesystem isolation: it stages a workspace
+    # copy on the same filesystem as the host. Report this honestly so the
+    # manager does not over-promise isolation.
+    assert capabilities.filesystem_isolation is False
     assert capabilities.copy_on_write is True
     assert capabilities.network_isolation is False
     assert capabilities.memory_limit is False
@@ -146,3 +150,44 @@ def test_artifact_collection_captures_declared_paths(tmp_path: Path) -> None:
     backend.cleanup(prepared)
 
     assert any(artifact.relative_path == "report.txt" for artifact in result.artifacts)
+
+
+def test_read_only_workspace_blocks_writes_to_staged_files(tmp_path: Path) -> None:
+    (tmp_path / "data.txt").write_text("original", encoding="utf-8")
+    backend = LocalStagingBackend()
+    request = request_for(tmp_path, [sys.executable, "-c", "print('readonly')"])
+    request.profile.filesystem.mode = SandboxFilesystemMode.READ_ONLY_WORKSPACE
+    request.profile.filesystem.detect_changes = False
+
+    prepared = backend.prepare(request)
+
+    staged_file = prepared.workspace_copy_root / "data.txt"
+    assert staged_file.exists()
+    # READ_ONLY_WORKSPACE must actually enforce read-only: writing to a
+    # staged file must fail rather than silently succeeding. This regression
+    # test guards against the old bug where read_only was mapped to
+    # COPY_ON_WRITE_WORKSPACE (writable) instead of READ_ONLY_WORKSPACE.
+    with pytest.raises(PermissionError):
+        staged_file.write_text("modified", encoding="utf-8")
+    # Cleanup must succeed even when the tree was marked read-only.
+    backend.cleanup(prepared)
+    assert not prepared.sandbox_root.exists()
+
+
+def test_read_only_workspace_mode_not_mapped_to_copy_on_write(tmp_path: Path) -> None:
+    (tmp_path / "seed.txt").write_text("seed", encoding="utf-8")
+    backend = LocalStagingBackend()
+    request = request_for(tmp_path, [sys.executable, "-c", "print('mode')"])
+    request.profile.filesystem.mode = SandboxFilesystemMode.READ_ONLY_WORKSPACE
+    request.profile.filesystem.detect_changes = False
+
+    prepared = backend.prepare(request)
+    try:
+        # The staged workspace must be the read-only mode, not silently
+        # downgraded to copy-on-write (which would permit writes).
+        import stat as stat_module
+        staged = prepared.workspace_copy_root / "seed.txt"
+        mode = staged.stat().st_mode
+        assert not (mode & stat_module.S_IWUSR), "staged file retains write bit"
+    finally:
+        backend.cleanup(prepared)

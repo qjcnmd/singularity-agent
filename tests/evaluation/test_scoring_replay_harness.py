@@ -695,3 +695,70 @@ def test_offline_golden_suite_does_not_scan_workspace_for_diff_outcomes(
 
     assert result.execution_evidence["diff"]["status"] == "blocked"
     assert "diff_requires_execution" in result.scoring.failure_reasons
+
+
+def test_patch_payload_skips_env_file_content(tmp_path: Path) -> None:
+    from singularity.evaluation.live import _patch_payload
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    (workspace / ".env").write_text(
+        "OPENAI_API_KEY=sk-secret-123456789\nDATABASE_URL=postgres://user:pass@host/db\n",
+        encoding="utf-8",
+    )
+
+    before_snapshot = {"app.py": "", ".env": ""}
+    payload = _patch_payload(before_snapshot, workspace)
+
+    diff_text = payload["diff"]
+    assert "sk-secret" not in diff_text
+    assert "DATABASE_URL" not in diff_text
+    assert "postgres://user:pass" not in diff_text
+    assert "<sensitive_path>" in payload["changed_files"]
+    assert "app.py" in payload["changed_files"]
+
+
+def test_patch_payload_skips_pem_and_key_files(tmp_path: Path) -> None:
+    from singularity.evaluation.live import _patch_payload
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "server.pem").write_text(
+        "-----BEGIN PRIVATE KEY-----\nMIIBVwIBADANBgkqhkiG9w0BAQEFAASCAUEwggE9AgEAAkEA\n-----END PRIVATE KEY-----\n",
+        encoding="utf-8",
+    )
+    (workspace / "private.key").write_text(
+        "super_secret_key_material_here\n",
+        encoding="utf-8",
+    )
+    (workspace / "config.py").write_text("DEBUG = True\n", encoding="utf-8")
+
+    before_snapshot = {"server.pem": "", "private.key": "", "config.py": ""}
+    payload = _patch_payload(before_snapshot, workspace)
+
+    diff_text = payload["diff"]
+    assert "BEGIN PRIVATE KEY" not in diff_text
+    assert "super_secret_key_material" not in diff_text
+    assert "<sensitive_path>" in payload["changed_files"]
+    assert "config.py" in payload["changed_files"]
+
+
+def test_patch_payload_redacts_secrets_in_non_sensitive_files(tmp_path: Path) -> None:
+    from singularity.evaluation.live import _patch_payload
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "settings.py").write_text(
+        'API_KEY = "sk-leaked-abcdefghij"\nTOKEN = "ghp_abcdefghijklmnop"\n',
+        encoding="utf-8",
+    )
+
+    before_snapshot = {"settings.py": ""}
+    payload = _patch_payload(before_snapshot, workspace)
+
+    diff_text = payload["diff"]
+    assert "sk-leaked" not in diff_text
+    assert "ghp_abcdefghijklmnop" not in diff_text
+    assert "settings.py" in payload["changed_files"]
+

@@ -255,3 +255,84 @@ def test_store_close_releases_sqlite_connection(tmp_path: Path) -> None:
 
     with pytest.raises(sqlite3.ProgrammingError):
         store.connection.execute("select 1")
+
+
+def test_store_supports_concurrent_reads_and_writes_without_error(tmp_path: Path) -> None:
+    import threading
+
+    store = ObservationStore(tmp_path / "context.sqlite3")
+    store.append_item(make_item("item_seed"))
+    errors: list[BaseException] = []
+
+    def writer() -> None:
+        try:
+            for index in range(40):
+                store.append_item(make_item(f"item_writer_{index}"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def reader() -> None:
+        try:
+            for _ in range(80):
+                items = store.query_items(run_id="run_1")
+                events = store.events_for_run("run_1")
+                loaded = store.load_item("item_seed")
+                assert loaded is not None
+                assert isinstance(items, list)
+                assert isinstance(events, list)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    threads.append(threading.Thread(target=writer))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    items = store.query_items(run_id="run_1")
+    item_ids = {item.item_id for item in items}
+    assert "item_seed" in item_ids
+    for index in range(40):
+        assert f"item_writer_{index}" in item_ids
+    events = store.events_for_run("run_1")
+    assert len(events) >= 41
+
+
+def test_store_concurrent_reads_are_consistent_after_writes(tmp_path: Path) -> None:
+    import threading
+
+    store = ObservationStore(tmp_path / "context.sqlite3")
+    for index in range(20):
+        store.append_item(make_item(f"item_init_{index}"))
+
+    consistency_errors: list[BaseException] = []
+
+    def reader() -> None:
+        try:
+            for _ in range(50):
+                items = store.query_items(run_id="run_1")
+                events = store.events_for_run("run_1")
+                # events count should always be >= items count (each item_added emits an event)
+                assert len(events) >= len(items)
+        except BaseException as exc:
+            consistency_errors.append(exc)
+
+    def writer() -> None:
+        try:
+            for index in range(30):
+                store.append_item(make_item(f"item_concurrent_{index}"))
+        except BaseException as exc:
+            consistency_errors.append(exc)
+
+    threads = [threading.Thread(target=reader) for _ in range(3)]
+    threads.append(threading.Thread(target=writer))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert consistency_errors == []
+    final_items = store.query_items(run_id="run_1")
+    assert len(final_items) == 50

@@ -70,6 +70,8 @@ class SandboxResourceLimits:
     max_artifact_bytes: int | None = None
     max_processes: int | None = None
     max_memory_mb: int | None = None
+    memory_limit: str | None = None
+    pids_limit: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -205,6 +207,7 @@ class SandboxProfile:
     env: SandboxEnvPolicy
     resources: SandboxResourceLimits
     description: str = ""
+    image_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, SandboxProfileName):
@@ -218,6 +221,7 @@ class SandboxProfile:
             "env": self.env.to_dict(),
             "resources": self.resources.to_dict(),
             "description": self.description,
+            "image_digest": self.image_digest,
         }
 
 

@@ -30,6 +30,10 @@ SKIP_DIRS = {
     "venv",
 }
 
+# Default per-file size limit for search_text scans. Files larger than this
+# are skipped (with a warning entry in the result) to bound scan cost.
+DEFAULT_SEARCH_MAX_FILE_BYTES = 10 * 1024 * 1024
+
 
 class ListFilesInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -54,6 +58,11 @@ class SearchTextInput(BaseModel):
     path: str = Field(".", description="File or directory path to search.")
     case_sensitive: bool = Field(False, description="Whether matching is case-sensitive.")
     max_results: int = Field(50, ge=1, le=200, description="Maximum matches to return.")
+    max_file_bytes: int = Field(
+        10_485_760,
+        ge=1,
+        description="Skip files larger than this many bytes when scanning.",
+    )
 
 
 class ReadOnlyToolHandlers:
@@ -99,9 +108,44 @@ class ReadOnlyToolHandlers:
                 code="sensitive_path_denied",
             )
 
-        raw = path.read_bytes()
-        truncated = len(raw) > args.max_bytes
-        chunk = raw[: args.max_bytes]
+        # Determine file size before reading to avoid loading arbitrarily
+        # large files into memory. Falls back to a bounded read when the
+        # size cannot be obtained (e.g. special files).
+        size: int | None = None
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = None
+
+        max_bytes = args.max_bytes
+        if size is not None and size > max_bytes:
+            # Read only the prefix we need; mark the result as truncated.
+            with path.open("rb") as handle:
+                chunk = handle.read(max_bytes + 1)
+            truncated = len(chunk) > max_bytes
+            chunk = chunk[:max_bytes]
+            if self._looks_binary(chunk):
+                raise ToolExecutionFailure(f"File appears to be binary: {args.path}")
+            return {
+                "path": self._relative(path),
+                "content": chunk.decode("utf-8", errors="replace"),
+                "truncated": truncated,
+                "bytes_read": len(chunk),
+                "bytes_total": size,
+            }
+
+        # Size is small enough (or unknown) - read everything, but cap the
+        # read to a defensive upper bound when stat() failed so a streamed
+        # or special file cannot exhaust memory.
+        if size is None:
+            with path.open("rb") as handle:
+                raw = handle.read(max_bytes + 1)
+            truncated = len(raw) > max_bytes
+            chunk = raw[:max_bytes]
+        else:
+            raw = path.read_bytes()
+            truncated = len(raw) > max_bytes
+            chunk = raw[:max_bytes]
         if self._looks_binary(chunk):
             raise ToolExecutionFailure(f"File appears to be binary: {args.path}")
 
@@ -110,7 +154,7 @@ class ReadOnlyToolHandlers:
             "content": chunk.decode("utf-8", errors="replace"),
             "truncated": truncated,
             "bytes_read": len(chunk),
-            "bytes_total": len(raw),
+            "bytes_total": size if size is not None else len(raw),
         }
 
     def search_text(self, args: SearchTextInput) -> dict[str, Any]:
@@ -121,6 +165,7 @@ class ReadOnlyToolHandlers:
         files = [start] if start.is_file() else sorted(start.rglob("*"))
         needle = args.query if args.case_sensitive else args.query.lower()
         matches: list[dict[str, Any]] = []
+        skipped_files: list[dict[str, Any]] = []
 
         for path in files:
             if len(matches) >= args.max_results:
@@ -128,6 +173,20 @@ class ReadOnlyToolHandlers:
             if not path.is_file() or self._should_skip(path):
                 continue
             if self.sensitivity.is_sensitive(path):
+                continue
+            # Bound scan cost: skip oversized files instead of reading them.
+            try:
+                file_size = path.stat().st_size
+            except OSError:
+                continue
+            if file_size > args.max_file_bytes:
+                skipped_files.append(
+                    {
+                        "path": self._relative(path),
+                        "size": file_size,
+                        "limit": args.max_file_bytes,
+                    }
+                )
                 continue
             try:
                 raw = path.read_bytes()
@@ -153,6 +212,7 @@ class ReadOnlyToolHandlers:
             "query": args.query,
             "matches": matches,
             "truncated": len(matches) >= args.max_results,
+            "skipped_files": skipped_files,
         }
 
     def _resolve_inside_root(self, user_path: str) -> Path:

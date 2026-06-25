@@ -6,6 +6,7 @@ Source paths:
 - src/singularity/observability/recorder.py
 - src/singularity/observability/store.py
 - src/singularity/observability/artifacts.py
+- src/singularity/observability/spans.py
 - src/singularity/observability/summary.py
 - src/singularity/context/store.py
 - src/singularity/context/models.py
@@ -33,6 +34,9 @@ Symbols:
 - TraceArtifactStore.write_text_artifact
 - TraceArtifactStore.write_bytes_artifact
 - TraceArtifactStore.register_file_artifact
+- SpanManager
+- SpanManager.start_span
+- SpanManager.end_span
 - TraceSummaryBuilder
 - ObservationStore
 - ObservationStore.record_event
@@ -62,6 +66,7 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 - `src/singularity/observability/recorder.py`: `TraceRecorder.emit()`, legacy event mapping, span and artifact APIs.
 - `src/singularity/observability/store.py`: trace event, span, and artifact persistence.
 - `src/singularity/observability/artifacts.py`: trace artifact storage and limits.
+- `src/singularity/observability/spans.py`: `SpanManager` span lifecycle (start/end) with thread-local span stacks.
 - `src/singularity/observability/summary.py`: timeline and final report summaries.
 - `src/singularity/context/store.py`: context event and tool observation persistence.
 - `src/singularity/context/models.py`: `ToolObservation`.
@@ -76,10 +81,11 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 2. `TraceRecorder.emit()` redacts payload, creates `TraceEvent`, computes `payload_hash`, sets `redaction_applied=True`, appends event to `TraceStore`, and notifies interaction sinks.
 3. Legacy `record()` maps event names such as `planner`, `tool_call`, `model_request`, `command`, `mutation`, `verification`, `failure_analysis_requested`, and `repair_signal_consumed` to typed `TraceEventType` values.
 4. Components that need files call `TraceRecorder.write_artifact()`, which delegates to `TraceArtifactStore` and stores `TraceArtifact`.
-5. Context code calls `ObservationStore.record_event()` and `save_observation()` for context-local event and observation state.
-6. Policy code calls `PolicyAuditWriter.append()` with `PolicyRequest` and `PolicyDecision`.
-7. Review code calls `ReviewPipeline._emit()` to send review lifecycle events.
-8. Planner records review and diff observations in `Planner.record_review_observation()` and `record_diff_observation()`.
+5. Components that need span lifecycle call `TraceRecorder.span()` / `start_span()` / `end_span()`, which delegate to `SpanManager`; span attributes are redacted before the span is appended to `TraceStore`.
+6. Context code calls `ObservationStore.record_event()` and `save_observation()` for context-local event and observation state.
+7. Policy code calls `PolicyAuditWriter.append()` with `PolicyRequest` and `PolicyDecision`.
+8. Review code calls `ReviewPipeline._emit()` to send review lifecycle events.
+9. Planner records review and diff observations in `Planner.record_review_observation()` and `record_diff_observation()`.
 
 ## Runtime Objects Passed
 
@@ -121,7 +127,9 @@ Internal-only objects include:
 - Trace write failures are caught and printed as redacted warnings rather than failing the run.
 - Interaction sink failures are caught and printed as redacted warnings.
 - Artifact writes enforce per-artifact and total-size limits.
-- Sensitive file artifacts must be text-redactable.
+- `register_file_artifact` passes source file content through `TraceRedactor.redact_text()` for all text files (both `sensitive=True` and `sensitive=False`); the `redacted` flag is set `True` when text redaction was applied and `False` when a non-sensitive binary file fell back to byte copy. Sensitive binary files raise `TraceArtifactError` because they cannot be text-redacted.
+- `TraceStore.__init__` validates `run_id` and raises `ValueError` for path traversal (`..`), absolute paths (leading `/` or drive letter), empty values, or any character outside `[A-Za-z0-9_-]`.
+- `SpanManager` stores the active span stack in `threading.local()` so each thread has an independent parent-child span view, and guards `start_span`/`end_span` with an `RLock` to serialize `TraceStore` file I/O; the span body executes without holding the lock.
 - `ObservationStore.save_observation()` redacts secret/sensitive content and removes raw keys before storage.
 - `PolicyAuditWriter.append()` redacts request and decision fields before JSONL append.
 - Review trace events can still be non-blocking if model critic fails.

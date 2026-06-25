@@ -52,11 +52,17 @@ class ApprovalGate:
     def register_grant(self, grant: ApprovalGrant) -> None:
         with _file_lock(self._grants_lock_path):
             self._grants = self._load_grants_unlocked()
+            # P0-3: Dedup by grant_id AND decision_id so a single approval
+            # decision cannot be amplified into multiple consumable grants.
+            # Repeated imports of the same grant (even without a grant_id)
+            # resolve to the same deterministic ID and the same decision_id,
+            # so they replace the prior entry instead of appending a new one.
             existing = next(
                 (
                     index
                     for index, candidate in enumerate(self._grants)
                     if candidate.grant_id == grant.grant_id
+                    or candidate.decision_id == grant.decision_id
                 ),
                 None,
             )
@@ -70,6 +76,27 @@ class ApprovalGate:
         with _file_lock(self._grants_lock_path):
             self._grants = self._load_grants_unlocked()
             return self._find_matching_grant_unlocked(request)
+
+    def grants_store_path(self) -> Path:
+        """Return the resolved path used to persist approval grants."""
+        return _approval_grants_path(self.config)
+
+    def is_grant_store_trusted(self, workspace_root: Path | str) -> bool:
+        """Return True when the grant store lives outside the workspace.
+
+        P0-1: Grants persisted inside the model-writable workspace are
+        considered untrusted because the model could forge them via shell
+        writes. Only grants stored outside the workspace may be consumed
+        automatically by ToolExecutor.
+        """
+        grant_path = _approval_grants_path(self.config).resolve(strict=False)
+        root = Path(workspace_root).expanduser().resolve(strict=False)
+        try:
+            root_key = os.path.normcase(os.path.normpath(str(root)))
+            path_key = os.path.normcase(os.path.normpath(str(grant_path)))
+            return os.path.commonpath([root_key, path_key]) != root_key
+        except (OSError, ValueError):
+            return False
 
     def consume_matching_grant(self, request: PolicyRequest) -> ApprovalGrant | None:
         with _file_lock(self._grants_lock_path):
@@ -342,5 +369,8 @@ def _unlock_file(handle: Any) -> None:
 
 def _approval_grants_path(config: PolicyConfig) -> Path:
     if config.approval_grants_path is None:
-        return Path(config.workspace_root) / ".singularity" / "policy" / "approval_grants.jsonl"
+        # P0-1: Default grant store must live outside the model-writable
+        # workspace so the model cannot forge grants via shell writes.
+        from singularity.policy.config import _default_policy_home
+        return _default_policy_home() / ".singularity" / "policy" / "approval_grants.jsonl"
     return Path(config.approval_grants_path)

@@ -414,6 +414,18 @@ C:\\repo\\src\\ui.tsx
     assert any(failure.symbol == "no-console" and failure.line == 5 for failure in failures)
 
 
+def test_npm_build_failure_parser_extracts_line_number() -> None:
+    output = "src/app.tsx:12:5 - error TS2304: Cannot find name 'foo'."
+
+    failures = FailureParserRegistry().parse(output)
+
+    npm_failure = next(
+        failure for failure in failures if failure.file == "src/app.tsx"
+    )
+    assert npm_failure.line == 12
+    assert npm_failure.file == "src/app.tsx"
+
+
 def test_command_failures_convert_to_semantic_verification_results(tmp_path: Path) -> None:
     request = CommandRequest(argv=["missing-test-tool"])
     fake = FakeCommandExecutor(

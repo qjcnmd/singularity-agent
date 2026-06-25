@@ -17,6 +17,11 @@ SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\b(cookie)\s*:\s*([^\n\r]+)"),
     re.compile(r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\b(sk-[A-Za-z0-9._\-]+|gh[pousr]_[A-Za-z0-9_]+|npm_[A-Za-z0-9_]+)\b"),
+    re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),
+    re.compile(r"\b(eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b"),
+    re.compile(r"\b(xox[baprs]-[A-Za-z0-9-]+)\b"),
+    re.compile(r"\b(sk_live_[A-Za-z0-9]+)\b"),
+    re.compile(r"\b(AIza[0-9A-Za-z_-]{35})\b"),
 )
 
 
@@ -24,6 +29,22 @@ SENSITIVE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\.env\b"),
     re.compile(r"(?i)\bprivate[_-]?key\b"),
     re.compile(r"(?i)\bpassword\b"),
+)
+
+
+SENSITIVE_FIELD_MARKERS: tuple[str, ...] = (
+    "token",
+    "secret",
+    "password",
+    "cookie",
+    "api_key",
+    "authorization",
+    "credential",
+    "passphrase",
+    "private_key",
+    "access_token",
+    "refresh_token",
+    "client_secret",
 )
 
 
@@ -66,7 +87,7 @@ class ContextRedactor:
             redacted: dict[str, Any] = {}
             for key, item in value.items():
                 key_text = str(key)
-                if any(marker in key_text.lower() for marker in ("token", "secret", "password", "cookie", "api_key")):
+                if any(marker in key_text.lower() for marker in SENSITIVE_FIELD_MARKERS):
                     redacted[key_text] = self._marker(str(item))
                 else:
                     redacted[key_text] = self.redact_value(item)

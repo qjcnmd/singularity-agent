@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import os
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -69,6 +70,8 @@ class SandboxFilesystemManager:
                 policy=policy,
             )
             execution_cwd = workspace_copy_root / resolved_cwd.relative_to(workspace_root)
+            if policy.mode == SandboxFilesystemMode.READ_ONLY_WORKSPACE:
+                self._make_readonly(workspace_copy_root)
         else:
             workspace_copy_root = sandbox_root / "workspace"
             workspace_copy_root.mkdir(parents=True, exist_ok=True)
@@ -128,7 +131,21 @@ class SandboxFilesystemManager:
 
     def cleanup(self, sandbox_root: Path) -> None:
         if sandbox_root.exists():
+            _clear_readonly_tree(sandbox_root)
             shutil.rmtree(sandbox_root)
+
+    @staticmethod
+    def _make_readonly(root: Path) -> None:
+        # Best-effort read-only enforcement for the staged workspace tree.
+        # Clearing the write bits sets the read-only attribute on Windows
+        # (preventing file modification) and removes write permission on
+        # POSIX. Directory-level creation is a best-effort signal on Windows.
+        write_bits = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+        for path in (root, *root.rglob("*")):
+            try:
+                os.chmod(path, path.stat().st_mode & ~write_bits)
+            except OSError:
+                pass
 
     def _copy_workspace(
         self,
@@ -186,3 +203,13 @@ class SandboxFilesystemManager:
 
 def random_trace_id() -> str:
     return f"sandbox_trace_{uuid4().hex[:12]}"
+
+
+def _clear_readonly_tree(root: Path) -> None:
+    # Restore write access on the staged tree so shutil.rmtree can remove it
+    # even when READ_ONLY_WORKSPACE marked files/directories read-only.
+    for path in (root, *root.rglob("*")):
+        try:
+            os.chmod(path, path.stat().st_mode | stat.S_IWRITE)
+        except OSError:
+            pass

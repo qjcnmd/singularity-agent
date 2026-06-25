@@ -15,6 +15,7 @@ from uuid import uuid4
 from rich.console import Console
 
 from singularity.config import ProductionConfig, adaptive_default_max_turns
+from singularity.context.redaction import ContextRedactor
 from singularity.evaluation.models import (
     BenchmarkAdapterKind,
     BenchmarkTask,
@@ -30,6 +31,8 @@ from singularity.policy import ApprovalMode, SecurityMode
 
 LIVE_TASK_SET_SCHEMA_VERSION = "evaluation.live_agent_task_set/v1"
 LIVE_RESULT_SCHEMA_VERSION = "evaluation.live_agent_eval_result/v1"
+
+_PATCH_REDACTOR = ContextRedactor()
 
 
 @dataclass(frozen=True)
@@ -1704,9 +1707,15 @@ def _run_shell(command: str, *, cwd: Path, timeout_seconds: int, redactor: Trace
 
 def _patch_payload(before_snapshot: dict[str, str], workspace: Path) -> dict[str, Any]:
     after = _read_text_files(workspace)
-    paths = sorted(path for path in set(before_snapshot) | set(after) if before_snapshot.get(path, "") != after.get(path, ""))
+    all_changed = sorted(
+        path
+        for path in set(before_snapshot) | set(after)
+        if before_snapshot.get(path, "") != after.get(path, "")
+    )
     diff_lines: list[str] = []
-    for path in paths:
+    for path in all_changed:
+        if _is_sensitive_path(path):
+            continue
         old = before_snapshot.get(path, "").splitlines(keepends=True)
         new = after.get(path, "").splitlines(keepends=True)
         diff_lines.extend(
@@ -1718,10 +1727,11 @@ def _patch_payload(before_snapshot: dict[str, str], workspace: Path) -> dict[str
                 lineterm="",
             )
         )
+    diff_text = _PATCH_REDACTOR.redact_text("\n".join(diff_lines))
     return {
         "schema_version": "evaluation.patch/v1",
-        "changed_files": paths,
-        "diff": "\n".join(diff_lines),
+        "changed_files": [_display_path(path) for path in all_changed],
+        "diff": diff_text,
         "applicable": False,
     }
 
@@ -1904,11 +1914,21 @@ def _skip_path(path: str) -> bool:
 
 def _is_sensitive_name(name: str) -> bool:
     lowered = name.lower()
-    return lowered.startswith(".env") or "api_key" in lowered or "token" in lowered or "secret" in lowered
+    return (
+        lowered.startswith(".env")
+        or "api_key" in lowered
+        or "token" in lowered
+        or "secret" in lowered
+        or lowered.endswith((".pem", ".key"))
+    )
+
+
+def _is_sensitive_path(path: str) -> bool:
+    return any(_is_sensitive_name(part) for part in Path(path).parts)
 
 
 def _display_path(path: str) -> str:
-    return "<sensitive_path>" if any(_is_sensitive_name(part) for part in Path(path).parts) else path
+    return "<sensitive_path>" if _is_sensitive_path(path) else path
 
 
 def _is_git_repo(path: Path) -> bool:

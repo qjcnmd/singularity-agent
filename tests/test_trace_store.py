@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from singularity.observability.models import (
     TraceArtifact,
     TraceArtifactKind,
@@ -118,3 +120,30 @@ def test_trace_store_append_query_timeline_summary_and_recovery(tmp_path: Path) 
     recovered = store.recover_incomplete_spans()
     assert recovered == ["span_1"]
     assert store.latest_spans()["span_1"].status == TraceStatus.FAILED
+
+
+def test_trace_store_rejects_path_traversal_run_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        TraceStore(tmp_path, run_id="../evil")
+
+
+def test_trace_store_rejects_absolute_run_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        TraceStore(tmp_path, run_id="/absolute/path")
+    with pytest.raises(ValueError):
+        TraceStore(tmp_path, run_id="C:/windows/path")
+
+
+def test_trace_store_rejects_unsafe_characters_in_run_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        TraceStore(tmp_path, run_id="run with spaces")
+    with pytest.raises(ValueError):
+        TraceStore(tmp_path, run_id="run.id")
+    with pytest.raises(ValueError):
+        TraceStore(tmp_path, run_id="")
+
+
+def test_trace_store_accepts_valid_run_id(tmp_path: Path) -> None:
+    store = TraceStore(tmp_path, run_id="valid-run-id-123")
+    assert store.run_id == "valid-run-id-123"
+    assert store.run_dir.name == "valid-run-id-123"

@@ -7,6 +7,7 @@ from singularity.sandbox import (
     LocalStagingBackend,
     SandboxArtifactCollector,
     SandboxCapabilities,
+    SandboxFilesystemMode,
     SandboxNetworkMode,
     SandboxNetworkPolicy,
     SandboxProfileName,
@@ -309,3 +310,82 @@ def test_sandbox_artifact_collector_writes_redacted_output_bytes(tmp_path: Path)
     assert stdout_artifact.size_bytes == len(stdout.encode("utf-8"))
     assert "sk-sandbox-secret" not in artifact_text
     assert "OPENAI_API_KEY=<redacted>" in artifact_text
+
+
+def test_read_only_filesystem_mode_maps_to_read_only_workspace(tmp_path: Path) -> None:
+    # Regression: "read_only"/"readonly" used to be mapped to
+    # COPY_ON_WRITE_WORKSPACE (writable). It must now map to
+    # READ_ONLY_WORKSPACE so the staged tree is actually read-only.
+    component = SandboxManager(tmp_path, backends=[LocalStagingBackend()])
+    command_request = type(
+        "Cmd",
+        (),
+        {"argv": ["python", "-c", "print('ok')"], "command_id": "cmd_1", "purpose": None},
+    )()
+    constraints = type(
+        "Constraints",
+        (),
+        {
+            "filesystem_mode": "read_only",
+            "network_allowed": False,
+            "hard_isolation_required": False,
+            "sandbox_required": True,
+            "max_duration_seconds": None,
+            "max_output_chars": None,
+            "allowed_hosts": [],
+            "to_dict": lambda self: {},
+        },
+    )()
+    policy_decision = type(
+        "Decision",
+        (),
+        {"decision_id": "dec_1", "constraints": constraints, "reason": "test"},
+    )()
+
+    request = component.build_request_from_policy(
+        command_request,
+        policy_decision,
+        session_id="session",
+        task_id="task",
+        action_id="action",
+        cwd=tmp_path,
+    )
+
+    assert request.profile.filesystem.mode == SandboxFilesystemMode.READ_ONLY_WORKSPACE
+
+
+def test_network_denied_fail_closed_produces_violation_on_local_backend(tmp_path: Path) -> None:
+    # LocalStagingBackend has network_isolation=False. When the profile
+    # denies network access (mode=DENIED), the manager must fail-closed by
+    # recording a SandboxViolation rather than silently running with an
+    # unenforced denial.
+    component = SandboxManager(tmp_path, backends=[LocalStagingBackend()])
+    request = sandbox_request(tmp_path)
+    # The default ISOLATED_VERIFICATION profile already sets network.mode=DENIED.
+    assert request.profile.network.mode == SandboxNetworkMode.DENIED
+    request.profile.network.require_hard_isolation = False
+
+    result = component.run(request)
+
+    violation_types = [violation.violation_type for violation in result.violations]
+    assert "network_denial_unenforced" in violation_types
+
+
+def test_capability_summary_reflects_selected_backend_not_union(tmp_path: Path) -> None:
+    # capability_summary must report isolation based on the selected (first
+    # available) backend, not the union of all backends. When Docker is
+    # first and available, hard_isolation must be True (Docker has
+    # network_isolation). When only LocalStaging is available, it must be
+    # False.
+    docker = DockerSandboxBackend()
+    docker.is_available = lambda: True  # type: ignore[method-assign]
+    component_with_docker = SandboxManager(tmp_path, backends=[docker, LocalStagingBackend()])
+
+    summary = component_with_docker.capability_summary()
+
+    assert summary["hard_isolation"] is True
+
+    component_local_only = SandboxManager(tmp_path, backends=[LocalStagingBackend()])
+    summary_local = component_local_only.capability_summary()
+
+    assert summary_local["hard_isolation"] is False

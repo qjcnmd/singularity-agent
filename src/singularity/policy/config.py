@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -16,6 +17,19 @@ class ApprovalMode(str, Enum):
 class SecurityMode(str, Enum):
     STRICT = "strict"
     COMPAT = "compat"
+
+
+def _default_policy_home() -> Path:
+    """Return the base directory for default policy artifacts.
+
+    P0-1: Default grant/audit paths must live outside the model-writable
+    workspace. ``SINGULARITY_POLICY_HOME`` allows operators and tests to
+    redirect the default location without affecting ``Path.home()``.
+    """
+    env_home = os.environ.get("SINGULARITY_POLICY_HOME")
+    if env_home:
+        return Path(env_home).expanduser()
+    return Path.home()
 
 
 @dataclass(frozen=True)
@@ -40,12 +54,16 @@ class PolicyConfig:
         object.__setattr__(self, "security_mode", _security_mode(self.security_mode))
         root = Path(self.workspace_root).expanduser().resolve(strict=False)
         object.__setattr__(self, "workspace_root", root)
+        # P0-1: Audit log and approval grants must default to a location
+        # outside the model-writable workspace so the model cannot forge
+        # audit entries or approval grants via shell writes. Explicit
+        # configuration still overrides the default for backward compatibility.
+        home_policy_dir = _default_policy_home() / ".singularity" / "policy"
         if self.audit_log_path is None:
-            policy_dir = root / ".singularity" / "policy"
             object.__setattr__(
                 self,
                 "audit_log_path",
-                policy_dir / "audit.jsonl",
+                home_policy_dir / "audit.jsonl",
             )
         else:
             object.__setattr__(self, "audit_log_path", Path(self.audit_log_path))
@@ -53,7 +71,7 @@ class PolicyConfig:
             object.__setattr__(
                 self,
                 "approval_grants_path",
-                root / ".singularity" / "policy" / "approval_grants.jsonl",
+                home_policy_dir / "approval_grants.jsonl",
             )
         else:
             object.__setattr__(self, "approval_grants_path", Path(self.approval_grants_path))

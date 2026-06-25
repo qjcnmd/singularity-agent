@@ -45,9 +45,9 @@ class ObservationStore:
         self.trace = trace
         if db_path is not None:
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._connection = sqlite3.connect(str(db_path))
+            self._connection = sqlite3.connect(str(db_path), check_same_thread=False)
         else:
-            self._connection = sqlite3.connect(":memory:")
+            self._connection = sqlite3.connect(":memory:", check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._lock = RLock()
         self._init_schema()
@@ -83,11 +83,12 @@ class ObservationStore:
             self._connection.commit()
 
     def load_messages(self, run_id: str) -> list[dict[str, Any]]:
-        rows = self._connection.execute(
-            "select payload from messages where run_id = ? order by seq",
-            (run_id,),
-        ).fetchall()
-        return [json.loads(row["payload"]) for row in rows]
+        with self._lock:
+            rows = self._connection.execute(
+                "select payload from messages where run_id = ? order by seq",
+                (run_id,),
+            ).fetchall()
+            return [json.loads(row["payload"]) for row in rows]
 
     def append_item(
         self,
@@ -137,11 +138,12 @@ class ObservationStore:
         return stored_item
 
     def load_item(self, item_id: str) -> ContextItem | None:
-        row = self._connection.execute(
-            "select * from context_items where item_id = ?",
-            (item_id,),
-        ).fetchone()
-        return self._item_from_row(row) if row is not None else None
+        with self._lock:
+            row = self._connection.execute(
+                "select * from context_items where item_id = ?",
+                (item_id,),
+            ).fetchone()
+            return self._item_from_row(row) if row is not None else None
 
     def query_items(
         self,
@@ -172,7 +174,8 @@ class ObservationStore:
         if clauses:
             sql += " where " + " and ".join(clauses)
         sql += " order by seq, created_at, item_id"
-        rows = self._connection.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._connection.execute(sql, params).fetchall()
         return [self._item_from_row(row) for row in rows]
 
     def mark_stale(self, item_id: str, *, reason: str = "") -> None:
@@ -184,57 +187,59 @@ class ObservationStore:
         )
 
     def supersede_item(self, item_id: str, *, superseded_by: str) -> None:
-        row = self._connection.execute(
-            "select run_id, metadata from context_items where item_id = ?",
-            (item_id,),
-        ).fetchone()
-        if row is None:
-            return
-        metadata = json.loads(row["metadata"] or "{}")
-        metadata["superseded_by"] = superseded_by
-        self._connection.execute(
-            """
-            update context_items
-            set freshness = ?, metadata = ?, updated_at = ?
-            where item_id = ?
-            """,
-            (
-                ContextFreshness.OBSOLETE.value,
-                json.dumps(metadata, ensure_ascii=False, default=str),
-                self._now(),
-                item_id,
-            ),
-        )
-        self._append_event(
-            row["run_id"],
-            event_type="context.item_superseded",
-            item_id=item_id,
-            payload={"superseded_by": superseded_by},
-        )
-        self._connection.commit()
+        with self._lock:
+            row = self._connection.execute(
+                "select run_id, metadata from context_items where item_id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                return
+            metadata = json.loads(row["metadata"] or "{}")
+            metadata["superseded_by"] = superseded_by
+            self._connection.execute(
+                """
+                update context_items
+                set freshness = ?, metadata = ?, updated_at = ?
+                where item_id = ?
+                """,
+                (
+                    ContextFreshness.OBSOLETE.value,
+                    json.dumps(metadata, ensure_ascii=False, default=str),
+                    self._now(),
+                    item_id,
+                ),
+            )
+            self._append_event(
+                row["run_id"],
+                event_type="context.item_superseded",
+                item_id=item_id,
+                payload={"superseded_by": superseded_by},
+            )
+            self._connection.commit()
 
     def set_item_pinned(self, item_id: str, *, pinned: bool = True) -> None:
-        row = self._connection.execute(
-            "select run_id from context_items where item_id = ?",
-            (item_id,),
-        ).fetchone()
-        if row is None:
-            return
-        self._connection.execute(
-            """
-            update context_items
-            set pinned = ?, updated_at = ?
-            where item_id = ?
-            """,
-            (1 if pinned else 0, self._now(), item_id),
-        )
-        self._append_event(
-            row["run_id"],
-            event_type="context.item_pinned" if pinned else "context.item_unpinned",
-            item_id=item_id,
-            payload={"pinned": pinned},
-        )
-        self._connection.commit()
+        with self._lock:
+            row = self._connection.execute(
+                "select run_id from context_items where item_id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                return
+            self._connection.execute(
+                """
+                update context_items
+                set pinned = ?, updated_at = ?
+                where item_id = ?
+                """,
+                (1 if pinned else 0, self._now(), item_id),
+            )
+            self._append_event(
+                row["run_id"],
+                event_type="context.item_pinned" if pinned else "context.item_unpinned",
+                item_id=item_id,
+                payload={"pinned": pinned},
+            )
+            self._connection.commit()
 
     def compact_items(
         self,
@@ -270,21 +275,22 @@ class ObservationStore:
                 raise
 
     def events_for_run(self, run_id: str) -> list[dict[str, Any]]:
-        rows = self._connection.execute(
-            "select * from context_events where run_id = ? order by seq",
-            (run_id,),
-        ).fetchall()
-        return [
-            {
-                "seq": row["seq"],
-                "run_id": row["run_id"],
-                "event_type": row["event_type"],
-                "item_id": row["item_id"],
-                "payload": json.loads(row["payload"] or "{}"),
-                "created_at": row["created_at"],
-            }
-            for row in rows
-        ]
+        with self._lock:
+            rows = self._connection.execute(
+                "select * from context_events where run_id = ? order by seq",
+                (run_id,),
+            ).fetchall()
+            return [
+                {
+                    "seq": row["seq"],
+                    "run_id": row["run_id"],
+                    "event_type": row["event_type"],
+                    "item_id": row["item_id"],
+                    "payload": json.loads(row["payload"] or "{}"),
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
 
     def record_event(
         self,
@@ -408,13 +414,14 @@ class ObservationStore:
         )
 
     def get_observation(self, observation_id: str) -> ToolObservation | None:
-        row = self._connection.execute(
-            "select * from observations where id = ?",
-            (observation_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        refs = self.references_for_observation(observation_id)
+        with self._lock:
+            row = self._connection.execute(
+                "select * from observations where id = ?",
+                (observation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            refs = self.references_for_observation(observation_id)
         return ToolObservation(
             id=row["id"],
             run_id=row["run_id"],
@@ -440,34 +447,38 @@ class ObservationStore:
         )
 
     def observation_count(self, run_id: str) -> int:
-        row = self._connection.execute(
-            "select count(*) as count from observations where run_id = ?",
-            (run_id,),
-        ).fetchone()
-        return int(row["count"])
+        with self._lock:
+            row = self._connection.execute(
+                "select count(*) as count from observations where run_id = ?",
+                (run_id,),
+            ).fetchone()
+            return int(row["count"])
 
     def save_reference(self, reference: ContextReference, *, commit: bool = True) -> None:
-        self._insert_reference(reference)
-        if commit:
-            self._connection.commit()
+        with self._lock:
+            self._insert_reference(reference)
+            if commit:
+                self._connection.commit()
 
     def resolve_reference(self, ref_id: str) -> ContextReference | None:
-        row = self._connection.execute(
-            "select * from context_references where id = ?",
-            (ref_id,),
-        ).fetchone()
-        return self._reference_from_row(row) if row is not None else None
+        with self._lock:
+            row = self._connection.execute(
+                "select * from context_references where id = ?",
+                (ref_id,),
+            ).fetchone()
+            return self._reference_from_row(row) if row is not None else None
 
     def references_for_observation(self, observation_id: str) -> list[ContextReference]:
-        rows = self._connection.execute(
-            """
-            select * from context_references
-            where observation_id = ? or source_item_id = ?
-            order by id
-            """,
-            (observation_id, observation_id),
-        ).fetchall()
-        return [self._reference_from_row(row) for row in rows]
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                select * from context_references
+                where observation_id = ? or source_item_id = ?
+                order by id
+                """,
+                (observation_id, observation_id),
+            ).fetchall()
+            return [self._reference_from_row(row) for row in rows]
 
     def references_for_target(
         self,
@@ -480,11 +491,12 @@ class ObservationStore:
         if ref_type is not None:
             clauses.append("ref_type = ?")
             params.append(ref_type)
-        rows = self._connection.execute(
-            "select * from context_references where " + " and ".join(clauses) + " order by id",
-            params,
-        ).fetchall()
-        return [self._reference_from_row(row) for row in rows]
+        with self._lock:
+            rows = self._connection.execute(
+                "select * from context_references where " + " and ".join(clauses) + " order by id",
+                params,
+            ).fetchall()
+            return [self._reference_from_row(row) for row in rows]
 
     def update_reference_freshness(
         self,
@@ -494,15 +506,16 @@ class ObservationStore:
         reason: str = "",
     ) -> None:
         freshness_value = _value(freshness)
-        self._connection.execute(
-            """
-            update context_references
-            set freshness = ?, metadata = json_set(coalesce(metadata, '{}'), '$.stale_reason', ?)
-            where id = ?
-            """,
-            (freshness_value, reason, ref_id),
-        )
-        self._connection.commit()
+        with self._lock:
+            self._connection.execute(
+                """
+                update context_references
+                set freshness = ?, metadata = json_set(coalesce(metadata, '{}'), '$.stale_reason', ?)
+                where id = ?
+                """,
+                (freshness_value, reason, ref_id),
+            )
+            self._connection.commit()
 
     def save_snapshot(self, snapshot: ContextSnapshot) -> None:
         with self._lock:
@@ -543,15 +556,16 @@ class ObservationStore:
             self._connection.commit()
 
     def latest_snapshot(self, run_id: str) -> ContextSnapshot | None:
-        row = self._connection.execute(
-            """
-            select * from context_snapshots
-            where run_id = ?
-            order by created_at desc, snapshot_id desc
-            limit 1
-            """,
-            (run_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                select * from context_snapshots
+                where run_id = ?
+                order by created_at desc, snapshot_id desc
+                limit 1
+                """,
+                (run_id,),
+            ).fetchone()
         if row is None:
             return None
         return ContextSnapshot(
@@ -614,15 +628,16 @@ class ObservationStore:
             self._connection.commit()
 
     def latest_bundle(self, run_id: str) -> ContextBundle | None:
-        row = self._connection.execute(
-            """
-            select * from context_bundles
-            where run_id = ?
-            order by created_at desc, bundle_id desc
-            limit 1
-            """,
-            (run_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                select * from context_bundles
+                where run_id = ?
+                order by created_at desc, bundle_id desc
+                limit 1
+                """,
+                (run_id,),
+            ).fetchone()
         if row is None:
             return None
         return ContextBundle.from_dict(
@@ -685,22 +700,23 @@ class ObservationStore:
         payload: dict[str, Any],
         source_item_ids: list[str],
     ) -> None:
-        self._connection.execute(
-            """
-            insert or replace into context_summaries(
-                summary_id, run_id, payload, source_item_ids, created_at
+        with self._lock:
+            self._connection.execute(
+                """
+                insert or replace into context_summaries(
+                    summary_id, run_id, payload, source_item_ids, created_at
+                )
+                values(?, ?, ?, ?, ?)
+                """,
+                (
+                    summary_id,
+                    run_id,
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    json.dumps(source_item_ids, ensure_ascii=False),
+                    self._now(),
+                ),
             )
-            values(?, ?, ?, ?, ?)
-            """,
-            (
-                summary_id,
-                run_id,
-                json.dumps(payload, ensure_ascii=False, default=str),
-                json.dumps(source_item_ids, ensure_ascii=False),
-                self._now(),
-            ),
-        )
-        self._connection.commit()
+            self._connection.commit()
 
     def save_recovery_checkpoint(
         self,
@@ -709,33 +725,35 @@ class ObservationStore:
         checkpoint_id: str,
         payload: dict[str, Any],
     ) -> None:
-        self._connection.execute(
-            """
-            insert or replace into context_recovery_checkpoints(
-                checkpoint_id, run_id, payload, created_at
+        with self._lock:
+            self._connection.execute(
+                """
+                insert or replace into context_recovery_checkpoints(
+                    checkpoint_id, run_id, payload, created_at
+                )
+                values(?, ?, ?, ?)
+                """,
+                (
+                    checkpoint_id,
+                    run_id,
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    self._now(),
+                ),
             )
-            values(?, ?, ?, ?)
-            """,
-            (
-                checkpoint_id,
-                run_id,
-                json.dumps(payload, ensure_ascii=False, default=str),
-                self._now(),
-            ),
-        )
-        self._connection.commit()
+            self._connection.commit()
 
     def latest_recovery_checkpoint(self, run_id: str) -> dict[str, Any] | None:
-        row = self._connection.execute(
-            """
-            select payload from context_recovery_checkpoints
-            where run_id = ?
-            order by created_at desc, checkpoint_id desc
-            limit 1
-            """,
-            (run_id,),
-        ).fetchone()
-        return json.loads(row["payload"]) if row else None
+        with self._lock:
+            row = self._connection.execute(
+                """
+                select payload from context_recovery_checkpoints
+                where run_id = ?
+                order by created_at desc, checkpoint_id desc
+                limit 1
+                """,
+                (run_id,),
+            ).fetchone()
+            return json.loads(row["payload"]) if row else None
 
     def current_version(self, run_id: str) -> int:
         with self._lock:
@@ -1138,27 +1156,28 @@ class ObservationStore:
         event_type: str,
         reason: str,
     ) -> None:
-        row = self._connection.execute(
-            "select run_id from context_items where item_id = ?",
-            (item_id,),
-        ).fetchone()
-        if row is None:
-            return
-        self._connection.execute(
-            """
-            update context_items
-            set freshness = ?, updated_at = ?
-            where item_id = ?
-            """,
-            (freshness.value, self._now(), item_id),
-        )
-        self._append_event(
-            row["run_id"],
-            event_type=event_type,
-            item_id=item_id,
-            payload={"reason": reason},
-        )
-        self._connection.commit()
+        with self._lock:
+            row = self._connection.execute(
+                "select run_id from context_items where item_id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                return
+            self._connection.execute(
+                """
+                update context_items
+                set freshness = ?, updated_at = ?
+                where item_id = ?
+                """,
+                (freshness.value, self._now(), item_id),
+            )
+            self._append_event(
+                row["run_id"],
+                event_type=event_type,
+                item_id=item_id,
+                payload={"reason": reason},
+            )
+            self._connection.commit()
 
     def _item_from_row(self, row: sqlite3.Row) -> ContextItem:
         return ContextItem(

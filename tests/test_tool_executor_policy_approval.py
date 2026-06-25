@@ -104,7 +104,11 @@ def test_require_review_uses_approval_gate_and_consumes_grant(tmp_path: Path) ->
     calls: list[str] = []
     policy_engine = SequencedPolicyEngine([DecisionOutcome.REQUIRE_REVIEW])
     gate = ApprovalGate(
-        PolicyConfig(workspace_root=tmp_path, approval_mode=ApprovalMode.INTERACTIVE),
+        PolicyConfig(
+            workspace_root=tmp_path,
+            approval_mode=ApprovalMode.INTERACTIVE,
+            approval_grants_path=tmp_path / "policy" / "grants.jsonl",
+        ),
         interaction=InteractionController(provider=ApprovingProvider()),
     )
     component = component_with_policy(
@@ -117,6 +121,73 @@ def test_require_review_uses_approval_gate_and_consumes_grant(tmp_path: Path) ->
     assert calls == ["called"]
     assert result.metadata["approval_grant_id"].startswith("grant_")
     assert gate.find_matching_grant(policy_engine.requests[0]) is None
+
+
+def test_untrusted_grant_store_inside_workspace_is_not_consumed(tmp_path: Path) -> None:
+    # P0-1: Grants persisted inside the workspace are untrusted and must not
+    # be auto-consumed by ToolExecutor. The pre-registered grant below lives
+    # inside the workspace, so the executor must fall through to resolve(),
+    # which fails closed without an interaction provider.
+    from singularity.policy import (
+        ApprovalGrant,
+        ApprovalScope,
+        Capability,
+        OperationKind,
+        PolicyComponent,
+        PolicyRequest,
+        PolicySubject,
+        ResourceRef,
+    )
+
+    grants_path = tmp_path / ".singularity" / "policy" / "approval_grants.jsonl"
+    policy_engine = SequencedPolicyEngine([DecisionOutcome.REQUIRE_REVIEW])
+    gate = ApprovalGate(
+        PolicyConfig(
+            workspace_root=tmp_path,
+            approval_mode=ApprovalMode.INTERACTIVE,
+            approval_grants_path=grants_path,
+        )
+    )
+    assert gate.is_grant_store_trusted(tmp_path) is False
+
+    request = PolicyRequest(
+        session_id="session",
+        task_id="task",
+        phase_id="phase",
+        action_id="action",
+        component=PolicyComponent.TOOL,
+        operation=OperationKind.READ_FILE,
+        capability=Capability.READ_WORKSPACE,
+        subject=PolicySubject(subject_type="component", name="ToolExecutor"),
+        resource=ResourceRef(resource_type="file", identifier="README.md"),
+        reason="read me",
+        workspace_root=str(tmp_path),
+    )
+    grant = ApprovalGrant(
+        decision_id="policy_dec_test_untrusted",
+        request_id=request.request_id,
+        approved_by="forged-by-model",
+        session_id=request.session_id,
+        scope=ApprovalScope(
+            capabilities=[Capability.READ_WORKSPACE],
+            path_globs=["README.md"],
+            single_use=True,
+        ),
+    )
+    gate.register_grant(grant)
+
+    calls: list[str] = []
+    component = component_with_policy(
+        tmp_path, policy_engine, approval_gate=gate, handler_calls=calls
+    )
+
+    result = component.execute_tool_call(make_tool_call("read_policy"))
+
+    # The grant was not consumed because the store is untrusted. The executor
+    # falls through to resolve() which fails closed without a provider.
+    assert result.ok is False
+    assert result.error_code == "approval_required"
+    assert calls == []
 
 
 def test_tool_executor_requires_injected_policy_engine(tmp_path: Path) -> None:

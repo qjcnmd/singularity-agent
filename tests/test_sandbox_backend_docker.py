@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 
 from singularity.sandbox.backends import DockerSandboxBackend, docker_backend_available
 from singularity.sandbox.models import (
+    SandboxFilesystemMode,
     SandboxNetworkMode,
     SandboxNetworkPolicy,
     SandboxProfileName,
@@ -77,6 +79,16 @@ def test_docker_backend_builds_cli_command_with_staged_workspace_and_limits(
     assert result.stdout == "ok\n"
     command = completed_commands[0]
     assert command[:3] == ["docker", "run", "--rm"]
+    # Security hardening params (P1-3): --name, --user, --cap-drop=ALL,
+    # --security-opt no-new-privileges, --init must be present.
+    assert "--name" in command
+    assert command[command.index("--name") + 1] == f"singularity-{prepared.sandbox_id}"
+    assert "--user" in command
+    assert command[command.index("--user") + 1] == "1000:1000"
+    assert "--cap-drop=ALL" in command
+    assert "--security-opt" in command
+    assert command[command.index("--security-opt") + 1] == "no-new-privileges"
+    assert "--init" in command
     assert "--network" in command
     assert "none" in command
     assert "--memory" in command
@@ -166,3 +178,188 @@ def test_real_docker_backend_smoke_skips_when_daemon_unavailable(tmp_path: Path)
 
     assert result.status == SandboxStatus.SUCCESS
     assert "docker" in result.stdout
+
+
+def test_docker_command_pins_image_digest_when_provided(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed_commands: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = b"ok\n"
+        stderr = b""
+
+    def fake_run(command: list[str], **kwargs: object) -> _Completed:
+        completed_commands.append(command)
+        return _Completed()
+
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
+    request = _request(tmp_path)
+    request.profile.image_digest = "sha256:abcdef1234567890"
+    backend = DockerSandboxBackend(image="python:3.13-slim")
+    prepared = backend.prepare(request)
+
+    backend.run(prepared)
+
+    command = completed_commands[0]
+    assert "python:3.13-slim@sha256:abcdef1234567890" in command
+    # The bare tag must not appear separately when a digest is pinned.
+    assert "python:3.13-slim" not in [
+        part for part in command if part == "python:3.13-slim"
+    ]
+
+
+def test_docker_command_uses_image_tag_when_no_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed_commands: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = b"ok\n"
+        stderr = b""
+
+    def fake_run(command: list[str], **kwargs: object) -> _Completed:
+        completed_commands.append(command)
+        return _Completed()
+
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
+    request = _request(tmp_path)
+    backend = DockerSandboxBackend(image="python:3.13-slim")
+    prepared = backend.prepare(request)
+
+    backend.run(prepared)
+
+    command = completed_commands[0]
+    assert "python:3.13-slim" in command
+    # No digest suffix must be appended when image_digest is None.
+    assert not any(
+        part.startswith("python:3.13-slim@") for part in command
+    )
+
+
+def test_docker_command_mounts_workspace_readonly_for_read_only_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed_commands: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = b"ok\n"
+        stderr = b""
+
+    def fake_run(command: list[str], **kwargs: object) -> _Completed:
+        completed_commands.append(command)
+        return _Completed()
+
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
+    request = _request(tmp_path)
+    request.profile.filesystem.mode = SandboxFilesystemMode.READ_ONLY_WORKSPACE
+    backend = DockerSandboxBackend(image="python:3.13-slim")
+    prepared = backend.prepare(request)
+
+    backend.run(prepared)
+
+    command = completed_commands[0]
+    readonly_mount = f"{prepared.workspace_copy_root}:/workspace:ro"
+    assert readonly_mount in command
+
+
+def test_docker_command_uses_memory_and_pids_limit_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed_commands: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = b"ok\n"
+        stderr = b""
+
+    def fake_run(command: list[str], **kwargs: object) -> _Completed:
+        completed_commands.append(command)
+        return _Completed()
+
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
+    request = _request(tmp_path)
+    request.profile.resources.memory_limit = "512m"
+    request.profile.resources.pids_limit = 100
+    backend = DockerSandboxBackend(image="python:3.13-slim")
+    prepared = backend.prepare(request)
+
+    backend.run(prepared)
+
+    command = completed_commands[0]
+    assert "--memory" in command
+    assert command[command.index("--memory") + 1] == "512m"
+    assert "--pids-limit" in command
+    assert command[command.index("--pids-limit") + 1] == "100"
+
+
+def test_docker_timeout_triggers_container_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_calls: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(command: list[str], **kwargs: object) -> _Completed:
+        run_calls.append(command)
+        if len(command) >= 3 and command[:3] == ["docker", "run", "--rm"]:
+            raise subprocess.TimeoutExpired(cmd=command, timeout=1)
+        return _Completed()
+
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
+    request = _request(tmp_path)
+    request.profile.resources.timeout_seconds = 1
+    backend = DockerSandboxBackend(image="python:3.13-slim")
+    prepared = backend.prepare(request)
+
+    result = backend.run(prepared)
+
+    assert result.status == SandboxStatus.TIMEOUT
+    assert result.metadata["error_code"] == "timeout"
+    # On timeout, the backend must call `docker stop <container>` to clean
+    # up the orphaned container (it was started with --rm, so stop also
+    # removes it).
+    stop_calls = [
+        cmd for cmd in run_calls if len(cmd) >= 2 and cmd[:2] == ["docker", "stop"]
+    ]
+    assert len(stop_calls) == 1
+    assert stop_calls[0][2] == f"singularity-{prepared.sandbox_id}"
+
+
+def test_docker_command_respects_container_user_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed_commands: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = b"ok\n"
+        stderr = b""
+
+    def fake_run(command: list[str], **kwargs: object) -> _Completed:
+        completed_commands.append(command)
+        return _Completed()
+
+    monkeypatch.setattr("singularity.sandbox.backends.subprocess.run", fake_run)
+    request = _request(tmp_path)
+    request.metadata["container_user"] = "1001:1001"
+    backend = DockerSandboxBackend(image="python:3.13-slim")
+    prepared = backend.prepare(request)
+
+    backend.run(prepared)
+
+    command = completed_commands[0]
+    assert "--user" in command
+    assert command[command.index("--user") + 1] == "1001:1001"

@@ -137,6 +137,52 @@ The current structure is strong: model protocol concerns live in `tool_protocol`
 
 The main complexity is that `ToolExecutor.execute_request()` is large because it owns validation, policy, approval, replay, caching, dispatch, output limiting, trace, and planner update. That makes docs and tests important for preventing silent boundary drift.
 
+## Cache And Concurrency Behavior
+
+`ToolExecutor` owns two in-memory stores that are touched on every tool call:
+
+- `ToolResultCache` (OrderedDict-backed LRU keyed by `_cache_key()` output).
+- `IdempotencyLedger` (dict keyed by `tool_call_id` for replay detection).
+
+### Cache Key Construction
+
+`_cache_key()` builds the cache key from:
+
+- `tool_name`, `version`, model schema fingerprint (`_model_schema_fingerprint`);
+- validated `arguments`;
+- `workspace_root` string;
+- `paths` snapshot from `_file_snapshots()`.
+
+`_file_snapshots()` no longer scans the workspace tree. For each path returned by `_touched_paths()` (derived from `spec.resource_resolver`), it records lightweight `stat()` data:
+
+- `size` (`st_size`);
+- `mtime_ns` (`st_mtime_ns`);
+- `is_dir`;
+- `{"exists": False}` when `stat()` raises `OSError`.
+
+This replaces the previous `rglob("*")` + `read_bytes()` + sha256 approach, which scanned the entire workspace on every cache key computation.
+
+### Incremental Invalidation After Write Tools
+
+When `spec.permission_level != READ_ONLY`, `ToolExecutor` calls `_invalidate_after_write(spec, validated_args, result)` instead of `self._cache.clear()`. The method collects affected paths from:
+
+1. `result.content["changed_files"]` and `result.content["affected_files"]` (populated by `WorkspaceMutationManager` observation when the write tool records its mutation).
+2. `spec.resource_resolver` output via `_touched_paths()`.
+
+If at least one affected path is determined, `self._cache.invalidate_paths(affected)` evicts only cache entries whose `touched_paths` overlap the mutated paths (`_paths_overlap`). When no affected paths can be determined (for example free-form shell tools without a resource resolver), the method falls back to `self._cache.clear()` so stale read-only results are never served.
+
+### Thread Safety
+
+`ToolResultCache` and `IdempotencyLedger` each hold a `threading.RLock`. All access points are guarded:
+
+- `ToolResultCache.get` (including TTL expiry and `move_to_end`);
+- `ToolResultCache.set` (including LRU `popitem(last=False)`);
+- `ToolResultCache.invalidate_paths` (iterates a snapshot via `list(self._entries.items())`);
+- `ToolResultCache.clear` and `__len__`;
+- `IdempotencyLedger.check` and `IdempotencyLedger.remember`.
+
+`RLock` is used so compound operations (get+move_to_end, check+remember) stay safe under concurrent tool execution within the same thread.
+
 ## Production-Grade Target Structure
 
 Current code has no separate object named `ToolRuntime`; the runtime object is `ToolExecutor`.
@@ -171,4 +217,4 @@ Update this document when changing:
 
 ## Last Verified Against
 
-Last verified against commit `5f2202bd8cfcc2a4e4a66c025891550e52f3556e` on 2026-06-25.
+Last verified against commit `0179eeb36ed7723b5dbc922310871c83931f1df6` on 2026-06-25.

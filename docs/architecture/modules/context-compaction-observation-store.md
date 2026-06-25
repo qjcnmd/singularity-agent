@@ -8,6 +8,7 @@ Source paths:
 - src/singularity/context/store.py
 - src/singularity/context/models.py
 - src/singularity/context/usage.py
+- src/singularity/context/redaction.py
 
 Symbols:
 - ContextManager
@@ -43,6 +44,10 @@ Symbols:
 - ContextSummaryEnvelope
 - ToolObservation
 - ContextUsageReporter
+- SensitivityClassifier
+- ContextRedactor
+- ContextRedactor.redact_text
+- ContextRedactor.redact_value
 
 ## Module Boundary
 
@@ -60,6 +65,7 @@ It is not responsible for generating the main task model request except through 
 - `src/singularity/context/store.py`: SQLite persistence for messages, items, observations, events, bundles, references, snapshots, and summaries.
 - `src/singularity/context/models.py`: `ContextSnapshot`, `ContextSummaryPayload`, `ContextSummaryEnvelope`, `ToolObservation`.
 - `src/singularity/context/usage.py`: usage/cache reporting.
+- `src/singularity/context/redaction.py`: secret pattern matching, sensitive field markers, `SensitivityClassifier`, and `ContextRedactor` used by `manager.py` and `store.py`.
 
 ## Runtime Call Chain
 
@@ -74,6 +80,16 @@ It is not responsible for generating the main task model request except through 
 9. `ContextManager._observe_compaction_committed()` emits `context.compaction_completed`.
 10. If any stage fails, `_handle_compaction_failure()` calls `ContextCompactionCommitter.recover_after_failure()` or builds a minimal tail fallback, then emits `context.compaction_failed`.
 
+### Tool Result Redaction Path
+
+`ContextManager.add_tool_result()` runs redaction uniformly across all sensitivity levels:
+
+1. `_preview_result()` produces the preview text and truncation metadata from the raw result.
+2. `SensitivityClassifier.classify(result)` assigns a `ContextSensitivity` (SECRET/SENSITIVE/WORKSPACE/PUBLIC) used for the `ToolObservation.sensitivity` field and downstream storage policy.
+3. `ContextRedactor.redact_text(preview)` is applied unconditionally to `rendered_preview` for every sensitivity level, including PUBLIC and WORKSPACE, so secret patterns matching `SECRET_PATTERNS` are replaced with `<redacted:<digest>>` markers regardless of the classified level.
+4. `ObservationStore.save_observation()` re-runs `SensitivityClassifier.classify()` on `observation.raw_result` and, when the result is SECRET/SENSITIVE and `allow_raw_secret_storage` is False, re-applies `ContextRedactor` to preview and stored result.
+5. `ObservationStore._stored_observation_result()` always wraps the stored raw result through `ContextRedactor.redact_value()`, and `_stored_observation_metadata()` / `_stored_observation_preview()` always redact metadata dicts and previews via `redact_value()` / `redact_text()`.
+
 ## Runtime Objects Passed
 
 - `CompactionPlan`: `source_item_ids`, `buckets`, `retained_item_ids`, `current_summary_item_ids`, `omitted_item_ids`, `llm_buckets`, `deterministic_buckets`, `archive_buckets`, `recent_tail`, `previous_summary`, `cache_attribution`, `partial_range`.
@@ -82,6 +98,9 @@ It is not responsible for generating the main task model request except through 
 - `ContextSummaryEnvelope`: version, summary id, summary payload, source item ids, cache attribution, previous summary digest, summary digest, rendered summary, metadata.
 - `ContextSnapshot`: `snapshot_id`, `run_id`, `session_id`, `task_id`, `goal`, `summary`, `retained_item_ids`, `known_observation_ids`, `version`, `created_at`, `retained_messages`, `metadata`.
 - `ToolObservation`: id, tool name, call id, ok, raw result, preview, truncation, metadata, run id, turn, token counts, digest, refs, cache, duration, error code, sensitivity.
+- `redaction.SECRET_PATTERNS`: tuple of compiled regexes covering bearer/authorization headers, `API_KEY`/`TOKEN`/`SECRET`/`PASSWORD` assignments, cookies, PEM private key blocks, `sk-`/`gh[pousr]_`/`npm_` tokens, AWS Access Key IDs (`AKIA[0-9A-Z]{16}`), JWTs (`eyJ...`), Slack tokens (`xox[baprs]-...`), Stripe live keys (`sk_live_...`), and Google API keys (`AIza...`).
+- `redaction.SENSITIVE_FIELD_MARKERS`: tuple of field-name substrings (`token`, `secret`, `password`, `cookie`, `api_key`, `authorization`, `credential`, `passphrase`, `private_key`, `access_token`, `refresh_token`, `client_secret`) used by `ContextRedactor.redact_value()` to mask dict values case-insensitively.
+- `redaction.SENSITIVE_PATTERNS`: tuple of regexes (`.env`, `private[_-]?key`, `password`) used by `SensitivityClassifier` to upgrade content to `SENSITIVE` when no `SECRET_PATTERNS` match.
 
 ## Model-Visible Objects (模型实际可见对象)
 
@@ -114,6 +133,9 @@ Internal-only objects include:
 - If snapshot recovery fails or no snapshot exists, the manager falls back to base messages plus recent tail.
 - `ContextCompressor.parse_summary()` can reject invalid JSON, invalid schema, missing references, or drifted summaries.
 - `ObservationStore` redacts secret/sensitive content before storage unless explicitly configured to allow raw secret storage.
+- `ObservationStore.__init__()` opens its SQLite connection with `check_same_thread=False` so the store can be shared across threads in the runtime.
+- All `ObservationStore` read and write paths acquire `self._lock` (an `RLock`) before touching `self._connection`, including `load_messages`, `load_item`, `query_items`, `events_for_run`, `get_observation`, `observation_count`, `resolve_reference`, `references_for_observation`, `references_for_target`, `latest_snapshot`, `latest_bundle`, `latest_recovery_checkpoint`, `current_version`, and the `transaction()` context manager. This makes concurrent reads and writes safe under multi-threaded access.
+- Write paths use `begin immediate` transactions inside `append_item`, `compact_items`, and `transaction()` so version conflicts roll back cleanly via `ContextVersionConflict`.
 
 ## Current Structure Assessment
 
@@ -157,4 +179,4 @@ Update this document when changing:
 
 ## Last Verified Against
 
-Last verified against commit `5f2202bd8cfcc2a4e4a66c025891550e52f3556e` on 2026-06-25.
+Last verified against commit `0179eeb36ed7723b5dbc922310871c83931f1df6` on 2026-06-25.

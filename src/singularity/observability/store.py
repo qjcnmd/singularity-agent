@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,22 @@ from singularity.observability.summary import TraceSummaryBuilder
 from singularity.observability.timeline import TraceTimelineBuilder
 
 
+_RUN_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_run_id(run_id: str) -> None:
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("run_id must be a non-empty string.")
+    if ".." in run_id:
+        raise ValueError(f"run_id must not contain '..': {run_id!r}")
+    if run_id.startswith("/") or (len(run_id) >= 2 and run_id[1] == ":"):
+        raise ValueError(f"run_id must not be an absolute path: {run_id!r}")
+    if not _RUN_ID_SAFE_RE.match(run_id):
+        raise ValueError(
+            f"run_id must only contain letters, digits, '-' or '_': {run_id!r}"
+        )
+
+
 class TraceStore:
     def __init__(
         self,
@@ -29,6 +46,7 @@ class TraceStore:
         run_id: str,
         trace_dir: Path | str | None = None,
     ) -> None:
+        _validate_run_id(run_id)
         self.root = Path(root)
         self.run_id = run_id
         self.trace_dir = Path(trace_dir).expanduser() if trace_dir is not None else None

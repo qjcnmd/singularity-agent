@@ -18,6 +18,7 @@ from singularity.sandbox.models import (
     SandboxRequest,
     SandboxResult,
     SandboxStatus,
+    SandboxViolation,
     default_sandbox_profile,
     new_sandbox_id,
 )
@@ -67,7 +68,7 @@ class SandboxManager:
                 result = self._unavailable(request, "No sandbox backend is registered.", started)
                 self._record_trace(prepared=prepared, result=result, capabilities=None, request=request)
                 return result
-            self.ensure_capabilities(request, backend)
+            capability_violations = self.ensure_capabilities(request, backend)
             self._throw_if_cancelled()
             prepared = backend.prepare(request)
             self._throw_if_cancelled()
@@ -92,6 +93,8 @@ class SandboxManager:
                 summary=f"Sandbox command started in {prepared.sandbox_id}.",
             )
             result = backend.run(prepared)
+            if capability_violations:
+                result.violations.extend(capability_violations)
             self._throw_if_cancelled()
             try:
                 backend.cleanup(prepared)
@@ -167,10 +170,32 @@ class SandboxManager:
         self,
         request: SandboxRequest,
         backend: SandboxBackend,
-    ) -> None:
+    ) -> list[SandboxViolation]:
         capabilities = backend.capabilities()
+        violations: list[SandboxViolation] = []
         if request.profile.network.require_hard_isolation and not capabilities.network_isolation:
             raise SandboxCapabilityError("Backend cannot enforce required network isolation.")
+        if (
+            request.profile.network.mode == SandboxNetworkMode.DENIED
+            and not capabilities.network_isolation
+        ):
+            # Fail-closed: the profile denies network access but the selected
+            # backend cannot enforce network isolation. Record a violation
+            # instead of silently running with an unenforced denial.
+            violations.append(
+                SandboxViolation(
+                    violation_type="network_denial_unenforced",
+                    message=(
+                        f"Backend {backend.name()} cannot enforce denied network mode; "
+                        "network access is not isolated."
+                    ),
+                    severity="warning",
+                    evidence={
+                        "backend": backend.name(),
+                        "network_mode": request.profile.network.mode.value,
+                    },
+                )
+            )
         if request.profile.resources.max_memory_mb is not None and not capabilities.memory_limit:
             raise SandboxCapabilityError("Backend cannot enforce memory limits.")
         if request.profile.resources.max_processes is not None and not capabilities.process_limit:
@@ -178,23 +203,32 @@ class SandboxManager:
         request_checker = getattr(backend, "ensure_request_supported", None)
         if callable(request_checker):
             request_checker(request)
+        return violations
 
     def capability_summary(self, *, approval_mode: str | None = None) -> dict[str, Any]:
         backends: dict[str, dict[str, Any]] = {}
+        selected_capabilities: dict[str, Any] | None = None
         for backend in self.backends:
             if not self._backend_available(backend):
                 continue
             name = backend.name()
-            backends[name] = backend.capabilities().to_dict()
-        hard_isolation = any(
-            capabilities.get("network_isolation") is True
-            for capabilities in backends.values()
-        )
-        soft_workspace_isolation = any(
-            capabilities.get("copy_on_write") is True
-            or capabilities.get("filesystem_isolation") is True
-            for capabilities in backends.values()
-        )
+            capabilities_dict = backend.capabilities().to_dict()
+            backends[name] = capabilities_dict
+            if selected_capabilities is None:
+                # The first available backend is what `_select_backend` would
+                # pick for a default request; report isolation capabilities
+                # based on this selected backend rather than the union of all
+                # available backends.
+                selected_capabilities = capabilities_dict
+        if selected_capabilities is None:
+            hard_isolation = False
+            soft_workspace_isolation = False
+        else:
+            hard_isolation = selected_capabilities.get("network_isolation") is True
+            soft_workspace_isolation = (
+                selected_capabilities.get("copy_on_write") is True
+                or selected_capabilities.get("filesystem_isolation") is True
+            )
         default_profile = default_sandbox_profile(
             SandboxProfileName.ISOLATED_VERIFICATION,
             workspace_root=self.workspace_root,
@@ -272,7 +306,7 @@ class SandboxManager:
         elif filesystem_mode in {"copy_on_write", "workspace_copy", "copy_on_write_workspace"}:
             profile.filesystem.mode = SandboxFilesystemMode.COPY_ON_WRITE_WORKSPACE
         elif filesystem_mode in {"read_only", "readonly", "read_only_workspace"}:
-            profile.filesystem.mode = SandboxFilesystemMode.COPY_ON_WRITE_WORKSPACE
+            profile.filesystem.mode = SandboxFilesystemMode.READ_ONLY_WORKSPACE
         elif filesystem_mode in {"empty", "empty_temp_workspace"}:
             profile.filesystem.mode = SandboxFilesystemMode.EMPTY_TEMP_WORKSPACE
         if profile.filesystem.mode == SandboxFilesystemMode.COPY_ON_WRITE_WORKSPACE:

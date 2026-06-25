@@ -879,3 +879,90 @@ def test_planner_records_review_observation_and_routes_decision(tmp_path: Path) 
     )
 
     assert planner.state.status == TaskStatus.NEEDS_REVIEW
+
+
+def test_planner_store_atomic_write_does_not_corrupt_existing_file(tmp_path: Path) -> None:
+    from singularity.planner.store import PlannerStore
+
+    store = PlannerStore(tmp_path)
+    target = store.session_dir("session_atomic") / "state.json"
+    original_payload = {"session_id": "session_atomic", "version": 1, "task_id": "task_1"}
+    store._write_json(target, original_payload)
+    assert target.exists()
+
+    # Simulate an interrupted write: a leftover temp file should not corrupt the target.
+    temp_path = target.with_name(f".{target.name}.stale.tmp")
+    temp_path.write_text("PARTIAL_CORRUPT", encoding="utf-8")
+
+    # The original file must still be readable and intact.
+    loaded = store._read_json(target)
+    assert loaded == original_payload
+
+    # A fresh atomic write replaces the file completely; no partial content remains.
+    new_payload = {"session_id": "session_atomic", "version": 2, "task_id": "task_2"}
+    store._write_json(target, new_payload)
+    loaded = store._read_json(target)
+    assert loaded == new_payload
+    assert "PARTIAL_CORRUPT" not in target.read_text(encoding="utf-8")
+
+
+def test_planner_store_concurrent_append_events_do_not_interleave(tmp_path: Path) -> None:
+    import threading
+
+    from singularity.planner.store import PlannerStore
+
+    store = PlannerStore(tmp_path)
+    session_id = "session_concurrent"
+    events_path = store.session_dir(session_id) / "planner_events.jsonl"
+
+    errors: list[BaseException] = []
+
+    def appender(thread_index: int) -> None:
+        try:
+            for index in range(25):
+                store.append_event(
+                    session_id,
+                    task_id=f"task_{thread_index}",
+                    phase="inspecting_workspace",
+                    action_id=f"action_{thread_index}_{index}",
+                    extra={"thread_index": thread_index, "index": index},
+                )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=appender, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    lines = [line for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # Each append writes exactly one full line; no partial/interleaved lines.
+    assert len(lines) == 100
+    parsed = [json.loads(line) for line in lines]
+    action_ids = [entry["action_id"] for entry in parsed]
+    assert len(set(action_ids)) == 100
+    for entry in parsed:
+        assert entry["event"] == "planner"
+        assert entry["session_id"] == session_id
+
+
+def test_planner_store_save_is_atomic_across_files(tmp_path: Path) -> None:
+    from singularity.planner.store import PlannerStore
+
+    store = PlannerStore(tmp_path)
+    planner = Planner(tmp_path, session_id="session_save_atomic", task_id="task_save")
+    planner.start_task("Atomic save task")
+
+    # All four files should be present and valid after save (atomic per file).
+    session_dir = tmp_path / ".singularity" / "planner" / "session_save_atomic"
+    for filename in ("state.json", "plan.json", "evidence.json", "budget.json"):
+        path = session_dir / filename
+        assert path.exists()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert isinstance(payload, dict)
+        # No leftover temp files after a successful save.
+        siblings = [child.name for child in session_dir.iterdir() if child.name.startswith(f".{filename}.")]
+        assert siblings == []
+

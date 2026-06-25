@@ -27,6 +27,101 @@ def test_context_redactor_classifies_and_redacts_secret_patterns() -> None:
     assert "<redacted:" in redacted
 
 
+def test_context_redactor_redacts_aws_access_key() -> None:
+    aws_key = "AKIAIOSFODNN7EXAMPLE"
+    text = f"using aws key {aws_key} for upload"
+    classifier = SensitivityClassifier()
+    redactor = ContextRedactor()
+
+    assert classifier.classify(text) == ContextSensitivity.SECRET
+    redacted = redactor.redact_text(text)
+    assert aws_key not in redacted
+    assert "<redacted:" in redacted
+
+
+def test_context_redactor_redacts_jwt() -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    text = f"bearer {jwt}"
+    classifier = SensitivityClassifier()
+    redactor = ContextRedactor()
+
+    assert classifier.classify(text) == ContextSensitivity.SECRET
+    redacted = redactor.redact_text(text)
+    assert jwt not in redacted
+    assert "eyJ" not in redacted
+    assert "<redacted:" in redacted
+
+
+def test_context_redactor_redacts_slack_token() -> None:
+    slack = "xoxb-1234567890-abcdef"
+    text = f"slack token: {slack}"
+    classifier = SensitivityClassifier()
+    redactor = ContextRedactor()
+
+    assert classifier.classify(text) == ContextSensitivity.SECRET
+    redacted = redactor.redact_text(text)
+    assert slack not in redacted
+    assert "xoxb-" not in redacted
+    assert "<redacted:" in redacted
+
+
+def test_context_redactor_redacts_stripe_live_key() -> None:
+    stripe = "sk_live_abcdef1234567890"
+    text = f"charge with {stripe} failed"
+    classifier = SensitivityClassifier()
+    redactor = ContextRedactor()
+
+    assert classifier.classify(text) == ContextSensitivity.SECRET
+    redacted = redactor.redact_text(text)
+    assert stripe not in redacted
+    assert "sk_live_" not in redacted
+    assert "<redacted:" in redacted
+
+
+def test_context_redactor_redacts_google_api_key() -> None:
+    google_key = "AIza" + "A" * 35
+    text = f"maps api call {google_key} done"
+    classifier = SensitivityClassifier()
+    redactor = ContextRedactor()
+
+    assert classifier.classify(text) == ContextSensitivity.SECRET
+    redacted = redactor.redact_text(text)
+    assert google_key not in redacted
+    assert "AIza" not in redacted
+    assert "<redacted:" in redacted
+
+
+def test_context_redactor_redacts_sensitive_dict_field_values() -> None:
+    payload = {
+        "authorization": "Bearer abcdefgh",
+        "credential": "user:pass",
+        "access_token": "token-value-123",
+        "refresh_token": "refresh-value-456",
+        "client_secret": "secret-value-789",
+        "passphrase": "my-passphrase",
+        "private_key": "-----BEGIN PRIVATE KEY-----",
+        "safe": "keep-me",
+    }
+    redactor = ContextRedactor()
+
+    redacted = redactor.redact_value(payload)
+
+    assert redacted["authorization"] != "Bearer abcdefgh"
+    assert "abcdefgh" not in str(redacted["authorization"])
+    assert redacted["credential"] != "user:pass"
+    assert "user:pass" not in str(redacted["credential"])
+    assert redacted["access_token"] != "token-value-123"
+    assert "token-value-123" not in str(redacted["access_token"])
+    assert redacted["refresh_token"] != "refresh-value-456"
+    assert redacted["client_secret"] != "secret-value-789"
+    assert redacted["passphrase"] != "my-passphrase"
+    assert redacted["private_key"] != "-----BEGIN PRIVATE KEY-----"
+    assert redacted["safe"] == "keep-me"
+    assert "<redacted:" in str(redacted["authorization"])
+    assert "<redacted:" in str(redacted["credential"])
+    assert "<redacted:" in str(redacted["access_token"])
+
+
 def test_secret_tool_result_is_not_rendered_to_model_by_default(tmp_path) -> None:
     context = ContextManager(
         system_prompt="system",

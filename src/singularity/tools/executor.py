@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import pickle
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -117,16 +118,21 @@ def _json_safe_process_value(value: Any) -> Any:
 class ToolResultCache:
     def __init__(self) -> None:
         self._entries: OrderedDict[str, _CacheEntry] = OrderedDict()
+        # Re-entrant lock so nested calls within the same thread (and
+        # compound operations like get+move_to_end) stay safe under
+        # concurrent tool execution.
+        self._lock = threading.RLock()
 
     def get(self, key: str, *, ttl_seconds: float | None) -> ToolResult | None:
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        if ttl_seconds is not None and time.time() - entry.created_at > ttl_seconds:
-            self._entries.pop(key, None)
-            return None
-        self._entries.move_to_end(key)
-        return entry.result.model_copy(deep=True)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            if ttl_seconds is not None and time.time() - entry.created_at > ttl_seconds:
+                self._entries.pop(key, None)
+                return None
+            self._entries.move_to_end(key)
+            return entry.result.model_copy(deep=True)
 
     def set(
         self,
@@ -136,32 +142,40 @@ class ToolResultCache:
         max_entries: int,
         touched_paths: tuple[str, ...],
     ) -> None:
-        self._entries[key] = _CacheEntry(
-            result=result.model_copy(deep=True),
-            created_at=time.time(),
-            touched_paths=touched_paths,
-        )
-        self._entries.move_to_end(key)
-        while len(self._entries) > max_entries:
-            self._entries.popitem(last=False)
+        with self._lock:
+            self._entries[key] = _CacheEntry(
+                result=result.model_copy(deep=True),
+                created_at=time.time(),
+                touched_paths=touched_paths,
+            )
+            self._entries.move_to_end(key)
+            while len(self._entries) > max_entries:
+                self._entries.popitem(last=False)
 
     def invalidate_paths(self, paths: list[str]) -> None:
-        normalized = {Path(path).as_posix() for path in paths}
-        for key, entry in list(self._entries.items()):
-            if any(
-                _paths_overlap(changed, touched)
-                for changed in normalized
-                for touched in entry.touched_paths
-            ):
-                self._entries.pop(key, None)
+        with self._lock:
+            normalized = {Path(path).as_posix() for path in paths}
+            for key, entry in list(self._entries.items()):
+                if any(
+                    _paths_overlap(changed, touched)
+                    for changed in normalized
+                    for touched in entry.touched_paths
+                ):
+                    self._entries.pop(key, None)
 
     def clear(self) -> None:
-        self._entries.clear()
+        with self._lock:
+            self._entries.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
 
 
 class IdempotencyLedger:
     def __init__(self) -> None:
         self._entries: dict[str, _ReplayEntry] = {}
+        self._lock = threading.RLock()
 
     def check(
         self,
@@ -172,22 +186,23 @@ class IdempotencyLedger:
     ) -> ToolResult | None:
         if not tool_call_id:
             return None
-        existing = self._entries.get(tool_call_id)
-        if existing is None:
-            return None
-        if existing.args_fingerprint != args_fingerprint:
-            return ToolResult.failure(
-                code="conflicting_replay",
-                message="Duplicate tool_call_id was reused with different arguments.",
-            )
-        if not existing.replay_allowed:
-            return ToolResult.failure(
-                code="replay_not_allowed",
-                message="Duplicate tool_call_id replay is not allowed for this tool.",
-            )
-        replay = existing.result.model_copy(deep=True)
-        replay.metadata["replay"] = True
-        return replay
+        with self._lock:
+            existing = self._entries.get(tool_call_id)
+            if existing is None:
+                return None
+            if existing.args_fingerprint != args_fingerprint:
+                return ToolResult.failure(
+                    code="conflicting_replay",
+                    message="Duplicate tool_call_id was reused with different arguments.",
+                )
+            if not existing.replay_allowed:
+                return ToolResult.failure(
+                    code="replay_not_allowed",
+                    message="Duplicate tool_call_id replay is not allowed for this tool.",
+                )
+            replay = existing.result.model_copy(deep=True)
+            replay.metadata["replay"] = True
+            return replay
 
     def remember(
         self,
@@ -199,11 +214,12 @@ class IdempotencyLedger:
     ) -> None:
         if not tool_call_id:
             return
-        self._entries[tool_call_id] = _ReplayEntry(
-            args_fingerprint=args_fingerprint,
-            result=result.model_copy(deep=True),
-            replay_allowed=replay_allowed,
-        )
+        with self._lock:
+            self._entries[tool_call_id] = _ReplayEntry(
+                args_fingerprint=args_fingerprint,
+                result=result.model_copy(deep=True),
+                replay_allowed=replay_allowed,
+            )
 
 
 class ToolPolicyEngineProtocol(Protocol):
@@ -476,7 +492,11 @@ class ToolExecutor:
                     touched_paths=touched_paths,
                 )
             if spec.permission_level != PermissionLevel.READ_ONLY:
-                self._cache.clear()
+                # Incremental invalidation: evict only cache entries whose
+                # touched paths overlap the mutated paths, instead of clearing
+                # the whole cache. This preserves unrelated read-only results
+                # (e.g. cached reads of other files) across a targeted write.
+                self._invalidate_after_write(spec, validated_args, result)
             self._remember_replay(tool_call_id, args_fingerprint, spec, result)
             return result
         except Exception as exc:
@@ -522,6 +542,40 @@ class ToolExecutor:
 
     def invalidate_paths(self, paths: list[str]) -> None:
         self._cache.invalidate_paths(paths)
+
+    def _invalidate_after_write(
+        self,
+        spec: ToolSpec,
+        validated_args: dict[str, Any],
+        result: ToolResult,
+    ) -> None:
+        # Collect the paths a write tool touched. Prefer the mutation
+        # observation's ``changed_files`` (most accurate) and merge in the
+        # spec's resource_resolver output. Fall back to a full clear when no
+        # affected paths can be determined (e.g. free-form shell tools) so we
+        # never serve stale read-only results.
+        affected: list[str] = []
+        seen: set[str] = set()
+
+        content = result.content if isinstance(result.content, dict) else {}
+        for key in ("changed_files", "affected_files"):
+            value = content.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item not in seen:
+                        seen.add(item)
+                        affected.append(item)
+
+        for path in self._touched_paths(spec, validated_args):
+            if path not in seen:
+                seen.add(path)
+                affected.append(path)
+
+        if affected:
+            self._cache.invalidate_paths(affected)
+        else:
+            # Could not determine the mutation surface - conservative clear.
+            self._cache.clear()
 
     @staticmethod
     def _normalize_execution_request(
@@ -676,7 +730,14 @@ class ToolExecutor:
         if decision.outcome == DecisionOutcome.ALLOW:
             return None, decision.approval_grant_id, decision.decision_id
         if decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate is not None:
-            if hasattr(self.approval_gate, "consume_matching_grant"):
+            # P0-1: Only consume pre-existing grants when the grant store is
+            # trusted (i.e. lives outside the model-writable workspace). Grants
+            # persisted inside the workspace could have been forged by the model
+            # via shell writes and must not auto-approve subsequent actions.
+            grant_store_trusted = True
+            if hasattr(self.approval_gate, "is_grant_store_trusted"):
+                grant_store_trusted = self.approval_gate.is_grant_store_trusted(self.workspace_root)
+            if hasattr(self.approval_gate, "consume_matching_grant") and grant_store_trusted:
                 existing_grant = self.approval_gate.consume_matching_grant(request)
                 if existing_grant is not None:
                     allowed = _decision_allowed_by_grant(decision, existing_grant.grant_id)
@@ -1261,62 +1322,27 @@ class ToolExecutor:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
     def _file_snapshots(self, spec: ToolSpec, args: dict[str, Any]) -> dict[str, Any]:
+        # Lightweight cache-key fingerprints based on per-path stat() data
+        # (size + mtime). This avoids the previous behavior of scanning an
+        # entire workspace tree via rglob("*") and hashing every file with
+        # sha256. Callers are expected to invalidate cache entries through
+        # ``invalidate_paths`` (or the write-tool invalidation hook) when a
+        # mutation is not observable via stat() - e.g. directory children
+        # changing content without changing the directory's own mtime.
         snapshots: dict[str, Any] = {}
         for path in self._touched_paths(spec, args):
             full = (self.workspace_root / path).resolve(strict=False)
-            if full.exists() and full.is_file():
-                try:
-                    snapshots[path] = {
-                        "sha256": hashlib.sha256(full.read_bytes()).hexdigest(),
-                        "size": full.stat().st_size,
-                    }
-                except OSError:
-                    snapshots[path] = {"error": "unreadable"}
-            elif full.exists() and full.is_dir():
-                snapshots[path] = self._directory_snapshot(full)
-            else:
-                snapshots[path] = {"exists": False}
-        return snapshots
-
-    def _directory_snapshot(self, root: Path) -> dict[str, Any]:
-        entries: list[dict[str, Any]] = []
-        for child in sorted(root.rglob("*")):
-            if ".git" in child.parts or ".singularity" in child.parts:
-                continue
-            if self._is_sensitive_path(child):
-                continue
             try:
-                relative = child.relative_to(root).as_posix()
-            except ValueError:
+                stat = full.stat()
+            except OSError:
+                snapshots[path] = {"exists": False}
                 continue
-            if child.is_file():
-                try:
-                    entries.append(
-                        {
-                            "path": relative,
-                            "sha256": hashlib.sha256(child.read_bytes()).hexdigest(),
-                            "size": child.stat().st_size,
-                        }
-                    )
-                except OSError:
-                    entries.append({"path": relative, "error": "unreadable"})
-        digest = hashlib.sha256(
-            json.dumps(entries, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-        return {"digest": digest, "file_count": len(entries)}
-
-    def _is_sensitive_path(self, path: Path) -> bool:
-        parts = [part.lower() for part in path.parts]
-        name = path.name.lower()
-        if name == ".env" or name.startswith(".env."):
-            return True
-        if any(part in {".ssh", ".gnupg", ".aws", ".azure"} for part in parts):
-            return True
-        if any(marker in name for marker in ("token", "secret", "credential", "password", "api_key")):
-            return True
-        if any(name.endswith(ext) for ext in (".pem", ".key", ".p12", ".pfx")):
-            return True
-        return False
+            snapshots[path] = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "is_dir": full.is_dir(),
+            }
+        return snapshots
 
     def _touched_paths(self, spec: ToolSpec, args: dict[str, Any]) -> tuple[str, ...]:
         paths: list[str] = []

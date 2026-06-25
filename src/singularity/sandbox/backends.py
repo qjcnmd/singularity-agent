@@ -20,6 +20,7 @@ from singularity.sandbox.models import (
     PreparedSandbox,
     SandboxCapabilities,
     SandboxChangeSummary,
+    SandboxFilesystemMode,
     SandboxNetworkMode,
     SandboxRequest,
     SandboxResult,
@@ -56,7 +57,7 @@ class LocalStagingBackend:
 
     def capabilities(self) -> SandboxCapabilities:
         return SandboxCapabilities(
-            filesystem_isolation=True,
+            filesystem_isolation=False,
             copy_on_write=True,
             readonly_mount=False,
             network_isolation=False,
@@ -330,6 +331,7 @@ class DockerSandboxBackend:
         except subprocess.TimeoutExpired as exc:
             error_code = "timeout"
             status = SandboxStatus.TIMEOUT
+            self._stop_orphan_container(prepared)
             stdout = self._redact_output(
                 (exc.stdout or b"").decode("utf-8", errors="replace")
                 if isinstance(exc.stdout, bytes)
@@ -418,27 +420,80 @@ class DockerSandboxBackend:
     def _docker_command(self, prepared: PreparedSandbox) -> list[str]:
         request = prepared.request
         workdir = self._container_workdir(prepared)
+        resources = request.profile.resources
+        readonly_workspace = (
+            request.profile.filesystem.mode == SandboxFilesystemMode.READ_ONLY_WORKSPACE
+        )
+        mount_target = f"{prepared.workspace_copy_root}:/workspace"
+        if readonly_workspace:
+            mount_target += ":ro"
         command = [
             "docker",
             "run",
             "--rm",
+            "--name",
+            self._container_name(prepared),
+            "--user",
+            self._container_user(request),
+            "--cap-drop=ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--init",
             "-v",
-            f"{prepared.workspace_copy_root}:/workspace",
+            mount_target,
             "-w",
             workdir,
         ]
         if request.profile.network.mode != SandboxNetworkMode.ALLOWED:
             command.extend(["--network", "none"])
-        if request.profile.resources.max_memory_mb is not None:
-            command.extend(["--memory", f"{request.profile.resources.max_memory_mb}m"])
-        if request.profile.resources.max_processes is not None:
-            command.extend(["--pids-limit", str(request.profile.resources.max_processes)])
+        memory_limit = resources.memory_limit or (
+            f"{resources.max_memory_mb}m" if resources.max_memory_mb is not None else None
+        )
+        if memory_limit is not None:
+            command.extend(["--memory", memory_limit])
+        pids_limit = (
+            resources.pids_limit
+            if resources.pids_limit is not None
+            else resources.max_processes
+        )
+        if pids_limit is not None:
+            command.extend(["--pids-limit", str(pids_limit)])
         env_file = self._write_env_file(prepared)
         if env_file is not None:
             command.extend(["--env-file", str(env_file)])
-        command.append(self.image)
+        command.append(self._resolve_image(request))
         command.extend(_container_command(request.command))
         return command
+
+    @staticmethod
+    def _container_name(prepared: PreparedSandbox) -> str:
+        return f"singularity-{prepared.sandbox_id}"
+
+    @staticmethod
+    def _container_user(request: SandboxRequest) -> str:
+        override = (request.metadata or {}).get("container_user")
+        return str(override) if override else "1000:1000"
+
+    def _resolve_image(self, request: SandboxRequest) -> str:
+        digest = request.profile.image_digest
+        if not digest or "@" in self.image:
+            return self.image
+        return f"{self.image}@{digest}"
+
+    def _stop_orphan_container(self, prepared: PreparedSandbox) -> None:
+        # Best-effort cleanup of an orphaned container left running after a
+        # timeout. With --rm, `docker stop` both stops and removes it.
+        try:
+            subprocess.run(
+                ["docker", "stop", self._container_name(prepared)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
 
     @staticmethod
     def _write_env_file(prepared: PreparedSandbox) -> Path | None:

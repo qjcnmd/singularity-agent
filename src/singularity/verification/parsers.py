@@ -129,7 +129,7 @@ class NpmBuildFailureParser(FailureParser):
             failures.append(
                 ParsedFailure(
                     file=match.group(1) if match else None,
-                    line=int(match.group(2)) if match else None,
+                    line=int(match.group(3)) if match else None,
                     symbol=None,
                     test_name=None,
                     message=line.strip(),

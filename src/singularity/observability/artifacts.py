@@ -107,18 +107,18 @@ class TraceArtifactStore:
         artifact_id = f"artifact_{uuid4().hex[:12]}"
         suffix = source.suffix or ".bin"
         path = self.artifact_dir / f"{artifact_id}{suffix}"
-        if sensitive:
-            try:
-                path.write_text(
-                    self.redactor.redact_text(source.read_text(encoding="utf-8")),
-                    encoding="utf-8",
-                )
-            except UnicodeDecodeError as exc:
+        redacted = False
+        try:
+            original = source.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            if sensitive:
                 raise TraceArtifactError(
                     "Sensitive file artifacts must be text-redactable."
                 ) from exc
-        else:
             shutil.copyfile(source, path)
+        else:
+            path.write_text(self.redactor.redact_text(original), encoding="utf-8")
+            redacted = True
         content_type = mimetypes.guess_type(str(source))[0] or "application/octet-stream"
         return self._artifact(
             artifact_id=artifact_id,
@@ -126,7 +126,7 @@ class TraceArtifactStore:
             path=path,
             task_id=task_id,
             content_type=content_type,
-            redacted=sensitive,
+            redacted=redacted,
             sensitive=sensitive,
             summary=summary,
             metadata=metadata or {},

@@ -73,6 +73,46 @@ def test_register_file_artifact_copies_and_events_only_need_artifact_id(tmp_path
     assert "large output" not in str(event_payload)
 
 
+def test_register_file_artifact_redacts_secrets_when_not_sensitive(tmp_path: Path) -> None:
+    source = tmp_path / "secret.log"
+    source.write_text(
+        "calling provider with sk-abcdefghijklmnop and AKIAABCDEFGHIJKLMNOP\n"
+        "normal line stays intact",
+        encoding="utf-8",
+    )
+    store = TraceArtifactStore(tmp_path, run_id="run_1", session_id="session_1")
+
+    artifact = store.register_file_artifact(
+        kind=TraceArtifactKind.COMMAND_LOG,
+        source_path=source,
+        summary="command log",
+        sensitive=False,
+    )
+
+    stored = artifact.path.read_text(encoding="utf-8")
+    assert "sk-abcdefghijklmnop" not in stored
+    assert "AKIAABCDEFGHIJKLMNOP" not in stored
+    assert "normal line stays intact" in stored
+    assert artifact.redacted is True
+
+
+def test_register_file_artifact_redacts_secrets_when_sensitive(tmp_path: Path) -> None:
+    source = tmp_path / "secret.log"
+    source.write_text("token=sk-secret-token-12345 inside", encoding="utf-8")
+    store = TraceArtifactStore(tmp_path, run_id="run_1", session_id="session_1")
+
+    artifact = store.register_file_artifact(
+        kind=TraceArtifactKind.COMMAND_LOG,
+        source_path=source,
+        summary="command log",
+        sensitive=True,
+    )
+
+    stored = artifact.path.read_text(encoding="utf-8")
+    assert "sk-secret-token-12345" not in stored
+    assert artifact.redacted is True
+
+
 def test_artifact_store_resolves_by_opaque_artifact_id(tmp_path: Path) -> None:
     store = TraceArtifactStore(tmp_path, run_id="run_1", session_id="session_1")
     artifact = store.write_text_artifact(
