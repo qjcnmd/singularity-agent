@@ -1,0 +1,172 @@
+# Trace / Observation / Audit Events Runtime Flow
+
+Runtime flow doc id: trace-observation-audit-events
+Source paths:
+- src/singularity/observability/models.py
+- src/singularity/observability/recorder.py
+- src/singularity/observability/store.py
+- src/singularity/observability/artifacts.py
+- src/singularity/observability/summary.py
+- src/singularity/context/store.py
+- src/singularity/context/models.py
+- src/singularity/policy/audit.py
+- src/singularity/review/pipeline.py
+- src/singularity/review/critic.py
+- src/singularity/planner/engine.py
+
+Symbols:
+- TraceEventType
+- TraceArtifactKind
+- TraceEvent
+- TraceSpan
+- TraceArtifact
+- TraceSummary
+- TraceRecorder
+- TraceRecorder.emit
+- TraceRecorder.record
+- TraceRecorder.write_artifact
+- TraceStore
+- TraceStore.append_event
+- TraceStore.append_artifact
+- TraceStore.query_events
+- TraceArtifactStore
+- TraceArtifactStore.write_text_artifact
+- TraceArtifactStore.write_bytes_artifact
+- TraceArtifactStore.register_file_artifact
+- TraceSummaryBuilder
+- ObservationStore
+- ObservationStore.record_event
+- ObservationStore.save_observation
+- ToolObservation
+- PolicyAuditWriter
+- PolicyAuditWriter.append
+- ReviewPipeline
+- ReviewPipeline._emit
+- ModelCritic
+- ModelCritic.review
+- Planner
+- Planner.record_diff_observation
+- Planner.record_review_observation
+
+## Module Boundary
+
+This module owns internal observability, context observations, policy audit logs, review trace events, and trace artifact references.
+
+It is responsible for redacted trace event creation, trace event persistence, trace artifact metadata, policy audit JSONL rows, context observation storage, and review/planner observation events.
+
+It is not responsible for deciding model prompts or provider request schemas. Trace and audit data become model-visible only if another module intentionally renders bounded summaries into context.
+
+## Current Source Locations
+
+- `src/singularity/observability/models.py`: trace event/span/artifact/summary models and enums.
+- `src/singularity/observability/recorder.py`: `TraceRecorder.emit()`, legacy event mapping, span and artifact APIs.
+- `src/singularity/observability/store.py`: trace event, span, and artifact persistence.
+- `src/singularity/observability/artifacts.py`: trace artifact storage and limits.
+- `src/singularity/observability/summary.py`: timeline and final report summaries.
+- `src/singularity/context/store.py`: context event and tool observation persistence.
+- `src/singularity/context/models.py`: `ToolObservation`.
+- `src/singularity/policy/audit.py`: policy audit writer.
+- `src/singularity/review/pipeline.py`: review trace events.
+- `src/singularity/review/critic.py`: model critic request and result boundary.
+- `src/singularity/planner/engine.py`: diff and review observations.
+
+## Runtime Call Chain
+
+1. Runtime components call `TraceRecorder.emit()` or legacy `TraceRecorder.record()`.
+2. `TraceRecorder.emit()` redacts payload, creates `TraceEvent`, computes `payload_hash`, sets `redaction_applied=True`, appends event to `TraceStore`, and notifies interaction sinks.
+3. Legacy `record()` maps event names such as `planner`, `tool_call`, `model_request`, `command`, `mutation`, `verification`, `failure_analysis_requested`, and `repair_signal_consumed` to typed `TraceEventType` values.
+4. Components that need files call `TraceRecorder.write_artifact()`, which delegates to `TraceArtifactStore` and stores `TraceArtifact`.
+5. Context code calls `ObservationStore.record_event()` and `save_observation()` for context-local event and observation state.
+6. Policy code calls `PolicyAuditWriter.append()` with `PolicyRequest` and `PolicyDecision`.
+7. Review code calls `ReviewPipeline._emit()` to send review lifecycle events.
+8. Planner records review and diff observations in `Planner.record_review_observation()` and `record_diff_observation()`.
+
+## Runtime Objects Passed
+
+- `TraceEvent`: `event_id`, `event_type`, `run_id`, `session_id`, `task_id`, `phase_id`, `action_id`, `parent_event_id`, `timestamp`, `monotonic_ms`, `component`, `severity`, `summary`, `payload`, `artifact_refs`, `policy_decision_id`, `approval_grant_id`, `sandbox_id`, `command_id`, `transaction_id`, `verification_id`, `span_id`, `redaction_applied`, `payload_hash`.
+- `TraceArtifact`: `artifact_id`, `run_id`, `session_id`, `task_id`, `kind`, `path`, `relative_path`, `size_bytes`, `sha256`, `content_type`, `redacted`, `sensitive`, `summary`, `metadata`.
+- `ToolObservation`: persisted context observation with preview, raw digest, source refs, duration, cache, error, and sensitivity.
+- `PolicyAuditEntry`: normalized and redacted policy request/decision audit row.
+- Review trace payloads: review stage, findings, decision, report id, transaction id, verification id, policy decision id.
+
+## Model-Visible Objects (模型实际可见对象)
+
+The model does not receive `TraceEvent`, `TraceArtifact`, `PolicyAuditEntry`, or raw `ObservationStore` rows.
+
+The model can see trace-adjacent data only after bounded projection into context, for example:
+
+- tool observation previews rendered as tool messages;
+- planner review summaries recorded into planner/context evidence;
+- artifact ids or references included in tool observation payloads;
+- context summaries that mention refs or verification status.
+
+`ModelCritic.review()` is a separate model call and sends a bounded review target/report prompt, not the full trace store or audit log.
+
+## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
+
+Internal-only objects include:
+
+- full trace payloads after redaction;
+- payload hashes;
+- run/session/task/phase/action ids;
+- policy decision and approval grant ids;
+- sandbox, command, transaction, verification, and span ids;
+- trace artifact absolute paths on disk;
+- policy audit rows and grant scopes;
+- context event rows and raw observation storage after redaction;
+- review internal evidence and decision ids.
+
+## State Transitions And Failure Paths
+
+- Trace write failures are caught and printed as redacted warnings rather than failing the run.
+- Interaction sink failures are caught and printed as redacted warnings.
+- Artifact writes enforce per-artifact and total-size limits.
+- Sensitive file artifacts must be text-redactable.
+- `ObservationStore.save_observation()` redacts secret/sensitive content and removes raw keys before storage.
+- `PolicyAuditWriter.append()` redacts request and decision fields before JSONL append.
+- Review trace events can still be non-blocking if model critic fails.
+
+## Current Structure Assessment
+
+The structure is intentionally multi-channel: trace captures runtime events, context store captures model-context observations, and policy audit captures permission decisions. This is a reasonable separation because each channel has different retention and visibility expectations.
+
+The risk is that all three channels use dictionary payloads in places. Runtime Flow Docs must keep the model-visible projection distinct from trace/audit payloads.
+
+## Production-Grade Target Structure
+
+Current code has no single `AuditBoundaryClassifier`.
+
+A production-grade target could add proposed classification fields:
+
+- proposed `visibility: model|trace|audit|artifact|storage`;
+- proposed `redaction_policy_id`;
+- proposed `retention_class`;
+- proposed `model_projection_allowed`;
+- proposed `external_export_allowed`.
+
+These are proposed only. Current code uses redactors, trace models, context rendering, and audit writers separately.
+
+## Harness Usage Example
+
+A tool call is denied by policy. `PolicyEngine` emits policy trace and writes audit. `ToolExecutor` returns a failure `ToolResult` with an error code. `ToolProtocolEngine` records protocol trace and appends a bounded tool result to context. The next model turn sees the failure code in a tool message, while the full policy request, resource details, audit row, and trace ids remain internal.
+
+## Maintenance Rules
+
+Update this document when changing:
+
+- `TraceEvent`, `TraceArtifact`, trace event types, or trace store schema;
+- `TraceRecorder.emit()`, `record()`, or artifact writing;
+- `ObservationStore.record_event()` or `save_observation()`;
+- policy audit serialization or redaction;
+- review trace event payloads;
+- planner diff/review observation fields;
+- any decision to render trace/audit data into model context.
+
+## Verification
+
+- `python scripts/verify_runtime_docs.py`
+- `python -m pytest tests/test_observability_models.py tests/test_trace_store.py tests/test_trace_artifacts.py tests/test_trace_timeline_summary.py tests/test_policy_audit.py tests/test_observability_integration.py tests/review --basetemp work/pytest-tmp`
+
+## Last Verified Against
+
+Last verified against commit `5f2202bd8cfcc2a4e4a66c025891550e52f3556e` on 2026-06-25.

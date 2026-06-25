@@ -42,6 +42,30 @@ Do not read `.env` unless the user explicitly asks for environment diagnosis and
 ## Scope Discipline
 
 For code tasks, start from the mapped subsystem and its tests. Keep edits inside the task boundary, preserve existing runtime layering, and avoid unrelated cleanup.
+
+## Runtime Flow Docs
+
+Module-level Runtime Flow Docs live under:
+
+```text
+docs/architecture/modules/
+```
+
+Any change that modifies core runtime objects, object fields, call chains, model-visible schemas, tool result envelopes, policy or approval behavior, trace or audit payloads, context assembly, prompt framing, model request construction, compaction, observation storage, planner or replanner behavior, failure recovery, or artifact/long-result handling must update the corresponding Runtime Flow Doc in the same change.
+
+Runtime Flow Docs must stay source-backed. Do not document fields, objects, functions, or call chains that cannot be located in the current source tree. Current implementation details and proposed production-grade target structure must be separated clearly.
+
+Before finishing a runtime-sensitive change, run:
+
+```text
+python scripts/verify_runtime_docs.py
+```
+
+Final responses for code changes in this repository must state:
+
+- which source files changed;
+- which `docs/architecture/modules/*.md` files were updated;
+- if no Runtime Flow Doc changed, why the change does not affect documented runtime flow.
 ## Mandatory Real Model Validation
 
 Singularity is a production-grade local CLI coding agent harness. Any change that affects agent capability, execution behavior, model interaction, prompt assembly, context management, tool exposure, tool execution, planner behavior, repair flow, verification flow, evaluation harness, CLI task execution, tracing, reporting, policy/approval, or benchmark behavior must be validated with at least one real model call.

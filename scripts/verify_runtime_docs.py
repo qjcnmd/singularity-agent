@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import ast
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DOCS_DIR = REPO_ROOT / "docs" / "architecture" / "modules"
+
+CORE_DOC_IDS = {
+    "tool-registry-exposure",
+    "plugin-tools-registry",
+    "tool-execution-runtime",
+    "model-turn-provider-tools",
+    "policy-approval-gates",
+    "context-assembly-prompt-frame",
+    "context-compaction-observation-store",
+    "planner-replanner-failure-recovery",
+    "trace-observation-audit-events",
+    "artifact-long-result-handling",
+}
+
+REQUIRED_HEADINGS = {
+    "Module Boundary",
+    "Current Source Locations",
+    "Runtime Call Chain",
+    "Runtime Objects Passed",
+    "Model-Visible Objects",
+    "Internal Trace Debug Audit Objects",
+    "State Transitions And Failure Paths",
+    "Current Structure Assessment",
+    "Production-Grade Target Structure",
+    "Harness Usage Example",
+    "Maintenance Rules",
+    "Verification",
+    "Last Verified Against",
+}
+
+REQUIRED_PHRASES = {
+    "Model-Visible Objects",
+    "Internal Trace Debug Audit Objects",
+}
+
+
+@dataclass(frozen=True)
+class RuntimeDoc:
+    path: Path
+    text: str
+    doc_id: str
+    source_paths: list[str]
+    symbols: list[str]
+    headings: set[str]
+
+
+def main() -> int:
+    errors: list[str] = []
+    docs = _load_docs(errors)
+    seen_ids = {doc.doc_id for doc in docs if doc.doc_id}
+
+    missing = sorted(CORE_DOC_IDS - seen_ids)
+    for doc_id in missing:
+        errors.append(f"missing core runtime doc id: {doc_id}")
+
+    duplicate_ids = sorted(
+        doc_id for doc_id in seen_ids if sum(1 for doc in docs if doc.doc_id == doc_id) > 1
+    )
+    for doc_id in duplicate_ids:
+        errors.append(f"duplicate runtime doc id: {doc_id}")
+
+    for doc in docs:
+        _verify_doc(doc, errors)
+
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+    print(f"Runtime docs verified: {len(docs)} documents, {len(CORE_DOC_IDS)} core modules covered.")
+    return 0
+
+
+def _load_docs(errors: list[str]) -> list[RuntimeDoc]:
+    if not DOCS_DIR.is_dir():
+        errors.append(f"runtime docs directory missing: {_rel(DOCS_DIR)}")
+        return []
+
+    docs: list[RuntimeDoc] = []
+    for path in sorted(DOCS_DIR.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        doc_id = _extract_doc_id(text)
+        docs.append(
+            RuntimeDoc(
+                path=path,
+                text=text,
+                doc_id=doc_id,
+                source_paths=_extract_list(text, "Source paths:"),
+                symbols=_extract_list(text, "Symbols:"),
+                headings=_extract_headings(text),
+            )
+        )
+    return docs
+
+
+def _verify_doc(doc: RuntimeDoc, errors: list[str]) -> None:
+    label = _rel(doc.path)
+    if not doc.doc_id:
+        errors.append(f"{label}: missing 'Runtime flow doc id:'")
+
+    missing_headings = sorted(REQUIRED_HEADINGS - doc.headings)
+    for heading in missing_headings:
+        errors.append(f"{label}: missing heading '## {heading}'")
+
+    for phrase in REQUIRED_PHRASES:
+        if phrase not in doc.text:
+            errors.append(f"{label}: missing required phrase '{phrase}'")
+
+    if not doc.source_paths:
+        errors.append(f"{label}: no Source paths entries")
+    if not doc.symbols:
+        errors.append(f"{label}: no Symbols entries")
+
+    existing_sources: list[Path] = []
+    for source in doc.source_paths:
+        source_path = (REPO_ROOT / source).resolve(strict=False)
+        if not source_path.exists():
+            errors.append(f"{label}: source path does not exist: {source}")
+            continue
+        existing_sources.append(source_path)
+
+    available = _symbols_in_sources(existing_sources)
+    for symbol in doc.symbols:
+        if symbol not in available:
+            errors.append(f"{label}: symbol not found in listed source paths: {symbol}")
+
+
+def _extract_doc_id(text: str) -> str:
+    match = re.search(r"^Runtime flow doc id:\s*([A-Za-z0-9_.-]+)\s*$", text, re.MULTILINE)
+    return match.group(1) if match else ""
+
+
+def _extract_list(text: str, marker: str) -> list[str]:
+    lines = text.splitlines()
+    values: list[str] = []
+    in_block = False
+    for line in lines:
+        if line.strip() == marker:
+            in_block = True
+            continue
+        if in_block:
+            if not line.strip():
+                break
+            if line.startswith("- "):
+                values.append(line[2:].strip().strip("`"))
+                continue
+            if line.startswith("#"):
+                break
+    return values
+
+
+def _extract_headings(text: str) -> set[str]:
+    headings: set[str] = set()
+    for match in re.finditer(r"^##\s+(.+?)\s*$", text, re.MULTILINE):
+        heading = match.group(1).strip()
+        if " (" in heading:
+            heading = heading.split(" (", 1)[0].strip()
+        headings.add(heading)
+    return headings
+
+
+def _symbols_in_sources(paths: list[Path]) -> set[str]:
+    symbols: set[str] = set()
+    for path in paths:
+        if path.suffix != ".py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                symbols.add(node.name)
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        symbols.add(f"{node.name}.{child.name}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                symbols.add(node.name)
+    return symbols
+
+
+def _rel(path: Path) -> str:
+    try:
+        return path.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
