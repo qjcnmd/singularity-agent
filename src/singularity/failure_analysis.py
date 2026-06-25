@@ -55,6 +55,117 @@ INTERNAL_VERIFICATION_REFS = {"final_review"}
 
 
 @dataclass(frozen=True)
+class VerificationStep:
+    """A single executable verification step within a verification contract."""
+
+    step_id: str
+    command: str
+    kind: str = "smoke"
+    required: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step_id": self.step_id,
+            "command": self.command,
+            "kind": self.kind,
+            "required": self.required,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "VerificationStep":
+        return cls(
+            step_id=str(payload.get("step_id") or ""),
+            command=str(payload.get("command") or ""),
+            kind=str(payload.get("kind") or "smoke"),
+            required=bool(payload.get("required", True)),
+        )
+
+
+@dataclass(frozen=True)
+class VerificationContract:
+    """Structured verification requirements derived from a repair contract.
+
+    Replaces loose ``verification_plan: list[str]`` with typed steps, status
+    tracking, and satisfaction evidence.
+    """
+
+    contract_id: str
+    steps: list[VerificationStep]
+    status: str = "pending"
+    validation_errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract_id": self.contract_id,
+            "steps": [step.to_dict() for step in self.steps],
+            "status": self.status,
+            "validation_errors": list(self.validation_errors),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "VerificationContract":
+        steps = [VerificationStep.from_dict(item) for item in (payload.get("steps") or [])]
+        return cls(
+            contract_id=str(payload.get("contract_id") or ""),
+            steps=steps,
+            status=str(payload.get("status") or "pending"),
+            validation_errors=list(payload.get("validation_errors") or []),
+        )
+
+    @classmethod
+    def from_plan_strings(
+        cls, plan: list[str], *, contract_id: str | None = None
+    ) -> "VerificationContract":
+        steps: list[VerificationStep] = []
+        for index, text in enumerate(plan):
+            text = text.strip()
+            if not text or text in INTERNAL_VERIFICATION_REFS:
+                continue
+            steps.append(
+                VerificationStep(
+                    step_id=f"vstep_{index}",
+                    command=text,
+                    kind="smoke",
+                    required=True,
+                )
+            )
+        return cls(
+            contract_id=contract_id or f"vcontract_{uuid4().hex[:12]}",
+            steps=steps,
+        )
+
+    @classmethod
+    def empty(cls) -> "VerificationContract":
+        return cls(contract_id=f"vcontract_{uuid4().hex[:12]}", steps=[])
+
+    @property
+    def is_valid(self) -> bool:
+        return bool(self.steps) and not self.validation_errors
+
+
+@dataclass(frozen=True)
+class ContractSatisfaction:
+    """Tracks whether a verification contract was satisfied after repair."""
+
+    contract_id: str
+    satisfied: bool
+    completed_steps: list[str]
+    failed_steps: list[str]
+    skipped_steps: list[str]
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract_id": self.contract_id,
+            "satisfied": self.satisfied,
+            "completed_steps": self.completed_steps,
+            "failed_steps": self.failed_steps,
+            "skipped_steps": self.skipped_steps,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class FailureAnalysisRequest:
     request_id: str
     run_id: str
@@ -198,6 +309,9 @@ class FailureAnalysisResult:
     needs_user_input: bool
     blocked_reason: str | None = None
     raw_response_ref: str | None = None
+    verification_contract: VerificationContract = field(
+        default_factory=VerificationContract.empty
+    )
 
     @classmethod
     def from_model_payload(
@@ -220,7 +334,12 @@ class FailureAnalysisResult:
         verification_plan = _strings_required(payload, "verification_plan") if not needs_user_input else _strings(
             payload.get("verification_plan")
         )
-        _validate_verification_plan(verification_plan, needs_user_input=needs_user_input)
+        verification_contract = VerificationContract.from_plan_strings(verification_plan)
+        _validate_verification_plan(
+            verification_plan,
+            needs_user_input=needs_user_input,
+            verification_contract=verification_contract,
+        )
         blocked_reason = _text(payload.get("blocked_reason")) or None
         if needs_user_input and not blocked_reason:
             raise ValueError("blocked_reason is required when needs_user_input=true")
@@ -242,6 +361,7 @@ class FailureAnalysisResult:
             needs_user_input=needs_user_input,
             blocked_reason=blocked_reason,
             raw_response_ref=raw_response_ref,
+            verification_contract=verification_contract,
         )
 
     @classmethod
@@ -286,6 +406,7 @@ class FailureAnalysisResult:
             "repair_strategy": self.repair_strategy,
             "next_actions": self.next_actions,
             "verification_plan": self.verification_plan,
+            "verification_contract": self.verification_contract.to_dict(),
             "confidence": self.confidence,
             "needs_user_input": self.needs_user_input,
             "blocked_reason": self.blocked_reason,
@@ -329,6 +450,9 @@ class RepairContract:
     needs_user_input: bool = False
     blocked_reason: str | None = None
     validation_errors: list[str] = field(default_factory=list)
+    verification_contract: VerificationContract = field(
+        default_factory=VerificationContract.empty
+    )
 
     @classmethod
     def from_analysis(
@@ -338,12 +462,13 @@ class RepairContract:
         action_candidates: list[RepairActionCandidate],
     ) -> "RepairContract":
         allowed = _allowed_tools_from_candidates(action_candidates)
-        if analysis.verification_plan:
+        if analysis.verification_plan or analysis.verification_contract.steps:
             allowed.extend(["run_verification", "get_verification_result"])
         errors = _repair_contract_errors(
             analysis=analysis,
             action_candidates=action_candidates,
             allowed_tool_names=allowed,
+            verification_contract=analysis.verification_contract,
         )
         return cls(
             contract_id=f"repair_contract_{uuid4().hex[:12]}",
@@ -358,6 +483,7 @@ class RepairContract:
             needs_user_input=analysis.needs_user_input or bool(errors) or bool(analysis.blocked_reason),
             blocked_reason=analysis.blocked_reason or ("; ".join(errors) if errors else None),
             validation_errors=errors,
+            verification_contract=analysis.verification_contract,
         )
 
     @classmethod
@@ -375,6 +501,7 @@ class RepairContract:
             needs_user_input=True,
             blocked_reason=reason,
             validation_errors=[reason],
+            verification_contract=analysis.verification_contract,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -386,6 +513,7 @@ class RepairContract:
             "evidence_refs": self.evidence_refs,
             "action_candidates": [item.to_dict() for item in self.action_candidates],
             "verification_plan": self.verification_plan,
+            "verification_contract": self.verification_contract.to_dict(),
             "confidence": self.confidence,
             "allowed_tool_names": self.allowed_tool_names,
             "needs_user_input": self.needs_user_input,
@@ -408,6 +536,9 @@ class RepairPlan:
     needs_user_input: bool = False
     blocked_reason: str | None = None
     repair_contract: RepairContract | None = None
+    verification_contract: VerificationContract = field(
+        default_factory=VerificationContract.empty
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -420,6 +551,7 @@ class RepairPlan:
             "next_actions": self.next_actions,
             "next_verification": {"commands": self.verification_plan},
             "verification_plan": self.verification_plan,
+            "verification_contract": self.verification_contract.to_dict(),
             "evidence_refs": self.evidence_refs,
             "confidence": self.confidence,
             "needs_user_input": self.needs_user_input,
@@ -445,6 +577,9 @@ class RepairReplanSignal:
     repair_contract: RepairContract
     error_code: str
     verification_failed: bool = True
+    verification_contract: VerificationContract = field(
+        default_factory=VerificationContract.empty
+    )
 
     @classmethod
     def from_contract(
@@ -470,6 +605,7 @@ class RepairReplanSignal:
             blocked_reason=contract.blocked_reason,
             repair_contract=contract,
             error_code=analysis.failure_category or "repair_planned",
+            verification_contract=contract.verification_contract,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -483,6 +619,7 @@ class RepairReplanSignal:
             "target_files": self.target_files,
             "action_candidates": self.action_candidates,
             "verification_plan": self.verification_plan,
+            "verification_contract": self.verification_contract.to_dict(),
             "confidence": self.confidence,
             "needs_user_input": self.needs_user_input,
             "blocked_reason": self.blocked_reason,
@@ -646,6 +783,7 @@ class RepairPlanner:
                 needs_user_input=True,
                 blocked_reason=blocked or "user_input_required",
                 repair_contract=contract,
+                verification_contract=contract.verification_contract,
             )
         candidates = _action_candidates(analysis)
         contract = RepairContract.from_analysis(analysis, action_candidates=candidates)
@@ -664,6 +802,7 @@ class RepairPlanner:
                 needs_user_input=True,
                 blocked_reason=contract.blocked_reason or "repair_contract_invalid",
                 repair_contract=contract,
+                verification_contract=contract.verification_contract,
             )
         return RepairPlan(
             plan_id=f"repair_{uuid4().hex[:12]}",
@@ -676,6 +815,7 @@ class RepairPlanner:
             evidence_refs=analysis.evidence_refs,
             confidence=analysis.confidence,
             repair_contract=contract,
+            verification_contract=contract.verification_contract,
         )
 
     def to_replan_signal(
@@ -1077,11 +1217,24 @@ def _validated_affected_files(value: Any, *, request: FailureAnalysisRequest) ->
     return resolved
 
 
-def _validate_verification_plan(plan: list[str], *, needs_user_input: bool) -> None:
+def _validate_verification_plan(
+    plan: list[str],
+    *,
+    needs_user_input: bool,
+    verification_contract: VerificationContract | None = None,
+) -> None:
     if needs_user_input:
         return
-    if not plan:
+    has_contract = (
+        verification_contract is not None
+        and verification_contract.is_valid
+    )
+    if not plan and not has_contract:
         raise ValueError("verification_plan must contain at least one executable verification step")
+    if verification_contract is not None and verification_contract.validation_errors:
+        raise ValueError(
+            "verification_contract invalid: " + "; ".join(verification_contract.validation_errors)
+        )
     for item in plan:
         text = item.strip()
         if not text:
@@ -1097,6 +1250,7 @@ def _repair_contract_errors(
     analysis: FailureAnalysisResult,
     action_candidates: list[RepairActionCandidate],
     allowed_tool_names: list[str],
+    verification_contract: VerificationContract | None = None,
 ) -> list[str]:
     errors: list[str] = []
     if not FAILURE_CATEGORY_PATTERN.match(analysis.failure_category):
@@ -1113,9 +1267,15 @@ def _repair_contract_errors(
         errors.extend(_repair_action_candidate_errors(candidate, target_files=analysis.affected_files))
     if not analysis.needs_user_input:
         try:
-            _validate_verification_plan(analysis.verification_plan, needs_user_input=False)
+            _validate_verification_plan(
+                analysis.verification_plan,
+                needs_user_input=False,
+                verification_contract=verification_contract,
+            )
         except ValueError as exc:
             errors.append(str(exc))
+    if verification_contract is not None and verification_contract.validation_errors:
+        errors.extend(verification_contract.validation_errors)
     if any(tool not in TOOL_HINTS for tool in allowed_tool_names):
         errors.append("unsupported_tool_hint")
     return sorted(dict.fromkeys(errors))

@@ -4,6 +4,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from singularity.failure_analysis import (
+    ContractSatisfaction,
+    VerificationContract,
+)
 from singularity.planner.budget import BudgetController
 from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.context import PlannerContextRenderer
@@ -1060,8 +1064,16 @@ class Planner:
         for criterion_id, criterion in criteria.items():
             if criterion["required"] and not criterion["satisfied"]:
                 unmet.append(f"contract:{criterion_id}")
+        satisfaction = self.assess_verification_contract_satisfaction()
+        if satisfaction.failed_steps and not satisfaction.satisfied:
+            unmet.append("verification_contract_satisfaction")
         status = TaskStatus.COMPLETED if not unmet else TaskStatus.BLOCKED
-        assessment = {"status": status.value, "unmet": unmet, "criteria": criteria}
+        assessment = {
+            "status": status.value,
+            "unmet": unmet,
+            "criteria": criteria,
+            "verification_contract_satisfaction": satisfaction.to_dict(),
+        }
         if unmet and mark_blocked:
             state.status = TaskStatus.BLOCKED
             state.blocked_reasons = sorted(set([*state.blocked_reasons, *unmet]))
@@ -1387,6 +1399,80 @@ class Planner:
             for item in contract.get("target_files") or []
             if item
         }
+
+    def _active_repair_verification_contract(self) -> VerificationContract:
+        """Extract the structured verification contract from the active repair."""
+        contract = self._active_repair_contract()
+        if not contract:
+            return VerificationContract.empty()
+        payload = contract.get("verification_contract")
+        if isinstance(payload, dict) and payload.get("steps"):
+            return VerificationContract.from_dict(payload)
+        plan_strings = contract.get("verification_plan") or []
+        if plan_strings:
+            return VerificationContract.from_plan_strings(plan_strings)
+        return VerificationContract.empty()
+
+    def assess_verification_contract_satisfaction(self) -> ContractSatisfaction:
+        """Evaluate whether the active verification contract is satisfied."""
+        contract = self._active_repair_verification_contract()
+        if not contract.steps:
+            return ContractSatisfaction(
+                contract_id=contract.contract_id,
+                satisfied=True,
+                completed_steps=[],
+                failed_steps=[],
+                skipped_steps=[],
+                reason="no_verification_steps",
+            )
+        verification_results = self.evidence.verification_results
+        if not verification_results:
+            return ContractSatisfaction(
+                contract_id=contract.contract_id,
+                satisfied=False,
+                completed_steps=[],
+                failed_steps=[step.step_id for step in contract.steps],
+                skipped_steps=[],
+                reason="no_verification_results",
+            )
+        latest = verification_results[-1]
+        check_status = latest.get("check_status") or []
+        passed_checks = {
+            item.get("check_id")
+            for item in check_status
+            if isinstance(item, dict) and item.get("status") == "passed"
+        }
+        failed_checks = {
+            item.get("check_id")
+            for item in check_status
+            if isinstance(item, dict)
+            and item.get("status") in {"failed", "blocked", "timeout", "flaky"}
+        }
+        completed: list[str] = []
+        failed: list[str] = []
+        skipped: list[str] = []
+        for step in contract.steps:
+            if step.step_id in passed_checks:
+                completed.append(step.step_id)
+            elif step.step_id in failed_checks:
+                failed.append(step.step_id)
+            elif not step.required:
+                skipped.append(step.step_id)
+            else:
+                failed.append(step.step_id)
+        assessment_status = (latest.get("completion_assessment") or {}).get("status")
+        satisfied = (
+            not failed
+            and assessment_status in {"ready", "ready_with_warnings"}
+        )
+        return ContractSatisfaction(
+            contract_id=contract.contract_id,
+            satisfied=satisfied,
+            completed_steps=completed,
+            failed_steps=failed,
+            skipped_steps=skipped,
+            reason=None if satisfied else f"failed_steps={len(failed)}",
+        )
 
     def _record_repair_signal_consumed(
         self,

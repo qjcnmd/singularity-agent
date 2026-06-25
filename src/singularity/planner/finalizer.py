@@ -338,6 +338,9 @@ class Finalizer:
             if isinstance(latest_plan, dict)
             else None
         ) or contract.get("blocked_reason")
+        vcontract = contract.get("verification_contract") or {}
+        vcontract = vcontract if isinstance(vcontract, dict) else {}
+        vcontract_steps = vcontract.get("steps") or []
         return {
             "failure_analysis_count": len(evidence.failure_analyses),
             "repair_plan_count": len(evidence.repair_plans),
@@ -355,6 +358,10 @@ class Finalizer:
             "latest_contract_validation_errors": validation_errors,
             "latest_blocked_reason": blocked_reason,
             "needs_user_input": bool(latest_plan.get("needs_user_input")) if isinstance(latest_plan, dict) else False,
+            "verification_contract_id": vcontract.get("contract_id"),
+            "verification_contract_step_count": len(vcontract_steps),
+            "verification_contract_status": vcontract.get("status"),
+            "verification_contract_validation_errors": vcontract.get("validation_errors") or [],
         }
 
 
@@ -428,6 +435,9 @@ class FinalReportRenderer:
             f"- Repair attempts: {report.failure_repair_summary.get('repair_attempt_count', 0)}",
             f"- Blocked reason: {report.failure_repair_summary.get('latest_blocked_reason') or '-'}",
             f"- Contract validation errors: {report.failure_repair_summary.get('latest_contract_validation_errors') or []}",
+            f"- Verification contract: {report.failure_repair_summary.get('verification_contract_id') or '-'}",
+            f"- Verification contract steps: {report.failure_repair_summary.get('verification_contract_step_count', 0)}",
+            f"- Verification contract status: {report.failure_repair_summary.get('verification_contract_status') or '-'}",
             f"- Unresolved issues: {len(report.unresolved_issues)}",
             "",
             "## Final Review",
