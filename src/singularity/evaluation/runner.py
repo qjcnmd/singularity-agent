@@ -32,8 +32,6 @@ from singularity.policy import ApprovalMode, SecurityMode
 
 EVALUATION_TASK_SET_SCHEMA_VERSION = "evaluation.task_set/v1"
 EVALUATION_RESULT_SCHEMA_VERSION = "evaluation.result/v1"
-LEGACY_LIVE_TASK_SET_SCHEMA_VERSION = "evaluation.live_agent_task_set/v1"
-LEGACY_LIVE_RESULT_SCHEMA_VERSION = "evaluation.live_agent_eval_result/v1"
 
 _PATCH_REDACTOR = ContextRedactor()
 
@@ -194,10 +192,7 @@ class EvaluationTaskSet:
     @classmethod
     def from_dict(cls, payload: dict[str, Any], *, base_dir: Path) -> "EvaluationTaskSet":
         schema_version = str(payload.get("schema_version") or "")
-        if schema_version not in {
-            EVALUATION_TASK_SET_SCHEMA_VERSION,
-            LEGACY_LIVE_TASK_SET_SCHEMA_VERSION,
-        }:
+        if schema_version != EVALUATION_TASK_SET_SCHEMA_VERSION:
             raise ValueError(f"Unsupported evaluation schema_version: {schema_version}")
         tasks_payload = payload.get("tasks")
         if not isinstance(tasks_payload, list) or not tasks_payload:
@@ -1206,10 +1201,7 @@ def _previous_evaluation_result(
             payload = json.loads(baseline_result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        if isinstance(payload, dict) and payload.get("schema_version") in {
-            EVALUATION_RESULT_SCHEMA_VERSION,
-            LEGACY_LIVE_RESULT_SCHEMA_VERSION,
-        }:
+        if isinstance(payload, dict) and payload.get("schema_version") == EVALUATION_RESULT_SCHEMA_VERSION:
             return payload
         return None
     candidates: list[tuple[int, Path]] = []
@@ -1227,10 +1219,7 @@ def _previous_evaluation_result(
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict) and payload.get("schema_version") in {
-            EVALUATION_RESULT_SCHEMA_VERSION,
-            LEGACY_LIVE_RESULT_SCHEMA_VERSION,
-        }:
+        if isinstance(payload, dict) and payload.get("schema_version") == EVALUATION_RESULT_SCHEMA_VERSION:
             return payload
     return None
 

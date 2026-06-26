@@ -96,26 +96,20 @@ Evaluation hooks are declarative. Command hooks are intended to run through `Com
 
 `archive_path` is accepted in the schema, but execution is fail-closed until Singularity has a controlled archive restore adapter that stages files and applies them through `WorkspaceMutationManager`.
 
-`golden_contract` is optional for legacy benchmark tasks and required for the Phase 1J built-in Golden Task Set. When present, it records the scenario, expected files, expected commands, expected evidence names, expected markdown report sections, and required trace artifact kinds. Evaluation reports carry this contract through `execution_evidence.golden_contract` and render it in a `Golden Task Evidence` markdown section.
+`golden_contract` is optional for benchmark tasks. When present, it records the scenario, expected files, expected commands, expected evidence names, expected markdown report sections, and required trace artifact kinds. Evaluation reports carry this contract through `execution_evidence.golden_contract` and render it in a `Golden Task Evidence` markdown section.
 
-The checked-in Phase 1J Golden Task Set lives at:
+The current manifest-driven capability regression task set lives at:
 
 ```text
-docs/evaluation/phase1j-golden-tasks.json
+docs/evaluation/capability-regression-tasks.json
 ```
 
 It covers:
 
-- create file + smoke verify
-- modify bug + test pass
-- verification failure + repair
-- completion rejected + continue
-- final review rejected + repair
-- full markdown report
-- approval required + resume
-- sandbox required / unavailable fail closed
-- dynamic retrieval after failure
-- memory write only after verified completion
+- simple single-file patching;
+- multi-file reasoning;
+- failure repair after verification feedback;
+- completion-gate behavior where agent self-report must not be treated as evaluator success.
 
 ## CLI
 
@@ -124,7 +118,7 @@ Validate and list a Golden Task Set:
 ```bash
 singularity-agent eval task validate golden.json --json
 singularity-agent eval task list golden.json --version v1 --tag tool-heavy
-singularity-agent eval task validate docs/evaluation/phase1j-golden-tasks.json --json
+singularity-agent eval run docs/evaluation/capability-regression-tasks.json --json
 ```
 
 Replay a trace with a fixed profile:
@@ -184,8 +178,6 @@ The evaluation runner writes stable `result.json`, `report.json`, `report.md`, a
 `docs/evaluation/capability-regression-tasks.json` is the main multi-task capability regression manifest. It currently covers four task classes: `simple_patch`, `multi_file_reasoning`, `failure_repair`, and `completion_gate`. `docs/evaluation/capability-fix-math-test-only.json` is the focused smoke manifest.
 
 `docs/evaluation/evaluation-baseline-example.json` is a sanitized result example. It is safe to reference in docs and regression-shape tests because it does not include provider credentials, raw prompts, raw traces, or private artifacts. Real evaluation runs should continue writing under `work/evaluations/`.
-
-Legacy `eval live run`, `eval live private`, `eval live quicksort`, `evaluation.live_agent_task_set/v1`, `evaluation.live_agent_eval_result/v1`, and `docs/evaluation/live-*` files remain readable compatibility aliases for historical reports and manifests. New code, docs, manifests, tests, and CLI examples must use the canonical evaluation/benchmark names above.
 
 Run A/B or regression checks:
 

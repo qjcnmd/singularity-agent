@@ -22,7 +22,7 @@ Planner -> write_file/apply_patch -> EditExecutor -> WorkspaceMutationManager ->
 
 Low-level `workspace_*` tools and `edit_apply` remain registered for compatibility and internal tests, but Planner default phases expose the Phase 1B facades instead.
 
-See also: `docs/phase1b_execution_primitives.md`.
+See also: `docs/architecture/modules/tool-execution-runtime.md`.
 
 ## Strategies
 

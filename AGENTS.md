@@ -47,7 +47,11 @@ For code tasks, start from the mapped subsystem and its tests. Keep edits inside
 
 Use mainstream domain terms for production runtime objects, files, schemas, and CLI commands. Evaluation code must use `evaluation`, `eval`, `evaluator`, `evaluation harness`, `benchmark`, `task`, `task set`, `result`, `report`, `runner`, or `experiment` as appropriate.
 
-Do not introduce prompt-polluted names, explanatory static fields, duplicate alias fields, or bespoke names when a mainstream term already exists. The old `live` evaluation names are compatibility aliases only; do not use them for new code, schemas, manifests, docs, tests, or CLI examples except when documenting legacy compatibility.
+Do not introduce prompt-polluted names, explanatory static fields, duplicate alias fields, or bespoke names when a mainstream term already exists. Retired evaluation aliases from the previous naming cleanup have been removed from current code, schemas, manifests, docs, tests, and CLI examples; do not reintroduce them as compatibility surfaces.
+
+## Documentation Scope
+
+Repository documentation describes only the current runtime structure, complete fields, call chains, schemas, CLI entrypoints, and data flow present in the source tree. Do not keep historical phase reports, roadmap reports, production review reports, old manifest copies, old runtime docs, or compatibility notes in the worktree. Historical facts belong in git history, not in current docs.
 
 ## Runtime Flow Docs
 
@@ -61,7 +65,7 @@ Any change that modifies core runtime objects, object fields, call chains, model
 
 Runtime Flow Docs must stay source-backed. Do not document fields, objects, functions, or call chains that cannot be located in the current source tree. Current implementation details and proposed production-grade target structure must be separated clearly.
 
-Any change to code structure, dataclass fields, public CLI commands, schema versions, trace event payloads, evaluation manifests, result/report schemas, or compatibility aliases must update the corresponding Runtime Flow Doc in the same change. Runtime Flow Docs must treat source code as the only authority, list complete fields for documented runtime dataclasses, and keep legacy aliases clearly separated from canonical runtime objects.
+Any change to code structure, dataclass fields, public CLI commands, schema versions, trace event payloads, evaluation manifests, or result/report schemas must update the corresponding Runtime Flow Doc in the same change. Runtime Flow Docs must treat source code as the only authority, list complete fields for documented runtime dataclasses, and avoid historical aliases or retired compatibility layers.
 
 Before finishing a runtime-sensitive change, run:
 

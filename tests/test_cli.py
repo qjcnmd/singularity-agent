@@ -896,23 +896,8 @@ def test_cli_eval_private_uses_private_benchmark_adapter(tmp_path: Path, monkeyp
     assert seen["verification_command"] == "python -m pytest tests/test_app.py"
     assert seen["kwargs"]["env_root"] == tmp_path.resolve()
 
-    seen.clear()
-    legacy = runner.invoke(
-        app,
-        [
-            "eval",
-            "live",
-            "private",
-            str(task_set),
-            "--run-id",
-            "private_cli",
-            "--project-root",
-            str(tmp_path),
-            "--json",
-        ],
-    )
-
-    assert legacy.exit_code == 0, legacy.output
-    assert json.loads(legacy.output)["run_id"] == "private_cli"
-    assert seen["task_id"] == "private.cli"
+    # Regression guard: the retired evaluation subcommand is intentionally absent.
+    removed = runner.invoke(app, ["eval", "live", "private", str(task_set)])
+    assert removed.exit_code != 0
+    assert "No such command" in removed.output
 

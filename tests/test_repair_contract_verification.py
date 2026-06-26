@@ -757,7 +757,7 @@ class TestPlannerVerificationAuthorization:
         planner, contract = self._setup_repair_planner(tmp_path)
         planner.apply_benchmark_constraints(
             {
-                "task_id": "live.fix_math_test",
+                "task_id": "evaluation.fix_math_test",
                 "allowed_tools": ["read_file", "write_file", "run_verification"],
                 "expected_file_changes": ["math_utils.py"],
                 "completion_standard": "pytest passes",
@@ -783,7 +783,7 @@ class TestPlannerVerificationAuthorization:
         planner, contract = self._setup_repair_planner(tmp_path)
         planner.apply_benchmark_constraints(
             {
-                "task_id": "live.fix_math_test",
+                "task_id": "evaluation.fix_math_test",
                 "allowed_tools": ["read_file", "write_file", "run_verification"],
                 "expected_file_changes": ["math_utils.py"],
                 "completion_standard": "pytest passes",
@@ -808,7 +808,7 @@ class TestPlannerVerificationAuthorization:
     def test_benchmark_verification_command_applied_when_set_before_start_task(
         self, tmp_path: Path
     ) -> None:
-        """Live-eval order: apply_benchmark_constraints runs before start_task.
+        """Evaluation order: apply_benchmark_constraints runs before start_task.
 
         Ensures the benchmark verification_command overrides the rules-based
         verification_requirements even when apply_benchmark_constraints is
@@ -821,7 +821,7 @@ class TestPlannerVerificationAuthorization:
         planner = Planner(workspace_root=tmp_path)
         planner.apply_benchmark_constraints(
             {
-                "task_id": "live.fix_math_test",
+                "task_id": "evaluation.fix_math_test",
                 "allowed_tools": ["read_file", "write_file", "run_verification"],
                 "expected_file_changes": ["math_utils.py"],
                 "completion_standard": "pytest passes",

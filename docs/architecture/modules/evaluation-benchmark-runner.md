@@ -3,7 +3,6 @@
 Runtime flow doc id: evaluation-benchmark-runner
 Source paths:
 - src/singularity/evaluation/runner.py
-- src/singularity/evaluation/live.py
 - src/singularity/evaluation/failure_case_replay.py
 - src/singularity/evaluation/targeted_replay.py
 - src/singularity/cli.py
@@ -82,10 +81,9 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 ## Current Source Locations
 
 - `src/singularity/evaluation/runner.py`: canonical evaluation task-set models, runner, report schema, public/hidden verification, command interpreter strategy, and regression comparison.
-- `src/singularity/evaluation/live.py`: legacy compatibility shim that re-exports canonical evaluation names under old `Live*` aliases.
 - `src/singularity/evaluation/failure_case_replay.py`: post-run failure-case extraction from evaluation reports and trace summaries.
 - `src/singularity/evaluation/targeted_replay.py`: deterministic targeted repair smoke that drives the real `AgentLoop.run()` repair path and writes targeted replay JSON/Markdown artifacts.
-- `src/singularity/cli.py`: canonical `eval run`, `eval private`, `eval provider-smoke`, `eval targeted-replay`, plus legacy `eval live ...` compatibility entrypoints.
+- `src/singularity/cli.py`: canonical `eval run`, `eval private`, `eval provider-smoke`, and `eval targeted-replay` entrypoints.
 - `src/singularity/kernel/bootstrap.py`: `KernelBootstrap.boot()` constructs the graph and kernel.
 - `src/singularity/kernel/agent_kernel.py`: `AgentKernel.run_task()` creates and runs `AgentLoop`.
 - `src/singularity/agent_loop.py`: real agent loop that talks to the provider, tool protocol, planner, failure analyzer, and final reviewer.
@@ -118,7 +116,7 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 - `EvaluationTask`: task id/type, workspace, model-visible user task, allowed paths/tools, tool policy, strategy, expected file changes, verification commands, completion standard, risk tags, prepare commands, hidden prepare commands, timeout, and success criteria.
 - `ProductionConfig`: resolved per-task runtime config using the benchmark workspace as `project_root` and the CLI/env root for provider configuration loading.
 - `CommandEvalResult`: raw command string, resolved argv, interpreter strategy, exit code, duration, timeout state, sanitized first-line error summary, pass/fail state, and command failure category.
-- `EvaluationTaskResult`: per-task evaluation report object with runtime telemetry, patch/check evidence, verification result, contract satisfaction, repair summary, reproducible environment, agent completion state, evaluator success state, compatibility aliases, and failure classification.
+- `EvaluationTaskResult`: per-task evaluation report object with runtime telemetry, patch/check evidence, verification result, contract satisfaction, repair summary, reproducible environment, agent completion state, evaluator success state, current schema aliases for `completed`/`success`, and failure classification.
 - `FailureCaseRecord`: replayable failed-task metadata with schema version, task id, status, failure category, miscompletion count, public/hidden verification booleans, policy blocks, expected file changes, actual changed files, final report status, repair attempt/execution counts, blocked reason, report/regression paths, trace path, trace artifact refs, contract satisfaction, repair telemetry, verification payload, and bounded trace summary.
 - `TargetedFailureReplayResult`: deterministic smoke evidence with AgentLoop entry flag, trigger category, FailureAnalyzer request/result counts, authoritative repair plan/contract counts, repair attempt/execution counts, repair phase observation, bounded phase/planner-status history, bounded repair-contract summary, verification-contract satisfaction, repair scope checks, final report status, trace path, trace refs, and optional report paths.
 - `result.json`/`report.json`: suite payload with summary, task results, duration, optional regression comparison, and artifact paths.
@@ -164,7 +162,7 @@ Provider secrets are not part of the report payload. The report records redacted
 ## State Transitions And Failure Paths
 
 - Task-set loading fails fast on invalid schema version, missing tasks, missing `task_id`, missing `user_task`, missing `allowed_paths`, missing `verification_command`, unsupported tool policy, unsupported approval mode, or repo task without `start_commit`/prepare command.
-- Legacy `evaluation.live_agent_task_set/v1` manifests are accepted by `EvaluationTaskSet.from_dict()` for historical compatibility, but canonical artifacts are written as `evaluation.task_set/v1` and `evaluation.result/v1`.
+- `EvaluationTaskSet.from_dict()` accepts only `evaluation.task_set/v1`. Result comparison accepts only `evaluation.result/v1` baseline artifacts.
 - Prepare command failure returns a structured task result before kernel boot.
 - Provider/network infrastructure failures are classified as `infrastructure_blocked` and do not run independent verification.
 - Patch applicability is false when a patch is required and the clean verification workspace cannot reproduce the agent workspace changes, or when required `expected_file_changes` are absent.
@@ -179,7 +177,7 @@ Provider secrets are not part of the report payload. The report records redacted
 
 ## Current Structure Assessment
 
-The canonical evaluation runner uses mainstream evaluation/benchmark/task/result/report naming. The old `Live*` class names, `eval live ...` CLI, and `evaluation.live_agent_*` schema versions are compatibility shims only.
+The canonical evaluation runner uses mainstream evaluation/benchmark/task/result/report naming. Retired evaluation aliases from the previous naming cleanup are not part of current code or docs.
 
 The current report schema separates agent completion from evaluator pass state and preserves miscompletion detection. It no longer writes presentation-only provenance fields or duplicate aliases such as `tool_call_count`, `task_verification_result`, `failure_repair_count`, `result_extraction`, `repair_verification_contract`, or `agent_loop_ref`.
 
@@ -231,7 +229,7 @@ Update this document when changing:
 - `_apply_benchmark_constraints()` and planner benchmark verification command injection;
 - `_run_shell()` command parsing, interpreter mapping, or failure taxonomy;
 - `_contract_satisfaction()` and miscompletion semantics;
-- evaluation report, summary, regression, failure replay, reproducible environment, or compatibility alias fields.
+- evaluation report, summary, regression, failure replay, reproducible environment, or completion/result alias fields.
 
 ## Verification
 
@@ -244,4 +242,4 @@ Relevant checks:
 ## Last Verified Against
 
 - Source tree date: 2026-06-26
-- Code paths: `src/singularity/evaluation/runner.py`, `src/singularity/evaluation/live.py`, `src/singularity/cli.py`, `src/singularity/kernel/bootstrap.py`, `src/singularity/kernel/agent_kernel.py`, `src/singularity/agent_loop.py`
+- Code paths: `src/singularity/evaluation/runner.py`, `src/singularity/cli.py`, `src/singularity/kernel/bootstrap.py`, `src/singularity/kernel/agent_kernel.py`, `src/singularity/agent_loop.py`

@@ -501,7 +501,7 @@ def test_scoring_marks_failed_policy_and_verification_as_failure() -> None:
     assert "policy_denials" in result.failure_reasons
 
 
-def _contract_task(task_id: str = "phase1j.create_file_smoke_verify") -> BenchmarkTask:
+def _contract_task(task_id: str = "benchmark.contract.create_file_smoke_verify") -> BenchmarkTask:
     payload = _task(task_id).to_dict()
     payload["golden_contract"] = {
         "scenario": "create_file_smoke_verify",
@@ -556,7 +556,7 @@ def test_evaluation_report_includes_golden_contract_evidence(tmp_path: Path) -> 
     assert contract["required_trace_artifacts"][0]["kind"] == "diff"
     assert payload["profile_reports"][0]["task_results"][0]["execution_evidence"]["golden_contract"] == contract
     assert "## Golden Task Evidence" in markdown
-    assert "phase1j.create_file_smoke_verify" in markdown
+    assert "benchmark.contract.create_file_smoke_verify" in markdown
     assert "quicksort.py" in markdown
     assert "python -m pytest tests/test_quicksort.py" in markdown
 
@@ -606,7 +606,7 @@ def test_evaluation_assertions_fail_closed(tmp_path: Path, assertion: str) -> No
 
 
 def test_regression_report_binds_each_regression_to_trace_artifact_ref(tmp_path: Path) -> None:
-    task = _contract_task("phase1j.modify_bug_test_pass")
+    task = _contract_task("benchmark.contract.modify_bug_test_pass")
     baseline = EvaluationHarness(project_root=tmp_path).run_suite(
         tasks=[task],
         profiles=[EvaluationProfile(name="baseline", model="gpt-a")],
@@ -628,7 +628,7 @@ def test_regression_report_binds_each_regression_to_trace_artifact_ref(tmp_path:
     task_regressions = [
         item
         for item in regression.regressions
-        if item.get("task_id") == "phase1j.modify_bug_test_pass"
+        if item.get("task_id") == "benchmark.contract.modify_bug_test_pass"
     ]
     assert task_regressions
     for item in task_regressions:
@@ -637,7 +637,7 @@ def test_regression_report_binds_each_regression_to_trace_artifact_ref(tmp_path:
 
 
 def test_write_regression_report_persists_trace_artifact_per_regression(tmp_path: Path) -> None:
-    task = _contract_task("phase1j.trace_artifact_regression")
+    task = _contract_task("benchmark.contract.trace_artifact_regression")
     baseline = EvaluationHarness(project_root=tmp_path).run_suite(
         tasks=[task],
         profiles=[EvaluationProfile(name="baseline", model="gpt-a")],
@@ -676,7 +676,7 @@ def test_offline_golden_suite_does_not_scan_workspace_for_diff_outcomes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    task = _contract_task("phase1j.offline_fast")
+    task = _contract_task("benchmark.contract.offline_fast")
 
     def fail_if_scanned(_root: Path):
         raise AssertionError("offline evaluation should not scan the workspace")

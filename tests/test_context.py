@@ -74,7 +74,8 @@ def test_long_tool_result_is_truncated_in_message_but_raw_result_is_preserved() 
     assert observation.raw_result == result
     assert '"truncated": true' in tool_message["content"]
     assert long_content not in tool_message["content"]
-    assert len(tool_message["content"]) < len(long_content)
+    assert tool_message["content"].count("x") == 4000
+    assert '"raw_digest":' in tool_message["content"]
 
 
 def test_tool_protocol_result_message_omits_internal_only_fields() -> None:

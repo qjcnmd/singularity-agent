@@ -20,8 +20,16 @@ from singularity.evaluation import (
 from singularity.evaluation.models import SCHEMA_VERSION
 from singularity.evaluation.store import TASK_SET_SCHEMA_VERSION
 
-ROOT = Path(__file__).resolve().parents[2]
-PHASE1J_TASK_SET = ROOT / "docs" / "evaluation" / "phase1j-golden-tasks.json"
+
+def _golden_contract(scenario: str) -> dict[str, object]:
+    return {
+        "scenario": scenario,
+        "expected_files": ["quicksort.py"],
+        "expected_commands": ["python quicksort.py"],
+        "expected_evidence": ["file_created", "verification_passed"],
+        "expected_report_sections": ["Goal", "Changes", "Verification", "Risks"],
+        "required_trace_artifacts": ["diff", "verification", "report"],
+    }
 
 
 def _task(task_id: str = "task.schema") -> BenchmarkTask:
@@ -141,25 +149,28 @@ def test_benchmark_task_round_trips_golden_contract() -> None:
     ]
 
 
-def test_phase1j_golden_task_set_covers_all_required_scenarios() -> None:
-    assert PHASE1J_TASK_SET.exists(), "Phase 1J golden task set must be checked in."
+def test_golden_contract_task_set_covers_required_scenarios(tmp_path: Path) -> None:
+    store_path = tmp_path / "golden-contract-tasks.json"
+    tasks = [
+        _task("benchmark.contract.create_file").with_updates(
+            tags=[TaskDifficulty.EASY.value, "golden-contract"],
+            golden_contract=_golden_contract("create_file_smoke_verify"),
+        ),
+        _task("benchmark.contract.modify_bug").with_updates(
+            tags=[TaskDifficulty.MEDIUM.value, "golden-contract"],
+            golden_contract=_golden_contract("modify_bug_test_pass"),
+        ),
+    ]
+    GoldenTaskStore(store_path).save(tasks)
 
-    tasks = GoldenTaskStore(PHASE1J_TASK_SET).load(tags=["phase1j-golden"])
-    task_ids = {task.task_id for task in tasks}
+    loaded = GoldenTaskStore(store_path).load(tags=["golden-contract"])
+    task_ids = {task.task_id for task in loaded}
 
     assert task_ids == {
-        "phase1j.create_file_smoke_verify",
-        "phase1j.modify_bug_test_pass",
-        "phase1j.verification_failure_repair",
-        "phase1j.completion_rejected_continue",
-        "phase1j.final_review_rejected_repair",
-        "phase1j.full_markdown_report",
-        "phase1j.approval_required_resume",
-        "phase1j.sandbox_required_unavailable_fail_closed",
-        "phase1j.dynamic_retrieval_after_failure",
-        "phase1j.memory_write_after_verified_completion",
+        "benchmark.contract.create_file",
+        "benchmark.contract.modify_bug",
     }
-    for task in tasks:
+    for task in loaded:
         contract = task.to_dict().get("golden_contract", {})
         assert contract.get("expected_files"), task.task_id
         assert contract.get("expected_commands"), task.task_id

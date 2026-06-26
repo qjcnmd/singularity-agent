@@ -84,7 +84,6 @@ eval_trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_ab_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_regression_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_report_app = typer.Typer(add_completion=False, no_args_is_help=True)
-eval_live_app = typer.Typer(add_completion=False, no_args_is_help=True)
 system_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 app.add_typer(index_app, name="index")
@@ -101,7 +100,6 @@ eval_app.add_typer(eval_trace_app, name="trace")
 eval_app.add_typer(eval_ab_app, name="ab")
 eval_app.add_typer(eval_regression_app, name="regression")
 eval_app.add_typer(eval_report_app, name="report")
-eval_app.add_typer(eval_live_app, name="live")
 console = Console()
 _REDACTOR = TraceRedactor()
 ProjectRootOption = Annotated[
@@ -1144,56 +1142,6 @@ def eval_run(
         raise typer.Exit(1)
 
 
-@eval_live_app.command("run")
-def eval_live_run(
-    task_set: Annotated[Path, typer.Argument(help="Legacy live alias for an evaluation task set JSON path.")],
-    output_dir: Annotated[
-        Path | None,
-        typer.Option("--output-dir", help="Directory for evaluation workspaces and result JSON."),
-    ] = None,
-    run_id: Annotated[
-        str | None,
-        typer.Option("--run-id", help="Stable evaluation run id."),
-    ] = None,
-    max_turns: Annotated[
-        int | None,
-        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns per task."),
-    ] = None,
-    model: Annotated[
-        str | None,
-        typer.Option("--model", help="Override SINGULARITY_MODEL for this evaluation."),
-    ] = None,
-    base_url: Annotated[
-        str | None,
-        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this evaluation."),
-    ] = None,
-    baseline_result: Annotated[
-        Path | None,
-        typer.Option("--baseline-result", help="Explicit previous evaluation result.json for regression comparison."),
-    ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
-    project_root: ProjectRootOption = None,
-) -> None:
-    """Compatibility alias for `eval run`."""
-
-    result = _run_evaluation_task_set(
-        task_set=task_set,
-        output_dir=output_dir,
-        run_id=run_id,
-        max_turns=max_turns,
-        model=model,
-        base_url=base_url,
-        baseline_result=baseline_result,
-        project_root=project_root,
-    )
-    if json_output:
-        _write_stdout(json_dumps(result))
-    else:
-        console.print(Panel(json_dumps(result), title="evaluation", border_style="cyan"))
-    if result["summary"]["success_count"] != result["summary"]["task_count"]:
-        raise typer.Exit(1)
-
-
 def _run_private_evaluation_task_set(
     *,
     task_set: Path,
@@ -1269,56 +1217,6 @@ def eval_private(
         raise typer.Exit(1)
 
 
-@eval_live_app.command("private")
-def eval_live_private(
-    task_set: Annotated[Path, typer.Argument(help="Legacy live alias for a private BenchmarkTask set JSON/YAML path.")],
-    output_dir: Annotated[
-        Path | None,
-        typer.Option("--output-dir", help="Directory for evaluation workspaces and result JSON."),
-    ] = None,
-    run_id: Annotated[
-        str | None,
-        typer.Option("--run-id", help="Stable evaluation run id."),
-    ] = None,
-    max_turns: Annotated[
-        int | None,
-        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns per task."),
-    ] = None,
-    model: Annotated[
-        str | None,
-        typer.Option("--model", help="Override SINGULARITY_MODEL for this evaluation."),
-    ] = None,
-    base_url: Annotated[
-        str | None,
-        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this evaluation."),
-    ] = None,
-    baseline_result: Annotated[
-        Path | None,
-        typer.Option("--baseline-result", help="Explicit previous evaluation result.json for regression comparison."),
-    ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
-    project_root: ProjectRootOption = None,
-) -> None:
-    """Compatibility alias for `eval private`."""
-
-    result = _run_private_evaluation_task_set(
-        task_set=task_set,
-        output_dir=output_dir,
-        run_id=run_id,
-        max_turns=max_turns,
-        model=model,
-        base_url=base_url,
-        baseline_result=baseline_result,
-        project_root=project_root,
-    )
-    if json_output:
-        _write_stdout(json_dumps(result))
-    else:
-        console.print(Panel(json_dumps(result), title="private evaluation", border_style="cyan"))
-    if result["summary"]["success_count"] != result["summary"]["task_count"]:
-        raise typer.Exit(1)
-
-
 @eval_app.command("provider-smoke")
 def eval_provider_smoke(
     output_dir: Annotated[
@@ -1345,49 +1243,6 @@ def eval_provider_smoke(
     project_root: ProjectRootOption = None,
 ) -> None:
     """Run the configured provider through a controlled quicksort create-and-verify task."""
-
-    result = _run_provider_smoke_benchmark(
-        output_dir=output_dir,
-        run_id=run_id,
-        max_turns=max_turns,
-        model=model,
-        base_url=base_url,
-        project_root=resolve_project_root(project_root),
-    )
-    if json_output:
-        _write_stdout(json_dumps(result))
-        return
-    console.print(Panel(json_dumps(result), title="provider smoke", border_style="cyan"))
-    if not result["ok"]:
-        raise typer.Exit(1)
-
-
-@eval_live_app.command("quicksort")
-def eval_live_quicksort(
-    output_dir: Annotated[
-        Path | None,
-        typer.Option("--output-dir", help="Directory for the provider smoke workspace and report."),
-    ] = None,
-    run_id: Annotated[
-        str | None,
-        typer.Option("--run-id", help="Stable provider smoke run id."),
-    ] = None,
-    max_turns: Annotated[
-        int,
-        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns."),
-    ] = 12,
-    model: Annotated[
-        str | None,
-        typer.Option("--model", help="Override SINGULARITY_MODEL for this provider smoke."),
-    ] = None,
-    base_url: Annotated[
-        str | None,
-        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this provider smoke."),
-    ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
-    project_root: ProjectRootOption = None,
-) -> None:
-    """Compatibility alias for `eval provider-smoke`."""
 
     result = _run_provider_smoke_benchmark(
         output_dir=output_dir,
@@ -1475,9 +1330,6 @@ def _run_provider_smoke_benchmark(
         close_resources = getattr(kernel, "close_resources", None)
         if callable(close_resources):
             close_resources()
-
-
-_run_live_quicksort_benchmark = _run_provider_smoke_benchmark
 
 
 def _profiles_from_cli(profile_json: list[str] | None) -> list[EvaluationProfile]:

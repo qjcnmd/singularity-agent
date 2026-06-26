@@ -52,7 +52,7 @@ class ExpectedOutcomeKind(str, Enum):
 
 
 VALID_DIFFICULTY_TAGS = {item.value for item in TaskDifficulty}
-VALID_AGENT_HARNESS_TAGS = {"memory-heavy", "tool-heavy", "phase1j-golden"}
+VALID_AGENT_HARNESS_TAGS = {"memory-heavy", "tool-heavy", "golden-contract"}
 VALID_TAGS = VALID_DIFFICULTY_TAGS | VALID_AGENT_HARNESS_TAGS
 VALID_TASK_VERSIONS = {"v1", "v2"}
 VALID_HOOK_STAGES = {"before_run", "after_run", "score_adjustment"}
