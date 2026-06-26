@@ -1,168 +1,84 @@
-# ModelTurnRequest / ModelToolSchema / Provider Tools Runtime Flow
+# ModelTurn / Provider / Tools Exposure模块数据流
 
-Runtime flow doc id: model-turn-provider-tools
-Source paths:
-- src/singularity/agent_loop.py
+模块数据流文档 ID: model-turn-provider-tools
+
+源码证据路径:
 - src/singularity/model/models.py
 - src/singularity/model/runner.py
 - src/singularity/model/request_builder.py
 - src/singularity/model/tools.py
-- src/singularity/model/messages.py
-- src/singularity/model/providers.py
-- src/singularity/instructions/prompt_assembly.py
 
-Symbols:
-- AgentLoop
-- AgentLoop.run
+关键符号:
 - ModelTurnRequest
-- ModelToolSchema
-- ModelMessage
 - ModelTurnResult
-- ProviderRequest
+- ModelMessage
+- ModelToolSchema
+- ModelToolCall
 - ModelRunner
-- ModelRunner.build_request_from_context
-- ModelRunner.run_turn
-- ModelTurnRequestBuilder
-- ModelTurnRequestBuilder.build_request
-- ModelToolRenderer
-- ModelToolRenderer.render
-- ModelToolRenderer.to_provider_tools
-- MessageConverter
-- MessageConverter.to_provider_messages
-- PromptAssemblyPipeline
-- PromptAssemblyPipeline.build_for_model_turn
 
-Field checks:
-- ModelTurnRequest: request_id, run_id, session_id, task_id, phase_id, action_id, purpose, messages, tools, tool_choice, model_preferences, budget, context_metadata, policy_metadata, trace_metadata
-- ModelMessage: role, content, name, tool_call_id, metadata
+字段清单:
 - ContentBlock: type, text, artifact_ref, metadata
+- ModelMessage: role, content, name, tool_call_id, metadata
 - ModelToolSchema: name, description, parameters_schema, capability_tags, risk_tags, metadata
 - ToolChoicePolicy: mode, tool_name, allowed_tool_names, max_tool_calls
+- ModelToolCall: tool_call_id, tool_name, arguments, raw_arguments, parse_status, validation_errors, provider_metadata
+- ModelCapabilities: supports_tools, supports_parallel_tool_calls, supports_streaming, supports_json_mode, supports_system_message, supports_developer_message, max_context_tokens, max_output_tokens, input_modalities, output_modalities
+- ModelPreferences: provider_name, model_name, temperature, top_p, max_output_tokens, json_mode, stream, fallback_models
+- ModelBudget: max_input_tokens, max_output_tokens, max_total_tokens, max_retries, max_latency_ms, max_cost_estimate
+- ModelUsage: input_tokens, output_tokens, total_tokens, cached_input_tokens, reasoning_tokens, cost_estimate
+- ModelTurnRequest: request_id, run_id, session_id, task_id, phase_id, action_id, purpose, messages, tools, tool_choice, model_preferences, budget, context_metadata, policy_metadata, trace_metadata
+- ModelValidationResult: valid, errors, warnings, repaired, repair_message
+- ModelError: kind, message, retryable, provider_name, model_name, raw_error_ref, metadata
 - ModelTurnResult: request_id, response_id, status, assistant_message, tool_calls, usage, finish_reason, validation, error, provider_name, model_name, latency_ms, trace_event_ids, raw_response_ref, metadata
-- ProviderRequest: request_id, purpose, messages, tools, tool_choice, preferences, policy_metadata, trace_metadata
 
-## Module Boundary
+## 这一层解决什么问题
 
-This module owns the final model request object and provider conversion boundary.
+模型层把上下文、工具 schema、tool choice、budget 和 provider 偏好组装为 `ModelTurnRequest（模型单轮请求）`，再把 provider 响应解析为 `ModelTurnResult（模型单轮结果）`。
 
-It is responsible for assembling `ModelTurnRequest`, choosing messages and tools for the current turn, carrying internal context/policy/trace metadata, invoking `ModelRunner.run_turn()`, converting messages/tools into provider payloads, and normalizing provider responses into `ModelTurnResult`.
+## 当前源码位置
 
-It is not responsible for executing tools returned by the model or deciding whether a tool should be allowed to run.
+- src/singularity/model/models.py
+- src/singularity/model/runner.py
+- src/singularity/model/request_builder.py
+- src/singularity/model/tools.py
 
-## Current Source Locations
+## 关键类、函数、字段
 
-- `src/singularity/agent_loop.py`: `AgentLoop.run()` calls `model_runner.build_request_from_context()` and `model_runner.run_turn()`.
-- `src/singularity/model/models.py`: `ModelTurnRequest`, `ModelToolSchema`, `ModelMessage`, `ModelTurnResult`.
-- `src/singularity/model/request_builder.py`: `ModelTurnRequestBuilder.build_request()`.
-- `src/singularity/model/tools.py`: `ModelToolRenderer`.
-- `src/singularity/model/messages.py`: `MessageConverter`.
-- `src/singularity/model/runner.py`: request creation, capability adjustment, `ProviderRequest` creation, send, validation, trace.
-- `src/singularity/model/providers.py`: `ProviderRequest`, provider request conversion, and OpenAI-compatible payload conversion.
-- `src/singularity/instructions/prompt_assembly.py`: `PromptAssemblyPipeline.build_for_model_turn()`.
+关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
 
-## Runtime Call Chain
+## 真实运行时调用链
 
-1. `AgentLoop.run()` starts or resumes planner state.
-2. Per turn, `planner.step()` selects the current action and allowed tools.
-3. `planner.filtered_tools()` narrows available tool names.
-4. `ModelRunner.build_request_from_context()` calls `ModelTurnRequestBuilder.build_request()`.
-5. `ModelTurnRequestBuilder.build_request()` calls `ModelToolRenderer.render()`.
-6. It calls `ModelToolRenderer.to_provider_tools()` to give the context assembler a tool-token budget shape.
-7. If prompt assembly is configured, `PromptAssemblyPipeline.build_for_model_turn()` creates the stable prompt prefix.
-8. `ContextManager.messages(tools=provider_tools, planner_context=..., persist=True)` provides dynamic tail messages.
-9. `ModelTurnRequestBuilder` returns `ModelTurnRequest`.
-10. `ModelRunner.run_turn()` validates and adjusts the request, then `_send_with_retry()` wraps it in `ProviderRequest`.
-11. Provider code converts `ModelMessage` and `ModelToolSchema` into provider payload messages and tools.
-12. Provider response is normalized into `ModelTurnResult`, including assistant message, parsed tool calls, usage, status, and provider metadata.
+`AgentLoop.run()` -> `ModelRunner.build_request_from_context()` -> `PromptAssemblyPipeline` -> provider registry -> provider chat/completion -> `ModelRunner.run_turn()` -> `ModelTurnResult` -> tool protocol 或 finalization。
 
-## Runtime Objects Passed
+## 真实对象完整结构
 
-- `ModelTurnRequest`: `request_id`, `run_id`, `session_id`, `task_id`, `phase_id`, `action_id`, `purpose`, `messages`, `tools`, `tool_choice`, `model_preferences`, `budget`, `context_metadata`, `policy_metadata`, `trace_metadata`.
-- `ModelMessage`: `role`, `content`, optional `name`, optional `tool_call_id`, `metadata`.
-- `ContentBlock`: `type`, `text`, `artifact_ref`, `metadata`.
-- `ModelToolSchema`: `name`, `description`, `parameters_schema`, `capability_tags`, `risk_tags`, `metadata`.
-- `ToolChoicePolicy`: `mode`, `tool_name`, `allowed_tool_names`, `max_tool_calls`.
-- `ProviderRequest`: `request_id`, `purpose`, `messages`, `tools`, `tool_choice`, `preferences`, `policy_metadata`, `trace_metadata`.
-- `ModelTurnResult`: `request_id`, `response_id`, `status`, `assistant_message`, `tool_calls`, `usage`, `finish_reason`, `validation`, `error`, `provider_name`, `model_name`, `latency_ms`, `trace_event_ids`, `raw_response_ref`, `metadata`.
+- `ModelTurnRequest（模型单轮请求）` 完整字段列在字段清单中，生成者是 `ModelRunner`，消费者是 provider adapter 和 trace recorder。
+- `ModelTurnResult（模型单轮结果）` 完整字段列在字段清单中，生成者是 `ModelRunner`，消费者是 `AgentLoop`、`ContextManager`、`ToolProtocolEngine`。
 
-## Model-Visible Objects (模型实际可见对象)
+## 谁生成这些对象
 
-The provider-visible request includes:
+这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
 
-- messages converted from `ModelTurnRequest.messages`: role, content, optional name, optional `tool_call_id`, and provider-compatible assistant tool calls when present;
-- tools converted from `ModelTurnRequest.tools`: function name, description, parameters, optional strict flag;
-- tool choice converted from `ToolChoicePolicy`;
-- provider request preferences such as model, temperature, top_p, max output tokens, json mode, and stream.
+## 谁消费这些对象
 
-The model sees prompt assembly output, rendered context messages, planner context that was intentionally rendered into messages, and provider tool schemas.
+消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
 
-For the OpenAI-compatible HTTP payload, preferences are projected as `model`, optional `temperature`, optional `top_p`, optional `max_tokens`, and optional JSON `response_format`. `stream` selects the provider call path; it is not message content or provider function schema.
+## 是否落盘
 
-`MessageConverter.to_provider_messages()` may produce an intermediate `metadata` key for local conversion state such as developer-message fallback. `_model_messages_to_openai()` removes that key before the OpenAI-compatible or legacy chat provider payload is sent, except that assistant `metadata["tool_calls"]` is safely converted into provider-compatible `tool_calls`.
+落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
 
-## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
+## 是否进入 trace / audit
 
-Internal-only request data includes:
+进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
 
-- `ModelTurnRequest.context_metadata`: context budget, prompt ids/hashes, stable/dynamic hashes, tool schema hash, bundle id, bundle digest, compression snapshot id, context shape hash, ordering hash, and bundle metadata;
-- `ModelTurnRequest.policy_metadata`;
-- `ModelTurnRequest.trace_metadata`;
-- `ModelMessage.metadata`, except the special assistant `tool_calls` projection described above;
-- `ModelToolSchema.metadata`, except that `metadata["strict"]` can affect whether the provider function schema includes `strict: true`;
-- request/response trace events and raw response references;
-- model validation and budget diagnostics.
+## 失败路径
 
-These fields may be carried to provider-adapter code as request metadata for observability. In the OpenAI-compatible provider, `ProviderRequest.policy_metadata` and `ProviderRequest.trace_metadata` are not included in the HTTP JSON payload, and the metadata dicts themselves are not provider message content or provider function schema.
+失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
 
-## State Transitions And Failure Paths
+## 当前结构问题
 
-- If provider capability does not support tools, `ModelRunner` can adjust or reject the request according to capability handling.
-- Invalid messages or tool calls produce `ModelTurnStatus.INVALID_RESPONSE` or validation errors.
-- Provider auth, network, timeout, or response-shape failures become `ModelError` on `ModelTurnResult`.
-- `AgentLoop._outcome_from_model_failure()` maps non-success model turns into retryable, blocked, or fatal `ExecutionOutcome`.
-- Failure analysis uses a separate `ModelPurpose.FAILURE_ANALYSIS` request without tools.
+当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
 
-## Current Structure Assessment
+## 维护规则
 
-The current structure is coherent because `ModelTurnRequest` is the stable model-boundary object and `ModelTurnRequestBuilder` owns the context-to-request projection. `ModelToolRenderer` keeps provider schemas narrow.
-
-The main drift risk is that metadata fields on `ModelTurnRequest` and `ModelToolSchema` can be confused with model-visible content. Provider conversion must continue to exclude governance metadata from messages and tools unless it is intentionally rendered into prompt text.
-
-## Production-Grade Target Structure
-
-Current code has `ModelTurnRequestBuilder`, not a separate audited `ModelRequestProjection` object.
-
-A production-grade target could add a proposed projection report with:
-
-- proposed `model_visible_messages_hash`;
-- proposed `model_visible_tools_hash`;
-- proposed `excluded_internal_metadata_keys`;
-- proposed `provider_payload_schema_version`;
-- proposed `leak_check_status`.
-
-Those fields are proposed. Current code uses hashes in `context_metadata` and trace metadata, not a dedicated leak report.
-
-## Harness Usage Example
-
-On a normal inspect-and-edit turn, planner allows read tools. `ModelTurnRequestBuilder` emits a stable system/developer prompt from `PromptAssemblyPipeline`, dynamic context messages from `ContextManager`, and tool schemas for the allowed read tools. The provider receives function schemas for those tools. If the model returns a `read_file` tool call, that response returns as `ModelTurnResult.tool_calls` and leaves this module for the tool protocol module.
-
-## Maintenance Rules
-
-Update this document when changing:
-
-- `ModelTurnRequest`, `ModelMessage`, `ModelToolSchema`, `ModelToolCall`, or `ModelTurnResult`;
-- `ModelTurnRequestBuilder.build_request()`;
-- `ModelRunner.build_request_from_context()` or `run_turn()`;
-- provider message/tool conversion;
-- prompt assembly output shape;
-- any metadata field that might be mistaken for model-visible content.
-
-## Verification
-
-- `python scripts/verify_runtime_docs.py`
-- `python -m pytest tests/test_model_models.py tests/test_model_runner.py tests/test_model_tools.py tests/test_instruction_integration.py tests/test_prompt_assembly.py --basetemp work/pytest-tmp`
-- `python -m pytest tests/test_production_baseline_alignment.py::test_runtime_call_chain_stays_on_kernel_graph_model_request_path --basetemp work/pytest-tmp`
-
-## Last Verified Against
-
-Last verified against commit `5f2202bd8cfcc2a4e4a66c025891550e52f3556e` on 2026-06-25.
+修改本模块相关类、字段、函数、调用链、CLI、schema、manifest、trace event、report schema 或 evaluation result 时，必须同步更新本文件并运行 `python scripts/verify_runtime_docs.py`。展示真实对象时必须列完整字段，不允许只列子集，不允许新增仅服务文档说明的运行时字段。

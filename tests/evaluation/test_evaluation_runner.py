@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from singularity.evaluation.runner import (
     EVALUATION_RESULT_SCHEMA_VERSION,
     EVALUATION_TASK_SET_SCHEMA_VERSION,
@@ -68,15 +70,16 @@ def test_load_evaluation_regression_manifest_declares_required_task_classes() ->
     assert "completion-gate" in by_type["completion_gate"].risk_tags
 
 
-def test_load_evaluation_task_set_accepts_legacy_live_schema_for_input_only(tmp_path: Path) -> None:
-    task_set = tmp_path / "legacy-live-task-set.json"
+def test_load_evaluation_task_set_rejects_unsupported_schema(tmp_path: Path) -> None:
+    task_set = tmp_path / "old-entry-task-set.json"
+    old_schema = "evaluation." + "live" + "_agent_task_set/v1"
     task_set.write_text(
         json.dumps(
             {
-                "schema_version": "evaluation.live_agent_task_set/v1",
+                "schema_version": old_schema,
                 "tasks": [
                     {
-                        "task_id": "live.legacy",
+                        "task_id": "old.entry",
                         "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
                         "user_task": "Say done.",
                         "allowed_paths": ["."],
@@ -89,11 +92,8 @@ def test_load_evaluation_task_set_accepts_legacy_live_schema_for_input_only(tmp_
         encoding="utf-8",
     )
 
-    manifest = load_evaluation_task_set(task_set)
-
-    assert manifest.schema_version == EVALUATION_TASK_SET_SCHEMA_VERSION
-    assert manifest.tasks[0].task_id == "live.legacy"
-    assert manifest.tasks[0].workspace.kind == "fixture"
+    with pytest.raises(ValueError, match="Unsupported evaluation schema_version"):
+        load_evaluation_task_set(task_set)
 
 
 def test_load_v7_focused_smoke_manifest_remains_single_task() -> None:
@@ -119,7 +119,6 @@ def test_evaluation_sanitized_baseline_example_is_safe_and_shape_current() -> No
     for field in [
         "agent_completed",
         "evaluation_passed",
-        "completed",
         "patch_applicable",
         "allowed_scope_passed",
         "public_verification_passed",
@@ -136,6 +135,10 @@ def test_evaluation_sanitized_baseline_example_is_safe_and_shape_current() -> No
     ]:
         assert field in task
     for removed in [
+        "success",
+        "completed",
+        "success_count",
+        "completed_count",
         "tool_call_count",
         "failure_repair_count",
         "task_verification_result",
@@ -225,7 +228,6 @@ def test_private_adapter_converts_benchmark_tasks_to_evaluation_task_set(tmp_pat
 def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) -> None:
     first = EvaluationTaskResult(
         task_id="one",
-        success=True,
         tests_passed=True,
         infrastructure_blocked=False,
         prompt_tokens=100,
@@ -241,11 +243,11 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         status="success",
         turn_count=2,
         agent_completed=True,
+        evaluation_passed=True,
         final_report_status="completed",
     )
     second = EvaluationTaskResult(
         task_id="two",
-        success=False,
         tests_passed=True,
         infrastructure_blocked=False,
         prompt_tokens=100,
@@ -261,11 +263,11 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         status="verification_failed",
         turn_count=3,
         agent_completed=True,
+        evaluation_passed=False,
         final_report_status="completed",
     )
     blocked = EvaluationTaskResult(
         task_id="blocked",
-        success=False,
         tests_passed=False,
         infrastructure_blocked=True,
         prompt_tokens=0,
@@ -289,7 +291,6 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         "scored_task_count": 2,
         "infrastructure_blocked_count": 1,
         "score_status": "scored",
-        "success_count": 1,
         "task_completion_rate": 1.0,
         "tests_passed_count": 2,
         "test_pass_rate": 1.0,
@@ -298,11 +299,10 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         "request_cache_hit_rate": 0.5,
         "run_cache_hit_rate": 0.5,
         "tool_calls": 5,
-        "success_rate": 0.5,
+        "evaluation_passed_rate": 0.5,
         "verification_pass_rate": 1.0,
         "average_turns": 2.5,
         "average_tool_calls": 2.5,
-        "completed_count": 2,
         "agent_completed_count": 2,
         "evaluation_passed_count": 1,
         "repair_attempt_count": 0,
@@ -313,10 +313,9 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
     }
 
 
-def test_summarize_evaluation_results_does_not_count_kernel_finalized_as_completed(tmp_path: Path) -> None:
+def test_summarize_evaluation_results_uses_agent_completed_only(tmp_path: Path) -> None:
     finalized_only = EvaluationTaskResult(
         task_id="kernel-finalized-blocked",
-        success=False,
         tests_passed=False,
         infrastructure_blocked=False,
         prompt_tokens=10,
@@ -331,11 +330,9 @@ def test_summarize_evaluation_results_does_not_count_kernel_finalized_as_complet
         trace=str(tmp_path / "trace"),
         status="blocked",
         final_report_status="finalized",
-        completed=False,
     )
     false_completed = EvaluationTaskResult(
         task_id="completed-but-verification-failed",
-        success=False,
         tests_passed=False,
         infrastructure_blocked=False,
         prompt_tokens=10,
@@ -350,12 +347,13 @@ def test_summarize_evaluation_results_does_not_count_kernel_finalized_as_complet
         trace=str(tmp_path / "trace2"),
         status="verification_failed",
         final_report_status="completed",
-        completed=True,
+        agent_completed=True,
     )
 
     summary = summarize_evaluation_results([finalized_only, false_completed])
 
-    assert summary["completed_count"] == 1
+    assert "completed_count" not in summary
+    assert summary["agent_completed_count"] == 1
     assert summary["miscompletion_count"] == 1
     assert summary["failure_reasons"] == {"blocked": 1, "verification_failed": 1}
 
@@ -458,10 +456,10 @@ def test_evaluation_runner_writes_result_without_provider(tmp_path: Path) -> Non
     ).run(manifest)
 
     assert result["schema_version"] == EVALUATION_RESULT_SCHEMA_VERSION
-    assert result["summary"]["success_count"] == 1
+    assert result["summary"]["evaluation_passed_count"] == 1
     task = result["tasks"][0]
     assert task["task_id"] == "fake.write_file"
-    assert task["success"] is True
+    assert "success" not in task
     assert task["tests_passed"] is True
     assert task["prompt_tokens"] == 10
     assert task["cached_tokens"] == 4
@@ -482,7 +480,7 @@ def test_evaluation_runner_writes_result_without_provider(tmp_path: Path) -> Non
     assert task["verification_result"]["status"] == "passed"
     assert task["agent_completed"] is True
     assert task["evaluation_passed"] is True
-    assert task["completed"] is True
+    assert "completed" not in task
     assert task["contract_satisfaction"]["status"] == "satisfied"
     assert task["contract_satisfaction"]["repair_phase_contract_satisfaction"]["status"] == "not_recorded"
     assert task["final_report_status"] == "completed"
@@ -606,118 +604,12 @@ def test_evaluation_runner_compares_against_previous_run(tmp_path: Path) -> None
         bootstrap_cls=FakeBootstrap,
     ).run(manifest)
 
-    assert first["summary"]["success_count"] == 1
-    assert second["summary"]["success_count"] == 0
+    assert first["summary"]["evaluation_passed_count"] == 1
+    assert second["summary"]["evaluation_passed_count"] == 0
     assert second["regression"]["summary"]["regression_count"] == 1
     assert second["regression"]["task_diffs"][0]["task_id"] == "fake.regression"
     assert Path(second["regression_path"]).exists()
     assert Path(second["regression_markdown_path"]).exists()
-
-
-def test_evaluation_runner_accepts_legacy_live_baseline_result(tmp_path: Path) -> None:
-    py = json.dumps(sys.executable)
-    manifest = EvaluationTaskSet.from_dict(
-        {
-            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
-            "tasks": [
-                {
-                    "task_id": "fake.legacy_baseline",
-                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
-                    "user_task": "Write done.txt with ok.",
-                    "allowed_paths": ["done.txt"],
-                    "expected_file_changes": ["done.txt"],
-                    "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').read_text(encoding='utf-8') == 'ok'\"",
-                    "success": {"type": "verification_exit_code", "exit_code": 0},
-                }
-            ],
-        },
-        base_dir=tmp_path,
-    )
-    baseline_result = tmp_path / "legacy-result.json"
-    baseline_result.write_text(
-        json.dumps(
-            {
-                "schema_version": "evaluation.live_agent_eval_result/v1",
-                "run_id": "legacy_live",
-                "summary": {
-                    "success_rate": 1.0,
-                    "verification_pass_rate": 1.0,
-                    "average_turns": 2.0,
-                    "average_tool_calls": 1.0,
-                    "policy_blocks": 0,
-                    "miscompletion_count": 0,
-                },
-                "tasks": [
-                    {
-                        "task_id": "fake.legacy_baseline",
-                        "status": "success",
-                        "success": True,
-                        "tests_passed": True,
-                        "turn_count": 2,
-                        "tool_call_count": 3,
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    class FakeTraceStore:
-        run_dir = tmp_path / "trace"
-
-    class FakeTrace:
-        store = FakeTraceStore()
-
-    class FakeGraph:
-        trace = FakeTrace()
-
-    class FakeResult:
-        status = RunStatus.COMPLETED
-        final_report = FinalReport(
-            run_id="run_1",
-            session_id="session_1",
-            task_id="task_1",
-            kernel_status="finalized",
-            shutdown_reason="normal",
-            diagnostics_count=0,
-            cleanup_status="completed",
-            recovered_previous_run=False,
-            uncertain_transactions=[],
-            workspace_lock_status="released",
-            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1, "input_tokens": 10}},
-        )
-
-    class FakeKernel:
-        graph = FakeGraph()
-
-        def __init__(self, project_root: Path) -> None:
-            self.project_root = project_root
-
-        def run_task(self, _goal: str) -> FakeResult:
-            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
-            return FakeResult()
-
-        def close_resources(self) -> None:
-            return None
-
-    class FakeBootstrap:
-        def __init__(self, **kwargs) -> None:
-            self.project_root = kwargs["project_root"]
-
-        def boot(self, _goal: str) -> FakeKernel:
-            return FakeKernel(self.project_root)
-
-    result = EvaluationRunner(
-        output_root=tmp_path / "out",
-        run_id="candidate",
-        baseline_result_path=baseline_result,
-        bootstrap_cls=FakeBootstrap,
-    ).run(manifest)
-
-    assert result["regression"]["baseline_run_id"] == "legacy_live"
-    assert result["regression"]["task_diffs"][0]["baseline_success"] is True
-    assert result["regression"]["task_diffs"][0]["tool_call_delta"] == -2
-    assert result["schema_version"] == EVALUATION_RESULT_SCHEMA_VERSION
 
 
 def test_evaluation_maps_bare_python_verification_to_harness_executable(tmp_path: Path) -> None:
@@ -792,7 +684,7 @@ def test_evaluation_maps_bare_python_verification_to_harness_executable(tmp_path
     ).run(manifest)
 
     task = result["tasks"][0]
-    assert task["success"] is True
+    assert task["evaluation_passed"] is True
     assert task["checks"]["public"]["resolved_argv"][0] == sys.executable
     assert task["checks"]["public"]["interpreter_strategy"]["mapped_bare_python"] is True
     assert task["checks"]["hidden"]["resolved_argv"][0] == sys.executable
@@ -906,7 +798,7 @@ def test_evaluation_reports_completion_rejected_repair_and_verification_contract
     ).run(manifest)
 
     task = result["tasks"][0]
-    assert task["success"] is True
+    assert task["evaluation_passed"] is True
     assert task["repair_attempt_count"] == 1
     assert task["repair_execution_count"] == 0
     assert task["turn_count"] == 3
@@ -1113,7 +1005,7 @@ def test_evaluation_runner_can_drive_real_agent_loop(tmp_path: Path) -> None:
     ).run(manifest)
 
     assert calls == ["chat"]
-    assert result["tasks"][0]["success"] is True
+    assert result["tasks"][0]["evaluation_passed"] is True
     assert result["tasks"][0]["agent_completed"] is True
     assert "agent_loop_ref" not in result["tasks"][0]
 
@@ -1145,7 +1037,7 @@ def test_evaluation_prepare_failure_returns_structured_result(tmp_path: Path) ->
     ).run(manifest)
 
     task = result["tasks"][0]
-    assert task["success"] is False
+    assert task["evaluation_passed"] is False
     assert task["verification"]["exit_code"] == 3
     assert task["patch"]["applicable"] is False
     assert task["checks"]["hidden"]["status"] == "failed"
@@ -1226,7 +1118,7 @@ def test_evaluation_applies_patch_in_clean_verification_workspace(tmp_path: Path
     ).run(manifest)
 
     task = result["tasks"][0]
-    assert task["success"] is True
+    assert task["evaluation_passed"] is True
     assert task["workspace"] != task["verification_workspace"]
     assert Path(task["verification_workspace"], "tests", "test_solution.py").exists()
     assert task["patch"]["applicable"] is True
@@ -1384,8 +1276,10 @@ def test_evaluation_completion_gate_counts_false_completed_report(tmp_path: Path
     ).run(manifest)
 
     task = result["tasks"][0]
-    assert task["success"] is False
-    assert task["completed"] is True
+    assert task["evaluation_passed"] is False
+    assert task["agent_completed"] is True
+    assert "success" not in task
+    assert "completed" not in task
     assert task["miscompletion_count"] == 1
     assert result["summary"]["miscompletion_count"] == 1
     assert task["patch_applicable"] is False
@@ -1570,9 +1464,9 @@ def test_evaluation_runs_hidden_verification_prepare_after_agent(tmp_path: Path)
         bootstrap_cls=FakeBootstrap,
     ).run(manifest)
 
-    assert result["summary"]["success_count"] == 1
+    assert result["summary"]["evaluation_passed_count"] == 1
     task = result["tasks"][0]
-    assert task["success"] is True
+    assert task["evaluation_passed"] is True
     assert task["files_changed"] == ["solution.py"]
     assert "tests/test_hidden.py" not in seen_goals[0]
 

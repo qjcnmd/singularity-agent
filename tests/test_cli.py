@@ -870,7 +870,7 @@ def test_cli_eval_private_uses_private_benchmark_adapter(tmp_path: Path, monkeyp
             return {
                 "schema_version": "evaluation.result/v1",
                 "run_id": "private_cli",
-                "summary": {"success_count": 1, "task_count": 1},
+                "summary": {"evaluation_passed_count": 1, "task_count": 1},
                 "tasks": [],
             }
 
@@ -900,20 +900,24 @@ def test_cli_eval_private_uses_private_benchmark_adapter(tmp_path: Path, monkeyp
     removed = runner.invoke(app, ["eval", "live", "private", str(task_set)])
     assert removed.exit_code != 0
     assert "No such command" in removed.output
+    benchmark_removed = runner.invoke(app, ["benchmark", "live", "private", str(task_set)])
+    assert benchmark_removed.exit_code != 0
+    assert "No such command" in benchmark_removed.output
 
 
-def test_cli_eval_run_accepts_legacy_live_manifest_through_canonical_command(
+def test_cli_eval_run_rejects_unsupported_manifest_schema(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    task_set = tmp_path / "legacy-live.json"
+    task_set = tmp_path / "old-entry.json"
+    old_schema = "evaluation." + "live" + "_agent_task_set/v1"
     task_set.write_text(
         json.dumps(
             {
-                "schema_version": "evaluation.live_agent_task_set/v1",
+                "schema_version": old_schema,
                 "tasks": [
                     {
-                        "task_id": "live.cli",
+                        "task_id": "old.cli",
                         "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
                         "user_task": "Say done.",
                         "allowed_paths": ["."],
@@ -925,19 +929,18 @@ def test_cli_eval_run_accepts_legacy_live_manifest_through_canonical_command(
         ),
         encoding="utf-8",
     )
-    seen = {}
+    seen = {"ran": False}
 
     class FakeRunner:
         def __init__(self, **kwargs) -> None:
             seen["kwargs"] = kwargs
 
         def run(self, manifest):
-            seen["task_id"] = manifest.tasks[0].task_id
-            seen["schema_version"] = manifest.schema_version
+            seen["ran"] = True
             return {
                 "schema_version": "evaluation.result/v1",
                 "run_id": "canonical",
-                "summary": {"success_count": 1, "task_count": 1},
+                "summary": {"evaluation_passed_count": 1, "task_count": 1},
                 "tasks": [],
             }
 
@@ -945,8 +948,8 @@ def test_cli_eval_run_accepts_legacy_live_manifest_through_canonical_command(
 
     result = runner.invoke(app, ["eval", "run", str(task_set), "--json"])
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["run_id"] == "canonical"
-    assert seen["task_id"] == "live.cli"
-    assert seen["schema_version"] == "evaluation.task_set/v1"
+    assert result.exit_code != 0
+    assert isinstance(result.exception, ValueError)
+    assert "Unsupported evaluation schema_version" in str(result.exception)
+    assert seen["ran"] is False
 

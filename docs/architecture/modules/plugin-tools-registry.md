@@ -1,168 +1,83 @@
-# Plugin Tools Into ToolRegistry Runtime Flow
+# Plugin Tools Registry模块数据流
 
-Runtime flow doc id: plugin-tools-registry
-Source paths:
-- src/singularity/kernel/graph.py
-- src/singularity/plugins/manager.py
-- src/singularity/plugins/status.py
-- src/singularity/plugins/loader.py
-- src/singularity/plugins/host.py
+模块数据流文档 ID: plugin-tools-registry
+
+源码证据路径:
 - src/singularity/plugins/models.py
-- src/singularity/tools/models.py
-- src/singularity/tools/registry.py
+- src/singularity/plugins/manager.py
+- src/singularity/plugins/discovery.py
+- src/singularity/plugins/loader.py
+- src/singularity/plugins/permissions.py
 
-Symbols:
-- AgentGraphBuilder
-- AgentGraphBuilder._build_tools_protocol
-- PluginManager
-- PluginManager.activate
-- PluginStatusStore
-- PluginStatusStore.enabled_for
-- PluginLockStore
-- PluginLoader
-- PluginLoader.load
-- PluginHost
-- PluginHost.register_tool
+关键符号:
+- PluginManifest
 - DiscoveredPlugin
-- PluginDiagnostic
-- PluginToolContribution
-- PluginLockEntry
 - PluginStatus
-- ToolOrigin
-- ToolSpec
-- ToolRegistry
-- ToolRegistry.register
+- PluginToolContribution
+- PluginContributionSet
+- PluginLoadResult
+- PluginManager
 
-Field checks:
+字段清单:
+- CompatibilitySpec: min_singularity_version, max_singularity_version, min_python, max_python
+- PluginManifest: id, name, version, api_version, entrypoint, type, capabilities, permissions, activation, compatibility, config_schema
 - DiscoveredPlugin: manifest, manifest_path, plugin_dir, source, manifest_hash, diagnostics
-- PluginStatus: enabled, version, path, manifest_hash, approved_permissions, config, compatibility_status
-- PluginToolContribution: plugin_id, local_name, exposed_name, required_permissions, spec
 - PluginDiagnostic: plugin_id, severity, code, message, path, details
+- PluginStatus: enabled, version, path, manifest_hash, approved_permissions, config, compatibility_status
 - PluginLockEntry: plugin_id, version, path, manifest_hash, compatibility_status, enabled
-- ToolOrigin: kind, plugin_id, local_tool_name, exposed_name, manifest_hash, source_path, required_permissions, approved_permissions, activation_hash, schema_digest
-- ToolSpec: name, version, description, input_model, output_model, handler, permission_level, risk_tags, timeout_seconds, max_output_chars, cacheable, idempotent, uses_edit_executor, uses_mutation_manager, uses_command_executor, delegates_policy_constraints, capabilities, operation, resource_resolver, side_effects, sensitivity, cache_policy, idempotency_policy, execution_backend, approval_profile, artifact_policy, enabled
+- PluginToolContribution: plugin_id, local_name, exposed_name, required_permissions, spec
+- PluginContributionSet: plugin_id, tools, provider, prompt, memory, eval, project_adapter
+- PluginLoadResult: plugin_id, loaded, contribution_set, diagnostics
 
-## Module Boundary
+## 这一层解决什么问题
 
-This module owns the flow that admits plugin-contributed tools into the same `ToolRegistry` used by built-in tools.
+Plugin 层发现、校验、启用插件 manifest，并把插件贡献的工具注入 ToolRegistry，同时保留权限、compatibility 和 lock/status 数据。
 
-It is responsible for plugin discovery status checks, manifest hash/path matching, plugin load, contribution permission checks, contribution schema checks, risk tag checks, approval profile checks, and registry registration with `ToolOriginKind.PLUGIN`.
+## 当前源码位置
 
-It is not responsible for executing plugin tools differently after registration. Once admitted, plugin tools use the same `ToolExecutor`, policy, approval, tool protocol, context, and trace paths as built-in tools.
+- src/singularity/plugins/models.py
+- src/singularity/plugins/manager.py
+- src/singularity/plugins/discovery.py
+- src/singularity/plugins/loader.py
+- src/singularity/plugins/permissions.py
 
-## Current Source Locations
+## 关键类、函数、字段
 
-- `src/singularity/kernel/graph.py`: `_build_tools_protocol()` creates `PluginManager` after built-in tool registration and before `ToolExecutor`.
-- `src/singularity/plugins/manager.py`: `PluginManager.activate()`, `_admit_tool_contribution()`, and `_tool_origin()`.
-- `src/singularity/plugins/status.py`: `PluginStatusStore.get()`, `PluginStatusStore.enabled_for()`, and `PluginLockStore`.
-- `src/singularity/plugins/loader.py`: `PluginLoader.load()` imports and calls plugin registration entrypoints.
-- `src/singularity/plugins/host.py`: `PluginHost.register_tool()` builds `PluginToolContribution`.
-- `src/singularity/plugins/models.py`: plugin manifest/status/contribution models.
-- `src/singularity/tools/models.py`: `ToolOrigin`, `ToolOriginKind`, `ToolSpec`.
+关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
 
-## Runtime Call Chain
+## 真实运行时调用链
 
-1. `AgentGraphBuilder._build_tools_protocol()` registers built-in tool groups into `ToolRegistry`.
-2. It constructs `PluginManager(project_root, trace=trace)`.
-3. `PluginManager.activate(registry=tools, policy_engine=policy_engine)` calls `discover()`.
-4. For each discovered plugin, `PluginStatusStore.get(plugin_id)` reads the persisted status and skips absent or disabled entries.
-5. `PluginStatusStore.enabled_for(plugin)` rechecks enabled status and rejects status records whose path or `manifest_hash` no longer matches the discovered plugin.
-6. `check_plugin()` and duplicate id checks produce diagnostics.
-7. `_policy_gate()` optionally calls `PolicyEngine.enforce()` before loading plugin code.
-8. `PluginLoader.load()` calls the plugin registration entrypoint with `PluginHost`.
-9. `PluginHost.register_tool()` creates `PluginToolContribution` values with an underlying `ToolSpec`.
-10. `_admit_tool_contribution()` checks identity, declared and approved permissions, derived permission shape, schema root, root `additionalProperties`, plugin risk tags, approval profile, and high-risk gates.
-11. `ToolRegistry.register(contribution.spec, origin=_tool_origin(...), admitted=True, admission_reason="plugin_contribution_admitted")` inserts the plugin tool.
+`AgentGraphBuilder._build_tools_protocol()` -> `PluginManager.activate()` -> discovery/loader/permission checks -> `PluginToolContribution.spec` 注册到 `ToolRegistry` -> 模型工具 schema 暴露。
 
-## Runtime Objects Passed
+## 真实对象完整结构
 
-- `DiscoveredPlugin`: manifest, manifest path, plugin directory, source, and `manifest_hash`.
-- `PluginStatus`: `enabled`, `version`, `path`, `manifest_hash`, `approved_permissions`, `config`, `compatibility_status`.
-- `PluginToolContribution`: `plugin_id`, `local_name`, `exposed_name`, `required_permissions`, `spec`.
-- `ToolSpec`: same internal execution contract used by built-in tools.
-- `ToolOrigin`: `kind=PLUGIN`, `plugin_id`, `local_tool_name`, `exposed_name`, `manifest_hash`, `source_path`, `required_permissions`, `approved_permissions`, `activation_hash`, `schema_digest`.
-- `PluginDiagnostic`: plugin id, severity, code, message, path, details.
+- `PluginManifest（插件清单）` 完整字段列在字段清单中，消费者是 discovery、loader、permission manager 和 status/lock 组件。
+- `PluginToolContribution（插件工具贡献）` 完整字段列在字段清单中，最终转换为 `RegisteredToolRecord`。
 
-## Model-Visible Objects (模型实际可见对象)
+## 谁生成这些对象
 
-After plugin admission, the model sees the plugin tool exactly like any other visible tool:
+这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
 
-- provider function `name`;
-- provider function `description`;
-- provider function `parameters`;
-- optional provider function `strict`.
+## 谁消费这些对象
 
-Plugin identity is not emitted by `ModelToolRenderer.to_provider_tools()`. `ModelToolRenderer.render()` stores `origin` and optional `plugin_id` in `ModelToolSchema.metadata`, but the provider schema conversion does not include that metadata.
+消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
 
-## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
+## 是否落盘
 
-Internal-only plugin data includes:
+落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
 
-- `PluginStatus.path`, `manifest_hash`, `approved_permissions`, and `config`;
-- `PluginLockEntry` records written by `PluginLockStore`;
-- `PluginDiagnostic` details;
-- `ToolOrigin` plugin metadata;
-- plugin manager trace events: `PLUGIN_DISCOVERED`, `PLUGIN_CHECK_FAILED`, `PLUGIN_TOOL_REGISTERED`, and `PLUGIN_ACTIVATED`;
-- plugin loader trace events: `PLUGIN_LOAD_STARTED`, `PLUGIN_LOAD_COMPLETED`, and `PLUGIN_LOAD_FAILED`;
-- plugin host custom trace events: `PLUGIN_EVENT`;
-- `_policy_gate()` policy request/decision ids.
+## 是否进入 trace / audit
 
-## State Transitions And Failure Paths
+进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
 
-- Disabled or absent plugin status skips activation.
-- Path or manifest hash mismatch produces `plugin_status_mismatch` and prevents registration.
-- Duplicate enabled plugin ids produce `duplicate_plugin_id_enabled`.
-- Policy gate denial produces `plugin_policy_denied`.
-- Policy gate exceptions produce `plugin_policy_gate_failed`.
-- Loader failure keeps diagnostics and prevents contribution registration.
-- Contribution identity/name mismatch prevents registration.
-- Undeclared or unapproved permissions prevent registration.
-- Schema root allowing extra properties prevents registration.
-- Missing `plugin` and `plugin:<id>` risk tags prevents registration.
-- Missing plugin approval profile prevents registration.
-- High-risk permissions require a policy gate or explicit approval profile.
-- `ToolRegistry.register()` can still reject duplicate or invalid `ToolSpec` values.
+## 失败路径
 
-## Current Structure Assessment
+失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
 
-The current structure is reasonable because plugins enter through a narrow admission path and then reuse the normal tool runtime. That avoids a parallel plugin execution path.
+## 当前结构问题
 
-The main operational risk is that plugin governance spans manifest discovery, status store, loader, contribution admission, and registry records. The runtime flow doc must stay aligned with all of those files, not just `PluginManager`.
+当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
 
-## Production-Grade Target Structure
+## 维护规则
 
-Current code does not have a single durable `PluginToolAdmissionRecord` object. A production-grade target could add a proposed record that captures:
-
-- proposed `admission_id`;
-- proposed `plugin_status_snapshot`;
-- proposed `policy_decision_id`;
-- proposed `diagnostic_codes`;
-- proposed `registered_tool_names`;
-- proposed `provider_schema_hash`.
-
-This is not current implementation. Today the durable pieces are plugin status, plugin lock, registry record, and trace events.
-
-## Harness Usage Example
-
-A local plugin contributes `format_markdown` with declared read/write permissions. The user enables it, producing `plugin-status.json` with a matching path and `manifest_hash`. During kernel graph build, `PluginManager.activate()` loads the plugin, validates the contribution, and registers its `ToolSpec` with `ToolOriginKind.PLUGIN`. In the next model turn, the model sees only a normal `format_markdown` function schema. The policy and trace layers still know it came from the plugin.
-
-## Maintenance Rules
-
-Update this document when changing:
-
-- plugin manifest/status/lock fields;
-- `PluginManager.activate()` or `_admit_tool_contribution()`;
-- `PluginStatusStore.enabled_for()`;
-- `PluginLoader.load()` or `PluginHost.register_tool()`;
-- `ToolOrigin` plugin fields;
-- the place in `AgentGraphBuilder._build_tools_protocol()` where plugins activate.
-
-## Verification
-
-- `python scripts/verify_runtime_docs.py`
-- `python -m pytest tests/plugins tests/test_tool_registry_production.py --basetemp work/pytest-tmp`
-- `python -m pytest tests/plugins/test_tool_plugin_integration.py --basetemp work/pytest-tmp`
-
-## Last Verified Against
-
-Last verified against commit `5f2202bd8cfcc2a4e4a66c025891550e52f3556e` on 2026-06-25.
+修改本模块相关类、字段、函数、调用链、CLI、schema、manifest、trace event、report schema 或 evaluation result 时，必须同步更新本文件并运行 `python scripts/verify_runtime_docs.py`。展示真实对象时必须列完整字段，不允许只列子集，不允许新增仅服务文档说明的运行时字段。

@@ -19,15 +19,15 @@ def _load_verify_module():
     return module
 
 
-def test_extract_field_checks_parses_explicit_doc_block() -> None:
+def test_extract_field_checks_parses_chinese_doc_block() -> None:
     module = _load_verify_module()
 
     text = """
-Field checks:
+字段清单:
 - ToolResult: ok, content, error_code
 - ModelTurnRequest: request_id, messages, tools
 
-## Module Boundary
+## 维护规则
 """
 
     assert module._extract_field_checks(text) == {
@@ -60,3 +60,13 @@ class RuntimeObject:
         "RuntimeObject": {"request_id", "metadata"}
     }
     assert "RuntimeObject.save" in module._symbols_in_sources([source])
+
+
+def test_forbidden_keyword_list_avoids_literal_old_terms() -> None:
+    module = _load_verify_module()
+
+    forbidden = module._forbidden_terms()
+
+    assert "LEGACY" + "_LIVE" in forbidden
+    assert "evaluation." + "live" + "_agent" in forbidden
+    assert "Runtime" + " Flow" in forbidden

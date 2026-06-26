@@ -1,143 +1,79 @@
-# Tool Registry / ToolSpec / Tool Exposure Runtime Flow
+# Tool Registry / Tool Exposure模块数据流
 
-Runtime flow doc id: tool-registry-exposure
-Source paths:
-- src/singularity/kernel/graph.py
-- src/singularity/tools/registry.py
+模块数据流文档 ID: tool-registry-exposure
+
+源码证据路径:
 - src/singularity/tools/models.py
+- src/singularity/tools/registry.py
 - src/singularity/tools/router.py
-- src/singularity/planner/engine.py
 - src/singularity/model/tools.py
 
-Symbols:
-- AgentGraphBuilder
-- AgentGraphBuilder._build_tools_protocol
-- ToolRegistry
-- ToolRegistry.register
-- ToolRegistry.list_model_visible
-- ToolRegistry.to_openai_tools
-- ToolRegistry._validate_spec
+关键符号:
 - ToolSpec
+- ToolResult
+- ToolExecutionRequest
 - RegisteredToolRecord
-- ToolRouter
-- ToolRouter.decide
-- ToolExposureDecision
-- Planner
-- Planner.decide_tool_exposure
-- Planner.filtered_tools
-- ModelToolRenderer
-- ModelToolRenderer.render
-- ModelToolRenderer.to_provider_tools
+- ToolOrigin
+- ToolRegistry
 
-## Module Boundary
+字段清单:
+- ToolSpec: name, version, description, input_model, output_model, handler, permission_level, risk_tags, timeout_seconds, max_output_chars, cacheable, idempotent, uses_edit_executor, uses_mutation_manager, uses_command_executor, delegates_policy_constraints, capabilities, operation, resource_resolver, side_effects, sensitivity, cache_policy, idempotency_policy, retry_policy, execution_backend, approval_profile, artifact_policy, streamable, enabled
+- ToolResult: ok, content, error_code, error, truncated, metadata
+- ToolExecutionRequest: tool_call_id, tool_name, raw_arguments, normalized_arguments, batch_id, run_id, session_id, task_id, phase_id, model_request_id, model_response_id, argument_digest, metadata
+- RegisteredToolRecord: spec, origin, admitted, admission_reason, diagnostics, metadata
+- ToolOrigin: kind, plugin_id, local_tool_name, exposed_name, manifest_hash, source_path, required_permissions, approved_permissions, activation_hash, schema_digest
+- ToolCachePolicy: cacheable, ttl_seconds, max_entries
+- ToolIdempotencyPolicy: idempotent, replay_returns_previous
+- ToolRetryPolicy: max_attempts
 
-This module owns the registry-side definition of tools and the first model-facing exposure boundary.
+## 这一层解决什么问题
 
-It is responsible for accepting `ToolSpec` instances, retaining `RegisteredToolRecord` governance metadata, filtering enabled and admitted tools through `ToolRegistry.list_model_visible()`, and rendering model-facing schemas through `ToolRegistry.to_openai_tools()` or `ModelToolRenderer.render()`.
+工具注册层把内置工具和插件工具统一为 `ToolSpec（工具规格）`，再投影成 provider 可见的工具 schema。
 
-It is not responsible for executing a tool, approving a tool call, validating provider tool-call responses, or storing tool results. Those are owned by `ToolExecutor`, policy/approval, and `ToolProtocolEngine`.
+## 当前源码位置
 
-## Current Source Locations
+- src/singularity/tools/models.py
+- src/singularity/tools/registry.py
+- src/singularity/tools/router.py
+- src/singularity/model/tools.py
 
-- `src/singularity/kernel/graph.py`: `AgentGraphBuilder._build_tools_protocol()` constructs `ToolRegistry`, registers built-in tool groups, activates plugins, then builds `ToolExecutor` and `ToolProtocolEngine`.
-- `src/singularity/tools/registry.py`: `ToolRegistry.register()`, `list_model_visible()`, `to_openai_tools()`, and `_validate_spec()`.
-- `src/singularity/tools/models.py`: `ToolSpec`, `RegisteredToolRecord`, `ToolOrigin`, `ToolExecutionRequest`, and `ToolResult`.
-- `src/singularity/tools/router.py`: `ToolRouter.decide()` and `ToolExposureDecision`.
-- `src/singularity/planner/engine.py`: `Planner.decide_tool_exposure()` and `filtered_tools()` apply task-phase exposure decisions.
-- `src/singularity/model/tools.py`: `ModelToolRenderer.render()` and `to_provider_tools()`.
+## 关键类、函数、字段
 
-## Runtime Call Chain
+关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
 
-1. `AgentGraphBuilder.build()` calls `_build_tools_protocol()`.
-2. `_build_tools_protocol()` creates `ToolRegistry(project_root)`.
-3. Built-in registration functions call `ToolRegistry.register(spec)`.
-4. `ToolRegistry._validate_spec()` rejects enabled write/shell/delegated specs that do not declare the required execution backend or delegation flags.
-5. Plugin activation may call `ToolRegistry.register()` with `ToolOrigin(kind=ToolOriginKind.PLUGIN, ...)`.
-6. During `AgentLoop.run()`, the loop calls `self.tools.openai_tools(strict=self.strict)`.
-7. `Planner.filtered_tools()` and `Planner.decide_tool_exposure()` use `ToolRouter.decide()` to narrow active tool exposure for the current task phase.
-8. `ModelRunner.build_request_from_context()` delegates to `ModelTurnRequestBuilder.build_request()`.
-9. `ModelToolRenderer.render()` calls `registry.list_model_visible()`, converts each visible `ToolSpec` into `ModelToolSchema`, and stores internal metadata on that schema.
-10. `ModelToolRenderer.to_provider_tools()` converts `ModelToolSchema` into provider function schemas.
+## 真实运行时调用链
 
-## Runtime Objects Passed
+`AgentGraphBuilder._build_tools_protocol()` 创建 `ToolRegistry` -> 注册 mutation/edit/command/workspace/code-index/verification/plugin tools -> `AgentLoop` 调用 `tools.openai_tools()` 生成模型可见 schema。
 
-- `ToolSpec`: `name`, `version`, `description`, `input_model`, `output_model`, `handler`, `permission_level`, `risk_tags`, `timeout_seconds`, `max_output_chars`, `cacheable`, `idempotent`, `uses_edit_executor`, `uses_mutation_manager`, `uses_command_executor`, `delegates_policy_constraints`, `capabilities`, `operation`, `resource_resolver`, `side_effects`, `sensitivity`, `cache_policy`, `idempotency_policy`, `retry_policy`, `execution_backend`, `approval_profile`, `artifact_policy`, `streamable`, `enabled`.
-- `RegisteredToolRecord`: `spec`, `origin`, `admitted`, `admission_reason`, `diagnostics`, `metadata`.
-- `ToolOrigin`: `kind`, `plugin_id`, `local_tool_name`, `exposed_name`, `manifest_hash`, `source_path`, `required_permissions`, `approved_permissions`, `activation_hash`, `schema_digest`.
-- `ModelToolSchema`: `name`, `description`, `parameters_schema`, `capability_tags`, `risk_tags`, `metadata`.
+## 真实对象完整结构
 
-## Model-Visible Objects (模型实际可见对象)
+- `ToolSpec（工具规格）` 完整字段列在字段清单中，生成者是各 register_* 函数或 plugin manager。
+- `ToolResult（工具结果）` 完整字段列在字段清单中，消费者是 `ToolExecutor`、tool protocol result envelope 和 context observation。
 
-The model-visible provider tool schema is restricted to:
+## 谁生成这些对象
 
-- `type: "function"`;
-- `function.name`;
-- `function.description`;
-- `function.parameters`;
-- optional `function.strict`.
+这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
 
-`ToolRegistry.to_openai_tools()` and `ModelToolRenderer.to_provider_tools()` both emit only that function schema. The model does not receive `ToolSpec.handler`, `permission_level`, `risk_tags`, `execution_backend`, `approval_profile`, `artifact_policy`, `ToolOrigin`, or `RegisteredToolRecord`.
+## 谁消费这些对象
 
-`ModelToolRenderer.render()` creates `ModelToolSchema.metadata` with `version`, `permission_level`, `cacheable`, `idempotent`, `strict`, `origin`, and optional `plugin_id`, but `to_provider_tools()` does not copy that metadata into the provider tool schema.
+消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
 
-## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
+## 是否落盘
 
-Internal-only governance data includes:
+落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
 
-- `RegisteredToolRecord.origin`, `admitted`, `admission_reason`, `diagnostics`, and `metadata`;
-- `ToolSpec.permission_level`, `risk_tags`, `capabilities`, `operation`, `side_effects`, `sensitivity`, `execution_backend`, `approval_profile`, and `artifact_policy`;
-- `ToolExposureDecision` reasons and planner phase gating;
-- `ToolRegistry.list_policy_shapes()` output for internal policy shape inspection;
-- `ModelToolSchema.metadata`, which is used for request metadata and schema hashing but not provider schema emission.
+## 是否进入 trace / audit
 
-## State Transitions And Failure Paths
+进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
 
-- Registering after `ToolRegistry.freeze()` raises `RuntimeError`.
-- Duplicate tool names raise `ValueError`.
-- Enabled write tools without mutation manager delegation are rejected by `_validate_spec()`.
-- Enabled shell tools without command executor or delegated backend are rejected.
-- Verification tools that set `delegates_policy_constraints=True` must use `DELEGATED_VERIFICATION_RUNNER`.
-- Disabled specs are stored but excluded from `list_model_visible()`.
-- Non-admitted records are excluded from `list_model_visible()`.
+## 失败路径
 
-## Current Structure Assessment
+失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
 
-The current structure is reasonable because `ToolSpec` remains the rich internal contract while provider exposure is a narrow projection. `ToolRegistry.list_model_visible()` is the right place to separate enabled/admitted tools from all registered records.
+## 当前结构问题
 
-The main weakness is that `ToolRegistry.to_openai_tools()` and `ModelToolRenderer.to_provider_tools()` are two provider-schema paths with similar output shapes. They currently agree on the key boundary, but future changes must update both or consolidate the conversion.
+当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
 
-## Production-Grade Target Structure
+## 维护规则
 
-Current code has no dedicated single `ToolExposurePolicy` object. A production-grade target could introduce one proposed object that owns:
-
-- proposed `exposure_reason`;
-- proposed `schema_visibility_level`;
-- proposed `model_schema_version`;
-- proposed invariant checks that metadata fields cannot leak into provider schemas.
-
-This is not current implementation. Today the split is `ToolRegistry.list_model_visible()` plus `ModelToolRenderer`.
-
-## Harness Usage Example
-
-In a typical coding-agent turn, `AgentGraphBuilder._build_tools_protocol()` registers `read_file`, `search_text`, edit, command, workspace-state, code-index, and verification tools. `AgentLoop.run()` asks planner for the active phase, filters tool names, and `ModelToolRenderer.to_provider_tools()` exposes only the allowed function names and JSON schemas. The model can call `read_file` by name, but it cannot see the Python handler, the mutation backend, policy tags, or plugin origin metadata.
-
-## Maintenance Rules
-
-Update this document when changing:
-
-- `ToolSpec` fields that affect exposure, policy, execution, or result handling;
-- `RegisteredToolRecord` or `ToolOrigin`;
-- `ToolRegistry.register()`, `_validate_spec()`, `list_model_visible()`, or `to_openai_tools()`;
-- `ToolRouter.decide()`, `Planner.decide_tool_exposure()`, or `Planner.filtered_tools()`;
-- built-in tool registration order in `AgentGraphBuilder._build_tools_protocol()`;
-- `ModelToolRenderer.render()` or `to_provider_tools()`.
-
-## Verification
-
-- `python scripts/verify_runtime_docs.py`
-- `python -m pytest tests/test_tool_registry_production.py tests/test_model_tools.py tests/test_tool_contract.py tests/test_tool_router.py --basetemp work/pytest-tmp`
-- `python -m pytest tests/test_agent_graph.py --basetemp work/pytest-tmp`
-
-## Last Verified Against
-
-Last verified against commit `5f2202bd8cfcc2a4e4a66c025891550e52f3556e` on 2026-06-25.
+修改本模块相关类、字段、函数、调用链、CLI、schema、manifest、trace event、report schema 或 evaluation result 时，必须同步更新本文件并运行 `python scripts/verify_runtime_docs.py`。展示真实对象时必须列完整字段，不允许只列子集，不允许新增仅服务文档说明的运行时字段。

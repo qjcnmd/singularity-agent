@@ -1,35 +1,26 @@
-# Context Compaction / Observation Store模块数据流
+# AgentLoop 主循环模块数据流
 
-模块数据流文档 ID: context-compaction-observation-store
+模块数据流文档 ID: agent-loop
 
 源码证据路径:
-- src/singularity/context/models.py
-- src/singularity/context/compaction.py
-- src/singularity/context/store.py
-- src/singularity/context/recovery.py
+- src/singularity/agent_loop.py
 
 关键符号:
-- ContextSnapshot
-- ToolObservation
-- RecoveredContext
-- PartialCompactionRange
+- AgentLoop
+- AgentLoop.run
+- AgentLoopResult
+- AgentLoopStatus
 
 字段清单:
-- ContextSnapshot: snapshot_id, run_id, session_id, task_id, goal, summary, retained_item_ids, known_observation_ids, version, created_at, retained_messages, metadata
-- ToolObservation: id, tool_name, tool_call_id, ok, raw_result, preview, truncated, metadata, run_id, turn, created_at, input_tokens, preview_tokens, raw_digest, source_refs, cache_hit, duration_seconds, error_code, tool_version, truncation_reason, sensitivity
-- RecoveredContext: run_id, messages, context_items, last_bundle, planner_state, pending_tool_calls, completed_tool_call_ids, pending_policy_approval, active_process_sessions, open_mutation_transactions, last_verification_status, last_safe_checkpoint, recommended_next_action, recovery_warnings, trace_last_event
-- PartialCompactionRange: start_turn, end_turn, checkpoint_id
+- AgentLoopResult: status, final_answer, turn, error_code, diagnostics
 
 ## 这一层解决什么问题
 
-该层负责上下文快照、压缩摘要、工具观察和 crash recovery 所需的最近状态，防止长任务上下文无限增长。
+AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型单轮请求、工具协议结果和最终报告串成一个可中断、可重试、可追踪的执行循环。
 
 ## 当前源码位置
 
-- src/singularity/context/models.py
-- src/singularity/context/compaction.py
-- src/singularity/context/store.py
-- src/singularity/context/recovery.py
+- src/singularity/agent_loop.py
 
 ## 关键类、函数、字段
 
@@ -37,12 +28,12 @@
 
 ## 真实运行时调用链
 
-`ContextManager` 写入 context store -> compaction 生成 `ContextSummaryEnvelope` / `ContextSnapshot` -> recovery 读取最近 bundle、工具状态和 planner 状态 -> `AgentLoop` 恢复下一步。
+`AgentKernel.run_task()` 构造 `AgentLoop` -> `AgentLoop.run()` -> `RunController.run_loop()` 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`，最后通过 `Planner.finalize()` 或失败 outcome 结束。
 
 ## 真实对象完整结构
 
-- `ContextSnapshot（上下文快照）` 完整字段列在字段清单中，落盘到 context store。
-- `ToolObservation（工具观察）` 完整字段列在字段清单中，消费者是 context 渲染、planner 证据和 failure analysis。
+- `AgentLoopResult（智能体主循环结果）` 完整字段是 `status`、`final_answer`、`turn`、`error_code`、`diagnostics`。
+- `AgentLoopStatus（主循环状态）` 当前枚举值为 `completed`、`blocked`、`max_turns_exceeded`、`failed`。
 
 ## 谁生成这些对象
 

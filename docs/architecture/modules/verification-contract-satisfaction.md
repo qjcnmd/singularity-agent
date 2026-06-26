@@ -1,35 +1,38 @@
-# Context Compaction / Observation Store模块数据流
+# Verification / Contract Satisfaction模块数据流
 
-模块数据流文档 ID: context-compaction-observation-store
+模块数据流文档 ID: verification-contract-satisfaction
 
 源码证据路径:
-- src/singularity/context/models.py
-- src/singularity/context/compaction.py
-- src/singularity/context/store.py
-- src/singularity/context/recovery.py
+- src/singularity/verification/models.py
+- src/singularity/verification/contract.py
+- src/singularity/verification/runner.py
+- src/singularity/verification/satisfaction.py
 
 关键符号:
-- ContextSnapshot
-- ToolObservation
-- RecoveredContext
-- PartialCompactionRange
+- VerificationCheck
+- VerificationResult
+- CompletionAssessment
+- VerificationStep
+- VerificationContract
+- VerificationRunner
 
 字段清单:
-- ContextSnapshot: snapshot_id, run_id, session_id, task_id, goal, summary, retained_item_ids, known_observation_ids, version, created_at, retained_messages, metadata
-- ToolObservation: id, tool_name, tool_call_id, ok, raw_result, preview, truncated, metadata, run_id, turn, created_at, input_tokens, preview_tokens, raw_digest, source_refs, cache_hit, duration_seconds, error_code, tool_version, truncation_reason, sensitivity
-- RecoveredContext: run_id, messages, context_items, last_bundle, planner_state, pending_tool_calls, completed_tool_call_ids, pending_policy_approval, active_process_sessions, open_mutation_transactions, last_verification_status, last_safe_checkpoint, recommended_next_action, recovery_warnings, trace_last_event
-- PartialCompactionRange: start_turn, end_turn, checkpoint_id
+- VerificationCheck: kind, command, scope, required, timeout, risk_tags, failure_policy, id, policy_decision, policy_reasons, skip_reason, source, contract_step_id
+- VerificationResult: check_id, kind, status, failure_type, evidence, repair_hints, confidence_impact, duration_ms, attempts, policy_decision
+- CompletionAssessment: status, confidence, passed_checks, failed_checks, skipped_checks, warnings, remaining_risks
+- VerificationStep: step_id, command, kind, required
+- VerificationContract: contract_id, steps, status, validation_errors
 
 ## 这一层解决什么问题
 
-该层负责上下文快照、压缩摘要、工具观察和 crash recovery 所需的最近状态，防止长任务上下文无限增长。
+Verification 层发现、计划并执行验证命令，把命令结果转换为 `VerificationResult（验证结果）` 和 completion assessment，同时约束 repair contract 的允许命令。
 
 ## 当前源码位置
 
-- src/singularity/context/models.py
-- src/singularity/context/compaction.py
-- src/singularity/context/store.py
-- src/singularity/context/recovery.py
+- src/singularity/verification/models.py
+- src/singularity/verification/contract.py
+- src/singularity/verification/runner.py
+- src/singularity/verification/satisfaction.py
 
 ## 关键类、函数、字段
 
@@ -37,12 +40,12 @@
 
 ## 真实运行时调用链
 
-`ContextManager` 写入 context store -> compaction 生成 `ContextSummaryEnvelope` / `ContextSnapshot` -> recovery 读取最近 bundle、工具状态和 planner 状态 -> `AgentLoop` 恢复下一步。
+`run_verification` tool -> `VerificationRunner.run()` -> `CommandExecutor.run()` -> parsers/satisfaction -> planner evidence -> `AgentLoop._attempt_finalize()` completion gate。
 
 ## 真实对象完整结构
 
-- `ContextSnapshot（上下文快照）` 完整字段列在字段清单中，落盘到 context store。
-- `ToolObservation（工具观察）` 完整字段列在字段清单中，消费者是 context 渲染、planner 证据和 failure analysis。
+- `VerificationCheck（验证检查）` 完整字段列在字段清单中，描述要执行或跳过的验证动作。
+- `VerificationContract（验证契约）` 完整字段列在字段清单中，约束 repair 阶段允许的验证命令。
 
 ## 谁生成这些对象
 

@@ -15,7 +15,8 @@ def test_targeted_failure_replay_runner_activates_repair_chain_and_completes(tmp
     assert payload["entered_agent_loop"] is True
     assert "agent_loop_ref" not in payload
     assert payload["status"] == "completed"
-    assert payload["completed"] is True
+    assert payload["agent_completed"] is True
+    assert "completed" not in payload
     assert payload["failure_trigger"] == "verification_failed"
     assert payload["failure_analysis_request_count"] == 1
     assert payload["failure_analysis_result_count"] == 1
@@ -74,10 +75,12 @@ def test_targeted_failure_replay_runner_writes_bounded_json_and_markdown_reports
         "json": str(json_path),
         "markdown": str(markdown_path),
     }
-    assert rerun.completed is True
+    assert rerun.agent_completed is True
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     markdown = markdown_path.read_text(encoding="utf-8")
     assert payload["status"] == "completed"
+    assert payload["agent_completed"] is True
+    assert "completed" not in payload
     assert payload["entered_agent_loop"] is True
     assert "model_visible_objects" not in payload
     assert "evaluator_internal_objects" not in payload

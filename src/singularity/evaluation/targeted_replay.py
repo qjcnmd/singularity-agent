@@ -32,7 +32,7 @@ TARGETED_REPLAY_SCHEMA_VERSION = "evaluation.targeted_failure_replay/v1"
 @dataclass(frozen=True)
 class TargetedFailureReplayResult:
     status: str
-    completed: bool
+    agent_completed: bool
     entered_agent_loop: bool
     failure_trigger: str
     failure_analysis_request_count: int
@@ -57,7 +57,7 @@ class TargetedFailureReplayResult:
         payload = {
             "schema_version": TARGETED_REPLAY_SCHEMA_VERSION,
             "status": self.status,
-            "completed": self.completed,
+            "agent_completed": self.agent_completed,
             "entered_agent_loop": self.entered_agent_loop,
             "failure_trigger": self.failure_trigger,
             "failure_analysis_request_count": self.failure_analysis_request_count,
@@ -242,7 +242,7 @@ class TargetedFailureReplayRunner:
         )
         return TargetedFailureReplayResult(
             status=agent_result.status.value,
-            completed=agent_result.status == AgentLoopStatus.COMPLETED,
+            agent_completed=agent_result.status == AgentLoopStatus.COMPLETED,
             entered_agent_loop=bool(provider.calls),
             failure_trigger=_failure_trigger(planner),
             failure_analysis_request_count=_trace_event_count(trace.path, "failure_analysis_requested"),
@@ -555,7 +555,7 @@ def _targeted_replay_markdown(result: TargetedFailureReplayResult) -> str:
             "# Targeted Failure Replay",
             "",
             f"- status: `{payload['status']}`",
-            f"- completed: `{payload['completed']}`",
+            f"- agent_completed: `{payload['agent_completed']}`",
             f"- entered_agent_loop: `{payload['entered_agent_loop']}`",
             f"- failure_trigger: `{payload['failure_trigger']}`",
             f"- repairing_failures_seen: `{payload['repairing_failures_seen']}`",

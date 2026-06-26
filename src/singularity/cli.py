@@ -911,7 +911,7 @@ def eval_targeted_replay(
         _write_stdout(json_dumps(result.to_dict()))
     else:
         console.print(Panel(json_dumps(result.to_dict()), title="targeted failure replay", border_style="cyan"))
-    if not result.completed:
+    if not result.agent_completed:
         raise typer.Exit(1)
 
 
@@ -1138,7 +1138,7 @@ def eval_run(
         _write_stdout(json_dumps(result))
     else:
         console.print(Panel(json_dumps(result), title="evaluation", border_style="cyan"))
-    if result["summary"]["success_count"] != result["summary"]["task_count"]:
+    if result["summary"]["evaluation_passed_count"] != result["summary"]["task_count"]:
         raise typer.Exit(1)
 
 
@@ -1213,7 +1213,7 @@ def eval_private(
         _write_stdout(json_dumps(result))
     else:
         console.print(Panel(json_dumps(result), title="private evaluation", border_style="cyan"))
-    if result["summary"]["success_count"] != result["summary"]["task_count"]:
+    if result["summary"]["evaluation_passed_count"] != result["summary"]["task_count"]:
         raise typer.Exit(1)
 
 

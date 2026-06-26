@@ -32,8 +32,6 @@ from singularity.policy import ApprovalMode, SecurityMode
 
 EVALUATION_TASK_SET_SCHEMA_VERSION = "evaluation.task_set/v1"
 EVALUATION_RESULT_SCHEMA_VERSION = "evaluation.result/v1"
-LEGACY_LIVE_TASK_SET_SCHEMA_VERSION = "evaluation.live_agent_task_set/v1"
-LEGACY_LIVE_RESULT_SCHEMA_VERSION = "evaluation.live_agent_eval_result/v1"
 
 _PATCH_REDACTOR = ContextRedactor()
 
@@ -194,10 +192,7 @@ class EvaluationTaskSet:
     @classmethod
     def from_dict(cls, payload: dict[str, Any], *, base_dir: Path) -> "EvaluationTaskSet":
         schema_version = str(payload.get("schema_version") or "")
-        if schema_version not in {
-            EVALUATION_TASK_SET_SCHEMA_VERSION,
-            LEGACY_LIVE_TASK_SET_SCHEMA_VERSION,
-        }:
+        if schema_version != EVALUATION_TASK_SET_SCHEMA_VERSION:
             raise ValueError(f"Unsupported evaluation schema_version: {schema_version}")
         tasks_payload = payload.get("tasks")
         if not isinstance(tasks_payload, list) or not tasks_payload:
@@ -245,7 +240,6 @@ class CommandEvalResult:
 @dataclass(frozen=True)
 class EvaluationTaskResult:
     task_id: str
-    success: bool
     tests_passed: bool
     infrastructure_blocked: bool
     prompt_tokens: int
@@ -264,7 +258,6 @@ class EvaluationTaskResult:
     verification: CommandEvalResult | None = None
     agent_completed: bool = False
     evaluation_passed: bool = False
-    completed: bool = False
     patch_applicable: bool = False
     allowed_scope_passed: bool = False
     public_verification_passed: bool = False
@@ -286,17 +279,10 @@ class EvaluationTaskResult:
     trace_artifact_refs: list[str] = field(default_factory=list)
     reproducible_environment: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "evaluation_passed", bool(self.success))
-        agent_completed = bool(self.agent_completed or self.completed)
-        object.__setattr__(self, "agent_completed", agent_completed)
-        object.__setattr__(self, "completed", agent_completed)
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
             "status": self.status,
-            "success": self.success,
             "tests_passed": self.tests_passed,
             "infrastructure_blocked": self.infrastructure_blocked,
             "turn_count": self.turn_count,
@@ -316,7 +302,6 @@ class EvaluationTaskResult:
             "verification": self.verification.to_dict() if self.verification else None,
             "agent_completed": self.agent_completed,
             "evaluation_passed": self.evaluation_passed,
-            "completed": self.completed,
             "patch_applicable": self.patch_applicable,
             "allowed_scope_passed": self.allowed_scope_passed,
             "public_verification_passed": self.public_verification_passed,
@@ -919,7 +904,6 @@ class EvaluationRunner:
         )
         return EvaluationTaskResult(
             task_id=task.task_id,
-            success=evaluation_passed,
             tests_passed=tests_passed,
             infrastructure_blocked=infrastructure_blocked,
             status=status,
@@ -940,7 +924,6 @@ class EvaluationRunner:
             verification=verification,
             agent_completed=agent_completed,
             evaluation_passed=evaluation_passed,
-            completed=agent_completed,
             patch_applicable=patch_applicable,
             allowed_scope_passed=allowed_scope_passed,
             public_verification_passed=public_verification_passed,
@@ -986,7 +969,7 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
     scored_results = [result for result in results if not result.infrastructure_blocked]
     scored_task_count = len(scored_results)
     infrastructure_blocked_count = task_count - scored_task_count
-    success_count = sum(1 for result in results if result.evaluation_passed)
+    evaluation_passed_count = sum(1 for result in results if result.evaluation_passed)
     tests_passed_count = sum(1 for result in results if result.tests_passed)
     prompt_tokens = sum(result.prompt_tokens for result in results)
     cached_tokens = sum(result.cached_tokens for result in results)
@@ -997,9 +980,9 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
             reason = result.failure_category if result.failure_category and result.failure_category != "none" else result.status
             failures[reason or "failure"] = failures.get(reason or "failure", 0) + 1
         miscompletion_count += result.miscompletion_count or int(
-            _summary_completed(result) and not result.evaluation_passed
+            result.agent_completed and not result.evaluation_passed
         )
-    agent_completed_count = sum(1 for result in scored_results if _summary_completed(result))
+    agent_completed_count = sum(1 for result in scored_results if result.agent_completed)
     return {
         "task_count": task_count,
         "scored_task_count": scored_task_count,
@@ -1009,7 +992,6 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
             scored_task_count=scored_task_count,
             infrastructure_blocked_count=infrastructure_blocked_count,
         ),
-        "success_count": success_count,
         "task_completion_rate": _rate(agent_completed_count, scored_task_count),
         "tests_passed_count": tests_passed_count,
         "test_pass_rate": _rate(tests_passed_count, scored_task_count),
@@ -1018,7 +1000,7 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
         "request_cache_hit_rate": _average_rate({result.task_id: result.request_cache_hit_rate for result in scored_results}),
         "run_cache_hit_rate": _rate(cached_tokens, prompt_tokens),
         "tool_calls": sum(result.tool_calls for result in results),
-        "success_rate": _rate(success_count, scored_task_count),
+        "evaluation_passed_rate": _rate(evaluation_passed_count, scored_task_count),
         "verification_pass_rate": _rate(tests_passed_count, scored_task_count),
         "average_turns": round(
             sum(result.turn_count for result in scored_results) / scored_task_count,
@@ -1032,9 +1014,8 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
         )
         if scored_task_count
         else 0.0,
-        "completed_count": agent_completed_count,
         "agent_completed_count": agent_completed_count,
-        "evaluation_passed_count": success_count,
+        "evaluation_passed_count": evaluation_passed_count,
         "repair_attempt_count": sum(result.repair_attempt_count for result in results),
         "repair_execution_count": sum(result.repair_execution_count for result in results),
         "policy_blocks": sum(result.policy_blocks for result in results),
@@ -1065,8 +1046,8 @@ def compare_evaluation_results(
         task_diffs.append(
             {
                 "task_id": task_id,
-                "baseline_status": previous.get("status") or _legacy_status(previous),
-                "candidate_status": item.get("status") or _legacy_status(item),
+                "baseline_status": str(previous.get("status") or ""),
+                "candidate_status": str(item.get("status") or ""),
                 "baseline_success": _evaluation_passed_from_payload(previous),
                 "candidate_success": _evaluation_passed_from_payload(item),
                 "turn_delta": _safe_int(item.get("turn_count")) - _safe_int(previous.get("turn_count")),
@@ -1085,7 +1066,11 @@ def compare_evaluation_results(
         "baseline_run_id": str(baseline.get("run_id") or ""),
         "candidate_run_id": str(candidate.get("run_id") or ""),
         "summary": {
-            "success_rate_delta": _float_delta(candidate_summary, baseline_summary, "success_rate"),
+            "evaluation_passed_rate_delta": _float_delta(
+                candidate_summary,
+                baseline_summary,
+                "evaluation_passed_rate",
+            ),
             "verification_pass_rate_delta": _float_delta(candidate_summary, baseline_summary, "verification_pass_rate"),
             "average_turns_delta": _float_delta(candidate_summary, baseline_summary, "average_turns"),
             "average_tool_calls_delta": _float_delta(candidate_summary, baseline_summary, "average_tool_calls"),
@@ -1107,7 +1092,7 @@ def evaluation_report_markdown(payload: dict[str, Any]) -> str:
         "",
         f"- status: `{summary.get('score_status', 'unknown')}`",
         f"- task count: {summary.get('task_count', 0)}",
-        f"- success rate: {summary.get('success_rate', 0):.4f}",
+        f"- evaluation passed rate: {summary.get('evaluation_passed_rate', 0):.4f}",
         f"- verification pass rate: {summary.get('verification_pass_rate', 0):.4f}",
         f"- average turns: {summary.get('average_turns', 0):.4f}",
         f"- average tool calls: {summary.get('average_tool_calls', 0):.4f}",
@@ -1129,7 +1114,7 @@ def evaluation_report_markdown(payload: dict[str, Any]) -> str:
         lines.append(
             "| "
             f"`{task.get('task_id', '')}` | "
-            f"{task.get('status', _legacy_status(task))} | "
+            f"{task.get('status') or 'unknown'} | "
             f"{verification} | "
             f"{_safe_int(task.get('turn_count'))} | "
             f"{_safe_int(task.get('tool_calls'))} | "
@@ -1150,7 +1135,7 @@ def evaluation_regression_markdown(payload: dict[str, Any]) -> str:
     lines = [
         f"# Agent Evaluation Regression `{payload.get('baseline_run_id', '')}` -> `{payload.get('candidate_run_id', '')}`",
         "",
-        f"- success rate delta: {summary.get('success_rate_delta', 0):.4f}",
+        f"- evaluation passed rate delta: {summary.get('evaluation_passed_rate_delta', 0):.4f}",
         f"- verification pass rate delta: {summary.get('verification_pass_rate_delta', 0):.4f}",
         f"- average turns delta: {summary.get('average_turns_delta', 0):.4f}",
         f"- average tool calls delta: {summary.get('average_tool_calls_delta', 0):.4f}",
@@ -1230,10 +1215,7 @@ def _previous_evaluation_result(
 
 
 def _is_supported_evaluation_result(payload: dict[str, Any]) -> bool:
-    return payload.get("schema_version") in {
-        EVALUATION_RESULT_SCHEMA_VERSION,
-        LEGACY_LIVE_RESULT_SCHEMA_VERSION,
-    }
+    return payload.get("schema_version") == EVALUATION_RESULT_SCHEMA_VERSION
 
 
 def _workspace_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1486,20 +1468,12 @@ def _final_report_status(payload: dict[str, Any], *, agent_status: str) -> str:
     return agent_status
 
 
-def _summary_completed(result: EvaluationTaskResult) -> bool:
-    return bool(result.agent_completed or result.completed)
-
-
 def _evaluation_passed_from_payload(payload: dict[str, Any]) -> bool:
-    if "evaluation_passed" in payload:
-        return bool(payload.get("evaluation_passed"))
-    return bool(payload.get("success"))
+    return bool(payload.get("evaluation_passed"))
 
 
 def _payload_tool_calls(payload: dict[str, Any]) -> int:
-    if "tool_calls" in payload:
-        return _safe_int(payload.get("tool_calls"))
-    return _safe_int(payload.get("tool_call_count"))
+    return _safe_int(payload.get("tool_calls"))
 
 
 def _failure_repair_summary(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1517,11 +1491,7 @@ def _repair_execution_count(payload: dict[str, Any]) -> int:
 
 
 def _agent_completed(final_report_status: str, *, agent_status: str) -> bool:
-    return final_report_status in {"completed", "success"} or agent_status == "completed"
-
-
-def _completed(final_report_status: str, *, agent_status: str) -> bool:
-    return _agent_completed(final_report_status, agent_status=agent_status)
+    return final_report_status == "completed" or agent_status == "completed"
 
 
 def _blocked_reason(
@@ -2291,11 +2261,3 @@ def _float_delta(current: dict[str, Any], previous: dict[str, Any], key: str) ->
     return round(float(current.get(key, 0.0) or 0.0) - float(previous.get(key, 0.0) or 0.0), 6)
 
 
-def _legacy_status(payload: dict[str, Any]) -> str:
-    if payload.get("infrastructure_blocked"):
-        return "infrastructure_blocked"
-    if payload.get("success"):
-        return "success"
-    if payload.get("tests_passed") is False:
-        return "verification_failed"
-    return "failure"

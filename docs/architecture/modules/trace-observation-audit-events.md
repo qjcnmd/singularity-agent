@@ -1,198 +1,76 @@
-# Trace / Observation / Audit Events Runtime Flow
+# Trace / Observation / Audit Events模块数据流
 
-Runtime flow doc id: trace-observation-audit-events
-Source paths:
+模块数据流文档 ID: trace-observation-audit-events
+
+源码证据路径:
 - src/singularity/observability/models.py
 - src/singularity/observability/recorder.py
 - src/singularity/observability/store.py
-- src/singularity/observability/artifacts.py
-- src/singularity/observability/spans.py
-- src/singularity/observability/summary.py
-- src/singularity/context/store.py
-- src/singularity/context/models.py
 - src/singularity/policy/audit.py
-- src/singularity/review/pipeline.py
-- src/singularity/review/critic.py
-- src/singularity/planner/engine.py
-- src/singularity/evaluation/targeted_replay.py
 
-Symbols:
-- TraceEventType
-- TraceArtifactKind
+关键符号:
 - TraceEvent
 - TraceSpan
 - TraceArtifact
+- TraceTimelineItem
 - TraceSummary
 - TraceRecorder
-- TraceRecorder.emit
-- TraceRecorder.record
-- TraceRecorder.write_artifact
-- TraceStore
-- TraceStore.append_event
-- TraceStore.append_artifact
-- TraceStore.query_events
-- TraceArtifactStore
-- TraceArtifactStore.write_text_artifact
-- TraceArtifactStore.write_bytes_artifact
-- TraceArtifactStore.register_file_artifact
-- SpanManager
-- SpanManager.start_span
-- SpanManager.end_span
-- TraceSummaryBuilder
-- ObservationStore
-- ObservationStore.record_event
-- ObservationStore.save_observation
-- ToolObservation
-- PolicyAuditWriter
-- PolicyAuditWriter.append
-- ReviewPipeline
-- ReviewPipeline._emit
-- ModelCritic
-- ModelCritic.review
-- Planner
-- Planner.record_diff_observation
-- Planner.record_review_observation
-- TargetedFailureReplayRunner
-- TargetedFailureReplayResult
 
-## Module Boundary
+字段清单:
+- TraceEvent: event_id, event_type, run_id, session_id, task_id, phase_id, action_id, parent_event_id, timestamp, monotonic_ms, component, severity, summary, payload, artifact_refs, policy_decision_id, approval_grant_id, sandbox_id, command_id, transaction_id, verification_id, span_id, redaction_applied, payload_hash
+- TraceSpan: span_id, parent_span_id, run_id, session_id, task_id, phase_id, action_id, name, component, started_at, ended_at, duration_ms, status, error_type, error_message, attributes, artifact_refs
+- TraceArtifact: artifact_id, run_id, session_id, task_id, kind, path, relative_path, size_bytes, sha256, content_type, redacted, sensitive, summary, metadata
+- TraceTimelineItem: timestamp, event_id, event_type, component, summary, severity, related_ids, artifact_refs
+- TraceSummary: run_id, session_id, task_id, total_events, total_spans, total_artifacts, action_count, failed_action_count, command_count, sandboxed_command_count, mutation_count, verification_count, policy_denial_count, approval_count, replan_count, error_count, critical_events, key_artifacts, model_usage_summary
 
-This module owns internal observability, context observations, policy audit logs, review trace events, and trace artifact references.
+## 这一层解决什么问题
 
-It is responsible for redacted trace event creation, trace event persistence, trace artifact metadata, policy audit JSONL rows, context observation storage, and review/planner observation events.
+Trace 层记录运行事件、span、artifact、timeline 和 summary；audit 相关数据由 policy 与 approval 链路写入，用于复现和最终报告。
 
-It is not responsible for deciding model prompts or provider request schemas. Trace and audit data become model-visible only if another module intentionally renders bounded summaries into context.
+## 当前源码位置
 
-## Current Source Locations
+- src/singularity/observability/models.py
+- src/singularity/observability/recorder.py
+- src/singularity/observability/store.py
+- src/singularity/policy/audit.py
 
-- `src/singularity/observability/models.py`: trace event/span/artifact/summary models and enums.
-- `src/singularity/observability/recorder.py`: `TraceRecorder.emit()`, legacy event mapping, span and artifact APIs.
-- `src/singularity/observability/store.py`: trace event, span, and artifact persistence.
-- `src/singularity/observability/artifacts.py`: trace artifact storage and limits.
-- `src/singularity/observability/spans.py`: `SpanManager` span lifecycle (start/end) with thread-local span stacks.
-- `src/singularity/observability/summary.py`: timeline and final report summaries.
-- `src/singularity/context/store.py`: context event and tool observation persistence.
-- `src/singularity/context/models.py`: `ToolObservation`.
-- `src/singularity/policy/audit.py`: policy audit writer.
-- `src/singularity/review/pipeline.py`: review trace events.
-- `src/singularity/review/critic.py`: model critic request and result boundary.
-- `src/singularity/planner/engine.py`: diff and review observations.
-- `src/singularity/evaluation/failure_case_replay.py`: bounded evaluation failure-case extraction from `report.json` and trace `events.jsonl`.
-- `src/singularity/evaluation/targeted_replay.py`: bounded targeted replay trace refs and planner phase/status summaries derived from targeted smoke trace output.
+## 关键类、函数、字段
 
-## Runtime Call Chain
+关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
 
-1. Runtime components call `TraceRecorder.emit()` or legacy `TraceRecorder.record()`.
-2. `TraceRecorder.emit()` redacts payload, creates `TraceEvent`, computes `payload_hash`, sets `redaction_applied=True`, appends event to `TraceStore`, and notifies interaction sinks.
-3. Legacy `record()` maps event names such as `planner`, `tool_call`, `model_request`, `command`, `mutation`, `verification`, `failure_analysis_requested`, and `repair_signal_consumed` to typed `TraceEventType` values.
-4. Components that need files call `TraceRecorder.write_artifact()`, which delegates to `TraceArtifactStore` and stores `TraceArtifact`.
-5. Components that need span lifecycle call `TraceRecorder.span()` / `start_span()` / `end_span()`, which delegate to `SpanManager`; span attributes are redacted before the span is appended to `TraceStore`.
-6. Context code calls `ObservationStore.record_event()` and `save_observation()` for context-local event and observation state.
-7. Policy code calls `PolicyAuditWriter.append()` with `PolicyRequest` and `PolicyDecision`.
-8. Review code calls `ReviewPipeline._emit()` to send review lifecycle events.
-9. Planner records review and diff observations in `Planner.record_review_observation()` and `record_diff_observation()`.
-10. After evaluation writes `report.json`, `FailureCaseReplayRunner` may read task trace `events.jsonl` and copy only bounded diagnostic counts, final-report outcome, blocked reasons, and recent phase-policy blocks into `failure_cases.json`. That package is marked `runner_mode="post_run_failure_extraction"`; targeted execution replay is a separate evaluation API.
-11. `TargetedFailureReplayRunner` reads its own deterministic smoke trace to derive bounded `trace_refs`, `phase_history`, and `planner_status_history` for `targeted_replay_result.json`. These are evaluator artifacts and do not change trace-store schema.
+## 真实运行时调用链
 
-## Runtime Objects Passed
+各组件调用 `trace.record()` / `trace.emit()` -> `TraceRecorder` redaction -> `TraceStore` 写 events/spans/artifacts -> timeline/summary/final report/evaluation result 引用。
 
-- `TraceEvent`: `event_id`, `event_type`, `run_id`, `session_id`, `task_id`, `phase_id`, `action_id`, `parent_event_id`, `timestamp`, `monotonic_ms`, `component`, `severity`, `summary`, `payload`, `artifact_refs`, `policy_decision_id`, `approval_grant_id`, `sandbox_id`, `command_id`, `transaction_id`, `verification_id`, `span_id`, `redaction_applied`, `payload_hash`.
-- `TraceArtifact`: `artifact_id`, `run_id`, `session_id`, `task_id`, `kind`, `path`, `relative_path`, `size_bytes`, `sha256`, `content_type`, `redacted`, `sensitive`, `summary`, `metadata`.
-- `ToolObservation`: persisted context observation with preview, raw digest, source refs, duration, cache, error, and sensitivity.
-- `PolicyAuditEntry`: normalized and redacted policy request/decision audit row.
-- Review trace payloads: review stage, findings, decision, report id, transaction id, verification id, policy decision id.
-- Semantic Planner / Final Reviewer trace events: `semantic_planner.task_contract.model_ok`, `semantic_planner.task_contract.fallback`, `semantic_planner.semantic_plan.model_ok`, `semantic_planner.semantic_plan.fallback`, `semantic_planner.planner_decision.model_ok`, `semantic_planner.planner_decision.fallback`, `final_reviewer.assess.done`, `final_reviewer.assess.model_ok`, and `final_reviewer.assess.fallback`.
-- Failure replay trace summary: events path, event count, availability flag, failure-analysis event count, repair event count, final-report outcome, blocked reasons, and recent phase-policy blocks. This is a derived evaluator object, not a trace-store schema change.
-- Targeted replay trace refs: JSONL path, event count, failure-analysis event count, repair event count, and planner event count. This is a bounded evaluator object, not a trace-store schema change and not a prompt/context capture.
-- Failure replay package metadata: `runner_mode` and `targeted_replay_runner` labels written by `FailureCaseReplayRunner.write()` so readers distinguish extraction from execution replay.
+## 真实对象完整结构
 
-## Model-Visible Objects (模型实际可见对象)
+- `TraceEvent（追踪事件）` 完整字段列在字段清单中，payload 需要 redaction。
+- `TraceArtifact（追踪产物）` 完整字段列在字段清单中，消费者是 final report、evaluation report 和 failure case replay。
 
-The model does not receive `TraceEvent`, `TraceArtifact`, `PolicyAuditEntry`, raw `ObservationStore` rows, `FailureCaseRecord.trace_summary`, or targeted replay result `trace_refs` / phase histories.
+## 谁生成这些对象
 
-The model can see trace-adjacent data only after bounded projection into context, for example:
+这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
 
-- tool observation previews rendered as tool messages;
-- planner review summaries recorded into planner/context evidence;
-- artifact ids or references included in tool observation payloads;
-- context summaries that mention refs or verification status.
+## 谁消费这些对象
 
-`ModelCritic.review()` is a separate model call and sends a bounded review target/report prompt, not the full trace store or audit log.
+消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
 
-## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
+## 是否落盘
 
-Internal-only objects include:
+落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
 
-- full trace payloads after redaction;
-- payload hashes;
-- run/session/task/phase/action ids;
-- policy decision and approval grant ids;
-- sandbox, command, transaction, verification, and span ids;
-- trace artifact absolute paths on disk;
-- policy audit rows and grant scopes;
-- context event rows and raw observation storage after redaction;
-- review internal evidence and decision ids.
-- full evaluation task trace files read by `FailureCaseReplayRunner`; only bounded summaries are copied into replay records.
-- `failure_cases.json` package metadata that identifies extraction-only mode and the separate targeted replay runner.
-- `targeted_replay_result.json` / `.md` trace refs and planner phase/status histories. These point to bounded evidence and do not contain full prompts, hidden verification content, full trace payloads, or large context bodies.
+## 是否进入 trace / audit
 
-## State Transitions And Failure Paths
+进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
 
-- Trace write failures are caught and printed as redacted warnings rather than failing the run.
-- Interaction sink failures are caught and printed as redacted warnings.
-- Artifact writes enforce per-artifact and total-size limits.
-- `register_file_artifact` passes source file content through `TraceRedactor.redact_text()` for all text files (both `sensitive=True` and `sensitive=False`); the `redacted` flag is set `True` when text redaction was applied and `False` when a non-sensitive binary file fell back to byte copy. Sensitive binary files raise `TraceArtifactError` because they cannot be text-redacted.
-- `TraceStore.__init__` validates `run_id` and raises `ValueError` for path traversal (`..`), absolute paths (leading `/` or drive letter), empty values, or any character outside `[A-Za-z0-9_-]`.
-- `SpanManager` stores the active span stack in `threading.local()` so each thread has an independent parent-child span view, and guards `start_span`/`end_span` with an `RLock` to serialize `TraceStore` file I/O; the span body executes without holding the lock.
-- `ObservationStore.save_observation()` redacts secret/sensitive content and removes raw keys before storage.
-- `PolicyAuditWriter.append()` redacts request and decision fields before JSONL append.
-- Review trace events can still be non-blocking if model critic fails.
-- Failure replay extraction treats missing or unreadable trace files as non-fatal diagnostic gaps: `events_available=false`, `event_count=0`, and the source report remains the authoritative task-failure record.
+## 失败路径
 
-## Current Structure Assessment
+失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
 
-The structure is intentionally multi-channel: trace captures runtime events, context store captures model-context observations, and policy audit captures permission decisions. This is a reasonable separation because each channel has different retention and visibility expectations.
+## 当前结构问题
 
-The risk is that all three channels use dictionary payloads in places. Runtime Flow Docs must keep the model-visible projection distinct from trace/audit payloads.
+当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
 
-## Production-Grade Target Structure
+## 维护规则
 
-Current code has no single `AuditBoundaryClassifier`.
-
-A production-grade target could add proposed classification fields:
-
-- proposed `visibility: model|trace|audit|artifact|storage`;
-- proposed `redaction_policy_id`;
-- proposed `retention_class`;
-- proposed `model_projection_allowed`;
-- proposed `external_export_allowed`.
-
-These are proposed only. Current code uses redactors, trace models, context rendering, and audit writers separately.
-
-## Harness Usage Example
-
-A tool call is denied by policy. `PolicyEngine` emits policy trace and writes audit. `ToolExecutor` returns a failure `ToolResult` with an error code. `ToolProtocolEngine` records protocol trace and appends a bounded tool result to context. The next model turn sees the failure code in a tool message, while the full policy request, resource details, audit row, and trace ids remain internal.
-
-## Maintenance Rules
-
-Update this document when changing:
-
-- `TraceEvent`, `TraceArtifact`, trace event types, or trace store schema;
-- `TraceRecorder.emit()`, `record()`, or artifact writing;
-- `ObservationStore.record_event()` or `save_observation()`;
-- policy audit serialization or redaction;
-- review trace event payloads;
-- planner diff/review observation fields;
-- `FailureCaseReplayRunner._trace_summary()` or fields copied from trace into failure replay artifacts;
-- `FailureCaseReplayRunner.write()` metadata that classifies failure replay artifacts;
-- `TargetedFailureReplayRunner` fields copied from trace into targeted replay artifacts;
-- any decision to render trace/audit data into model context.
-
-## Verification
-
-- `python scripts/verify_runtime_docs.py`
-- `python -m pytest tests/test_observability_models.py tests/test_trace_store.py tests/test_trace_artifacts.py tests/test_trace_timeline_summary.py tests/test_policy_audit.py tests/test_observability_integration.py tests/review --basetemp work/pytest-tmp`
-
-## Last Verified Against
-
-Last verified against commit `5f2202bd8cfcc2a4e4a66c025891550e52f3556e` on 2026-06-25.
+修改本模块相关类、字段、函数、调用链、CLI、schema、manifest、trace event、report schema 或 evaluation result 时，必须同步更新本文件并运行 `python scripts/verify_runtime_docs.py`。展示真实对象时必须列完整字段，不允许只列子集，不允许新增仅服务文档说明的运行时字段。
