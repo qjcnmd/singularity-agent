@@ -10,8 +10,16 @@ Source paths:
 - src/singularity/planner/semantic_producers.py
 - src/singularity/planner/context.py
 - src/singularity/kernel/graph.py
-- src/singularity/failure_analysis.py
-- src/singularity/verification/failure_analysis.py
+- src/singularity/failure_analysis/__init__.py
+- src/singularity/failure_analysis/request.py
+- src/singularity/failure_analysis/result.py
+- src/singularity/failure_analysis/analyzer.py
+- src/singularity/repair/contract.py
+- src/singularity/repair/plan.py
+- src/singularity/repair/planner.py
+- src/singularity/repair/signal.py
+- src/singularity/verification/contract.py
+- src/singularity/verification/satisfaction.py
 - src/singularity/planner/final_reviewer.py
 - src/singularity/run_controller.py
 
@@ -42,6 +50,11 @@ Symbols:
 - RepairContract
 - RepairPlan
 - RepairReplanSignal
+- VerificationContract
+- VerificationStep
+- ContractSatisfaction
+- StepEvidence
+- Planner.assess_verification_contract_satisfaction
 - FailureAnalyzer
 - FailureAnalyzer.analyze
 - FailureAnalyzer._model_request
@@ -73,6 +86,17 @@ Symbols:
 - EvidenceLedger.query_evidence
 - EvidenceLedger.evidence_for_criterion
 
+Field checks:
+- FailureAnalysisRequest: request_id, run_id, session_id, task_id, phase_id, workspace_root, failure_source, failure_summary, failure_sources, context_references, recent_tail, verification_log_refs, changed_files, evidence_refs, metadata, risk_points, repair_policy, verification_strategies
+- FailureAnalysisResult: analysis_id, request_id, root_cause, failure_category, affected_files, evidence_refs, repair_strategy, next_actions, verification_plan, confidence, needs_user_input, blocked_reason, raw_response_ref, verification_contract
+- RepairContract: contract_id, analysis_id, failure_category, target_files, evidence_refs, action_candidates, verification_plan, confidence, allowed_tool_names, needs_user_input, blocked_reason, validation_errors, verification_contract
+- RepairPlan: plan_id, analysis_id, strategy, summary, action_candidates, next_actions, verification_plan, evidence_refs, confidence, needs_user_input, blocked_reason, repair_contract, verification_contract
+- RepairReplanSignal: signal_id, repair_plan_id, analysis_id, contract_id, failure_fingerprint, failure_category, target_files, action_candidates, verification_plan, confidence, needs_user_input, blocked_reason, repair_contract, error_code, verification_failed, verification_contract
+- VerificationContract: contract_id, steps, status, validation_errors
+- VerificationStep: step_id, command, kind, required
+- ContractSatisfaction: contract_id, satisfied, completed_steps, failed_steps, skipped_steps, reason, step_evidence
+- StepEvidence: step_id, check_id, command_id, status, artifact_ref
+
 ## Module Boundary
 
 This module owns task phase state, planner evidence, replan decisions, failure analysis, repair contract creation, and terminal outcome selection.
@@ -87,8 +111,16 @@ It is not responsible for executing tools, parsing provider tool-call protocol, 
 - `src/singularity/planner/engine.py`: planner state, evidence, tool authorization, replan, finalization, model context rendering.
 - `src/singularity/planner/replanner.py`: rule-based replan decision.
 - `src/singularity/planner/models.py`: task state, evidence, budget, replan decision, final report.
-- `src/singularity/failure_analysis.py`: `FailureAnalysisRequest`, `FailureAnalyzer`, `RepairPlanner`, repair contracts, replan signals.
-- `src/singularity/verification/failure_analysis.py`: verification-focused failure analyzer and repair planner helper.
+- `src/singularity/failure_analysis/request.py`: `FailureAnalysisRequest` and model payload construction.
+- `src/singularity/failure_analysis/result.py`: `FailureAnalysisResult` model payload validation and serialization.
+- `src/singularity/failure_analysis/analyzer.py`: `FailureAnalyzer` model call boundary.
+- `src/singularity/failure_analysis/__init__.py`: compatibility re-export for the old `singularity.failure_analysis` import path.
+- `src/singularity/repair/contract.py`: `RepairContract`, fail-closed categories, and contract validation.
+- `src/singularity/repair/plan.py`: `RepairPlan`.
+- `src/singularity/repair/planner.py`: `RepairPlanner`.
+- `src/singularity/repair/signal.py`: `RepairReplanSignal`.
+- `src/singularity/verification/contract.py`: `VerificationContract` and `VerificationStep`.
+- `src/singularity/verification/satisfaction.py`: `ContractSatisfaction`, `StepEvidence`, and `assess_verification_contract_satisfaction()`.
 - `src/singularity/run_controller.py`: loop reducer and execution outcome application.
 - `src/singularity/planner/semantic_objects.py`: frozen structured objects (`RiskPoint`/`VerificationStrategy`/`RepairPolicy`/`SemanticPlan`/`PlannerDecision`) carrying risk/verification/repair-policy metadata with `producer_source` origin tagging.
 - `src/singularity/planner/semantic_producers.py`: model-driven producers (`TaskContractProducer`/`SemanticPlanProducer`/`PlannerDecisionProducer`) + `PlannerProducerBundle`; always try model first, fall back to rules on failure.
@@ -116,7 +148,7 @@ It is not responsible for executing tools, parsing provider tool-call protocol, 
 16. `AgentGraphBuilder._wire_planner()` constructs `PlannerProducerBundle.with_rule_fallback(model_runner=..., rule_builder=planner.contract_builder, rule_planner=planner.semantic_planner, rule_replanner=planner.replanner, trace=planner.trace)` and calls `planner.attach_producers(bundle)`. `Planner.step()` relies on the `TaskState` produced by `start_task` through the producers (carrying `risk_points`/`verification_strategies`/`repair_policy`).
 17. `Planner.finalize()` now runs `self._run_final_reviewer_assessment()` before marking `COMPLETED`. This builds a `SemanticPlan` from `TaskState.risk_points`/`verification_strategies`/`repair_policy` (or `plan=None` when all three are empty, triggering the fallback coarse bucket-non-empty check) and calls `FinalReviewer.assess(contract=..., plan=..., evidence=..., state=..., context_payload=self._producer_context())`.
 18. `FinalReviewer.assess()` walks every `TaskContract.acceptance_criteria` entry, checks each `criterion.evidence` key against `EvidenceLedger.query_evidence()` (bucket non-empty), requires `state.final_assessment.status in {ready, ready_with_warnings}` for `verification_results` evidence, binds `RiskPoint`s via `acceptance_criterion_id` and flags `risk_remaining` when `evidence.command_results` is empty. When `model_runner` is provided, calls `ModelPurpose.FINAL_REVIEW` (json_mode, tools=[]) to *confirm* criteria — the model can flip `satisfied` False→True only when `failed_evidence` is empty and `evidence_refs` are attached; it cannot downgrade True→False. If `overall_satisfied=False`, `Planner.finalize()` sets `TaskStatus.BLOCKED` and returns early.
-19. During live benchmark tasks, `Planner.apply_benchmark_constraints()` stores expected file changes. `Planner.update_from_mutation()` and `_auto_advance_before_step()` keep the task in `applying_changes` until all expected files are present in mutation evidence.
+19. During evaluation benchmark tasks, `Planner.apply_benchmark_constraints()` stores expected file changes. `Planner.update_from_mutation()` and `_auto_advance_before_step()` keep the task in `applying_changes` until all expected files are present in mutation evidence.
 20. In `repairing_failures`, `Planner._repair_contract_execution_block()` fails closed when no authoritative `RepairContract` exists, or when the contract is blocked, invalid, low-confidence, or requires user input. `authorize_tool_call()`, `decide_tool_exposure()`, and `filtered_tools()` allow read/evidence tools but block mutation and verification execution until the FailureAnalyzer/RepairPlanner path records a contract.
 
 ## Runtime Objects Passed
@@ -146,7 +178,7 @@ The main task model sees planner state only through rendered context:
 - `planner.planner_context_message()` included by `ModelTurnRequestBuilder`;
 - context items created from planner state, failures, policy observations, and verification evidence;
 - tool result messages and bounded failure observations.
-- benchmark expected file changes, allowed scope, risk tags, completion standard, and model-visible verification command when live eval constraints are active.
+- benchmark expected file changes, allowed scope, risk tags, completion standard, and model-visible verification command when evaluation constraints are active.
 
 The failure-analysis model call sees `FailureAnalysisRequest.to_model_payload()` fields:
 
@@ -186,7 +218,7 @@ Internal-only planning data includes:
 
 - Normal phases include `understanding_task`, `inspecting_workspace`, `planning_changes`, `applying_changes`, `running_verification`, `repairing_failures`, and `finalizing`.
 - `Planner.update_from_tool_result()` can trigger `replan()` on failed tool results.
-- `Replanner.decide()` asks the user for blocked categories, missing information, low confidence, permission/policy/sandbox categories, and repair-budget exhaustion.
+- `Replanner.decide()` asks the user for blocked categories, missing information, low confidence, policy/sandbox/approval/action-not-allowed categories, and repair-budget exhaustion. `RepairContract` validation treats those categories as fail-closed blockers rather than repairable edit categories.
 - Patch context, snapshot mismatch, and external-change failures route to fresh reads.
 - Verification and semantic failures route to repair.
 - Repeated failure fingerprints without new evidence are suppressed.
@@ -199,7 +231,7 @@ Internal-only planning data includes:
 - Benchmark expected-file gate: when `benchmark_constraints.expected_file_changes` is present, mutation evidence must include every normalized expected path before the planner can auto-advance from `applying_changes` to `running_verification`. Missing expected files appear in completion assessment as `benchmark_expected_file_changes`, preventing final completion even if a final report is produced.
 - Repair-contract execution gate: if the phase is `repairing_failures` and `_active_repair_contract()` cannot find a contract from the authoritative FailureAnalyzer/RepairPlanner path, mutation tools, edit-plan tools, and executable verification tools are denied with `repair_contract_missing`. Read/evidence tools such as `read_file`, `search_text`, `inspect_diff`, and `get_verification_result` remain available so the agent can gather evidence without bypassing repair analysis.
 - Repair-phase completion gate: when the model attempts to finalize while `Planner.assess_completion()` reports `verification_contract_satisfaction` unmet in `repairing_failures`, `AgentLoop._repair_phase_completion_blocked_outcome()` returns a terminal blocked outcome with `repair_budget_exceeded`. This prevents an unrepaired failure from silently consuming turns until `max_turns_exceeded`.
-- Benchmark `verification_command` augmentation: when `apply_benchmark_constraints` declares a model-visible verification command (e.g. from a live-eval manifest), two things happen. First, `_apply_benchmark_verification_requirement` overrides the rules-based `TaskContract.verification_requirements` command field with the parsed benchmark argv, so `contract_smoke_commands()` returns the manifest-declared command (e.g. `["python", "-m", "pytest", ...]`) instead of the rules-synthesized `["python", <path>]`. This override is flushed in **both** `apply_benchmark_constraints` (when `planner.state` already exists) and `Planner.start_task` (when constraints were applied before state creation — the live-eval call order: `evaluation/live.py` calls `apply_benchmark_constraints` before `KernelBootstrap.boot` → `AgentLoop.run` → `RunController.start` → `planner.start_task`). Second, `_active_repair_verification_contract` augments the active repair contract with that command as an additional `VerificationStep` (`step_id="vstep_benchmark"`, `required=False`). This ensures the gate at `authorize_action` (which checks `smoke_commands` against the active repair `VerificationContract` using exact prefix argv matching) does not deny the canonical manifest-declared public verification command. The benchmark step is an allowance, not a requirement — it does not affect `assess_verification_contract_satisfaction`. Empty contracts (no active repair) already allow all commands and are not augmented. Live-eval hidden verification commands and `verification_prepare_commands` stay evaluator-internal; `evaluation/live.py` passes only `_model_visible_verification_command(task)` into planner benchmark constraints.
+- Benchmark `verification_command` augmentation: when `apply_benchmark_constraints` declares a model-visible verification command from an evaluation task set, two things happen. First, `_apply_benchmark_verification_requirement` overrides the rules-based `TaskContract.verification_requirements` command field with the parsed benchmark argv, so `contract_smoke_commands()` returns the manifest-declared command (e.g. `["python", "-m", "pytest", ...]`) instead of the rules-synthesized `["python", <path>]`. This override is flushed in **both** `apply_benchmark_constraints` (when `planner.state` already exists) and `Planner.start_task` (when constraints were applied before state creation: `evaluation/runner.py` calls `apply_benchmark_constraints` before `KernelBootstrap.boot` -> `AgentLoop.run` -> `RunController.start` -> `planner.start_task`). Second, `_active_repair_verification_contract` augments the active repair contract with that command as an additional `VerificationStep` (`step_id="vstep_benchmark"`, `required=False`). This ensures the gate at `authorize_action` (which checks `smoke_commands` against the active repair `VerificationContract` using exact prefix argv matching) does not deny the canonical manifest-declared public verification command. The benchmark step is an allowance, not a requirement; it does not affect `assess_verification_contract_satisfaction`. Empty contracts (no active repair) already allow all commands and are not augmented. Hidden verification commands and `verification_prepare_commands` stay evaluator-internal; `evaluation/runner.py` passes only `_model_visible_verification_command(task)` into planner benchmark constraints.
 
 ## Current Structure Assessment
 
@@ -244,7 +276,7 @@ Update this document when changing:
 - `PlannerProducerBundle`, producers, `semantic_objects.py`, `semantic_producers.py`, `_producer_context()`, `attach_producers()`, or `AgentGraphBuilder._wire_planner` producer injection.
 - `FinalReviewer.assess()`, `_run_final_reviewer_assessment()`, `assess_verification_contract_satisfaction()` fail-closed branches, `EvidenceLedger.query_evidence()`/`evidence_for_criterion()`, or `CompletionAssessment`/`CriterionAssessment` fields.
 - `_active_repair_verification_contract()`, `_augment_with_benchmark_verification_command()`, `_apply_benchmark_verification_requirement`, the `verification_command` field in `apply_benchmark_constraints`/benchmark constraints, or the `start_task` flush site that applies the benchmark `verification_command` to `verification_requirements` when constraints were set before state creation.
-- live-eval model-visible benchmark command routing from `evaluation/live.py` into `Planner.apply_benchmark_constraints()`, especially public/hidden verification boundaries.
+- evaluation model-visible benchmark command routing from `evaluation/runner.py` into `Planner.apply_benchmark_constraints()`, especially public/hidden verification boundaries.
 
 ## Verification
 

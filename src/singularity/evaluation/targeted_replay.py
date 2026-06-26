@@ -34,7 +34,6 @@ class TargetedFailureReplayResult:
     status: str
     completed: bool
     entered_agent_loop: bool
-    agent_loop_ref: str
     failure_trigger: str
     failure_analysis_request_count: int
     failure_analysis_result_count: int
@@ -60,7 +59,6 @@ class TargetedFailureReplayResult:
             "status": self.status,
             "completed": self.completed,
             "entered_agent_loop": self.entered_agent_loop,
-            "agent_loop_ref": self.agent_loop_ref,
             "failure_trigger": self.failure_trigger,
             "failure_analysis_request_count": self.failure_analysis_request_count,
             "failure_analysis_result_count": self.failure_analysis_result_count,
@@ -246,7 +244,6 @@ class TargetedFailureReplayRunner:
             status=agent_result.status.value,
             completed=agent_result.status == AgentLoopStatus.COMPLETED,
             entered_agent_loop=bool(provider.calls),
-            agent_loop_ref="AgentLoop.run",
             failure_trigger=_failure_trigger(planner),
             failure_analysis_request_count=_trace_event_count(trace.path, "failure_analysis_requested"),
             failure_analysis_result_count=_failure_analyzer_result_count(planner.evidence.failure_analyses),
@@ -560,7 +557,6 @@ def _targeted_replay_markdown(result: TargetedFailureReplayResult) -> str:
             f"- status: `{payload['status']}`",
             f"- completed: `{payload['completed']}`",
             f"- entered_agent_loop: `{payload['entered_agent_loop']}`",
-            f"- agent_loop_ref: `{payload['agent_loop_ref']}`",
             f"- failure_trigger: `{payload['failure_trigger']}`",
             f"- repairing_failures_seen: `{payload['repairing_failures_seen']}`",
             f"- failure_analysis_request_count: {payload['failure_analysis_request_count']}",

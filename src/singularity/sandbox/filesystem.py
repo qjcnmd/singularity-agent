@@ -136,16 +136,20 @@ class SandboxFilesystemManager:
 
     @staticmethod
     def _make_readonly(root: Path) -> None:
-        # Best-effort read-only enforcement for the staged workspace tree.
         # Clearing the write bits sets the read-only attribute on Windows
-        # (preventing file modification) and removes write permission on
-        # POSIX. Directory-level creation is a best-effort signal on Windows.
+        # and removes write permission on POSIX. Failure means the requested
+        # read-only capability was not enforced and must fail closed.
         write_bits = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+        failures: list[str] = []
         for path in (root, *root.rglob("*")):
             try:
                 os.chmod(path, path.stat().st_mode & ~write_bits)
             except OSError:
-                pass
+                failures.append(str(path))
+        if failures:
+            preview = ", ".join(failures[:5])
+            suffix = "" if len(failures) <= 5 else f", +{len(failures) - 5} more"
+            raise OSError(f"readonly sandbox capability failed for: {preview}{suffix}")
 
     def _copy_workspace(
         self,

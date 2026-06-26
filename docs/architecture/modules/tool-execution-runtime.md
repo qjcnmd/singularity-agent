@@ -13,6 +13,7 @@ Source paths:
 - src/singularity/sandbox/manager.py
 - src/singularity/sandbox/artifacts.py
 - src/singularity/sandbox/exceptions.py
+- src/singularity/sandbox/filesystem.py
 - src/singularity/sandbox/models.py
 
 Symbols:
@@ -35,6 +36,7 @@ Symbols:
 - ToolExecutor
 - ToolExecutor.execute_tool_call
 - ToolExecutor.execute_request
+- ToolExecutor._safe_update_planner
 - ToolExecutionRequest
 - ToolResult
 - Planner
@@ -46,6 +48,8 @@ Symbols:
 - SandboxArtifactCollector
 - SandboxArtifactCollector.collect
 - SandboxCapabilityError
+- SandboxFilesystemManager
+- SandboxFilesystemManager._make_readonly
 - SandboxCapabilities
 
 Field checks:
@@ -72,13 +76,14 @@ It is not responsible for exposing schemas to the model, building the model requ
 - `src/singularity/tool_protocol/models.py`: `ToolCallEnvelope`, `ToolProtocolResultEnvelope`, `ToolObservationView`, `ToolProtocolTurnResult`.
 - `src/singularity/tool_protocol/state.py`: `ToolProtocolStateStore` persists batches, call records, phase transitions, result binding, and appended context-message ids.
 - `ToolProtocolEngine` creates its default `ToolProtocolStateStore` under the active `TraceStore.run_dir` when a structured trace store is available. For legacy trace recorders with only `trace.path` and `trace.run_id`, it derives a per-run directory next to the trace path and stores `tool_protocol.sqlite3` there. Without trace data, it falls back to `<project_root>/.singularity/runs/default/tool_protocol.sqlite3`.
-- `src/singularity/tools/executor.py`: `ToolExecutor.execute_tool_call()` and `execute_request()`.
+- `src/singularity/tools/executor.py`: `ToolExecutor.execute_tool_call()`, `execute_request()`, and planner evidence update fail-closed handling.
 - `src/singularity/tools/models.py`: `ToolExecutionRequest`, `ToolResult`, `ToolError`, `ToolSpec`.
 - `src/singularity/planner/engine.py`: `Planner.update_from_tool_result()`.
 - `src/singularity/context/manager.py`: `ContextManager.add_tool_protocol_result()`.
 - `src/singularity/sandbox/manager.py`: `SandboxManager.ensure_capabilities()` enforces capability fail-closed checks before sandboxed execution.
 - `src/singularity/sandbox/artifacts.py`: `SandboxArtifactCollector.collect()` captures stdout/stderr logs and workspace file artifacts with redaction.
 - `src/singularity/sandbox/exceptions.py`: `SandboxCapabilityError` raised when a backend cannot enforce a required isolation capability.
+- `src/singularity/sandbox/filesystem.py`: `SandboxFilesystemManager` prepares sandbox workspaces and fails closed when read-only chmod enforcement fails.
 - `src/singularity/sandbox/models.py`: `SandboxCapabilities` (with `readonly_mount`, `network_isolation`), `SandboxNetworkMode.DENIED`, `SandboxFilesystemMode.READ_ONLY_WORKSPACE`.
 
 ## Runtime Call Chain
@@ -95,7 +100,7 @@ It is not responsible for exposing schemas to the model, building the model requ
 10. `ToolProtocolResultBuilder.build()` creates `ToolProtocolResultEnvelope`.
 11. `ToolProtocolStateStore` binds the result and transitions call phase.
 12. `ToolProtocolEngine.append_results_to_context()` calls `ContextManager.add_tool_protocol_result()`.
-13. If `AgentGraphBuilder._wire_planner()` has bound `planner` onto the shared `ToolExecutor`, `ToolExecutor._safe_update_planner()` or `_update_planner()` calls `Planner.update_from_tool_result()`.
+13. If `AgentGraphBuilder._wire_planner()` has bound `planner` onto the shared `ToolExecutor`, `ToolExecutor._safe_update_planner()` or `_update_planner()` calls `Planner.update_from_tool_result()`. Evidence update failures emit an error trace and fail closed instead of silently treating the tool dispatch as successful.
 14. `AgentLoop` reduces the `ToolProtocolTurnResult` and either continues, finalizes, blocks, or triggers failure analysis.
 
 ## Runtime Objects Passed
@@ -147,6 +152,7 @@ Internal-only execution data includes:
 - Invalid write/shell/delegated backend boundaries return `invalid_operation`.
 - Dry-run can return `dry_run_blocked`.
 - Policy denial, approval requirement, sandbox requirement, and planner denial return failure `ToolResult` values.
+- Planner evidence update failure in `ToolExecutor._safe_update_planner()` emits `TOOL_DISPATCH_FAILED` with error severity and raises `RuntimeError("planner observation update failed")`; the runtime does not treat the tool call as successfully recorded.
 - Handler exceptions return `internal_error` unless cancellation is raised.
 - Protocol validation errors create synthetic `ToolProtocolResultEnvelope` values.
 - `ToolProtocolTurnResult` can be processed, pending approval, rejected, invalid assistant, or no tool calls.
@@ -157,6 +163,7 @@ Sandboxed execution is governed by `SandboxManager.ensure_capabilities()`, which
 
 - Network DENIED fail-closed: when `request.profile.network.mode == SandboxNetworkMode.DENIED` and the selected backend reports `capabilities.network_isolation` is False, `ensure_capabilities()` raises `SandboxCapabilityError("Backend ... cannot enforce denied network mode; network access is not isolated.")`. The previous behavior of appending a violation and continuing is no longer used; a denied network profile that cannot be enforced fails closed.
 - READ_ONLY_WORKSPACE capability check: when `request.profile.filesystem.mode == SandboxFilesystemMode.READ_ONLY_WORKSPACE` and `capabilities.readonly_mount` is False, `ensure_capabilities()` raises `SandboxCapabilityError("Backend cannot enforce read-only workspace; write operations would not be blocked.")`.
+- READ_ONLY_WORKSPACE chmod enforcement: `SandboxFilesystemManager._make_readonly()` raises `OSError("readonly sandbox capability failed...")` if any filesystem chmod operation needed to enforce read-only mode fails. The sandbox must fail closed rather than silently preparing a writable workspace.
 - The same fail-closed raise applies to required hard network isolation (`require_hard_isolation` without `network_isolation`), memory limits (`max_memory_mb` without `memory_limit`), and process limits (`max_processes` without `process_limit`).
 
 ### Sandbox Artifact Redaction
@@ -240,11 +247,11 @@ The model calls `read_file` with a JSON argument. `ToolProtocolEngine` validates
 Update this document when changing:
 
 - `ToolExecutionRequest`, `ToolResult`, `ToolProtocolResultEnvelope`, or `ToolObservationView`;
-- `ToolExecutor.execute_request()` admission, cache, replay, handler, output limit, or trace behavior;
+- `ToolExecutor.execute_request()` admission, cache, replay, handler, output limit, trace behavior, or planner update failure handling;
 - `ToolProtocolEngine` validation, scheduling, replay, result binding, or context append behavior;
 - `Planner.update_from_tool_result()`;
 - `ContextManager.add_tool_protocol_result()` redaction behavior or sensitivity handling;
-- `SandboxManager.ensure_capabilities()` fail-closed checks, `SandboxCapabilities` fields, or `SandboxNetworkMode`/`SandboxFilesystemMode` enforcement;
+- `SandboxManager.ensure_capabilities()` fail-closed checks, `SandboxFilesystemManager._make_readonly()`, `SandboxCapabilities` fields, or `SandboxNetworkMode`/`SandboxFilesystemMode` enforcement;
 - `SandboxArtifactCollector` artifact capture or redaction behavior.
 
 ## Verification

@@ -11,7 +11,7 @@ from singularity.command.policy import is_secret_env_name
 
 
 SECRET_VALUE_RE = re.compile(
-    r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD)|DATABASE_URL|AWS_[A-Z0-9_]+|GITHUB_TOKEN|OPENAI_API_KEY)=([^\s]+)"
+    r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|DSN|CONN_STR|CONN_STRING|CONNECTION_STRING)|DATABASE_URL|AWS_[A-Z0-9_]+|GITHUB_TOKEN|OPENAI_API_KEY)=([^\s]+)"
 )
 
 
@@ -117,10 +117,13 @@ class OutputCollector:
 
     def snapshot(self) -> OutputSnapshot:
         with self._lock:
+            stdout = self.redactor.redact(self._stdout)
+            stderr = self.redactor.redact(self._stderr)
+            combined = self.redactor.redact(self._combined)
             return OutputSnapshot(
-                stdout_preview=self._stdout,
-                stderr_preview=self._stderr,
-                combined_output_preview=self._combined,
+                stdout_preview=stdout,
+                stderr_preview=stderr,
+                combined_output_preview=combined,
                 stdout_bytes=self._stdout_bytes,
                 stderr_bytes=self._stderr_bytes,
                 output_truncated=self._truncated,
@@ -139,6 +142,9 @@ class OutputCollector:
                 "stderr": len(self._stderr),
                 "combined": len(self._combined),
             }
+            stdout = self.redactor.redact(stdout)
+            stderr = self.redactor.redact(stderr)
+            combined = self.redactor.redact(combined)
             return OutputSnapshot(
                 stdout_preview=stdout,
                 stderr_preview=stderr,

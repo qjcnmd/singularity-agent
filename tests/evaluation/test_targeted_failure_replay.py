@@ -13,7 +13,7 @@ def test_targeted_failure_replay_runner_activates_repair_chain_and_completes(tmp
     payload = result.to_dict()
 
     assert payload["entered_agent_loop"] is True
-    assert payload["agent_loop_ref"] == "AgentLoop.run"
+    assert "agent_loop_ref" not in payload
     assert payload["status"] == "completed"
     assert payload["completed"] is True
     assert payload["failure_trigger"] == "verification_failed"
@@ -84,4 +84,4 @@ def test_targeted_failure_replay_runner_writes_bounded_json_and_markdown_reports
     assert len(payload["phase_history"]) <= 20
     assert len(payload["planner_status_history"]) <= 20
     assert "Targeted Failure Replay" in markdown
-    assert "AgentLoop.run" in markdown
+    assert "agent_loop_ref" not in markdown

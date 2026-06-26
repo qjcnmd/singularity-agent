@@ -698,7 +698,7 @@ def test_offline_golden_suite_does_not_scan_workspace_for_diff_outcomes(
 
 
 def test_patch_payload_skips_env_file_content(tmp_path: Path) -> None:
-    from singularity.evaluation.live import _patch_payload
+    from singularity.evaluation.runner import _patch_payload
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -720,7 +720,7 @@ def test_patch_payload_skips_env_file_content(tmp_path: Path) -> None:
 
 
 def test_patch_payload_skips_pem_and_key_files(tmp_path: Path) -> None:
-    from singularity.evaluation.live import _patch_payload
+    from singularity.evaluation.runner import _patch_payload
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -745,7 +745,7 @@ def test_patch_payload_skips_pem_and_key_files(tmp_path: Path) -> None:
 
 
 def test_patch_payload_redacts_secrets_in_non_sensitive_files(tmp_path: Path) -> None:
-    from singularity.evaluation.live import _patch_payload
+    from singularity.evaluation.runner import _patch_payload
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -761,4 +761,5 @@ def test_patch_payload_redacts_secrets_in_non_sensitive_files(tmp_path: Path) ->
     assert "sk-leaked" not in diff_text
     assert "ghp_abcdefghijklmnop" not in diff_text
     assert "settings.py" in payload["changed_files"]
+
 

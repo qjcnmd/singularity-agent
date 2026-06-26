@@ -66,6 +66,27 @@ def test_cwd_outside_workspace_fails(tmp_path: Path) -> None:
         )
 
 
+def test_readonly_workspace_chmod_failure_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("readonly\n", encoding="utf-8")
+    manager = SandboxFilesystemManager()
+
+    def fail_chmod(*_args, **_kwargs):
+        raise OSError("chmod denied")
+
+    monkeypatch.setattr("singularity.sandbox.filesystem.os.chmod", fail_chmod)
+
+    with pytest.raises(OSError, match="readonly sandbox capability failed"):
+        manager.prepare_filesystem(
+            sandbox_id="sandbox_readonly_failed",
+            policy=SandboxFilesystemPolicy(
+                mode=SandboxFilesystemMode.READ_ONLY_WORKSPACE,
+                workspace_root=tmp_path,
+                sandbox_root=tmp_path / "work" / "sandboxes" / "sandbox_readonly_failed",
+            ),
+            cwd=tmp_path,
+        )
+
+
 def test_change_detection_tracks_created_modified_deleted_and_cleanup(tmp_path: Path) -> None:
     (tmp_path / "keep.txt").write_text("before", encoding="utf-8")
     (tmp_path / "delete.txt").write_text("remove", encoding="utf-8")

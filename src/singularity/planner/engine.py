@@ -975,9 +975,15 @@ class Planner:
                 changed_files=self._changed_files(),
             )
         self._persist()
+        root_cause = analysis_payload.get("root_cause")
+        root_cause_reason = (
+            root_cause.get("description")
+            if isinstance(root_cause, dict)
+            else analysis_payload.get("root_cause_text")
+        )
         self._record_event(
             decision="failure_analysis",
-            reason=str(analysis_payload.get("root_cause_text") or "Failure analysis recorded."),
+            reason=str(root_cause_reason or "Failure analysis recorded."),
             evidence_refs=list(analysis_payload.get("evidence_refs") or []),
             replan_decision=replan_payload,
             extra={

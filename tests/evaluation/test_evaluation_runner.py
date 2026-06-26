@@ -5,15 +5,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from singularity.evaluation.live import (
-    LIVE_RESULT_SCHEMA_VERSION,
-    LIVE_TASK_SET_SCHEMA_VERSION,
-    LiveAgentEvalRunner,
-    LiveEvalManifest,
-    LiveEvalTaskResult,
+from singularity.evaluation.runner import (
+    EVALUATION_RESULT_SCHEMA_VERSION,
+    EVALUATION_TASK_SET_SCHEMA_VERSION,
+    EvaluationRunner,
+    EvaluationTaskSet,
+    EvaluationTaskResult,
     SingularityPrivateBenchmarkAdapter,
-    load_live_eval_manifest,
-    summarize_live_results,
+    load_evaluation_task_set,
+    summarize_evaluation_results,
 )
 from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
 from singularity.evaluation.models import FAILURE_CASE_RECORD_SCHEMA_VERSION
@@ -22,18 +22,18 @@ from singularity.kernel.models import RunStatus
 from tests.agent_loop_helpers import make_agent_session
 
 
-def test_load_live_eval_manifest_example() -> None:
-    manifest = load_live_eval_manifest(Path("docs/evaluation/live-agent-minimal-tasks.json"))
+def test_load_evaluation_task_set_example() -> None:
+    manifest = load_evaluation_task_set(Path("docs/evaluation/capability-minimal-tasks.json"))
 
-    assert manifest.schema_version == LIVE_TASK_SET_SCHEMA_VERSION
+    assert manifest.schema_version == EVALUATION_TASK_SET_SCHEMA_VERSION
     assert [task.task_id for task in manifest.tasks] == [
-        "live.create_quicksort",
-        "live.modify_existing_code",
-        "live.fix_math_test",
-        "live.reject_out_of_scope_change",
-        "live.verification_contract",
-        "live.completion_rejected_repair",
-        "live.policy_blocked",
+        "benchmark.create_quicksort",
+        "benchmark.modify_existing_code",
+        "benchmark.fix_math_test",
+        "benchmark.reject_out_of_scope_change",
+        "benchmark.verification_contract",
+        "benchmark.completion_rejected_repair",
+        "benchmark.policy_blocked",
     ]
     assert manifest.tasks[0].workspace.kind == "fixture"
     assert manifest.tasks[0].allowed_paths == ["quicksort.py"]
@@ -43,8 +43,8 @@ def test_load_live_eval_manifest_example() -> None:
     assert manifest.tasks[-1].tool_policy == "read_only"
 
 
-def test_load_live_eval_regression_manifest_declares_required_task_classes() -> None:
-    manifest = load_live_eval_manifest(Path("docs/evaluation/live-agent-regression-tasks.json"))
+def test_load_evaluation_regression_manifest_declares_required_task_classes() -> None:
+    manifest = load_evaluation_task_set(Path("docs/evaluation/capability-regression-tasks.json"))
 
     assert len(manifest.tasks) == 4
     by_type = {task.task_type: task for task in manifest.tasks}
@@ -69,31 +69,31 @@ def test_load_live_eval_regression_manifest_declares_required_task_classes() -> 
 
 
 def test_load_v7_focused_smoke_manifest_remains_single_task() -> None:
-    manifest = load_live_eval_manifest(Path("docs/evaluation/live-fix-math-test-only.json"))
+    manifest = load_evaluation_task_set(Path("docs/evaluation/capability-fix-math-test-only.json"))
 
-    assert [task.task_id for task in manifest.tasks] == ["live.fix_math_test"]
+    assert [task.task_id for task in manifest.tasks] == ["benchmark.fix_math_test"]
     assert manifest.tasks[0].task_type == "v7_smoke"
     assert manifest.tasks[0].public_verification_command == manifest.tasks[0].verification_command
     assert manifest.tasks[0].hidden_verification_command == manifest.tasks[0].verification_command
 
 
-def test_live_eval_sanitized_baseline_example_is_safe_and_shape_current() -> None:
-    path = Path("docs/evaluation/live-agent-baseline-example.json")
+def test_evaluation_sanitized_baseline_example_is_safe_and_shape_current() -> None:
+    path = Path("docs/evaluation/evaluation-baseline-example.json")
     text = path.read_text(encoding="utf-8")
     payload = json.loads(text)
 
-    assert payload["schema_version"] == LIVE_RESULT_SCHEMA_VERSION
+    assert payload["schema_version"] == EVALUATION_RESULT_SCHEMA_VERSION
     assert "SINGULARITY_API_KEY" not in text
     assert "api_key" not in text.lower()
     assert "sk-" not in text
     task = payload["tasks"][0]
-    assert task["reproducible_environment"]["schema_version"] == "evaluation.live_agent_environment/v1"
-    assert task["result_extraction"]["schema_version"] == "evaluation.live_agent_result_extraction/v1"
-    assert task["task_verification_result"] == task["verification_result"]
-    assert task["repair_verification_contract"]["status"] == "not_recorded"
+    assert task["reproducible_environment"]["schema_version"] == "evaluation.environment/v1"
     for field in [
+        "agent_completed",
+        "evaluation_passed",
         "completed",
         "patch_applicable",
+        "allowed_scope_passed",
         "public_verification_passed",
         "hidden_verification_passed",
         "contract_satisfaction",
@@ -101,15 +101,24 @@ def test_live_eval_sanitized_baseline_example_is_safe_and_shape_current() -> Non
         "repair_attempt_count",
         "repair_execution_count",
         "turn_count",
-        "tool_call_count",
+        "tool_calls",
         "blocked_reason",
         "failure_category",
         "final_report_status",
     ]:
         assert field in task
+    for removed in [
+        "tool_call_count",
+        "failure_repair_count",
+        "task_verification_result",
+        "repair_verification_contract",
+        "result_extraction",
+        "agent_loop_ref",
+    ]:
+        assert removed not in task
 
 
-def test_private_adapter_converts_benchmark_tasks_to_live_manifest(tmp_path: Path) -> None:
+def test_private_adapter_converts_benchmark_tasks_to_evaluation_task_set(tmp_path: Path) -> None:
     task_set = tmp_path / "private.json"
     task_set.write_text(
         json.dumps(
@@ -170,7 +179,7 @@ def test_private_adapter_converts_benchmark_tasks_to_live_manifest(tmp_path: Pat
 
     manifest = SingularityPrivateBenchmarkAdapter().load(task_set)
 
-    assert manifest.schema_version == LIVE_TASK_SET_SCHEMA_VERSION
+    assert manifest.schema_version == EVALUATION_TASK_SET_SCHEMA_VERSION
     assert manifest.tasks[0].task_id == "private.fix_bug"
     assert manifest.tasks[0].workspace.kind == "fixture"
     assert manifest.tasks[0].allowed_paths == ["math_utils.py"]
@@ -185,8 +194,8 @@ def test_private_adapter_converts_benchmark_tasks_to_live_manifest(tmp_path: Pat
     assert manifest.tasks[1].workspace.start_commit == "abc123"
 
 
-def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
-    first = LiveEvalTaskResult(
+def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) -> None:
+    first = EvaluationTaskResult(
         task_id="one",
         success=True,
         tests_passed=True,
@@ -203,9 +212,10 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         trace=str(tmp_path / "trace"),
         status="success",
         turn_count=2,
+        agent_completed=True,
         final_report_status="completed",
     )
-    second = LiveEvalTaskResult(
+    second = EvaluationTaskResult(
         task_id="two",
         success=False,
         tests_passed=True,
@@ -222,9 +232,10 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         trace=str(tmp_path / "trace2"),
         status="verification_failed",
         turn_count=3,
+        agent_completed=True,
         final_report_status="completed",
     )
-    blocked = LiveEvalTaskResult(
+    blocked = EvaluationTaskResult(
         task_id="blocked",
         success=False,
         tests_passed=False,
@@ -243,7 +254,7 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         turn_count=0,
     )
 
-    summary = summarize_live_results([first, second, blocked])
+    summary = summarize_evaluation_results([first, second, blocked])
 
     assert summary == {
         "task_count": 3,
@@ -251,7 +262,7 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         "infrastructure_blocked_count": 1,
         "score_status": "scored",
         "success_count": 1,
-        "task_completion_rate": 0.5,
+        "task_completion_rate": 1.0,
         "tests_passed_count": 2,
         "test_pass_rate": 1.0,
         "prompt_tokens": 200,
@@ -264,7 +275,8 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         "average_turns": 2.5,
         "average_tool_calls": 2.5,
         "completed_count": 2,
-        "failure_repair_count": 0,
+        "agent_completed_count": 2,
+        "evaluation_passed_count": 1,
         "repair_attempt_count": 0,
         "repair_execution_count": 0,
         "policy_blocks": 0,
@@ -273,8 +285,8 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
     }
 
 
-def test_summarize_live_results_does_not_count_kernel_finalized_as_completed(tmp_path: Path) -> None:
-    finalized_only = LiveEvalTaskResult(
+def test_summarize_evaluation_results_does_not_count_kernel_finalized_as_completed(tmp_path: Path) -> None:
+    finalized_only = EvaluationTaskResult(
         task_id="kernel-finalized-blocked",
         success=False,
         tests_passed=False,
@@ -293,7 +305,7 @@ def test_summarize_live_results_does_not_count_kernel_finalized_as_completed(tmp
         final_report_status="finalized",
         completed=False,
     )
-    false_completed = LiveEvalTaskResult(
+    false_completed = EvaluationTaskResult(
         task_id="completed-but-verification-failed",
         success=False,
         tests_passed=False,
@@ -313,17 +325,17 @@ def test_summarize_live_results_does_not_count_kernel_finalized_as_completed(tmp
         completed=True,
     )
 
-    summary = summarize_live_results([finalized_only, false_completed])
+    summary = summarize_evaluation_results([finalized_only, false_completed])
 
     assert summary["completed_count"] == 1
     assert summary["miscompletion_count"] == 1
     assert summary["failure_reasons"] == {"blocked": 1, "verification_failed": 1}
 
 
-def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) -> None:
+def test_evaluation_runner_writes_result_without_provider(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
     manifest_payload = {
-        "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+        "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
         "tasks": [
             {
                 "task_id": "fake.write_file",
@@ -336,7 +348,7 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
             }
         ],
     }
-    manifest = LiveEvalManifest.from_dict(manifest_payload, base_dir=tmp_path)
+    manifest = EvaluationTaskSet.from_dict(manifest_payload, base_dir=tmp_path)
 
     class FakeTraceStore:
         run_dir = tmp_path / "trace"
@@ -411,13 +423,13 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
         def boot(self, _goal: str) -> FakeKernel:
             return FakeKernel(self.project_root)
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="run_fake",
         bootstrap_cls=FakeBootstrap,
     ).run(manifest)
 
-    assert result["schema_version"] == LIVE_RESULT_SCHEMA_VERSION
+    assert result["schema_version"] == EVALUATION_RESULT_SCHEMA_VERSION
     assert result["summary"]["success_count"] == 1
     task = result["tasks"][0]
     assert task["task_id"] == "fake.write_file"
@@ -430,7 +442,6 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     assert task["status"] == "success"
     assert task["turn_count"] == 2
     assert task["tool_calls"] == 2
-    assert task["tool_call_count"] == 2
     assert task["files_changed"] == ["done.txt"]
     assert task["patch"]["applicable"] is True
     assert task["patch_applicable"] is True
@@ -441,10 +452,12 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     assert task["public_verification_passed"] is True
     assert task["hidden_verification_passed"] is True
     assert task["verification_result"]["status"] == "passed"
+    assert task["agent_completed"] is True
+    assert task["evaluation_passed"] is True
     assert task["completed"] is True
     assert task["contract_satisfaction"]["status"] == "satisfied"
+    assert task["contract_satisfaction"]["repair_phase_contract_satisfaction"]["status"] == "not_recorded"
     assert task["final_report_status"] == "completed"
-    assert task["failure_repair_count"] == 1
     assert task["repair_attempt_count"] == 1
     assert task["repair_execution_count"] == 0
     assert task["miscompletion_count"] == 0
@@ -458,12 +471,15 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     ]
     assert task["token_usage"]["input_tokens"] == 10
     assert task["cache_usage"]["run_cache_hit_rate"] == 0.4
-    assert task["task_verification_result"] == task["verification_result"]
-    assert task["repair_verification_contract"]["contract_id"] == "vc_1"
-    assert task["repair_verification_contract"]["latest_repair_contract_id"] == "rc_1"
-    assert task["repair_verification_contract"]["step_count"] == 1
-    assert task["result_extraction"]["planner_summary_present"] is True
-    assert task["result_extraction"]["failure_repair_source"].endswith("failure_repair_summary")
+    for removed in [
+        "tool_call_count",
+        "failure_repair_count",
+        "task_verification_result",
+        "repair_verification_contract",
+        "result_extraction",
+        "agent_loop_ref",
+    ]:
+        assert removed not in task
     assert task["reproducible_environment"]["workspace"]["type"] == "fixture"
     assert task["reproducible_environment"]["verification_command"] == manifest.tasks[0].verification_command
     assert task["reproducible_environment"]["public_verification_command"] == manifest.tasks[0].verification_command
@@ -474,18 +490,17 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     env_base_url = task["reproducible_environment"]["model_profile"]["base_url"]
     assert env_base_url is None or "sk-" not in env_base_url
     assert "env_file" in task["reproducible_environment"]["model_profile"]["sources"]
-    assert task["agent_loop_ref"].endswith("AgentLoop.run")
     assert Path(result["result_path"]).exists()
     assert Path(result["report_path"]).exists()
     assert Path(result["markdown_path"]).exists()
-    assert "Live Agent Evaluation" in Path(result["markdown_path"]).read_text(encoding="utf-8")
+    assert "Agent Evaluation" in Path(result["markdown_path"]).read_text(encoding="utf-8")
 
 
-def test_live_eval_runner_compares_against_previous_run(tmp_path: Path) -> None:
+def test_evaluation_runner_compares_against_previous_run(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
-    manifest = LiveEvalManifest.from_dict(
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.regression",
@@ -551,13 +566,13 @@ def test_live_eval_runner_compares_against_previous_run(tmp_path: Path) -> None:
             return FakeKernel(self.project_root, self.should_write)
 
     output_root = tmp_path / "out"
-    first = LiveAgentEvalRunner(
+    first = EvaluationRunner(
         output_root=output_root,
         run_id="baseline",
         bootstrap_cls=FakeBootstrap,
     ).run(manifest)
     FakeBootstrap.should_write = False
-    second = LiveAgentEvalRunner(
+    second = EvaluationRunner(
         output_root=output_root,
         run_id="candidate",
         bootstrap_cls=FakeBootstrap,
@@ -571,10 +586,10 @@ def test_live_eval_runner_compares_against_previous_run(tmp_path: Path) -> None:
     assert Path(second["regression_markdown_path"]).exists()
 
 
-def test_live_eval_maps_bare_python_verification_to_harness_executable(tmp_path: Path) -> None:
-    manifest = LiveEvalManifest.from_dict(
+def test_evaluation_maps_bare_python_verification_to_harness_executable(tmp_path: Path) -> None:
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.bare_python",
@@ -636,7 +651,7 @@ def test_live_eval_maps_bare_python_verification_to_harness_executable(tmp_path:
         def boot(self, _goal: str) -> FakeKernel:
             return FakeKernel(self.project_root)
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="bare_python",
         bootstrap_cls=FakeBootstrap,
@@ -650,11 +665,11 @@ def test_live_eval_maps_bare_python_verification_to_harness_executable(tmp_path:
     assert task["verification"]["failure_category"] == "none"
 
 
-def test_live_eval_reports_completion_rejected_repair_and_verification_contract(tmp_path: Path) -> None:
+def test_evaluation_reports_completion_rejected_repair_and_verification_contract(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
-    manifest = LiveEvalManifest.from_dict(
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.completion_repair",
@@ -750,7 +765,7 @@ def test_live_eval_reports_completion_rejected_repair_and_verification_contract(
         def boot(self, _goal: str) -> FakeKernel:
             return FakeKernel(self.project_root)
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="completion_repair",
         bootstrap_cls=FakeBootstrap,
@@ -758,22 +773,29 @@ def test_live_eval_reports_completion_rejected_repair_and_verification_contract(
 
     task = result["tasks"][0]
     assert task["success"] is True
-    assert task["failure_repair_count"] == 1
+    assert task["repair_attempt_count"] == 1
+    assert task["repair_execution_count"] == 0
     assert task["turn_count"] == 3
     assert task["tool_calls"] == 4
     assert task["contract_satisfaction"]["status"] == "satisfied"
-    assert task["repair_verification_contract"]["contract_id"] == "verification_contract_1"
-    assert task["repair_verification_contract"]["status"] == "satisfied"
-    assert task["repair_verification_contract"]["latest_target_files"] == ["app.py"]
-    assert task["result_extraction"]["repair_verification_contract_source"].endswith("failure_repair_summary")
+    assert task["contract_satisfaction"]["repair_phase_contract_satisfaction"] == {
+        "status": "satisfied",
+        "source": "kernel.final_report.planner_summary.contract_satisfaction",
+        "contract_id": "verification_contract_1",
+        "completed_steps": ["step_1"],
+        "failed_steps": [],
+        "skipped_steps": [],
+        "reason": None,
+    }
     assert task["trace_artifact_refs"] == ["planner/repair-plan.json", "trace/final-review.json"]
     report_text = Path(result["markdown_path"]).read_text(encoding="utf-8")
     assert "completion_repair" in report_text
     result_text = Path(result["result_path"]).read_text(encoding="utf-8")
     assert "verification_contract_1" in result_text
+    assert "repair_verification_contract" not in result_text
 
 
-def test_live_eval_uses_env_root_for_fixture_workspace_config(
+def test_evaluation_uses_env_root_for_fixture_workspace_config(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -794,9 +816,9 @@ def test_live_eval_uses_env_root_for_fixture_workspace_config(
         encoding="utf-8",
     )
     py = json.dumps(sys.executable)
-    manifest = LiveEvalManifest.from_dict(
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.env_root",
@@ -859,7 +881,7 @@ def test_live_eval_uses_env_root_for_fixture_workspace_config(
             assert self.config.base_url == "https://provider.example/v1"
             return FakeKernel(self.project_root)
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="env_root",
         env_root=env_root,
@@ -876,11 +898,11 @@ def test_live_eval_uses_env_root_for_fixture_workspace_config(
     assert "sk-local-test-secret" not in json.dumps(result)
 
 
-def test_live_eval_runner_can_drive_real_agent_loop(tmp_path: Path) -> None:
+def test_evaluation_runner_can_drive_real_agent_loop(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
-    manifest = LiveEvalManifest.from_dict(
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.real_agent_loop",
@@ -950,7 +972,7 @@ def test_live_eval_runner_can_drive_real_agent_loop(tmp_path: Path) -> None:
         def boot(self, _goal: str) -> FakeKernel:
             return FakeKernel(self.project_root)
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="real_loop",
         bootstrap_cls=FakeBootstrap,
@@ -958,14 +980,15 @@ def test_live_eval_runner_can_drive_real_agent_loop(tmp_path: Path) -> None:
 
     assert calls == ["chat"]
     assert result["tasks"][0]["success"] is True
-    assert result["tasks"][0]["agent_loop_ref"] == "KernelBootstrap.boot -> AgentKernel.run_task -> AgentLoop.run"
+    assert result["tasks"][0]["agent_completed"] is True
+    assert "agent_loop_ref" not in result["tasks"][0]
 
 
-def test_live_eval_prepare_failure_returns_structured_result(tmp_path: Path) -> None:
+def test_evaluation_prepare_failure_returns_structured_result(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
-    manifest = LiveEvalManifest.from_dict(
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.prepare_failure",
@@ -981,7 +1004,7 @@ def test_live_eval_prepare_failure_returns_structured_result(tmp_path: Path) -> 
         base_dir=tmp_path,
     )
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="run_prepare_failed",
         bootstrap_cls=object,
@@ -995,11 +1018,11 @@ def test_live_eval_prepare_failure_returns_structured_result(tmp_path: Path) -> 
     assert "prepare failed" in task["error_summary"]
 
 
-def test_live_eval_applies_patch_in_clean_verification_workspace(tmp_path: Path) -> None:
+def test_evaluation_applies_patch_in_clean_verification_workspace(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
-    manifest = LiveEvalManifest.from_dict(
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.clean_apply",
@@ -1062,7 +1085,7 @@ def test_live_eval_applies_patch_in_clean_verification_workspace(tmp_path: Path)
         def boot(self, _goal: str) -> FakeKernel:
             return FakeKernel(self.project_root)
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="run_apply",
         bootstrap_cls=FakeBootstrap,
@@ -1077,11 +1100,11 @@ def test_live_eval_applies_patch_in_clean_verification_workspace(tmp_path: Path)
     assert task["checks"]["public"]["passed"] is True
 
 
-def test_live_eval_marks_model_transport_blocker_without_running_verification(tmp_path: Path) -> None:
+def test_evaluation_marks_model_transport_blocker_without_running_verification(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
-    manifest = LiveEvalManifest.from_dict(
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.model_blocked",
@@ -1138,7 +1161,7 @@ def test_live_eval_marks_model_transport_blocker_without_running_verification(tm
         def boot(self, _goal: str) -> FakeKernel:
             return FakeKernel()
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="run_blocked",
         bootstrap_cls=FakeBootstrap,
@@ -1155,11 +1178,11 @@ def test_live_eval_marks_model_transport_blocker_without_running_verification(tm
     assert "infrastructure blocked" in task["error_summary"]
 
 
-def test_live_eval_completion_gate_counts_false_completed_report(tmp_path: Path) -> None:
+def test_evaluation_completion_gate_counts_false_completed_report(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
-    manifest = LiveEvalManifest.from_dict(
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.false_completed",
@@ -1220,7 +1243,7 @@ def test_live_eval_completion_gate_counts_false_completed_report(tmp_path: Path)
         def boot(self, _goal: str) -> FakeKernel:
             return FakeKernel()
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="false_completed",
         bootstrap_cls=FakeBootstrap,
@@ -1242,7 +1265,7 @@ def test_live_eval_completion_gate_counts_false_completed_report(tmp_path: Path)
     assert task["failure_category"] == "command_failed"
 
 
-def test_failure_case_replay_runner_extracts_live_failure_record(tmp_path: Path) -> None:
+def test_failure_case_replay_runner_extracts_evaluation_failure_record(tmp_path: Path) -> None:
     trace_dir = tmp_path / "trace"
     trace_dir.mkdir()
     (trace_dir / "events.jsonl").write_text(
@@ -1283,7 +1306,7 @@ def test_failure_case_replay_runner_extracts_live_failure_record(tmp_path: Path)
             {
                 "tasks": [
                     {
-                        "task_id": "live.regression.multi_file_reasoning",
+                        "task_id": "benchmark.regression.multi_file_reasoning",
                         "status": "verification_failed",
                         "success": False,
                         "failure_category": "verification_failed",
@@ -1299,8 +1322,7 @@ def test_failure_case_replay_runner_extracts_live_failure_record(tmp_path: Path)
                         "trace": str(trace_dir),
                         "trace_artifact_refs": ["artifact_prompt"],
                         "contract_satisfaction": {"status": "unsatisfied"},
-                        "repair_verification_contract": {"status": "not_recorded"},
-                        "task_verification_result": {"status": "failed"},
+                        "verification_result": {"status": "failed"},
                         "reproducible_environment": {
                             "expected_file_changes": ["cart.py", "policy.py"]
                         },
@@ -1318,7 +1340,7 @@ def test_failure_case_replay_runner_extracts_live_failure_record(tmp_path: Path)
     assert len(records) == 1
     record = records[0].to_dict()
     assert record["schema_version"] == FAILURE_CASE_RECORD_SCHEMA_VERSION
-    assert record["task_id"] == "live.regression.multi_file_reasoning"
+    assert record["task_id"] == "benchmark.regression.multi_file_reasoning"
     assert record["expected_file_changes"] == ["cart.py", "policy.py"]
     assert record["files_changed"] == ["policy.py"]
     assert record["repair_attempt_count"] == 0
@@ -1333,7 +1355,7 @@ def test_failure_case_replay_runner_extracts_live_failure_record(tmp_path: Path)
     assert "phase_history" not in saved["records"][0]
 
 
-def test_live_eval_runs_hidden_verification_prepare_after_agent(tmp_path: Path) -> None:
+def test_evaluation_runs_hidden_verification_prepare_after_agent(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
     hidden_test = "from solution import answer\n\n\ndef test_answer():\n    assert answer() == 42\n"
     hidden_source = tmp_path / "hidden_test_source.py"
@@ -1343,9 +1365,9 @@ def test_live_eval_runs_hidden_verification_prepare_after_agent(tmp_path: Path) 
         "Path('tests').mkdir(exist_ok=True); "
         f"Path('tests/test_hidden.py').write_text(Path({str(hidden_source)!r}).read_text(encoding='utf-8'), encoding='utf-8')"
     )
-    manifest = LiveEvalManifest.from_dict(
+    manifest = EvaluationTaskSet.from_dict(
         {
-            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
             "tasks": [
                 {
                     "task_id": "fake.hidden_verification",
@@ -1408,7 +1430,7 @@ def test_live_eval_runs_hidden_verification_prepare_after_agent(tmp_path: Path) 
         def boot(self, _goal: str) -> FakeKernel:
             return FakeKernel(self.project_root)
 
-    result = LiveAgentEvalRunner(
+    result = EvaluationRunner(
         output_root=tmp_path / "out",
         run_id="run_hidden",
         bootstrap_cls=FakeBootstrap,
@@ -1419,3 +1441,5 @@ def test_live_eval_runs_hidden_verification_prepare_after_agent(tmp_path: Path) 
     assert task["success"] is True
     assert task["files_changed"] == ["solution.py"]
     assert "tests/test_hidden.py" not in seen_goals[0]
+
+

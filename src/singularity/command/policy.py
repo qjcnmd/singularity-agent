@@ -101,6 +101,14 @@ class CommandPolicy:
             "*_SECRET",
             "PASSWORD",
             "DATABASE_URL",
+            "DSN",
+            "*_DSN",
+            "CONN_STR",
+            "*_CONN_STR",
+            "CONN_STRING",
+            "*_CONN_STRING",
+            "CONNECTION_STRING",
+            "*_CONNECTION_STRING",
             "AWS_*",
             "GITHUB_TOKEN",
             "OPENAI_API_KEY",
@@ -377,8 +385,13 @@ def is_secret_env_name(name: str) -> bool:
         upper.endswith("_TOKEN")
         or upper.endswith("_KEY")
         or upper.endswith("_SECRET")
+        or upper.endswith("_DSN")
+        or upper.endswith("_CONN_STR")
+        or upper.endswith("_CONN_STRING")
+        or upper.endswith("_CONNECTION_STRING")
         or "PASSWORD" in upper
         or upper == "DATABASE_URL"
+        or upper in {"DSN", "CONN_STR", "CONN_STRING", "CONNECTION_STRING"}
         or upper.startswith("AWS_")
         or upper in {"GITHUB_TOKEN", "OPENAI_API_KEY"}
     )

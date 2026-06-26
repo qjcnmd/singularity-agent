@@ -413,6 +413,7 @@ class ToolExecutor:
             )
             if planner_decision is not None and not planner_decision.allowed:
                 self._record_planner_denial(tool_name, planner_decision)
+                planner_updated = True
                 result = ToolResult.failure(
                     code=planner_decision.error_code or "action_not_allowed",
                     message="Planner denied tool execution.",
@@ -684,8 +685,9 @@ class ToolExecutor:
                 summary=f"Planner observation update failed for tool {tool_name}.",
                 payload={"tool_name": tool_name, "error_type": type(exc).__name__},
                 ids={"action_id": action_id or tool_call_id},
-                severity=TraceSeverity.WARNING,
+                severity=TraceSeverity.ERROR,
             )
+            raise RuntimeError("planner observation update failed") from exc
 
     def _record_planner_denial(self, tool_name: str, planner_decision: Any) -> None:
         self._emit_trace(

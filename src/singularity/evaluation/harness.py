@@ -10,9 +10,9 @@ from singularity.evaluation.execution import (
     EvaluationArtifactWriter,
     BenchmarkTaskExecutor,
 )
-from singularity.evaluation.live import (
-    LiveAgentEvalRunner,
-    LiveEvalManifest,
+from singularity.evaluation.runner import (
+    EvaluationRunner,
+    EvaluationTaskSet,
     SingularityPrivateBenchmarkAdapter,
 )
 from singularity.evaluation.patch_quality import PatchQualityEvaluator
@@ -149,7 +149,7 @@ class EvaluationHarness:
     def run_agent_benchmark_suite(
         self,
         *,
-        manifest: LiveEvalManifest,
+        manifest: EvaluationTaskSet,
         run_id: str | None = None,
         output_root: Path | str | None = None,
         max_turns: int | None = None,
@@ -159,7 +159,7 @@ class EvaluationHarness:
         bootstrap_cls: Any | None = None,
     ) -> dict[str, Any]:
         """Run coding-agent benchmarks through KernelBootstrap -> AgentKernel -> AgentLoop."""
-        return LiveAgentEvalRunner(
+        return EvaluationRunner(
             output_root=output_root or self.output_root,
             run_id=run_id,
             max_turns=max_turns,

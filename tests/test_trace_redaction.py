@@ -10,6 +10,9 @@ def test_redacts_secret_keys_recursively_without_preserving_secret_parts() -> No
         "nested": [
             {"password": "hunter2"},
             {"Authorization": "Bearer token-value"},
+            {"DATABASE_URL": "postgres://user:pass@localhost/db"},
+            {"READ_REPLICA_DSN": "postgres://user:pass@localhost/replica"},
+            {"APP_CONN_STR": "Server=.;Password=secret"},
             {"safe": "hello"},
         ],
         "cookie": "session=abc123",
@@ -20,7 +23,10 @@ def test_redacts_secret_keys_recursively_without_preserving_secret_parts() -> No
     assert redacted["OPENAI_API_KEY"] == "<redacted>"
     assert redacted["nested"][0]["password"] == "<redacted>"
     assert redacted["nested"][1]["Authorization"] == "<redacted>"
-    assert redacted["nested"][2]["safe"] == "hello"
+    assert redacted["nested"][2]["DATABASE_URL"] == "<redacted>"
+    assert redacted["nested"][3]["READ_REPLICA_DSN"] == "<redacted>"
+    assert redacted["nested"][4]["APP_CONN_STR"] == "<redacted>"
+    assert redacted["nested"][5]["safe"] == "hello"
     assert redacted["cookie"] == "<redacted>"
     assert "sk-" not in str(redacted)
     assert "hunter2" not in str(redacted)
@@ -32,6 +38,9 @@ def test_redacts_env_style_text_and_auth_headers() -> None:
     text = "\n".join(
         [
             "OPENAI_API_KEY=sk-prod-123",
+            "DATABASE_URL=postgres://user:pass@localhost/db",
+            "READ_REPLICA_DSN=postgres://user:pass@localhost/replica",
+            "APP_CONN_STR=Server=.;Password=secret",
             "Authorization: Bearer github-secret",
             "Cookie: sid=abc123",
             "normal=value",
@@ -41,12 +50,17 @@ def test_redacts_env_style_text_and_auth_headers() -> None:
     redacted = redactor.redact_text(text)
 
     assert "OPENAI_API_KEY=<redacted>" in redacted
+    assert "DATABASE_URL=<redacted>" in redacted
+    assert "READ_REPLICA_DSN=<redacted>" in redacted
+    assert "APP_CONN_STR=<redacted>" in redacted
     assert "Authorization: <redacted>" in redacted
     assert "Cookie: <redacted>" in redacted
     assert "normal=value" in redacted
     assert "sk-prod" not in redacted
     assert "github-secret" not in redacted
     assert "abc123" not in redacted
+    assert "postgres://user:pass" not in redacted
+    assert "Password=secret" not in redacted
 
 
 def test_redacts_cli_secret_flags_and_json_argv_values() -> None:

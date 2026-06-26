@@ -242,6 +242,7 @@ class CommandExecutor:
             return result
 
         if sandbox_required:
+            env_result = self.env_policy.build(request.env_request)
             sandbox_request = self.sandbox_manager.build_request_from_policy(
                 request,
                 policy_decision,
@@ -256,6 +257,7 @@ class CommandExecutor:
                 request,
                 decision=decision,
                 sandbox_result=sandbox_result,
+                redactor=env_result.redactor,
                 started_at=started_at,
                 started=started,
                 git_before=git_before,
@@ -658,6 +660,7 @@ class CommandExecutor:
         *,
         decision: CommandPolicyResult,
         sandbox_result: SandboxResult,
+        redactor: SecretRedactor,
         started_at: str,
         started: float,
         git_before: dict[str, Any],
@@ -670,8 +673,8 @@ class CommandExecutor:
             execution_status,
         )
         error_code = self._sandbox_error_code(sandbox_result, semantic_status)
-        stdout = sandbox_result.stdout
-        stderr = sandbox_result.stderr
+        stdout = redactor.redact(sandbox_result.stdout)
+        stderr = redactor.redact(sandbox_result.stderr)
         combined = stdout + stderr
         digest = hashlib.sha256(combined.encode("utf-8")).hexdigest()
         artifact_path = (

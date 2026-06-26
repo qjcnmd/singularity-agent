@@ -19,6 +19,7 @@ CORE_DOC_IDS = {
     "context-assembly-prompt-frame",
     "context-compaction-observation-store",
     "planner-replanner-failure-recovery",
+    "evaluation-benchmark-runner",
     "trace-observation-audit-events",
     "artifact-long-result-handling",
 }
@@ -42,6 +43,28 @@ REQUIRED_HEADINGS = {
 REQUIRED_PHRASES = {
     "Model-Visible Objects",
     "Internal Trace Debug Audit Objects",
+}
+
+COMPLETE_FIELD_CHECKS = {
+    "evaluation-benchmark-runner": {
+        "EvaluationWorkspace",
+        "EvaluationTask",
+        "EvaluationTaskSet",
+        "CommandEvalResult",
+        "EvaluationTaskResult",
+        "TargetedFailureReplayResult",
+    },
+    "planner-replanner-failure-recovery": {
+        "FailureAnalysisRequest",
+        "FailureAnalysisResult",
+        "RepairContract",
+        "RepairPlan",
+        "RepairReplanSignal",
+        "VerificationContract",
+        "VerificationStep",
+        "ContractSatisfaction",
+        "StepEvidence",
+    },
 }
 
 
@@ -146,6 +169,22 @@ def _verify_doc(doc: RuntimeDoc, errors: list[str]) -> None:
             for field_name in fields:
                 if field_name not in class_fields[class_name]:
                     errors.append(f"{label}: field not found on {class_name}: {field_name}")
+
+        complete_classes = COMPLETE_FIELD_CHECKS.get(doc.doc_id, set())
+        for class_name in sorted(complete_classes):
+            if class_name not in class_fields:
+                errors.append(f"{label}: complete field check class not found in listed source paths: {class_name}")
+                continue
+            documented_fields = set(doc.field_checks.get(class_name, []))
+            if not documented_fields:
+                errors.append(f"{label}: complete field check missing Field checks entry: {class_name}")
+                continue
+            missing_fields = sorted(class_fields[class_name] - documented_fields)
+            if missing_fields:
+                errors.append(
+                    f"{label}: Field checks for {class_name} missing current fields: "
+                    + ", ".join(missing_fields)
+                )
 
 
 def _extract_doc_id(text: str) -> str:

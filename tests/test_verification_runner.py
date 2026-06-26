@@ -2,6 +2,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from singularity.command import (
     CommandDecision,
     CommandPolicy,
@@ -186,6 +188,32 @@ def test_verification_command_serialization_redacts_sensitive_arguments() -> Non
         assert "<redacted>" in serialized
         assert payload["command_hash"]
         assert payload["argv"][-1] == "<redacted>"
+
+
+def test_active_verification_contract_getter_failure_fails_closed(tmp_path: Path) -> None:
+    class BrokenPlanner:
+        def get_active_verification_contract(self):
+            raise RuntimeError("contract store unavailable")
+
+    class RecordingTrace:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def record(self, event_type: str, payload: dict[str, object]) -> None:
+            self.events.append((event_type, payload))
+
+    trace = RecordingTrace()
+    runner = VerificationRunner(tmp_path, planner=BrokenPlanner(), trace=trace)
+
+    with pytest.raises(RuntimeError, match="active verification contract unavailable"):
+        runner.plan_verification(changed_files=["app.py"], task_intent="repair app")
+
+    assert any(
+        event_type == "verification"
+        and payload.get("phase") == "active_verification_contract_error"
+        and payload.get("source") == "get_active_verification_contract"
+        for event_type, payload in trace.events
+    )
 
 
 def test_impact_analysis_handles_docs_source_and_high_risk_files(tmp_path: Path) -> None:

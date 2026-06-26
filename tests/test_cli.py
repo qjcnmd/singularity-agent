@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from singularity.cli import app, _run_live_quicksort_benchmark
+from singularity.cli import app, _run_provider_smoke_benchmark
 from singularity.cli import create_or_resume_planner, workspace_health_summary
 from singularity.evaluation import (
     BenchmarkTask,
@@ -275,7 +275,7 @@ def test_index_cli_accepts_explicit_project_root(monkeypatch, tmp_path: Path) ->
     assert not (cwd / ".singularity" / "index.sqlite").exists()
 
 
-def test_eval_live_quicksort_uses_kernel_and_independent_smoke(monkeypatch, tmp_path: Path) -> None:
+def test_eval_provider_smoke_uses_kernel_and_independent_smoke(monkeypatch, tmp_path: Path) -> None:
     class FakeTrace:
         class Store:
             run_dir = tmp_path / "trace" / "run_1"
@@ -332,9 +332,9 @@ def test_eval_live_quicksort_uses_kernel_and_independent_smoke(monkeypatch, tmp_
 
     monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
 
-    result = _run_live_quicksort_benchmark(
-        output_dir=tmp_path / "live",
-        run_id="live_test",
+    result = _run_provider_smoke_benchmark(
+        output_dir=tmp_path / "provider",
+        run_id="provider_test",
         max_turns=3,
         model=None,
         base_url=None,
@@ -347,7 +347,7 @@ def test_eval_live_quicksort_uses_kernel_and_independent_smoke(monkeypatch, tmp_
     assert result["independent_smoke"]["exit_code"] == 0
 
 
-def test_eval_live_quicksort_accepts_verified_artifact_when_agent_blocks_late(
+def test_eval_provider_smoke_accepts_verified_artifact_when_agent_blocks_late(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -410,8 +410,8 @@ def test_eval_live_quicksort_accepts_verified_artifact_when_agent_blocks_late(
 
     monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
 
-    result = _run_live_quicksort_benchmark(
-        output_dir=tmp_path / "live",
+    result = _run_provider_smoke_benchmark(
+        output_dir=tmp_path / "provider",
         run_id="late_block",
         max_turns=3,
         model=None,
@@ -423,18 +423,18 @@ def test_eval_live_quicksort_accepts_verified_artifact_when_agent_blocks_late(
     assert result["status"] == "blocked"
 
 
-@pytest.mark.live_provider
-def test_eval_live_quicksort_real_provider_opt_in(tmp_path: Path) -> None:
-    if os.getenv("SINGULARITY_RUN_LIVE_PROVIDER_EVAL") != "1":
-        pytest.skip("set SINGULARITY_RUN_LIVE_PROVIDER_EVAL=1 to run live provider eval")
+@pytest.mark.provider_eval
+def test_eval_provider_smoke_real_provider_opt_in(tmp_path: Path) -> None:
+    if os.getenv("SINGULARITY_RUN_PROVIDER_EVAL") != "1":
+        pytest.skip("set SINGULARITY_RUN_PROVIDER_EVAL=1 to run provider evaluation")
     required = ["SINGULARITY_API_KEY", "SINGULARITY_MODEL", "SINGULARITY_BASE_URL"]
     missing = [name for name in required if not os.getenv(name)]
     if missing:
-        pytest.skip(f"missing live provider environment: {', '.join(missing)}")
+        pytest.skip(f"missing provider environment: {', '.join(missing)}")
 
-    result = _run_live_quicksort_benchmark(
-        output_dir=tmp_path / "live",
-        run_id="live_provider",
+    result = _run_provider_smoke_benchmark(
+        output_dir=tmp_path / "provider",
+        run_id="provider",
         max_turns=12,
         model=None,
         base_url=None,
@@ -449,7 +449,7 @@ def test_eval_live_quicksort_real_provider_opt_in(tmp_path: Path) -> None:
     api_key_fingerprint = sha256(api_key.encode()).hexdigest()
     assert (
         not leaked_api_key
-    ), f"live benchmark payload leaked api key sha256={api_key_fingerprint}"
+    ), f"provider smoke payload leaked api key sha256={api_key_fingerprint}"
 
 
 def test_cli_converts_kernel_cancellation_to_exit(monkeypatch, tmp_path: Path) -> None:
@@ -838,7 +838,7 @@ def test_cli_eval_report_show_reads_json_and_markdown(tmp_path: Path, monkeypatc
     assert "# Evaluation Report `show_cli`" in shown_md.output
 
 
-def test_cli_eval_live_private_uses_private_benchmark_adapter(tmp_path: Path, monkeypatch) -> None:
+def test_cli_eval_private_uses_private_benchmark_adapter(tmp_path: Path, monkeypatch) -> None:
     task_set = tmp_path / "private.json"
     task = BenchmarkTask(
         task_id="private.cli",
@@ -868,19 +868,18 @@ def test_cli_eval_live_private_uses_private_benchmark_adapter(tmp_path: Path, mo
             seen["task_id"] = manifest.tasks[0].task_id
             seen["verification_command"] = manifest.tasks[0].verification_command
             return {
-                "schema_version": "evaluation.live_agent_eval_result/v1",
+                "schema_version": "evaluation.result/v1",
                 "run_id": "private_cli",
                 "summary": {"success_count": 1, "task_count": 1},
                 "tasks": [],
             }
 
-    monkeypatch.setattr("singularity.cli.LiveAgentEvalRunner", FakeRunner)
+    monkeypatch.setattr("singularity.cli.EvaluationRunner", FakeRunner)
 
     result = runner.invoke(
         app,
         [
             "eval",
-            "live",
             "private",
             str(task_set),
             "--run-id",
@@ -896,3 +895,24 @@ def test_cli_eval_live_private_uses_private_benchmark_adapter(tmp_path: Path, mo
     assert seen["task_id"] == "private.cli"
     assert seen["verification_command"] == "python -m pytest tests/test_app.py"
     assert seen["kwargs"]["env_root"] == tmp_path.resolve()
+
+    seen.clear()
+    legacy = runner.invoke(
+        app,
+        [
+            "eval",
+            "live",
+            "private",
+            str(task_set),
+            "--run-id",
+            "private_cli",
+            "--project-root",
+            str(tmp_path),
+            "--json",
+        ],
+    )
+
+    assert legacy.exit_code == 0, legacy.output
+    assert json.loads(legacy.output)["run_id"] == "private_cli"
+    assert seen["task_id"] == "private.cli"
+

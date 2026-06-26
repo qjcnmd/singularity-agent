@@ -158,16 +158,30 @@ class VerificationRunner:
         if callable(getter):
             try:
                 contract = getter()
-                return contract if contract.steps else None
-            except Exception:
-                pass
+                return contract if contract is not None and getattr(contract, "steps", None) else None
+            except Exception as exc:
+                self._record_trace(
+                    "active_verification_contract_error",
+                    {
+                        "source": "get_active_verification_contract",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise RuntimeError("active verification contract unavailable") from exc
         # Fallback to private method for backward compat
         if hasattr(self.planner, "_active_repair_verification_contract"):
             try:
                 contract = self.planner._active_repair_verification_contract()
-                return contract if contract.steps else None
-            except Exception:
-                return None
+                return contract if contract is not None and getattr(contract, "steps", None) else None
+            except Exception as exc:
+                self._record_trace(
+                    "active_verification_contract_error",
+                    {
+                        "source": "_active_repair_verification_contract",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise RuntimeError("active verification contract unavailable") from exc
         return None
 
     def _task_contract_payload(self) -> dict[str, Any] | None:

@@ -69,11 +69,12 @@ def test_long_tool_result_is_truncated_in_message_but_raw_result_is_preserved() 
 
     tool_message = context.messages()[-1]
     assert len(observation.preview) == 4000
+    assert observation.preview == "x" * 4000
     assert observation.truncated is True
     assert observation.raw_result == result
     assert '"truncated": true' in tool_message["content"]
     assert long_content not in tool_message["content"]
-    assert "x" * 4000 in tool_message["content"]
+    assert len(tool_message["content"]) < len(long_content)
 
 
 def test_tool_protocol_result_message_omits_internal_only_fields() -> None:

@@ -43,6 +43,12 @@ Do not read `.env` unless the user explicitly asks for environment diagnosis and
 
 For code tasks, start from the mapped subsystem and its tests. Keep edits inside the task boundary, preserve existing runtime layering, and avoid unrelated cleanup.
 
+## Naming Discipline
+
+Use mainstream domain terms for production runtime objects, files, schemas, and CLI commands. Evaluation code must use `evaluation`, `eval`, `evaluator`, `evaluation harness`, `benchmark`, `task`, `task set`, `result`, `report`, `runner`, or `experiment` as appropriate.
+
+Do not introduce prompt-polluted names, explanatory static fields, duplicate alias fields, or bespoke names when a mainstream term already exists. The old `live` evaluation names are compatibility aliases only; do not use them for new code, schemas, manifests, docs, tests, or CLI examples except when documenting legacy compatibility.
+
 ## Runtime Flow Docs
 
 Module-level Runtime Flow Docs live under:
@@ -54,6 +60,8 @@ docs/architecture/modules/
 Any change that modifies core runtime objects, object fields, call chains, model-visible schemas, tool result envelopes, policy or approval behavior, trace or audit payloads, context assembly, prompt framing, model request construction, compaction, observation storage, planner or replanner behavior, failure recovery, or artifact/long-result handling must update the corresponding Runtime Flow Doc in the same change.
 
 Runtime Flow Docs must stay source-backed. Do not document fields, objects, functions, or call chains that cannot be located in the current source tree. Current implementation details and proposed production-grade target structure must be separated clearly.
+
+Any change to code structure, dataclass fields, public CLI commands, schema versions, trace event payloads, evaluation manifests, result/report schemas, or compatibility aliases must update the corresponding Runtime Flow Doc in the same change. Runtime Flow Docs must treat source code as the only authority, list complete fields for documented runtime dataclasses, and keep legacy aliases clearly separated from canonical runtime objects.
 
 Before finishing a runtime-sensitive change, run:
 
@@ -81,8 +89,8 @@ Required rule:
 4. Use the project’s existing `.env` / configuration loading path for provider credentials. Never print, copy, commit, expose, or include API keys or secrets in logs, reports, traces, markdown, screenshots, or final output.
 5. When checking environment readiness, only report redacted status, for example:
    `SINGULARITY_API_KEY=present(redacted)`, `SINGULARITY_BASE_URL=present`, `SINGULARITY_MODEL=present`.
-6. For benchmark/evaluation work, run a real live benchmark whenever possible, preferably:
-   `python -m singularity eval live run docs/evaluation/live-agent-minimal-tasks.json --run-id <meaningful-run-id>`
+6. For benchmark/evaluation work, run a real evaluation benchmark whenever possible, preferably:
+   `python -m singularity.cli eval run docs/evaluation/capability-regression-tasks.json --run-id <meaningful-run-id>`
    or the closest valid project CLI command if the CLI entrypoint differs.
 7. For non-evaluation agent changes, run the smallest real task that exercises the changed path, but it must still use the real model provider and real AgentLoop.
 8. Final output must include:

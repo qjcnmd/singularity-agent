@@ -17,7 +17,10 @@ from singularity.policy.models import (
 )
 
 
-SECRET_KEY_RE = re.compile(r"(authorization|token|api[_-]?key|secret|password)", re.IGNORECASE)
+SECRET_KEY_RE = re.compile(
+    r"(authorization|token|api[_-]?key|secret|password|database[_-]?url|dsn|conn(?:ection)?[_-]?(?:str|string))",
+    re.IGNORECASE,
+)
 SECRET_VALUE_RE = re.compile(
     r"(Bearer\s+)[A-Za-z0-9._\-]+|sk-[A-Za-z0-9._\-]+|secret-token",
     re.IGNORECASE,

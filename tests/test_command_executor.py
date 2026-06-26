@@ -201,7 +201,11 @@ def test_env_secret_is_not_passed_and_output_is_redacted(tmp_path: Path) -> None
     code = (
         "import os; "
         "print(os.getenv('OPENAI_API_KEY', 'missing')); "
-        "print(os.getenv('VISIBLE_VALUE', 'missing'))"
+        "print(os.getenv('READ_REPLICA_DSN', 'missing')); "
+        "print(os.getenv('APP_CONN_STR', 'missing')); "
+        "print(os.getenv('VISIBLE_VALUE', 'missing')); "
+        "print('DSN=postgres://user:pass@localhost/db'); "
+        "print('CONNECTION_STRING=Server=.;Password=pw')"
     )
 
     result = component.run(
@@ -211,14 +215,26 @@ def test_env_secret_is_not_passed_and_output_is_redacted(tmp_path: Path) -> None
             purpose=CommandPurpose.READ_ONLY_COMMAND,
             env_request={
                 "OPENAI_API_KEY": "sk-test-secret",
+                "DATABASE_URL": "postgres://user:pass@localhost/main",
+                "READ_REPLICA_DSN": "postgres://user:pass@localhost/replica",
+                "APP_CONN_STR": "Server=.;Password=secret",
                 "VISIBLE_VALUE": "visible-ok",
             },
         )
     )
 
     assert result.execution_status == ExecutionStatus.COMPLETED
-    assert result.env_denied == ["OPENAI_API_KEY"]
+    assert result.env_denied == [
+        "APP_CONN_STR",
+        "DATABASE_URL",
+        "OPENAI_API_KEY",
+        "READ_REPLICA_DSN",
+    ]
     assert "sk-test-secret" not in result.stdout_preview
+    assert "postgres://user:pass" not in result.stdout_preview
+    assert "Password=pw" not in result.stdout_preview
+    assert "DSN=[REDACTED]" in result.stdout_preview
+    assert "CONNECTION_STRING=[REDACTED]" in result.stdout_preview
     assert "missing" in result.stdout_preview
     assert "visible-ok" in result.stdout_preview
 

@@ -291,6 +291,23 @@ class TestBlockedCategories:
             assert plan.needs_user_input, f"category {category} should be blocked"
             assert plan.strategy == "blocked"
 
+    def test_policy_sandbox_approval_categories_fail_closed_by_category(self) -> None:
+        planner = RepairPlanner()
+        for category in [
+            "policy_blocked",
+            "sandbox_violation",
+            "approval_required",
+            "action_not_allowed",
+        ]:
+            analysis = _make_analysis(failure_category=category)
+            plan = planner.plan(analysis)
+
+            assert plan.needs_user_input is True
+            assert plan.strategy == "blocked"
+            assert plan.blocked_reason == category
+            assert plan.repair_contract is not None
+            assert plan.repair_contract.needs_user_input is True
+
     def test_low_confidence_rejected_by_contract(self) -> None:
         analysis = _make_analysis(confidence=MIN_REPAIR_CONFIDENCE - 0.1)
         candidates = [
@@ -1497,7 +1514,7 @@ class TestRepairTelemetryHardening:
         planner.evidence.repair_plans.append(executable_plan)
         planner.evidence.failure_analyses.append(
             {"analysis_id": "a1", "failure_category": "unit_test_failure",
-             "root_cause": {"description": "assertion failed"}, "root_cause_text": "assertion failed"}
+             "root_cause": {"description": "assertion failed"}}
         )
 
         # Inject a blocked repair plan
@@ -1521,7 +1538,7 @@ class TestRepairTelemetryHardening:
         planner.evidence.repair_plans.append(blocked_plan)
         planner.evidence.failure_analyses.append(
             {"analysis_id": "a2", "failure_category": "permission_denied",
-             "root_cause": {"description": "blocked"}, "root_cause_text": "blocked"}
+             "root_cause": {"description": "blocked"}}
         )
 
         summary = Finalizer._failure_repair_summary(planner.evidence)
@@ -1559,7 +1576,7 @@ class TestRepairTelemetryHardening:
         planner.evidence.repair_plans.append(plan_dict)
         planner.evidence.failure_analyses.append(
             {"analysis_id": "a1", "failure_category": "unit_test_failure",
-             "root_cause": {"description": "assertion failed"}, "root_cause_text": "assertion failed"}
+             "root_cause": {"description": "assertion failed"}}
         )
 
         summary = Finalizer._failure_repair_summary(planner.evidence)
@@ -1611,7 +1628,7 @@ class TestRepairTelemetryHardening:
         planner.evidence.repair_plans.append(plan_dict)
         planner.evidence.failure_analyses.append(
             {"analysis_id": "a1", "failure_category": "unit_test_failure",
-             "root_cause": {"description": "assertion failed"}, "root_cause_text": "assertion failed"}
+             "root_cause": {"description": "assertion failed"}}
         )
         # Simulate a verification result after the repair
         planner.evidence.verification_results.append({
@@ -1656,99 +1673,6 @@ class TestRepairTelemetryHardening:
         summary = Finalizer._failure_repair_summary(planner.evidence)
         assert summary["repair_execution_count"] == 0, "Blocked plan should not count as execution"
         assert summary["repair_blocked_count"] == 1
-
-
-class TestFailureRepairCountExtraction:
-    """Verify _failure_repair_count uses the new fields correctly."""
-
-    def test_extraction_prefers_execution_count(self) -> None:
-        from singularity.evaluation.live import _failure_repair_count
-
-        payload = {
-            "planner_summary": {
-                "failure_repair_summary": {
-                    "repair_execution_count": 2,
-                    "repair_attempt_count": 3,
-                    "repair_plan_count": 4,
-                    "failure_analysis_count": 5,
-                }
-            }
-        }
-        assert _failure_repair_count(payload) == 2
-
-    def test_extraction_falls_back_to_attempt_count(self) -> None:
-        from singularity.evaluation.live import _failure_repair_count
-
-        payload = {
-            "planner_summary": {
-                "failure_repair_summary": {
-                    "repair_attempt_count": 3,
-                    "repair_plan_count": 4,
-                    "failure_analysis_count": 5,
-                }
-            }
-        }
-        assert _failure_repair_count(payload) == 3
-
-    def test_extraction_falls_back_to_plan_count(self) -> None:
-        from singularity.evaluation.live import _failure_repair_count
-
-        payload = {
-            "planner_summary": {
-                "failure_repair_summary": {
-                    "repair_plan_count": 4,
-                    "failure_analysis_count": 5,
-                }
-            }
-        }
-        assert _failure_repair_count(payload) == 4
-
-    def test_extraction_returns_zero_when_no_summary(self) -> None:
-        from singularity.evaluation.live import _failure_repair_count
-
-        assert _failure_repair_count({}) == 0
-        assert _failure_repair_count({"planner_summary": {}}) == 0
-        assert _failure_repair_count({"planner_summary": {"failure_repair_summary": {}}}) == 0
-
-
-class TestRepairVerificationContractExtraction:
-    """Verify _repair_verification_contract includes new fields."""
-
-    def test_extraction_includes_repair_counts(self) -> None:
-        from singularity.evaluation.live import _repair_verification_contract
-
-        payload = {
-            "planner_summary": {
-                "failure_repair_summary": {
-                    "verification_contract_id": "vc_1",
-                    "verification_contract_step_count": 2,
-                    "verification_contract_status": "pending",
-                    "verification_contract_validation_errors": [],
-                    "latest_repair_contract_id": "rc_1",
-                    "latest_verification_plan": ["pytest tests/"],
-                    "latest_target_files": ["src/app.py"],
-                    "latest_blocked_reason": None,
-                    "needs_user_input": False,
-                    "repair_plan_count": 3,
-                    "repair_attempt_count": 2,
-                    "repair_execution_count": 1,
-                    "repair_blocked_count": 1,
-                }
-            }
-        }
-        result = _repair_verification_contract(payload)
-        assert result["contract_id"] == "vc_1"
-        assert result["step_count"] == 2
-        assert result["repair_plan_count"] == 3
-        assert result["repair_attempt_count"] == 2
-        assert result["repair_execution_count"] == 1
-        assert result["repair_blocked_count"] == 1
-
-    def test_extraction_not_recorded_when_no_summary(self) -> None:
-        from singularity.evaluation.live import _repair_verification_contract
-
-        result = _repair_verification_contract({})
-        assert result["status"] == "not_recorded"
 
 
 class TestPolicyBlockedNotRepair:
@@ -1838,7 +1762,7 @@ class TestCompletionRejectedRepairTelemetry:
         contract = VerificationContract.from_plan_strings(["pytest tests/"])
         planner.evidence.failure_analyses.append(
             {"analysis_id": "a1", "failure_category": "completion_stalled",
-             "root_cause": {"description": "stalled"}, "root_cause_text": "stalled"}
+             "root_cause": {"description": "stalled"}}
         )
         planner.evidence.repair_plans.append(RepairPlan(
             plan_id="rp_1", analysis_id="a1", strategy="repair_then_verify",
@@ -1893,7 +1817,7 @@ class TestCompletionRejectedRepairTelemetry:
         planner.start_task("fix the bug")
         planner.evidence.failure_analyses.append(
             {"analysis_id": "a1", "failure_category": "unit_test_failure",
-             "root_cause": {"description": "test failed"}, "root_cause_text": "test failed"}
+             "root_cause": {"description": "test failed"}}
         )
         contract = VerificationContract.from_plan_strings(["pytest tests/"])
         planner.evidence.repair_plans.append(RepairPlan(
@@ -1933,12 +1857,10 @@ class TestCompletionRejectedRepairTelemetry:
         assert frs.get("verification_contract_id") is not None
         assert frs.get("latest_repair_contract_id") == "rc_1"
 
-        # Verify the extraction path used by live.py
-        from singularity.evaluation.live import _failure_repair_count, _repair_verification_contract
-        assert _failure_repair_count(kernel_report.to_dict()) >= 1
-        rc = _repair_verification_contract(kernel_report.to_dict())
-        assert rc["status"] != "not_recorded"
-        assert rc["contract_id"] is not None
+        report_payload = kernel_report.to_dict()
+        report_summary = report_payload["planner_summary"]["failure_repair_summary"]
+        assert report_summary["repair_attempt_count"] >= 1
+        assert report_summary["verification_contract_id"] is not None
 
 
 class TestFinalReviewRejectedRepairTelemetry:
@@ -1965,7 +1887,7 @@ class TestFinalReviewRejectedRepairTelemetry:
         contract = VerificationContract.from_plan_strings(["pytest tests/"])
         planner.evidence.failure_analyses.append(
             {"analysis_id": "a_review", "failure_category": "review_rejection",
-             "root_cause": {"description": "review found issues"}, "root_cause_text": "review found issues"}
+             "root_cause": {"description": "review found issues"}}
         )
         planner.evidence.repair_plans.append(RepairPlan(
             plan_id="rp_review", analysis_id="a_review", strategy="repair_then_verify",
@@ -1990,3 +1912,4 @@ class TestFinalReviewRejectedRepairTelemetry:
         assert summary["repair_attempt_count"] == 1
         assert summary["latest_failure_category"] == "review_rejection"
         assert summary["verification_contract_id"] is not None
+

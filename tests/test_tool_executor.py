@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
 from pydantic import BaseModel, Field
 
 from singularity.tools import (
@@ -557,6 +558,56 @@ def test_tool_executor_reports_executed_tool_result_to_planner(tmp_path: Path) -
     assert planner.updates[0]["tool_name"] == "read_file"
     assert planner.updates[0]["result"].ok is True
     assert planner.updates[0]["action_id"].startswith("action_")
+
+
+def test_tool_executor_fails_closed_when_planner_update_fails(tmp_path: Path) -> None:
+    class BrokenPlanner:
+        session_id = "session_1"
+        task_id = "task_1"
+        state = None
+
+        def authorize_tool_call(self, **_kwargs: Any) -> None:
+            return None
+
+        def update_from_tool_result(self, **_kwargs: Any) -> None:
+            raise RuntimeError("planner store unavailable")
+
+    class RecordingTrace:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        def emit(self, event_type, **kwargs: Any) -> None:
+            self.events.append({"event_type": event_type, **kwargs})
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="read_ok",
+            version="0.0.1",
+            description="Read-only success.",
+            input_model=EmptyInput,
+            handler=lambda _args: {"ok": True},
+            permission_level=PermissionLevel.READ_ONLY,
+        )
+    )
+    trace = RecordingTrace()
+    component = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=trace,
+        workspace_root=tmp_path,
+        planner=BrokenPlanner(),
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="planner observation update failed"):
+        component.execute_tool_call(make_tool_call("read_ok", {}, tool_call_id="call_read"))
+
+    assert any(
+        "Planner observation update failed" in event.get("summary", "")
+        and str(event.get("severity")).lower().endswith("error")
+        for event in trace.events
+    )
 
 
 def test_write_file_facade_with_planner_observer_records_one_planner_change(tmp_path: Path) -> None:

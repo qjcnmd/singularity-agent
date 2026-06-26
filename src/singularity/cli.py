@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import subprocess
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import uuid4
 
 import click
@@ -15,15 +15,15 @@ from singularity.cli_paths import resolve_project_root
 from singularity.code_index import ProjectIndex
 from singularity.config import ProductionConfig, adaptive_default_max_turns
 from singularity.evaluation import (
+    EvaluationRunner,
     EvaluationProfile,
     EvaluationHarness,
     GoldenTaskStore,
-    LiveAgentEvalRunner,
     RegressionDetector,
     SingularityPrivateBenchmarkAdapter,
     TargetedFailureReplayRunner,
     TraceReplayHarness,
-    load_live_eval_manifest,
+    load_evaluation_task_set,
 )
 from singularity.git_client.cli import git_app
 from singularity.interaction import RichCliRenderer
@@ -1069,41 +1069,20 @@ def eval_report_show(
     console.print(report_path.read_text(encoding="utf-8"))
 
 
-@eval_live_app.command("run")
-def eval_live_run(
-    task_set: Annotated[Path, typer.Argument(help="Live agent eval task-set JSON path.")],
-    output_dir: Annotated[
-        Path | None,
-        typer.Option("--output-dir", help="Directory for live eval workspaces and result JSON."),
-    ] = None,
-    run_id: Annotated[
-        str | None,
-        typer.Option("--run-id", help="Stable live eval run id."),
-    ] = None,
-    max_turns: Annotated[
-        int | None,
-        typer.Option("--max-turns", min=1, max=40, help="Maximum live model turns per task."),
-    ] = None,
-    model: Annotated[
-        str | None,
-        typer.Option("--model", help="Override SINGULARITY_MODEL for this live eval."),
-    ] = None,
-    base_url: Annotated[
-        str | None,
-        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this live eval."),
-    ] = None,
-    baseline_result: Annotated[
-        Path | None,
-        typer.Option("--baseline-result", help="Explicit previous live eval result.json for regression comparison."),
-    ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
-    project_root: ProjectRootOption = None,
-) -> None:
-    """Run a manifest-driven live-provider agent evaluation."""
-
-    manifest = load_live_eval_manifest(task_set)
+def _run_evaluation_task_set(
+    *,
+    task_set: Path,
+    output_dir: Path | None,
+    run_id: str | None,
+    max_turns: int | None,
+    model: str | None,
+    base_url: str | None,
+    baseline_result: Path | None,
+    project_root: Path | None,
+) -> dict[str, Any]:
+    manifest = load_evaluation_task_set(task_set)
     env_root = resolve_project_root(project_root)
-    result = LiveAgentEvalRunner(
+    return EvaluationRunner(
         output_root=output_dir,
         run_id=run_id,
         max_turns=max_turns,
@@ -1113,94 +1092,261 @@ def eval_live_run(
         env_root=env_root,
         console=console,
     ).run(manifest)
+
+
+@eval_app.command("run")
+def eval_run(
+    task_set: Annotated[Path, typer.Argument(help="Evaluation task set JSON path.")],
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Directory for evaluation workspaces and result JSON."),
+    ] = None,
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Stable evaluation run id."),
+    ] = None,
+    max_turns: Annotated[
+        int | None,
+        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns per task."),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Override SINGULARITY_MODEL for this evaluation."),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this evaluation."),
+    ] = None,
+    baseline_result: Annotated[
+        Path | None,
+        typer.Option("--baseline-result", help="Explicit previous evaluation result.json for regression comparison."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
+) -> None:
+    """Run a manifest-driven agent evaluation."""
+
+    result = _run_evaluation_task_set(
+        task_set=task_set,
+        output_dir=output_dir,
+        run_id=run_id,
+        max_turns=max_turns,
+        model=model,
+        base_url=base_url,
+        baseline_result=baseline_result,
+        project_root=project_root,
+    )
     if json_output:
         _write_stdout(json_dumps(result))
     else:
-        console.print(Panel(json_dumps(result), title="live agent eval", border_style="cyan"))
+        console.print(Panel(json_dumps(result), title="evaluation", border_style="cyan"))
+    if result["summary"]["success_count"] != result["summary"]["task_count"]:
+        raise typer.Exit(1)
+
+
+@eval_live_app.command("run")
+def eval_live_run(
+    task_set: Annotated[Path, typer.Argument(help="Legacy live alias for an evaluation task set JSON path.")],
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Directory for evaluation workspaces and result JSON."),
+    ] = None,
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Stable evaluation run id."),
+    ] = None,
+    max_turns: Annotated[
+        int | None,
+        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns per task."),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Override SINGULARITY_MODEL for this evaluation."),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this evaluation."),
+    ] = None,
+    baseline_result: Annotated[
+        Path | None,
+        typer.Option("--baseline-result", help="Explicit previous evaluation result.json for regression comparison."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
+) -> None:
+    """Compatibility alias for `eval run`."""
+
+    result = _run_evaluation_task_set(
+        task_set=task_set,
+        output_dir=output_dir,
+        run_id=run_id,
+        max_turns=max_turns,
+        model=model,
+        base_url=base_url,
+        baseline_result=baseline_result,
+        project_root=project_root,
+    )
+    if json_output:
+        _write_stdout(json_dumps(result))
+    else:
+        console.print(Panel(json_dumps(result), title="evaluation", border_style="cyan"))
+    if result["summary"]["success_count"] != result["summary"]["task_count"]:
+        raise typer.Exit(1)
+
+
+def _run_private_evaluation_task_set(
+    *,
+    task_set: Path,
+    output_dir: Path | None,
+    run_id: str | None,
+    max_turns: int | None,
+    model: str | None,
+    base_url: str | None,
+    baseline_result: Path | None,
+    project_root: Path | None,
+) -> dict[str, Any]:
+    manifest = SingularityPrivateBenchmarkAdapter().load(task_set)
+    env_root = resolve_project_root(project_root)
+    return EvaluationRunner(
+        output_root=output_dir,
+        run_id=run_id,
+        max_turns=max_turns,
+        model=model,
+        base_url=base_url,
+        baseline_result_path=baseline_result,
+        env_root=env_root,
+        console=console,
+    ).run(manifest)
+
+
+@eval_app.command("private")
+def eval_private(
+    task_set: Annotated[Path, typer.Argument(help="Private BenchmarkTask set JSON/YAML path.")],
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Directory for evaluation workspaces and result JSON."),
+    ] = None,
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Stable evaluation run id."),
+    ] = None,
+    max_turns: Annotated[
+        int | None,
+        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns per task."),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Override SINGULARITY_MODEL for this evaluation."),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this evaluation."),
+    ] = None,
+    baseline_result: Annotated[
+        Path | None,
+        typer.Option("--baseline-result", help="Explicit previous evaluation result.json for regression comparison."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
+) -> None:
+    """Run private BenchmarkTask definitions through the evaluation runner."""
+
+    result = _run_private_evaluation_task_set(
+        task_set=task_set,
+        output_dir=output_dir,
+        run_id=run_id,
+        max_turns=max_turns,
+        model=model,
+        base_url=base_url,
+        baseline_result=baseline_result,
+        project_root=project_root,
+    )
+    if json_output:
+        _write_stdout(json_dumps(result))
+    else:
+        console.print(Panel(json_dumps(result), title="private evaluation", border_style="cyan"))
     if result["summary"]["success_count"] != result["summary"]["task_count"]:
         raise typer.Exit(1)
 
 
 @eval_live_app.command("private")
 def eval_live_private(
-    task_set: Annotated[Path, typer.Argument(help="Private BenchmarkTask set JSON/YAML path.")],
+    task_set: Annotated[Path, typer.Argument(help="Legacy live alias for a private BenchmarkTask set JSON/YAML path.")],
     output_dir: Annotated[
         Path | None,
-        typer.Option("--output-dir", help="Directory for live eval workspaces and result JSON."),
+        typer.Option("--output-dir", help="Directory for evaluation workspaces and result JSON."),
     ] = None,
     run_id: Annotated[
         str | None,
-        typer.Option("--run-id", help="Stable live eval run id."),
+        typer.Option("--run-id", help="Stable evaluation run id."),
     ] = None,
     max_turns: Annotated[
         int | None,
-        typer.Option("--max-turns", min=1, max=40, help="Maximum live model turns per task."),
+        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns per task."),
     ] = None,
     model: Annotated[
         str | None,
-        typer.Option("--model", help="Override SINGULARITY_MODEL for this live eval."),
+        typer.Option("--model", help="Override SINGULARITY_MODEL for this evaluation."),
     ] = None,
     base_url: Annotated[
         str | None,
-        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this live eval."),
+        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this evaluation."),
     ] = None,
     baseline_result: Annotated[
         Path | None,
-        typer.Option("--baseline-result", help="Explicit previous live eval result.json for regression comparison."),
+        typer.Option("--baseline-result", help="Explicit previous evaluation result.json for regression comparison."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Run private BenchmarkTask definitions through the live agent eval runner."""
+    """Compatibility alias for `eval private`."""
 
-    manifest = SingularityPrivateBenchmarkAdapter().load(task_set)
-    env_root = resolve_project_root(project_root)
-    result = LiveAgentEvalRunner(
-        output_root=output_dir,
+    result = _run_private_evaluation_task_set(
+        task_set=task_set,
+        output_dir=output_dir,
         run_id=run_id,
         max_turns=max_turns,
         model=model,
         base_url=base_url,
-        baseline_result_path=baseline_result,
-        env_root=env_root,
-        console=console,
-    ).run(manifest)
+        baseline_result=baseline_result,
+        project_root=project_root,
+    )
     if json_output:
         _write_stdout(json_dumps(result))
     else:
-        console.print(Panel(json_dumps(result), title="private live agent eval", border_style="cyan"))
+        console.print(Panel(json_dumps(result), title="private evaluation", border_style="cyan"))
     if result["summary"]["success_count"] != result["summary"]["task_count"]:
         raise typer.Exit(1)
 
 
-@eval_live_app.command("quicksort")
-def eval_live_quicksort(
+@eval_app.command("provider-smoke")
+def eval_provider_smoke(
     output_dir: Annotated[
         Path | None,
-        typer.Option("--output-dir", help="Directory for the live benchmark workspace and report."),
+        typer.Option("--output-dir", help="Directory for the provider smoke workspace and report."),
     ] = None,
     run_id: Annotated[
         str | None,
-        typer.Option("--run-id", help="Stable live benchmark run id."),
+        typer.Option("--run-id", help="Stable provider smoke run id."),
     ] = None,
     max_turns: Annotated[
         int,
-        typer.Option("--max-turns", min=1, max=40, help="Maximum live model turns."),
+        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns."),
     ] = 12,
     model: Annotated[
         str | None,
-        typer.Option("--model", help="Override SINGULARITY_MODEL for this live benchmark."),
+        typer.Option("--model", help="Override SINGULARITY_MODEL for this provider smoke."),
     ] = None,
     base_url: Annotated[
         str | None,
-        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this live benchmark."),
+        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this provider smoke."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
     project_root: ProjectRootOption = None,
 ) -> None:
-    """Run the live provider through a controlled quicksort create-and-verify task."""
+    """Run the configured provider through a controlled quicksort create-and-verify task."""
 
-    result = _run_live_quicksort_benchmark(
+    result = _run_provider_smoke_benchmark(
         output_dir=output_dir,
         run_id=run_id,
         max_turns=max_turns,
@@ -1211,12 +1357,55 @@ def eval_live_quicksort(
     if json_output:
         _write_stdout(json_dumps(result))
         return
-    console.print(Panel(json_dumps(result), title="live quicksort benchmark", border_style="cyan"))
+    console.print(Panel(json_dumps(result), title="provider smoke", border_style="cyan"))
     if not result["ok"]:
         raise typer.Exit(1)
 
 
-def _run_live_quicksort_benchmark(
+@eval_live_app.command("quicksort")
+def eval_live_quicksort(
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Directory for the provider smoke workspace and report."),
+    ] = None,
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Stable provider smoke run id."),
+    ] = None,
+    max_turns: Annotated[
+        int,
+        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns."),
+    ] = 12,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Override SINGULARITY_MODEL for this provider smoke."),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option("--base-url", help="Override SINGULARITY_BASE_URL for this provider smoke."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
+) -> None:
+    """Compatibility alias for `eval provider-smoke`."""
+
+    result = _run_provider_smoke_benchmark(
+        output_dir=output_dir,
+        run_id=run_id,
+        max_turns=max_turns,
+        model=model,
+        base_url=base_url,
+        project_root=resolve_project_root(project_root),
+    )
+    if json_output:
+        _write_stdout(json_dumps(result))
+        return
+    console.print(Panel(json_dumps(result), title="provider smoke", border_style="cyan"))
+    if not result["ok"]:
+        raise typer.Exit(1)
+
+
+def _run_provider_smoke_benchmark(
     *,
     output_dir: Path | None,
     run_id: str | None,
@@ -1224,15 +1413,15 @@ def _run_live_quicksort_benchmark(
     model: str | None,
     base_url: str | None,
     project_root: Path | None = None,
-) -> dict[str, object]:
-    resolved_run_id = run_id or f"live_quicksort_{uuid4().hex[:8]}"
-    root = (output_dir or (Path.cwd() / "work" / "evaluations-live")).expanduser().resolve(strict=False)
+) -> dict[str, Any]:
+    resolved_run_id = run_id or f"provider_smoke_{uuid4().hex[:8]}"
+    root = (output_dir or (Path.cwd() / "work" / "evaluations")).expanduser().resolve(strict=False)
     workspace = root / resolved_run_id / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     readme = workspace / "README.md"
     if not readme.exists():
         readme.write_text(
-            "Live benchmark workspace. Create quicksort.py and verify it with python quicksort.py.\n",
+            "Provider smoke workspace. Create quicksort.py and verify it with python quicksort.py.\n",
             encoding="utf-8",
         )
     goal = (
@@ -1248,7 +1437,7 @@ def _run_live_quicksort_benchmark(
         env_root=project_root or Path.cwd(),
         approval_mode=ApprovalMode.AUTO_SAFE,
         security_mode=SecurityMode.COMPAT,
-        profile="live-quicksort",
+        profile="evaluation-provider-smoke",
         cli_overrides={"max_turns", "model", "base_url", "approval_mode", "security_mode", "profile"},
     )
     kernel = KernelBootstrap(project_root=workspace, config=config, console=console).boot(goal)
@@ -1266,8 +1455,8 @@ def _run_live_quicksort_benchmark(
         artifact_ok = bool(quicksort_path.exists() and smoke is not None and smoke.returncode == 0)
         agent_completed = agent_result.status == RunStatus.COMPLETED
         return {
-            "schema_version": "evaluation.live_provider_benchmark/v1",
-            "benchmark": "quicksort",
+            "schema_version": "evaluation.provider_smoke/v1",
+            "benchmark": "provider_quicksort",
             "run_id": resolved_run_id,
             "ok": artifact_ok,
             "agent_completed": agent_completed,
@@ -1286,6 +1475,9 @@ def _run_live_quicksort_benchmark(
         close_resources = getattr(kernel, "close_resources", None)
         if callable(close_resources):
             close_resources()
+
+
+_run_live_quicksort_benchmark = _run_provider_smoke_benchmark
 
 
 def _profiles_from_cli(profile_json: list[str] | None) -> list[EvaluationProfile]:

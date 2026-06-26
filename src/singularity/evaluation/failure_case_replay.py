@@ -11,7 +11,7 @@ FAILURE_CASE_REPLAY_SCHEMA_VERSION = "evaluation.failure_case_replay/v1"
 
 
 class FailureCaseReplayRunner:
-    """Extract bounded replay records from live-eval failure reports.
+    """Extract bounded replay records from evaluation failure reports.
 
     This runner is intentionally post-run extraction only. Targeted execution
     replay lives in ``TargetedFailureReplayRunner``.
@@ -74,8 +74,8 @@ class FailureCaseReplayRunner:
             trace_path=trace_path,
             trace_artifact_refs=[str(item) for item in task.get("trace_artifact_refs") or []],
             contract_satisfaction=dict(task.get("contract_satisfaction") or {}),
-            repair_telemetry=dict(task.get("repair_verification_contract") or {}),
-            verification=dict(task.get("task_verification_result") or task.get("verification_result") or {}),
+            repair_telemetry=_repair_telemetry(task),
+            verification=dict(task.get("verification_result") or task.get("task_verification_result") or {}),
             trace_summary=_trace_summary(Path(trace_path)),
             source_report_path=str(self.report_path),
             source_regression_path=str(self.regression_path or ""),
@@ -84,6 +84,16 @@ class FailureCaseReplayRunner:
 
 def _task_succeeded(task: dict[str, Any]) -> bool:
     return bool(task.get("success") is True and task.get("miscompletion_count") in {0, None})
+
+
+def _repair_telemetry(task: dict[str, Any]) -> dict[str, Any]:
+    contract_satisfaction = task.get("contract_satisfaction")
+    if isinstance(contract_satisfaction, dict):
+        repair_phase = contract_satisfaction.get("repair_phase_contract_satisfaction")
+        if isinstance(repair_phase, dict):
+            return dict(repair_phase)
+    legacy = task.get("repair_verification_contract")
+    return dict(legacy) if isinstance(legacy, dict) else {}
 
 
 def _trace_summary(trace_path: Path) -> dict[str, Any]:
