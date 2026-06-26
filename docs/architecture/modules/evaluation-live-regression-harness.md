@@ -3,6 +3,7 @@
 Runtime flow doc id: evaluation-live-regression-harness
 Source paths:
 - src/singularity/evaluation/live.py
+- src/singularity/evaluation/targeted_replay.py
 - src/singularity/cli.py
 - src/singularity/kernel/bootstrap.py
 - src/singularity/kernel/agent_kernel.py
@@ -25,6 +26,10 @@ Symbols:
 - LiveAgentEvalRunner
 - LiveAgentEvalRunner.run
 - LiveAgentEvalRunner.run_task
+- TargetedFailureReplayRunner
+- TargetedFailureReplayRunner.run_smoke
+- TargetedFailureReplayResult
+- TargetedFailureReplayResult.to_dict
 - load_live_eval_manifest
 - summarize_live_results
 - compare_live_eval_results
@@ -61,6 +66,7 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 - `src/singularity/evaluation/live.py`: manifest models, live runner, report schema, public/hidden verification, command interpreter strategy, regression comparison.
 - `src/singularity/evaluation/models.py`: shared evaluation dataclasses, including `FailureCaseRecord`.
 - `src/singularity/evaluation/failure_case_replay.py`: `FailureCaseReplayRunner` extraction from live report and trace summaries.
+- `src/singularity/evaluation/targeted_replay.py`: `TargetedFailureReplayRunner` deterministic smoke that drives the real `AgentLoop.run()` repair path and emits explicit repair-activation evidence.
 - `src/singularity/cli.py`: `eval live run` and `eval live private` CLI entrypoints.
 - `src/singularity/kernel/bootstrap.py`: `KernelBootstrap.boot()` constructs the graph and kernel.
 - `src/singularity/kernel/agent_kernel.py`: `AgentKernel.run_task()` creates and runs `AgentLoop`.
@@ -84,7 +90,8 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 11. Hidden verification uses `hidden_verification_command` when declared, otherwise `verification_command`.
 12. `_contract_satisfaction()` evaluates allowed scope, independent verification, public verification, final report status, patch applicability, expected file changes, completion standard recording, risk tag recording, and expected blocked outcomes.
 13. `_task_result()` emits the per-task Eval Report schema fields, including `success`, `completed`, `patch_applicable`, `public_verification_passed`, `hidden_verification_passed`, `contract_satisfaction`, `miscompletion_count`, repair telemetry, turn/tool counts, blocking reason, failure category, and final report status.
-14. `FailureCaseReplayRunner.write()` reads the written live report and emits `failure_cases.json` with one `FailureCaseRecord` for each failed task. This is post-run evaluator extraction; it does not call planner, failure analyzer, verification runner, or model internals.
+14. `FailureCaseReplayRunner.write()` reads the written live report and emits `failure_cases.json` with one `FailureCaseRecord` for each failed task. This is post-run evaluator extraction; it does not call planner, failure analyzer, verification runner, or model internals. The payload declares `runner_mode="post_run_failure_extraction"` and points targeted execution replay to `TargetedFailureReplayRunner`.
+15. `TargetedFailureReplayRunner.run_smoke()` is a separate targeted smoke API. It creates a deterministic workspace, scripted provider, normal tool registry/executor/protocol, planner, verification runner, policy engine, and trace recorder, then calls `AgentLoop.run()` to exercise `verification_failed -> FailureAnalysisRequest -> FailureAnalysisResult -> RepairPlan/RepairContract -> repairing_failures -> VerificationContract satisfaction -> completed`.
 
 ## Runtime Objects Passed
 
@@ -94,8 +101,9 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 - `CommandEvalResult`: raw command string, resolved argv, interpreter strategy, exit code, duration, timeout state, sanitized first-line error summary, pass/fail state, and command failure category.
 - `LiveEvalTaskResult`: per-task Eval Report object with runtime telemetry, patch/check evidence, verification result, contract satisfaction, repair contract summary, reproducible environment, and AgentLoop reference.
 - `FailureCaseRecord`: replayable failed-task metadata with schema version, task id, status, failure category, miscompletion count, public/hidden verification booleans, policy blocks, expected file changes, actual changed files, final report status, repair attempt/execution counts, blocked reason, report/regression paths, trace path, trace artifact refs, contract satisfaction, repair telemetry, verification payload, and bounded trace summary.
+- `TargetedFailureReplayResult`: deterministic smoke evidence with schema version, AgentLoop entry flag/ref, trigger category, FailureAnalyzer request/result counts, authoritative repair plan/contract counts, repair attempt/execution counts, repair phase observation, verification-contract satisfaction, repair scope checks, final report status, trace path, and model-visible/internal object boundary labels.
 - `result.json`/`report.json`: suite payload with summary, task results, duration, optional regression comparison, and artifact paths.
-- `failure_cases.json`: evaluator-owned replay package with schema version, source report/regression paths, failure count, and serialized `FailureCaseRecord` entries.
+- `failure_cases.json`: evaluator-owned extraction package with schema version, `runner_mode`, targeted-runner label, source report/regression paths, failure count, and serialized `FailureCaseRecord` entries.
 
 ## Model-Visible Objects
 
@@ -113,7 +121,7 @@ When `verification_prepare_commands` are present, hidden evaluator setup remains
 
 Planner benchmark constraints receive only `_model_visible_verification_command(task)`. Hidden verifier commands are not injected into planner verification requirements unless they are also public.
 
-`FailureCaseRecord` and `failure_cases.json` are never model-visible during the original live run. They are evaluator-internal replay inputs for later diagnostics and targeted regression.
+`FailureCaseRecord` and `failure_cases.json` are never model-visible during the original live run. They are evaluator-internal extraction records for later diagnostics and targeted regression. `TargetedFailureReplayRunner` can run a deterministic smoke later, but that smoke uses normal `AgentLoop.run()` model context and does not make prior `FailureCaseRecord` objects visible to the task model.
 
 ## Internal Trace Debug Audit Objects
 
@@ -130,6 +138,7 @@ Internal-only evaluation data includes:
 - `reproducible_environment.model_profile.sources`;
 - command interpreter diagnostics such as `resolved_argv` and `harness_executable`.
 - `FailureCaseReplayRunner._trace_summary()` bounded trace extraction, including event count, failure-analysis event count, repair event count, final-report outcome, blocked reasons, and the last phase-policy blocks.
+- `TargetedFailureReplayResult.evaluator_internal_objects`, which labels evaluation-only objects such as `FailureCaseRecord`, `FailureCaseReplayRunner.extract`, and `failure_cases.json`.
 
 Provider secrets are not part of the report payload. The report records redacted provider/model/config status through the normal config/effective-config path.
 
@@ -140,8 +149,9 @@ Provider secrets are not part of the report payload. The report records redacted
 - Provider/network infrastructure failures are classified as `infrastructure_blocked` and do not run independent verification.
 - Patch applicability is false when a patch is required and the clean verification workspace cannot reproduce the agent workspace changes, or when required `expected_file_changes` are absent.
 - Public verification failure, hidden verification failure, changed files outside `allowed_paths`, failed success criteria, and patch failure all make `success=false`.
-- If the final report claims completed/finalized but the live task contract fails, `_task_result()` records `miscompletion_count=1`.
+- If the final report or agent status claims completed/success but the live task contract fails, `_task_result()` records `miscompletion_count=1`; suite summary uses the same completed/success-only predicate.
 - `_completed()` counts only explicit completed/success agent statuses as completed. A kernel-finalized blocked run is not counted as task completion.
+- `summarize_live_results()` counts `completed_count` only from `LiveEvalTaskResult.completed` or `final_report_status in {"completed", "success"}`. A `final_report_status="finalized"` value by itself is kernel finalization, not task completion, and is not counted as completed or miscompleted unless the task result separately records completed status.
 - `failure_cases.json` is written even when no tasks failed; in that case `failure_count=0` and `records=[]`.
 - `_run_shell()` parses manifest command strings with `shlex.split(posix=True)`, executes with `shell=False`, maps bare `python`/`python3`/`py` to the current harness `sys.executable`, and records command parse, timeout, command-not-found, dependency-missing, verification-failed, or command-failed categories.
 - Model-assisted planner/failure/final-review paths can participate only through the real AgentLoop. They cannot bypass policy, approval, sandbox, schema validation, benchmark contract satisfaction, or independent verification.
@@ -151,6 +161,8 @@ Provider secrets are not part of the report payload. The report records redacted
 The live runner already uses the real runtime path and independent verification workspace, which makes it a suitable capability regression harness rather than a synthetic evaluator. The current report schema now exposes stable per-task telemetry fields needed for regression analysis: completion state, patch applicability, public/hidden verification pass state, contract satisfaction, repair attempts/executions, turns, tool calls, blocked reason, failure category, and final report status.
 
 The V-7 focused manifest remains a one-task smoke check. The multi-task manifest is the primary capability regression entrypoint and covers simple patch, multi-file reasoning, failure-repair, and completion-gate task classes.
+
+The `FailureCaseReplayRunner` name is retained for compatibility, but its payload and docstring now identify it as post-run failure extraction. Actual targeted execution replay is the separate `TargetedFailureReplayRunner` API, so extraction artifacts cannot be mistaken for proof that the repair loop was activated.
 
 ## Production-Grade Target Structure
 
@@ -193,6 +205,7 @@ Update this document when changing:
 - `_run_shell()` command parsing, interpreter mapping, or failure taxonomy;
 - `_contract_satisfaction()` and miscompletion semantics;
 - live eval report, summary, regression, failure replay, or reproducible environment fields.
+- `TargetedFailureReplayRunner`, `TargetedFailureReplayResult`, or targeted repair-activation smoke evidence fields.
 
 ## Verification
 

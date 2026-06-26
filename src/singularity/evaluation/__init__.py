@@ -18,6 +18,10 @@ from singularity.evaluation.models import (
     WorkspaceSnapshotKind,
 )
 from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
+from singularity.evaluation.targeted_replay import (
+    TargetedFailureReplayResult,
+    TargetedFailureReplayRunner,
+)
 from singularity.evaluation.patch_quality import PatchQualityEvaluator
 from singularity.evaluation.replay import TraceReplayHarness
 from singularity.evaluation.reports import (
@@ -84,6 +88,8 @@ __all__ = [
     "TaskInput",
     "TraceReplayResult",
     "TraceReplayHarness",
+    "TargetedFailureReplayResult",
+    "TargetedFailureReplayRunner",
     "WorkspaceSnapshot",
     "WorkspaceSnapshotKind",
     "compare_live_eval_results",

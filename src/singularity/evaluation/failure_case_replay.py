@@ -11,7 +11,11 @@ FAILURE_CASE_REPLAY_SCHEMA_VERSION = "evaluation.failure_case_replay/v1"
 
 
 class FailureCaseReplayRunner:
-    """Extract bounded replay records from live-eval failure reports."""
+    """Extract bounded replay records from live-eval failure reports.
+
+    This runner is intentionally post-run extraction only. Targeted execution
+    replay lives in ``TargetedFailureReplayRunner``.
+    """
 
     def __init__(self, *, report_path: Path | str, regression_path: Path | str | None = None) -> None:
         self.report_path = Path(report_path)
@@ -35,6 +39,8 @@ class FailureCaseReplayRunner:
         records = self.extract(task_id=task_id)
         payload = {
             "schema_version": FAILURE_CASE_REPLAY_SCHEMA_VERSION,
+            "runner_mode": "post_run_failure_extraction",
+            "targeted_replay_runner": "TargetedFailureReplayRunner",
             "source_report_path": str(self.report_path),
             "source_regression_path": str(self.regression_path or ""),
             "failure_count": len(records),

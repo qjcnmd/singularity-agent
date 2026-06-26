@@ -1000,7 +1000,7 @@ def summarize_live_results(results: list[LiveEvalTaskResult]) -> dict[str, Any]:
             reason = result.failure_category if result.failure_category and result.failure_category != "none" else result.status
             failures[reason or "failure"] = failures.get(reason or "failure", 0) + 1
         miscompletion_count += result.miscompletion_count or int(
-            result.final_report_status in {"completed", "finalized"} and not result.success
+            _summary_completed(result) and not result.success
         )
     return {
         "task_count": task_count,
@@ -1034,11 +1034,7 @@ def summarize_live_results(results: list[LiveEvalTaskResult]) -> dict[str, Any]:
         )
         if scored_task_count
         else 0.0,
-        "completed_count": sum(
-            1
-            for result in scored_results
-            if result.completed or result.final_report_status in {"completed", "finalized"}
-        ),
+        "completed_count": sum(1 for result in scored_results if _summary_completed(result)),
         "failure_repair_count": sum(result.failure_repair_count for result in results),
         "repair_attempt_count": sum(result.repair_attempt_count for result in results),
         "repair_execution_count": sum(result.repair_execution_count for result in results),
@@ -1482,6 +1478,10 @@ def _final_report_status(payload: dict[str, Any], *, agent_status: str) -> str:
     if isinstance(payload, dict) and payload.get("kernel_status"):
         return str(payload["kernel_status"])
     return agent_status
+
+
+def _summary_completed(result: LiveEvalTaskResult) -> bool:
+    return bool(result.completed or result.final_report_status in {"completed", "success"})
 
 
 def _failure_repair_count(payload: dict[str, Any]) -> int:

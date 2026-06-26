@@ -272,6 +272,53 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
     }
 
 
+def test_summarize_live_results_does_not_count_kernel_finalized_as_completed(tmp_path: Path) -> None:
+    finalized_only = LiveEvalTaskResult(
+        task_id="kernel-finalized-blocked",
+        success=False,
+        tests_passed=False,
+        infrastructure_blocked=False,
+        prompt_tokens=10,
+        cached_tokens=0,
+        request_cache_hit_rate=0.0,
+        run_cache_hit_rate=0.0,
+        tool_calls=0,
+        files_changed=[],
+        duration_seconds=1.0,
+        error_summary="agent status: blocked",
+        workspace=str(tmp_path),
+        trace=str(tmp_path / "trace"),
+        status="blocked",
+        final_report_status="finalized",
+        completed=False,
+    )
+    false_completed = LiveEvalTaskResult(
+        task_id="completed-but-verification-failed",
+        success=False,
+        tests_passed=False,
+        infrastructure_blocked=False,
+        prompt_tokens=10,
+        cached_tokens=0,
+        request_cache_hit_rate=0.0,
+        run_cache_hit_rate=0.0,
+        tool_calls=0,
+        files_changed=[],
+        duration_seconds=1.0,
+        error_summary="verification failed",
+        workspace=str(tmp_path),
+        trace=str(tmp_path / "trace2"),
+        status="verification_failed",
+        final_report_status="completed",
+        completed=True,
+    )
+
+    summary = summarize_live_results([finalized_only, false_completed])
+
+    assert summary["completed_count"] == 1
+    assert summary["miscompletion_count"] == 1
+    assert summary["failure_reasons"] == {"blocked": 1, "verification_failed": 1}
+
+
 def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
     manifest_payload = {
@@ -1277,6 +1324,8 @@ def test_failure_case_replay_runner_extracts_live_failure_record(tmp_path: Path)
     assert record["trace_summary"]["final_report_outcome"] == "blocked"
     assert record["trace_summary"]["phase_policy_blocks"][0]["phase"] == "running_verification"
     saved = json.loads(output_path.read_text(encoding="utf-8"))
+    assert saved["runner_mode"] == "post_run_failure_extraction"
+    assert saved["targeted_replay_runner"] == "TargetedFailureReplayRunner"
     assert saved["failure_count"] == 1
 
 

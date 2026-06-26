@@ -87,7 +87,7 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 7. Policy code calls `PolicyAuditWriter.append()` with `PolicyRequest` and `PolicyDecision`.
 8. Review code calls `ReviewPipeline._emit()` to send review lifecycle events.
 9. Planner records review and diff observations in `Planner.record_review_observation()` and `record_diff_observation()`.
-10. After live eval writes `report.json`, `FailureCaseReplayRunner` may read task trace `events.jsonl` and copy only bounded diagnostic counts, final-report outcome, blocked reasons, and recent phase-policy blocks into `failure_cases.json`.
+10. After live eval writes `report.json`, `FailureCaseReplayRunner` may read task trace `events.jsonl` and copy only bounded diagnostic counts, final-report outcome, blocked reasons, and recent phase-policy blocks into `failure_cases.json`. That package is marked `runner_mode="post_run_failure_extraction"`; targeted execution replay is a separate evaluation API.
 
 ## Runtime Objects Passed
 
@@ -98,6 +98,7 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 - Review trace payloads: review stage, findings, decision, report id, transaction id, verification id, policy decision id.
 - Semantic Planner / Final Reviewer trace events: `semantic_planner.task_contract.model_ok`, `semantic_planner.task_contract.fallback`, `semantic_planner.semantic_plan.model_ok`, `semantic_planner.semantic_plan.fallback`, `semantic_planner.planner_decision.model_ok`, `semantic_planner.planner_decision.fallback`, `final_reviewer.assess.done`, `final_reviewer.assess.model_ok`, and `final_reviewer.assess.fallback`.
 - Failure replay trace summary: events path, event count, availability flag, failure-analysis event count, repair event count, final-report outcome, blocked reasons, and recent phase-policy blocks. This is a derived evaluator object, not a trace-store schema change.
+- Failure replay package metadata: `runner_mode` and `targeted_replay_runner` labels written by `FailureCaseReplayRunner.write()` so readers distinguish extraction from execution replay.
 
 ## Model-Visible Objects (模型实际可见对象)
 
@@ -126,6 +127,7 @@ Internal-only objects include:
 - context event rows and raw observation storage after redaction;
 - review internal evidence and decision ids.
 - full live-eval task trace files read by `FailureCaseReplayRunner`; only bounded summaries are copied into replay records.
+- `failure_cases.json` package metadata that identifies extraction-only mode and the separate targeted replay runner.
 
 ## State Transitions And Failure Paths
 
@@ -175,6 +177,7 @@ Update this document when changing:
 - review trace event payloads;
 - planner diff/review observation fields;
 - `FailureCaseReplayRunner._trace_summary()` or fields copied from trace into failure replay artifacts;
+- `FailureCaseReplayRunner.write()` metadata that classifies failure replay artifacts;
 - any decision to render trace/audit data into model context.
 
 ## Verification
