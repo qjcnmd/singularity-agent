@@ -901,3 +901,52 @@ def test_cli_eval_private_uses_private_benchmark_adapter(tmp_path: Path, monkeyp
     assert removed.exit_code != 0
     assert "No such command" in removed.output
 
+
+def test_cli_eval_run_accepts_legacy_live_manifest_through_canonical_command(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task_set = tmp_path / "legacy-live.json"
+    task_set.write_text(
+        json.dumps(
+            {
+                "schema_version": "evaluation.live_agent_task_set/v1",
+                "tasks": [
+                    {
+                        "task_id": "live.cli",
+                        "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                        "user_task": "Say done.",
+                        "allowed_paths": ["."],
+                        "verification_command": "python -c \"print('ok')\"",
+                        "success": {"type": "verification_exit_code", "exit_code": 0},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    seen = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs) -> None:
+            seen["kwargs"] = kwargs
+
+        def run(self, manifest):
+            seen["task_id"] = manifest.tasks[0].task_id
+            seen["schema_version"] = manifest.schema_version
+            return {
+                "schema_version": "evaluation.result/v1",
+                "run_id": "canonical",
+                "summary": {"success_count": 1, "task_count": 1},
+                "tasks": [],
+            }
+
+    monkeypatch.setattr("singularity.cli.EvaluationRunner", FakeRunner)
+
+    result = runner.invoke(app, ["eval", "run", str(task_set), "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["run_id"] == "canonical"
+    assert seen["task_id"] == "live.cli"
+    assert seen["schema_version"] == "evaluation.task_set/v1"
+

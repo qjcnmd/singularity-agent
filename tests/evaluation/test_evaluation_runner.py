@@ -68,6 +68,34 @@ def test_load_evaluation_regression_manifest_declares_required_task_classes() ->
     assert "completion-gate" in by_type["completion_gate"].risk_tags
 
 
+def test_load_evaluation_task_set_accepts_legacy_live_schema_for_input_only(tmp_path: Path) -> None:
+    task_set = tmp_path / "legacy-live-task-set.json"
+    task_set.write_text(
+        json.dumps(
+            {
+                "schema_version": "evaluation.live_agent_task_set/v1",
+                "tasks": [
+                    {
+                        "task_id": "live.legacy",
+                        "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                        "user_task": "Say done.",
+                        "allowed_paths": ["."],
+                        "verification_command": f"{json.dumps(sys.executable)} -c \"print('ok')\"",
+                        "success": {"type": "verification_exit_code", "exit_code": 0},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = load_evaluation_task_set(task_set)
+
+    assert manifest.schema_version == EVALUATION_TASK_SET_SCHEMA_VERSION
+    assert manifest.tasks[0].task_id == "live.legacy"
+    assert manifest.tasks[0].workspace.kind == "fixture"
+
+
 def test_load_v7_focused_smoke_manifest_remains_single_task() -> None:
     manifest = load_evaluation_task_set(Path("docs/evaluation/capability-fix-math-test-only.json"))
 
@@ -584,6 +612,112 @@ def test_evaluation_runner_compares_against_previous_run(tmp_path: Path) -> None
     assert second["regression"]["task_diffs"][0]["task_id"] == "fake.regression"
     assert Path(second["regression_path"]).exists()
     assert Path(second["regression_markdown_path"]).exists()
+
+
+def test_evaluation_runner_accepts_legacy_live_baseline_result(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.legacy_baseline",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Write done.txt with ok.",
+                    "allowed_paths": ["done.txt"],
+                    "expected_file_changes": ["done.txt"],
+                    "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').read_text(encoding='utf-8') == 'ok'\"",
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+    baseline_result = tmp_path / "legacy-result.json"
+    baseline_result.write_text(
+        json.dumps(
+            {
+                "schema_version": "evaluation.live_agent_eval_result/v1",
+                "run_id": "legacy_live",
+                "summary": {
+                    "success_rate": 1.0,
+                    "verification_pass_rate": 1.0,
+                    "average_turns": 2.0,
+                    "average_tool_calls": 1.0,
+                    "policy_blocks": 0,
+                    "miscompletion_count": 0,
+                },
+                "tasks": [
+                    {
+                        "task_id": "fake.legacy_baseline",
+                        "status": "success",
+                        "success": True,
+                        "tests_passed": True,
+                        "turn_count": 2,
+                        "tool_call_count": 3,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1, "input_tokens": 10}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="candidate",
+        baseline_result_path=baseline_result,
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    assert result["regression"]["baseline_run_id"] == "legacy_live"
+    assert result["regression"]["task_diffs"][0]["baseline_success"] is True
+    assert result["regression"]["task_diffs"][0]["tool_call_delta"] == -2
+    assert result["schema_version"] == EVALUATION_RESULT_SCHEMA_VERSION
 
 
 def test_evaluation_maps_bare_python_verification_to_harness_executable(tmp_path: Path) -> None:

@@ -32,6 +32,8 @@ from singularity.policy import ApprovalMode, SecurityMode
 
 EVALUATION_TASK_SET_SCHEMA_VERSION = "evaluation.task_set/v1"
 EVALUATION_RESULT_SCHEMA_VERSION = "evaluation.result/v1"
+LEGACY_LIVE_TASK_SET_SCHEMA_VERSION = "evaluation.live_agent_task_set/v1"
+LEGACY_LIVE_RESULT_SCHEMA_VERSION = "evaluation.live_agent_eval_result/v1"
 
 _PATCH_REDACTOR = ContextRedactor()
 
@@ -192,7 +194,10 @@ class EvaluationTaskSet:
     @classmethod
     def from_dict(cls, payload: dict[str, Any], *, base_dir: Path) -> "EvaluationTaskSet":
         schema_version = str(payload.get("schema_version") or "")
-        if schema_version != EVALUATION_TASK_SET_SCHEMA_VERSION:
+        if schema_version not in {
+            EVALUATION_TASK_SET_SCHEMA_VERSION,
+            LEGACY_LIVE_TASK_SET_SCHEMA_VERSION,
+        }:
             raise ValueError(f"Unsupported evaluation schema_version: {schema_version}")
         tasks_payload = payload.get("tasks")
         if not isinstance(tasks_payload, list) or not tasks_payload:
@@ -1065,7 +1070,7 @@ def compare_evaluation_results(
                 "baseline_success": _evaluation_passed_from_payload(previous),
                 "candidate_success": _evaluation_passed_from_payload(item),
                 "turn_delta": _safe_int(item.get("turn_count")) - _safe_int(previous.get("turn_count")),
-                "tool_call_delta": _safe_int(item.get("tool_calls")) - _safe_int(previous.get("tool_calls")),
+                "tool_call_delta": _payload_tool_calls(item) - _payload_tool_calls(previous),
                 "verification_changed": bool(previous.get("tests_passed")) != bool(item.get("tests_passed")),
                 "trace_artifact_refs": list(item.get("trace_artifact_refs") or []),
             }
@@ -1201,7 +1206,7 @@ def _previous_evaluation_result(
             payload = json.loads(baseline_result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        if isinstance(payload, dict) and payload.get("schema_version") == EVALUATION_RESULT_SCHEMA_VERSION:
+        if isinstance(payload, dict) and _is_supported_evaluation_result(payload):
             return payload
         return None
     candidates: list[tuple[int, Path]] = []
@@ -1219,9 +1224,16 @@ def _previous_evaluation_result(
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict) and payload.get("schema_version") == EVALUATION_RESULT_SCHEMA_VERSION:
+        if isinstance(payload, dict) and _is_supported_evaluation_result(payload):
             return payload
     return None
+
+
+def _is_supported_evaluation_result(payload: dict[str, Any]) -> bool:
+    return payload.get("schema_version") in {
+        EVALUATION_RESULT_SCHEMA_VERSION,
+        LEGACY_LIVE_RESULT_SCHEMA_VERSION,
+    }
 
 
 def _workspace_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1482,6 +1494,12 @@ def _evaluation_passed_from_payload(payload: dict[str, Any]) -> bool:
     if "evaluation_passed" in payload:
         return bool(payload.get("evaluation_passed"))
     return bool(payload.get("success"))
+
+
+def _payload_tool_calls(payload: dict[str, Any]) -> int:
+    if "tool_calls" in payload:
+        return _safe_int(payload.get("tool_calls"))
+    return _safe_int(payload.get("tool_call_count"))
 
 
 def _failure_repair_summary(payload: dict[str, Any]) -> dict[str, Any]:

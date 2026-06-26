@@ -33,6 +33,8 @@ from singularity.evaluation.reports import (
 from singularity.evaluation.runner import (
     EVALUATION_RESULT_SCHEMA_VERSION,
     EVALUATION_TASK_SET_SCHEMA_VERSION,
+    LEGACY_LIVE_RESULT_SCHEMA_VERSION,
+    LEGACY_LIVE_TASK_SET_SCHEMA_VERSION,
     CommandEvalResult,
     EvaluationRunner,
     EvaluationTask,
@@ -70,6 +72,8 @@ __all__ = [
     "CommandEvalResult",
     "EVALUATION_RESULT_SCHEMA_VERSION",
     "EVALUATION_TASK_SET_SCHEMA_VERSION",
+    "LEGACY_LIVE_RESULT_SCHEMA_VERSION",
+    "LEGACY_LIVE_TASK_SET_SCHEMA_VERSION",
     "EvaluationRunner",
     "EvaluationTask",
     "EvaluationTaskResult",

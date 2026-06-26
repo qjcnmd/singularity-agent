@@ -162,7 +162,7 @@ Provider secrets are not part of the report payload. The report records redacted
 ## State Transitions And Failure Paths
 
 - Task-set loading fails fast on invalid schema version, missing tasks, missing `task_id`, missing `user_task`, missing `allowed_paths`, missing `verification_command`, unsupported tool policy, unsupported approval mode, or repo task without `start_commit`/prepare command.
-- `EvaluationTaskSet.from_dict()` accepts only `evaluation.task_set/v1`. Result comparison accepts only `evaluation.result/v1` baseline artifacts.
+- `EvaluationTaskSet.from_dict()` emits the canonical `evaluation.task_set/v1` in memory and accepts the retired `evaluation.live_agent_task_set/v1` only as migration input. Result comparison emits canonical `evaluation.result/v1` artifacts and accepts retired `evaluation.live_agent_eval_result/v1` baseline artifacts only for read-only regression comparison.
 - Prepare command failure returns a structured task result before kernel boot.
 - Provider/network infrastructure failures are classified as `infrastructure_blocked` and do not run independent verification.
 - Patch applicability is false when a patch is required and the clean verification workspace cannot reproduce the agent workspace changes, or when required `expected_file_changes` are absent.
@@ -177,7 +177,7 @@ Provider secrets are not part of the report payload. The report records redacted
 
 ## Current Structure Assessment
 
-The canonical evaluation runner uses mainstream evaluation/benchmark/task/result/report naming. Retired evaluation aliases from the previous naming cleanup are not part of current code or docs.
+The canonical evaluation runner uses mainstream evaluation/benchmark/task/result/report naming. Retired evaluation aliases from the previous naming cleanup are not part of the current CLI, output schemas, or docs examples. The only retained migration behavior is read-only loading of retired live task-set and baseline-result schema ids.
 
 The current report schema separates agent completion from evaluator pass state and preserves miscompletion detection. It no longer writes presentation-only provenance fields or duplicate aliases such as `tool_call_count`, `task_verification_result`, `failure_repair_count`, `result_extraction`, `repair_verification_contract`, or `agent_loop_ref`.
 
