@@ -10,7 +10,6 @@ from rich.console import Console
 from singularity.agent_loop import AgentLoop, AgentLoopStatus
 from singularity.command import CommandExecutor
 from singularity.edit import EditExecutor
-from singularity.failure_analysis import VerificationContract
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import ModelRunner
@@ -23,6 +22,7 @@ from singularity.tools.edit import register_edit_tools
 from singularity.tools.mutation import register_mutation_tools
 from singularity.tools.verification import register_verification_tools
 from singularity.verification import VerificationRunner
+from singularity.verification.contract import VerificationContract
 from singularity.workspace import WorkspaceMutationManager
 
 

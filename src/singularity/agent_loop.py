@@ -10,13 +10,14 @@ from rich.console import Console
 
 from singularity.context import ContextManager
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
-from singularity.failure_analysis import FailureAnalysisRequest, FailureAnalyzer, RepairPlanner
+from singularity.failure_analysis import FailureAnalysisRequest, FailureAnalyzer
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.interaction import InteractionController, ProgressEvent
 from singularity.model import ModelErrorKind, ModelPurpose, ModelRunner, ModelTurnStatus
 from singularity.planner import Planner, TaskStatus
 from singularity.provider import OpenAICompatibleProvider
 from singularity.policy import PolicyEngine
+from singularity.repair import RepairPlanner
 from singularity.run_controller import RunController
 from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tools import ToolRegistry, ToolExecutor

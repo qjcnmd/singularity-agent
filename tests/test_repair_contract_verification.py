@@ -17,26 +17,26 @@ from pydantic import BaseModel
 from singularity.command import CommandRequest, SemanticStatus
 from singularity.agent_loop import AgentLoopStatus
 from singularity.failure_analysis import (
-    BLOCKED_FAILURE_CATEGORIES,
     MIN_REPAIR_CONFIDENCE,
-    ContractSatisfaction,
     FailureAnalysisRequest,
     FailureAnalysisResult,
+)
+from singularity.kernel.models import AgentRun, KernelContext, KernelStatus, RunIdentity
+from singularity.planner import Planner, TaskStatus
+from singularity.planner.models import AuthorizationDecision, EvidenceLedger
+from singularity.repair import (
+    BLOCKED_FAILURE_CATEGORIES,
     RepairActionCandidate,
     RepairContract,
     RepairPlan,
     RepairPlanner,
     RepairReplanSignal,
-    StepEvidence,
-    VerificationContract,
-    VerificationStep,
 )
-from singularity.kernel.models import AgentRun, KernelContext, KernelStatus, RunIdentity
-from singularity.planner import Planner, TaskStatus
-from singularity.planner.models import AuthorizationDecision, EvidenceLedger
 from singularity.tools.models import PermissionLevel, ToolSpec
 from singularity.verification import VerificationRunner
+from singularity.verification.contract import VerificationContract, VerificationStep
 from singularity.verification.models import CheckKind, VerificationCheck
+from singularity.verification.satisfaction import ContractSatisfaction, StepEvidence
 from tests.test_verification_runner import FakeCommandExecutor, command_result
 
 
@@ -394,6 +394,20 @@ class TestPlannerVerificationContract:
         satisfaction = planner.assess_verification_contract_satisfaction()
         assert satisfaction.satisfied
         assert satisfaction.reason == "no_verification_steps"
+
+    def test_repair_phase_missing_contract_is_not_satisfied(self, tmp_path: Path) -> None:
+        planner = self._make_repair_planner(tmp_path)
+        planner.evidence.repair_plans.append(
+            {
+                "plan_id": "verification_runner_legacy_plan",
+                "summary": "Failure evidence captured without an authoritative repair contract.",
+            }
+        )
+
+        satisfaction = planner.assess_verification_contract_satisfaction()
+
+        assert not satisfaction.satisfied
+        assert satisfaction.reason == "repair_contract_missing"
 
     def test_satisfaction_no_results_returns_not_satisfied(self, tmp_path: Path) -> None:
         planner = self._make_repair_planner(tmp_path)

@@ -4,11 +4,6 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from singularity.failure_analysis import (
-    ContractSatisfaction,
-    VerificationContract,
-    VerificationStep,
-)
 from singularity.planner.budget import BudgetController
 from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.context import PlannerContextRenderer
@@ -57,6 +52,8 @@ from singularity.tools.router import (
     target_paths_from_tool_arguments,
     write_blocked_by_user_constraint,
 )
+from singularity.verification.contract import VerificationContract, VerificationStep
+from singularity.verification.satisfaction import ContractSatisfaction, StepEvidence
 from singularity.observability.protocols import TraceRecorderProtocol
 from singularity.execution_outcome import ExecutionOutcome
 
@@ -1846,12 +1843,27 @@ class Planner:
         Falls back to blocking when step_evidence is absent but contract has
         steps — cannot assume satisfaction without evidence.
         """
-        from singularity.failure_analysis import StepEvidence
-
         active_repair = self._active_repair_contract()
         contract = self._active_repair_verification_contract()
         if not contract.steps:
             if not active_repair:
+                if (
+                    self.state is not None
+                    and self.state.current_phase in {
+                        "repairing_failures",
+                        "running_verification",
+                        "finalizing",
+                    }
+                    and self.evidence.repair_plans
+                ):
+                    return ContractSatisfaction(
+                        contract_id=contract.contract_id,
+                        satisfied=False,
+                        completed_steps=[],
+                        failed_steps=[],
+                        skipped_steps=[],
+                        reason="repair_contract_missing",
+                    )
                 return ContractSatisfaction(
                     contract_id=contract.contract_id,
                     satisfied=True,
@@ -1903,8 +1915,6 @@ class Planner:
         contract: VerificationContract,
         step_evidence_raw: list[dict[str, Any]],
     ) -> ContractSatisfaction:
-        from singularity.failure_analysis import StepEvidence
-
         evidence_by_step: dict[str, dict[str, Any]] = {}
         for item in step_evidence_raw:
             if isinstance(item, dict) and item.get("step_id"):
