@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -77,6 +78,7 @@ class LiveEvalTask:
     allowed_paths: list[str]
     verification_command: str
     success: dict[str, Any]
+    task_type: str = ""
     description: str = ""
     allowed_tools: list[str] = field(default_factory=list)
     tool_policy: str = "read_write"
@@ -85,6 +87,8 @@ class LiveEvalTask:
     completion_standard: str = ""
     risk_tags: list[str] = field(default_factory=list)
     prepare_commands: list[str] = field(default_factory=list)
+    public_verification_command: str = ""
+    hidden_verification_command: str = ""
     verification_prepare_commands: list[str] = field(default_factory=list)
     verification_timeout_seconds: int = 120
 
@@ -107,6 +111,7 @@ class LiveEvalTask:
             allowed_paths=[str(item) for item in payload.get("allowed_paths") or []],
             verification_command=str(payload.get("verification_command") or "").strip(),
             success=_dict(payload.get("success"), "success"),
+            task_type=str(payload.get("task_type") or "").strip(),
             description=str(payload.get("description") or "").strip(),
             allowed_tools=[str(item) for item in payload.get("allowed_tools") or []],
             tool_policy=str(payload.get("tool_policy") or "read_write").strip(),
@@ -117,6 +122,8 @@ class LiveEvalTask:
             completion_standard=str(payload.get("completion_standard") or "").strip(),
             risk_tags=[str(item) for item in payload.get("risk_tags") or []],
             prepare_commands=[str(item) for item in prepare_commands if str(item).strip()],
+            public_verification_command=str(payload.get("public_verification_command") or "").strip(),
+            hidden_verification_command=str(payload.get("hidden_verification_command") or "").strip(),
             verification_prepare_commands=[str(item) for item in verification_prepare_commands if str(item).strip()],
             verification_timeout_seconds=int(payload.get("verification_timeout_seconds") or 120),
         )
@@ -155,6 +162,7 @@ class LiveEvalTask:
             "allowed_paths": list(self.allowed_paths),
             "verification_command": self.verification_command,
             "success": dict(self.success),
+            "task_type": self.task_type,
             "description": self.description,
             "allowed_tools": list(self.allowed_tools),
             "tool_policy": self.tool_policy,
@@ -166,6 +174,10 @@ class LiveEvalTask:
         }
         if self.prepare_commands:
             payload["prepare_commands"] = list(self.prepare_commands)
+        if self.public_verification_command:
+            payload["public_verification_command"] = self.public_verification_command
+        if self.hidden_verification_command:
+            payload["hidden_verification_command"] = self.hidden_verification_command
         if self.verification_prepare_commands:
             payload["verification_prepare_commands"] = list(self.verification_prepare_commands)
         return payload
@@ -201,6 +213,10 @@ class CommandEvalResult:
     duration_seconds: float
     timed_out: bool = False
     error_summary: str = ""
+    raw_command: str = ""
+    resolved_argv: list[str] = field(default_factory=list)
+    interpreter_strategy: dict[str, Any] = field(default_factory=dict)
+    failure_category: str = ""
 
     @property
     def passed(self) -> bool:
@@ -214,6 +230,10 @@ class CommandEvalResult:
             "timed_out": self.timed_out,
             "passed": self.passed,
             "error_summary": self.error_summary,
+            "raw_command": self.raw_command or self.command,
+            "resolved_argv": list(self.resolved_argv),
+            "interpreter_strategy": dict(self.interpreter_strategy),
+            "failure_category": self.failure_category,
         }
 
 
@@ -237,6 +257,16 @@ class LiveEvalTaskResult:
     patch: dict[str, Any] = field(default_factory=dict)
     checks: dict[str, Any] = field(default_factory=dict)
     verification: CommandEvalResult | None = None
+    completed: bool = False
+    patch_applicable: bool = False
+    public_verification_passed: bool = False
+    hidden_verification_passed: bool = False
+    repair_attempt_count: int = 0
+    repair_execution_count: int = 0
+    miscompletion_count: int = 0
+    blocked_reason: str = ""
+    failure_category: str = ""
+    tool_call_count: int = 0
     request_cache_hit_rates: dict[str, float] = field(default_factory=dict)
     status: str = "unknown"
     turn_count: int = 0
@@ -276,6 +306,16 @@ class LiveEvalTaskResult:
             "patch": self.patch,
             "checks": self.checks,
             "verification": self.verification.to_dict() if self.verification else None,
+            "completed": self.completed,
+            "patch_applicable": self.patch_applicable,
+            "public_verification_passed": self.public_verification_passed,
+            "hidden_verification_passed": self.hidden_verification_passed,
+            "repair_attempt_count": self.repair_attempt_count,
+            "repair_execution_count": self.repair_execution_count,
+            "miscompletion_count": self.miscompletion_count,
+            "blocked_reason": self.blocked_reason,
+            "failure_category": self.failure_category,
+            "tool_call_count": self.tool_call_count,
             "request_cache_hit_rates": dict(sorted(self.request_cache_hit_rates.items())),
             "verification_result": self.verification_result,
             "contract_satisfaction": self.contract_satisfaction,
@@ -586,16 +626,33 @@ class LiveAgentEvalRunner:
                 root=task_dir,
             )
             patch_payload["applicable"] = applicable
+            public_command = _public_verification_command(task)
+            hidden_command = _hidden_verification_command(task)
             if task.verification_prepare_commands:
-                public_verification = CommandEvalResult(
-                    command=task.verification_command,
-                    exit_code=0,
-                    duration_seconds=0.0,
-                    error_summary="hidden verifier only",
-                )
+                if public_command:
+                    public_verification = _run_shell(
+                        public_command,
+                        cwd=verification_workspace,
+                        timeout_seconds=task.verification_timeout_seconds,
+                        redactor=self.redactor,
+                    )
+                else:
+                    public_verification = CommandEvalResult(
+                        command="",
+                        exit_code=0,
+                        duration_seconds=0.0,
+                        error_summary="hidden verifier only",
+                        interpreter_strategy={
+                            "schema_version": "evaluation.command_interpreter/v1",
+                            "mode": "not_run",
+                            "reason": "hidden_verifier_only",
+                            "shell": False,
+                            "harness_executable": sys.executable,
+                        },
+                    )
             else:
                 public_verification = _run_shell(
-                    task.verification_command,
+                    public_command,
                     cwd=verification_workspace,
                     timeout_seconds=task.verification_timeout_seconds,
                     redactor=self.redactor,
@@ -645,7 +702,7 @@ class LiveAgentEvalRunner:
                         reproducible_environment=reproducible_environment,
                     )
             hidden_verification = _run_shell(
-                task.verification_command,
+                hidden_command,
                 cwd=verification_workspace,
                 timeout_seconds=task.verification_timeout_seconds,
                 redactor=self.redactor,
@@ -668,10 +725,7 @@ class LiveAgentEvalRunner:
                 errors.append(f"verification failed: {verification.error_summary or verification.command}")
             if not public_verification.passed:
                 errors.append(f"public verification failed: {public_verification.error_summary or public_verification.command}")
-            patch_ok = bool(
-                patch_payload.get("applicable")
-                or not _patch_required(task, files_changed=files_changed)
-            )
+            patch_ok = _patch_applicable_for_task(task, patch=patch_payload, files_changed=files_changed)
             if not patch_ok:
                 errors.append("patch could not be applied to clean verification workspace")
             if not allowed_ok:
@@ -822,6 +876,28 @@ class LiveAgentEvalRunner:
         }
         extraction = _result_extraction(final_report_payload, trace_summary)
         repair_contract = _repair_verification_contract(final_report_payload)
+        report_status = final_report_status or agent_status
+        completed = _completed(report_status, agent_status=agent_status)
+        patch_applicable = _patch_applicable_for_task(task, patch=patch, files_changed=files_changed)
+        public_verification_passed = _check_passed(checks, "public")
+        hidden_verification_passed = _check_passed(checks, "hidden")
+        repair_attempt_count = _repair_attempt_count(final_report_payload)
+        repair_execution_count = _repair_execution_count(final_report_payload)
+        miscompletion_count = int(completed and not success)
+        blocked_reason = _blocked_reason(
+            final_report_payload,
+            agent_status=agent_status,
+            errors=errors,
+            verification=verification,
+        )
+        failure_category = _failure_category(
+            final_report_payload,
+            status=status,
+            verification=verification,
+            infrastructure_blocked=infrastructure_blocked,
+            policy_blocks=policy_blocks,
+            errors=errors,
+        )
         return LiveEvalTaskResult(
             task_id=task.task_id,
             success=success,
@@ -843,6 +919,16 @@ class LiveAgentEvalRunner:
             patch=patch or {"diff": "", "applicable": False, "changed_files": []},
             checks=checks or _checks_payload(None, verification),
             verification=verification,
+            completed=completed,
+            patch_applicable=patch_applicable,
+            public_verification_passed=public_verification_passed,
+            hidden_verification_passed=hidden_verification_passed,
+            repair_attempt_count=repair_attempt_count,
+            repair_execution_count=repair_execution_count,
+            miscompletion_count=miscompletion_count,
+            blocked_reason=blocked_reason,
+            failure_category=failure_category,
+            tool_call_count=tool_calls,
             request_cache_hit_rates=request_rates,
             verification_result=verification_result,
             contract_satisfaction=contract_satisfaction or _contract_satisfaction(
@@ -891,9 +977,11 @@ def summarize_live_results(results: list[LiveEvalTaskResult]) -> dict[str, Any]:
     miscompletion_count = 0
     for result in scored_results:
         if not result.success:
-            failures[result.status or "failure"] = failures.get(result.status or "failure", 0) + 1
-        if result.final_report_status in {"completed", "finalized"} and not result.success:
-            miscompletion_count += 1
+            reason = result.failure_category if result.failure_category and result.failure_category != "none" else result.status
+            failures[reason or "failure"] = failures.get(reason or "failure", 0) + 1
+        miscompletion_count += result.miscompletion_count or int(
+            result.final_report_status in {"completed", "finalized"} and not result.success
+        )
     return {
         "task_count": task_count,
         "scored_task_count": scored_task_count,
@@ -926,7 +1014,14 @@ def summarize_live_results(results: list[LiveEvalTaskResult]) -> dict[str, Any]:
         )
         if scored_task_count
         else 0.0,
+        "completed_count": sum(
+            1
+            for result in scored_results
+            if result.completed or result.final_report_status in {"completed", "finalized"}
+        ),
         "failure_repair_count": sum(result.failure_repair_count for result in results),
+        "repair_attempt_count": sum(result.repair_attempt_count for result in results),
+        "repair_execution_count": sum(result.repair_execution_count for result in results),
         "policy_blocks": sum(result.policy_blocks for result in results),
         "miscompletion_count": miscompletion_count,
         "failure_reasons": dict(sorted(failures.items())),
@@ -1138,12 +1233,16 @@ def _task_goal(task: LiveEvalTask) -> str:
     tools = ", ".join(task.allowed_tools) if task.allowed_tools else "default Singularity coding tools"
     risks = ", ".join(task.risk_tags) if task.risk_tags else "none declared"
     expected_changes = ", ".join(task.expected_file_changes) if task.expected_file_changes else "no required file changes declared"
-    verification_instruction = (
-        "Before finishing, run the relevant visible checks you can infer. "
-        "Hidden evaluator setup and independent verification will run after you finish."
-        if task.verification_prepare_commands
-        else f"Before finishing, run this verification command: {task.verification_command}"
-    )
+    visible_command = _model_visible_verification_command(task)
+    if visible_command:
+        verification_instruction = f"Before finishing, run this verification command: {visible_command}"
+    elif task.verification_prepare_commands:
+        verification_instruction = (
+            "Before finishing, run the relevant visible checks you can infer. "
+            "Hidden evaluator setup and independent verification will run after you finish."
+        )
+    else:
+        verification_instruction = f"Before finishing, run this verification command: {task.verification_command}"
     return (
         f"{task.user_task}\n\n"
         f"Allowed modification scope: {allowed}.\n"
@@ -1170,10 +1269,13 @@ def _reproducible_environment(
     return {
         "schema_version": "evaluation.live_agent_environment/v1",
         "task_id": task.task_id,
+        "task_type": task.task_type,
         "workspace": _workspace_environment(task, manifest_base=manifest_base),
         "workspace_path": str(workspace),
         "prepare_commands": list(task.prepare_commands),
         "verification_command": task.verification_command,
+        "public_verification_command": _public_verification_command(task),
+        "hidden_verification_command": _hidden_verification_command(task),
         "verification_prepare_commands": list(task.verification_prepare_commands),
         "verification_timeout_seconds": task.verification_timeout_seconds,
         "allowed_paths": list(task.allowed_paths),
@@ -1207,6 +1309,7 @@ def _reproducible_environment(
             "python": sys.version.split()[0],
             "platform": sys.platform,
             "agent_loop_ref": "KernelBootstrap.boot -> AgentKernel.run_task -> AgentLoop.run",
+            "interpreter_strategy": _interpreter_strategy_summary(),
         },
     }
 
@@ -1298,6 +1401,7 @@ def _apply_benchmark_constraints(kernel: Any, task: LiveEvalTask) -> None:
     apply_constraints = getattr(planner, "apply_benchmark_constraints", None)
     if not callable(apply_constraints):
         return
+    verification_command = _model_visible_verification_command(task)
     apply_constraints(
         {
             "task_id": task.task_id,
@@ -1305,7 +1409,7 @@ def _apply_benchmark_constraints(kernel: Any, task: LiveEvalTask) -> None:
             "expected_file_changes": task.expected_file_changes,
             "completion_standard": task.completion_standard,
             "risk_tags": task.risk_tags,
-            "verification_command": task.verification_command,
+            "verification_command": verification_command,
         }
     )
 
@@ -1373,6 +1477,75 @@ def _failure_repair_count(payload: dict[str, Any]) -> int:
         or failure_repair.get("repair_plan_count")
         or failure_repair.get("failure_analysis_count")
     )
+
+
+def _failure_repair_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    planner = payload.get("planner_summary") if isinstance(payload, dict) else {}
+    failure_repair = planner.get("failure_repair_summary") if isinstance(planner, dict) else {}
+    return failure_repair if isinstance(failure_repair, dict) else {}
+
+
+def _repair_attempt_count(payload: dict[str, Any]) -> int:
+    return _safe_int(_failure_repair_summary(payload).get("repair_attempt_count"))
+
+
+def _repair_execution_count(payload: dict[str, Any]) -> int:
+    return _safe_int(_failure_repair_summary(payload).get("repair_execution_count"))
+
+
+def _completed(final_report_status: str, *, agent_status: str) -> bool:
+    return final_report_status in {"completed", "finalized", "success"} or agent_status == "completed"
+
+
+def _blocked_reason(
+    payload: dict[str, Any],
+    *,
+    agent_status: str,
+    errors: list[str],
+    verification: CommandEvalResult | None,
+) -> str:
+    failure_repair = _failure_repair_summary(payload)
+    for key in ("latest_blocked_reason", "blocked_reason"):
+        value = failure_repair.get(key)
+        if value:
+            return str(value)
+    planner = payload.get("planner_summary") if isinstance(payload, dict) else {}
+    if isinstance(planner, dict):
+        reasons = planner.get("blocking_reasons")
+        if isinstance(reasons, list) and reasons:
+            return "; ".join(str(item) for item in reasons)
+        if planner.get("blocked_reason"):
+            return str(planner["blocked_reason"])
+    if agent_status in {"blocked", "failed", "max_turns_exceeded"} and errors:
+        return errors[0]
+    if verification is not None and not verification.passed:
+        return verification.error_summary or verification.failure_category
+    return ""
+
+
+def _failure_category(
+    payload: dict[str, Any],
+    *,
+    status: str,
+    verification: CommandEvalResult | None,
+    infrastructure_blocked: bool,
+    policy_blocks: int,
+    errors: list[str],
+) -> str:
+    if status == "success":
+        return "none"
+    failure_repair = _failure_repair_summary(payload)
+    if failure_repair.get("latest_failure_category"):
+        return str(failure_repair["latest_failure_category"])
+    if infrastructure_blocked:
+        return "infrastructure_blocked"
+    if policy_blocks:
+        return "policy_blocked"
+    if verification is not None and verification.failure_category and verification.failure_category != "none":
+        return verification.failure_category
+    if status in {"success", "unknown"} and not errors:
+        return "none"
+    return status or "failure"
 
 
 def _policy_blocks(payload: dict[str, Any], trace_summary: dict[str, Any]) -> int:
@@ -1624,6 +1797,40 @@ def _patch_required(task: LiveEvalTask, *, files_changed: list[str]) -> bool:
     return bool(task.expected_file_changes or files_changed)
 
 
+def _patch_applicable_for_task(
+    task: LiveEvalTask,
+    *,
+    patch: dict[str, Any],
+    files_changed: list[str],
+) -> bool:
+    if not _patch_required(task, files_changed=files_changed):
+        return True
+    if not patch.get("applicable"):
+        return False
+    if task.expected_file_changes:
+        changed = set(files_changed)
+        return all(path in changed for path in task.expected_file_changes)
+    return True
+
+
+def _public_verification_command(task: LiveEvalTask) -> str:
+    if task.public_verification_command:
+        return task.public_verification_command
+    if task.verification_prepare_commands:
+        return ""
+    return task.verification_command
+
+
+def _hidden_verification_command(task: LiveEvalTask) -> str:
+    return task.hidden_verification_command or task.verification_command
+
+
+def _model_visible_verification_command(task: LiveEvalTask) -> str:
+    if task.verification_prepare_commands:
+        return task.public_verification_command
+    return task.verification_command
+
+
 def _success_criterion_ok(
     success: dict[str, Any],
     *,
@@ -1679,10 +1886,28 @@ def _success_criterion_ok(
 def _run_shell(command: str, *, cwd: Path, timeout_seconds: int, redactor: TraceRedactor) -> CommandEvalResult:
     started = time.perf_counter()
     try:
+        argv, strategy = _resolve_command_argv(command)
+    except ValueError as exc:
+        return CommandEvalResult(
+            command=command,
+            raw_command=command,
+            resolved_argv=[],
+            exit_code=None,
+            duration_seconds=round(time.perf_counter() - started, 3),
+            error_summary=redactor.redact_text(str(exc))[:500],
+            interpreter_strategy={
+                "schema_version": "evaluation.command_interpreter/v1",
+                "mode": "parse_error",
+                "shell": False,
+                "harness_executable": sys.executable,
+            },
+            failure_category="command_parse_error",
+        )
+    try:
         completed = subprocess.run(
-            command,
+            argv,
             cwd=cwd,
-            shell=True,
+            shell=False,
             text=True,
             capture_output=True,
             timeout=timeout_seconds,
@@ -1692,18 +1917,102 @@ def _run_shell(command: str, *, cwd: Path, timeout_seconds: int, redactor: Trace
         error_summary = redactor.redact_text(output[0] if output else "")
         return CommandEvalResult(
             command=command,
+            raw_command=command,
+            resolved_argv=argv,
             exit_code=completed.returncode,
             duration_seconds=round(time.perf_counter() - started, 3),
             error_summary=error_summary[:500],
+            interpreter_strategy=strategy,
+            failure_category=_command_failure_category(
+                argv,
+                exit_code=completed.returncode,
+                error_summary=error_summary,
+            ),
         )
     except subprocess.TimeoutExpired:
         return CommandEvalResult(
             command=command,
+            raw_command=command,
+            resolved_argv=argv,
             exit_code=None,
             duration_seconds=round(time.perf_counter() - started, 3),
             timed_out=True,
             error_summary=f"timed out after {timeout_seconds}s",
+            interpreter_strategy=strategy,
+            failure_category="command_timeout",
         )
+    except FileNotFoundError as exc:
+        return CommandEvalResult(
+            command=command,
+            raw_command=command,
+            resolved_argv=argv,
+            exit_code=None,
+            duration_seconds=round(time.perf_counter() - started, 3),
+            error_summary=redactor.redact_text(str(exc))[:500],
+            interpreter_strategy=strategy,
+            failure_category="command_not_found",
+        )
+    except OSError as exc:
+        return CommandEvalResult(
+            command=command,
+            raw_command=command,
+            resolved_argv=argv,
+            exit_code=None,
+            duration_seconds=round(time.perf_counter() - started, 3),
+            error_summary=redactor.redact_text(str(exc))[:500],
+            interpreter_strategy=strategy,
+            failure_category="command_execution_error",
+        )
+
+
+def _resolve_command_argv(command: str) -> tuple[list[str], dict[str, Any]]:
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"command parse failed: {exc}") from exc
+    if not argv:
+        raise ValueError("command parse failed: empty command")
+    original_executable = argv[0]
+    mapped_bare_python = _is_bare_python_executable(original_executable)
+    if mapped_bare_python:
+        argv = [sys.executable, *argv[1:]]
+    strategy = _interpreter_strategy_summary()
+    strategy.update(
+        {
+            "mode": "argv",
+            "raw_executable": original_executable,
+            "resolved_executable": argv[0],
+            "mapped_bare_python": mapped_bare_python,
+        }
+    )
+    return argv, strategy
+
+
+def _interpreter_strategy_summary() -> dict[str, Any]:
+    return {
+        "schema_version": "evaluation.command_interpreter/v1",
+        "parser": "shlex.split(posix=True)",
+        "shell": False,
+        "bare_python_policy": "map_to_harness_sys_executable",
+        "harness_executable": sys.executable,
+    }
+
+
+def _is_bare_python_executable(value: str) -> bool:
+    if not value or any(sep in value for sep in ("/", "\\")):
+        return False
+    return value.lower() in {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}
+
+
+def _command_failure_category(argv: list[str], *, exit_code: int, error_summary: str) -> str:
+    if exit_code == 0:
+        return "none"
+    lowered = error_summary.lower()
+    if "no module named pytest" in lowered or "module named" in lowered:
+        return "environment_dependency_missing"
+    if len(argv) >= 3 and Path(argv[0]).resolve(strict=False) == Path(sys.executable).resolve(strict=False) and argv[1:3] == ["-m", "pytest"]:
+        return "verification_failed"
+    return "command_failed"
 
 
 def _patch_payload(before_snapshot: dict[str, str], workspace: Path) -> dict[str, Any]:
@@ -1778,6 +2087,11 @@ def _checks_payload(
         "public": _check_payload(public),
         "hidden": _check_payload(hidden),
     }
+
+
+def _check_passed(checks: dict[str, Any], name: str) -> bool:
+    check = checks.get(name) if isinstance(checks, dict) else None
+    return bool(isinstance(check, dict) and check.get("passed") is True)
 
 
 def _check_payload(result: CommandEvalResult | None) -> dict[str, Any]:

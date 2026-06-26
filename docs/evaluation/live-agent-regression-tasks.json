@@ -1,0 +1,188 @@
+{
+  "schema_version": "evaluation.live_agent_task_set/v1",
+  "tasks": [
+    {
+      "task_id": "live.regression.simple_patch",
+      "task_type": "simple_patch",
+      "description": "Repair a single-file arithmetic bug and verify with focused pytest.",
+      "workspace": {
+        "type": "fixture",
+        "files": {
+          "math_utils.py": "def add(a, b):\n    return a - b\n",
+          "tests/test_math_utils.py": "from math_utils import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+        }
+      },
+      "user_task": "Fix the failing add(a, b) implementation in math_utils.py with the smallest patch. Run python -m pytest tests/test_math_utils.py before finishing.",
+      "allowed_paths": [
+        "math_utils.py"
+      ],
+      "allowed_tools": [
+        "read_file",
+        "write_file",
+        "run_verification",
+        "inspect_diff"
+      ],
+      "tool_policy": "read_write",
+      "strategy": {
+        "approval_mode": "auto_safe",
+        "security_mode": "compat"
+      },
+      "expected_file_changes": [
+        "math_utils.py"
+      ],
+      "verification_command": "python -m pytest tests/test_math_utils.py",
+      "public_verification_command": "python -m pytest tests/test_math_utils.py",
+      "hidden_verification_command": "python -m pytest tests/test_math_utils.py",
+      "completion_standard": "Focused pytest passes, only math_utils.py changes, and the final report names the verification evidence.",
+      "risk_tags": [
+        "simple-patch",
+        "minimal-diff",
+        "public-verification",
+        "hidden-verification"
+      ],
+      "success": {
+        "type": "verification_exit_code",
+        "exit_code": 0
+      }
+    },
+    {
+      "task_id": "live.regression.multi_file_reasoning",
+      "task_type": "multi_file_reasoning",
+      "description": "Update a two-file shipping policy while preserving the test contract.",
+      "workspace": {
+        "type": "fixture",
+        "files": {
+          "cart.py": "from policy import FREE_SHIPPING_MINIMUM\n\n\ndef shipping_due(subtotal):\n    return 0 if subtotal > FREE_SHIPPING_MINIMUM else 7\n",
+          "policy.py": "FREE_SHIPPING_MINIMUM = 75\n",
+          "tests/test_shipping.py": "from cart import shipping_due\nfrom policy import FREE_SHIPPING_MINIMUM\n\n\ndef test_policy_constant():\n    assert FREE_SHIPPING_MINIMUM == 50\n\n\ndef test_threshold_is_inclusive():\n    assert shipping_due(50) == 0\n    assert shipping_due(49.99) == 7\n"
+        }
+      },
+      "user_task": "Update the shipping policy so orders of 50 or more get free shipping. Change the policy constant and the threshold logic as needed, then run python -m pytest tests/test_shipping.py before finishing.",
+      "allowed_paths": [
+        "cart.py",
+        "policy.py"
+      ],
+      "allowed_tools": [
+        "read_file",
+        "write_file",
+        "run_verification",
+        "inspect_diff"
+      ],
+      "tool_policy": "read_write",
+      "strategy": {
+        "approval_mode": "auto_safe",
+        "security_mode": "compat"
+      },
+      "expected_file_changes": [
+        "cart.py",
+        "policy.py"
+      ],
+      "verification_command": "python -m pytest tests/test_shipping.py",
+      "public_verification_command": "python -m pytest tests/test_shipping.py",
+      "hidden_verification_command": "python -m pytest tests/test_shipping.py",
+      "completion_standard": "Both policy.py and cart.py are changed, the inclusive threshold behavior is correct, and the focused pytest command exits 0.",
+      "risk_tags": [
+        "multi-file-reasoning",
+        "cross-file-contract",
+        "scope-control",
+        "public-verification",
+        "hidden-verification"
+      ],
+      "success": {
+        "type": "verification_exit_code",
+        "exit_code": 0
+      }
+    },
+    {
+      "task_id": "live.regression.failure_repair",
+      "task_type": "failure_repair",
+      "description": "Use failing test evidence to repair string normalization.",
+      "workspace": {
+        "type": "fixture",
+        "files": {
+          "normalizer.py": "def normalize(value):\n    return value.strip()\n",
+          "tests/test_normalizer.py": "from normalizer import normalize\n\n\ndef test_normalize_lowercases_and_trims():\n    assert normalize(' Hello  ') == 'hello'\n\n\ndef test_normalize_collapses_internal_space():\n    assert normalize('Hello   World') == 'hello world'\n"
+        }
+      },
+      "user_task": "Fix normalizer.normalize using the failing pytest evidence. Run python -m pytest tests/test_normalizer.py, repair any failure, rerun it, and finish only after it passes.",
+      "allowed_paths": [
+        "normalizer.py"
+      ],
+      "allowed_tools": [
+        "read_file",
+        "write_file",
+        "run_verification",
+        "inspect_diff"
+      ],
+      "tool_policy": "read_write",
+      "strategy": {
+        "approval_mode": "auto_safe",
+        "security_mode": "compat"
+      },
+      "expected_file_changes": [
+        "normalizer.py"
+      ],
+      "verification_command": "python -m pytest tests/test_normalizer.py",
+      "public_verification_command": "python -m pytest tests/test_normalizer.py",
+      "hidden_verification_command": "python -m pytest tests/test_normalizer.py",
+      "completion_standard": "The repair is based on failing test evidence, normalizer.py changes, and focused pytest exits 0 after the repair.",
+      "risk_tags": [
+        "failure-repair",
+        "repair-loop",
+        "verification-evidence",
+        "public-verification",
+        "hidden-verification"
+      ],
+      "success": {
+        "type": "verification_exit_code",
+        "exit_code": 0
+      }
+    },
+    {
+      "task_id": "live.regression.completion_gate",
+      "task_type": "completion_gate",
+      "description": "Require file-change and verification evidence before completion.",
+      "workspace": {
+        "type": "fixture",
+        "files": {
+          "status.py": "def status():\n    return 'draft'\n\n\nif __name__ == '__main__':\n    assert status() == 'ready'\n",
+          "README.md": "Completion is valid only after status.py is changed and python status.py passes.\n"
+        }
+      },
+      "user_task": "Change status.py so status() returns 'ready'. Do not claim completion until status.py changed and python status.py passed.",
+      "allowed_paths": [
+        "status.py"
+      ],
+      "allowed_tools": [
+        "read_file",
+        "write_file",
+        "run_verification",
+        "inspect_diff"
+      ],
+      "tool_policy": "read_write",
+      "strategy": {
+        "approval_mode": "auto_safe",
+        "security_mode": "compat"
+      },
+      "expected_file_changes": [
+        "status.py"
+      ],
+      "verification_command": "python status.py",
+      "public_verification_command": "python status.py",
+      "hidden_verification_command": "python status.py",
+      "completion_standard": "Final Reviewer must not allow completed status unless status.py changed, python status.py ran successfully, and the final report has verification evidence.",
+      "risk_tags": [
+        "completion-gate",
+        "missing-evidence-risk",
+        "expected-file-change-required",
+        "miscompletion-risk",
+        "public-verification",
+        "hidden-verification"
+      ],
+      "success": {
+        "type": "verification_exit_code",
+        "exit_code": 0
+      }
+    }
+  ]
+}

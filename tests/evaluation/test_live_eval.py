@@ -41,6 +41,39 @@ def test_load_live_eval_manifest_example() -> None:
     assert manifest.tasks[-1].tool_policy == "read_only"
 
 
+def test_load_live_eval_regression_manifest_declares_required_task_classes() -> None:
+    manifest = load_live_eval_manifest(Path("docs/evaluation/live-agent-regression-tasks.json"))
+
+    by_type = {task.task_type: task for task in manifest.tasks}
+    assert set(by_type) == {
+        "simple_patch",
+        "multi_file_reasoning",
+        "failure_repair",
+        "completion_gate",
+    }
+    for task in manifest.tasks:
+        assert task.workspace.kind == "fixture"
+        assert task.expected_file_changes
+        assert task.verification_command
+        assert task.public_verification_command
+        assert task.hidden_verification_command
+        assert task.completion_standard
+        assert task.risk_tags
+        assert "public-verification" in task.risk_tags
+        assert "hidden-verification" in task.risk_tags
+    assert by_type["multi_file_reasoning"].expected_file_changes == ["cart.py", "policy.py"]
+    assert "completion-gate" in by_type["completion_gate"].risk_tags
+
+
+def test_load_v7_focused_smoke_manifest_remains_single_task() -> None:
+    manifest = load_live_eval_manifest(Path("docs/evaluation/live-fix-math-test-only.json"))
+
+    assert [task.task_id for task in manifest.tasks] == ["live.fix_math_test"]
+    assert manifest.tasks[0].task_type == "v7_smoke"
+    assert manifest.tasks[0].public_verification_command == manifest.tasks[0].verification_command
+    assert manifest.tasks[0].hidden_verification_command == manifest.tasks[0].verification_command
+
+
 def test_live_eval_sanitized_baseline_example_is_safe_and_shape_current() -> None:
     path = Path("docs/evaluation/live-agent-baseline-example.json")
     text = path.read_text(encoding="utf-8")
@@ -55,6 +88,22 @@ def test_live_eval_sanitized_baseline_example_is_safe_and_shape_current() -> Non
     assert task["result_extraction"]["schema_version"] == "evaluation.live_agent_result_extraction/v1"
     assert task["task_verification_result"] == task["verification_result"]
     assert task["repair_verification_contract"]["status"] == "not_recorded"
+    for field in [
+        "completed",
+        "patch_applicable",
+        "public_verification_passed",
+        "hidden_verification_passed",
+        "contract_satisfaction",
+        "miscompletion_count",
+        "repair_attempt_count",
+        "repair_execution_count",
+        "turn_count",
+        "tool_call_count",
+        "blocked_reason",
+        "failure_category",
+        "final_report_status",
+    ]:
+        assert field in task
 
 
 def test_private_adapter_converts_benchmark_tasks_to_live_manifest(tmp_path: Path) -> None:
@@ -211,7 +260,10 @@ def test_summarize_live_results_reports_cache_and_rates(tmp_path: Path) -> None:
         "verification_pass_rate": 1.0,
         "average_turns": 2.5,
         "average_tool_calls": 2.5,
+        "completed_count": 2,
         "failure_repair_count": 0,
+        "repair_attempt_count": 0,
+        "repair_execution_count": 0,
         "policy_blocks": 0,
         "miscompletion_count": 1,
         "failure_reasons": {"verification_failed": 1},
@@ -328,14 +380,26 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     assert task["status"] == "success"
     assert task["turn_count"] == 2
     assert task["tool_calls"] == 2
+    assert task["tool_call_count"] == 2
     assert task["files_changed"] == ["done.txt"]
     assert task["patch"]["applicable"] is True
+    assert task["patch_applicable"] is True
     assert "done.txt" in task["patch"]["diff"]
     assert task["checks"]["public"]["passed"] is True
+    assert task["checks"]["public"]["resolved_argv"][0] == sys.executable
+    assert task["checks"]["public"]["interpreter_strategy"]["mapped_bare_python"] is False
+    assert task["public_verification_passed"] is True
+    assert task["hidden_verification_passed"] is True
     assert task["verification_result"]["status"] == "passed"
+    assert task["completed"] is True
     assert task["contract_satisfaction"]["status"] == "satisfied"
     assert task["final_report_status"] == "completed"
     assert task["failure_repair_count"] == 1
+    assert task["repair_attempt_count"] == 1
+    assert task["repair_execution_count"] == 0
+    assert task["miscompletion_count"] == 0
+    assert task["blocked_reason"] == ""
+    assert task["failure_category"] == "none"
     assert task["policy_blocks"] == 2
     assert task["trace_artifact_refs"] == [
         "planner/artifact.json",
@@ -352,6 +416,9 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     assert task["result_extraction"]["failure_repair_source"].endswith("failure_repair_summary")
     assert task["reproducible_environment"]["workspace"]["type"] == "fixture"
     assert task["reproducible_environment"]["verification_command"] == manifest.tasks[0].verification_command
+    assert task["reproducible_environment"]["public_verification_command"] == manifest.tasks[0].verification_command
+    assert task["reproducible_environment"]["hidden_verification_command"] == manifest.tasks[0].verification_command
+    assert task["reproducible_environment"]["runtime"]["interpreter_strategy"]["shell"] is False
     env_base_url = task["reproducible_environment"]["model_profile"]["base_url"]
     assert env_base_url is None or "sk-" not in env_base_url
     assert "env_file" in task["reproducible_environment"]["model_profile"]["sources"]
@@ -450,6 +517,85 @@ def test_live_eval_runner_compares_against_previous_run(tmp_path: Path) -> None:
     assert second["regression"]["task_diffs"][0]["task_id"] == "fake.regression"
     assert Path(second["regression_path"]).exists()
     assert Path(second["regression_markdown_path"]).exists()
+
+
+def test_live_eval_maps_bare_python_verification_to_harness_executable(tmp_path: Path) -> None:
+    manifest = LiveEvalManifest.from_dict(
+        {
+            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.bare_python",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Write done.txt with ok.",
+                    "allowed_paths": ["done.txt"],
+                    "expected_file_changes": ["done.txt"],
+                    "verification_command": "python -c \"from pathlib import Path; assert Path('done.txt').read_text(encoding='utf-8') == 'ok'\"",
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1, "input_tokens": 10}},
+            planner_summary={"status": "completed"},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = LiveAgentEvalRunner(
+        output_root=tmp_path / "out",
+        run_id="bare_python",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["success"] is True
+    assert task["checks"]["public"]["resolved_argv"][0] == sys.executable
+    assert task["checks"]["public"]["interpreter_strategy"]["mapped_bare_python"] is True
+    assert task["checks"]["hidden"]["resolved_argv"][0] == sys.executable
+    assert task["verification"]["failure_category"] == "none"
 
 
 def test_live_eval_reports_completion_rejected_repair_and_verification_contract(tmp_path: Path) -> None:
@@ -955,6 +1101,93 @@ def test_live_eval_marks_model_transport_blocker_without_running_verification(tm
     assert task["infrastructure_blocked"] is True
     assert task["verification"] is None
     assert "infrastructure blocked" in task["error_summary"]
+
+
+def test_live_eval_completion_gate_counts_false_completed_report(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest = LiveEvalManifest.from_dict(
+        {
+            "schema_version": LIVE_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.false_completed",
+                    "task_type": "completion_gate",
+                    "workspace": {"type": "fixture", "files": {"status.py": "VALUE = 'draft'\n"}},
+                    "user_task": "Change status.py so VALUE is ready and verify it.",
+                    "allowed_paths": ["status.py"],
+                    "expected_file_changes": ["status.py"],
+                    "verification_command": f"{py} -c \"from status import VALUE; assert VALUE == 'ready'\"",
+                    "completion_standard": "Completion requires the expected file change and a passing verification command.",
+                    "risk_tags": ["completion-gate", "missing-evidence-risk"],
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 0, "model_usage_summary": {"requests": 1, "input_tokens": 10}},
+            planner_summary={"status": "completed"},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def run_task(self, _goal: str) -> FakeResult:
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            _ = kwargs
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel()
+
+    result = LiveAgentEvalRunner(
+        output_root=tmp_path / "out",
+        run_id="false_completed",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["success"] is False
+    assert task["completed"] is True
+    assert task["miscompletion_count"] == 1
+    assert result["summary"]["miscompletion_count"] == 1
+    assert task["patch_applicable"] is False
+    assert task["public_verification_passed"] is False
+    assert task["hidden_verification_passed"] is False
+    assert task["contract_satisfaction"]["status"] == "unsatisfied"
+    assert any(
+        check["name"] == "expected_file_changes" and check["passed"] is False
+        for check in task["contract_satisfaction"]["checks"]
+    )
+    assert task["failure_category"] == "command_failed"
 
 
 def test_live_eval_runs_hidden_verification_prepare_after_agent(tmp_path: Path) -> None:

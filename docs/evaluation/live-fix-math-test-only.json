@@ -3,6 +3,7 @@
   "tasks": [
     {
       "task_id": "live.fix_math_test",
+      "task_type": "v7_smoke",
       "description": "Fix a real failing pytest test with a minimal code change.",
       "workspace": {
         "type": "fixture",
@@ -30,6 +31,8 @@
         "math_utils.py"
       ],
       "verification_command": "python -m pytest tests/test_math_utils.py",
+      "public_verification_command": "python -m pytest tests/test_math_utils.py",
+      "hidden_verification_command": "python -m pytest tests/test_math_utils.py",
       "completion_standard": "Focused pytest command passes and only math_utils.py changes.",
       "risk_tags": [
         "test-repair",

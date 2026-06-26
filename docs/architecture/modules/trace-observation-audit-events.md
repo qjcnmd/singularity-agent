@@ -94,6 +94,7 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 - `ToolObservation`: persisted context observation with preview, raw digest, source refs, duration, cache, error, and sensitivity.
 - `PolicyAuditEntry`: normalized and redacted policy request/decision audit row.
 - Review trace payloads: review stage, findings, decision, report id, transaction id, verification id, policy decision id.
+- Semantic Planner / Final Reviewer trace events: `semantic_planner.task_contract.model_ok`, `semantic_planner.task_contract.fallback`, `semantic_planner.semantic_plan.model_ok`, `semantic_planner.semantic_plan.fallback`, `semantic_planner.planner_decision.model_ok`, `semantic_planner.planner_decision.fallback`, `final_reviewer.assess.done`, `final_reviewer.assess.model_ok`, and `final_reviewer.assess.fallback`.
 
 ## Model-Visible Objects (模型实际可见对象)
 

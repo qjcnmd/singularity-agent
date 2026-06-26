@@ -152,11 +152,17 @@ singularity-agent eval live quicksort --json
 
 This command creates a controlled workspace under `work/evaluations-live/`, boots the real CLI kernel with the configured OpenAI-compatible provider, asks the agent to create and verify `quicksort.py`, and then independently runs `python quicksort.py`. Unlike trace replay, this path can make live model calls and should be run only when `SINGULARITY_API_KEY`, `SINGULARITY_MODEL`, and `SINGULARITY_BASE_URL` are intentionally configured.
 
-Run a manifest-driven live-provider eval:
+Run the retained V-7 focused smoke manifest:
 
 ```bash
-singularity-agent eval live run docs/evaluation/live-agent-minimal-tasks.json --json
-singularity-agent eval live run docs/evaluation/live-agent-minimal-tasks.json --baseline-result work/evaluations-live/previous/result.json
+singularity-agent eval live run docs/evaluation/live-fix-math-test-only.json --json
+```
+
+Run the multi-task live-provider capability regression:
+
+```bash
+singularity-agent eval live run docs/evaluation/live-agent-regression-tasks.json --json
+singularity-agent eval live run docs/evaluation/live-agent-regression-tasks.json --baseline-result work/evaluations-live/previous/result.json
 ```
 
 Run a private BenchmarkTask set through the private adapter:
@@ -165,15 +171,17 @@ Run a private BenchmarkTask set through the private adapter:
 singularity-agent eval live private private-benchmark.json --json
 ```
 
-The live manifest schema is the production benchmark layer for coding-agent behavior. Each task declares `task_id`, `description`, a `repo` or `fixture` workspace, optional `start_commit` or `prepare_commands`, `user_task`, `allowed_paths`, `allowed_tools`, `tool_policy` or `strategy`, `expected_file_changes`, `verification_command`, `completion_standard`, `risk_tags`, and `success`. Use `verification_prepare_commands` only for evaluator-owned hidden setup that must run after the agent finishes and before independent verification, such as applying a benchmark test patch without exposing it to the model; when hidden setup is present, the exact `verification_command` is also kept out of the model task.
+The live manifest schema is the production benchmark layer for coding-agent behavior. Each task declares `task_id`, optional `task_type`, `description`, a `repo` or `fixture` workspace, optional `start_commit` or `prepare_commands`, `user_task`, `allowed_paths`, `allowed_tools`, `tool_policy` or `strategy`, `expected_file_changes`, `verification_command`, optional `public_verification_command` / `hidden_verification_command`, `completion_standard`, `risk_tags`, and `success`. Use `verification_prepare_commands` only for evaluator-owned hidden setup that must run after the agent finishes and before independent verification, such as applying a benchmark test patch without exposing it to the model. When hidden setup is present, only `public_verification_command` is model-visible; hidden setup and hidden verification remain evaluator-internal.
 
 Each task runs in an isolated directory under `work/evaluations-live/<run_id>/<task_id>/workspace`. The runner boots the real Singularity kernel through `KernelBootstrap(...).boot(goal)` and then calls `AgentKernel.run_task(goal)`, which drives the real `AgentLoop`. The benchmark layer does not call Planner, ToolExecutor, or VerificationRunner directly to fake outcomes.
 
 Live evaluation also writes a clean verification workspace per task. The runner records the agent workspace patch as `patch.diff`, reapplies changed files onto the clean verification workspace, then records public and hidden check results under `checks.public` and `checks.hidden`. A task is successful only when the agent completion semantics, allowed path scope, expected file changes, patch applicability where a patch is expected, and independent verification criteria all pass. Rejection and policy-block tasks can express success with `agent_status` or `policy_blocks_min` criteria instead of pretending they are normal edit tasks.
 
-The live runner uses the normal `ProductionConfig.from_cli()` path. For manifest tasks, `--project-root` identifies the project/config root used to load project-local `.env` values while the actual agent run still uses each benchmark workspace as `project_root`. The loader only sets variables that are not already present in the process environment and keeps `SINGULARITY_API_KEY` out of effective config, trace, result, and report payloads. Per-task `reproducible_environment` records the fixture or repo source, prepare commands, verification commands, timeout, model/profile source, approval/security mode, sandbox strategy, and baseline artifact reference.
+The live runner uses the normal `ProductionConfig.from_cli()` path. For manifest tasks, `--project-root` identifies the project/config root used to load project-local `.env` values while the actual agent run still uses each benchmark workspace as `project_root`. The loader only sets variables that are not already present in the process environment and keeps `SINGULARITY_API_KEY` out of effective config, trace, result, and report payloads. Per-task `reproducible_environment` records the fixture or repo source, prepare commands, verification commands, timeout, model/profile source, approval/security mode, sandbox strategy, baseline artifact reference, and interpreter strategy. Manifest command strings are parsed to argv with `shlex.split(posix=True)` and executed with `shell=False`; bare `python`, `python3`, or `py` resolve to the harness `sys.executable` so benchmark verification does not depend on a manually installed shell `python`.
 
-The live runner writes stable `result.json`, `report.json`, and `report.md` files. Per-task results include `status`, `turn_count`, `tool_calls`, `files_changed`, `verification_result`, `task_verification_result`, `contract_satisfaction`, `repair_verification_contract`, `final_report_status`, `failure_repair_count`, `policy_blocks`, `token_usage`, `cache_usage`, `trace_artifact_refs`, `result_extraction`, `reproducible_environment`, and `agent_loop_ref`. Suite summaries include success rate, verification pass rate, average turns, average tool calls, failure reasons, repair count, policy blocks, and miscompletion count. With `--baseline-result`, or when a previous run result is available under the same output root, the runner also writes `regression.json` and `regression.md`.
+The live runner writes stable `result.json`, `report.json`, and `report.md` files. Per-task results include `success`, `completed`, `patch_applicable`, `public_verification_passed`, `hidden_verification_passed`, `contract_satisfaction`, `miscompletion_count`, `repair_attempt_count`, `repair_execution_count`, `turn_count`, `tool_call_count`, `blocked_reason`, `failure_category`, `final_report_status`, `status`, `tool_calls`, `files_changed`, `verification_result`, `task_verification_result`, `repair_verification_contract`, `failure_repair_count`, `policy_blocks`, `token_usage`, `cache_usage`, `trace_artifact_refs`, `result_extraction`, `reproducible_environment`, and `agent_loop_ref`. Suite summaries include success rate, verification pass rate, average turns, average tool calls, completed count, failure reasons, repair attempt/execution count, policy blocks, and miscompletion count. With `--baseline-result`, or when a previous run result is available under the same output root, the runner also writes `regression.json` and `regression.md`.
+
+`docs/evaluation/live-agent-regression-tasks.json` is the main multi-task capability regression manifest. It currently covers four task classes: `simple_patch`, `multi_file_reasoning`, `failure_repair`, and `completion_gate`. `docs/evaluation/live-fix-math-test-only.json` remains the focused V-7 smoke manifest.
 
 `docs/evaluation/live-agent-baseline-example.json` is a sanitized result example. It is safe to reference in docs and regression-shape tests because it does not include provider credentials, raw prompts, raw traces, or private artifacts. Real live runs should continue writing under `work/evaluations-live/`.
 

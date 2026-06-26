@@ -21,7 +21,10 @@
     "verification_pass_rate": 1.0,
     "average_turns": 2.0,
     "average_tool_calls": 1.0,
+    "completed_count": 1,
     "failure_repair_count": 0,
+    "repair_attempt_count": 0,
+    "repair_execution_count": 0,
     "policy_blocks": 0,
     "miscompletion_count": 0,
     "failure_reasons": {}
@@ -58,11 +61,45 @@
       "checks": {
         "public": {
           "status": "passed",
-          "passed": true
+          "passed": true,
+          "raw_command": "python quicksort.py",
+          "resolved_argv": [
+            "[PYTHON]",
+            "quicksort.py"
+          ],
+          "interpreter_strategy": {
+            "schema_version": "evaluation.command_interpreter/v1",
+            "parser": "shlex.split(posix=True)",
+            "shell": false,
+            "bare_python_policy": "map_to_harness_sys_executable",
+            "harness_executable": "[PYTHON]",
+            "mode": "argv",
+            "raw_executable": "python",
+            "resolved_executable": "[PYTHON]",
+            "mapped_bare_python": true
+          },
+          "failure_category": "none"
         },
         "hidden": {
           "status": "passed",
-          "passed": true
+          "passed": true,
+          "raw_command": "python quicksort.py",
+          "resolved_argv": [
+            "[PYTHON]",
+            "quicksort.py"
+          ],
+          "interpreter_strategy": {
+            "schema_version": "evaluation.command_interpreter/v1",
+            "parser": "shlex.split(posix=True)",
+            "shell": false,
+            "bare_python_policy": "map_to_harness_sys_executable",
+            "harness_executable": "[PYTHON]",
+            "mode": "argv",
+            "raw_executable": "python",
+            "resolved_executable": "[PYTHON]",
+            "mapped_bare_python": true
+          },
+          "failure_category": "none"
         }
       },
       "verification": {
@@ -71,8 +108,35 @@
         "duration_seconds": 0.0,
         "timed_out": false,
         "passed": true,
-        "error_summary": ""
+        "error_summary": "",
+        "raw_command": "python quicksort.py",
+        "resolved_argv": [
+          "[PYTHON]",
+          "quicksort.py"
+        ],
+        "interpreter_strategy": {
+          "schema_version": "evaluation.command_interpreter/v1",
+          "parser": "shlex.split(posix=True)",
+          "shell": false,
+          "bare_python_policy": "map_to_harness_sys_executable",
+          "harness_executable": "[PYTHON]",
+          "mode": "argv",
+          "raw_executable": "python",
+          "resolved_executable": "[PYTHON]",
+          "mapped_bare_python": true
+        },
+        "failure_category": "none"
       },
+      "completed": true,
+      "patch_applicable": true,
+      "public_verification_passed": true,
+      "hidden_verification_passed": true,
+      "repair_attempt_count": 0,
+      "repair_execution_count": 0,
+      "miscompletion_count": 0,
+      "blocked_reason": "",
+      "failure_category": "none",
+      "tool_call_count": 1,
       "verification_result": {
         "status": "passed",
         "command": "python quicksort.py",
@@ -133,6 +197,7 @@
       "reproducible_environment": {
         "schema_version": "evaluation.live_agent_environment/v1",
         "task_id": "live.create_quicksort",
+        "task_type": "simple_patch",
         "workspace": {
           "type": "fixture",
           "file_count": 1,
@@ -143,6 +208,8 @@
         },
         "prepare_commands": [],
         "verification_command": "python quicksort.py",
+        "public_verification_command": "python quicksort.py",
+        "hidden_verification_command": "python quicksort.py",
         "verification_prepare_commands": [],
         "verification_timeout_seconds": 120,
         "allowed_paths": [
@@ -186,7 +253,14 @@
         "runtime": {
           "python": "3.x",
           "platform": "win32",
-          "agent_loop_ref": "KernelBootstrap.boot -> AgentKernel.run_task -> AgentLoop.run"
+          "agent_loop_ref": "KernelBootstrap.boot -> AgentKernel.run_task -> AgentLoop.run",
+          "interpreter_strategy": {
+            "schema_version": "evaluation.command_interpreter/v1",
+            "parser": "shlex.split(posix=True)",
+            "shell": false,
+            "bare_python_policy": "map_to_harness_sys_executable",
+            "harness_executable": "[PYTHON]"
+          }
         }
       },
       "result_extraction": {
