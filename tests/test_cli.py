@@ -697,6 +697,34 @@ def test_cli_eval_trace_replay_outputs_deterministic_hash(tmp_path: Path, monkey
     assert payload["result_hash"]
 
 
+def test_cli_eval_targeted_replay_writes_repair_replay_artifacts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    output_dir = tmp_path / "targeted"
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "targeted-replay",
+            "--output-dir",
+            str(output_dir),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["entered_agent_loop"] is True
+    assert payload["status"] == "completed"
+    assert payload["repairing_failures_seen"] is True
+    assert "model_visible_objects" not in payload
+    assert "evaluator_internal_objects" not in payload
+    assert payload["report_paths"]["json"] == str(output_dir / "targeted_replay_result.json")
+    assert payload["report_paths"]["markdown"] == str(output_dir / "targeted_replay_result.md")
+    assert (output_dir / "targeted_replay_result.json").exists()
+    assert (output_dir / "targeted_replay_result.md").exists()
+
+
 def test_cli_eval_ab_and_regression_run_persist_reports(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     task_set = tmp_path / "golden.json"

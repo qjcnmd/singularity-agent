@@ -14,6 +14,7 @@ Source paths:
 - src/singularity/review/pipeline.py
 - src/singularity/review/critic.py
 - src/singularity/planner/engine.py
+- src/singularity/evaluation/targeted_replay.py
 
 Symbols:
 - TraceEventType
@@ -51,6 +52,8 @@ Symbols:
 - Planner
 - Planner.record_diff_observation
 - Planner.record_review_observation
+- TargetedFailureReplayRunner
+- TargetedFailureReplayResult
 
 ## Module Boundary
 
@@ -75,6 +78,7 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 - `src/singularity/review/critic.py`: model critic request and result boundary.
 - `src/singularity/planner/engine.py`: diff and review observations.
 - `src/singularity/evaluation/failure_case_replay.py`: bounded live-eval failure replay extraction from `report.json` and trace `events.jsonl`.
+- `src/singularity/evaluation/targeted_replay.py`: bounded targeted replay trace refs and planner phase/status summaries derived from targeted smoke trace output.
 
 ## Runtime Call Chain
 
@@ -88,6 +92,7 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 8. Review code calls `ReviewPipeline._emit()` to send review lifecycle events.
 9. Planner records review and diff observations in `Planner.record_review_observation()` and `record_diff_observation()`.
 10. After live eval writes `report.json`, `FailureCaseReplayRunner` may read task trace `events.jsonl` and copy only bounded diagnostic counts, final-report outcome, blocked reasons, and recent phase-policy blocks into `failure_cases.json`. That package is marked `runner_mode="post_run_failure_extraction"`; targeted execution replay is a separate evaluation API.
+11. `TargetedFailureReplayRunner` reads its own deterministic smoke trace to derive bounded `trace_refs`, `phase_history`, and `planner_status_history` for `targeted_replay_result.json`. These are evaluator artifacts and do not change trace-store schema.
 
 ## Runtime Objects Passed
 
@@ -98,11 +103,12 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 - Review trace payloads: review stage, findings, decision, report id, transaction id, verification id, policy decision id.
 - Semantic Planner / Final Reviewer trace events: `semantic_planner.task_contract.model_ok`, `semantic_planner.task_contract.fallback`, `semantic_planner.semantic_plan.model_ok`, `semantic_planner.semantic_plan.fallback`, `semantic_planner.planner_decision.model_ok`, `semantic_planner.planner_decision.fallback`, `final_reviewer.assess.done`, `final_reviewer.assess.model_ok`, and `final_reviewer.assess.fallback`.
 - Failure replay trace summary: events path, event count, availability flag, failure-analysis event count, repair event count, final-report outcome, blocked reasons, and recent phase-policy blocks. This is a derived evaluator object, not a trace-store schema change.
+- Targeted replay trace refs: JSONL path, event count, failure-analysis event count, repair event count, and planner event count. This is a bounded evaluator object, not a trace-store schema change and not a prompt/context capture.
 - Failure replay package metadata: `runner_mode` and `targeted_replay_runner` labels written by `FailureCaseReplayRunner.write()` so readers distinguish extraction from execution replay.
 
 ## Model-Visible Objects (模型实际可见对象)
 
-The model does not receive `TraceEvent`, `TraceArtifact`, `PolicyAuditEntry`, raw `ObservationStore` rows, or `FailureCaseRecord.trace_summary`.
+The model does not receive `TraceEvent`, `TraceArtifact`, `PolicyAuditEntry`, raw `ObservationStore` rows, `FailureCaseRecord.trace_summary`, or targeted replay result `trace_refs` / phase histories.
 
 The model can see trace-adjacent data only after bounded projection into context, for example:
 
@@ -128,6 +134,7 @@ Internal-only objects include:
 - review internal evidence and decision ids.
 - full live-eval task trace files read by `FailureCaseReplayRunner`; only bounded summaries are copied into replay records.
 - `failure_cases.json` package metadata that identifies extraction-only mode and the separate targeted replay runner.
+- `targeted_replay_result.json` / `.md` trace refs and planner phase/status histories. These point to bounded evidence and do not contain full prompts, hidden verification content, full trace payloads, or large context bodies.
 
 ## State Transitions And Failure Paths
 
@@ -178,6 +185,7 @@ Update this document when changing:
 - planner diff/review observation fields;
 - `FailureCaseReplayRunner._trace_summary()` or fields copied from trace into failure replay artifacts;
 - `FailureCaseReplayRunner.write()` metadata that classifies failure replay artifacts;
+- `TargetedFailureReplayRunner` fields copied from trace into targeted replay artifacts;
 - any decision to render trace/audit data into model context.
 
 ## Verification

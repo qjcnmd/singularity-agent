@@ -21,6 +21,7 @@ from singularity.evaluation import (
     LiveAgentEvalRunner,
     RegressionDetector,
     SingularityPrivateBenchmarkAdapter,
+    TargetedFailureReplayRunner,
     TraceReplayHarness,
     load_live_eval_manifest,
 )
@@ -878,6 +879,42 @@ def eval_trace_replay(
     profile = _profiles_from_cli([profile_json] if profile_json else None)[0]
     result = TraceReplayHarness(project_root=resolve_project_root(project_root)).replay(trace_run_dir, profile=profile)
     _print_eval_payload(result.to_dict(), json_output=json_output, title="trace replay")
+
+
+@eval_app.command("targeted-replay")
+def eval_targeted_replay(
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Directory for targeted replay JSON and Markdown artifacts."),
+    ] = None,
+    workspace_root: Annotated[
+        Path | None,
+        typer.Option("--workspace-root", help="Workspace used for the deterministic targeted replay fixture."),
+    ] = None,
+    max_turns: Annotated[
+        int,
+        typer.Option("--max-turns", min=1, max=40, help="Maximum model turns for the targeted replay smoke."),
+    ] = 6,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+) -> None:
+    """Run the deterministic targeted repair replay through AgentLoop and write artifacts."""
+
+    resolved_output = (output_dir or (Path.cwd() / "work" / "evaluations-targeted")).resolve(strict=False)
+    resolved_workspace = (
+        workspace_root.resolve(strict=False)
+        if workspace_root is not None
+        else resolved_output / "workspace"
+    )
+    result = TargetedFailureReplayRunner(
+        workspace_root=resolved_workspace,
+        max_turns=max_turns,
+    ).run(output_dir=resolved_output)
+    if json_output:
+        _write_stdout(json_dumps(result.to_dict()))
+    else:
+        console.print(Panel(json_dumps(result.to_dict()), title="targeted failure replay", border_style="cyan"))
+    if not result.completed:
+        raise typer.Exit(1)
 
 
 @eval_ab_app.command("run")

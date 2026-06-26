@@ -27,6 +27,7 @@ Symbols:
 - LiveAgentEvalRunner.run
 - LiveAgentEvalRunner.run_task
 - TargetedFailureReplayRunner
+- TargetedFailureReplayRunner.run
 - TargetedFailureReplayRunner.run_smoke
 - TargetedFailureReplayResult
 - TargetedFailureReplayResult.to_dict
@@ -46,6 +47,7 @@ Symbols:
 - AgentKernel.run_task
 - AgentLoop
 - AgentLoop.run
+- eval_targeted_replay
 - eval_live_run
 
 Field checks:
@@ -66,8 +68,8 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 - `src/singularity/evaluation/live.py`: manifest models, live runner, report schema, public/hidden verification, command interpreter strategy, regression comparison.
 - `src/singularity/evaluation/models.py`: shared evaluation dataclasses, including `FailureCaseRecord`.
 - `src/singularity/evaluation/failure_case_replay.py`: `FailureCaseReplayRunner` extraction from live report and trace summaries.
-- `src/singularity/evaluation/targeted_replay.py`: `TargetedFailureReplayRunner` deterministic smoke that drives the real `AgentLoop.run()` repair path and emits explicit repair-activation evidence.
-- `src/singularity/cli.py`: `eval live run` and `eval live private` CLI entrypoints.
+- `src/singularity/evaluation/targeted_replay.py`: `TargetedFailureReplayRunner` deterministic smoke that drives the real `AgentLoop.run()` repair path, emits explicit repair-activation evidence, and writes targeted replay JSON/Markdown artifacts.
+- `src/singularity/cli.py`: `eval live run`, `eval live private`, and `eval targeted-replay` CLI entrypoints.
 - `src/singularity/kernel/bootstrap.py`: `KernelBootstrap.boot()` constructs the graph and kernel.
 - `src/singularity/kernel/agent_kernel.py`: `AgentKernel.run_task()` creates and runs `AgentLoop`.
 - `src/singularity/agent_loop.py`: real agent loop that talks to the provider, tool protocol, planner, failure analyzer, and final reviewer.
@@ -92,6 +94,7 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 13. `_task_result()` emits the per-task Eval Report schema fields, including `success`, `completed`, `patch_applicable`, `public_verification_passed`, `hidden_verification_passed`, `contract_satisfaction`, `miscompletion_count`, repair telemetry, turn/tool counts, blocking reason, failure category, and final report status.
 14. `FailureCaseReplayRunner.write()` reads the written live report and emits `failure_cases.json` with one `FailureCaseRecord` for each failed task. This is post-run evaluator extraction; it does not call planner, failure analyzer, verification runner, or model internals. The payload declares `runner_mode="post_run_failure_extraction"` and points targeted execution replay to `TargetedFailureReplayRunner`.
 15. `TargetedFailureReplayRunner.run_smoke()` is a separate targeted smoke API. It creates a deterministic workspace, scripted provider, normal tool registry/executor/protocol, planner, verification runner, policy engine, and trace recorder, then calls `AgentLoop.run()` to exercise `verification_failed -> FailureAnalysisRequest -> FailureAnalysisResult -> RepairPlan/RepairContract -> repairing_failures -> VerificationContract satisfaction -> completed`.
+16. `TargetedFailureReplayRunner.run()` wraps the smoke result as a first-class evaluation artifact and writes `targeted_replay_result.json` plus `targeted_replay_result.md`. The CLI command `eval targeted-replay` calls this wrapper; it does not read `failure_cases.json` or replay extracted `FailureCaseRecord` objects into the original live AgentLoop.
 
 ## Runtime Objects Passed
 
@@ -101,7 +104,7 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 - `CommandEvalResult`: raw command string, resolved argv, interpreter strategy, exit code, duration, timeout state, sanitized first-line error summary, pass/fail state, and command failure category.
 - `LiveEvalTaskResult`: per-task Eval Report object with runtime telemetry, patch/check evidence, verification result, contract satisfaction, repair contract summary, reproducible environment, and AgentLoop reference.
 - `FailureCaseRecord`: replayable failed-task metadata with schema version, task id, status, failure category, miscompletion count, public/hidden verification booleans, policy blocks, expected file changes, actual changed files, final report status, repair attempt/execution counts, blocked reason, report/regression paths, trace path, trace artifact refs, contract satisfaction, repair telemetry, verification payload, and bounded trace summary.
-- `TargetedFailureReplayResult`: deterministic smoke evidence with schema version, AgentLoop entry flag/ref, trigger category, FailureAnalyzer request/result counts, authoritative repair plan/contract counts, repair attempt/execution counts, repair phase observation, verification-contract satisfaction, repair scope checks, final report status, trace path, and model-visible/internal object boundary labels.
+- `TargetedFailureReplayResult`: deterministic smoke evidence with schema version, AgentLoop entry flag/ref, trigger category, FailureAnalyzer request/result counts, authoritative repair plan/contract counts, repair attempt/execution counts, repair phase observation, bounded phase/planner-status history, bounded repair-contract summary, verification-contract satisfaction, repair scope checks, final report status, trace path, trace refs, and optional report paths.
 - `result.json`/`report.json`: suite payload with summary, task results, duration, optional regression comparison, and artifact paths.
 - `failure_cases.json`: evaluator-owned extraction package with schema version, `runner_mode`, targeted-runner label, source report/regression paths, failure count, and serialized `FailureCaseRecord` entries.
 
@@ -121,7 +124,9 @@ When `verification_prepare_commands` are present, hidden evaluator setup remains
 
 Planner benchmark constraints receive only `_model_visible_verification_command(task)`. Hidden verifier commands are not injected into planner verification requirements unless they are also public.
 
-`FailureCaseRecord` and `failure_cases.json` are never model-visible during the original live run. They are evaluator-internal extraction records for later diagnostics and targeted regression. `TargetedFailureReplayRunner` can run a deterministic smoke later, but that smoke uses normal `AgentLoop.run()` model context and does not make prior `FailureCaseRecord` objects visible to the task model.
+`FailureCaseRecord` and `failure_cases.json` are never model-visible during the original live run. They are evaluator-internal extraction records for later diagnostics and possible future targeted fixtures. Current targeted replay is a deterministic smoke entrypoint; it uses normal `AgentLoop.run()` model context and does not make prior `FailureCaseRecord` objects visible to the task model.
+
+The contents a model actually sees belong to the Context, Prompt, and `ModelTurnRequest` layers. Targeted replay result artifacts do not attempt to enumerate model-visible objects.
 
 ## Internal Trace Debug Audit Objects
 
@@ -138,7 +143,7 @@ Internal-only evaluation data includes:
 - `reproducible_environment.model_profile.sources`;
 - command interpreter diagnostics such as `resolved_argv` and `harness_executable`.
 - `FailureCaseReplayRunner._trace_summary()` bounded trace extraction, including event count, failure-analysis event count, repair event count, final-report outcome, blocked reasons, and the last phase-policy blocks.
-- `TargetedFailureReplayResult.evaluator_internal_objects`, which labels evaluation-only objects such as `FailureCaseRecord`, `FailureCaseReplayRunner.extract`, and `failure_cases.json`.
+- `TargetedFailureReplayResult` bounded evaluator evidence such as `phase_history`, `planner_status_history`, `repair_contract_summary`, `repairing_failures_evidence`, and `trace_refs`. These are evaluator/internal artifacts and are not prompt or context-capture fields.
 
 Provider secrets are not part of the report payload. The report records redacted provider/model/config status through the normal config/effective-config path.
 
@@ -155,6 +160,7 @@ Provider secrets are not part of the report payload. The report records redacted
 - `failure_cases.json` is written even when no tasks failed; in that case `failure_count=0` and `records=[]`.
 - `_run_shell()` parses manifest command strings with `shlex.split(posix=True)`, executes with `shell=False`, maps bare `python`/`python3`/`py` to the current harness `sys.executable`, and records command parse, timeout, command-not-found, dependency-missing, verification-failed, or command-failed categories.
 - Model-assisted planner/failure/final-review paths can participate only through the real AgentLoop. They cannot bypass policy, approval, sandbox, schema validation, benchmark contract satisfaction, or independent verification.
+- `FailureCaseReplayRunner` remains post-run extraction only. `failure_cases.json` is an evaluator/internal artifact and can be used as a future source for targeted fixtures, but the current extraction runner does not enter the original AgentLoop.
 
 ## Current Structure Assessment
 
@@ -177,19 +183,25 @@ Current code compares only tasks present in both baseline and candidate result f
 Run the retained V-7 smoke:
 
 ```bash
-python -m singularity eval live run docs/evaluation/live-fix-math-test-only.json --run-id v7-smoke
+python -m singularity.cli eval live run docs/evaluation/live-fix-math-test-only.json --run-id v7-smoke
 ```
 
 Run the multi-task capability regression:
 
 ```bash
-python -m singularity eval live run docs/evaluation/live-agent-regression-tasks.json --run-id capability-regression
+python -m singularity.cli eval live run docs/evaluation/live-agent-regression-tasks.json --run-id capability-regression
 ```
 
 With a baseline:
 
 ```bash
-python -m singularity eval live run docs/evaluation/live-agent-regression-tasks.json --baseline-result work/evaluations-live/previous/result.json
+python -m singularity.cli eval live run docs/evaluation/live-agent-regression-tasks.json --baseline-result work/evaluations-live/previous/result.json
+```
+
+Run the targeted repair replay artifact entrypoint:
+
+```bash
+python -m singularity.cli eval targeted-replay --output-dir work/evaluations-targeted --json
 ```
 
 ## Maintenance Rules
@@ -214,7 +226,7 @@ Relevant checks:
 - `python -m pytest tests/evaluation/test_live_eval.py --basetemp work/pytest-tmp`
 - `python -m pytest tests/evaluation --basetemp work/pytest-tmp`
 - `python scripts/verify_runtime_docs.py`
-- real model run through `python -m singularity eval live run docs/evaluation/live-agent-regression-tasks.json --run-id <run-id>`
+- real model run through `python -m singularity.cli eval live run docs/evaluation/live-agent-regression-tasks.json --run-id <run-id>`
 
 ## Last Verified Against
 

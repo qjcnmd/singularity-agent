@@ -46,6 +46,7 @@ def test_load_live_eval_manifest_example() -> None:
 def test_load_live_eval_regression_manifest_declares_required_task_classes() -> None:
     manifest = load_live_eval_manifest(Path("docs/evaluation/live-agent-regression-tasks.json"))
 
+    assert len(manifest.tasks) == 4
     by_type = {task.task_type: task for task in manifest.tasks}
     assert set(by_type) == {
         "simple_patch",
@@ -1327,6 +1328,9 @@ def test_failure_case_replay_runner_extracts_live_failure_record(tmp_path: Path)
     assert saved["runner_mode"] == "post_run_failure_extraction"
     assert saved["targeted_replay_runner"] == "TargetedFailureReplayRunner"
     assert saved["failure_count"] == 1
+    assert "entered_agent_loop" not in saved
+    assert "targeted_replay_result" not in saved
+    assert "phase_history" not in saved["records"][0]
 
 
 def test_live_eval_runs_hidden_verification_prepare_after_agent(tmp_path: Path) -> None:

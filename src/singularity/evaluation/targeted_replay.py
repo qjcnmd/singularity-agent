@@ -47,11 +47,15 @@ class TargetedFailureReplayResult:
     repair_scope: dict[str, Any]
     final_report_status: str
     trace_path: str
-    model_visible_objects: list[str] = field(default_factory=list)
-    evaluator_internal_objects: list[str] = field(default_factory=list)
+    phase_history: list[str] = field(default_factory=list)
+    planner_status_history: list[dict[str, str]] = field(default_factory=list)
+    repair_contract_summary: dict[str, Any] = field(default_factory=dict)
+    repairing_failures_evidence: dict[str, Any] = field(default_factory=dict)
+    trace_refs: dict[str, Any] = field(default_factory=dict)
+    report_paths: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": TARGETED_REPLAY_SCHEMA_VERSION,
             "status": self.status,
             "completed": self.completed,
@@ -69,9 +73,15 @@ class TargetedFailureReplayResult:
             "repair_scope": self.repair_scope,
             "final_report_status": self.final_report_status,
             "trace_path": self.trace_path,
-            "model_visible_objects": list(self.model_visible_objects),
-            "evaluator_internal_objects": list(self.evaluator_internal_objects),
+            "phase_history": list(self.phase_history),
+            "planner_status_history": list(self.planner_status_history),
+            "repair_contract_summary": dict(self.repair_contract_summary),
+            "repairing_failures_evidence": dict(self.repairing_failures_evidence),
+            "trace_refs": dict(self.trace_refs),
         }
+        if self.report_paths:
+            payload["report_paths"] = dict(self.report_paths)
+        return payload
 
 
 class TargetedFailureReplayRunner:
@@ -81,9 +91,31 @@ class TargetedFailureReplayRunner:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.max_turns = max_turns
 
+    def run(self, *, output_dir: Path | str) -> TargetedFailureReplayResult:
+        result = self.run_smoke()
+        output_path = Path(output_dir).resolve(strict=False)
+        output_path.mkdir(parents=True, exist_ok=True)
+        json_path = output_path / "targeted_replay_result.json"
+        markdown_path = output_path / "targeted_replay_result.md"
+        result = TargetedFailureReplayResult(
+            **{
+                **result.__dict__,
+                "report_paths": {"json": str(json_path), "markdown": str(markdown_path)},
+            }
+        )
+        json_path.write_text(
+            json.dumps(result.to_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        markdown_path.write_text(_targeted_replay_markdown(result), encoding="utf-8")
+        return result
+
     def run_smoke(self) -> TargetedFailureReplayResult:
         workspace = self.workspace_root
         workspace.mkdir(parents=True, exist_ok=True)
+        fixture_target = workspace / "quicksort.py"
+        if fixture_target.exists():
+            fixture_target.unlink()
         (workspace / "README.md").write_text("targeted repair replay fixture\n", encoding="utf-8")
         planner = Planner(workspace, session_id="targeted_replay", task_id="targeted_replay")
         trace = JsonlTraceRecorder.create(workspace)
@@ -196,6 +228,15 @@ class TargetedFailureReplayRunner:
             prompt_assembly=PromptAssemblyPipeline(workspace_root=workspace, trace=trace),
         )
         agent_result = agent.run("repair quicksort.py after a failing verification and verify it")
+        planner_status_history = _planner_status_history(trace.path, planner)
+        phase_history = _phase_history(planner_status_history)
+        repair_contract = _latest_repair_contract(planner.evidence.repair_plans)
+        repairing_evidence = _repairing_failures_evidence(
+            trace.path,
+            planner_status_history=planner_status_history,
+            final_phase=getattr(planner.state, "current_phase", ""),
+            final_status=getattr(getattr(planner.state, "status", None), "value", ""),
+        )
         final_report_status = (
             planner.final_report.status.value
             if planner.final_report is not None
@@ -213,21 +254,16 @@ class TargetedFailureReplayRunner:
             repair_contract_count=_repair_contract_count(planner.evidence.repair_plans),
             repair_attempt_count=_repair_attempt_count(planner.evidence.repair_plans),
             repair_execution_count=_repair_execution_count(planner.evidence.repair_plans, planner.evidence.verification_results),
-            repairing_failures_seen=_trace_event_count(trace.path, "repair_signal_consumed") > 0,
+            repairing_failures_seen=bool(repairing_evidence.get("seen")),
             verification_contract_satisfaction=planner.assess_verification_contract_satisfaction().to_dict(),
             repair_scope=_repair_scope(planner.evidence.repair_plans, planner.evidence.verification_results),
             final_report_status=final_report_status,
             trace_path=str(trace.path),
-            model_visible_objects=[
-                "FailureAnalysisRequest.to_model_payload",
-                "RepairContract projected through PlannerContextRenderer",
-                "VerificationContract command steps",
-            ],
-            evaluator_internal_objects=[
-                "FailureCaseRecord",
-                "FailureCaseReplayRunner.extract",
-                "failure_cases.json",
-            ],
+            phase_history=phase_history,
+            planner_status_history=planner_status_history,
+            repair_contract_summary=_repair_contract_summary(repair_contract),
+            repairing_failures_evidence=repairing_evidence,
+            trace_refs=_trace_refs(trace.path),
         )
 
 
@@ -351,10 +387,128 @@ def _latest_repair_contract(repair_plans: list[dict[str, Any]]) -> dict[str, Any
     return {}
 
 
-def _trace_event_count(path: Path, event_name: str) -> int:
+def _repair_contract_summary(contract: dict[str, Any]) -> dict[str, Any]:
+    verification_plan = [str(item) for item in contract.get("verification_plan") or []]
+    candidates = contract.get("action_candidates") or []
+    return {
+        "contract_id": str(contract.get("contract_id") or ""),
+        "target_files": [str(item) for item in contract.get("target_files") or []],
+        "action_count": len(candidates) if isinstance(candidates, list) else 0,
+        "verification_plan": verification_plan[:5],
+        "verification_step_count": len(
+            ((contract.get("verification_contract") or {}).get("steps") or [])
+            if isinstance(contract.get("verification_contract"), dict)
+            else []
+        ),
+        "needs_user_input": bool(contract.get("needs_user_input")),
+        "blocked_reason": str(contract.get("blocked_reason") or ""),
+    }
+
+
+def _planner_status_history(path: Path, planner: Planner) -> list[dict[str, str]]:
+    history: list[dict[str, str]] = []
+    for event in _trace_events(path):
+        if event.get("event") != "planner":
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        phase = str(data.get("phase") or "")
+        decision = str(data.get("decision") or "")
+        status = _status_for_phase(phase)
+        if phase:
+            _append_history(
+                history,
+                {
+                    "current_phase": phase,
+                    "status": status,
+                    "decision": decision,
+                    "source": "planner_trace",
+                },
+            )
+    state = getattr(planner, "state", None)
+    if state is not None:
+        status = getattr(getattr(state, "status", None), "value", "")
+        phase = str(getattr(state, "current_phase", "") or "")
+        _append_history(
+            history,
+            {
+                "current_phase": phase,
+                "status": status or _status_for_phase(phase),
+                "decision": "final_state",
+                "source": "planner_state",
+            },
+        )
+    return history[-20:]
+
+
+def _append_history(history: list[dict[str, str]], item: dict[str, str]) -> None:
+    if not item.get("current_phase"):
+        return
+    if history and all(history[-1].get(key) == item.get(key) for key in ("current_phase", "status", "decision")):
+        return
+    history.append(item)
+
+
+def _phase_history(planner_status_history: list[dict[str, str]]) -> list[str]:
+    phases: list[str] = []
+    for item in planner_status_history:
+        phase = item.get("current_phase")
+        if phase and (not phases or phases[-1] != phase):
+            phases.append(phase)
+    return phases[-20:]
+
+
+def _repairing_failures_evidence(
+    path: Path,
+    *,
+    planner_status_history: list[dict[str, str]],
+    final_phase: str,
+    final_status: str,
+) -> dict[str, Any]:
+    trace_event_count = _trace_event_count(path, "repair_signal_consumed")
+    trace_phase_event_count = _trace_repairing_phase_event_count(path)
+    planner_seen = any(
+        item.get("current_phase") == "repairing_failures"
+        or item.get("status") == "repairing_failures"
+        for item in planner_status_history
+    )
+    final_state_seen = final_phase == "repairing_failures" or final_status == "repairing_failures"
+    sources: list[str] = []
+    if planner_seen:
+        sources.append("planner_history")
+    if final_state_seen:
+        sources.append("planner_final_state")
+    if trace_phase_event_count:
+        sources.append("trace_event")
+    return {
+        "seen": bool(planner_seen or final_state_seen or trace_phase_event_count),
+        "sources": sources,
+        "trace_repair_signal_consumed_count": trace_event_count,
+        "trace_repairing_phase_event_count": trace_phase_event_count,
+    }
+
+
+def _trace_refs(path: Path) -> dict[str, Any]:
+    events = _trace_events(path)
+    return {
+        "jsonl_path": str(path),
+        "event_count": len(events),
+        "failure_analysis_event_count": sum(
+            1 for event in events if str(event.get("event") or "").startswith("failure_analysis_")
+        ),
+        "repair_event_count": sum(
+            1
+            for event in events
+            if str(event.get("event") or "") in {"repair_signal_consumed"}
+            or str(event.get("event") or "").startswith("repair_")
+        ),
+        "planner_event_count": sum(1 for event in events if event.get("event") == "planner"),
+    }
+
+
+def _trace_events(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
-        return 0
-    count = 0
+        return []
+    events: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -362,9 +516,66 @@ def _trace_event_count(path: Path, event_name: str) -> int:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _trace_event_count(path: Path, event_name: str) -> int:
+    count = 0
+    for event in _trace_events(path):
         if event.get("event") == event_name or event.get("event_type") == event_name:
             count += 1
     return count
+
+
+def _trace_repairing_phase_event_count(path: Path) -> int:
+    count = 0
+    for event in _trace_events(path):
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        phase = (
+            data.get("phase")
+            or data.get("current_phase")
+            or payload.get("phase")
+            or event.get("phase_id")
+        )
+        if phase == "repairing_failures":
+            count += 1
+    return count
+
+
+def _status_for_phase(phase: str) -> str:
+    return phase if phase else ""
+
+
+def _targeted_replay_markdown(result: TargetedFailureReplayResult) -> str:
+    payload = result.to_dict()
+    repair_contract = payload.get("repair_contract_summary") or {}
+    trace_refs = payload.get("trace_refs") or {}
+    return "\n".join(
+        [
+            "# Targeted Failure Replay",
+            "",
+            f"- status: `{payload['status']}`",
+            f"- completed: `{payload['completed']}`",
+            f"- entered_agent_loop: `{payload['entered_agent_loop']}`",
+            f"- agent_loop_ref: `{payload['agent_loop_ref']}`",
+            f"- failure_trigger: `{payload['failure_trigger']}`",
+            f"- repairing_failures_seen: `{payload['repairing_failures_seen']}`",
+            f"- failure_analysis_request_count: {payload['failure_analysis_request_count']}",
+            f"- failure_analysis_result_count: {payload['failure_analysis_result_count']}",
+            f"- repair_plan_count: {payload['repair_plan_count']}",
+            f"- repair_contract_count: {payload['repair_contract_count']}",
+            f"- repair_attempt_count: {payload['repair_attempt_count']}",
+            f"- repair_execution_count: {payload['repair_execution_count']}",
+            f"- verification_contract_satisfied: `{(payload.get('verification_contract_satisfaction') or {}).get('satisfied')}`",
+            f"- repair_target_files: `{', '.join(repair_contract.get('target_files') or []) or '-'}`",
+            f"- trace_jsonl: `{trace_refs.get('jsonl_path', '')}`",
+            f"- trace_event_count: {trace_refs.get('event_count', 0)}",
+            "",
+        ]
+    )
 
 
 def _tool_protocol_state_path(workspace: Path, trace: Any) -> Path:
