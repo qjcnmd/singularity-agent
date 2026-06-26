@@ -15,6 +15,8 @@ from singularity.evaluation.live import (
     load_live_eval_manifest,
     summarize_live_results,
 )
+from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
+from singularity.evaluation.models import FAILURE_CASE_RECORD_SCHEMA_VERSION
 from singularity.kernel.finalization import FinalReport
 from singularity.kernel.models import RunStatus
 from tests.agent_loop_helpers import make_agent_session
@@ -419,6 +421,8 @@ def test_live_eval_runner_writes_result_without_live_provider(tmp_path: Path) ->
     assert task["reproducible_environment"]["public_verification_command"] == manifest.tasks[0].verification_command
     assert task["reproducible_environment"]["hidden_verification_command"] == manifest.tasks[0].verification_command
     assert task["reproducible_environment"]["runtime"]["interpreter_strategy"]["shell"] is False
+    assert result["failure_case_count"] == 0
+    assert Path(result["failure_cases_path"]).exists()
     env_base_url = task["reproducible_environment"]["model_profile"]["base_url"]
     assert env_base_url is None or "sk-" not in env_base_url
     assert "env_file" in task["reproducible_environment"]["model_profile"]["sources"]
@@ -1188,6 +1192,92 @@ def test_live_eval_completion_gate_counts_false_completed_report(tmp_path: Path)
         for check in task["contract_satisfaction"]["checks"]
     )
     assert task["failure_category"] == "command_failed"
+
+
+def test_failure_case_replay_runner_extracts_live_failure_record(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    (trace_dir / "events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event_type": "action.proposed",
+                        "summary": "write_file is not allowed in phase running_verification.",
+                        "payload": {
+                            "phase": "running_verification",
+                            "reason": "write_file is not allowed in phase running_verification.",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_type": "final_report.completed",
+                        "summary": "Final report completed: blocked.",
+                        "payload": {
+                            "final_report": {
+                                "outcome": "blocked",
+                                "blocked_reasons": [
+                                    "write_file is not allowed in phase running_verification."
+                                ],
+                            }
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "live.regression.multi_file_reasoning",
+                        "status": "verification_failed",
+                        "success": False,
+                        "failure_category": "verification_failed",
+                        "miscompletion_count": 1,
+                        "public_verification_passed": False,
+                        "hidden_verification_passed": False,
+                        "policy_blocks": 1,
+                        "files_changed": ["policy.py"],
+                        "final_report_status": "finalized",
+                        "repair_attempt_count": 0,
+                        "repair_execution_count": 0,
+                        "blocked_reason": "agent status: blocked",
+                        "trace": str(trace_dir),
+                        "trace_artifact_refs": ["artifact_prompt"],
+                        "contract_satisfaction": {"status": "unsatisfied"},
+                        "repair_verification_contract": {"status": "not_recorded"},
+                        "task_verification_result": {"status": "failed"},
+                        "reproducible_environment": {
+                            "expected_file_changes": ["cart.py", "policy.py"]
+                        },
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    output_path = tmp_path / "failure_cases.json"
+    records = FailureCaseReplayRunner(report_path=report_path).write(output_path)
+
+    assert len(records) == 1
+    record = records[0].to_dict()
+    assert record["schema_version"] == FAILURE_CASE_RECORD_SCHEMA_VERSION
+    assert record["task_id"] == "live.regression.multi_file_reasoning"
+    assert record["expected_file_changes"] == ["cart.py", "policy.py"]
+    assert record["files_changed"] == ["policy.py"]
+    assert record["repair_attempt_count"] == 0
+    assert record["trace_summary"]["final_report_outcome"] == "blocked"
+    assert record["trace_summary"]["phase_policy_blocks"][0]["phase"] == "running_verification"
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+    assert saved["failure_count"] == 1
 
 
 def test_live_eval_runs_hidden_verification_prepare_after_agent(tmp_path: Path) -> None:

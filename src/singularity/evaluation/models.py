@@ -10,6 +10,7 @@ from typing import Any, TypeVar, cast
 
 
 SCHEMA_VERSION = "evaluation.benchmark_task/v1"
+FAILURE_CASE_RECORD_SCHEMA_VERSION = "evaluation.failure_case_record/v1"
 EnumT = TypeVar("EnumT", bound=Enum)
 
 
@@ -566,6 +567,85 @@ class PatchQualityResult:
             "metrics": _copy_jsonish(self.metrics),
             "warnings": list(self.warnings),
         }
+
+
+@dataclass(frozen=True)
+class FailureCaseRecord:
+    task_id: str
+    status: str
+    failure_category: str
+    miscompletion_count: int
+    public_verification_passed: bool
+    hidden_verification_passed: bool
+    policy_blocks: int
+    expected_file_changes: list[str]
+    files_changed: list[str]
+    final_report_status: str
+    repair_attempt_count: int
+    repair_execution_count: int
+    blocked_reason: str = ""
+    trace_path: str = ""
+    trace_artifact_refs: list[str] = field(default_factory=list)
+    contract_satisfaction: dict[str, Any] = field(default_factory=dict)
+    repair_telemetry: dict[str, Any] = field(default_factory=dict)
+    verification: dict[str, Any] = field(default_factory=dict)
+    trace_summary: dict[str, Any] = field(default_factory=dict)
+    source_report_path: str = ""
+    source_regression_path: str = ""
+    schema_version: str = FAILURE_CASE_RECORD_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "task_id": self.task_id,
+            "status": self.status,
+            "failure_category": self.failure_category,
+            "miscompletion_count": self.miscompletion_count,
+            "public_verification_passed": self.public_verification_passed,
+            "hidden_verification_passed": self.hidden_verification_passed,
+            "policy_blocks": self.policy_blocks,
+            "expected_file_changes": list(self.expected_file_changes),
+            "files_changed": list(self.files_changed),
+            "final_report_status": self.final_report_status,
+            "repair_attempt_count": self.repair_attempt_count,
+            "repair_execution_count": self.repair_execution_count,
+            "blocked_reason": self.blocked_reason,
+            "trace_path": self.trace_path,
+            "trace_artifact_refs": list(self.trace_artifact_refs),
+            "contract_satisfaction": _copy_jsonish(self.contract_satisfaction),
+            "repair_telemetry": _copy_jsonish(self.repair_telemetry),
+            "verification": _copy_jsonish(self.verification),
+            "trace_summary": _copy_jsonish(self.trace_summary),
+            "source_report_path": self.source_report_path,
+            "source_regression_path": self.source_regression_path,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "FailureCaseRecord":
+        return cls(
+            task_id=str(payload.get("task_id") or ""),
+            status=str(payload.get("status") or ""),
+            failure_category=str(payload.get("failure_category") or ""),
+            miscompletion_count=int(payload.get("miscompletion_count") or 0),
+            public_verification_passed=bool(payload.get("public_verification_passed")),
+            hidden_verification_passed=bool(payload.get("hidden_verification_passed")),
+            policy_blocks=int(payload.get("policy_blocks") or 0),
+            expected_file_changes=[str(item) for item in payload.get("expected_file_changes") or []],
+            files_changed=[str(item) for item in payload.get("files_changed") or []],
+            final_report_status=str(payload.get("final_report_status") or ""),
+            repair_attempt_count=int(payload.get("repair_attempt_count") or 0),
+            repair_execution_count=int(payload.get("repair_execution_count") or 0),
+            blocked_reason=str(payload.get("blocked_reason") or ""),
+            trace_path=str(payload.get("trace_path") or ""),
+            trace_artifact_refs=[str(item) for item in payload.get("trace_artifact_refs") or []],
+            contract_satisfaction=dict(payload.get("contract_satisfaction") or {}),
+            repair_telemetry=dict(payload.get("repair_telemetry") or {}),
+            verification=dict(payload.get("verification") or {}),
+            trace_summary=dict(payload.get("trace_summary") or {}),
+            source_report_path=str(payload.get("source_report_path") or ""),
+            source_regression_path=str(payload.get("source_regression_path") or ""),
+            schema_version=str(payload.get("schema_version") or FAILURE_CASE_RECORD_SCHEMA_VERSION),
+        )
 
 
 @dataclass(frozen=True)

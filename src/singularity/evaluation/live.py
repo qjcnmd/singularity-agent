@@ -453,8 +453,10 @@ class LiveAgentEvalRunner:
         report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         markdown_path.write_text(live_eval_report_markdown(payload), encoding="utf-8")
         regression = payload.get("regression")
+        regression_artifact_path: Path | None = None
         if isinstance(regression, dict):
             regression_path = self.run_dir / "regression.json"
+            regression_artifact_path = regression_path
             regression_md_path = self.run_dir / "regression.md"
             regression_path.write_text(
                 json.dumps(regression, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -466,9 +468,27 @@ class LiveAgentEvalRunner:
             )
             payload["regression_path"] = str(regression_path)
             payload["regression_markdown_path"] = str(regression_md_path)
+        from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
+
+        failure_cases_path = self.run_dir / "failure_cases.json"
+        failure_cases = FailureCaseReplayRunner(
+            report_path=report_path,
+            regression_path=regression_artifact_path,
+        ).write(failure_cases_path)
+        payload["failure_cases_path"] = str(failure_cases_path)
+        payload["failure_case_count"] = len(failure_cases)
         payload["result_path"] = str(result_path)
         payload["report_path"] = str(report_path)
         payload["markdown_path"] = str(markdown_path)
+        result_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        report_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        markdown_path.write_text(live_eval_report_markdown(payload), encoding="utf-8")
         return payload
 
     def run_task(self, task: LiveEvalTask, *, manifest_base: Path) -> LiveEvalTaskResult:
@@ -1494,7 +1514,7 @@ def _repair_execution_count(payload: dict[str, Any]) -> int:
 
 
 def _completed(final_report_status: str, *, agent_status: str) -> bool:
-    return final_report_status in {"completed", "finalized", "success"} or agent_status == "completed"
+    return final_report_status in {"completed", "success"} or agent_status == "completed"
 
 
 def _blocked_reason(

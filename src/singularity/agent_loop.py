@@ -361,6 +361,14 @@ class AgentLoop:
                 controller.apply_outcome(blocked)
                 self._record_outcome_context(context, planner, blocked)
                 return self._terminal_result_from_outcome(blocked, turn=turn)
+            repair_blocked = self._repair_phase_completion_blocked_outcome(
+                planner,
+                assessment=assessment,
+            )
+            if repair_blocked is not None:
+                controller.apply_outcome(repair_blocked)
+                self._record_outcome_context(context, planner, repair_blocked)
+                return self._terminal_result_from_outcome(repair_blocked, turn=turn)
             return None
         if (
             planner.state is not None
@@ -597,6 +605,23 @@ class AgentLoop:
         snapshot = self._failure_snapshot(planner)
         if request.fingerprint in self._failure_analysis_fingerprints:
             if not self._duplicate_failure_has_new_evidence(request.fingerprint, snapshot):
+                if self._is_stalled_completion_gate_failure(
+                    failure_source=failure_source,
+                    outcome=outcome,
+                ):
+                    signal_payload = self._failure_replan_signals.get(request.fingerprint)
+                    return ExecutionOutcome(
+                        status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
+                        source="failure_analysis",
+                        reason="Repeated completion/final review failure without new repair evidence.",
+                        error_code="repair_budget_exceeded",
+                        next_action="ask_user",
+                        observation_summary=(
+                            "Completion gate is still blocked after failure analysis and no new repair evidence."
+                        ),
+                        retry_allowed=False,
+                        metadata={"replan_signal": signal_payload or {}},
+                    )
                 return None
             signal_payload = self._failure_replan_signals.get(request.fingerprint)
             if signal_payload is None:
@@ -769,6 +794,45 @@ class AgentLoop:
                 ]
             ),
         }
+
+    @staticmethod
+    def _is_stalled_completion_gate_failure(
+        *,
+        failure_source: str,
+        outcome: ExecutionOutcome | None,
+    ) -> bool:
+        if failure_source in {"completion", "completion_review"}:
+            return True
+        return bool(
+            outcome is not None
+            and outcome.error_code in {"completion_rejected", "final_review_rejected"}
+        )
+
+    @staticmethod
+    def _repair_phase_completion_blocked_outcome(
+        planner: Planner,
+        *,
+        assessment: dict[str, Any],
+    ) -> ExecutionOutcome | None:
+        state = getattr(planner, "state", None)
+        if getattr(state, "current_phase", "") != "repairing_failures":
+            return None
+        unmet = [str(item) for item in assessment.get("unmet") or []]
+        if "verification_contract_satisfaction" not in unmet:
+            return None
+        return ExecutionOutcome(
+            status=ExecutionOutcomeStatus.BLOCKED,
+            source="completion",
+            reason="Repair phase completion rejected because the active repair contract is unsatisfied.",
+            error_code="repair_budget_exceeded",
+            missing_evidence=unmet,
+            next_action="blocked",
+            observation_summary=(
+                "Repair phase cannot complete because the active repair verification contract is unsatisfied."
+            ),
+            retry_allowed=False,
+            metadata={"assessment": assessment},
+        )
 
     def _duplicate_failure_has_new_evidence(self, fingerprint: str, snapshot: dict[str, int]) -> bool:
         previous = self._failure_analysis_snapshots.get(fingerprint)

@@ -34,7 +34,7 @@ from singularity.failure_analysis import (
 from singularity.kernel.models import AgentRun, KernelContext, KernelStatus, RunIdentity
 from singularity.planner import Planner, TaskStatus
 from singularity.planner.models import AuthorizationDecision, EvidenceLedger
-from singularity.tools.models import ToolSpec
+from singularity.tools.models import PermissionLevel, ToolSpec
 from singularity.verification import VerificationRunner
 from singularity.verification.models import CheckKind, VerificationCheck
 from tests.test_verification_runner import FakeCommandExecutor, command_result
@@ -559,6 +559,8 @@ class TestPlannerVerificationAuthorization:
     def _setup_repair_planner(self, tmp_path: Path) -> tuple[Planner, VerificationContract]:
         planner = Planner(tmp_path, session_id="s1", task_id="t1")
         planner.start_task("fix the bug")
+        assert planner.state is not None
+        assert planner.plan is not None
         planner.state.status = TaskStatus.REPAIRING_FAILURES
         planner.state.current_phase = "repairing_failures"
         planner.plan.current_phase = "repairing_failures"
@@ -590,6 +592,33 @@ class TestPlannerVerificationAuthorization:
         planner.evidence.repair_plans.append(plan.to_dict())
         return planner, contract
 
+    def _setup_repair_phase_without_contract(self, tmp_path: Path) -> Planner:
+        planner = Planner(tmp_path, session_id="s1", task_id="t1")
+        planner.start_task("fix the bug")
+        assert planner.state is not None
+        assert planner.plan is not None
+        planner.state.status = TaskStatus.REPAIRING_FAILURES
+        planner.state.current_phase = "repairing_failures"
+        planner.plan.current_phase = "repairing_failures"
+        planner.evidence.repair_plans.append(
+            {
+                "plan_id": "lightweight_verification_plan",
+                "summary": "VerificationRunner captured failure evidence without an authoritative repair contract.",
+            }
+        )
+        return planner
+
+    def _make_write_spec(self, name: str) -> ToolSpec:
+        return ToolSpec(
+            name=name,
+            version="0.0.1",
+            description=f"Test {name}",
+            input_model=_EmptyInput,
+            handler=lambda args: {},
+            permission_level=PermissionLevel.WRITE,
+            uses_mutation_manager=True,
+        )
+
     def test_contract_command_allowed(self, tmp_path: Path) -> None:
         """run_verification with contract-matching command is allowed."""
         planner, contract = self._setup_repair_planner(tmp_path)
@@ -601,6 +630,47 @@ class TestPlannerVerificationAuthorization:
             arguments={"smoke_commands": [["pytest", "tests/"]]},
         )
         assert decision.allowed
+
+    def test_missing_repair_contract_blocks_execution_but_allows_evidence_tools(
+        self, tmp_path: Path
+    ) -> None:
+        planner = self._setup_repair_phase_without_contract(tmp_path)
+
+        write_decision = planner.authorize_tool_call(
+            tool_name="write_file",
+            tool_call_id="tc_write",
+            spec=self._make_write_spec("write_file"),
+            arguments={"path": "src/app.py", "content": "fixed = True\n"},
+        )
+        assert not write_decision.allowed
+        assert write_decision.error_code == "repair_contract_missing"
+
+        verify_decision = planner.authorize_tool_call(
+            tool_name="run_verification",
+            tool_call_id="tc_verify",
+            spec=self._make_spec("run_verification"),
+            arguments={"smoke_commands": [["pytest", "tests/"]]},
+        )
+        assert not verify_decision.allowed
+        assert verify_decision.error_code == "repair_contract_missing"
+
+        evidence_decision = planner.authorize_tool_call(
+            tool_name="get_verification_result",
+            tool_call_id="tc_evidence",
+            spec=self._make_spec("get_verification_result"),
+            arguments={},
+        )
+        assert evidence_decision.allowed
+
+        tools = [
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "inspect_diff"}},
+            {"function": {"name": "get_verification_result"}},
+            {"function": {"name": "write_file"}},
+            {"function": {"name": "run_verification"}},
+        ]
+        exposed = {tool["function"]["name"] for tool in planner.filtered_tools(tools)}
+        assert exposed == {"read_file", "inspect_diff", "get_verification_result"}
 
     def test_arbitrary_command_rejected(self, tmp_path: Path) -> None:
         """run_verification with a command NOT in the contract is rejected."""

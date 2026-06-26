@@ -59,6 +59,8 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 ## Current Source Locations
 
 - `src/singularity/evaluation/live.py`: manifest models, live runner, report schema, public/hidden verification, command interpreter strategy, regression comparison.
+- `src/singularity/evaluation/models.py`: shared evaluation dataclasses, including `FailureCaseRecord`.
+- `src/singularity/evaluation/failure_case_replay.py`: `FailureCaseReplayRunner` extraction from live report and trace summaries.
 - `src/singularity/cli.py`: `eval live run` and `eval live private` CLI entrypoints.
 - `src/singularity/kernel/bootstrap.py`: `KernelBootstrap.boot()` constructs the graph and kernel.
 - `src/singularity/kernel/agent_kernel.py`: `AgentKernel.run_task()` creates and runs `AgentLoop`.
@@ -82,6 +84,7 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 11. Hidden verification uses `hidden_verification_command` when declared, otherwise `verification_command`.
 12. `_contract_satisfaction()` evaluates allowed scope, independent verification, public verification, final report status, patch applicability, expected file changes, completion standard recording, risk tag recording, and expected blocked outcomes.
 13. `_task_result()` emits the per-task Eval Report schema fields, including `success`, `completed`, `patch_applicable`, `public_verification_passed`, `hidden_verification_passed`, `contract_satisfaction`, `miscompletion_count`, repair telemetry, turn/tool counts, blocking reason, failure category, and final report status.
+14. `FailureCaseReplayRunner.write()` reads the written live report and emits `failure_cases.json` with one `FailureCaseRecord` for each failed task. This is post-run evaluator extraction; it does not call planner, failure analyzer, verification runner, or model internals.
 
 ## Runtime Objects Passed
 
@@ -90,7 +93,9 @@ It is not responsible for planner reasoning, tool execution, policy approval, sa
 - `ProductionConfig`: resolved per-task runtime config using the benchmark workspace as `project_root` and the CLI/env root for provider configuration loading.
 - `CommandEvalResult`: raw command string, resolved argv, interpreter strategy, exit code, duration, timeout state, sanitized first-line error summary, pass/fail state, and command failure category.
 - `LiveEvalTaskResult`: per-task Eval Report object with runtime telemetry, patch/check evidence, verification result, contract satisfaction, repair contract summary, reproducible environment, and AgentLoop reference.
+- `FailureCaseRecord`: replayable failed-task metadata with schema version, task id, status, failure category, miscompletion count, public/hidden verification booleans, policy blocks, expected file changes, actual changed files, final report status, repair attempt/execution counts, blocked reason, report/regression paths, trace path, trace artifact refs, contract satisfaction, repair telemetry, verification payload, and bounded trace summary.
 - `result.json`/`report.json`: suite payload with summary, task results, duration, optional regression comparison, and artifact paths.
+- `failure_cases.json`: evaluator-owned replay package with schema version, source report/regression paths, failure count, and serialized `FailureCaseRecord` entries.
 
 ## Model-Visible Objects
 
@@ -108,6 +113,8 @@ When `verification_prepare_commands` are present, hidden evaluator setup remains
 
 Planner benchmark constraints receive only `_model_visible_verification_command(task)`. Hidden verifier commands are not injected into planner verification requirements unless they are also public.
 
+`FailureCaseRecord` and `failure_cases.json` are never model-visible during the original live run. They are evaluator-internal replay inputs for later diagnostics and targeted regression.
+
 ## Internal Trace Debug Audit Objects
 
 Internal-only evaluation data includes:
@@ -122,6 +129,7 @@ Internal-only evaluation data includes:
 - raw trace and final report payload after normal runtime redaction;
 - `reproducible_environment.model_profile.sources`;
 - command interpreter diagnostics such as `resolved_argv` and `harness_executable`.
+- `FailureCaseReplayRunner._trace_summary()` bounded trace extraction, including event count, failure-analysis event count, repair event count, final-report outcome, blocked reasons, and the last phase-policy blocks.
 
 Provider secrets are not part of the report payload. The report records redacted provider/model/config status through the normal config/effective-config path.
 
@@ -133,6 +141,8 @@ Provider secrets are not part of the report payload. The report records redacted
 - Patch applicability is false when a patch is required and the clean verification workspace cannot reproduce the agent workspace changes, or when required `expected_file_changes` are absent.
 - Public verification failure, hidden verification failure, changed files outside `allowed_paths`, failed success criteria, and patch failure all make `success=false`.
 - If the final report claims completed/finalized but the live task contract fails, `_task_result()` records `miscompletion_count=1`.
+- `_completed()` counts only explicit completed/success agent statuses as completed. A kernel-finalized blocked run is not counted as task completion.
+- `failure_cases.json` is written even when no tasks failed; in that case `failure_count=0` and `records=[]`.
 - `_run_shell()` parses manifest command strings with `shlex.split(posix=True)`, executes with `shell=False`, maps bare `python`/`python3`/`py` to the current harness `sys.executable`, and records command parse, timeout, command-not-found, dependency-missing, verification-failed, or command-failed categories.
 - Model-assisted planner/failure/final-review paths can participate only through the real AgentLoop. They cannot bypass policy, approval, sandbox, schema validation, benchmark contract satisfaction, or independent verification.
 
@@ -175,13 +185,14 @@ python -m singularity eval live run docs/evaluation/live-agent-regression-tasks.
 Update this document when changing:
 
 - `LiveEvalTask`, `CommandEvalResult`, or `LiveEvalTaskResult` fields;
+- `FailureCaseRecord`, `FailureCaseReplayRunner`, or `failure_cases.json` schema;
 - live eval manifest schema or success criteria;
 - public/hidden verification behavior;
 - `_task_goal()` model-visible benchmark instructions;
 - `_apply_benchmark_constraints()` and planner benchmark verification command injection;
 - `_run_shell()` command parsing, interpreter mapping, or failure taxonomy;
 - `_contract_satisfaction()` and miscompletion semantics;
-- live eval report, summary, regression, or reproducible environment fields.
+- live eval report, summary, regression, failure replay, or reproducible environment fields.
 
 ## Verification
 

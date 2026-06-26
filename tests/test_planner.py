@@ -106,6 +106,54 @@ def test_benchmark_constraints_limit_tool_exposure_and_authorization(tmp_path: P
     assert state.task_contract["benchmark_constraints"]["allowed_tools"] == ["read_file"]
 
 
+def test_benchmark_expected_file_changes_delay_verification_phase(tmp_path: Path) -> None:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    planner.apply_benchmark_constraints(
+        {
+            "task_id": "bench.multi_file",
+            "allowed_tools": ["read_file", "write_file", "run_verification"],
+            "expected_file_changes": ["cart.py", "policy.py"],
+            "verification_command": "python -m pytest tests/test_shipping.py",
+        }
+    )
+    state = planner.start_task("Update policy and cart")
+    state.status = TaskStatus.APPLYING_CHANGES
+    state.current_phase = "applying_changes"
+    planner.plan.current_phase = "applying_changes"
+
+    planner.update_from_tool_result(
+        tool_call_id="call_policy",
+        tool_name="write_file",
+        result={
+            "ok": True,
+            "content": {
+                "mutation_status": "applied",
+                "transaction_id": "tx_policy",
+                "changed_files": ["policy.py"],
+            },
+        },
+    )
+
+    assert planner.state.current_phase == "applying_changes"
+    assessment = planner.assess_completion(mark_blocked=False)
+    assert "benchmark_expected_file_changes" in assessment["unmet"]
+
+    planner.update_from_tool_result(
+        tool_call_id="call_cart",
+        tool_name="write_file",
+        result={
+            "ok": True,
+            "content": {
+                "mutation_status": "applied",
+                "transaction_id": "tx_cart",
+                "changed_files": ["cart.py"],
+            },
+        },
+    )
+
+    assert planner.state.current_phase == "running_verification"
+
+
 def test_sandbox_required_policy_observation_is_not_unresolved_failure(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Run verification")
@@ -965,4 +1013,3 @@ def test_planner_store_save_is_atomic_across_files(tmp_path: Path) -> None:
         # No leftover temp files after a successful save.
         siblings = [child.name for child in session_dir.iterdir() if child.name.startswith(f".{filename}.")]
         assert siblings == []
-

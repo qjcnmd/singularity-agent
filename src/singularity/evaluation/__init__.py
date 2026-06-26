@@ -7,6 +7,7 @@ from singularity.evaluation.models import (
     EvaluationProfile,
     ExpectedOutcome,
     ExpectedOutcomeKind,
+    FailureCaseRecord,
     GoldenTaskContract,
     PatchQualityResult,
     ScoringResult,
@@ -16,6 +17,7 @@ from singularity.evaluation.models import (
     WorkspaceSnapshot,
     WorkspaceSnapshotKind,
 )
+from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
 from singularity.evaluation.patch_quality import PatchQualityEvaluator
 from singularity.evaluation.replay import TraceReplayHarness
 from singularity.evaluation.reports import (
@@ -52,6 +54,8 @@ __all__ = [
     "BenchmarkVisibility",
     "EvaluationHook",
     "EvaluationProfile",
+    "FailureCaseRecord",
+    "FailureCaseReplayRunner",
     "EvaluationReport",
     "EvaluationHarness",
     "ExpectedOutcome",

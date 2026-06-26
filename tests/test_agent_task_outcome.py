@@ -172,6 +172,7 @@ def test_malformed_tool_args_record_retryable_outcome(tmp_path: Path) -> None:
     result = agent.run("inspect then change code")
 
     assert result.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
+    assert result.error_code == "max_turns_exceeded"
     assert len(provider.calls) == 2
     assert [item["status"] for item in planner.evidence.task_outcomes[:2]] == [
         "retryable",
@@ -226,7 +227,8 @@ def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> N
 
     result = agent.run("implement quicksort.py and verify it")
 
-    assert result.status == AgentLoopStatus.MAX_TURNS_EXCEEDED
+    assert result.status == AgentLoopStatus.BLOCKED
+    assert result.error_code == "repair_budget_exceeded"
     assert planner.state is not None
     assert planner.state.current_phase == "repairing_failures"
     assert planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "failed"
@@ -239,6 +241,10 @@ def test_verification_failure_replans_instead_of_completing(tmp_path: Path) -> N
     assert rejected["error_code"] == "completion_rejected"
     assert rejected["next_action"] == "continue"
     assert rejected["retry_allowed"] is True
+    blocked = planner.evidence.task_outcomes[-1]
+    assert blocked["status"] == "blocked"
+    assert blocked["error_code"] == "repair_budget_exceeded"
+    assert blocked["retry_allowed"] is False
     assert planner.evidence.failure_analyses[-1]["failure_category"] == "unit_test_failure"
     assert planner.evidence.repair_plans[-1]["strategy"] == "patch the failing file and rerun the smoke command"
 

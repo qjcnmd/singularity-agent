@@ -74,6 +74,7 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 - `src/singularity/review/pipeline.py`: review trace events.
 - `src/singularity/review/critic.py`: model critic request and result boundary.
 - `src/singularity/planner/engine.py`: diff and review observations.
+- `src/singularity/evaluation/failure_case_replay.py`: bounded live-eval failure replay extraction from `report.json` and trace `events.jsonl`.
 
 ## Runtime Call Chain
 
@@ -86,6 +87,7 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 7. Policy code calls `PolicyAuditWriter.append()` with `PolicyRequest` and `PolicyDecision`.
 8. Review code calls `ReviewPipeline._emit()` to send review lifecycle events.
 9. Planner records review and diff observations in `Planner.record_review_observation()` and `record_diff_observation()`.
+10. After live eval writes `report.json`, `FailureCaseReplayRunner` may read task trace `events.jsonl` and copy only bounded diagnostic counts, final-report outcome, blocked reasons, and recent phase-policy blocks into `failure_cases.json`.
 
 ## Runtime Objects Passed
 
@@ -95,10 +97,11 @@ It is not responsible for deciding model prompts or provider request schemas. Tr
 - `PolicyAuditEntry`: normalized and redacted policy request/decision audit row.
 - Review trace payloads: review stage, findings, decision, report id, transaction id, verification id, policy decision id.
 - Semantic Planner / Final Reviewer trace events: `semantic_planner.task_contract.model_ok`, `semantic_planner.task_contract.fallback`, `semantic_planner.semantic_plan.model_ok`, `semantic_planner.semantic_plan.fallback`, `semantic_planner.planner_decision.model_ok`, `semantic_planner.planner_decision.fallback`, `final_reviewer.assess.done`, `final_reviewer.assess.model_ok`, and `final_reviewer.assess.fallback`.
+- Failure replay trace summary: events path, event count, availability flag, failure-analysis event count, repair event count, final-report outcome, blocked reasons, and recent phase-policy blocks. This is a derived evaluator object, not a trace-store schema change.
 
 ## Model-Visible Objects (模型实际可见对象)
 
-The model does not receive `TraceEvent`, `TraceArtifact`, `PolicyAuditEntry`, or raw `ObservationStore` rows.
+The model does not receive `TraceEvent`, `TraceArtifact`, `PolicyAuditEntry`, raw `ObservationStore` rows, or `FailureCaseRecord.trace_summary`.
 
 The model can see trace-adjacent data only after bounded projection into context, for example:
 
@@ -122,6 +125,7 @@ Internal-only objects include:
 - policy audit rows and grant scopes;
 - context event rows and raw observation storage after redaction;
 - review internal evidence and decision ids.
+- full live-eval task trace files read by `FailureCaseReplayRunner`; only bounded summaries are copied into replay records.
 
 ## State Transitions And Failure Paths
 
@@ -134,6 +138,7 @@ Internal-only objects include:
 - `ObservationStore.save_observation()` redacts secret/sensitive content and removes raw keys before storage.
 - `PolicyAuditWriter.append()` redacts request and decision fields before JSONL append.
 - Review trace events can still be non-blocking if model critic fails.
+- Failure replay extraction treats missing or unreadable trace files as non-fatal diagnostic gaps: `events_available=false`, `event_count=0`, and the source report remains the authoritative task-failure record.
 
 ## Current Structure Assessment
 
@@ -169,6 +174,7 @@ Update this document when changing:
 - policy audit serialization or redaction;
 - review trace event payloads;
 - planner diff/review observation fields;
+- `FailureCaseReplayRunner._trace_summary()` or fields copied from trace into failure replay artifacts;
 - any decision to render trace/audit data into model context.
 
 ## Verification

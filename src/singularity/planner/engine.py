@@ -326,6 +326,28 @@ class Planner:
         phase = plan.phase(state.current_phase)
         normalized_args = self.policy.normalize_arguments(arguments or {})
         repair_allowed = self._active_repair_allowed_tools()
+        repair_execution_block = self._repair_contract_execution_block()
+        if repair_execution_block and tool_name not in self._repair_contract_evidence_tools():
+            error_code, block_reason = repair_execution_block
+            decision = AuthorizationDecision(
+                allowed=False,
+                error_code=error_code,
+                reason=(
+                    f"{tool_name} requires an executable repair contract before "
+                    f"repair-phase execution: {block_reason}."
+                ),
+            )
+            self._record_event(
+                action_id=tool_call_id,
+                action_kind=self.policy.action_for_tool(tool_name).value,
+                decision="deny",
+                reason=decision.reason,
+                extra={
+                    "reason_code": decision.error_code,
+                    "repair_contract": self._active_repair_contract(),
+                },
+            )
+            return decision
         if repair_allowed and tool_name not in repair_allowed:
             decision = AuthorizationDecision(
                 allowed=False,
@@ -612,9 +634,10 @@ class Planner:
             }
             self.evidence.applied_changes.append(entry)
             self._append_unique(self._state().linked_transactions, transaction_id)
-            self._state().status = TaskStatus.RUNNING_VERIFICATION
-            self._state().current_phase = "running_verification"
-            self._plan().current_phase = "running_verification"
+            if self._mutation_contract_ready_for_verification():
+                self._state().status = TaskStatus.RUNNING_VERIFICATION
+                self._state().current_phase = "running_verification"
+                self._plan().current_phase = "running_verification"
         if payload.get("error_code"):
             self.replan({"error_code": payload.get("error_code")})
         self._persist()
@@ -1265,8 +1288,11 @@ class Planner:
         for criterion_id, criterion in criteria.items():
             if criterion["required"] and not criterion["satisfied"]:
                 unmet.append(f"contract:{criterion_id}")
+        missing_benchmark_changes = self._missing_benchmark_expected_file_changes()
+        if missing_benchmark_changes:
+            unmet.append("benchmark_expected_file_changes")
         satisfaction = self.assess_verification_contract_satisfaction()
-        if satisfaction.failed_steps and not satisfaction.satisfied:
+        if not satisfaction.satisfied:
             unmet.append("verification_contract_satisfaction")
         status = TaskStatus.COMPLETED if not unmet else TaskStatus.BLOCKED
         assessment = {
@@ -1539,9 +1565,13 @@ class Planner:
         current_step = self.semantic_rolling_plan().current_step()
         if current_step is not None:
             allowed.update(current_step.allowed_capabilities)
-        repair_allowed = self._active_repair_allowed_tools()
-        if repair_allowed:
-            allowed &= repair_allowed
+        repair_execution_block = self._repair_contract_execution_block()
+        if repair_execution_block:
+            allowed &= self._repair_contract_evidence_tools()
+        else:
+            repair_allowed = self._active_repair_allowed_tools()
+            if repair_allowed:
+                allowed &= repair_allowed
         benchmark_allowed = self._benchmark_allowed_tools()
         if benchmark_allowed:
             allowed &= benchmark_allowed
@@ -1586,9 +1616,13 @@ class Planner:
             current_step = self.semantic_rolling_plan().current_step()
             if current_step is not None:
                 allowed.update(current_step.allowed_capabilities)
-            repair_allowed = self._active_repair_allowed_tools()
-            if repair_allowed:
-                allowed &= repair_allowed
+            repair_execution_block = self._repair_contract_execution_block()
+            if repair_execution_block:
+                allowed &= self._repair_contract_evidence_tools()
+            else:
+                repair_allowed = self._active_repair_allowed_tools()
+                if repair_allowed:
+                    allowed &= repair_allowed
             benchmark_allowed = self._benchmark_allowed_tools()
             if benchmark_allowed:
                 allowed &= benchmark_allowed
@@ -1644,6 +1678,30 @@ class Planner:
             if contract:
                 return contract
         return {}
+
+    def _repair_contract_execution_block(self) -> tuple[str, str] | None:
+        if self.state is None or self.state.current_phase != "repairing_failures":
+            return None
+        contract = self._active_repair_contract()
+        if not contract:
+            return (
+                "repair_contract_missing",
+                "repairing_failures requires FailureAnalyzer/RepairPlanner contract evidence",
+            )
+        blocked_reason = _repair_contract_blocked_reason(contract, {})
+        if not blocked_reason:
+            return None
+        if blocked_reason == "repair_contract_requires_user_input":
+            return blocked_reason, blocked_reason
+        if blocked_reason.startswith("repair_contract_invalid"):
+            return "repair_contract_invalid", blocked_reason
+        if blocked_reason == "repair_contract_low_confidence":
+            return blocked_reason, blocked_reason
+        return "repair_contract_blocked", blocked_reason
+
+    @staticmethod
+    def _repair_contract_evidence_tools() -> set[str]:
+        return set(READ_TOOLS | DIFF_TOOLS | {"get_verification_result"})
 
     def _active_repair_allowed_tools(self) -> set[str]:
         contract = self._active_repair_contract()
@@ -1936,6 +1994,26 @@ class Planner:
             state.current_phase = "applying_changes"
             plan.current_phase = "applying_changes"
 
+    def _mutation_contract_ready_for_verification(self) -> bool:
+        expected = self._benchmark_expected_file_changes()
+        if not expected:
+            return True
+        return not self._missing_benchmark_expected_file_changes()
+
+    def _benchmark_expected_file_changes(self) -> set[str]:
+        return {
+            _normalize_planner_path(item)
+            for item in self._benchmark_constraints.get("expected_file_changes") or []
+            if item
+        }
+
+    def _missing_benchmark_expected_file_changes(self) -> list[str]:
+        expected = self._benchmark_expected_file_changes()
+        if not expected:
+            return []
+        changed = {_normalize_planner_path(item) for item in self._changed_files()}
+        return sorted(expected - changed)
+
     def _auto_advance_before_step(self) -> None:
         state = self._state()
         plan = self._plan()
@@ -1943,7 +2021,11 @@ class Planner:
             state.status = TaskStatus.APPLYING_CHANGES
             state.current_phase = "applying_changes"
             plan.current_phase = "applying_changes"
-        if state.current_phase == "applying_changes" and self.evidence.applied_changes:
+        if (
+            state.current_phase == "applying_changes"
+            and self.evidence.applied_changes
+            and self._mutation_contract_ready_for_verification()
+        ):
             state.status = TaskStatus.RUNNING_VERIFICATION
             state.current_phase = "running_verification"
             plan.current_phase = "running_verification"
