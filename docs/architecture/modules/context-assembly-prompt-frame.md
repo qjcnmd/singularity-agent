@@ -10,6 +10,7 @@ Source paths:
 - src/singularity/context/models.py
 - src/singularity/context/store.py
 - src/singularity/planner/context.py
+- src/singularity/planner/final_reviewer.py
 
 Symbols:
 - AgentLoop
@@ -40,6 +41,10 @@ Symbols:
 - PlannerContextRenderer._risk_points_summary
 - PlannerContextRenderer._verification_strategies_summary
 - PlannerContextRenderer._repair_policy_summary
+- FinalReviewer
+- FinalReviewer.assess
+- CompletionAssessment
+- CriterionAssessment
 
 ## Module Boundary
 
@@ -105,6 +110,8 @@ Planner context message now includes projected summaries of Semantic Planner obj
 
 Producer-internal model calls (`TaskContractProducer`/`SemanticPlanProducer`/`PlannerDecisionProducer`) use a separate compact `Planner._producer_context()` dict and do NOT flow through `PlannerContextRenderer`. Only the main task model sees the renderer output. This separation prevents producer-internal model calls from polluting the main task model's context.
 
+The FinalReviewer model call (`ModelPurpose.FINAL_REVIEW`, json_mode, `tools=[]`, `ToolChoiceMode.NONE`) follows the same producer-internal pattern: it uses `Planner._producer_context()` and does NOT flow through `PlannerContextRenderer`. The model receives per-criterion assessment summaries + evidence bucket counts only; it can confirm (False→True with evidence_refs) but cannot override evidence-gate failures. `CompletionAssessment.criteria` summaries are internal-only and are NOT projected into the main task model context.
+
 ## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
 
 Internal-only context data includes:
@@ -115,6 +122,7 @@ Internal-only context data includes:
 - prompt manifest ids, prompt hashes, stable/dynamic tail hashes, and tool schema hashes in request metadata;
 - trace events emitted by `ContextManager.persist_bundle()`.
 - full `RiskPoint`/`VerificationStrategy`/`RepairPolicy` objects (persisted on `TaskState` as dicts) are internal-only; `PlannerContextRenderer` projects only summary subsets into the model-visible context message.
+- `CompletionAssessment` + `CriterionAssessment` (with `failed_evidence`/`risk_remaining`/`evidence_refs`) are internal-only; `PlannerContextRenderer` does not project them into the model-visible context. Trace events: `final_reviewer.assess.done`/`.model_ok`/`.fallback`.
 
 ## State Transitions And Failure Paths
 
@@ -159,11 +167,12 @@ Update this document when changing:
 - `ContextAssembler` grouping, ordering, redaction, bounding, or budgeting;
 - `ModelTurnRequestBuilder.build_request()` message merge behavior.
 - `PlannerContextRenderer.render()` output shape, or the three summary static methods (`_risk_points_summary`/`_verification_strategies_summary`/`_repair_policy_summary`).
+- `FinalReviewer.assess()` model call shape, `ModelPurpose.FINAL_REVIEW`, or `CompletionAssessment`/`CriterionAssessment` projection boundary (internal-only, not rendered through `PlannerContextRenderer`).
 
 ## Verification
 
 - `python scripts/verify_runtime_docs.py`
-- `python -m pytest tests/test_context.py tests/test_context_production.py tests/test_context_budget.py tests/test_context_assembler_retrieval.py tests/test_prompt_assembly.py tests/test_instruction_integration.py tests/test_semantic_planner_capability.py --basetemp work/pytest-tmp`
+- `python -m pytest tests/test_context.py tests/test_context_production.py tests/test_context_budget.py tests/test_context_assembler_retrieval.py tests/test_prompt_assembly.py tests/test_instruction_integration.py tests/test_semantic_planner_capability.py tests/test_final_reviewer.py --basetemp work/pytest-tmp`
 
 ## Last Verified Against
 

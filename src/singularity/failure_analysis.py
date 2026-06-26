@@ -252,6 +252,9 @@ class FailureAnalysisRequest:
     changed_files: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    risk_points: list[dict[str, Any]] = field(default_factory=list)
+    repair_policy: dict[str, Any] | None = None
+    verification_strategies: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_planner(
@@ -270,6 +273,9 @@ class FailureAnalysisRequest:
         phase_id = str(getattr(state, "current_phase", "") or "failure_analysis")
         failure_sources = _failure_sources(evidence, outcome=outcome)
         summary = _failure_summary(failure_sources, outcome=outcome)
+        risk_points = list(getattr(state, "risk_points", None) or [])
+        repair_policy = getattr(state, "repair_policy", None)
+        verification_strategies = list(getattr(state, "verification_strategies", None) or [])
         return cls(
             request_id=f"failure_analysis_{uuid4().hex[:12]}",
             run_id=str(getattr(context, "run_id", "") or session_id or task_id),
@@ -286,6 +292,9 @@ class FailureAnalysisRequest:
             changed_files=_changed_files(evidence),
             evidence_refs=_evidence_refs(evidence),
             metadata={"turn": turn} if turn is not None else {},
+            risk_points=risk_points,
+            repair_policy=repair_policy if isinstance(repair_policy, dict) else None,
+            verification_strategies=verification_strategies,
         )
 
     @property
@@ -342,6 +351,9 @@ class FailureAnalysisRequest:
             "changed_files": self.changed_files[-30:],
             "allowed_target_files": self.allowed_target_files[-30:],
             "evidence_refs": self.evidence_refs[-30:],
+            "risk_points": self.risk_points[-10:],
+            "repair_policy": self.repair_policy,
+            "verification_strategies": self.verification_strategies[-10:],
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -361,6 +373,9 @@ class FailureAnalysisRequest:
             "changed_files": self.changed_files,
             "evidence_refs": self.evidence_refs,
             "metadata": self.metadata,
+            "risk_points": self.risk_points,
+            "repair_policy": self.repair_policy,
+            "verification_strategies": self.verification_strategies,
         }
 
 
@@ -394,6 +409,7 @@ class FailureAnalysisResult:
         needs_user_input = _bool_required(payload, "needs_user_input")
         confidence = _confidence_required(payload.get("confidence"))
         category = _required_text(payload, "failure_category")
+        category = category.replace("/", "_").replace("-", "_")
         if not FAILURE_CATEGORY_PATTERN.match(category):
             raise ValueError(f"invalid failure_category: {category!r}")
         root_cause = _required_text(payload, "root_cause")
@@ -828,7 +844,12 @@ class RepairPlanner:
     def __init__(self, *, trace: Any | None = None) -> None:
         self.trace = trace
 
-    def plan(self, analysis: FailureAnalysisResult) -> RepairPlan:
+    def plan(
+        self,
+        analysis: FailureAnalysisResult,
+        *,
+        repair_policy: dict[str, Any] | None = None,
+    ) -> RepairPlan:
         blocked = (
             analysis.blocked_reason
             or (
@@ -856,6 +877,35 @@ class RepairPlanner:
                 verification_contract=contract.verification_contract,
             )
         candidates = _action_candidates(analysis)
+        if repair_policy is not None:
+            allowed = set(repair_policy.get("allowed_repair_actions") or [])
+            if allowed:
+                candidates = [
+                    c for c in candidates
+                    if not hasattr(c, "action_type") or c.action_type in allowed
+                    or str(getattr(c, "action_type", "")) in allowed
+                ]
+            escalation_threshold = repair_policy.get("escalation_threshold")
+            if isinstance(escalation_threshold, int) and escalation_threshold <= 0:
+                contract = RepairContract.blocked(
+                    analysis, reason="repair_policy_escalation_threshold_reached"
+                )
+                self._record_contract_validation(contract)
+                return RepairPlan(
+                    plan_id=f"repair_{uuid4().hex[:12]}",
+                    analysis_id=analysis.analysis_id,
+                    strategy="blocked",
+                    summary=analysis.root_cause,
+                    action_candidates=[],
+                    next_actions=analysis.next_actions,
+                    verification_plan=analysis.verification_plan,
+                    evidence_refs=analysis.evidence_refs,
+                    confidence=analysis.confidence,
+                    needs_user_input=True,
+                    blocked_reason="repair_policy_escalation_threshold_reached",
+                    repair_contract=contract,
+                    verification_contract=contract.verification_contract,
+                )
         contract = RepairContract.from_analysis(analysis, action_candidates=candidates)
         self._record_contract_validation(contract)
         if contract.needs_user_input or contract.blocked_reason:

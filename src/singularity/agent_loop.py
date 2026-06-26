@@ -617,7 +617,7 @@ class AgentLoop:
             return None
         self._failure_analysis_fingerprints.add(request.fingerprint)
         analysis = self.failure_analyzer.analyze(request)
-        repair_plan = self.repair_planner.plan(analysis)
+        repair_plan = self.repair_planner.plan(analysis, repair_policy=request.repair_policy)
         replan_signal = self.repair_planner.to_replan_signal(
             request=request,
             analysis=analysis,

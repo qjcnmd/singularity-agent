@@ -1305,6 +1305,7 @@ def _apply_benchmark_constraints(kernel: Any, task: LiveEvalTask) -> None:
             "expected_file_changes": task.expected_file_changes,
             "completion_standard": task.completion_standard,
             "risk_tags": task.risk_tags,
+            "verification_command": task.verification_command,
         }
     )
 

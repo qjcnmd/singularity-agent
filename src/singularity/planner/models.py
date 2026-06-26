@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar
 from uuid import uuid4
 
 
@@ -384,6 +384,69 @@ class EvidenceLedger:
     def add_unique_file(self, path: str) -> None:
         if path and path not in self.inspected_files:
             self.inspected_files.append(path)
+
+    # --- Final Reviewer / Failure Analyzer query API (criterion-keyed) ---
+
+    _EVIDENCE_KEY_TO_BUCKET: ClassVar[dict[str, str]] = {
+        "inspected_files": "inspected_files",
+        "relevant_symbols": "relevant_symbols",
+        "search_results": "search_results",
+        "applied_changes": "applied_changes",
+        "command_results": "command_results",
+        "verification_results": "verification_results",
+        "parsed_failures": "parsed_failures",
+        "missing_evidence": "missing_evidence",
+        "unresolved_failures": "unresolved_failures",
+        "external_changes": "external_changes",
+        "risks": "risks",
+        "tool_results": "tool_results",
+        "policy_observations": "policy_observations",
+        "sandbox_observations": "sandbox_observations",
+        "instruction_prompt_observations": "instruction_prompt_observations",
+        "project_index_observations": "project_index_observations",
+        "diff_observations": "diff_observations",
+        "edit_plans": "edit_plans",
+        "edit_results": "edit_results",
+        "review_results": "review_results",
+        "failure_analyses": "failure_analyses",
+        "repair_plans": "repair_plans",
+        "retrieval_results": "retrieval_results",
+        "task_outcomes": "task_outcomes",
+    }
+
+    def query_evidence(self, evidence_key: str) -> list[Any]:
+        """Return the evidence records for a known evidence_key.
+
+        Maps well-known keys (``inspected_files``, ``applied_changes``,
+        ``verification_results`` ...) to their bucket. Unknown keys are
+        resolved via ``getattr`` so callers can query any attribute.
+        Returns an empty list when the bucket is absent or empty.
+        """
+        bucket_name = self._EVIDENCE_KEY_TO_BUCKET.get(evidence_key, evidence_key)
+        value: Any = getattr(self, bucket_name, None)
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    def evidence_for_criterion(self, criterion_id: str) -> list[dict[str, Any]]:
+        """Return all evidence records tagged with ``criterion_id``.
+
+        Walks every dict-bearing bucket and collects records whose
+        ``criterion_id`` field matches. Buckets that hold non-dict items
+        (``inspected_files`` holds strings, ``assumptions``/``missing_evidence``/
+        ``external_changes`` hold strings) are skipped automatically.
+        """
+        matched: list[dict[str, Any]] = []
+        for bucket_name in self._EVIDENCE_KEY_TO_BUCKET.values():
+            bucket = getattr(self, bucket_name, None)
+            if not isinstance(bucket, list):
+                continue
+            for record in bucket:
+                if isinstance(record, dict) and record.get("criterion_id") == criterion_id:
+                    matched.append(record)
+        return matched
 
     def to_dict(self) -> dict[str, Any]:
         return {

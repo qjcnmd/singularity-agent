@@ -657,6 +657,103 @@ class TestPlannerVerificationAuthorization:
         assert not decision.allowed
         assert decision.error_code == "verification_contract_command_not_allowed"
 
+    def test_benchmark_verification_command_allowed(self, tmp_path: Path) -> None:
+        """Benchmark verification_command is allowed even if not in the repair contract.
+
+        When ``apply_benchmark_constraints`` declares a ``verification_command``,
+        the gate at ``authorize_action`` must allow that command even if the
+        active repair ``verification_plan`` only contains a different command.
+        This is the fix for the V-3 blocker where the manifest's
+        ``python -m pytest ...`` was rejected because the rules-based contract
+        only allowed ``python math_utils.py``.
+        """
+        planner, contract = self._setup_repair_planner(tmp_path)
+        planner.apply_benchmark_constraints(
+            {
+                "task_id": "live.fix_math_test",
+                "allowed_tools": ["read_file", "write_file", "run_verification"],
+                "expected_file_changes": ["math_utils.py"],
+                "completion_standard": "pytest passes",
+                "risk_tags": ["test-repair"],
+                "verification_command": "python -m pytest tests/test_math_utils.py",
+            }
+        )
+        spec = self._make_spec("run_verification")
+        decision = planner.authorize_tool_call(
+            tool_name="run_verification",
+            tool_call_id="tc_bench",
+            spec=spec,
+            arguments={
+                "smoke_commands": [
+                    ["python", "-m", "pytest", "tests/test_math_utils.py"]
+                ]
+            },
+        )
+        assert decision.allowed
+
+    def test_benchmark_does_not_weaken_gate(self, tmp_path: Path) -> None:
+        """A command that is neither in the contract nor the benchmark is still rejected."""
+        planner, contract = self._setup_repair_planner(tmp_path)
+        planner.apply_benchmark_constraints(
+            {
+                "task_id": "live.fix_math_test",
+                "allowed_tools": ["read_file", "write_file", "run_verification"],
+                "expected_file_changes": ["math_utils.py"],
+                "completion_standard": "pytest passes",
+                "risk_tags": ["test-repair"],
+                "verification_command": "python -m pytest tests/test_math_utils.py",
+            }
+        )
+        spec = self._make_spec("run_verification")
+        decision = planner.authorize_tool_call(
+            tool_name="run_verification",
+            tool_call_id="tc_reject",
+            spec=spec,
+            arguments={
+                "smoke_commands": [
+                    ["python", "-m", "black", "--check", "."]
+                ]
+            },
+        )
+        assert not decision.allowed
+        assert decision.error_code == "verification_contract_command_not_allowed"
+
+    def test_benchmark_verification_command_applied_when_set_before_start_task(
+        self, tmp_path: Path
+    ) -> None:
+        """Live-eval order: apply_benchmark_constraints runs before start_task.
+
+        Ensures the benchmark verification_command overrides the rules-based
+        verification_requirements even when apply_benchmark_constraints is
+        called while planner.state is None. This is the fix for the V-4
+        blocker where the manifest's verification_command was stored in
+        benchmark_constraints but never propagated into the rules-based
+        verification_requirements, so the model still saw and ran
+        ``python math_utils.py`` and misdiagnosed a dependency_missing.
+        """
+        planner = Planner(workspace_root=tmp_path)
+        planner.apply_benchmark_constraints(
+            {
+                "task_id": "live.fix_math_test",
+                "allowed_tools": ["read_file", "write_file", "run_verification"],
+                "expected_file_changes": ["math_utils.py"],
+                "completion_standard": "pytest passes",
+                "risk_tags": ["test-repair"],
+                "verification_command": "python -m pytest tests/test_math_utils.py",
+            }
+        )
+        assert planner.state is None
+        planner.start_task("Fix the failing add in math_utils.py and run smoke verification.")
+        smoke = planner.contract_smoke_commands()
+        assert smoke == [["python", "-m", "pytest", "tests/test_math_utils.py"]]
+        assert smoke != [["python", "math_utils.py"]]
+        stored_command = (
+            planner.state.task_contract.get("verification_requirements", [{}])[0].get("command")
+            if planner.state
+            else None
+        )
+        assert stored_command == ["python", "-m", "pytest", "tests/test_math_utils.py"]
+
 
 # ---------------------------------------------------------------------------
 # VerificationRunner: step_evidence in observation

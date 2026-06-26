@@ -28,6 +28,7 @@ class ModelPurpose(str, Enum):
     TASK_CONTRACT_EXTRACTION = "task_contract_extraction"
     SEMANTIC_PLANNING = "semantic_planning"
     PLANNER_DECISION = "planner_decision"
+    FINAL_REVIEW = "final_review"
 
 
 class ModelRole(str, Enum):

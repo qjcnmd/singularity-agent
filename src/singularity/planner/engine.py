@@ -7,11 +7,13 @@ from uuid import uuid4
 from singularity.failure_analysis import (
     ContractSatisfaction,
     VerificationContract,
+    VerificationStep,
 )
 from singularity.planner.budget import BudgetController
 from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.context import PlannerContextRenderer
 from singularity.planner.finalizer import Finalizer, FinalReportRenderer
+from singularity.planner.final_reviewer import FinalReviewer
 from singularity.planner.models import (
     ActionKind,
     ActionStatus,
@@ -76,6 +78,7 @@ class Planner:
         lesson_extractor: LessonExtractor | None = None,
         producers: PlannerProducerBundle | None = None,
         model_runner: Any | None = None,
+        final_reviewer: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.session_id = session_id or uuid4().hex
@@ -102,6 +105,9 @@ class Planner:
             rule_planner=self.semantic_planner,
             rule_replanner=self.replanner,
             trace=self.trace,
+        )
+        self.final_reviewer = final_reviewer or FinalReviewer(
+            model_runner=model_runner, trace=self.trace
         )
         self.state: TaskState | None = None
         self.plan: TaskPlan | None = None
@@ -181,10 +187,18 @@ class Planner:
             self.state.completion_criteria.required_verifications_passed = False
         self.plan = self._default_plan(self.state.task_id)
         if self._benchmark_constraints:
-            self.state.task_contract = {
+            task_contract = {
                 **self.state.task_contract,
                 "benchmark_constraints": dict(self._benchmark_constraints),
             }
+            verification_command = str(
+                self._benchmark_constraints.get("verification_command") or ""
+            )
+            if verification_command:
+                task_contract = self._apply_benchmark_verification_requirement(
+                    task_contract, verification_command
+                )
+            self.state.task_contract = task_contract
         self.evidence = EvidenceLedger(assumptions=list(self.state.assumptions))
         self.budget = ExecutionBudget()
         self._persist()
@@ -199,19 +213,26 @@ class Planner:
         expected_file_changes = sorted(
             dict.fromkeys(str(item) for item in constraints.get("expected_file_changes") or [])
         )
+        verification_command = str(constraints.get("verification_command") or "")
         payload = {
             "allowed_tools": allowed_tools,
             "expected_file_changes": expected_file_changes,
             "completion_standard": str(constraints.get("completion_standard") or ""),
             "risk_tags": [str(item) for item in constraints.get("risk_tags") or []],
             "task_id": str(constraints.get("task_id") or ""),
+            "verification_command": verification_command,
         }
         self._benchmark_constraints = payload
         if self.state is not None:
-            self.state.task_contract = {
+            task_contract = {
                 **self.state.task_contract,
                 "benchmark_constraints": dict(payload),
             }
+            if verification_command:
+                task_contract = self._apply_benchmark_verification_requirement(
+                    task_contract, verification_command
+                )
+            self.state.task_contract = task_contract
             self._persist()
         if self.trace is not None:
             self.trace.record(
@@ -1312,6 +1333,26 @@ class Planner:
         )
         final_review = self._run_final_review(trace_summary=trace_summary)
         contract_satisfaction = self.assess_verification_contract_satisfaction().to_dict()
+        completion_assessment = self._run_final_reviewer_assessment()
+        if not completion_assessment.overall_satisfied:
+            self._state().status = TaskStatus.BLOCKED
+            self._state().blocked_reasons = sorted(
+                set([*self._state().blocked_reasons, *completion_assessment.blocking_reasons])
+            )
+            self._persist()
+            self._record_event(
+                decision="finalize",
+                reason="Final reviewer blocked completion: "
+                + "; ".join(completion_assessment.blocking_reasons),
+                completion_assessment=completion_assessment.to_dict(),
+            )
+            report = self.finalizer.build(
+                state=self._state(),
+                evidence=self.evidence,
+                trace_summary=trace_summary,
+                contract_satisfaction=contract_satisfaction,
+            )
+            return report
         report = self.finalizer.build(
             state=self._state(),
             evidence=self.evidence,
@@ -1397,6 +1438,31 @@ class Planner:
         if not review_id or not any(item.get("review_id") == review_id for item in self.evidence.review_results):
             self.record_review_observation(payload)
         return report
+
+    def _run_final_reviewer_assessment(self) -> Any:
+        """Run the per-criterion FinalReviewer gate before finalize."""
+        state = self._state()
+        contract = self._contract()
+        plan: Any = None
+        if state.risk_points or state.verification_strategies or state.repair_policy:
+            from singularity.planner.semantic_objects import SemanticPlan
+
+            plan = SemanticPlan.from_dict(
+                {
+                    "rolling_plan": state.rolling_plan or {},
+                    "risk_points": state.risk_points,
+                    "verification_strategies": state.verification_strategies,
+                    "repair_policy": state.repair_policy,
+                    "producer_source": "rules",
+                }
+            )
+        return self.final_reviewer.assess(
+            contract=contract,
+            plan=plan,
+            evidence=self.evidence,
+            state=state,
+            context_payload=self._producer_context(),
+        )
 
     def interrupt(self, reason: str = "interrupted") -> TaskState:
         state = self._state()
@@ -1618,17 +1684,96 @@ class Planner:
         return self._active_repair_verification_contract()
 
     def _active_repair_verification_contract(self) -> VerificationContract:
-        """Extract the structured verification contract from the active repair."""
+        """Extract the structured verification contract from the active repair.
+
+        When benchmark constraints declare a ``verification_command``, augment
+        the contract with that command as an allowed (non-required) step so the
+        gate at :meth:`authorize_action` does not deny the canonical
+        manifest-declared verification command. This does not bypass the gate
+        — it makes the contract correct.
+        """
         contract = self._active_repair_contract()
         if not contract:
             return VerificationContract.empty()
         payload = contract.get("verification_contract")
         if isinstance(payload, dict) and payload.get("steps"):
-            return VerificationContract.from_dict(payload)
-        plan_strings = contract.get("verification_plan") or []
-        if plan_strings:
-            return VerificationContract.from_plan_strings(plan_strings)
-        return VerificationContract.empty()
+            base = VerificationContract.from_dict(payload)
+        else:
+            plan_strings = contract.get("verification_plan") or []
+            if plan_strings:
+                base = VerificationContract.from_plan_strings(plan_strings)
+            else:
+                base = VerificationContract.empty()
+        return self._augment_with_benchmark_verification_command(base)
+
+    def _augment_with_benchmark_verification_command(
+        self, contract: VerificationContract
+    ) -> VerificationContract:
+        """Augment ``contract`` with the benchmark ``verification_command`` step.
+
+        The benchmark step is an allowance (``required=False``), not a hard
+        requirement — it ensures the gate allows the manifest-declared
+        verification command without affecting satisfaction assessment.
+        Empty contracts already allow all commands, so they are returned unchanged.
+        """
+        benchmark_cmd = str(
+            self._benchmark_constraints.get("verification_command") or ""
+        ).strip()
+        if not benchmark_cmd:
+            return contract
+        if not contract.steps:
+            return contract
+        benchmark_step = VerificationStep(
+            step_id="vstep_benchmark",
+            command=benchmark_cmd,
+            kind="smoke",
+            required=False,
+        )
+        if any(
+            step.matches_command(benchmark_step.command_argv)
+            for step in contract.steps
+        ):
+            return contract
+        return VerificationContract(
+            contract_id=contract.contract_id,
+            steps=[*contract.steps, benchmark_step],
+            status=contract.status,
+            validation_errors=list(contract.validation_errors),
+        )
+
+    @staticmethod
+    def _apply_benchmark_verification_requirement(
+        task_contract: dict[str, Any], verification_command: str
+    ) -> dict[str, Any]:
+        """Override rules-based ``verification_requirements`` with the benchmark command.
+
+        The rules-based ``TaskContractBuilder.from_rules`` synthesizes
+        ``["python", <path>]`` from the goal text, which rarely matches the
+        manifest-declared ``verification_command`` (e.g. ``python -m pytest ...``).
+        When a benchmark ``verification_command`` is present, replace the
+        ``command`` field of existing requirements so the model sees and runs
+        the correct verification command from the start.
+        """
+        import shlex
+
+        try:
+            cmd_argv = shlex.split(verification_command)
+        except ValueError:
+            cmd_argv = verification_command.split()
+        if not cmd_argv:
+            return task_contract
+        existing = list(task_contract.get("verification_requirements") or [])
+        if existing:
+            existing[0] = {**existing[0], "command": cmd_argv}
+        else:
+            existing = [
+                {
+                    "description": f"Run verification: {verification_command}",
+                    "command": cmd_argv,
+                    "required": True,
+                }
+            ]
+        return {**task_contract, "verification_requirements": existing}
 
     def assess_verification_contract_satisfaction(self) -> ContractSatisfaction:
         """Evaluate whether the active verification contract is satisfied.
@@ -1639,11 +1784,21 @@ class Planner:
         """
         from singularity.failure_analysis import StepEvidence
 
+        active_repair = self._active_repair_contract()
         contract = self._active_repair_verification_contract()
         if not contract.steps:
+            if not active_repair:
+                return ContractSatisfaction(
+                    contract_id=contract.contract_id,
+                    satisfied=True,
+                    completed_steps=[],
+                    failed_steps=[],
+                    skipped_steps=[],
+                    reason="no_verification_steps",
+                )
             return ContractSatisfaction(
                 contract_id=contract.contract_id,
-                satisfied=True,
+                satisfied=False,
                 completed_steps=[],
                 failed_steps=[],
                 skipped_steps=[],
