@@ -50,6 +50,7 @@ class PolicyConfig:
     default_command_timeout_seconds: int = 30
     audit_log_path: Path | str | None = None
     approval_grants_path: Path | str | None = None
+    consumption_ledger_path: Path | str | None = None
     security_mode: SecurityMode | str = SecurityMode.STRICT
     operator_key_path: Path | str | None = None
 
@@ -79,6 +80,22 @@ class PolicyConfig:
             )
         else:
             object.__setattr__(self, "approval_grants_path", Path(self.approval_grants_path))
+        # Trust boundary: consumption ledger defaults to the same
+        # outside-workspace policy dir as the grant store. The ledger is the
+        # single source of truth for grant consumption (HMAC-chained,
+        # append-only) and must not be model-writable.
+        if self.consumption_ledger_path is None:
+            object.__setattr__(
+                self,
+                "consumption_ledger_path",
+                home_policy_dir / "grant_consumption_ledger.jsonl",
+            )
+        else:
+            object.__setattr__(
+                self,
+                "consumption_ledger_path",
+                Path(self.consumption_ledger_path),
+            )
         # Operator key: binds remote approval grant signatures to a secret
         # held outside the workspace. Defaults to
         # ``<policy_home>/.singularity/policy/operator.pem`` so test isolation

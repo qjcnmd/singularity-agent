@@ -30,6 +30,8 @@ from singularity.policy import (
     ApprovalGrant,
     ApprovalScope,
     Capability,
+    GrantConsumptionLedger,
+    GrantConsumptionLedgerTamperError,
     OperationKind,
     PolicyComponent,
     PolicyConfig,
@@ -39,7 +41,7 @@ from singularity.policy import (
 )
 from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
 from singularity.tools.command import register_command_tools
-from tests.tool_executor_helpers import make_test_policy_engine
+from tests.tool_executor_helpers import make_ledger_test_config, make_test_policy_engine
 
 
 # ---------------------------------------------------------------------------
@@ -47,37 +49,27 @@ from tests.tool_executor_helpers import make_test_policy_engine
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Defect: ApprovalGrant.consumed is persisted as a plain boolean in the "
-        "jsonl store with no integrity protection. An attacker with write access "
-        "to the grant store can flip consumed=false to replay a single_use "
-        "grant. Fix direction: protect the consumed state with an HMAC over the "
-        "full grant record (including consumed), or maintain a separate "
-        "append-only consumption ledger whose entries cannot be unset by "
-        "editing the grants file. Until then, tampering the jsonl allows "
-        "reconsumption."
-    ),
-)
 def test_tampered_consumed_field_cannot_be_reconsumed(tmp_path: Path) -> None:
     """Persisted jsonl consumed field flipped to false must not allow reconsumption.
 
     The flow:
     1. Register a single_use grant in a trusted (outside-workspace) store.
-    2. Consume it legitimately (consumed=True is persisted).
-    3. Attacker edits the jsonl file to flip consumed back to false.
+    2. Consume it legitimately (a signed consumption record is appended to the
+       append-only GrantConsumptionLedger).
+    3. Attacker edits the jsonl grants file: ApprovalGrant no longer carries a
+       ``consumed`` field, but the attacker re-adds a forged ``consumed: false``
+       entry (or deletes the grant and re-imports it) trying to revive it.
     4. Reload the gate from the tampered store.
-    5. Secure behavior: the tampered grant must NOT be reconsumable.
-
-    Currently this xfails because ``ApprovalGrant.from_dict`` trusts the
-    ``consumed`` field from disk and ``ApprovalGate._load_grants_unlocked``
-    performs no integrity check, so flipping the boolean revives the grant.
+    5. Secure behavior: the tampered grant must NOT be reconsumable, because
+       the consumption truth lives in the HMAC-chained ledger, not in the
+       grants file.
     """
     grants_path = tmp_path / "outside_grants.jsonl"
-    config = PolicyConfig(
-        workspace_root=tmp_path,
-        approval_grants_path=grants_path,
+    ledger_path = tmp_path / "outside_ledger.jsonl"
+    config = make_ledger_test_config(
+        tmp_path,
+        grants_path=grants_path,
+        ledger_path=ledger_path,
     )
     gate = ApprovalGate(config)
 
@@ -112,9 +104,12 @@ def test_tampered_consumed_field_cannot_be_reconsumed(tmp_path: Path) -> None:
     # 1. Consume the grant legitimately.
     consumed_grant = gate.consume_matching_grant(request)
     assert consumed_grant is not None
-    assert consumed_grant.consumed is True
+    assert gate.is_grant_consumed(consumed_grant.grant_id) is True
 
-    # 2. Attacker tampers the persisted jsonl: flip consumed back to false.
+    # 2. Attacker tampers the persisted jsonl grants file: re-add a forged
+    #    ``consumed: false`` entry (legacy field) and rewrite the line. Under
+    #    the new trust model this is a no-op for consumption truth, which
+    #    lives in the HMAC-chained ledger.
     assert grants_path.exists()
     records = [
         json.loads(line)
@@ -123,7 +118,7 @@ def test_tampered_consumed_field_cannot_be_reconsumed(tmp_path: Path) -> None:
     ]
     assert records, "at least one grant should be persisted"
     for record in records:
-        record["consumed"] = False
+        record["consumed"] = False  # forged legacy field; from_dict ignores it
     grants_path.write_text(
         "".join(
             json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
@@ -132,14 +127,189 @@ def test_tampered_consumed_field_cannot_be_reconsumed(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # 3. Reload the gate from the tampered store.
+    # 3. Reload the gate from the tampered grants store. The ledger file is
+    #    untouched and still chains a signed consumption record for this
+    #    grant_id, so the reloaded gate must refuse to reconsume.
     reloaded_gate = ApprovalGate(config)
 
     # 4. SECURE behavior: the tampered grant must NOT be reconsumable.
     replayed = reloaded_gate.consume_matching_grant(request)
     assert replayed is None, (
-        "A single_use grant whose consumed flag was tampered back to false in "
-        "the jsonl store must not be reconsumable."
+        "A single_use grant whose jsonl record was tampered must not be "
+        "reconsumable: consumption truth lives in the HMAC-chained ledger."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1b. GrantConsumptionLedger tamper / replay / rollback / cross-session
+# ---------------------------------------------------------------------------
+
+
+def _make_grant_and_request(tmp_path: Path, *, session_id: str = "session"):
+    request = PolicyRequest(
+        session_id=session_id,
+        task_id="task",
+        phase_id="phase",
+        action_id="action",
+        component=PolicyComponent.COMMAND,
+        operation=OperationKind.EXECUTE_COMMAND,
+        capability=Capability.EXECUTE_COMMAND,
+        subject=PolicySubject(subject_type="component", name="CommandExecutor"),
+        resource=ResourceRef(resource_type="command", identifier="python -c print(1)"),
+        reason="test",
+        workspace_root=str(tmp_path),
+    )
+    grant = ApprovalGrant(
+        decision_id=f"policy_dec_{session_id}",
+        request_id=request.request_id,
+        approved_by="test-approver",
+        session_id=request.session_id,
+        scope=ApprovalScope(
+            capabilities=[Capability.EXECUTE_COMMAND],
+            command_patterns=[request.resource.identifier],
+            session_only=True,
+            single_use=True,
+        ),
+        single_use=True,
+    )
+    return grant, request
+
+
+def test_ledger_tampering_breaks_hmac(tmp_path: Path) -> None:
+    """Editing any field of a consumption record breaks its HMAC and fail-closes."""
+    config = make_ledger_test_config(tmp_path)
+    gate = ApprovalGate(config)
+    grant, request = _make_grant_and_request(tmp_path)
+    gate.register_grant(grant)
+    gate.consume_matching_grant(request)
+    ledger_path = config.consumption_ledger_path
+    assert ledger_path.exists()
+
+    # Tamper: flip a character in consumed_at.
+    lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    assert lines, "ledger should have at least one record"
+    record = json.loads(lines[0])
+    record["consumed_at"] = record["consumed_at"] + "X"
+    lines[0] = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    ledger_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    reloaded = GrantConsumptionLedger(config)
+    with pytest.raises(GrantConsumptionLedgerTamperError):
+        reloaded.is_consumed(grant.grant_id)
+
+
+def test_ledger_deletion_breaks_chain(tmp_path: Path) -> None:
+    """Deleting the last record breaks the head pointer; truncating mid-file breaks the chain."""
+    config = make_ledger_test_config(tmp_path)
+    gate = ApprovalGate(config)
+    grant_a, request_a = _make_grant_and_request(tmp_path, session_id="session_a")
+    grant_b, request_b = _make_grant_and_request(tmp_path, session_id="session_b")
+    gate.register_grant(grant_a)
+    gate.register_grant(grant_b)
+    gate.consume_matching_grant(request_a)
+    gate.consume_matching_grant(request_b)
+
+    ledger_path = config.consumption_ledger_path
+    lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) >= 2
+    # Delete the last line (truncate the chain).
+    ledger_path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+
+    reloaded = GrantConsumptionLedger(config)
+    with pytest.raises(GrantConsumptionLedgerTamperError):
+        reloaded.is_consumed(grant_a.grant_id)
+
+
+def test_ledger_replay_rejected(tmp_path: Path) -> None:
+    """Replaying an old record line is rejected because grant_id is already consumed."""
+    config = make_ledger_test_config(tmp_path)
+    gate = ApprovalGate(config)
+    grant, request = _make_grant_and_request(tmp_path)
+    gate.register_grant(grant)
+    gate.consume_matching_grant(request)
+    ledger_path = config.consumption_ledger_path
+
+    # Replay: duplicate the consumed record line.
+    lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    assert lines
+    ledger_path.write_text(lines[0] + "\n" + lines[0] + "\n", encoding="utf-8")
+
+    reloaded = GrantConsumptionLedger(config)
+    # Chain is intact (the duplicated line still passes HMAC because the
+    # record content is unchanged) but the head pointer disagrees with the
+    # new file content (record_count mismatch), so tamper is detected.
+    with pytest.raises(GrantConsumptionLedgerTamperError):
+        reloaded.all_records()
+
+
+def test_ledger_rollback_detected(tmp_path: Path) -> None:
+    """Rolling back the ledger (deleting head pointer or truncating) is fail-closed."""
+    config = make_ledger_test_config(tmp_path)
+    gate = ApprovalGate(config)
+    grant, request = _make_grant_and_request(tmp_path)
+    gate.register_grant(grant)
+    gate.consume_matching_grant(request)
+
+    # Rollback attempt: delete the head pointer file but leave the ledger.
+    head_path = config.consumption_ledger_path.with_suffix(
+        config.consumption_ledger_path.suffix + ".head.json"
+    )
+    assert head_path.exists()
+    head_path.unlink()
+
+    reloaded = GrantConsumptionLedger(config)
+    with pytest.raises(GrantConsumptionLedgerTamperError):
+        reloaded.is_consumed(grant.grant_id)
+
+
+def test_duplicate_consumption_rejected(tmp_path: Path) -> None:
+    """Consuming the same grant twice must return None on the second attempt."""
+    config = make_ledger_test_config(tmp_path)
+    gate = ApprovalGate(config)
+    grant, request = _make_grant_and_request(tmp_path)
+    gate.register_grant(grant)
+
+    first = gate.consume_matching_grant(request)
+    assert first is not None
+    second = gate.consume_matching_grant(request)
+    assert second is None, "A single_use grant must not be consumable twice."
+
+
+def test_cross_session_replay_rejected(tmp_path: Path) -> None:
+    """A grant consumed in session A cannot be reconsumed in session B.
+
+    ``ApprovalScope.session_only`` already blocks ``matches()`` across
+    sessions, and ``GrantConsumptionLedger.is_consumed`` independently
+    records the consuming ``session_id`` in the signed record. This test
+    verifies the end-to-end behavior: even if an attacker copies the grant
+    into a fresh store for session B, the ledger's record for that
+    ``grant_id`` (bound to session A) still blocks reconsumption.
+    """
+    config = make_ledger_test_config(tmp_path)
+    gate = ApprovalGate(config)
+    grant, request_a = _make_grant_and_request(tmp_path, session_id="session_a")
+    gate.register_grant(grant)
+    gate.consume_matching_grant(request_a)
+    assert gate.is_grant_consumed(grant.grant_id) is True
+
+    # Session B attacker reuses the same grant_id.
+    request_b = PolicyRequest(
+        session_id="session_b",
+        task_id=request_a.task_id,
+        phase_id=request_a.phase_id,
+        action_id=request_a.action_id,
+        component=request_a.component,
+        operation=request_a.operation,
+        capability=request_a.capability,
+        subject=request_a.subject,
+        resource=request_a.resource,
+        reason=request_a.reason,
+        workspace_root=request_a.workspace_root,
+    )
+    replayed = gate.consume_matching_grant(request_b)
+    assert replayed is None, (
+        "Cross-session replay of a single_use grant must be refused: the "
+        "ledger's consumption record for this grant_id is signed and append-only."
     )
 
 

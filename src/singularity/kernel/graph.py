@@ -346,6 +346,7 @@ class AgentGraphBuilder:
                 execution_core=execution_core,
                 tool_protocol=tool_protocol,
                 verification_review=verification_review,
+                model_runner=model_context.model_runner,
             )
             self._prime_planner_context(
                 user_goal=user_goal,
@@ -706,6 +707,7 @@ class AgentGraphBuilder:
         execution_core: _ExecutionCoreComponents,
         tool_protocol: _ToolProtocolEngines,
         verification_review: _VerificationReviewPipelines,
+        model_runner: ModelRunner | None = None,
     ) -> None:
         planner.project_index = infra.project_index
         planner.memory_pipeline = infra.memory_pipeline
@@ -722,6 +724,20 @@ class AgentGraphBuilder:
         verification_review.review_pipeline.planner = planner
         planner.review_pipeline = verification_review.review_pipeline
         tool_protocol.tool_executor.planner = planner
+        # Inject Semantic Planner producer bundle so Planner.start_task/replan/
+        # record_failure_analysis go through model-driven producers with rule
+        # fallback. infra.model_runner is the ModelRunner instance built in
+        # _build_infra; when None (test/CI), producers auto-fallback to rules.
+        from singularity.planner.semantic_producers import PlannerProducerBundle
+
+        bundle = PlannerProducerBundle.with_rule_fallback(
+            model_runner=model_runner,
+            rule_builder=planner.contract_builder,
+            rule_planner=planner.semantic_planner,
+            rule_replanner=planner.replanner,
+            trace=planner.trace,
+        )
+        planner.attach_producers(bundle)
 
     @staticmethod
     def _prime_planner_context(

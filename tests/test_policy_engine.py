@@ -15,6 +15,7 @@ from singularity.policy import (
     ResourceRef,
     PolicyComponent,
 )
+from tests.tool_executor_helpers import make_ledger_test_config
 
 
 def req(
@@ -99,14 +100,15 @@ def test_policy_denies_outside_delete_and_read_only_mutation(tmp_path: Path) -> 
 
 def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_path: Path) -> None:
     grants_path = tmp_path / "policy" / "grants.jsonl"
-    component = PolicyEngine(
-        PolicyConfig(
-            workspace_root=tmp_path,
-            approval_mode=ApprovalMode.NON_INTERACTIVE,
-            security_mode="compat",
-            approval_grants_path=grants_path,
-        )
+    ledger_path = tmp_path / "policy" / "ledger.jsonl"
+    config = make_ledger_test_config(
+        tmp_path,
+        grants_path=grants_path,
+        ledger_path=ledger_path,
+        approval_mode=ApprovalMode.NON_INTERACTIVE,
+        security_mode="compat",
     )
+    component = PolicyEngine(config)
     command = req(
         tmp_path,
         operation=OperationKind.MUTATE_FILE,
@@ -119,8 +121,8 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
     assert denied.outcome == DecisionOutcome.DENY
     assert denied.reason == "Review required but approval mode is non_interactive."
 
-    interactive = PolicyEngine(PolicyConfig(workspace_root=tmp_path, security_mode="compat", approval_grants_path=grants_path))
-    gate = ApprovalGate(PolicyConfig(workspace_root=tmp_path, security_mode="compat", approval_grants_path=grants_path))
+    interactive = PolicyEngine(config)
+    gate = ApprovalGate(config)
     pending = interactive.evaluate(command)
     grant = ApprovalGrant(
         decision_id=pending.decision_id,
@@ -152,9 +154,11 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
 
 def test_policy_grants_persist_across_process_restarts(tmp_path: Path) -> None:
     grant_path = tmp_path / "policy" / "grants.jsonl"
-    config = PolicyConfig(
-        workspace_root=tmp_path,
-        approval_grants_path=grant_path,
+    ledger_path = tmp_path / "policy" / "ledger.jsonl"
+    config = make_ledger_test_config(
+        tmp_path,
+        grants_path=grant_path,
+        ledger_path=ledger_path,
         security_mode="compat",
     )
     first = ApprovalGate(config)
@@ -188,9 +192,10 @@ def test_policy_grants_persist_across_process_restarts(tmp_path: Path) -> None:
 
 
 def test_single_use_grant_cannot_be_consumed_twice_by_stale_process(tmp_path: Path) -> None:
-    config = PolicyConfig(
-        workspace_root=tmp_path,
-        approval_grants_path=tmp_path / "policy" / "grants.jsonl",
+    config = make_ledger_test_config(
+        tmp_path,
+        grants_path=tmp_path / "policy" / "grants.jsonl",
+        ledger_path=tmp_path / "policy" / "ledger.jsonl",
         security_mode="compat",
     )
     request = req(
@@ -225,9 +230,10 @@ def test_single_use_grant_cannot_be_consumed_twice_by_stale_process(tmp_path: Pa
 
 
 def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path: Path) -> None:
-    config = PolicyConfig(
-        workspace_root=tmp_path,
-        approval_grants_path=tmp_path / "policy" / "grants.jsonl",
+    config = make_ledger_test_config(
+        tmp_path,
+        grants_path=tmp_path / "policy" / "grants.jsonl",
+        ledger_path=tmp_path / "policy" / "ledger.jsonl",
         security_mode="compat",
     )
     request = req(
@@ -270,9 +276,10 @@ def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path:
 
 
 def test_session_only_grant_without_session_id_fails_closed(tmp_path: Path) -> None:
-    config = PolicyConfig(
-        workspace_root=tmp_path,
-        approval_grants_path=tmp_path / "policy" / "grants.jsonl",
+    config = make_ledger_test_config(
+        tmp_path,
+        grants_path=tmp_path / "policy" / "grants.jsonl",
+        ledger_path=tmp_path / "policy" / "ledger.jsonl",
         security_mode="compat",
     )
     request = req(
@@ -345,8 +352,14 @@ def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
 
 def test_approval_gate_consumes_grant_without_reevaluating_policy(tmp_path: Path) -> None:
     grants_path = tmp_path / "policy" / "grants.jsonl"
-    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path, approval_grants_path=grants_path))
-    gate = ApprovalGate(PolicyConfig(workspace_root=tmp_path, approval_grants_path=grants_path))
+    ledger_path = tmp_path / "policy" / "ledger.jsonl"
+    config = make_ledger_test_config(
+        tmp_path,
+        grants_path=grants_path,
+        ledger_path=ledger_path,
+    )
+    component = PolicyEngine(config)
+    gate = ApprovalGate(config)
     request = req(
         tmp_path,
         operation=OperationKind.EXECUTE_COMMAND,
@@ -370,7 +383,7 @@ def test_approval_gate_consumes_grant_without_reevaluating_policy(tmp_path: Path
 
     assert consumed is not None
     assert consumed.grant_id == grant.grant_id
-    assert consumed.consumed is True
+    assert gate.is_grant_consumed(consumed.grant_id) is True
 
 
 def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: Path) -> None:

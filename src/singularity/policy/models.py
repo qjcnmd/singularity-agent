@@ -284,13 +284,14 @@ class ApprovalGrant:
     grant_id: str = field(default_factory=lambda: f"grant_{uuid4().hex[:12]}")
     expires_at: str | None = None
     single_use: bool = True
-    consumed: bool = False
     reason: str = ""
     operator_signature: str | None = None
 
     def matches(self, request: PolicyRequest, *, workspace_root: Path | str | None) -> bool:
-        if self.consumed:
-            return False
+        # Trust boundary: consumption state is owned by GrantConsumptionLedger
+        # (append-only, HMAC-chained). ApprovalGrant is an authorization
+        # declaration and carries no consumption state, so matches() only
+        # checks scope/expiry/session binding.
         if self.expires_at and datetime.fromisoformat(self.expires_at) < datetime.now(UTC):
             return False
         if self.scope.session_only and self.session_id != request.session_id:
@@ -307,11 +308,9 @@ class ApprovalGrant:
             return _matches_any(normalized, _normalized_path_globs(self.scope.path_globs, workspace_root))
         return True
 
-    def consume(self) -> None:
-        if self.single_use or self.scope.single_use:
-            self.consumed = True
-
     def to_dict(self) -> dict[str, Any]:
+        # Trust boundary: no "consumed" field is persisted. Consumption
+        # facts live in GrantConsumptionLedger (append-only, HMAC-chained).
         return {
             "grant_id": self.grant_id,
             "decision_id": self.decision_id,
@@ -322,7 +321,6 @@ class ApprovalGrant:
             "scope": self.scope.to_dict(),
             "expires_at": self.expires_at,
             "single_use": self.single_use,
-            "consumed": self.consumed,
             "reason": self.reason,
             "operator_signature": self.operator_signature,
         }
@@ -361,7 +359,6 @@ class ApprovalGrant:
             ),
             expires_at=payload.get("expires_at"),
             single_use=bool(payload.get("single_use", True)),
-            consumed=bool(payload.get("consumed", False)),
             reason=str(payload.get("reason") or ""),
             operator_signature=payload.get("operator_signature"),
         )

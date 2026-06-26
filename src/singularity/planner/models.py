@@ -140,6 +140,13 @@ class TaskState:
     lifecycle_status: str = "created"
     rolling_plan: dict[str, Any] = field(default_factory=dict)
     sandbox_capability: dict[str, Any] = field(default_factory=dict)
+    # Semantic Planner capability layer: structured risk/verification/repair
+    # policy produced by the model-driven producers. Stored as dicts for
+    # TaskState serialization compatibility; producers hydrate to objects
+    # via semantic_objects.{RiskPoint,VerificationStrategy,RepairPolicy}.from_dict.
+    risk_points: list[dict[str, Any]] = field(default_factory=list)
+    verification_strategies: list[dict[str, Any]] = field(default_factory=list)
+    repair_policy: dict[str, Any] | None = None
 
     def touch(self) -> None:
         self.updated_at = _now()
@@ -170,6 +177,9 @@ class TaskState:
             "lifecycle_status": self.lifecycle_status,
             "rolling_plan": self.rolling_plan,
             "sandbox_capability": self.sandbox_capability,
+            "risk_points": self.risk_points,
+            "verification_strategies": self.verification_strategies,
+            "repair_policy": self.repair_policy,
         }
 
     @classmethod
@@ -201,6 +211,13 @@ class TaskState:
             lifecycle_status=str(payload.get("lifecycle_status") or "created"),
             rolling_plan=dict(payload.get("rolling_plan") or {}),
             sandbox_capability=dict(payload.get("sandbox_capability") or {}),
+            risk_points=list(payload.get("risk_points") or []),
+            verification_strategies=list(payload.get("verification_strategies") or []),
+            repair_policy=(
+                dict(repair_policy_raw)
+                if (repair_policy_raw := payload.get("repair_policy"))
+                else None
+            ),
         )
 
 

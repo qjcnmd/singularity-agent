@@ -25,6 +25,9 @@ class ModelPurpose(str, Enum):
     CLASSIFY_ERROR = "classify_error"
     VALIDATE_TOOL_CALL = "validate_tool_call"
     COMPACT_CONTEXT = "compact_context"
+    TASK_CONTRACT_EXTRACTION = "task_contract_extraction"
+    SEMANTIC_PLANNING = "semantic_planning"
+    PLANNER_DECISION = "planner_decision"
 
 
 class ModelRole(str, Enum):

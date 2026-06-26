@@ -24,6 +24,7 @@ from singularity.policy import (
 )
 from singularity.policy.approval import _approval_grants_path
 from singularity.policy.config import _default_policy_home
+from tests.tool_executor_helpers import make_ledger_test_config
 
 
 class FakeProvider:
@@ -197,9 +198,11 @@ def test_repeated_import_without_grant_id_does_not_amplify(tmp_path: Path) -> No
     from singularity.policy.approval import _approval_grants_path
 
     grants_path = tmp_path / "outside_grants.jsonl"
-    config = PolicyConfig(
-        workspace_root=tmp_path,
-        approval_grants_path=grants_path,
+    ledger_path = tmp_path / "outside_ledger.jsonl"
+    config = make_ledger_test_config(
+        tmp_path,
+        grants_path=grants_path,
+        ledger_path=ledger_path,
     )
     gate = ApprovalGate(config)
 
@@ -216,7 +219,6 @@ def test_repeated_import_without_grant_id_does_not_amplify(tmp_path: Path) -> No
             "single_use": True,
         },
         "single_use": True,
-        "consumed": False,
         "reason": "approved once",
     }
 
@@ -242,7 +244,7 @@ def test_repeated_import_without_grant_id_does_not_amplify(tmp_path: Path) -> No
     # consumption succeeds and the second must return None (no amplification).
     first_consume = gate.consume_matching_grant(request)
     assert first_consume is not None
-    assert first_consume.consumed is True
+    assert gate.is_grant_consumed(first_consume.grant_id) is True
 
     second_consume = gate.consume_matching_grant(request)
     assert second_consume is None, (

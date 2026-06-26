@@ -41,6 +41,12 @@ from singularity.planner.replanner import Replanner
 from singularity.planner.retrieval import LessonExtractor, RetrievalOrchestrator
 from singularity.planner.risk import RiskEscalator
 from singularity.planner.semantic import RollingPlan, SemanticPlanner
+from singularity.planner.semantic_objects import (
+    RepairPolicy,
+    RiskPoint,
+    VerificationStrategy,
+)
+from singularity.planner.semantic_producers import PlannerProducerBundle
 from singularity.planner.store import PlannerStore
 from singularity.tools.models import ToolResult, ToolSpec
 from singularity.tools.router import (
@@ -68,6 +74,8 @@ class Planner:
         memory_pipeline: Any | None = None,
         retrieval_orchestrator: RetrievalOrchestrator | None = None,
         lesson_extractor: LessonExtractor | None = None,
+        producers: PlannerProducerBundle | None = None,
+        model_runner: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.session_id = session_id or uuid4().hex
@@ -88,6 +96,13 @@ class Planner:
         self.memory_pipeline = memory_pipeline
         self.retrieval_orchestrator = retrieval_orchestrator or RetrievalOrchestrator()
         self.lesson_extractor = lesson_extractor or LessonExtractor()
+        self.producers = producers or PlannerProducerBundle.with_rule_fallback(
+            model_runner=model_runner,
+            rule_builder=self.contract_builder,
+            rule_planner=self.semantic_planner,
+            rule_replanner=self.replanner,
+            trace=self.trace,
+        )
         self.state: TaskState | None = None
         self.plan: TaskPlan | None = None
         self.evidence = EvidenceLedger()
@@ -95,6 +110,29 @@ class Planner:
         self.final_report: FinalReport | None = None
         self.actions: dict[str, AgentAction] = {}
         self._benchmark_constraints: dict[str, Any] = {}
+
+    def attach_producers(self, bundle: PlannerProducerBundle) -> None:
+        """Attach a producer bundle (called by ``AgentGraphBuilder._wire_planner``)."""
+        self.producers = bundle
+
+    def _producer_context(self) -> dict[str, Any]:
+        """Compact context for producer-internal model calls.
+
+        Intentionally separate from ``PlannerContextRenderer.render()`` (which
+        projects to the main task model) so producer calls do not pollute the
+        main task model's context.
+        """
+        if self.state is None:
+            return {"task_id": self.task_id, "session_id": self.session_id}
+        return {
+            "run_id": self.session_id,
+            "session_id": self.session_id,
+            "task_id": self.state.task_id,
+            "phase_id": self.state.current_phase,
+            "user_goal": self.state.effective_goal or self.state.normalized_goal,
+            "task_contract": self.state.task_contract,
+            "current_step_id": (self.state.rolling_plan or {}).get("current_step_id"),
+        }
 
     def start_task(
         self,
@@ -105,8 +143,14 @@ class Planner:
     ) -> TaskState:
         self._throw_if_cancelled()
         normalized_goal = " ".join(user_goal.split())
-        contract = self.contract_builder.build(normalized_goal)
-        rolling_plan = self.semantic_planner.initial_plan(contract)
+        context_payload = self._producer_context()
+        contract = self.producers.task_contract.produce(
+            normalized_goal, context_payload=context_payload
+        )
+        semantic_plan = self.producers.semantic_plan.produce_initial(
+            contract, context_payload=context_payload
+        )
+        rolling_plan = semantic_plan.rolling_plan
         self.state = TaskState(
             task_id=self.task_id,
             session_id=self.session_id,
@@ -119,6 +163,15 @@ class Planner:
             current_phase="understanding_task",
             task_contract=contract.to_dict(),
             rolling_plan=rolling_plan.to_dict(),
+            risk_points=[rp.to_dict() for rp in semantic_plan.risk_points],
+            verification_strategies=[
+                vs.to_dict() for vs in semantic_plan.verification_strategies
+            ],
+            repair_policy=(
+                semantic_plan.repair_policy.to_dict()
+                if semantic_plan.repair_policy
+                else None
+            ),
         )
         if self._is_read_only_goal(user_goal):
             self.state.completion_criteria.required_files_inspected = (
@@ -598,10 +651,22 @@ class Planner:
                 ):
                     self.evidence.failure_analyses.append(analysis)
                 if self.state and self.state.task_contract:
-                    self.state.rolling_plan = self.semantic_planner.repair_plan(
+                    semantic_plan = self.producers.semantic_plan.produce_repair(
                         analysis,
-                        task_contract=self.state.task_contract,
-                    ).to_dict()
+                        task_contract=TaskContract.from_dict(self.state.task_contract),
+                        context_payload=self._producer_context(),
+                    )
+                    self.state.rolling_plan = semantic_plan.rolling_plan.to_dict()
+                    self.state.risk_points = [
+                        rp.to_dict() for rp in semantic_plan.risk_points
+                    ]
+                    self.state.verification_strategies = [
+                        vs.to_dict() for vs in semantic_plan.verification_strategies
+                    ]
+                    if semantic_plan.repair_policy:
+                        self.state.repair_policy = (
+                            semantic_plan.repair_policy.to_dict()
+                        )
         repair_plan = verification.get("repair_plan")
         if isinstance(repair_plan, dict):
             plan_id = repair_plan.get("plan_id")
@@ -846,10 +911,20 @@ class Planner:
             state.current_phase = "repairing_failures"
             plan.current_phase = "repairing_failures"
             if state.task_contract:
-                state.rolling_plan = self.semantic_planner.repair_plan(
+                semantic_plan = self.producers.semantic_plan.produce_repair(
                     repair_contract or repair_payload or analysis_payload,
-                    task_contract=state.task_contract,
-                ).to_dict()
+                    task_contract=TaskContract.from_dict(state.task_contract),
+                    context_payload=self._producer_context(),
+                )
+                state.rolling_plan = semantic_plan.rolling_plan.to_dict()
+                state.risk_points = [
+                    rp.to_dict() for rp in semantic_plan.risk_points
+                ]
+                state.verification_strategies = [
+                    vs.to_dict() for vs in semantic_plan.verification_strategies
+                ]
+                if semantic_plan.repair_policy:
+                    state.repair_policy = semantic_plan.repair_policy.to_dict()
             self._record_dynamic_retrieval(
                 trigger="failure_analysis",
                 failure_analysis=analysis_payload,
@@ -1100,7 +1175,27 @@ class Planner:
                 )
                 self._record_repair_signal_consumed(signal_payload, decision)
                 return decision
-        decision = self.replanner.decide(signal_payload)
+        planner_decision = self.producers.planner_decision.produce(
+            signal_payload,
+            context_payload=self._producer_context(),
+            risk_points=[
+                RiskPoint.from_dict(rp) for rp in state.risk_points
+            ],
+            verification_strategies=[
+                VerificationStrategy.from_dict(vs)
+                for vs in state.verification_strategies
+            ],
+            repair_policy=(
+                RepairPolicy.from_dict(state.repair_policy)
+                if state.repair_policy
+                else None
+            ),
+        )
+        decision = ReplanDecision(
+            decision=planner_decision.decision,
+            reason=planner_decision.reason,
+            next_action=planner_decision.next_action,
+        )
         if decision.decision == ReplanDecisionKind.READ_FRESH_FILE:
             state.status = TaskStatus.INSPECTING_WORKSPACE
             state.current_phase = "inspecting_workspace"

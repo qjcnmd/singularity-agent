@@ -18,6 +18,7 @@ from singularity.policy import (
 )
 from singularity.interaction import InteractionController, UserDecision
 from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor, ToolSpec
+from tests.tool_executor_helpers import make_ledger_test_config
 from singularity.jsonl_trace import JsonlTraceRecorder
 
 
@@ -104,10 +105,11 @@ def test_require_review_uses_approval_gate_and_consumes_grant(tmp_path: Path) ->
     calls: list[str] = []
     policy_engine = SequencedPolicyEngine([DecisionOutcome.REQUIRE_REVIEW])
     gate = ApprovalGate(
-        PolicyConfig(
-            workspace_root=tmp_path,
+        make_ledger_test_config(
+            tmp_path,
+            grants_path=tmp_path / "policy" / "grants.jsonl",
+            ledger_path=tmp_path / "policy" / "ledger.jsonl",
             approval_mode=ApprovalMode.INTERACTIVE,
-            approval_grants_path=tmp_path / "policy" / "grants.jsonl",
         ),
         interaction=InteractionController(provider=ApprovingProvider()),
     )

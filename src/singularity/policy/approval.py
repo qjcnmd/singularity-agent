@@ -18,6 +18,7 @@ from singularity.policy.exceptions import (
     PolicyEscalationRequired,
     SandboxRequired,
 )
+from singularity.policy.ledger import GrantConsumptionLedger
 from singularity.policy.models import (
     ApprovalGrant,
     DecisionOutcome,
@@ -48,6 +49,16 @@ class ApprovalGate:
         self.interaction = interaction
         self._grants_lock_path = _approval_grants_path(self.config).with_suffix(".lock")
         self._grants: list[ApprovalGrant] = self._load_grants()
+        # Trust boundary: consumption truth lives in the append-only,
+        # HMAC-chained GrantConsumptionLedger, never in a mutable field on
+        # ApprovalGrant. The same operator key that signs remote grants also
+        # signs ledger records, so the ledger inherits the operator key
+        # configured on PolicyConfig.
+        self._ledger = GrantConsumptionLedger(config, trace=trace)
+
+    def is_grant_consumed(self, grant_id: str) -> bool:
+        """Return True iff ``grant_id`` is recorded as consumed in the ledger."""
+        return self._ledger.is_consumed(grant_id)
 
     def register_grant(self, grant: ApprovalGrant) -> None:
         with _file_lock(self._grants_lock_path):
@@ -105,8 +116,9 @@ class ApprovalGate:
             grant = self._find_matching_grant_unlocked(request)
             if grant is None:
                 return None
-            grant.consume()
-            self._persist_grants_unlocked()
+            if self._ledger.is_consumed(grant.grant_id):
+                return None
+            self._ledger.consume(grant, request=request)
             return grant
 
     def consume_grant(self, grant: ApprovalGrant) -> ApprovalGrant | None:
@@ -123,10 +135,14 @@ class ApprovalGate:
             if current is None:
                 self._grants.append(grant)
                 current = grant
-            if current.consumed:
+                self._persist_grants_unlocked()
+            if self._ledger.is_consumed(current.grant_id):
                 return None
-            current.consume()
-            self._persist_grants_unlocked()
+            # No PolicyRequest is available at this entry point: bind the
+            # consumption record to grant fields (grant_id, decision_id,
+            # request_id, session_id). The request_digest still uniquely
+            # binds the consumption event for replay detection.
+            self._ledger.consume(current, request=None)
             return current
 
     def resolve(
@@ -301,8 +317,15 @@ class ApprovalGate:
     def _find_matching_grant_unlocked(self, request: PolicyRequest) -> ApprovalGrant | None:
         workspace_root = request.workspace_root or self.config.workspace_root
         for grant in self._grants:
-            if grant.matches(request, workspace_root=Path(workspace_root)):
-                return grant
+            if not grant.matches(request, workspace_root=Path(workspace_root)):
+                continue
+            # Trust boundary: a single_use grant whose consumption is recorded
+            # in the append-only ledger is no longer a match for any request,
+            # even if its scope/session/expiry still match. This keeps
+            # find_matching_grant consistent with consume_matching_grant.
+            if grant.single_use and self._ledger.is_consumed(grant.grant_id):
+                continue
+            return grant
         return None
 
     def _load_grants(self) -> list[ApprovalGrant]:

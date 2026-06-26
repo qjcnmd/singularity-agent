@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from singularity.policy.approval import ApprovalGate
 from singularity.policy.models import (
@@ -132,11 +132,15 @@ class RemoteApprovalExchange:
         operator_key = load_operator_key(self.operator_key_path)
         signature_payload = _operator_signature_payload(grant_dict)
         grant_dict["operator_signature"] = sign_grant(signature_payload, operator_key)
+        # request_export is dict[str, object]; the request/decision sub-objects
+        # are themselves JSON objects, so cast for typed access.
+        request_obj = cast("dict[str, object]", request_export.get("request", {}))
+        decision_obj = cast("dict[str, object]", request_export.get("decision", {}))
         grant_payload: dict[str, object] = {
             "schema_version": GRANT_SCHEMA,
             "created_at": _now(),
-            "request_id": request_export.get("request", {}).get("request_id", ""),
-            "decision_id": request_export.get("decision", {}).get("decision_id", ""),
+            "request_id": request_obj.get("request_id", ""),
+            "decision_id": decision_obj.get("decision_id", ""),
             "request": request_export.get("request"),
             "decision": request_export.get("decision"),
             "request_digest": request_export.get("request_digest"),

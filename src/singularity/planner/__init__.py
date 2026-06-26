@@ -40,6 +40,19 @@ from singularity.planner.semantic import (
     RollingPlan,
     SemanticPlanner,
 )
+from singularity.planner.semantic_objects import (
+    PlannerDecision,
+    RepairPolicy,
+    RiskPoint,
+    SemanticPlan,
+    VerificationStrategy,
+)
+from singularity.planner.semantic_producers import (
+    PlannerDecisionProducer,
+    PlannerProducerBundle,
+    SemanticPlanProducer,
+    TaskContractProducer,
+)
 from singularity.planner.store import PlannerStore
 
 __all__ = [
@@ -62,6 +75,9 @@ __all__ = [
     "PlanDependency",
     "PlanStep",
     "Planner",
+    "PlannerDecision",
+    "PlannerDecisionProducer",
+    "PlannerProducerBundle",
     "PlannerStore",
     "RetrievalOrchestrator",
     "ReportRequirement",
@@ -69,11 +85,16 @@ __all__ = [
     "create_or_resume_planner",
     "ReplanDecision",
     "ReplanDecisionKind",
+    "RepairPolicy",
     "RiskDecisionKind",
     "RiskEscalation",
     "RiskLevel",
+    "RiskPoint",
     "RollingPlan",
     "SemanticPlanner",
+    "SemanticPlan",
+    "SemanticPlanProducer",
+    "TaskContractProducer",
     "TaskPhase",
     "TaskPlan",
     "TaskContract",
@@ -82,4 +103,5 @@ __all__ = [
     "TaskState",
     "TaskStatus",
     "VerificationRequirement",
+    "VerificationStrategy",
 ]

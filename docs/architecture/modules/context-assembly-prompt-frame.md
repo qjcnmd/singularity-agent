@@ -9,6 +9,7 @@ Source paths:
 - src/singularity/context/assembler.py
 - src/singularity/context/models.py
 - src/singularity/context/store.py
+- src/singularity/planner/context.py
 
 Symbols:
 - AgentLoop
@@ -34,6 +35,11 @@ Symbols:
 - ObservationStore.append_message
 - ObservationStore.append_item
 - ObservationStore.save_bundle
+- PlannerContextRenderer
+- PlannerContextRenderer.render
+- PlannerContextRenderer._risk_points_summary
+- PlannerContextRenderer._verification_strategies_summary
+- PlannerContextRenderer._repair_policy_summary
 
 ## Module Boundary
 
@@ -52,6 +58,7 @@ It is not responsible for provider API transport, tool execution, policy approva
 - `src/singularity/context/assembler.py`: `ContextAssembler.build_bundle()`, grouping, ordering, budgeting, and rendering.
 - `src/singularity/context/models.py`: `ContextItem`, `ContextBundle`, `ContextBudgetPlan`, `ContextRenderPolicy`.
 - `src/singularity/context/store.py`: message, item, and bundle persistence.
+- `src/singularity/planner/context.py`: `PlannerContextRenderer.render()` projects planner state (including `risk_points`/`verification_strategies`/`repair_policy` summaries) into a context message consumed by `ModelTurnRequestBuilder`.
 
 ## Runtime Call Chain
 
@@ -62,7 +69,7 @@ It is not responsible for provider API transport, tool execution, policy approva
 5. `ModelTurnRequestBuilder.build_request()` calls `ModelToolRenderer.render()` and `to_provider_tools()` for tool schemas and tool token budget.
 6. If prompt assembly is enabled, `PromptAssemblyPipeline.build_for_model_turn()` builds the stable prompt frame.
 7. `ContextManager.messages(tools=provider_tools, planner_context=..., persist=True)` checks whether compression is needed.
-8. `ContextManager.build_bundle()` loads current items with `ObservationStore.query_items()`, adds planner context as a temporary item, includes active summaries, and calls `ContextAssembler.build_bundle()`.
+8. `ContextManager.build_bundle()` loads current items with `ObservationStore.query_items()`, adds planner context as a temporary item, includes active summaries, and calls `ContextAssembler.build_bundle()`. The planner context payload is produced by `PlannerContextRenderer.render()` and now includes `risk_points`, `verification_strategies`, and `repair_policy` summary keys projected via the renderer's three static summary methods.
 9. `ContextAssembler.build_bundle()` filters visible/current items, groups assistant/tool protocol messages, scores groups, orders selected groups, computes `ContextBudgetPlan`, and returns `ContextBundle`.
 10. `ContextManager.persist_bundle()` saves the bundle and emits `context.bundle_built` and `context.rendered_for_model`.
 11. `ModelTurnRequestBuilder.build_request()` merges stable and dynamic messages, computes prompt/context/tool hashes, and stores those hashes in `context_metadata` and `trace_metadata`.
@@ -91,6 +98,13 @@ Context messages include:
 
 The model can see context identifiers, content digests, reference ids, truncation markers, and bounded previews when those are intentionally rendered into message content.
 
+Planner context message now includes projected summaries of Semantic Planner objects:
+- `risk_points`: list of `{risk_id, description, severity}` (no `trigger_conditions`/`mitigation_strategy` — internal only).
+- `verification_strategies`: list of `{strategy_id, acceptance_criterion_id, expected_outcome}` (no `fallback_commands` — internal only).
+- `repair_policy`: `{failure_category_pattern, max_attempts, escalation_threshold}` (no `allowed_repair_actions` full list — internal only).
+
+Producer-internal model calls (`TaskContractProducer`/`SemanticPlanProducer`/`PlannerDecisionProducer`) use a separate compact `Planner._producer_context()` dict and do NOT flow through `PlannerContextRenderer`. Only the main task model sees the renderer output. This separation prevents producer-internal model calls from polluting the main task model's context.
+
 ## Internal Trace Debug Audit Objects (内部 trace/debug/audit 对象)
 
 Internal-only context data includes:
@@ -100,6 +114,7 @@ Internal-only context data includes:
 - `ObservationStore` SQLite tables for messages, context items, events, bundles, references, snapshots, and summaries;
 - prompt manifest ids, prompt hashes, stable/dynamic tail hashes, and tool schema hashes in request metadata;
 - trace events emitted by `ContextManager.persist_bundle()`.
+- full `RiskPoint`/`VerificationStrategy`/`RepairPolicy` objects (persisted on `TaskState` as dicts) are internal-only; `PlannerContextRenderer` projects only summary subsets into the model-visible context message.
 
 ## State Transitions And Failure Paths
 
@@ -143,12 +158,13 @@ Update this document when changing:
 - `ContextManager.messages()`, `build_bundle()`, `persist_bundle()`, or `instruction_sources()`;
 - `ContextAssembler` grouping, ordering, redaction, bounding, or budgeting;
 - `ModelTurnRequestBuilder.build_request()` message merge behavior.
+- `PlannerContextRenderer.render()` output shape, or the three summary static methods (`_risk_points_summary`/`_verification_strategies_summary`/`_repair_policy_summary`).
 
 ## Verification
 
 - `python scripts/verify_runtime_docs.py`
-- `python -m pytest tests/test_context.py tests/test_context_production.py tests/test_context_budget.py tests/test_context_assembler_retrieval.py tests/test_prompt_assembly.py tests/test_instruction_integration.py --basetemp work/pytest-tmp`
+- `python -m pytest tests/test_context.py tests/test_context_production.py tests/test_context_budget.py tests/test_context_assembler_retrieval.py tests/test_prompt_assembly.py tests/test_instruction_integration.py tests/test_semantic_planner_capability.py --basetemp work/pytest-tmp`
 
 ## Last Verified Against
 
-Last verified against commit `5f2202bd8cfcc2a4e4a66c025891550e52f3556e` on 2026-06-25.
+Last verified against commit `5f2202bd8cfcc2a4e4a66c025891550e52f3556e` on 2026-06-26.

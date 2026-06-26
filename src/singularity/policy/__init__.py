@@ -11,6 +11,12 @@ from singularity.policy.exceptions import (
     PolicyEscalationRequired,
     SandboxRequired,
 )
+from singularity.policy.ledger import (
+    GrantAlreadyConsumedError,
+    GrantConsumptionLedger,
+    GrantConsumptionLedgerTamperError,
+    GrantConsumptionRecord,
+)
 from singularity.policy.models import (
     ApprovalGrant,
     ApprovalRequirement,
@@ -43,6 +49,10 @@ __all__ = [
     "approval_scope_for_request",
     "Capability",
     "DecisionOutcome",
+    "GrantAlreadyConsumedError",
+    "GrantConsumptionLedger",
+    "GrantConsumptionLedgerTamperError",
+    "GrantConsumptionRecord",
     "OperationKind",
     "PolicyAskUserRequired",
     "PolicyAuditEntry",

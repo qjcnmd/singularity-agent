@@ -27,6 +27,11 @@ class PlannerContextRenderer:
                 "allowed_tools": plan.phase(state.current_phase).allowed_tools,
                 "task_contract": self._contract_summary(state.task_contract),
                 "rolling_plan": self._rolling_plan_summary(state.rolling_plan),
+                "risk_points": self._risk_points_summary(state.risk_points),
+                "verification_strategies": self._verification_strategies_summary(
+                    state.verification_strategies
+                ),
+                "repair_policy": self._repair_policy_summary(state.repair_policy),
                 "evidence": {
                     "inspected_files": evidence.inspected_files[-20:],
                     "changed_files": self._changed_files(evidence),
@@ -90,6 +95,41 @@ class PlannerContextRenderer:
             "plan_id": rolling_plan.get("plan_id"),
             "current_step_id": rolling_plan.get("current_step_id"),
             "steps": rolling_plan.get("steps") or [],
+        }
+
+    @staticmethod
+    def _risk_points_summary(risk_points: list[dict]) -> list[dict]:
+        """Project risk_points summary (no trigger_conditions/mitigation details)."""
+        return [
+            {
+                "risk_id": rp.get("risk_id"),
+                "description": rp.get("description"),
+                "severity": rp.get("severity"),
+            }
+            for rp in (risk_points or [])
+        ]
+
+    @staticmethod
+    def _verification_strategies_summary(strategies: list[dict]) -> list[dict]:
+        """Project verification_strategies summary (no fallback_commands)."""
+        return [
+            {
+                "strategy_id": vs.get("strategy_id"),
+                "acceptance_criterion_id": vs.get("acceptance_criterion_id"),
+                "expected_outcome": vs.get("expected_outcome"),
+            }
+            for vs in (strategies or [])
+        ]
+
+    @staticmethod
+    def _repair_policy_summary(policy: dict | None) -> dict:
+        """Project repair_policy summary (no allowed_repair_actions full list)."""
+        if not policy:
+            return {}
+        return {
+            "failure_category_pattern": policy.get("failure_category_pattern"),
+            "max_attempts": policy.get("max_attempts"),
+            "escalation_threshold": policy.get("escalation_threshold"),
         }
 
     @staticmethod
