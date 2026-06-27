@@ -13,7 +13,7 @@ from singularity.interaction import (
     RichInteractionProvider,
 )
 from singularity.observability import TraceRecorder
-from singularity.policy import ApprovalMode
+from singularity.policy import PermissionProfileName
 from singularity.workspace_state import WorkspaceStateManager
 
 from singularity.kernel.cancellation import CancellationManager
@@ -65,11 +65,7 @@ class KernelBootstrap:
             session_id=config.resume_session or trace.session_id,
             task_id=trace.run_id,
         )
-        interaction_mode = (
-            InteractionMode.NON_INTERACTIVE
-            if config.approval_mode == ApprovalMode.NON_INTERACTIVE
-            else config.interaction_mode
-        )
+        interaction_mode = config.interaction_mode
         renderer = RichCliRenderer(self.console)
         provider = (
             RichInteractionProvider(self.console)
@@ -107,7 +103,7 @@ class KernelBootstrap:
         try:
             self.workspace_lock.acquire_lock(
                 run_id=identity.run_id,
-                read_only=config.approval_mode == ApprovalMode.READ_ONLY,
+                read_only=config.permission_profile == PermissionProfileName.READ_ONLY,
             )
             context.workspace_lock_status = "acquired"
             recovery_workspace_state = WorkspaceStateManager(self.project_root, trace=trace)

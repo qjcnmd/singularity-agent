@@ -69,6 +69,26 @@ export SINGULARITY_MODEL=gpt-4.1-mini
 显式 CLI 参数 > SINGULARITY_* 环境变量 > .singularity/config.toml > 默认值
 ```
 
+## Permission 与 Sandbox 边界
+
+会话权限通过行业通用的 permission profile 表达：
+
+```bash
+singularity-agent "inspect and verify this project" \
+  --permission-profile workspace-write \
+  --approval-policy on-request \
+  --network-access denied \
+  --add-dir ../shared-output \
+  --windows-sandbox elevated
+```
+
+- `read-only`、`workspace-write`、`danger-full-access`描述会话 filesystem 边界。
+- `--add-dir`显式增加可写目录，不要求提升为`danger-full-access`。
+- `on-request`允许高风险动作进入审批；`never`把需要审批的动作转为拒绝。
+- protected paths由Policy、command、tool和workspace mutation边界执行，不能由模型提供的参数关闭。
+
+当前 sandbox 只注册OS-native方向的`WindowsSandboxBackend`。它会探测restricted token、Job Object、low integrity、ACL、Windows Firewall和private desktop能力，但当前elevated setup及native launcher尚未完成，因此报告`backend_unavailable`。Sandbox-required命令不会回退到普通本地进程；workspace projection或文件复制也不会被表述为强隔离。非Windows平台在实现对应native backend前同样明确不可用。
+
 ## CLI
 
 运行一次真实 agent：

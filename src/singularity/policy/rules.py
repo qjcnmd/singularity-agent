@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-from singularity.policy.config import ApprovalMode, PolicyConfig, SecurityMode
+from singularity.policy.config import PolicyConfig
 from singularity.policy.models import (
     Capability,
     DecisionOutcome,
@@ -17,9 +19,14 @@ from singularity.policy.models import (
     approval_scope_for_request,
     policy_context_summary,
 )
+from singularity.policy.permissions import (
+    ApprovalPolicy,
+    NetworkAccess,
+    PermissionProfile,
+    PermissionProfileName,
+    ProtectedPathRule,
+)
 from singularity.policy.risk import RiskAssessment
-
-READ_ONLY_FILESYSTEM_MODES = {"READ_ONLY_WORKSPACE", "read_only", "read_only_workspace"}
 
 
 @dataclass(frozen=True)
@@ -40,7 +47,27 @@ class DefaultLocalPolicyRules:
         risk: RiskAssessment,
         config: PolicyConfig,
     ) -> PolicyDecision:
-        result = self._decide(request, risk=risk, config=config)
+        profile = config.permission_profile
+        if profile is None:  # PolicyConfig constructs this; fail closed if bypassed.
+            result = RuleResult(
+                DecisionOutcome.DENY,
+                "No session permission profile is configured.",
+                "deny_missing_permission_profile",
+            )
+        else:
+            result = self._decide(request, risk=risk, profile=profile)
+            if (
+                result.outcome == DecisionOutcome.REQUIRE_REVIEW
+                and profile.approval_policy == ApprovalPolicy.NEVER
+            ):
+                result = RuleResult(
+                    DecisionOutcome.DENY,
+                    f"{result.reason} Approval policy is never.",
+                    f"{result.rule_id}_approval_never",
+                    constraints=result.constraints,
+                    review_kind=result.review_kind,
+                )
+
         required = None
         if result.outcome == DecisionOutcome.REQUIRE_REVIEW:
             from singularity.policy.models import ApprovalRequirement
@@ -67,7 +94,9 @@ class DefaultLocalPolicyRules:
             required_approval=required,
             rule_ids=[result.rule_id],
             audit_severity=_severity(result.outcome, risk.level),
-            context_summary=policy_context_summary(request, result.outcome, result.reason),
+            context_summary=policy_context_summary(
+                request, result.outcome, result.reason
+            ),
         )
 
     def _decide(
@@ -75,24 +104,17 @@ class DefaultLocalPolicyRules:
         request: PolicyRequest,
         *,
         risk: RiskAssessment,
-        config: PolicyConfig,
+        profile: PermissionProfile,
     ) -> RuleResult:
         tags = set(risk.tags)
         operation = request.operation
-        capability = request.capability
 
-        disabled = _disabled_by_config(request, config)
-        if disabled is not None:
-            return disabled
-
-        # Trust boundary: hard-deny any write/command operation that targets
-        # the workspace-local policy directory. This prevents the model from
-        # forging approval grants or audit entries through shell writes.
-        if _targets_workspace_policy_dir(request, config):
+        protected = _protected_path_violation(request, profile, tags)
+        if protected is not None:
             return RuleResult(
                 DecisionOutcome.DENY,
-                "Writes to the workspace policy directory are denied to prevent approval forgery.",
-                "hard_deny_workspace_policy_dir_write",
+                f"Protected path access denied: {protected.description or protected.pattern}.",
+                "hard_deny_protected_path",
             )
 
         if RiskTag.SECRETS_EXFILTRATION in tags or (
@@ -103,317 +125,331 @@ class DefaultLocalPolicyRules:
                 "Action combines secret access with network risk.",
                 "hard_deny_secret_exfiltration",
             )
-        if RiskTag.SECRET_ACCESS in tags and (
-            risk.level == RiskLevel.CRITICAL or config.deny_secret_access_by_default
-        ):
+        if RiskTag.SECRET_ACCESS in tags:
             return RuleResult(
                 DecisionOutcome.DENY,
-                "Highly sensitive secret access is denied by default.",
+                "Sensitive credential or secret access is denied.",
                 "hard_deny_secret_access",
             )
-        if _outside_write_or_delete(request, tags) and config.deny_outside_workspace_write:
-            return RuleResult(
-                DecisionOutcome.DENY,
-                "Workspace-outside write/delete is denied.",
-                "hard_deny_outside_workspace_write",
-            )
-        if risk.level == RiskLevel.CRITICAL and RiskTag.DESTRUCTIVE in tags:
-            return RuleResult(
-                DecisionOutcome.DENY,
-                "Critical destructive action is denied.",
-                "hard_deny_destructive",
-            )
-        if "sudo" in request.resource.identifier.lower() or "runas" in request.resource.identifier.lower():
-            return RuleResult(
-                DecisionOutcome.ESCALATE,
-                "Administrator privilege requests must be handled outside Singularity.",
-                "escalate_admin_privilege",
-            )
-        if "encodedcommand" in request.resource.identifier.lower():
+        command_text = _command_text(request).lower()
+        if "encodedcommand" in command_text or " -enc " in command_text:
             return RuleResult(
                 DecisionOutcome.DENY,
                 "Encoded shell commands are denied.",
                 "hard_deny_encoded_command",
             )
-        if "curl" in request.resource.identifier.lower() and "|" in request.resource.identifier:
+        if "curl" in command_text and "|" in command_text:
             return RuleResult(
                 DecisionOutcome.DENY,
                 "Remote scripts piped into interpreters are denied.",
                 "hard_deny_remote_script_pipe",
             )
 
-        if config.approval_mode == ApprovalMode.READ_ONLY:
-            if operation in {
-                OperationKind.READ_FILE,
-                OperationKind.LIST_DIRECTORY,
-                OperationKind.SEARCH,
-            } and capability in {
-                Capability.READ_WORKSPACE,
-                Capability.LIST_DIRECTORY,
-            }:
-                return RuleResult(DecisionOutcome.ALLOW, "Read-only operation allowed.", "read_only_allow")
-            return RuleResult(
-                DecisionOutcome.DENY,
-                "read_only mode only allows low-risk workspace reads.",
-                "read_only_deny_non_read",
-            )
-
-        if config.approval_mode == ApprovalMode.REVIEW_ALL:
-            return RuleResult(
-                DecisionOutcome.REQUIRE_REVIEW,
-                "review_all mode requires user review.",
-                "review_all",
-                review_kind=_review_kind(request),
-            )
-
         if operation in {
             OperationKind.READ_FILE,
             OperationKind.LIST_DIRECTORY,
             OperationKind.SEARCH,
-        } and capability in {Capability.READ_WORKSPACE, Capability.LIST_DIRECTORY}:
-            return RuleResult(DecisionOutcome.ALLOW, "Workspace read is allowed.", "auto_allow_workspace_read")
-
-        if capability == Capability.EXECUTE_GENERATED_CODE or RiskTag.EXECUTES_GENERATED_CODE in tags:
-            return RuleResult(
-                DecisionOutcome.SANDBOX_REQUIRED,
-                "Generated code execution requires a sandbox backend.",
-                "sandbox_generated_code",
-                constraints=PolicyConstraints(
-                    sandbox_required=True,
-                    hard_isolation_required=True,
-                    filesystem_mode="copy_on_write_workspace",
-                    network_allowed=False,
-                    max_duration_seconds=request.metadata.get("timeout"),
-                    max_output_chars=request.metadata.get("max_output_chars"),
-                    env_redaction=True,
-                ),
-            )
-
-        if config.security_mode == SecurityMode.COMPAT and _compat_local_command_allow(request, risk):
+        }:
             return RuleResult(
                 DecisionOutcome.ALLOW,
-                "Plain local command allowed by compat security mode.",
-                "compat_local_command_allow",
+                "Filesystem read is allowed outside protected paths.",
+                "allow_filesystem_read",
             )
 
-        if config.security_mode == SecurityMode.STRICT and _strict_command_requires_sandbox(request):
-            return RuleResult(
-                DecisionOutcome.SANDBOX_REQUIRED,
-                "Strict security mode requires command execution through an isolated sandbox.",
-                "strict_command_sandbox_required",
-                constraints=PolicyConstraints(
-                    sandbox_required=True,
-                    hard_isolation_required=True,
-                    filesystem_mode="copy_on_write_workspace",
-                    network_allowed=False,
-                    max_duration_seconds=request.metadata.get("timeout"),
-                    max_output_chars=request.metadata.get("max_output_chars"),
-                    env_redaction=True,
-                ),
-            )
+        if _always_review(request, tags, command_text):
+            return _review_result(request, "High-risk action requires user review.")
 
-        if operation == OperationKind.VERIFICATION:
-            return RuleResult(
-                DecisionOutcome.SANDBOX_REQUIRED,
-                "Verification command execution requires an isolated sandbox.",
-                "sandbox_verification",
-                constraints=PolicyConstraints(
-                    sandbox_required=True,
-                    hard_isolation_required=True,
-                    filesystem_mode="copy_on_write_workspace",
-                    network_allowed=False,
-                    max_duration_seconds=request.metadata.get("timeout"),
-                    max_output_chars=request.metadata.get("max_output_chars"),
-                    env_redaction=True,
-                ),
+        if _is_network_action(request, tags):
+            if profile.network_access == NetworkAccess.DENIED:
+                return _review_result(
+                    request,
+                    "Network access is outside the current session permission boundary.",
+                )
+            if profile.profile == PermissionProfileName.DANGER_FULL_ACCESS:
+                return RuleResult(
+                    DecisionOutcome.ALLOW,
+                    "Network access is allowed by the session permission profile.",
+                    "allow_profile_network",
+                )
+            return _sandbox_result(
+                request,
+                profile,
+                reason="Network-enabled execution requires OS sandbox enforcement.",
+                rule_id="sandbox_profile_network",
             )
-
-        if config.approval_mode == ApprovalMode.AUTO_SAFE and _auto_safe_component_allow(request, risk):
-            return RuleResult(DecisionOutcome.ALLOW, "Low-risk component action allowed by auto_safe mode.", "auto_safe_component_allow")
 
         if operation in {
             OperationKind.MUTATE_FILE,
             OperationKind.CREATE_FILE,
-            OperationKind.DELETE_FILE,
             OperationKind.ROLLBACK,
+            OperationKind.CHANGE_CONFIG,
+        }:
+            path = _primary_path(request, profile)
+            paths = _path_candidates(request, profile)
+            if (
+                profile.profile != PermissionProfileName.READ_ONLY
+                and (path is not None or paths)
+                and all(profile.is_writable_path(candidate) for candidate in (paths or (path,)))
+            ):
+                return RuleResult(
+                    DecisionOutcome.ALLOW,
+                    "Write is within a session-authorized writable root.",
+                    "allow_profile_writable_path",
+                )
+            return _review_result(
+                request,
+                "Write is outside the current session write boundary.",
+            )
+
+        if operation in {
             OperationKind.EXECUTE_COMMAND,
             OperationKind.EXECUTE_PROJECT_CODE,
-            OperationKind.PACKAGE_INSTALL,
-            OperationKind.NETWORK_ACCESS,
             OperationKind.START_LONG_PROCESS,
-            OperationKind.KILL_PROCESS,
-            OperationKind.CHANGE_CONFIG,
             OperationKind.VERIFICATION,
         }:
-            return RuleResult(
-                DecisionOutcome.REQUIRE_REVIEW,
-                f"{operation.value} requires local CLI review.",
-                "require_review_pipeline_action",
-                constraints=PolicyConstraints(
-                    filesystem_mode=(
-                        "workspace_write"
-                        if operation
-                        in {
-                            OperationKind.MUTATE_FILE,
-                            OperationKind.CREATE_FILE,
-                            OperationKind.DELETE_FILE,
-                            OperationKind.ROLLBACK,
-                        }
-                        else "read_only"
-                    ),
-                    network_allowed=RiskTag.NETWORK in tags,
-                    max_duration_seconds=request.metadata.get("timeout"),
-                    env_redaction=True,
-                ),
-                review_kind=_review_kind(request),
+            if profile.profile == PermissionProfileName.READ_ONLY:
+                return _review_result(
+                    request,
+                    "Command execution requires review in read-only mode.",
+                )
+            if profile.profile == PermissionProfileName.DANGER_FULL_ACCESS:
+                return RuleResult(
+                    DecisionOutcome.ALLOW,
+                    "Local command execution is allowed by danger-full-access.",
+                    "allow_profile_local_command",
+                )
+            return _sandbox_result(
+                request,
+                profile,
+                reason="Local command execution requires OS sandbox enforcement.",
+                rule_id="sandbox_profile_local_command",
             )
 
         if request.resource.resource_type == "env":
-            return RuleResult(
-                DecisionOutcome.REQUIRE_REVIEW,
-                "Environment access requires review.",
-                "require_review_env",
-                review_kind="config",
-            )
+            return _review_result(request, "Environment access requires user review.")
 
-        return RuleResult(DecisionOutcome.ASK_USER, "Policy needs more information.", "ask_user_insufficient_context")
+        return _review_result(
+            request,
+            "Action is not covered by an automatic session permission.",
+        )
 
 
-def _outside_write_or_delete(request: PolicyRequest, tags: set[RiskTag]) -> bool:
-    return RiskTag.OUTSIDE_WORKSPACE in tags and request.operation in {
-        OperationKind.MUTATE_FILE,
-        OperationKind.CREATE_FILE,
-        OperationKind.DELETE_FILE,
-        OperationKind.ROLLBACK,
-        OperationKind.CHANGE_CONFIG,
-    }
+def _review_result(request: PolicyRequest, reason: str) -> RuleResult:
+    return RuleResult(
+        DecisionOutcome.REQUIRE_REVIEW,
+        reason,
+        "require_review_permission_boundary",
+        constraints=PolicyConstraints(
+            filesystem_mode="read-only",
+            network_allowed=False,
+            max_duration_seconds=request.metadata.get("timeout"),
+            max_output_chars=request.metadata.get("max_output_chars"),
+            env_redaction=True,
+        ),
+        review_kind=_review_kind(request),
+    )
 
 
-def _auto_safe_component_allow(request: PolicyRequest, risk: RiskAssessment) -> bool:
-    if request.operation == OperationKind.START_LONG_PROCESS:
-        return bool(request.metadata.get("risk_acceptance_reason"))
-    if risk.level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
-        return False
-    if (
-        request.operation in {OperationKind.EXECUTE_COMMAND, OperationKind.EXECUTE_PROJECT_CODE}
-        and RiskTag.MUTATES_FILES in risk.tags
-        and request.metadata.get("filesystem_mode") in READ_ONLY_FILESYSTEM_MODES
-    ):
-        return False
+def _sandbox_result(
+    request: PolicyRequest,
+    profile: PermissionProfile,
+    *,
+    reason: str,
+    rule_id: str,
+) -> RuleResult:
+    return RuleResult(
+        DecisionOutcome.SANDBOX_REQUIRED,
+        reason,
+        rule_id,
+        constraints=PolicyConstraints(
+            filesystem_mode=profile.profile.value,
+            network_allowed=profile.network_access == NetworkAccess.ALLOWED,
+            max_duration_seconds=request.metadata.get("timeout"),
+            max_output_chars=request.metadata.get("max_output_chars"),
+            env_redaction=True,
+            sandbox_required=True,
+            hard_isolation_required=True,
+        ),
+    )
+
+
+def _always_review(
+    request: PolicyRequest, tags: set[RiskTag], command_text: str
+) -> bool:
     if request.operation in {
         OperationKind.DELETE_FILE,
         OperationKind.PACKAGE_INSTALL,
-        OperationKind.NETWORK_ACCESS,
-        OperationKind.CHANGE_CONFIG,
+        OperationKind.KILL_PROCESS,
     }:
-        return False
-    if request.component.value == "tool" and request.metadata.get("delegated_executor"):
         return True
-    return request.operation in {
-        OperationKind.READ_FILE,
-        OperationKind.LIST_DIRECTORY,
-        OperationKind.SEARCH,
-        OperationKind.MUTATE_FILE,
-        OperationKind.CREATE_FILE,
-        OperationKind.ROLLBACK,
-        OperationKind.EXECUTE_COMMAND,
-        OperationKind.EXECUTE_PROJECT_CODE,
-        OperationKind.VERIFICATION,
+    if (
+        request.operation == OperationKind.START_LONG_PROCESS
+        and not request.metadata.get("risk_acceptance_reason")
+    ):
+        return True
+    if request.destructive or RiskTag.DESTRUCTIVE in tags:
+        return True
+    if RiskTag.PACKAGE_MANAGER in tags or RiskTag.SUPPLY_CHAIN in tags:
+        return True
+    if "sudo" in command_text or "runas" in command_text:
+        return True
+    return _is_vcs_mutation(command_text)
+
+
+def _is_vcs_mutation(command_text: str) -> bool:
+    try:
+        argv = shlex.split(command_text, posix=os.name != "nt")
+    except ValueError:
+        argv = command_text.split()
+    if not argv or Path(argv[0]).stem.lower() != "git":
+        return False
+    return len(argv) > 1 and argv[1].lower() in {
+        "add",
+        "am",
+        "apply",
+        "branch",
+        "checkout",
+        "cherry-pick",
+        "clean",
+        "commit",
+        "fetch",
+        "merge",
+        "mv",
+        "pull",
+        "push",
+        "rebase",
+        "reset",
+        "restore",
+        "revert",
+        "rm",
+        "stash",
+        "switch",
+        "tag",
     }
 
 
-def _disabled_by_config(
+def _is_network_action(request: PolicyRequest, tags: set[RiskTag]) -> bool:
+    return (
+        request.operation == OperationKind.NETWORK_ACCESS
+        or request.capability == Capability.NETWORK_ACCESS
+        or request.requires_network
+        or RiskTag.NETWORK in tags
+    )
+
+
+def _protected_path_violation(
     request: PolicyRequest,
-    config: PolicyConfig,
-) -> RuleResult | None:
-    operation = request.operation
-    capability = request.capability
-    if (
-        not config.allow_workspace_reads
-        and operation in {OperationKind.READ_FILE, OperationKind.LIST_DIRECTORY, OperationKind.SEARCH}
-        and capability in {Capability.READ_WORKSPACE, Capability.LIST_DIRECTORY}
-    ):
-        return RuleResult(DecisionOutcome.DENY, "Workspace reads are disabled by policy config.", "config_deny_workspace_read")
-    if (
-        not config.allow_workspace_mutation_with_review
-        and operation in {
-            OperationKind.MUTATE_FILE,
-            OperationKind.CREATE_FILE,
-            OperationKind.DELETE_FILE,
-            OperationKind.ROLLBACK,
-        }
-    ):
-        return RuleResult(DecisionOutcome.DENY, "Workspace mutation review is disabled by policy config.", "config_deny_workspace_mutation")
-    if (
-        not config.allow_command_with_review
-        and operation in {
-            OperationKind.EXECUTE_COMMAND,
-            OperationKind.EXECUTE_PROJECT_CODE,
-            OperationKind.START_LONG_PROCESS,
-            OperationKind.KILL_PROCESS,
-            OperationKind.VERIFICATION,
-        }
-    ):
-        return RuleResult(DecisionOutcome.DENY, "Command execution review is disabled by policy config.", "config_deny_command")
-    if (
-        not config.allow_network_with_review
-        and (
-            operation == OperationKind.NETWORK_ACCESS
-            or request.requires_network
-            or capability == Capability.NETWORK_ACCESS
-        )
-    ):
-        return RuleResult(DecisionOutcome.DENY, "Network access review is disabled by policy config.", "config_deny_network")
-    if not config.allow_package_install_with_review and operation == OperationKind.PACKAGE_INSTALL:
-        return RuleResult(DecisionOutcome.DENY, "Package install review is disabled by policy config.", "config_deny_package_install")
+    profile: PermissionProfile,
+    tags: set[RiskTag],
+) -> ProtectedPathRule | None:
+    access = _path_access(request, tags)
+    for candidate in _path_candidates(request, profile):
+        rule = profile.matching_protected_rule(candidate, access=access)
+        if rule is not None and rule.hard_deny:
+            return rule
     return None
 
 
-def _compat_local_command_allow(request: PolicyRequest, risk: RiskAssessment) -> bool:
-    if request.component.value != "command":
-        return False
-    if request.operation == OperationKind.VERIFICATION:
-        if request.capability != Capability.EXECUTE_PROJECT_CODE:
-            return False
-    elif request.operation == OperationKind.EXECUTE_COMMAND:
-        if request.capability != Capability.EXECUTE_COMMAND:
-            return False
-    else:
-        return False
-    if request.requires_network or request.touches_workspace or request.touches_secrets:
-        return False
-    if request.destructive or request.long_running:
-        return False
-    if risk.level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
-        return False
-    blocked_tags = {
-        RiskTag.NETWORK,
-        RiskTag.PACKAGE_MANAGER,
-        RiskTag.SUPPLY_CHAIN,
-        RiskTag.LONG_RUNNING,
-        RiskTag.DESTRUCTIVE,
-        RiskTag.IRREVERSIBLE,
-        RiskTag.MUTATES_FILES,
-        RiskTag.MUTATES_CONFIG,
-        RiskTag.MUTATES_LOCKFILE,
-        RiskTag.EXECUTES_GENERATED_CODE,
-        RiskTag.SECRET_ACCESS,
-        RiskTag.SECRETS_EXFILTRATION,
-    }
-    if request.operation != OperationKind.VERIFICATION:
-        blocked_tags.add(RiskTag.EXECUTES_PROJECT_CODE)
-    return not (set(risk.tags) & blocked_tags)
-
-
-def _strict_command_requires_sandbox(request: PolicyRequest) -> bool:
-    if request.component.value != "command":
-        return False
-    return request.operation in {
+def _path_access(request: PolicyRequest, tags: set[RiskTag]) -> str:
+    if request.operation in {
+        OperationKind.MUTATE_FILE,
+        OperationKind.CREATE_FILE,
+        OperationKind.DELETE_FILE,
+        OperationKind.ROLLBACK,
+        OperationKind.CHANGE_CONFIG,
+    } or RiskTag.MUTATES_FILES in tags:
+        return "write"
+    if request.operation in {
         OperationKind.EXECUTE_COMMAND,
         OperationKind.EXECUTE_PROJECT_CODE,
+        OperationKind.PACKAGE_INSTALL,
         OperationKind.START_LONG_PROCESS,
         OperationKind.VERIFICATION,
-    }
+    }:
+        return "execute"
+    return "read"
+
+
+def _path_candidates(
+    request: PolicyRequest, profile: PermissionProfile
+) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    if request.resource.resource_type in {"file", "directory", "workspace", "config"}:
+        candidates.append(_resolve_request_path(request.resource.identifier, profile))
+    resources = request.metadata.get("resources")
+    if isinstance(resources, list):
+        for item in resources:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("resource_type") or "") not in {
+                "",
+                "file",
+                "directory",
+                "workspace",
+                "config",
+            }:
+                continue
+            identifier = item.get("normalized_identifier") or item.get("identifier")
+            if identifier:
+                candidates.append(_resolve_request_path(str(identifier), profile))
+    files_changed = request.metadata.get("files_changed")
+    if isinstance(files_changed, list):
+        for item in files_changed:
+            if isinstance(item, str) and item:
+                candidates.append(_resolve_request_path(item, profile))
+    if request.resource.resource_type == "command":
+        for token in _command_path_tokens(_command_text(request)):
+            candidates.append(_resolve_request_path(token, profile))
+    return tuple(dict.fromkeys(candidates))
+
+
+def _primary_path(
+    request: PolicyRequest, profile: PermissionProfile
+) -> Path | None:
+    if request.resource.resource_type not in {"file", "directory", "workspace", "config"}:
+        return None
+    return _resolve_request_path(
+        request.resource.normalized_identifier or request.resource.identifier,
+        profile,
+    )
+
+
+def _resolve_request_path(value: str, profile: PermissionProfile) -> Path:
+    raw = Path(value).expanduser()
+    if not raw.is_absolute():
+        raw = profile.workspace_roots[0] / raw
+    return raw.resolve(strict=False)
+
+
+def _command_text(request: PolicyRequest) -> str:
+    return str(
+        request.metadata.get("command")
+        or request.metadata.get("shell")
+        or (request.resource.identifier if request.resource.resource_type == "command" else "")
+        or ""
+    )
+
+
+def _command_path_tokens(command: str) -> tuple[str, ...]:
+    try:
+        argv = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        argv = command.split()
+    lexical_tokens = re.split(r"[\s\"'<>|;]+", command)
+    tokens: list[str] = []
+    for token in (*argv[1:], *lexical_tokens[1:]):
+        candidate = token.strip("'\";,()[]{}")
+        if not candidate or candidate.startswith("-") or "://" in candidate:
+            continue
+        normalized = candidate.replace("\\", "/")
+        if (
+            "/" in normalized
+            or normalized.startswith(".")
+            or Path(candidate).suffix.lower()
+            in {".env", ".json", ".pem", ".key", ".pfx", ".p12"}
+        ):
+            tokens.append(candidate)
+    return tuple(tokens)
 
 
 def _review_kind(request: PolicyRequest) -> str:
@@ -436,90 +472,11 @@ def _review_kind(request: PolicyRequest) -> str:
 def _severity(outcome: DecisionOutcome, risk_level: RiskLevel) -> str:
     if outcome in {DecisionOutcome.DENY, DecisionOutcome.ESCALATE}:
         return "error"
-    if outcome in {DecisionOutcome.REQUIRE_REVIEW, DecisionOutcome.SANDBOX_REQUIRED}:
+    if outcome in {
+        DecisionOutcome.REQUIRE_REVIEW,
+        DecisionOutcome.SANDBOX_REQUIRED,
+    }:
         return "warning"
     if risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
         return "warning"
     return "info"
-
-
-_POLICY_DIR_WRITE_OPERATIONS = {
-    OperationKind.MUTATE_FILE,
-    OperationKind.CREATE_FILE,
-    OperationKind.DELETE_FILE,
-    OperationKind.ROLLBACK,
-    OperationKind.CHANGE_CONFIG,
-    OperationKind.EXECUTE_COMMAND,
-    OperationKind.EXECUTE_PROJECT_CODE,
-    OperationKind.START_LONG_PROCESS,
-    OperationKind.VERIFICATION,
-    OperationKind.PACKAGE_INSTALL,
-}
-
-
-def _targets_workspace_policy_dir(request: PolicyRequest, config: PolicyConfig) -> bool:
-    """Detect attempts to write to ``<workspace>/.singularity/policy/``.
-
-    Trust boundary: the workspace-local policy directory previously stored
-    approval grants and audit logs. Allowing the model to write there would
-    let it forge grants and bypass human approval. This guard hard-denies
-    any write or command operation whose target path resolves under that
-    directory, and also blocks command strings that reference it.
-    """
-    if request.operation not in _POLICY_DIR_WRITE_OPERATIONS:
-        return False
-
-    workspace_root = Path(config.workspace_root).expanduser().resolve(strict=False)
-    policy_dir = workspace_root / ".singularity" / "policy"
-
-    candidate_identifiers: list[str] = []
-    if request.resource.resource_type in {"file", "directory", "workspace", "config"}:
-        candidate_identifiers.append(
-            request.resource.normalized_identifier or request.resource.identifier
-        )
-    resources_raw = request.metadata.get("resources")
-    if isinstance(resources_raw, list):
-        for item in resources_raw:
-            if not isinstance(item, dict):
-                continue
-            resource_type = str(item.get("resource_type") or "")
-            if resource_type and resource_type not in {"file", "directory", "workspace", "config"}:
-                continue
-            identifier = item.get("normalized_identifier") or item.get("identifier")
-            if identifier:
-                candidate_identifiers.append(str(identifier))
-
-    for identifier in candidate_identifiers:
-        raw = Path(str(identifier)).expanduser()
-        candidate = raw if raw.is_absolute() else workspace_root / raw
-        try:
-            resolved = candidate.resolve(strict=False)
-        except OSError:
-            continue
-        if _is_within_policy_dir(resolved, policy_dir):
-            return True
-
-    command_text = str(
-        request.metadata.get("command")
-        or request.metadata.get("shell")
-        or (request.resource.identifier if request.resource.resource_type == "command" else "")
-        or ""
-    )
-    if command_text and _command_references_policy_dir(command_text):
-        return True
-
-    return False
-
-
-def _is_within_policy_dir(path: Path, policy_dir: Path) -> bool:
-    try:
-        path_key = os.path.normcase(os.path.normpath(str(path.resolve(strict=False))))
-        dir_key = os.path.normcase(os.path.normpath(str(policy_dir.resolve(strict=False))))
-        return os.path.commonpath([path_key, dir_key]) == dir_key
-    except (OSError, ValueError):
-        return False
-
-
-def _command_references_policy_dir(command: str) -> bool:
-    normalized = command.replace("\\", "/").lower()
-    return ".singularity/policy/" in normalized

@@ -66,12 +66,14 @@ class SearchTextInput(BaseModel):
 
 
 class ReadOnlyToolHandlers:
-    def __init__(self, project_root: Path) -> None:
+    def __init__(self, project_root: Path, *, permission_profile: Any = None) -> None:
         self.project_root = project_root.resolve()
+        self.permission_profile = permission_profile
         self.sensitivity = FileSensitivityClassifier(self.project_root)
 
     def list_files(self, args: ListFilesInput) -> dict[str, Any]:
         root = self._resolve_inside_root(args.path)
+        self._ensure_not_protected(root)
         if not root.exists():
             raise ToolExecutionFailure(f"Path does not exist: {args.path}")
         if not root.is_dir():
@@ -85,6 +87,9 @@ class ReadOnlyToolHandlers:
             if len(path.relative_to(root).parts) > args.max_depth:
                 continue
             if path.is_file():
+                if self._is_protected(path):
+                    sensitive_hidden_count += 1
+                    continue
                 if self.sensitivity.is_sensitive(path):
                     sensitive_hidden_count += 1
                     continue
@@ -98,6 +103,7 @@ class ReadOnlyToolHandlers:
 
     def read_file(self, args: ReadFileInput) -> dict[str, Any]:
         path = self._resolve_inside_root(args.path)
+        self._ensure_not_protected(path)
         if not path.exists():
             raise ToolExecutionFailure(f"File does not exist: {args.path}")
         if not path.is_file():
@@ -159,6 +165,7 @@ class ReadOnlyToolHandlers:
 
     def search_text(self, args: SearchTextInput) -> dict[str, Any]:
         start = self._resolve_inside_root(args.path)
+        self._ensure_not_protected(start)
         if not start.exists():
             raise ToolExecutionFailure(f"Path does not exist: {args.path}")
 
@@ -171,6 +178,8 @@ class ReadOnlyToolHandlers:
             if len(matches) >= args.max_results:
                 break
             if not path.is_file() or self._should_skip(path):
+                continue
+            if self._is_protected(path):
                 continue
             if self.sensitivity.is_sensitive(path):
                 continue
@@ -216,8 +225,22 @@ class ReadOnlyToolHandlers:
         }
 
     def _resolve_inside_root(self, user_path: str) -> Path:
-        path = (self.project_root / user_path).resolve()
-        if path != self.project_root and self.project_root not in path.parents:
+        raw = Path(user_path).expanduser()
+        path = (raw if raw.is_absolute() else self.project_root / raw).resolve()
+        roots = (
+            self.permission_profile.workspace_roots
+            if self.permission_profile is not None
+            else (self.project_root,)
+        )
+        roots = (
+            *roots,
+            *(
+                self.permission_profile.additional_writable_directories
+                if self.permission_profile is not None
+                else ()
+            ),
+        )
+        if not any(path == root or root in path.parents for root in roots):
             raise ToolExecutionFailure(
                 f"Path escapes project root: {user_path}",
                 code="validation_error",
@@ -227,12 +250,51 @@ class ReadOnlyToolHandlers:
     def _relative(self, path: Path) -> str:
         if path == self.project_root:
             return "."
-        return path.relative_to(self.project_root).as_posix()
+        try:
+            return path.relative_to(self.project_root).as_posix()
+        except ValueError:
+            for index, root in enumerate(
+                self.permission_profile.additional_writable_directories
+                if self.permission_profile is not None
+                else ()
+            ):
+                try:
+                    relative = path.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                return f"additional-dir:{index}/{relative or '.'}"
+            return path.name
+
+    def _is_protected(self, path: Path) -> bool:
+        return bool(
+            self.permission_profile is not None
+            and self.permission_profile.matching_protected_rule(path, access="read")
+        )
+
+    def _ensure_not_protected(self, path: Path) -> None:
+        if self._is_protected(path):
+            raise ToolExecutionFailure(
+                "Protected path cannot be read by model-visible tools.",
+                code="protected_path_denied",
+            )
 
     def _should_skip(self, path: Path) -> bool:
-        try:
-            parts = path.relative_to(self.project_root).parts
-        except ValueError:
+        roots = (
+            self.project_root,
+            *(
+                self.permission_profile.additional_writable_directories
+                if self.permission_profile is not None
+                else ()
+            ),
+        )
+        parts = None
+        for root in roots:
+            try:
+                parts = path.relative_to(root).parts
+                break
+            except ValueError:
+                continue
+        if parts is None:
             return True
         return any(part in SKIP_DIRS for part in parts)
 
@@ -242,7 +304,10 @@ class ReadOnlyToolHandlers:
 
 
 def register_read_only_tools(registry: Any) -> None:
-    handlers = ReadOnlyToolHandlers(registry.project_root)
+    handlers = ReadOnlyToolHandlers(
+        registry.project_root,
+        permission_profile=getattr(registry, "permission_profile", None),
+    )
     registry.register(
         ToolSpec(
             name="list_files",

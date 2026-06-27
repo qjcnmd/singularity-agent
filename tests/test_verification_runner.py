@@ -390,8 +390,8 @@ def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path)
                 "raw_command": ["python", "-c", "print('ok')"],
             },
             "sandbox_availability": {
-                "available_backends": ["local_staging"],
-                "selected_backend": "local_staging",
+                "available_backends": ["windows"],
+                "selected_backend": "windows",
                 "hard_isolation_available": False,
                 "absolute_path": str(tmp_path),
             },
@@ -417,8 +417,8 @@ def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path)
         "provider": {"provider": "mock", "supports_streaming": False},
         "command": {"backend": "local_process", "timeout": True},
         "sandbox": {
-            "available_backends": ["local_staging"],
-            "selected_backend": "local_staging",
+            "available_backends": ["windows"],
+            "selected_backend": "windows",
             "hard_isolation_available": False,
         },
     }

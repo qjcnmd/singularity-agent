@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from singularity.config import ApprovalMode
 from singularity.config import ProductionConfig
+from singularity.policy.permissions import ApprovalPolicy
 from singularity.kernel.graph import AgentGraphBuilder, AgentGraph
 from singularity.kernel.health import ComponentHealthChecker
 from singularity.kernel.models import ComponentName, ComponentState, RunIdentity
@@ -129,21 +129,12 @@ def test_agent_graph_records_sandbox_capability_in_task_state(
     graph = _build_graph(tmp_path, monkeypatch, user_goal="Need sandbox evidence")
 
     snapshot = graph.planner.state.sandbox_capability
-    assert set(snapshot) >= {
-        "hard_isolation",
-        "soft_workspace_isolation",
-        "no_isolation",
-        "network_blocked",
-        "write_scope",
-        "approval_mode",
-        "available_backends",
-    }
-    assert snapshot["approval_mode"] == "non_interactive"
-    assert snapshot["soft_workspace_isolation"] is True
-    assert snapshot["no_isolation"] is False
-    assert snapshot["write_scope"] == "copy_on_write_workspace"
-    assert isinstance(snapshot["hard_isolation"], bool)
-    assert isinstance(snapshot["network_blocked"], bool)
+    assert snapshot["mode"] == "workspace-write"
+    assert snapshot["permission"]["profile"] == "workspace-write"
+    assert snapshot["permission"]["approval_policy"] == "never"
+    assert snapshot["permission"]["network_access"] == "denied"
+    assert snapshot["permission"]["protected_paths_enforced"] is True
+    assert snapshot["enforcement_status"] in {"available", "backend_unavailable"}
 
     restored = TaskState.from_dict(graph.planner.state.to_dict())
 
@@ -257,7 +248,7 @@ def _build_graph(
     config = ProductionConfig.from_cli(
         project_root=tmp_path,
         dry_run=True,
-        approval_mode=ApprovalMode.NON_INTERACTIVE,
+        approval_policy=ApprovalPolicy.NEVER,
     )
     trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "traces")
     return AgentGraphBuilder().build(

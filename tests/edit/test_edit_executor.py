@@ -396,6 +396,7 @@ def test_repair_failure_does_not_retry_non_recoverable_categories(tmp_path: Path
 
     assert result.ok is False
     assert result.repair_attempts == []
+    assert result.error_code == "policy_denied"
     assert result.validation.failure_category.value == "policy_denied"
 
 

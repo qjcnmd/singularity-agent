@@ -52,7 +52,8 @@ def test_config_check_reports_missing_fields_without_leaking_api_key(monkeypatch
     schema = next(item for item in result.findings if item.check_id == "config.file")
     provider = next(item for item in result.findings if item.check_id == "config.provider")
     assert schema.auto_repairable is True
-    assert "missing policy section" in schema.technical_detail
+    assert "missing model section" in schema.technical_detail
+    assert "missing provider section" in schema.technical_detail
     assert provider.status == "failed"
     assert "SINGULARITY_API_KEY" in provider.technical_detail
     assert "sk-secret-value" not in payload

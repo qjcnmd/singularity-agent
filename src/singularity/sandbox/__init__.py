@@ -1,12 +1,12 @@
 from singularity.sandbox.artifacts import SandboxArtifactCollector
 from singularity.sandbox.backends import (
-    DockerSandboxBackend,
-    LocalStagingBackend,
     SandboxBackend,
-    WindowsRestrictedTokenBackend,
+    WindowsSandboxBackend,
+    WindowsSandboxDoctorReport,
+    WindowsSandboxPrimitives,
+    WindowsSandboxSetup,
     default_sandbox_backends,
-    docker_backend_available,
-    windows_restricted_token_available,
+    probe_windows_sandbox,
 )
 from singularity.sandbox.environment import SandboxEnvironmentBuilder
 from singularity.sandbox.exceptions import (
@@ -43,8 +43,6 @@ from singularity.sandbox.manager import SandboxManager
 from singularity.sandbox.trace_recorder import SandboxJsonlTraceRecorder
 
 __all__ = [
-    "DockerSandboxBackend",
-    "LocalStagingBackend",
     "PreparedSandbox",
     "SandboxArtifact",
     "SandboxArtifactCollector",
@@ -60,6 +58,8 @@ __all__ = [
     "SandboxFilesystemManager",
     "SandboxFilesystemMode",
     "SandboxFilesystemPolicy",
+    "SandboxJsonlTraceRecorder",
+    "SandboxManager",
     "SandboxNetworkMode",
     "SandboxNetworkPolicy",
     "SandboxProfile",
@@ -67,17 +67,17 @@ __all__ = [
     "SandboxRequest",
     "SandboxResourceLimits",
     "SandboxResult",
-    "SandboxManager",
     "SandboxSetupError",
     "SandboxStatus",
     "SandboxTimeout",
-    "SandboxJsonlTraceRecorder",
     "SandboxUnavailable",
     "SandboxViolation",
     "SandboxViolationError",
-    "WindowsRestrictedTokenBackend",
-    "default_sandbox_profile",
+    "WindowsSandboxBackend",
+    "WindowsSandboxDoctorReport",
+    "WindowsSandboxPrimitives",
+    "WindowsSandboxSetup",
     "default_sandbox_backends",
-    "docker_backend_available",
-    "windows_restricted_token_available",
+    "default_sandbox_profile",
+    "probe_windows_sandbox",
 ]

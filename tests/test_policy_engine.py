@@ -4,7 +4,7 @@ from singularity.policy import (
     ApprovalGate,
     ApprovalGrant,
     ApprovalScope,
-    ApprovalMode,
+    ApprovalPolicy,
     Capability,
     DecisionOutcome,
     OperationKind,
@@ -14,6 +14,8 @@ from singularity.policy import (
     PolicySubject,
     ResourceRef,
     PolicyComponent,
+    PermissionProfile,
+    PermissionProfileName,
 )
 from tests.tool_executor_helpers import make_ledger_test_config
 
@@ -41,7 +43,7 @@ def req(
     )
 
 
-def test_policy_allows_workspace_read_and_reviews_mutation(tmp_path: Path) -> None:
+def test_workspace_write_profile_allows_workspace_read_and_mutation(tmp_path: Path) -> None:
     component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
 
     read = component.evaluate(
@@ -64,15 +66,20 @@ def test_policy_allows_workspace_read_and_reviews_mutation(tmp_path: Path) -> No
     )
 
     assert read.outcome == DecisionOutcome.ALLOW
-    assert mutate.outcome == DecisionOutcome.REQUIRE_REVIEW
-    assert mutate.required_approval is not None
+    assert mutate.outcome == DecisionOutcome.ALLOW
+    assert mutate.required_approval is None
 
 
-def test_policy_denies_outside_delete_and_read_only_mutation(tmp_path: Path) -> None:
+def test_policy_reviews_outside_delete_and_read_only_mutation(tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside.txt"
     component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
     read_only = PolicyEngine(
-        PolicyConfig(workspace_root=tmp_path, approval_mode=ApprovalMode.READ_ONLY)
+        PolicyConfig(
+            workspace_root=tmp_path,
+            permission_profile=PermissionProfile.default_for_workspace(
+                tmp_path, profile=PermissionProfileName.READ_ONLY
+            ),
+        )
     )
 
     delete = component.evaluate(
@@ -94,21 +101,24 @@ def test_policy_denies_outside_delete_and_read_only_mutation(tmp_path: Path) -> 
         )
     )
 
-    assert delete.outcome == DecisionOutcome.DENY
-    assert mutation.outcome == DecisionOutcome.DENY
+    assert delete.outcome == DecisionOutcome.REQUIRE_REVIEW
+    assert mutation.outcome == DecisionOutcome.REQUIRE_REVIEW
 
 
-def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_path: Path) -> None:
+def test_approval_never_fails_closed_and_on_request_grant_allows_exact_action(tmp_path: Path) -> None:
     grants_path = tmp_path / "policy" / "grants.jsonl"
     ledger_path = tmp_path / "policy" / "ledger.jsonl"
-    config = make_ledger_test_config(
+    never_config = make_ledger_test_config(
         tmp_path,
         grants_path=grants_path,
         ledger_path=ledger_path,
-        approval_mode=ApprovalMode.NON_INTERACTIVE,
-        security_mode="compat",
+        permission_profile=PermissionProfile.default_for_workspace(
+            tmp_path,
+            profile=PermissionProfileName.READ_ONLY,
+            approval_policy=ApprovalPolicy.NEVER,
+        ),
     )
-    component = PolicyEngine(config)
+    component = PolicyEngine(never_config)
     command = req(
         tmp_path,
         operation=OperationKind.MUTATE_FILE,
@@ -119,8 +129,16 @@ def test_non_interactive_review_fails_closed_and_grant_allows_exact_action(tmp_p
 
     denied = component.enforce(command)
     assert denied.outcome == DecisionOutcome.DENY
-    assert denied.reason == "Review required but approval mode is non_interactive."
+    assert "Approval policy is never" in denied.reason
 
+    config = make_ledger_test_config(
+        tmp_path,
+        grants_path=grants_path,
+        ledger_path=ledger_path,
+        permission_profile=PermissionProfile.default_for_workspace(
+            tmp_path, profile=PermissionProfileName.READ_ONLY
+        ),
+    )
     interactive = PolicyEngine(config)
     gate = ApprovalGate(config)
     pending = interactive.evaluate(command)
@@ -159,7 +177,6 @@ def test_policy_grants_persist_across_process_restarts(tmp_path: Path) -> None:
         tmp_path,
         grants_path=grant_path,
         ledger_path=ledger_path,
-        security_mode="compat",
     )
     first = ApprovalGate(config)
     request = req(
@@ -196,7 +213,6 @@ def test_single_use_grant_cannot_be_consumed_twice_by_stale_process(tmp_path: Pa
         tmp_path,
         grants_path=tmp_path / "policy" / "grants.jsonl",
         ledger_path=tmp_path / "policy" / "ledger.jsonl",
-        security_mode="compat",
     )
     request = req(
         tmp_path,
@@ -234,7 +250,6 @@ def test_session_only_grant_does_not_match_other_session_after_restart(tmp_path:
         tmp_path,
         grants_path=tmp_path / "policy" / "grants.jsonl",
         ledger_path=tmp_path / "policy" / "ledger.jsonl",
-        security_mode="compat",
     )
     request = req(
         tmp_path,
@@ -280,7 +295,6 @@ def test_session_only_grant_without_session_id_fails_closed(tmp_path: Path) -> N
         tmp_path,
         grants_path=tmp_path / "policy" / "grants.jsonl",
         ledger_path=tmp_path / "policy" / "ledger.jsonl",
-        security_mode="compat",
     )
     request = req(
         tmp_path,
@@ -307,14 +321,14 @@ def test_session_only_grant_without_session_id_fails_closed(tmp_path: Path) -> N
     assert ApprovalGate(config).find_matching_grant(request) is None
 
 
-def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
+def test_policy_config_uses_one_session_permission_profile(tmp_path: Path) -> None:
+    profile = PermissionProfile.default_for_workspace(
+        tmp_path,
+        profile=PermissionProfileName.READ_ONLY,
+        approval_policy=ApprovalPolicy.NEVER,
+    )
     component = PolicyEngine(
-        PolicyConfig(
-            workspace_root=tmp_path,
-            allow_workspace_reads=False,
-            allow_command_with_review=False,
-            allow_network_with_review=False,
-        )
+        PolicyConfig(workspace_root=tmp_path, permission_profile=profile)
     )
 
     read = component.evaluate(
@@ -345,7 +359,8 @@ def test_policy_config_switches_are_enforced(tmp_path: Path) -> None:
         )
     )
 
-    assert read.outcome == DecisionOutcome.DENY
+    assert component.config.permission_profile is profile
+    assert read.outcome == DecisionOutcome.ALLOW
     assert command.outcome == DecisionOutcome.DENY
     assert network.outcome == DecisionOutcome.DENY
 
@@ -411,7 +426,7 @@ def test_policy_requires_sandbox_for_verification_and_generated_code(tmp_path: P
     assert verification.outcome == DecisionOutcome.SANDBOX_REQUIRED
     assert verification.constraints.sandbox_required is True
     assert verification.constraints.hard_isolation_required is True
-    assert verification.constraints.filesystem_mode == "copy_on_write_workspace"
+    assert verification.constraints.filesystem_mode == "workspace-write"
     assert generated.outcome == DecisionOutcome.SANDBOX_REQUIRED
     assert generated.constraints.hard_isolation_required is True
 
@@ -433,7 +448,7 @@ def test_policy_hard_denies_writes_to_workspace_policy_dir(tmp_path: Path) -> No
         )
     )
     assert mutate.outcome == DecisionOutcome.DENY
-    assert "hard_deny_workspace_policy_dir_write" in mutate.rule_ids
+    assert "hard_deny_protected_path" in mutate.rule_ids
 
     # Command strings referencing the policy dir are also denied.
     command = component.evaluate(
@@ -446,7 +461,7 @@ def test_policy_hard_denies_writes_to_workspace_policy_dir(tmp_path: Path) -> No
         )
     )
     assert command.outcome == DecisionOutcome.DENY
-    assert "hard_deny_workspace_policy_dir_write" in command.rule_ids
+    assert "hard_deny_protected_path" in command.rule_ids
 
 
 def test_policy_allows_reads_outside_policy_dir(tmp_path: Path) -> None:

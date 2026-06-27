@@ -18,8 +18,8 @@ from singularity.policy import (
     PolicySubject,
     ResourceRef,
     PolicyComponent,
-    SecurityMode,
 )
+from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolExecutor, ToolSpec
 from singularity.verification import VerificationRunner
 from singularity.workspace import CreateFile, WorkspaceMutationManager
@@ -31,7 +31,15 @@ class EmptyInput(BaseModel):
 
 class CountingPolicyEngine(PolicyEngine):
     def __init__(self, tmp_path: Path) -> None:
-        super().__init__(PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT))
+        super().__init__(
+            PolicyConfig(
+                workspace_root=tmp_path,
+                permission_profile=PermissionProfile.default_for_workspace(
+                    tmp_path,
+                    profile=PermissionProfileName.DANGER_FULL_ACCESS,
+                ),
+            )
+        )
         self.calls: list[str] = []
 
     def enforce(self, request):  # type: ignore[no-untyped-def]
@@ -112,7 +120,7 @@ def test_command_executor_calls_policy_before_execute(tmp_path: Path) -> None:
     assert any(call.startswith("command:execute_command") for call in policy.calls)
 
 
-def test_policy_compat_allows_plain_local_command_without_review(tmp_path: Path) -> None:
+def test_permission_profile_controls_local_command_sandboxing(tmp_path: Path) -> None:
     request = PolicyRequest(
         session_id="session",
         task_id="task",
@@ -129,20 +137,23 @@ def test_policy_compat_allows_plain_local_command_without_review(tmp_path: Path)
             "command": f"{sys.executable} -c \"print('ok')\"",
             "network_policy": "DISABLED",
             "filesystem_mode": "READ_ONLY_WORKSPACE",
-            "security_mode": "compat",
         },
         workspace_root=str(tmp_path),
     )
 
-    strict = PolicyEngine(
-        PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.STRICT)
-    )
-    compat = PolicyEngine(
-        PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT)
+    workspace_write = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
+    danger_full_access = PolicyEngine(
+        PolicyConfig(
+            workspace_root=tmp_path,
+            permission_profile=PermissionProfile.default_for_workspace(
+                tmp_path,
+                profile=PermissionProfileName.DANGER_FULL_ACCESS,
+            ),
+        )
     )
 
-    assert strict.enforce(request).outcome == DecisionOutcome.SANDBOX_REQUIRED
-    assert compat.enforce(request).outcome == DecisionOutcome.ALLOW
+    assert workspace_write.enforce(request).outcome == DecisionOutcome.SANDBOX_REQUIRED
+    assert danger_full_access.enforce(request).outcome == DecisionOutcome.ALLOW
 
 
 def test_verification_runner_does_not_bypass_policy(tmp_path: Path) -> None:

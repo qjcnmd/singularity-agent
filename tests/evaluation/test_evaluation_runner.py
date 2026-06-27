@@ -43,6 +43,16 @@ def test_load_evaluation_task_set_example() -> None:
     assert manifest.tasks[0].completion_standard
     assert "smoke-test" in manifest.tasks[0].risk_tags
     assert manifest.tasks[-1].tool_policy == "read_only"
+    for task in manifest.tasks:
+        assert task.strategy["permission_profile"] in {
+            "read-only",
+            "workspace-write",
+            "danger-full-access",
+        }
+        assert task.strategy["approval_policy"] in {"on-request", "never"}
+        assert task.strategy["network_access"] in {"denied", "allowed"}
+        assert "approval_mode" not in task.strategy
+        assert "security_mode" not in task.strategy
 
 
 def test_load_evaluation_regression_manifest_declares_required_task_classes() -> None:
@@ -116,6 +126,13 @@ def test_evaluation_sanitized_baseline_example_is_safe_and_shape_current() -> No
     assert "sk-" not in text
     task = payload["tasks"][0]
     assert task["reproducible_environment"]["schema_version"] == "evaluation.environment/v1"
+    policy = task["reproducible_environment"]["policy"]
+    assert policy["permission_profile"] == "workspace-write"
+    assert policy["approval_policy"] == "never"
+    assert policy["network_access"] == "denied"
+    assert "approval_mode" not in policy
+    assert "security_mode" not in policy
+    assert "sandbox_strategy" not in policy
     for field in [
         "agent_completed",
         "evaluation_passed",
@@ -174,7 +191,12 @@ def test_private_adapter_converts_benchmark_tasks_to_evaluation_task_set(tmp_pat
                             "inline_files": {"math_utils.py": "def add(a, b):\n    return a - b\n"},
                         },
                         "allowed_tools": ["read_file", "write_file", "run_verification"],
-                        "strategy": {"tool_policy": "read_write", "approval_mode": "auto_safe"},
+                        "strategy": {
+                            "tool_policy": "read_write",
+                            "permission_profile": "workspace-write",
+                            "approval_policy": "never",
+                            "network_access": "denied",
+                        },
                         "expected_file_changes": ["math_utils.py"],
                         "completion_standard": "Focused pytest passes.",
                         "risk_tags": ["test-repair"],
@@ -218,6 +240,8 @@ def test_private_adapter_converts_benchmark_tasks_to_evaluation_task_set(tmp_pat
     assert manifest.tasks[0].expected_file_changes == ["math_utils.py"]
     assert manifest.tasks[0].completion_standard == "Focused pytest passes."
     assert manifest.tasks[0].risk_tags == ["test-repair"]
+    assert manifest.tasks[0].strategy["permission_profile"] == "workspace-write"
+    assert manifest.tasks[0].strategy["approval_policy"] == "never"
     assert manifest.tasks[0].verification_command == f"{json.dumps(sys.executable)} -m pytest tests/test_math.py"
     assert manifest.tasks[1].task_id == "private.repo_issue"
     assert manifest.tasks[1].workspace.kind == "repo"

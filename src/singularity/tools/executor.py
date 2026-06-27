@@ -731,6 +731,14 @@ class ToolExecutor:
         decision = self.policy_engine.enforce(request)
         if decision.outcome == DecisionOutcome.ALLOW:
             return None, decision.approval_grant_id, decision.decision_id
+        # CommandExecutor and WorkspaceMutationManager are the authoritative
+        # execution boundaries for delegated tools.  They must consume review
+        # grants exactly once; ToolExecutor only enforces hard denials here.
+        if (
+            decision.outcome != DecisionOutcome.DENY
+            and (spec.uses_command_executor or spec.uses_mutation_manager)
+        ):
+            return None, None, decision.decision_id
         if decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate is not None:
             # Trust boundary: only consume pre-existing grants when the grant
             # store is trusted (i.e. lives outside the model-writable

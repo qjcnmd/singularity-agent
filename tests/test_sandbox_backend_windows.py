@@ -1,20 +1,9 @@
-import os
-import sys
 from pathlib import Path
 
 import pytest
 
-from singularity.sandbox import (
-    SandboxCapabilityError,
-    SandboxNetworkMode,
-    SandboxNetworkPolicy,
-    SandboxProfileName,
-    SandboxRequest,
-    SandboxStatus,
-    WindowsRestrictedTokenBackend,
-    default_sandbox_profile,
-    windows_restricted_token_available,
-)
+import singularity.sandbox as sandbox
+from singularity.sandbox import SandboxCapabilityError, SandboxProfileName, SandboxRequest
 
 
 def _request(tmp_path: Path) -> SandboxRequest:
@@ -23,95 +12,61 @@ def _request(tmp_path: Path) -> SandboxRequest:
         session_id="session",
         task_id="task",
         action_id="action",
-        command=[
-            sys.executable,
-            "-c",
-            "from pathlib import Path; Path('windows.txt').write_text('ok', encoding='utf-8'); print('windows')",
-        ],
+        command=["python", "-c", "print('must-not-run')"],
         cwd=tmp_path,
         workspace_root=tmp_path,
-        profile=default_sandbox_profile(
+        profile=sandbox.default_sandbox_profile(
             SandboxProfileName.ISOLATED_VERIFICATION,
             workspace_root=tmp_path,
         ),
     )
 
 
-def _absolute_write_request(tmp_path: Path, target: Path) -> SandboxRequest:
-    request = _request(tmp_path)
-    request.command = [
-        sys.executable,
-        "-c",
-        (
-            "from pathlib import Path\n"
-            f"target = Path({str(target)!r})\n"
-            "try:\n"
-            "    target.write_text('escape', encoding='utf-8')\n"
-            "    print('wrote')\n"
-            "except OSError as exc:\n"
-            "    print(type(exc).__name__)\n"
-        ),
-    ]
-    return request
+def test_windows_doctor_reports_primitives_and_setup_separately() -> None:
+    report = sandbox.probe_windows_sandbox()
+    payload = report.to_dict()
 
-
-def test_windows_restricted_backend_capabilities_are_honest() -> None:
-    capabilities = WindowsRestrictedTokenBackend().capabilities()
-
-    assert capabilities.filesystem_isolation is True
-    assert capabilities.copy_on_write is True
-    assert capabilities.network_isolation is False
-    assert capabilities.process_tree_kill is True
-    assert capabilities.memory_limit is False
-
-
-def test_windows_restricted_backend_fails_closed_for_hard_network(tmp_path: Path) -> None:
-    backend = WindowsRestrictedTokenBackend()
-    request = _request(tmp_path)
-    request.profile.network = SandboxNetworkPolicy(
-        mode=SandboxNetworkMode.DENIED,
-        require_hard_isolation=True,
+    assert payload["implementation"] == "elevated"
+    assert set(payload["primitives"]) == {
+        "restricted_token",
+        "job_object",
+        "low_integrity",
+        "acl",
+        "firewall",
+        "private_desktop",
+    }
+    assert set(payload["setup"]) == {
+        "sandbox_account",
+        "acl_boundary",
+        "network_filter",
+        "private_desktop",
+        "execution_backend",
+    }
+    assert report.available == (
+        all(payload["primitives"].values()) and all(payload["setup"].values())
     )
-
-    with pytest.raises(SandboxCapabilityError):
-        backend.prepare(request)
+    assert report.missing_requirements
 
 
-def test_real_windows_restricted_backend_smoke(tmp_path: Path) -> None:
-    if os.name != "nt":
-        pytest.skip("Windows restricted token backend is Windows-only.")
-    if not windows_restricted_token_available(use_cache=False):
-        pytest.skip("Windows restricted token APIs are unavailable.")
-    backend = WindowsRestrictedTokenBackend()
-    prepared = backend.prepare(_request(tmp_path))
-    try:
-        result = backend.run(prepared)
-    finally:
-        backend.cleanup(prepared)
+def test_windows_backend_is_unavailable_until_all_enforcement_is_configured() -> None:
+    backend = sandbox.WindowsSandboxBackend()
+    report = backend.doctor()
 
-    assert result.status == SandboxStatus.SUCCESS
-    assert result.backend_name == "windows_restricted_token"
-    assert result.stdout.strip() == "windows"
-    assert not (tmp_path / "windows.txt").exists()
-    assert result.filesystem_changes.created_files == ["windows.txt"]
-    assert result.metadata["network_isolation_enforced"] is False
-    assert result.metadata["restricted_token"] is True
-    assert result.metadata["integrity_level"] == "low"
+    assert report.setup.execution_backend is False
+    assert backend.is_available() is False
+    assert backend.capabilities().filesystem_isolation is False
+    assert backend.capabilities().network_isolation is False
 
 
-def test_real_windows_restricted_backend_blocks_absolute_host_write(tmp_path: Path) -> None:
-    if os.name != "nt":
-        pytest.skip("Windows restricted token backend is Windows-only.")
-    if not windows_restricted_token_available(use_cache=False):
-        pytest.skip("Windows restricted token APIs are unavailable.")
-    escape_target = tmp_path / "escape.txt"
-    backend = WindowsRestrictedTokenBackend()
-    prepared = backend.prepare(_absolute_write_request(tmp_path, escape_target))
-    try:
-        result = backend.run(prepared)
-    finally:
-        backend.cleanup(prepared)
+def test_windows_setup_fails_explicitly_instead_of_claiming_success() -> None:
+    backend = sandbox.WindowsSandboxBackend()
 
-    assert result.status == SandboxStatus.SUCCESS
-    assert "wrote" not in result.stdout
-    assert not escape_target.exists()
+    with pytest.raises(sandbox.SandboxSetupError, match="elevated Windows sandbox setup"):
+        backend.setup()
+
+
+def test_windows_backend_never_prepares_without_completed_setup(tmp_path: Path) -> None:
+    backend = sandbox.WindowsSandboxBackend()
+
+    with pytest.raises(SandboxCapabilityError, match="backend_unavailable"):
+        backend.prepare(_request(tmp_path))

@@ -8,7 +8,8 @@ from singularity.agent_loop import AgentLoopStatus
 from singularity.command import CommandExecutor
 from singularity.edit import EditExecutor
 from singularity.planner import Planner, TaskStatus
-from singularity.policy import ApprovalMode, PolicyConfig, PolicyEngine, SecurityMode
+from singularity.policy import PolicyConfig, PolicyEngine
+from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
 from singularity.tools.edit import register_edit_tools
 from singularity.tools.mutation import register_mutation_tools
@@ -65,8 +66,10 @@ def _tool_executor(
     policy = PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
-            approval_mode=ApprovalMode.AUTO_SAFE,
-            security_mode=SecurityMode.COMPAT,
+            permission_profile=PermissionProfile.default_for_workspace(
+                tmp_path,
+                profile=PermissionProfileName.DANGER_FULL_ACCESS,
+            ),
         )
     )
     registry = ToolRegistry(tmp_path)
@@ -359,8 +362,10 @@ def _run_quicksort_agent(root: Path, mutation_tool: str, mutation_args: dict[str
     policy = PolicyEngine(
         PolicyConfig(
             workspace_root=root,
-            approval_mode=ApprovalMode.AUTO_SAFE,
-            security_mode=SecurityMode.COMPAT,
+            permission_profile=PermissionProfile.default_for_workspace(
+                root,
+                profile=PermissionProfileName.DANGER_FULL_ACCESS,
+            ),
         )
     )
     trace = JsonlTraceRecorder.create(root)

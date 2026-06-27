@@ -12,7 +12,8 @@ from singularity.command import (
     FilesystemMode,
 )
 from singularity.context import ContextManager
-from singularity.policy import ApprovalMode, PolicyConfig, PolicyEngine, SecurityMode
+from singularity.policy import PolicyConfig, PolicyEngine
+from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.tools.models import ToolResult
 from singularity.tools.workspace_state import WorkspaceHealthInput, WorkspaceHealthToolHandlers
 from singularity.jsonl_trace import JsonlTraceRecorder
@@ -144,8 +145,10 @@ def test_command_executor_records_side_effect_ownership_by_command_purpose(tmp_p
         policy_engine=PolicyEngine(
             PolicyConfig(
                 workspace_root=tmp_path,
-                approval_mode=ApprovalMode.AUTO_SAFE,
-                security_mode=SecurityMode.COMPAT,
+                permission_profile=PermissionProfile.default_for_workspace(
+                    tmp_path,
+                    profile=PermissionProfileName.DANGER_FULL_ACCESS,
+                ),
             )
         ),
     )

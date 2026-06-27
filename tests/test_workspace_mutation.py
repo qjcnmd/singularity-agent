@@ -71,9 +71,9 @@ def test_policy_denies_secret_and_git_internal_paths(tmp_path: Path) -> None:
     )
 
     assert env_result.ok is False
-    assert env_result.error_code == "file_class_denied"
+    assert env_result.error_code == "protected_path_denied"
     assert git_result.ok is False
-    assert git_result.error_code in {"path_denied", "file_class_denied"}
+    assert git_result.error_code == "protected_path_denied"
     assert not (tmp_path / ".env").exists()
 
 
@@ -92,7 +92,7 @@ def test_policy_denies_singularity_state_dir(tmp_path: Path) -> None:
     )
 
     assert result.ok is False
-    assert result.error_code == "path_denied"
+    assert result.error_code == "protected_path_denied"
     assert not (tmp_path / ".singularity" / "sessions" / "x" / "tamper.json").exists()
 
 
@@ -251,8 +251,8 @@ def test_policy_require_review_is_expressed_for_project_config(tmp_path: Path) -
         created_by="test",
     )
 
-    assert preview.ok is False
-    assert preview.error_code == "review_required"
+    assert preview.ok is True
+    assert preview.error_code is None
     assert preview.policy_decisions[0].decision == "require_review"
     assert pyproject.read_text(encoding="utf-8") == "[project]\nname = 'x'\n"
 
@@ -453,4 +453,3 @@ def test_mutation_manager_cleans_old_before_artifacts_after_commit(tmp_path: Pat
     # After cleanup, only .before artifacts from the most recent N transactions should remain.
     tx_dirs_with_before = {parent for parent in (f.parent for f in before_files)}
     assert len(tx_dirs_with_before) <= component._MAX_BEFORE_ARTIFACTS
-

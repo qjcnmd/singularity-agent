@@ -207,7 +207,6 @@ class SandboxProfile:
     env: SandboxEnvPolicy
     resources: SandboxResourceLimits
     description: str = ""
-    image_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, SandboxProfileName):
@@ -221,7 +220,6 @@ class SandboxProfile:
             "env": self.env.to_dict(),
             "resources": self.resources.to_dict(),
             "description": self.description,
-            "image_digest": self.image_digest,
         }
 
 
@@ -407,14 +405,14 @@ def default_sandbox_profile(
         return SandboxProfile(
             name=resolved,
             filesystem=SandboxFilesystemPolicy(
-                mode=SandboxFilesystemMode.COPY_ON_WRITE_WORKSPACE,
+                mode=SandboxFilesystemMode.READ_ONLY_WORKSPACE,
                 workspace_root=workspace,
                 detect_changes=False,
             ),
             network=SandboxNetworkPolicy(mode=SandboxNetworkMode.DENIED),
             env=SandboxEnvPolicy(),
             resources=SandboxResourceLimits(timeout_seconds=30, max_output_chars=20000),
-            description="Read-only analysis in an isolated workspace copy.",
+            description="Read-only analysis enforced by the native OS sandbox.",
         )
     if resolved == SandboxProfileName.GENERATED_CODE:
         return SandboxProfile(
@@ -440,7 +438,7 @@ def default_sandbox_profile(
             network=SandboxNetworkPolicy(mode=SandboxNetworkMode.ALLOWED),
             env=SandboxEnvPolicy(),
             resources=SandboxResourceLimits(timeout_seconds=180, max_output_chars=30000),
-            description="Package operation in a copy-on-write workspace.",
+            description="Package operation under native OS sandbox enforcement.",
         )
     if resolved == SandboxProfileName.LONG_RUNNING_SERVICE:
         return SandboxProfile(
@@ -469,7 +467,7 @@ def default_sandbox_profile(
             max_output_chars=40000,
             max_artifact_bytes=20 * 1024 * 1024,
         ),
-        description="Verification in an isolated copy-on-write workspace.",
+        description="Verification under native OS sandbox enforcement.",
     )
 
 

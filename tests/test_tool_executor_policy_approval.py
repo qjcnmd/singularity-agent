@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict
 
 from singularity.policy import (
     ApprovalGate,
-    ApprovalMode,
     approval_scope_for_request,
     DecisionOutcome,
     PolicyConfig,
@@ -41,7 +40,7 @@ class SequencedPolicyEngine:
 
     @property
     def config(self) -> PolicyConfig:
-        return PolicyConfig(approval_mode=ApprovalMode.INTERACTIVE)
+        return PolicyConfig()
 
     def evaluate(self, request: PolicyRequest) -> PolicyDecision:
         self.requests.append(request)
@@ -109,7 +108,6 @@ def test_require_review_uses_approval_gate_and_consumes_grant(tmp_path: Path) ->
             tmp_path,
             grants_path=tmp_path / "policy" / "grants.jsonl",
             ledger_path=tmp_path / "policy" / "ledger.jsonl",
-            approval_mode=ApprovalMode.INTERACTIVE,
         ),
         interaction=InteractionController(provider=ApprovingProvider()),
     )
@@ -146,7 +144,6 @@ def test_untrusted_grant_store_inside_workspace_is_not_consumed(tmp_path: Path) 
     gate = ApprovalGate(
         PolicyConfig(
             workspace_root=tmp_path,
-            approval_mode=ApprovalMode.INTERACTIVE,
             approval_grants_path=grants_path,
         )
     )

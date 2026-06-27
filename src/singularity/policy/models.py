@@ -140,9 +140,6 @@ class PolicyConstraints:
     network_allowed: bool = False
     max_duration_seconds: int | None = None
     max_output_chars: int | None = None
-    allowed_paths: list[str] = field(default_factory=list)
-    denied_paths: list[str] = field(default_factory=list)
-    allowed_hosts: list[str] = field(default_factory=list)
     env_redaction: bool = True
     sandbox_required: bool = False
     hard_isolation_required: bool = False
@@ -153,9 +150,6 @@ class PolicyConstraints:
             "network_allowed": self.network_allowed,
             "max_duration_seconds": self.max_duration_seconds,
             "max_output_chars": self.max_output_chars,
-            "allowed_paths": self.allowed_paths,
-            "denied_paths": self.denied_paths,
-            "allowed_hosts": self.allowed_hosts,
             "env_redaction": self.env_redaction,
             "sandbox_required": self.sandbox_required,
             "hard_isolation_required": self.hard_isolation_required,

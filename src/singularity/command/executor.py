@@ -37,6 +37,7 @@ from singularity.command.policy import CommandPolicy
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.policy import (
+    ApprovalGate,
     Capability,
     DecisionOutcome,
     OperationKind,
@@ -46,13 +47,21 @@ from singularity.policy import (
     PolicySubject,
     ResourceRef,
     PolicyComponent,
+    PolicyError,
+    PermissionProfileName,
 )
 from singularity.policy.audit import redact, redact_resource_identifier
 from singularity.sandbox import (
+    SandboxFilesystemMode,
+    SandboxNetworkMode,
+    SandboxProfileName,
+    SandboxRequest,
     SandboxResult,
     SandboxManager,
     SandboxStatus,
+    default_sandbox_profile,
 )
+from singularity.sandbox.models import new_sandbox_id
 
 if TYPE_CHECKING:
     from singularity.workspace_state import WorkspaceStateManager
@@ -124,6 +133,7 @@ class CommandExecutor:
         workspace_state_manager: "WorkspaceStateManager | None" = None,
         planner: Any | None = None,
         policy_engine: PolicyEngine | None = None,
+        approval_gate: ApprovalGate | None = None,
         sandbox_manager: SandboxManager | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)
@@ -135,13 +145,13 @@ class CommandExecutor:
         self.policy_engine = policy_engine or PolicyEngine(
             PolicyConfig.default_for_workspace(self.workspace_root)
         )
-        self.policy = policy or CommandPolicy(
-            security_mode=self.policy_engine.config.security_mode
-        )
+        self.permission_profile = self.policy_engine.config.permission_profile
+        self.approval_gate = approval_gate
+        self.policy = policy or CommandPolicy()
         self.sandbox_manager = sandbox_manager or SandboxManager(
             self.workspace_root,
             trace=trace if trace is not None and hasattr(trace, "emit") else None,
-            security_mode=self.policy_engine.config.security_mode,
+            permission_profile=self.permission_profile,
         )
         self._sessions: dict[str, _SessionRecord] = {}
 
@@ -185,27 +195,47 @@ class CommandExecutor:
             policy_decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
             or policy_decision.constraints.sandbox_required
         )
+        approved_escalation = False
+        approval_grant_id: str | None = None
+        if policy_decision.outcome == DecisionOutcome.REQUIRE_REVIEW:
+            if self.approval_gate is not None:
+                try:
+                    grant = self.approval_gate.authorize(policy_request, policy_decision)
+                except PolicyError:
+                    grant = None
+                if grant is not None:
+                    approval_grant_id = grant.grant_id
+                    approved_escalation = True
+                    sandbox_required = (
+                        self.permission_profile.profile
+                        == PermissionProfileName.READ_ONLY
+                    )
         if policy_decision.outcome != DecisionOutcome.ALLOW and not sandbox_required:
-            result = self._policy_blocked_result(
-                request,
-                decision=policy_decision,
-                started_at=started_at,
-                started=started,
-                git_before=git_before,
-                git_after=git_before,
-                policy_request=policy_request,
-            )
-            self._record_trace(
-                request,
-                result,
-                tool_call_id=tool_call_id,
-                transaction_id=transaction_id,
-            )
-            self._notify_planner_policy(request, policy_request, policy_decision)
-            return result
+            if approved_escalation:
+                pass
+            else:
+                result = self._policy_blocked_result(
+                    request,
+                    decision=policy_decision,
+                    started_at=started_at,
+                    started=started,
+                    git_before=git_before,
+                    git_after=git_before,
+                    policy_request=policy_request,
+                )
+                self._record_trace(
+                    request,
+                    result,
+                    tool_call_id=tool_call_id,
+                    transaction_id=transaction_id,
+                )
+                self._notify_planner_policy(request, policy_request, policy_decision)
+                return result
         decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
         if decision.decision == CommandDecision.DENY or (
-            decision.decision != CommandDecision.ALLOW and not sandbox_required
+            decision.decision != CommandDecision.ALLOW
+            and not sandbox_required
+            and not approved_escalation
         ):
             result = self._blocked_result(
                 request,
@@ -243,12 +273,10 @@ class CommandExecutor:
 
         if sandbox_required:
             env_result = self.env_policy.build(request.env_request)
-            sandbox_request = self.sandbox_manager.build_request_from_policy(
+            sandbox_request = self._sandbox_request(
                 request,
-                policy_decision,
-                session_id=policy_request.session_id,
-                task_id=policy_request.task_id,
-                action_id=policy_request.action_id,
+                policy_request=policy_request,
+                policy_decision=policy_decision,
                 cwd=cwd,
             )
             sandbox_result = self.sandbox_manager.run(sandbox_request)
@@ -330,6 +358,9 @@ class CommandExecutor:
                 tool_call_id=tool_call_id,
             )
         self._notify_planner_policy(request, policy_request, policy_decision)
+        if approved_escalation:
+            result.metadata["approved_escalation"] = True
+            result.metadata["approval_grant_id"] = approval_grant_id
         return result
 
     def start_process(
@@ -358,9 +389,21 @@ class CommandExecutor:
         policy_request = self._policy_request(request)
         policy_decision = self.policy_engine.enforce(policy_request)
         self._record_policy_trace(policy_request, policy_decision)
+        approved_escalation = False
+        if policy_decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate:
+            try:
+                approved_escalation = (
+                    self.approval_gate.authorize(policy_request, policy_decision) is not None
+                )
+            except PolicyError:
+                approved_escalation = False
         if (
             policy_decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
             or policy_decision.constraints.sandbox_required
+            or (
+                approved_escalation
+                and self.permission_profile.profile == PermissionProfileName.READ_ONLY
+            )
         ):
             return ProcessSession(
                 process_id=request.command_id,
@@ -374,7 +417,7 @@ class CommandExecutor:
                 owner_transaction=transaction_id,
                 error_code="sandbox_required",
             )
-        if policy_decision.outcome != DecisionOutcome.ALLOW:
+        if policy_decision.outcome != DecisionOutcome.ALLOW and not approved_escalation:
             return ProcessSession(
                 process_id=request.command_id,
                 command_id=request.command_id,
@@ -388,7 +431,9 @@ class CommandExecutor:
                 error_code=_policy_error_code(policy_decision.outcome),
             )
         decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
-        if decision.decision != CommandDecision.ALLOW:
+        if decision.decision != CommandDecision.ALLOW and not (
+            approved_escalation and decision.decision == CommandDecision.REQUIRE_REVIEW
+        ):
             session = ProcessSession(
                 process_id=request.command_id,
                 command_id=request.command_id,
@@ -704,7 +749,7 @@ class CommandExecutor:
         }
         isolation_report = self._isolation_report(request.resource_limits)
         isolation_report["backend"] = sandbox_result.backend_name
-        isolation_report["filesystem_isolation"] = "copy_on_write_workspace"
+        isolation_report["filesystem_isolation"] = "native_os_sandbox"
         isolation_report["sandbox"] = sandbox_report
         return CommandResult(
             command_id=request.command_id,
@@ -1237,13 +1282,70 @@ class CommandExecutor:
             metadata={
                 **request.safe_metadata(),
                 "env_policy": request.env_request,
-                "security_mode": self.policy_engine.config.security_mode.value,
             },
             requires_network=request.network_mode != NetworkMode.DISABLED,
             touches_workspace=request.filesystem_mode != FilesystemMode.READ_ONLY_WORKSPACE,
             long_running=request.purpose == CommandPurpose.LONG_RUNNING,
             destructive=request.purpose == CommandPurpose.DESTRUCTIVE,
             workspace_root=str(self.workspace_root),
+        )
+
+    def _sandbox_request(
+        self,
+        request: CommandRequest,
+        *,
+        policy_request: PolicyRequest,
+        policy_decision: Any,
+        cwd: Path,
+    ) -> SandboxRequest:
+        profile_name = (
+            SandboxProfileName.READONLY_ANALYSIS
+            if self.permission_profile.profile == PermissionProfileName.READ_ONLY
+            else SandboxProfileName.ISOLATED_VERIFICATION
+        )
+        profile = default_sandbox_profile(profile_name, workspace_root=self.workspace_root)
+        if self.permission_profile.profile != PermissionProfileName.READ_ONLY:
+            profile.filesystem.mode = SandboxFilesystemMode.COPY_ON_WRITE_WORKSPACE
+            profile.filesystem.writable_paths = [
+                str(path)
+                for path in (
+                    *self.permission_profile.workspace_roots,
+                    *self.permission_profile.additional_writable_directories,
+                )
+            ]
+        profile.filesystem.exclude_globs = sorted(
+            {
+                *profile.filesystem.exclude_globs,
+                *(rule.pattern for rule in self.permission_profile.protected_paths),
+            }
+        )
+        profile.network.mode = SandboxNetworkMode(
+            self.permission_profile.network_access.value
+        )
+        profile.network.require_hard_isolation = (
+            profile.network.mode == SandboxNetworkMode.DENIED
+        )
+        profile.resources.timeout_seconds = request.resource_limits.timeout_seconds
+        profile.resources.max_output_chars = request.resource_limits.max_combined_output_bytes
+        env_result = self.env_policy.build(request.env_request)
+        profile.env.extra_env = dict(env_result.env)
+        command: list[str] | str = request.argv or request.shell or ""
+        return SandboxRequest(
+            sandbox_id=new_sandbox_id(),
+            session_id=policy_request.session_id,
+            task_id=policy_request.task_id,
+            action_id=policy_request.action_id,
+            command=command,
+            cwd=cwd,
+            workspace_root=self.workspace_root,
+            profile=profile,
+            policy_decision_id=policy_decision.decision_id,
+            policy_constraints=policy_decision.constraints,
+            reason=policy_decision.reason,
+            metadata={
+                "command_id": request.command_id,
+                "permission_profile": self.permission_profile.profile.value,
+            },
         )
 
     def _policy_blocked_result(

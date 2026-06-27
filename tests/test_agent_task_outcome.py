@@ -9,7 +9,6 @@ from singularity.edit import EditExecutor
 from singularity.model import ModelError, ModelErrorKind
 from singularity.planner import Planner, TaskStatus
 from singularity.policy import (
-    ApprovalMode,
     DecisionOutcome,
     OperationKind,
     PolicyConfig,
@@ -17,8 +16,8 @@ from singularity.policy import (
     PolicyRequest,
     PolicyEngine,
     RiskLevel,
-    SecurityMode,
 )
+from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.run_controller import RunLifecycleStatus
 from singularity.tools import ToolRegistry
 from singularity.tools.edit import register_edit_tools
@@ -51,7 +50,7 @@ class FakeProvider:
 
 class DenyMutationPolicyEngine:
     def __init__(self, workspace_root: Path) -> None:
-        self.config = PolicyConfig(workspace_root=workspace_root, approval_mode=ApprovalMode.AUTO_SAFE)
+        self.config = PolicyConfig(workspace_root=workspace_root)
         self.requests: list[PolicyRequest] = []
 
     def evaluate(self, request: PolicyRequest) -> PolicyDecision:
@@ -722,8 +721,10 @@ def test_approval_wait_keeps_context_for_resume(tmp_path: Path) -> None:
     policy = PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
-            approval_mode=ApprovalMode.REVIEW_ALL,
-            security_mode=SecurityMode.COMPAT,
+            permission_profile=PermissionProfile.default_for_workspace(
+                tmp_path,
+                profile=PermissionProfileName.READ_ONLY,
+            ),
         )
     )
     agent = make_task_agent(
@@ -765,8 +766,10 @@ def make_task_agent(
     policy = policy_engine or PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
-            approval_mode=ApprovalMode.AUTO_SAFE,
-            security_mode=SecurityMode.COMPAT,
+            permission_profile=PermissionProfile.default_for_workspace(
+                tmp_path,
+                profile=PermissionProfileName.DANGER_FULL_ACCESS,
+            ),
         )
     )
     tools = ToolRegistry(tmp_path)

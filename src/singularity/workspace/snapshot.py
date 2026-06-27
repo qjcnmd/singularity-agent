@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from singularity.workspace.errors import MutationError
+from singularity.policy import PermissionProfile
 from singularity.workspace.pathing import WorkspacePathResolver
 
 
@@ -48,8 +49,15 @@ class FileSnapshot:
 
 
 class WorkspaceIndex:
-    def __init__(self, workspace_root: Path | str) -> None:
-        self.resolver = WorkspacePathResolver(workspace_root)
+    def __init__(
+        self,
+        workspace_root: Path | str,
+        *,
+        permission_profile: PermissionProfile | None = None,
+    ) -> None:
+        self.resolver = WorkspacePathResolver(
+            workspace_root, permission_profile=permission_profile
+        )
         self.snapshots: dict[str, FileSnapshot] = {}
 
     def snapshot_file(self, user_path: str | Path) -> FileSnapshot:

@@ -16,6 +16,7 @@ from uuid import uuid4
 from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.observability.models import TraceEventType
 from singularity.policy import (
+    ApprovalGate,
     Capability,
     DecisionOutcome,
     OperationKind,
@@ -25,6 +26,7 @@ from singularity.policy import (
     PolicySubject,
     ResourceRef,
     PolicyComponent,
+    PolicyError,
 )
 from singularity.policy.audit import redact
 from singularity.workspace.diff import (
@@ -232,11 +234,23 @@ class WorkspaceMutationManager:
         workspace_state_manager: "WorkspaceStateManager | None" = None,
         planner: Any | None = None,
         policy_engine: PolicyEngine | None = None,
+        approval_gate: ApprovalGate | None = None,
         project_index: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
-        self.resolver = WorkspacePathResolver(self.workspace_root)
-        self.index = WorkspaceIndex(self.workspace_root)
+        self.policy_engine = policy_engine or PolicyEngine(
+            PolicyConfig.default_for_workspace(self.workspace_root)
+        )
+        self.permission_profile = self.policy_engine.config.permission_profile
+        self.approval_gate = approval_gate
+        self.resolver = WorkspacePathResolver(
+            self.workspace_root,
+            permission_profile=self.permission_profile,
+            default_access="write",
+        )
+        self.index = WorkspaceIndex(
+            self.workspace_root, permission_profile=self.permission_profile
+        )
         self.policy = policy or WorkspacePolicy()
         self.trace = trace
         self.diff_engine = DiffEngine(
@@ -248,9 +262,6 @@ class WorkspaceMutationManager:
         self.verification_hook = verification_hook
         self.workspace_state_manager = workspace_state_manager
         self.planner = planner
-        self.policy_engine = policy_engine or PolicyEngine(
-            PolicyConfig.default_for_workspace(self.workspace_root)
-        )
         self.project_index = project_index
         self._journals: "OrderedDict[str, MutationJournal]" = OrderedDict()
         self._changesets: "OrderedDict[str, ChangeSet]" = OrderedDict()
@@ -274,7 +285,7 @@ class WorkspaceMutationManager:
             )
         except MutationError as exc:
             return self._failure_result(exc, status="rejected")
-        policy_result = self._policy_result(changeset)
+        policy_result = self._policy_result(changeset, block_review=False)
         if policy_result is not None:
             return policy_result
         return MutationResult(
@@ -826,6 +837,16 @@ class WorkspaceMutationManager:
         request = self._policy_request(changeset, transaction_id=transaction_id)
         decision = self.policy_engine.enforce(request)
         self._record_policy_trace(request, decision)
+        if decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate:
+            try:
+                grant = self.approval_gate.authorize(request, decision)
+            except PolicyError:
+                grant = None
+            if grant is not None:
+                impact_result = self._project_index_policy_result(changeset, transaction_id)
+                if impact_result is not None:
+                    return impact_result
+                return None
         if decision.outcome == DecisionOutcome.ALLOW:
             impact_result = self._project_index_policy_result(changeset, transaction_id)
             if impact_result is not None:
@@ -895,6 +916,12 @@ class WorkspaceMutationManager:
         self._record_policy_trace(request, decision)
         if decision.outcome == DecisionOutcome.ALLOW:
             return None
+        if decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate:
+            try:
+                if self.approval_gate.authorize(request, decision) is not None:
+                    return None
+            except PolicyError:
+                pass
         self._record_policy_observation(request, decision)
         return MutationResult(
             ok=False,
@@ -960,6 +987,10 @@ class WorkspaceMutationManager:
                 "reversible": True,
                 "transaction_id": transaction_id,
                 "changeset_id": changeset.id,
+                "resources": [
+                    {"resource_type": "file", "identifier": path}
+                    for path in changeset.affected_files
+                ],
             },
             reversible=True,
             touches_workspace=True,
@@ -1223,7 +1254,9 @@ class WorkspaceMutationManager:
                     {"path": path, "expected_sha256": base_snapshot.sha256, "current_sha256": current_hash},
                 )
 
-    def _policy_result(self, changeset: ChangeSet) -> MutationResult | None:
+    def _policy_result(
+        self, changeset: ChangeSet, *, block_review: bool = True
+    ) -> MutationResult | None:
         denied = [decision for decision in changeset.policy_decisions if decision.decision == DENY]
         if denied:
             code = denied[0].error_code or "policy_denied"
@@ -1243,7 +1276,7 @@ class WorkspaceMutationManager:
             for decision in changeset.policy_decisions
             if decision.decision == REQUIRE_REVIEW
         ]
-        if review:
+        if review and block_review:
             return MutationResult(
                 ok=False,
                 status="requires_review",

@@ -222,10 +222,10 @@
         },
         "policy": {
           "tool_policy": "read_write",
-          "approval_mode": "auto_safe",
-          "security_mode": "compat",
-          "interaction_mode": "non_interactive",
-          "sandbox_strategy": "compat"
+          "permission_profile": "workspace-write",
+          "approval_policy": "never",
+          "network_access": "denied",
+          "interaction_mode": "non_interactive"
         },
         "baseline_artifacts": {
           "baseline_result_path": null,

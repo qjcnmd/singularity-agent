@@ -1,6 +1,6 @@
 from singularity.policy.approval import ApprovalGate
 from singularity.policy.audit import PolicyAuditWriter
-from singularity.policy.config import ApprovalMode, PolicyConfig, SecurityMode
+from singularity.policy.config import PolicyConfig
 from singularity.policy.engine import PolicyEngine
 from singularity.policy.exceptions import (
     ApprovalDenied,
@@ -35,6 +35,15 @@ from singularity.policy.models import (
     PolicyComponent,
     approval_scope_for_request,
 )
+from singularity.policy.permissions import (
+    ApprovalPolicy,
+    BUILTIN_PROTECTED_PATH_RULES,
+    NetworkAccess,
+    PermissionProfile,
+    PermissionProfileName,
+    PermissionSummary,
+    ProtectedPathRule,
+)
 from singularity.policy.risk import RiskAssessment, RiskClassifier
 from singularity.policy.remote import RemoteApprovalExport, RemoteApprovalExchange
 
@@ -42,18 +51,23 @@ __all__ = [
     "ApprovalDenied",
     "ApprovalGate",
     "ApprovalGrant",
-    "ApprovalMode",
+    "ApprovalPolicy",
     "ApprovalRequired",
     "ApprovalRequirement",
     "ApprovalScope",
     "approval_scope_for_request",
     "Capability",
+    "BUILTIN_PROTECTED_PATH_RULES",
     "DecisionOutcome",
     "GrantAlreadyConsumedError",
     "GrantConsumptionLedger",
     "GrantConsumptionLedgerTamperError",
     "GrantConsumptionRecord",
     "OperationKind",
+    "NetworkAccess",
+    "PermissionProfile",
+    "PermissionProfileName",
+    "PermissionSummary",
     "PolicyAskUserRequired",
     "PolicyAuditEntry",
     "PolicyAuditWriter",
@@ -67,6 +81,7 @@ __all__ = [
     "PolicyEngine",
     "PolicySubject",
     "ResourceRef",
+    "ProtectedPathRule",
     "RiskAssessment",
     "RiskClassifier",
     "RiskLevel",
@@ -75,5 +90,4 @@ __all__ = [
     "RemoteApprovalExport",
     "RemoteApprovalExchange",
     "SandboxRequired",
-    "SecurityMode",
 ]

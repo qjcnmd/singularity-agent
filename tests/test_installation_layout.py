@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from singularity.cli import app
-from singularity.release.init import initialize_user_data
+from singularity.release.init import initialize_user_data, load_config
 from singularity.release.migrations import Migration, apply_migrations, load_manifest
 from singularity.release.models import atomic_write_json, read_json
 from singularity.release.paths import UserDataMode, resolve_user_data_paths
@@ -48,6 +48,21 @@ def test_system_init_is_idempotent_and_does_not_overwrite_config(
     assert paths.manifest_file.exists()
 
 
+def test_system_init_omits_unconnected_policy_and_sandbox_configuration(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SINGULARITY_HOME", str(tmp_path / "component"))
+
+    result = runner.invoke(app, ["system", "init", "--json"])
+    config = load_config(resolve_user_data_paths())
+
+    assert result.exit_code == 0
+    assert "policy" not in config
+    assert "sandbox" not in config
+    assert {"schema_version", "component", "model", "provider"} <= set(config)
+
+
 def test_doctor_json_reports_component_health_without_real_home(
     monkeypatch,
     tmp_path: Path,
@@ -79,7 +94,7 @@ def test_version_json_uses_project_version_in_source_checkout(monkeypatch, tmp_p
 def test_migration_failure_rolls_back_config_and_manifest(tmp_path: Path) -> None:
     paths = resolve_user_data_paths(home=tmp_path / "component")
     initialize_user_data(paths)
-    original_config = {"schema_version": 1, "component": {"mode": "user"}, "policy": {}, "sandbox": {}, "model": {}, "provider": {}}
+    original_config = {"schema_version": 1, "component": {"mode": "user"}, "model": {}, "provider": {}}
     atomic_write_json(paths.config_file, original_config)
     manifest = load_manifest(paths).to_dict()
     manifest["last_migration"] = "000"

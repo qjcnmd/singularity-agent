@@ -4,7 +4,7 @@ import builtins
 from pathlib import Path
 from typing import Any
 
-from singularity.policy import Capability
+from singularity.policy import Capability, PermissionProfile
 from singularity.tools.models import (
     PermissionLevel,
     RegisteredToolRecord,
@@ -17,8 +17,17 @@ from singularity.tools.models import (
 
 
 class ToolRegistry:
-    def __init__(self, project_root: Path, *, include_default_tools: bool = True) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        include_default_tools: bool = True,
+        permission_profile: PermissionProfile | None = None,
+    ) -> None:
         self.project_root = project_root.resolve()
+        self.permission_profile = permission_profile or PermissionProfile.default_for_workspace(
+            self.project_root
+        )
         self._tools: dict[str, ToolSpec] = {}
         self._records: dict[str, RegisteredToolRecord] = {}
         self._frozen = False

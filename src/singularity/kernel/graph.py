@@ -13,7 +13,7 @@ from singularity.agent_loop import SYSTEM_PROMPT
 from singularity.context import ContextManager
 from singularity.evaluation import EvaluationHarness
 from singularity.instructions import PromptAssemblyPipeline
-from singularity.interaction import InteractionMode, InteractionController
+from singularity.interaction import InteractionController
 from singularity.model import (
     ModelProviderRegistry,
     ModelRunner,
@@ -21,7 +21,7 @@ from singularity.model import (
 )
 from singularity.memory import MemoryLearningPipeline
 from singularity.observability import TraceRecorder
-from singularity.policy import ApprovalGate, ApprovalMode, PolicyEngine
+from singularity.policy import ApprovalGate, PolicyConfig, PolicyEngine
 from singularity.plugins import PluginManager
 from singularity.planner import Planner, create_or_resume_planner
 from singularity.review import ReviewPipeline
@@ -413,13 +413,8 @@ class AgentGraphBuilder:
         marker: _ComponentMarker,
     ) -> _InfraComponents:
         if interaction_controller is None:
-            interaction_mode = (
-                InteractionMode.NON_INTERACTIVE
-                if config.approval_mode == ApprovalMode.NON_INTERACTIVE
-                else config.interaction_mode
-            )
             interaction_controller = InteractionController(
-                mode=interaction_mode,
+                mode=config.interaction_mode,
                 trace=trace,
             )
         if hasattr(trace, "set_interaction_sink"):
@@ -462,7 +457,11 @@ class AgentGraphBuilder:
         interaction_controller: InteractionController,
         marker: _ComponentMarker,
     ) -> _PolicySandboxComponents:
-        policy_config = config.to_policy_config()
+        permission_profile = config.to_permission_profile()
+        policy_config = PolicyConfig(
+            workspace_root=project_root,
+            permission_profile=permission_profile,
+        )
         policy_engine = PolicyEngine(policy_config, trace=trace)
         approval_gate = ApprovalGate(
             policy_config,
@@ -474,7 +473,7 @@ class AgentGraphBuilder:
         sandbox_manager = SandboxManager(
             project_root,
             trace=trace,
-            security_mode=config.security_mode,
+            permission_profile=permission_profile,
         )
         marker.mark(ComponentName.SANDBOX)
 
@@ -499,6 +498,7 @@ class AgentGraphBuilder:
             workspace_state_manager=infra.workspace_state_manager,
             planner=None,
             policy_engine=policy_sandbox.policy_engine,
+            approval_gate=policy_sandbox.approval_gate,
             sandbox_manager=policy_sandbox.sandbox_manager,
         )
         marker.mark(ComponentName.COMMAND)
@@ -509,6 +509,7 @@ class AgentGraphBuilder:
             workspace_state_manager=infra.workspace_state_manager,
             planner=None,
             policy_engine=policy_sandbox.policy_engine,
+            approval_gate=policy_sandbox.approval_gate,
             project_index=infra.project_index,
         )
         marker.mark(ComponentName.MUTATION)
@@ -538,7 +539,10 @@ class AgentGraphBuilder:
         execution_core: _ExecutionCoreComponents,
         marker: _ComponentMarker,
     ) -> _ToolProtocolEngines:
-        tools = ToolRegistry(project_root)
+        tools = ToolRegistry(
+            project_root,
+            permission_profile=policy_sandbox.policy_engine.config.permission_profile,
+        )
         register_mutation_tools(tools, execution_core.mutation_manager)
         register_edit_tools(tools, execution_core.edit_executor)
         register_command_tools(tools, execution_core.command_executor)
@@ -597,6 +601,7 @@ class AgentGraphBuilder:
             trace=trace,
             planner=None,
             policy_engine=policy_sandbox.policy_engine,
+            approval_gate=policy_sandbox.approval_gate,
             project_index=infra.project_index,
         )
         register_verification_tools(tool_protocol.tools, verification_runner)
@@ -712,10 +717,17 @@ class AgentGraphBuilder:
         planner.project_index = infra.project_index
         planner.memory_pipeline = infra.memory_pipeline
         if planner.state is not None:
+            permission_summary = (
+                policy_sandbox.policy_engine.config.permission_profile.summary().to_dict()
+            )
             planner.record_sandbox_capability(
-                policy_sandbox.sandbox_manager.capability_summary(
-                    approval_mode=config.approval_mode.value,
-                )
+                {
+                    "mode": permission_summary["profile"],
+                    "permission": permission_summary,
+                    "enforcement_status": policy_sandbox.sandbox_manager.capability_summary()[
+                        "backend_status"
+                    ],
+                }
             )
         execution_core.command_executor.planner = planner
         execution_core.mutation_manager.planner = planner

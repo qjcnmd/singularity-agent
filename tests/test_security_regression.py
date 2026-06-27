@@ -362,25 +362,24 @@ def test_tool_executor_rejects_write_to_policy_dir_via_shell(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
-# 3. READ_ONLY_WORKSPACE capability check (covered elsewhere)
-#    Covered by test_sandbox_manager.py::test_read_only_workspace_fails_closed_on_local_backend
+# 3. Native sandbox availability fail-closed check (covered elsewhere)
+#    Covered by test_sandbox_manager.py::test_manager_fails_closed_without_available_backend_and_does_not_prepare
 # ---------------------------------------------------------------------------
 
 
-def test_smoke_read_only_workspace_fail_closed_coverage_exists() -> None:
-    """Smoke test: verify the READ_ONLY_WORKSPACE fail-closed test still exists.
+def test_smoke_backend_unavailable_fail_closed_coverage_exists() -> None:
+    """Smoke test: verify the native sandbox fail-closed test still exists.
 
     The actual coverage lives in
-    ``test_sandbox_manager.py::test_read_only_workspace_fails_closed_on_local_backend``,
-    which asserts LocalStagingBackend fails closed when the profile requests
-    READ_ONLY_WORKSPACE (since the backend only does chmod, which the same
-    user can undo).
+    ``test_sandbox_manager.py::test_manager_fails_closed_without_available_backend_and_does_not_prepare``,
+    which asserts an unavailable OS-native backend returns ``backend_unavailable``
+    and never prepares or starts the command.
     """
     from tests import test_sandbox_manager
 
     assert hasattr(
         test_sandbox_manager,
-        "test_read_only_workspace_fails_closed_on_local_backend",
+        "test_manager_fails_closed_without_available_backend_and_does_not_prepare",
     )
 
 
@@ -449,13 +448,13 @@ def test_smoke_sandbox_artifact_redaction_coverage_exists() -> None:
 def test_smoke_network_denied_fail_closed_coverage_exists() -> None:
     """Smoke test: verify the network DENIED fail-closed test still exists.
 
-    Covered by ``test_sandbox_manager.py::test_network_denied_fail_closed_on_local_backend``.
+    Covered by ``test_sandbox_manager.py::test_manager_enforces_resolved_request_capabilities_before_prepare``.
     """
     from tests import test_sandbox_manager
 
     assert hasattr(
         test_sandbox_manager,
-        "test_network_denied_fail_closed_on_local_backend",
+        "test_manager_enforces_resolved_request_capabilities_before_prepare",
     )
 
 

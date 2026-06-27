@@ -17,7 +17,8 @@ from singularity.tools.models import ToolExecutionBackendKind, ToolResult, ToolS
 from pydantic import BaseModel
 from singularity.workspace import CreateFile, WorkspaceMutationManager
 from singularity.command import CommandRequest, CommandExecutor
-from singularity.policy import PolicyConfig, PolicyEngine, SecurityMode
+from singularity.policy import PolicyConfig, PolicyEngine
+from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.review import (
     ReviewDecision,
     ReviewDecisionAction,
@@ -726,7 +727,13 @@ def test_command_executor_observer_updates_planner_with_rich_result(tmp_path: Pa
         tmp_path,
         planner=planner,
         policy_engine=PolicyEngine(
-            PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT)
+            PolicyConfig(
+                workspace_root=tmp_path,
+                permission_profile=PermissionProfile.default_for_workspace(
+                    tmp_path,
+                    profile=PermissionProfileName.DANGER_FULL_ACCESS,
+                ),
+            )
         ),
     )
 

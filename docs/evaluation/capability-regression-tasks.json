@@ -24,8 +24,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "math_utils.py"
@@ -70,8 +71,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "cart.py",
@@ -116,8 +118,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "normalizer.py"
@@ -161,8 +164,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "status.py"

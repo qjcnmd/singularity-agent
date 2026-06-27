@@ -57,7 +57,7 @@ markers = [
     "evaluation: evaluation harness, scoring, replay, and benchmark infrastructure tests",
     "provider_eval: opt-in tests that call a real configured model provider",
     "slow: tests that take >5s due to concurrency or multi-turn agent simulation",
-    "external: tests requiring external resources (docker, git, network) but fast when available",
+    "external: tests requiring platform, git, or network resources but fast when available",
     "flaky: tests with known intermittent failures; see docs/testing.md for handling",
 ]
 norecursedirs = [

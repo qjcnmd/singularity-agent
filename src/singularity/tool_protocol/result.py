@@ -46,7 +46,18 @@ class ToolProtocolResultBuilder:
             raise ValueError("tool_call is required")
         raw_payload = result.model_dump(mode="json")
         raw_ref = raw_result_ref or self._persist_raw(tool_call, raw_payload)
-        preview_value: Any = result.content if result.ok else raw_payload.get("error")
+        # The full failure remains available to trusted trace/artifact consumers, but
+        # policy decisions, approval grants, matchers and backend capabilities are
+        # authority-bearing internal objects.  A model observation only receives the
+        # stable public error contract.
+        if result.ok:
+            preview_value: Any = result.content
+        else:
+            error = result.error
+            preview_value = {
+                "code": error.code if error is not None else "tool_executor_failed",
+                "message": error.message if error is not None else "Tool execution failed.",
+            }
         redacted_preview = self.redactor.redact_value(preview_value) if redact else preview_value
         preview = json.dumps(redacted_preview, ensure_ascii=False, default=str)
         truncated = result.truncated or len(preview) > self.max_preview_chars

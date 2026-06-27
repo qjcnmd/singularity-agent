@@ -139,7 +139,7 @@ def test_delegated_backend_contract_does_not_require_legacy_boolean(tmp_path: Pa
     result = component.execute_tool_call(make_tool_call("backend_only_command"))
 
     assert result.ok is False
-    assert result.error_code == "delegated_backend_unavailable"
+    assert result.error_code == "sandbox_required"
     assert called is False
 
 

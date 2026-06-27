@@ -19,7 +19,8 @@ from singularity.command import (
     ResourceLimits,
     SemanticStatus,
 )
-from singularity.policy import ApprovalMode, DecisionOutcome, PolicyConfig, PolicyEngine, SecurityMode
+from singularity.policy import DecisionOutcome, PolicyConfig, PolicyEngine
+from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.context import ContextManager
 from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
 from singularity.tools.command import register_command_tools
@@ -45,14 +46,16 @@ def tool_call(name: str, arguments: dict, *, tool_call_id: str = "call_command")
     }
 
 
-def compat_command_executor(tmp_path: Path, **kwargs) -> CommandExecutor:
+def unrestricted_command_executor(tmp_path: Path, **kwargs) -> CommandExecutor:
     return CommandExecutor(
         tmp_path,
         policy_engine=PolicyEngine(
             PolicyConfig(
                 workspace_root=tmp_path,
-                approval_mode=ApprovalMode.AUTO_SAFE,
-                security_mode=SecurityMode.COMPAT,
+                permission_profile=PermissionProfile.default_for_workspace(
+                    tmp_path,
+                    profile=PermissionProfileName.DANGER_FULL_ACCESS,
+                ),
             )
         ),
         **kwargs,
@@ -71,6 +74,7 @@ def test_strict_mode_blocks_inline_interpreter_readonly_command(tmp_path: Path) 
             ],
             cwd=".",
             purpose=CommandPurpose.READ_ONLY_COMMAND,
+            filesystem_mode=FilesystemMode.READ_WRITE_WORKSPACE,
         )
     )
 
@@ -80,15 +84,11 @@ def test_strict_mode_blocks_inline_interpreter_readonly_command(tmp_path: Path) 
     assert not (tmp_path / "x").exists()
 
 
-def test_strict_auto_safe_command_requires_sandbox_instead_of_local_process(tmp_path: Path) -> None:
+def test_workspace_write_command_requires_sandbox_instead_of_local_process(tmp_path: Path) -> None:
     component = CommandExecutor(
         tmp_path,
         policy_engine=PolicyEngine(
-            PolicyConfig(
-                workspace_root=tmp_path,
-                approval_mode=ApprovalMode.AUTO_SAFE,
-                security_mode=SecurityMode.STRICT,
-            )
+            PolicyConfig(workspace_root=tmp_path)
         ),
     )
 
@@ -105,8 +105,8 @@ def test_strict_auto_safe_command_requires_sandbox_instead_of_local_process(tmp_
     assert result.isolation_report["filesystem_isolation"] != "workspace_cwd_advisory"
 
 
-def test_compat_mode_preserves_legacy_inline_interpreter_execution(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+def test_danger_full_access_allows_inline_interpreter_execution(tmp_path: Path) -> None:
+    component = unrestricted_command_executor(tmp_path)
 
     result = component.run(
         CommandRequest(
@@ -126,8 +126,8 @@ def test_compat_mode_preserves_legacy_inline_interpreter_execution(tmp_path: Pat
     assert result.output_digest
 
 
-def test_compat_mode_requires_review_for_inline_interpreter_workspace_write(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+def test_danger_full_access_still_requires_review_for_workspace_write(tmp_path: Path) -> None:
+    component = unrestricted_command_executor(tmp_path)
 
     result = component.run(
         CommandRequest(
@@ -138,6 +138,7 @@ def test_compat_mode_requires_review_for_inline_interpreter_workspace_write(tmp_
             ],
             cwd=".",
             purpose=CommandPurpose.READ_ONLY_COMMAND,
+            filesystem_mode=FilesystemMode.READ_WRITE_WORKSPACE,
         )
     )
 
@@ -147,7 +148,7 @@ def test_compat_mode_requires_review_for_inline_interpreter_workspace_write(tmp_
 
 
 def test_command_executor_can_build_command_plan(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
     request = CommandRequest(
         argv=[sys.executable, "-c", "print('plan')"],
         cwd=".",
@@ -197,7 +198,7 @@ def test_cwd_outside_workspace_is_rejected(tmp_path: Path) -> None:
 
 
 def test_env_secret_is_not_passed_and_output_is_redacted(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
     code = (
         "import os; "
         "print(os.getenv('OPENAI_API_KEY', 'missing')); "
@@ -240,7 +241,7 @@ def test_env_secret_is_not_passed_and_output_is_redacted(tmp_path: Path) -> None
 
 
 def test_stdout_stderr_are_collected_separately(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
     code = (
         "import sys, time; "
         "print('out', flush=True); "
@@ -262,7 +263,7 @@ def test_stdout_stderr_are_collected_separately(tmp_path: Path) -> None:
 
 
 def test_large_output_is_truncated_and_saved_as_artifact(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
 
     result = component.run(
         CommandRequest(
@@ -288,7 +289,7 @@ def test_large_output_is_truncated_and_saved_as_artifact(tmp_path: Path) -> None
 
 
 def test_timeout_marks_result_and_does_not_become_internal_error(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
 
     result = component.run(
         CommandRequest(
@@ -306,7 +307,7 @@ def test_timeout_marks_result_and_does_not_become_internal_error(tmp_path: Path)
 
 
 def test_idle_timeout_marks_result(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
 
     result = component.run(
         CommandRequest(
@@ -325,7 +326,7 @@ def test_idle_timeout_marks_result(tmp_path: Path) -> None:
 
 
 def test_nonzero_exit_is_not_an_internal_error(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
 
     result = component.run(
         CommandRequest(
@@ -342,7 +343,7 @@ def test_nonzero_exit_is_not_an_internal_error(tmp_path: Path) -> None:
 
 
 def test_project_verification_nonzero_is_semantic_test_failure(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
 
     result = component.run(
         CommandRequest(
@@ -355,31 +356,6 @@ def test_project_verification_nonzero_is_semantic_test_failure(tmp_path: Path) -
     assert result.execution_status == ExecutionStatus.COMPLETED
     assert result.semantic_status == SemanticStatus.TESTS_FAILED
     assert result.error_code == "semantic_failure"
-
-
-def test_compat_verification_does_not_use_docker_when_available(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        "singularity.sandbox.backends.docker_backend_available",
-        lambda: True,
-    )
-    component = compat_command_executor(tmp_path)
-
-    result = component.run(
-        CommandRequest(
-            argv=[sys.executable, "-c", "print('local verification')"],
-            cwd=".",
-            purpose=CommandPurpose.PROJECT_VERIFICATION,
-        )
-    )
-
-    assert result.execution_status == ExecutionStatus.COMPLETED
-    assert result.semantic_status == SemanticStatus.SUCCEEDED
-    assert result.backend == "local_process"
-    assert result.metadata["sandbox_availability"]["registered_backends"][0] == "docker"
-    assert result.metadata["sandbox_availability"]["selected_backend"] is None
 
 
 def test_command_policy_classifies_pytest_and_package_manager_commands(tmp_path: Path) -> None:
@@ -421,13 +397,13 @@ def test_destructive_command_is_denied(tmp_path: Path) -> None:
         workspace_root=tmp_path,
     )
 
-    assert decision.decision == CommandDecision.DENY
+    assert decision.decision == CommandDecision.REQUIRE_REVIEW
     assert CommandRisk.DESTRUCTIVE in decision.risk_tags
-    assert decision.error_code == "policy_denied"
+    assert decision.error_code == "review_required"
 
 
 def test_long_running_process_can_start_read_stop_and_list(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
     secret = "process-secret-value"
     request = CommandRequest(
         argv=[
@@ -486,7 +462,7 @@ def test_start_process_tracks_files_written_immediately_after_spawn(tmp_path: Pa
                 started_at_monotonic=time.perf_counter(),
             )
 
-    component = compat_command_executor(tmp_path, backend=ImmediateWriteBackend())
+    component = unrestricted_command_executor(tmp_path, backend=ImmediateWriteBackend())
     request = CommandRequest(
         argv=[sys.executable, "-c", "pass"],
         cwd=".",
@@ -503,7 +479,7 @@ def test_start_process_tracks_files_written_immediately_after_spawn(tmp_path: Pa
 
 def test_workspace_side_effects_are_tracked(tmp_path: Path) -> None:
     trace = JsonlTraceRecorder.create(tmp_path)
-    component = compat_command_executor(tmp_path, trace=trace)
+    component = unrestricted_command_executor(tmp_path, trace=trace)
 
     result = component.run(
         CommandRequest(
@@ -526,7 +502,7 @@ def test_workspace_side_effects_are_tracked(tmp_path: Path) -> None:
 
 
 def test_command_result_observation_is_compact_for_context_manager(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
     result = component.run(
         CommandRequest(
             argv=[sys.executable, "-c", "print('X' * 5000)"],
@@ -554,7 +530,7 @@ def test_command_result_observation_is_compact_for_context_manager(tmp_path: Pat
 
 def test_command_trace_records_full_audit_event(tmp_path: Path) -> None:
     trace = JsonlTraceRecorder.create(tmp_path)
-    component = compat_command_executor(tmp_path, trace=trace)
+    component = unrestricted_command_executor(tmp_path, trace=trace)
 
     result = component.run(
         CommandRequest(
@@ -590,7 +566,7 @@ def test_command_trace_records_full_audit_event(tmp_path: Path) -> None:
 
 def test_command_trace_redacts_sensitive_argv_and_url_query(tmp_path: Path) -> None:
     trace = JsonlTraceRecorder.create(tmp_path)
-    component = compat_command_executor(tmp_path, trace=trace)
+    component = unrestricted_command_executor(tmp_path, trace=trace)
     secret = "plain-secret-value"
     query_secret = "query-secret-value"
 
@@ -622,7 +598,7 @@ def test_command_trace_redacts_sensitive_argv_and_url_query(tmp_path: Path) -> N
 
 
 def test_command_result_records_safe_capability_summary(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
 
     result = component.run(
         CommandRequest(
@@ -636,35 +612,9 @@ def test_command_result_records_safe_capability_summary(tmp_path: Path) -> None:
     assert str(tmp_path) not in json.dumps(result.metadata, sort_keys=True)
 
 
-def test_sandbox_availability_summary_ignores_unavailable_backends(tmp_path: Path) -> None:
-    from singularity.sandbox import DockerSandboxBackend, LocalStagingBackend, SandboxManager
-
-    docker = DockerSandboxBackend()
-    docker.is_available = lambda: False  # type: ignore[method-assign]
-    component = compat_command_executor(
-        tmp_path,
-        sandbox_manager=SandboxManager(
-            tmp_path,
-            backends=[docker, LocalStagingBackend()],
-        ),
-    )
-
-    result = component.run(
-        CommandRequest(
-            argv=[sys.executable, "-c", "print('ok')"],
-            cwd=".",
-        )
-    )
-
-    sandbox = result.metadata["sandbox_availability"]
-    assert sandbox["registered_backends"] == ["docker", "local_staging"]
-    assert sandbox["available_backends"] == ["local_staging"]
-    assert sandbox["hard_isolation_available"] is False
-
-
 def test_run_command_tool_is_registered_and_uses_command_executor(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    register_command_tools(registry, compat_command_executor(tmp_path))
+    register_command_tools(registry, unrestricted_command_executor(tmp_path))
     component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.coding_agent(),
@@ -691,7 +641,7 @@ def test_run_command_tool_is_registered_and_uses_command_executor(tmp_path: Path
 
 def test_start_process_rejects_verification_like_command(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, include_default_tools=False)
-    register_command_tools(registry, compat_command_executor(tmp_path))
+    register_command_tools(registry, unrestricted_command_executor(tmp_path))
     component = ToolExecutor(
         registry=registry,
         policy=ToolPolicy.coding_agent(),
@@ -717,7 +667,7 @@ def test_start_process_rejects_verification_like_command(tmp_path: Path) -> None
 
 
 def test_command_executor_start_process_rejects_verification_like_command(tmp_path: Path) -> None:
-    component = compat_command_executor(tmp_path)
+    component = unrestricted_command_executor(tmp_path)
 
     session = component.start_process(
         CommandRequest(

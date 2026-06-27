@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from singularity.config import ApprovalMode, ProductionConfig
+from singularity.config import ProductionConfig
+from singularity.policy.permissions import ApprovalPolicy
 from singularity.kernel.models import RunIdentity, RunStatus
 from singularity.observability import TraceRecorder
 from singularity.observability.models import TraceArtifactKind
@@ -43,7 +44,7 @@ def test_agent_host_start_run_wraps_kernel_without_exposing_agent_graph(tmp_path
     host = AgentHost(tmp_path, bootstrap_factory=lambda **_kwargs: _Bootstrap(kernel))
     config = ProductionConfig.from_cli(
         project_root=tmp_path,
-        approval_mode=ApprovalMode.NON_INTERACTIVE,
+        approval_policy=ApprovalPolicy.NEVER,
         dry_run=True,
     )
 
@@ -65,7 +66,7 @@ def test_agent_host_registers_approval_grants_through_approval_gate(tmp_path: Pa
     host = AgentHost(tmp_path, bootstrap_factory=lambda **_kwargs: _Bootstrap(kernel))
     config = ProductionConfig.from_cli(
         project_root=tmp_path,
-        approval_mode=ApprovalMode.NON_INTERACTIVE,
+        approval_policy=ApprovalPolicy.NEVER,
         dry_run=True,
     )
     host.start_run("wait for approval", config=config)

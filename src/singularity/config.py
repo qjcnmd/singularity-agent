@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING, Any, Callable
 from pydantic import BaseModel
 
 from singularity.interaction.models import InteractionMode
-from singularity.policy.config import ApprovalMode, PolicyConfig, SecurityMode
+from singularity.policy.config import PolicyConfig
+from singularity.policy.permissions import (
+    ApprovalPolicy,
+    NetworkAccess,
+    PermissionProfile,
+    PermissionProfileName,
+)
 
 if TYPE_CHECKING:
     from singularity.model.config import ModelRunnerConfig
@@ -33,21 +39,13 @@ class Settings(BaseModel):
         base_url: str | None = None,
         model: str | None = None,
     ) -> "Settings":
-        missing = [
-            name
-            for name in (
-                "SINGULARITY_API_KEY",
-            )
-            if not os.getenv(name)
-        ]
+        missing = [name for name in ("SINGULARITY_API_KEY",) if not os.getenv(name)]
         if base_url is None and not os.getenv("SINGULARITY_BASE_URL"):
             missing.append("SINGULARITY_BASE_URL")
         if model is None and not os.getenv("SINGULARITY_MODEL"):
             missing.append("SINGULARITY_MODEL")
         if missing:
-            raise RuntimeError(
-                "Missing required environment variables: " + ", ".join(missing)
-            )
+            raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
         return cls(
             base_url=base_url or os.environ["SINGULARITY_BASE_URL"],
@@ -112,8 +110,12 @@ def adaptive_default_max_turns(goal: str | None) -> int:
 _CONFIG_DEFAULTS: dict[str, Any] = {
     "max_turns": BASE_DEFAULT_MAX_TURNS,
     "profile": None,
-    "approval_mode": ApprovalMode.AUTO_SAFE,
-    "security_mode": SecurityMode.STRICT,
+    "permission_profile": PermissionProfileName.WORKSPACE_WRITE,
+    "approval_policy": ApprovalPolicy.ON_REQUEST,
+    "network_access": NetworkAccess.DENIED,
+    "additional_writable_directories": (),
+    "protected_paths": (),
+    "windows_sandbox": "elevated",
     "interaction_mode": InteractionMode.INTERACTIVE,
     "strict": False,
     "dry_run": False,
@@ -137,8 +139,12 @@ class ProductionConfig:
     project_root: Path
     max_turns: int = BASE_DEFAULT_MAX_TURNS
     profile: str | None = None
-    approval_mode: ApprovalMode = ApprovalMode.AUTO_SAFE
-    security_mode: SecurityMode = SecurityMode.STRICT
+    permission_profile: PermissionProfileName = PermissionProfileName.WORKSPACE_WRITE
+    approval_policy: ApprovalPolicy = ApprovalPolicy.ON_REQUEST
+    network_access: NetworkAccess = NetworkAccess.DENIED
+    additional_writable_directories: tuple[Path, ...] = ()
+    protected_paths: tuple[str, ...] = ()
+    windows_sandbox: str = "elevated"
     interaction_mode: InteractionMode = InteractionMode.INTERACTIVE
     strict: bool = False
     dry_run: bool = False
@@ -164,8 +170,12 @@ class ProductionConfig:
         project_root: Path | str,
         max_turns: int | None = None,
         profile: str | None = None,
-        approval_mode: ApprovalMode | str | None = None,
-        security_mode: SecurityMode | str | None = None,
+        permission_profile: PermissionProfileName | str | None = None,
+        approval_policy: ApprovalPolicy | str | None = None,
+        network_access: NetworkAccess | str | None = None,
+        additional_writable_directories: list[Path | str] | tuple[Path | str, ...] | None = None,
+        protected_paths: list[str] | tuple[str, ...] | None = None,
+        windows_sandbox: str | None = None,
         interaction_mode: InteractionMode | str | None = None,
         strict: bool | None = None,
         dry_run: bool | None = None,
@@ -192,17 +202,19 @@ class ProductionConfig:
         env_load = _load_project_env(env_file)
         env_file_source = f"project:{_display_config_path(env_file, root)}" if env_load.found else None
         resolved_config_file = (
-            Path(config_file).expanduser()
-            if config_file is not None
-            else root / ".singularity" / "config.toml"
+            Path(config_file).expanduser() if config_file is not None else root / ".singularity" / "config.toml"
         )
         config_values = _flatten_config(_read_config_file(resolved_config_file))
         config_source = f"config:{_config_file_handle(resolved_config_file, root)}"
         cli_values = {
             "max_turns": max_turns,
             "profile": profile,
-            "approval_mode": approval_mode,
-            "security_mode": security_mode,
+            "permission_profile": permission_profile,
+            "approval_policy": approval_policy,
+            "network_access": network_access,
+            "additional_writable_directories": additional_writable_directories,
+            "protected_paths": protected_paths,
+            "windows_sandbox": windows_sandbox,
             "interaction_mode": interaction_mode,
             "strict": strict,
             "dry_run": dry_run,
@@ -224,8 +236,12 @@ class ProductionConfig:
         converters: dict[str, Callable[[Any], Any]] = {
             "max_turns": int,
             "profile": _optional_str,
-            "approval_mode": _approval_mode,
-            "security_mode": _security_mode,
+            "permission_profile": _permission_profile_name,
+            "approval_policy": _approval_policy,
+            "network_access": _network_access,
+            "additional_writable_directories": lambda value: _path_tuple(value, root=root),
+            "protected_paths": _string_tuple,
+            "windows_sandbox": _windows_sandbox,
             "interaction_mode": _interaction_mode,
             "strict": _bool_value,
             "dry_run": _bool_value,
@@ -245,8 +261,12 @@ class ProductionConfig:
         env_names = {
             "max_turns": "SINGULARITY_MAX_TURNS",
             "profile": "SINGULARITY_PROFILE",
-            "approval_mode": "SINGULARITY_APPROVAL_MODE",
-            "security_mode": "SINGULARITY_SECURITY_MODE",
+            "permission_profile": "SINGULARITY_PERMISSION_PROFILE",
+            "approval_policy": "SINGULARITY_APPROVAL_POLICY",
+            "network_access": "SINGULARITY_NETWORK_ACCESS",
+            "additional_writable_directories": "SINGULARITY_ADDITIONAL_WRITABLE_DIRECTORIES",
+            "protected_paths": "SINGULARITY_PROTECTED_PATHS",
+            "windows_sandbox": "SINGULARITY_WINDOWS_SANDBOX",
             "interaction_mode": "SINGULARITY_INTERACTION_MODE",
             "strict": "SINGULARITY_STRICT",
             "dry_run": "SINGULARITY_DRY_RUN",
@@ -289,8 +309,12 @@ class ProductionConfig:
             project_root=root,
             max_turns=values["max_turns"],
             profile=values["profile"],
-            approval_mode=values["approval_mode"],
-            security_mode=values["security_mode"],
+            permission_profile=values["permission_profile"],
+            approval_policy=values["approval_policy"],
+            network_access=values["network_access"],
+            additional_writable_directories=values["additional_writable_directories"],
+            protected_paths=values["protected_paths"],
+            windows_sandbox=values["windows_sandbox"],
             interaction_mode=values["interaction_mode"],
             strict=values["strict"],
             dry_run=values["dry_run"],
@@ -316,8 +340,17 @@ class ProductionConfig:
     def to_policy_config(self) -> PolicyConfig:
         return PolicyConfig(
             workspace_root=self.project_root,
-            approval_mode=self.approval_mode,
-            security_mode=self.security_mode,
+            permission_profile=self.to_permission_profile(),
+        )
+
+    def to_permission_profile(self) -> PermissionProfile:
+        return PermissionProfile(
+            profile=self.permission_profile,
+            workspace_roots=(self.project_root,),
+            additional_writable_directories=self.additional_writable_directories,
+            network_access=self.network_access,
+            approval_policy=self.approval_policy,
+            protected_paths=self.protected_paths,
         )
 
     def to_model_runner_config(self) -> "ModelRunnerConfig":
@@ -356,8 +389,12 @@ class ProductionConfig:
             "project_root": str(self.project_root),
             "max_turns": self.max_turns,
             "profile": self.profile,
-            "approval_mode": self.approval_mode.value,
-            "security_mode": self.security_mode.value,
+            "permission_profile": self.permission_profile.value,
+            "approval_policy": self.approval_policy.value,
+            "network_access": self.network_access.value,
+            "additional_writable_directories": [str(path) for path in self.additional_writable_directories],
+            "protected_paths": list(self.protected_paths),
+            "windows_sandbox": self.windows_sandbox,
             "interaction_mode": self.interaction_mode.value,
             "strict": self.strict,
             "dry_run": self.dry_run,
@@ -382,11 +419,31 @@ class ProductionConfig:
 
     def final_report_config_summary(self) -> dict[str, Any]:
         effective = self.effective_config()
+        values = dict(effective["values"])
+        values.pop("protected_paths", None)
+        values.pop("additional_writable_directories", None)
+        permission = self.to_permission_profile().summary().to_dict()
+        permission["writable_roots"] = [
+            _report_path_handle(Path(path), self.project_root)
+            if path != "*"
+            else "*"
+            for path in permission["writable_roots"]
+        ]
         return {
-            **effective["values"],
+            **values,
+            "permission": permission,
             "sources": effective["sources"],
             "config_file": effective["config_file"],
         }
+
+
+def _report_path_handle(path: Path, project_root: Path) -> str:
+    resolved = path.resolve(strict=False)
+    try:
+        relative = resolved.relative_to(project_root.resolve(strict=False))
+        return relative.as_posix() or "."
+    except ValueError:
+        return f"additional-dir:{resolved.name}"
 
 
 def _read_config_file(path: Path) -> dict[str, Any]:
@@ -436,6 +493,21 @@ def _parse_env_line(line: str) -> tuple[str, str] | None:
 
 def _flatten_config(data: dict[str, Any]) -> dict[str, Any]:
     flattened = dict(data)
+    permissions = flattened.pop("permissions", None)
+    if isinstance(permissions, dict):
+        mapping = {
+            "profile": "permission_profile",
+            "approval_policy": "approval_policy",
+            "network_access": "network_access",
+            "additional_writable_directories": "additional_writable_directories",
+            "protected_paths": "protected_paths",
+        }
+        for source, target in mapping.items():
+            if source in permissions:
+                flattened[target] = permissions[source]
+        windows = permissions.get("windows")
+        if isinstance(windows, dict) and "implementation" in windows:
+            flattened["windows_sandbox"] = windows["implementation"]
     project_index = flattened.pop("project_index", None)
     if isinstance(project_index, dict):
         mapping = {
@@ -464,9 +536,7 @@ def _resolve_config_value(
     default: Any,
 ) -> tuple[Any, str]:
     cli_is_explicit = (
-        cli_value is not None
-        if cli_overrides is None
-        else name in cli_overrides and cli_value is not None
+        cli_value is not None if cli_overrides is None else name in cli_overrides and cli_value is not None
     )
     if cli_is_explicit:
         return cli_value, "cli"
@@ -514,13 +584,63 @@ def _display_config_path(path: Path, root: Path) -> str:
         return str(path)
 
 
-def _approval_mode(value: ApprovalMode | str) -> ApprovalMode:
-    if isinstance(value, ApprovalMode):
+def _permission_profile_name(
+    value: PermissionProfileName | str,
+) -> PermissionProfileName:
+    if isinstance(value, PermissionProfileName):
         return value
-    try:
-        return ApprovalMode[str(value).upper()]
-    except KeyError:
-        return ApprovalMode(str(value))
+    return PermissionProfileName(str(value).strip().lower())
+
+
+def _approval_policy(value: ApprovalPolicy | str) -> ApprovalPolicy:
+    if isinstance(value, ApprovalPolicy):
+        return value
+    return ApprovalPolicy(str(value).strip().lower())
+
+
+def _network_access(value: NetworkAccess | str) -> NetworkAccess:
+    if isinstance(value, NetworkAccess):
+        return value
+    return NetworkAccess(str(value).strip().lower())
+
+
+def _path_tuple(value: Any, *, root: Path) -> tuple[Path, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        items = [item for item in value.split(os.pathsep) if item]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ValueError("additional_writable_directories must be a list of paths")
+    normalized: list[Path] = []
+    for item in items:
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        resolved = path.resolve(strict=False)
+        if resolved not in normalized:
+            normalized.append(resolved)
+    return tuple(normalized)
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        items = value.split(os.pathsep)
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        raise ValueError("protected_paths must be a list of path patterns")
+    return tuple(dict.fromkeys(str(item).strip() for item in items if str(item).strip()))
+
+
+def _windows_sandbox(value: Any) -> str:
+    implementation = str(value).strip().lower()
+    if implementation != "elevated":
+        raise ValueError("windows sandbox implementation must be 'elevated'")
+    return implementation
 
 
 def _interaction_mode(value: InteractionMode | str) -> InteractionMode:
@@ -530,12 +650,3 @@ def _interaction_mode(value: InteractionMode | str) -> InteractionMode:
         return InteractionMode[str(value).upper()]
     except KeyError:
         return InteractionMode(str(value))
-
-
-def _security_mode(value: SecurityMode | str) -> SecurityMode:
-    if isinstance(value, SecurityMode):
-        return value
-    try:
-        return SecurityMode[str(value).upper()]
-    except KeyError:
-        return SecurityMode(str(value))

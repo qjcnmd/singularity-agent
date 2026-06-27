@@ -26,8 +26,7 @@ from singularity.policy import (
     PolicyComponent,
 )
 from singularity.policy.approval import ApprovalGate
-from singularity.policy.config import ApprovalMode
-from singularity.policy import SecurityMode
+from singularity.policy.permissions import ApprovalPolicy, PermissionProfile, PermissionProfileName
 from singularity.policy.exceptions import ApprovalRequired
 from singularity.policy.models import DecisionOutcome
 from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
@@ -50,9 +49,15 @@ from singularity.verification import VerificationRunner
 from tests.tool_executor_helpers import make_test_policy_engine
 
 
-def _compat_policy_engine(tmp_path: Path) -> PolicyEngine:
+def _unrestricted_policy_engine(tmp_path: Path) -> PolicyEngine:
     return PolicyEngine(
-        PolicyConfig(workspace_root=tmp_path, security_mode=SecurityMode.COMPAT)
+        PolicyConfig(
+            workspace_root=tmp_path,
+            permission_profile=PermissionProfile.default_for_workspace(
+                tmp_path,
+                profile=PermissionProfileName.DANGER_FULL_ACCESS,
+            ),
+        )
     )
 
 
@@ -90,7 +95,10 @@ def test_policy_engine_and_approval_gate_emit_trace(tmp_path: Path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_policy", session_id="session_policy")
     config = PolicyConfig(
         workspace_root=tmp_path,
-        approval_mode=ApprovalMode.NON_INTERACTIVE,
+        permission_profile=PermissionProfile.default_for_workspace(
+            tmp_path,
+            approval_policy=ApprovalPolicy.NEVER,
+        ),
         audit_log_path=tmp_path / "audit.jsonl",
     )
     policy = PolicyEngine(config, trace=trace)
@@ -147,7 +155,7 @@ def test_command_mutation_planner_context_and_final_report_trace(tmp_path: Path)
         tmp_path,
         trace=trace,
         planner=planner,
-        policy_engine=_compat_policy_engine(tmp_path),
+        policy_engine=_unrestricted_policy_engine(tmp_path),
     )
     command_result = command.run(
         CommandRequest(
@@ -233,13 +241,10 @@ def test_sandbox_manager_emits_unified_trace_when_trace_recorder_is_used(tmp_pat
 
     result = component.run(_sandbox_request(tmp_path))
 
-    assert result.status.value == "success"
+    assert result.status.value == "backend_unavailable"
     values = _event_values(trace)
     assert TraceEventType.SANDBOX_REQUESTED.value in values
-    assert TraceEventType.SANDBOX_PREPARED.value in values
-    assert TraceEventType.SANDBOX_STARTED.value in values
     assert TraceEventType.SANDBOX_COMPLETED.value in values
-    assert TraceEventType.SANDBOX_CLEANED.value in values
 
 
 def test_verification_runner_emits_check_evidence_and_repair_trace(tmp_path: Path) -> None:

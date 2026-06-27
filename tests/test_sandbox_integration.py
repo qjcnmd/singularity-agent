@@ -1,211 +1,66 @@
+from __future__ import annotations
+
+import json
 import sys
 from pathlib import Path
 
-from singularity.command import CommandRequest, CommandExecutor, ExecutionStatus, SemanticStatus
-from singularity.planner import EvidenceLedger, Planner, TaskState, TaskStatus
-from singularity.planner.finalizer import Finalizer
-from singularity.policy import (
-    DecisionOutcome,
-    PolicyConfig,
-    PolicyConstraints,
-    PolicyDecision,
-    PolicyEngine,
-    SecurityMode,
+from singularity.sandbox import (
+    SandboxManager,
+    SandboxProfileName,
+    SandboxRequest,
+    SandboxStatus,
+    default_sandbox_profile,
 )
-from singularity.verification import FailureType, VerificationRunner
 
 
-class SandboxRequiredPolicy(PolicyEngine):
-    def __init__(
-        self,
-        root: Path,
-        *,
-        hard_network: bool = False,
-        security_mode: SecurityMode = SecurityMode.STRICT,
-        network_allowed: bool = False,
-    ) -> None:
-        super().__init__(PolicyConfig(workspace_root=root, security_mode=security_mode))
-        self.hard_network = hard_network
-        self.network_allowed = network_allowed
-
-    def enforce(self, request):  # type: ignore[no-untyped-def]
-        return PolicyDecision(
-            request_id=request.request_id,
-            outcome=DecisionOutcome.SANDBOX_REQUIRED,
-            reason="test requires sandbox",
-            constraints=PolicyConstraints(
-                sandbox_required=True,
-                filesystem_mode="copy_on_write_workspace",
-                network_allowed=self.network_allowed,
-                max_duration_seconds=request.metadata.get("timeout"),
-                max_output_chars=20000,
-                allowed_hosts=["hard-network-required"] if self.hard_network else [],
-            ),
-        )
-
-
-def test_command_executor_routes_sandbox_required_command_without_real_workspace_write(tmp_path: Path) -> None:
-    component = CommandExecutor(
-        tmp_path,
-        policy_engine=SandboxRequiredPolicy(
-            tmp_path,
-            security_mode=SecurityMode.COMPAT,
-            network_allowed=True,
-        ),
-    )
-
-    result = component.run(
-        CommandRequest(
-            argv=[
-                sys.executable,
-                "-c",
-                "from pathlib import Path; Path('only-sandbox.txt').write_text('x', encoding='utf-8'); print('ok')",
-            ],
-            cwd=".",
-        )
-    )
-
-    assert result.execution_status == ExecutionStatus.COMPLETED
-    assert result.semantic_status == SemanticStatus.SUCCEEDED
-    assert not (tmp_path / "only-sandbox.txt").exists()
-    assert result.isolation_report["sandbox"]["status"] == "success"
-    assert result.changed_files == ["only-sandbox.txt"]
-
-
-def test_strict_sandbox_required_command_fails_closed_without_hard_isolation(tmp_path: Path) -> None:
-    component = CommandExecutor(
-        tmp_path,
-        policy_engine=SandboxRequiredPolicy(tmp_path),
-    )
-
-    result = component.run(
-        CommandRequest(
-            argv=[sys.executable, "-c", "print('ok')"],
-            cwd=".",
-        )
-    )
-
-    assert result.execution_status == ExecutionStatus.BACKEND_ERROR
-    assert result.error_code == "sandbox_unavailable"
-    assert result.isolation_report["sandbox"]["status"] == "backend_unavailable"
-
-
-def test_verification_evidence_records_sandbox_metadata(tmp_path: Path) -> None:
-    (tmp_path / "pyproject.toml").write_text(
-        """
-[project]
-name = "sample"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-""",
-        encoding="utf-8",
-    )
-    tests_dir = tmp_path / "tests"
-    tests_dir.mkdir()
-    (tests_dir / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-    command_executor = CommandExecutor(
-        tmp_path,
-        policy_engine=SandboxRequiredPolicy(
-            tmp_path,
-            security_mode=SecurityMode.COMPAT,
-            network_allowed=True,
-        ),
-    )
-    component = VerificationRunner(
-        tmp_path,
-        command_executor=command_executor,
-        policy_engine=SandboxRequiredPolicy(
-            tmp_path,
-            security_mode=SecurityMode.COMPAT,
-            network_allowed=True,
-        ),
-    )
-
-    plan = component.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")
-    observation = component.run_plan(plan.id)
-    results = observation["verification"]["results"]
-
-    assert observation["verification"]["check_status"]
-    sandboxed = [result for result in results if result["evidence"]["sandbox_id"]]
-    assert sandboxed
-    assert any(result["evidence"]["sandbox_status"] == "success" for result in sandboxed)
-    assert {
-        result["evidence"]["sandbox_backend"]
-        for result in sandboxed
-    } <= {"docker", "windows_restricted_token", "local_staging"}
-
-
-def test_sandbox_unavailable_becomes_verification_failure_evidence(tmp_path: Path) -> None:
-    (tmp_path / "pyproject.toml").write_text(
-        """
-[project]
-name = "sample"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-""",
-        encoding="utf-8",
-    )
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-    command_executor = CommandExecutor(
-        tmp_path,
-        policy_engine=SandboxRequiredPolicy(tmp_path, hard_network=True),
-    )
-    component = VerificationRunner(
-        tmp_path,
-        command_executor=command_executor,
-        policy_engine=SandboxRequiredPolicy(tmp_path),
-    )
-
-    plan = component.plan_verification(changed_files=["tests/test_sample.py"], task_intent="tests")
-    observation = component.run_plan(plan.id)
-
-    assert any(
-        check["failure_type"] == FailureType.SANDBOX_LIMITATION.value
-        for check in observation["verification"]["failed_checks"]
-    )
-
-
-def test_planner_context_and_final_report_include_sandbox_summary(tmp_path: Path) -> None:
-    planner = Planner(tmp_path, session_id="session", task_id="task")
-    planner.start_task("Sandbox summary")
-    planner.update_from_command(
-        {
-            "command_result": {
-                "command_id": "cmd_1",
-                "semantic_status": "succeeded",
-                "changed_files": ["generated.txt"],
-                "isolation_report": {
-                    "sandbox": {
-                        "sandbox_id": "sandbox_1",
-                        "backend": "local_staging",
-                        "status": "success",
-                        "artifact_count": 1,
-                        "changed_files_count": 1,
-                    }
-                },
-            }
-        }
-    )
-
-    rendered = planner.renderer.render(
-        state=planner.state,
-        plan=planner.plan,
-        evidence=planner.evidence,
-    )
-    state = TaskState(
-        task_id="task",
+def test_default_os_sandbox_fails_closed_without_executing_process(tmp_path: Path) -> None:
+    marker = tmp_path / "must-not-exist.txt"
+    request = SandboxRequest(
+        sandbox_id="sandbox_integration",
         session_id="session",
-        user_goal="report",
-        normalized_goal="report",
-        status=TaskStatus.COMPLETED,
+        task_id="task",
+        action_id="action",
+        command=[
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+        ],
+        cwd=tmp_path,
+        workspace_root=tmp_path,
+        profile=default_sandbox_profile(
+            SandboxProfileName.ISOLATED_VERIFICATION,
+            workspace_root=tmp_path,
+        ),
     )
-    evidence = EvidenceLedger(command_results=planner.evidence.command_results)
-    report = Finalizer().build(state=state, evidence=evidence)
 
-    assert "[sandbox]" in rendered
-    assert report.sandbox_isolation_summary["sandboxed_commands_count"] == 1
-    assert report.sandbox_isolation_summary["artifact_count"] == 1
-    assert report.sandbox_isolation_summary["imported_changes_count"] == 0
+    result = SandboxManager(tmp_path).run(request)
+
+    assert result.status == SandboxStatus.BACKEND_UNAVAILABLE
+    assert result.metadata["error_code"] == "backend_unavailable"
+    assert marker.exists() is False
+
+    trace_path = tmp_path / ".singularity" / "sandbox" / "trace.jsonl"
+    event = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["status"] == "backend_unavailable"
+    assert event["cleanup_status"] == "not_started"
+
+
+def test_unavailable_os_sandbox_does_not_create_workspace_projection(tmp_path: Path) -> None:
+    request = SandboxRequest(
+        sandbox_id="sandbox_no_projection",
+        session_id="session",
+        task_id="task",
+        action_id="action",
+        command=[sys.executable, "-c", "print('must-not-run')"],
+        cwd=tmp_path,
+        workspace_root=tmp_path,
+        profile=default_sandbox_profile(
+            SandboxProfileName.READONLY_ANALYSIS,
+            workspace_root=tmp_path,
+        ),
+    )
+
+    result = SandboxManager(tmp_path).run(request)
+
+    assert result.status == SandboxStatus.BACKEND_UNAVAILABLE
+    assert not (tmp_path / "work" / "sandboxes" / request.sandbox_id).exists()

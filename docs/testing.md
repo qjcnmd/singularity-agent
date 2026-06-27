@@ -13,13 +13,13 @@ Singularity 测试体系按 pytest marker 分为以下层级。
 |--------|--------|------|------|-------------|
 | `smoke` | 25 | 运行属性 | 核心路径烟雾测试，覆盖 CLI/Context/Planner/Policy/Tool/Verification | ❌ 显式运行 |
 | `unit` | ~260 | 功能分类 | 纯函数/类测试，最小化跨组件依赖 | ✅ |
-| `integration` | ~589 | 功能分类 | 多组件集成测试（agent simulation、component wiring、subprocess、threading、真实 git/Docker） | ✅ |
+| `integration` | ~589 | 功能分类 | 多组件集成测试（agent simulation、component wiring、subprocess、threading、真实 git） | ✅ |
 | `regression` | 68 | 功能分类 | 生产基线、文档一致性、schema 稳定性守卫 | ✅ |
 | `security` | 54 | 功能分类 | 信任边界、脱敏、注入、密钥安全测试 | ✅ |
 | `flaky` | 4 | 运行属性 | 已知偶发失败测试（默认仍运行，见下方处理策略） | ✅ |
 | `evaluation` | 58 | 功能分类 | 评估基础设施：评分、回放、benchmark harness | ❌ 显式运行 |
 | `slow` | ~25 | 运行属性 | 真正慢的测试（>3s），agent loop 模拟/并发 | ❌ 显式运行 |
-| `external` | ~22 | 运行属性 | 依赖外部资源（Docker/git/network），实际很快 | ❌ 显式运行 |
+| `external` | ~22 | 运行属性 | 依赖外部资源或平台能力（git/network/Windows OS sandbox APIs），实际通常较快 | ❌ 显式运行 |
 | `provider_eval` | 1 | 运行属性 | 需真实模型 provider 的烟雾测试 | ❌ 显式运行 |
 
 > **注意**：数量会随重分类调整而变化。以实际 `python -m pytest --co -q` 为准。
@@ -173,7 +173,16 @@ Slow 测试主要是 agent loop 多轮模拟（3-8s）和并发测试。日常�
 python -m pytest -m external -v
 ```
 
-External 测试依赖 git、Docker 或网络。本地开发时通常可用，CI 中需要确保环境就绪。
+External 测试依赖 git、network 或Windows OS sandbox能力。本地与CI都必须按实际平台能力运行；backend capability/setup缺失时应断言`backend_unavailable`，不能改用普通本地进程获得通过。
+
+Windows sandbox定向验证：
+
+```bash
+python -m pytest tests/test_sandbox_backend_windows.py -m external -v
+python -m pytest tests -k sandbox -m "not evaluation and not provider_eval and not slow" -v
+```
+
+当前Windows测试覆盖primitive doctor、未完成elevated setup时的fail-closed结果、manager capability enforcement和“未启动进程/未创建workspace projection”。只有未来真实account、ACL、network filter、restricted token、Job Object和private desktop全部接通后，才允许增加成功执行smoke；文件复制或chmod不能作为成功隔离断言。
 
 ## 8. Marker 自检方式
 

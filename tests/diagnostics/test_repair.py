@@ -63,7 +63,8 @@ def test_repair_apply_fills_missing_config_fields_without_overwriting_custom(tmp
 
     assert plan.applied is True
     assert config["component"]["mode"] == "custom"
-    assert config["policy"]["approval_mode"] == "auto_safe"
+    assert "policy" not in config
+    assert "sandbox" not in config
     assert config["provider"]["api_key_env"] == "SINGULARITY_API_KEY"
 
 

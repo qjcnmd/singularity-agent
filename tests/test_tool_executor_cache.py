@@ -5,7 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from singularity.policy import ApprovalMode, PolicyConfig, PolicyEngine, ResourceRef, SecurityMode
+from singularity.policy import PolicyConfig, PolicyEngine, ResourceRef
+from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.tools import (
     ToolCachePolicy,
     ToolPolicy,
@@ -448,8 +449,10 @@ def _make_write_capable_executor(tmp_path: Path) -> ToolExecutor:
     policy_engine = PolicyEngine(
         PolicyConfig(
             workspace_root=tmp_path,
-            approval_mode=ApprovalMode.AUTO_SAFE,
-            security_mode=SecurityMode.COMPAT,
+            permission_profile=PermissionProfile.default_for_workspace(
+                tmp_path,
+                profile=PermissionProfileName.DANGER_FULL_ACCESS,
+            ),
         )
     )
     registry = ToolRegistry(tmp_path)
@@ -683,4 +686,3 @@ def test_concurrent_invalidate_and_read_does_not_corrupt_cache(tmp_path: Path) -
         thread.join()
 
     assert errors == [], f"concurrent invalidate/read raised: {errors}"
-

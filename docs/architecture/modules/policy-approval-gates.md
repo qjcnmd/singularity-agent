@@ -1,25 +1,41 @@
-# Policy / Approval Gates模块数据流
+# Policy / Approval Gates 模块数据流
 
 模块数据流文档 ID: policy-approval-gates
 
 源码证据路径:
+- src/singularity/policy/permissions.py
 - src/singularity/policy/models.py
+- src/singularity/policy/config.py
+- src/singularity/policy/rules.py
 - src/singularity/policy/engine.py
 - src/singularity/policy/approval.py
 - src/singularity/policy/audit.py
 
 关键符号:
+- PermissionProfile
+- PermissionSummary
+- ProtectedPathRule
+- PolicyConfig
+- PolicySubject
+- ResourceRef
+- PolicyConstraints
 - PolicyRequest
-- PolicyDecision
+- ApprovalScope
+- ApprovalRequirement
 - ApprovalGrant
+- PolicyDecision
 - PolicyAuditEntry
 - PolicyEngine
 - ApprovalGate
 
 字段清单:
+- ProtectedPathRule: pattern, allow_read, allow_write, allow_execute, hard_deny, description
+- PermissionSummary: profile, writable_roots, network_access, approval_policy, protected_paths_enforced
+- PermissionProfile: profile, workspace_roots, additional_writable_directories, network_access, approval_policy, protected_paths
+- PolicyConfig: workspace_root, audit_log_path, approval_grants_path, consumption_ledger_path, operator_key_path, permission_profile
 - PolicySubject: subject_type, name
 - ResourceRef: resource_type, identifier, normalized_identifier, workspace_relative, sensitive, metadata
-- PolicyConstraints: filesystem_mode, network_allowed, max_duration_seconds, max_output_chars, allowed_paths, denied_paths, allowed_hosts, env_redaction, sandbox_required, hard_isolation_required
+- PolicyConstraints: filesystem_mode, network_allowed, max_duration_seconds, max_output_chars, env_redaction, sandbox_required, hard_isolation_required
 - PolicyRequest: session_id, task_id, phase_id, action_id, component, operation, capability, subject, resource, reason, request_id, proposed_by_model, risk_tags, metadata, evidence_refs, reversible, requires_network, touches_workspace, touches_secrets, destructive, long_running, interactive, workspace_root
 - ApprovalScope: capabilities, path_globs, command_patterns, network_hosts, max_duration_seconds, max_files, session_only, single_use
 - ApprovalRequirement: message, scope, review_kind, details
@@ -29,31 +45,120 @@
 
 ## 这一层解决什么问题
 
-Policy 层把组件、能力、资源、风险、约束和人工 approval 统一成可审计决策，保护文件、命令、网络、secret 和高风险操作。
+Policy 层把会话级权限边界、动作级策略决策和人工 approval 串成同一条强制执行链。会话级边界由 `PermissionProfile` 描述；动作级结果仍使用仓库既有 `allow / deny / require_review / sandbox_required` 语义。完整内部对象只供 runtime、audit、trace 使用；模型只能看到裁剪后的权限摘要和安全错误信息。
+
+## 命名来源
+
+| 名称 | 来源 |
+|---|---|
+| `PermissionProfile` | Codex Permission Profiles 与通用 access-control profile 术语 |
+| `read-only` / `workspace-write` / `danger-full-access` | Codex sandbox modes |
+| `approval_policy` / `on-request` / `never` | Codex approvals 常见策略名 |
+| `--add-dir` / additional writable directories | Codex CLI 额外可写目录语义 |
+| protected paths / deny 优先 | Codex permissions、NIST least privilege 与通用 deny-overrides access control |
+| `require_review` / `sandbox_required` | 沿用仓库既有动作级 `DecisionOutcome`，不是会话模式 |
 
 ## 当前源码位置
 
-- src/singularity/policy/models.py
-- src/singularity/policy/engine.py
-- src/singularity/policy/approval.py
-- src/singularity/policy/audit.py
+- `src/singularity/policy/permissions.py`
+- `src/singularity/policy/models.py`
+- `src/singularity/policy/config.py`
+- `src/singularity/policy/rules.py`
+- `src/singularity/policy/engine.py`
+- `src/singularity/policy/approval.py`
+- `src/singularity/policy/audit.py`
 
 ## 关键类、函数、字段
 
-本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
+- `PermissionProfileName`: `READ_ONLY`, `WORKSPACE_WRITE`, `DANGER_FULL_ACCESS`
+- `ApprovalPolicy`: `ON_REQUEST`, `NEVER`
+- `NetworkAccess`: `DENIED`, `ALLOWED`
+- `ProtectedPathRule`: `pattern`, `allow_read`, `allow_write`, `allow_execute`, `hard_deny`, `description`
+- `PermissionSummary`: `profile`, `writable_roots`, `network_access`, `approval_policy`, `protected_paths_enforced`
+- `PermissionProfile`: `profile`, `workspace_roots`, `additional_writable_directories`, `network_access`, `approval_policy`, `protected_paths`
+- `PolicyConfig`: `workspace_root`, `audit_log_path`, `approval_grants_path`, `consumption_ledger_path`, `operator_key_path`, `permission_profile`
+- `PolicySubject`: `subject_type`, `name`
+- `ResourceRef`: `resource_type`, `identifier`, `normalized_identifier`, `workspace_relative`, `sensitive`, `metadata`
+- `PolicyConstraints`: `filesystem_mode`, `network_allowed`, `max_duration_seconds`, `max_output_chars`, `env_redaction`, `sandbox_required`, `hard_isolation_required`
+- `PolicyRequest`: `session_id`, `task_id`, `phase_id`, `action_id`, `component`, `operation`, `capability`, `subject`, `resource`, `reason`, `request_id`, `proposed_by_model`, `risk_tags`, `metadata`, `evidence_refs`, `reversible`, `requires_network`, `touches_workspace`, `touches_secrets`, `destructive`, `long_running`, `interactive`, `workspace_root`
+- `ApprovalScope`: `capabilities`, `path_globs`, `command_patterns`, `network_hosts`, `max_duration_seconds`, `max_files`, `session_only`, `single_use`
+- `ApprovalRequirement`: `message`, `scope`, `review_kind`, `details`
+- `ApprovalGrant`: `decision_id`, `request_id`, `approved_by`, `scope`, `session_id`, `approved_at`, `grant_id`, `expires_at`, `single_use`, `reason`, `operator_signature`
+- `PolicyDecision`: `request_id`, `outcome`, `reason`, `risk_level`, `risk_tags`, `user_message`, `constraints`, `required_approval`, `rule_ids`, `audit_severity`, `context_summary`, `decision_id`, `approval_grant_id`
+- `PolicyAuditEntry`: `timestamp`, `session_id`, `task_id`, `phase_id`, `action_id`, `request_id`, `decision_id`, `component`, `operation`, `capability`, `resource_summary`, `normalized_input_hash`, `risk_level`, `risk_tags`, `outcome`, `rule_ids`, `reason`, `approval_required`, `approval_grant_id`, `approved_by_user`, `user_decision`, `constraints`, `execution_result_ref`
 
 ## 真实运行时调用链
 
-`ToolExecutor` / `CommandExecutor` / `WorkspaceMutationManager` / `VerificationRunner` 创建 `PolicyRequest` -> `PolicyEngine.evaluate()` -> `ApprovalGate` 可选人工授权 -> ledger/audit -> 执行或拒绝。
+`ProductionConfig.to_permission_profile()` 在 kernel 启动时生成一个不可变 `PermissionProfile`。`AgentGraphBuilder._build_policy_sandbox()` 用同一个 profile 构造 `PolicyConfig`、`PolicyEngine`、`ApprovalGate` 和 `SandboxManager`，再把同一个 `PolicyEngine` / `ApprovalGate` 注入 `CommandExecutor`、`WorkspaceMutationManager`、`VerificationRunner` 和 `ToolExecutor`。
+
+执行时，`ToolExecutor` 只做工具准入和 hard deny；对于 delegated command/mutation，它不提前消费 approval grant。`CommandExecutor._policy_request()`、`WorkspaceMutationManager._policy_request()`、`VerificationRunner._policy_request()` 在真正执行边界生成 `PolicyRequest`，调用 `PolicyEngine.enforce()` 得到 `PolicyDecision`。`REQUIRE_REVIEW` 由该执行边界调用 `ApprovalGate.authorize()` 消费单次授权；`SANDBOX_REQUIRED` 交给 `SandboxManager.run()` 执行已经构造好的 `SandboxRequest`。`approval_policy=never` 在 rules 层把 review 转为 deny。
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 时模型请求写文件或跑命令为例：`ToolExecutor._policy_request()` / `CommandExecutor._policy_request()` / `VerificationRunner._policy_request()` -> `PolicyEngine.evaluate()` -> `ApprovalGate.resolve()` 先生成对象 `PolicyRequest`，再读取 subject、resource、risk 和 constraints 返回 `PolicyDecision`。若 decision 是 review，`ApprovalGate.resolve()` 读取或写入 `approval_grants.jsonl` 并生成 `ApprovalGrant`；随后执行器只在 grant 范围匹配时继续。`PolicyAuditWriter.append()` 写入 `audit.jsonl`，`PolicyEngine._emit_policy_trace()` 写 trace event；deny/ask_user/sandbox_required 返回失败或阻塞结果，不会让 handler 继续执行。
+以模型请求写入 `quicksort.py` 并运行验证为例：`ToolExecutor` -> `WorkspaceMutationManager.apply_operations()` -> `PolicyEngine.enforce()` -> `ApprovalGate.authorize()` 或直接执行。Mutation manager 生成 `PolicyRequest`，`PolicyEngine.enforce()` 消费 request、生成 `PolicyDecision`，并通过 `PolicyAuditWriter.append()` 落盘到 policy audit JSONL；workspace 内普通写入在 `workspace-write` 下 allow，`.env`、`.git/config` 或 `.singularity/**` 则因 `PermissionProfile.protected_paths` hard deny。随后命令验证进入 `CommandExecutor.run()` -> `CommandExecutor._sandbox_request()` -> `SandboxManager.run()`；command executor 再次生成 command `PolicyRequest`，在 `workspace-write` 下普通本地命令得到 `sandbox_required`，并生成 `SandboxRequest` 交给 sandbox 层消费。trace 记录 `policy.requested`、`policy.decided` / `policy.blocked`、`sandbox.requested`、`sandbox.completed`；audit JSONL 记录完整 request/decision 投影；模型 context 只收到裁剪后的 outcome/reason 或 `PermissionSummary`。
+
+`PolicyAuditWriter.append()` 写入 JSONL 对象，`PolicyEngine._emit_policy_trace()` 写入 trace 事件，`ApprovalGate.authorize()` 返回 grant 结果。
+
 ## 真实对象完整结构
 
-### PolicyRequest（策略请求）
+### PermissionProfile（会话级权限配置）
 
-执行组件发起的能力/资源评估请求。**边界**：内部治理对象，进入 policy audit ledger；不进入模型请求。
+```python
+@dataclass(frozen=True)
+class PermissionProfile:
+    profile: PermissionProfileName
+    workspace_roots: tuple[Path | str, ...]
+    additional_writable_directories: tuple[Path | str, ...] = ()
+    network_access: NetworkAccess = NetworkAccess.DENIED
+    approval_policy: ApprovalPolicy = ApprovalPolicy.ON_REQUEST
+    protected_paths: tuple[ProtectedPathRule | str, ...] = ()
+```
+
+`PermissionProfile.__post_init__()` 解析和规范化 root/add-dir 路径，并把用户配置的 `protected_paths` 追加到内建保护规则后面；用户配置只能增加规则，不能移除内建规则。`summary()` 只生成模型可见摘要，不包含 matcher、内部规则、grant、decision 或 backend capability 对象。
+
+### PermissionSummary（模型可见权限摘要）
+
+```python
+@dataclass(frozen=True)
+class PermissionSummary:
+    profile: PermissionProfileName
+    writable_roots: tuple[str, ...]
+    network_access: NetworkAccess
+    approval_policy: ApprovalPolicy
+    protected_paths_enforced: bool = True
+```
+
+### ProtectedPathRule（受保护路径规则）
+
+```python
+@dataclass(frozen=True)
+class ProtectedPathRule:
+    pattern: str
+    allow_read: bool = False
+    allow_write: bool = False
+    allow_execute: bool = False
+    hard_deny: bool = True
+    description: str = ""
+```
+
+内建规则覆盖 `.git/**` 写入、`.singularity/**`、非示例 `.env*`、SSH/cloud 凭据目录、credential/token 文件和私钥/证书密钥文件。`.git` 读取允许，直接写入拒绝；VCS mutation 命令仍由 command risk 走 review。
+
+### PolicyConfig（策略运行配置）
+
+```python
+@dataclass(frozen=True)
+class PolicyConfig:
+    workspace_root: Path | str = "."
+    audit_log_path: Path | str | None = None
+    approval_grants_path: Path | str | None = None
+    consumption_ledger_path: Path | str | None = None
+    operator_key_path: Path | str | None = None
+    permission_profile: PermissionProfile | None = None
+```
+
+`PolicyConfig` 不再包含旧审批模式枚举或旧安全模式枚举。默认 audit、approval grants、consumption ledger 和 operator key 均落在 workspace 外的 policy home，避免模型通过 workspace 写入伪造授权。
+
+### PolicyRequest（策略请求）
 
 ```python
 @dataclass(frozen=True)
@@ -83,9 +188,32 @@ class PolicyRequest:
     workspace_root: str | None = None
 ```
 
-### PolicyDecision（策略决策）
+### 枚举值域
 
-policy engine 的评估结果。**边界**：内部治理对象，落盘到 audit.jsonl；`outcome`/`reason`/`constraints` 投影进执行器决策，裁剪后 observation 进入 context。
+```python
+class PermissionProfileName(str, Enum):
+    READ_ONLY = "read-only"
+    WORKSPACE_WRITE = "workspace-write"
+    DANGER_FULL_ACCESS = "danger-full-access"
+
+class ApprovalPolicy(str, Enum):
+    ON_REQUEST = "on-request"
+    NEVER = "never"
+
+class NetworkAccess(str, Enum):
+    DENIED = "denied"
+    ALLOWED = "allowed"
+
+class DecisionOutcome(str, Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+    REQUIRE_REVIEW = "require_review"
+    ASK_USER = "ask_user"
+    ESCALATE = "escalate"
+    SANDBOX_REQUIRED = "sandbox_required"
+```
+
+### PolicyDecision（策略决策）
 
 ```python
 @dataclass(frozen=True)
@@ -105,137 +233,66 @@ class PolicyDecision:
     approval_grant_id: str | None = None
 ```
 
-### PolicyAuditEntry（策略审计条目）
-
-每次 policy 评估的不可变审计记录。**边界**：audit 对象，落盘到 policy audit JSONL；不进入模型、不写 trace events.jsonl。
+### PolicyConstraints（动作级约束）
 
 ```python
 @dataclass(frozen=True)
-class PolicyAuditEntry:
-    timestamp: str
-    session_id: str
-    task_id: str
-    phase_id: str
-    action_id: str
-    request_id: str
-    decision_id: str
-    component: PolicyComponent | str
-    operation: OperationKind | str
-    capability: Capability | str
-    resource_summary: str
-    normalized_input_hash: str
-    risk_level: RiskLevel | str
-    risk_tags: list[RiskTag | str]
-    outcome: DecisionOutcome | str
-    rule_ids: list[str]
-    reason: str
-    approval_required: bool
-    approval_grant_id: str | None = None
-    approved_by_user: bool = False
-    user_decision: str | None = None
-    constraints: dict[str, Any] = field(default_factory=dict)
-    execution_result_ref: str | None = None
+class PolicyConstraints:
+    filesystem_mode: str = "none"
+    network_allowed: bool = False
+    max_duration_seconds: int | None = None
+    max_output_chars: int | None = None
+    env_redaction: bool = True
+    sandbox_required: bool = False
+    hard_isolation_required: bool = False
 ```
 
-### 关键枚举值域
+`PolicyConstraints` 只保留 runtime 真实消费的动作级约束。路径、host、writable root 等边界由会话级 `PermissionProfile` 执行，不再在 constraints 上保留 no-op 字段。
+
+### ApprovalGrant 与审计对象
 
 ```python
-class DecisionOutcome(str, Enum):    # PolicyDecision.outcome
-    ALLOW = "allow"
-    DENY = "deny"
-    REQUIRE_REVIEW = "require_review"
-    ASK_USER = "ask_user"
-    ESCALATE = "escalate"
-    SANDBOX_REQUIRED = "sandbox_required"
-
-class RiskLevel(str, Enum):          # PolicyDecision.risk_level
-    NONE = "none"
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
-
-class PolicyComponent(str, Enum):    # PolicyRequest.component
-    TOOL = "tool"
-    MUTATION = "mutation"
-    COMMAND = "command"
-    VERIFICATION = "verification"
-    PLANNER = "planner"
-    WORKSPACE_STATE = "workspace_state"
-    SYSTEM = "system"
-
-class Capability(str, Enum):         # PolicyRequest.capability (20 members)
-    READ_WORKSPACE = "read_workspace"
-    READ_OUTSIDE_WORKSPACE = "read_outside_workspace"
-    READ_SECRET = "read_secret"
-    LIST_DIRECTORY = "list_directory"
-    MUTATE_WORKSPACE = "mutate_workspace"
-    CREATE_FILE = "create_file"
-    DELETE_FILE = "delete_file"
-    MOVE_FILE = "move_file"
-    ROLLBACK_MUTATION = "rollback_mutation"
-    EXECUTE_COMMAND = "execute_command"
-    EXECUTE_PROJECT_CODE = "execute_project_code"
-    EXECUTE_GENERATED_CODE = "execute_generated_code"
-    NETWORK_ACCESS = "network_access"
-    PACKAGE_INSTALL = "package_install"
-    PACKAGE_SCRIPT = "package_script"
-    START_LONG_PROCESS = "start_long_process"
-    KILL_PROCESS = "kill_process"
-    READ_ENV = "read_env"
-    WRITE_ENV = "write_env"
-    CHANGE_AGENT_CONFIG = "change_agent_config"
-
-class RiskTag(str, Enum):            # PolicyRequest.risk_tags (19 members)
-    WORKSPACE_READ = "workspace_read"
-    OUTSIDE_WORKSPACE = "outside_workspace"
-    SECRET_ACCESS = "secret_access"
-    MUTATES_FILES = "mutates_files"
-    MUTATES_CONFIG = "mutates_config"
-    MUTATES_LOCKFILE = "mutates_lockfile"
-    DESTRUCTIVE = "destructive"
-    IRREVERSIBLE = "irreversible"
-    EXECUTES_CODE = "executes_code"
-    EXECUTES_PROJECT_CODE = "executes_project_code"
-    EXECUTES_GENERATED_CODE = "executes_generated_code"
-    SHELL_EXPANSION = "shell_expansion"
-    NETWORK = "network"
-    PACKAGE_MANAGER = "package_manager"
-    SUPPLY_CHAIN = "supply_chain"
-    LONG_RUNNING = "long_running"
-    RESOURCE_HEAVY = "resource_heavy"
-    PERSISTENT_SIDE_EFFECT = "persistent_side_effect"
-    SECRETS_EXFILTRATION = "secrets_exfiltration"
+@dataclass
+class ApprovalGrant:
+    decision_id: str
+    request_id: str
+    approved_by: str
+    scope: ApprovalScope
+    session_id: str | None = None
+    approved_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    grant_id: str = field(default_factory=lambda: f"grant_{uuid4().hex[:12]}")
+    expires_at: str | None = None
+    single_use: bool = True
+    reason: str = ""
+    operator_signature: str | None = None
 ```
 
-### 数据流概述
-
-`ToolExecutor._policy_request()` / `CommandExecutor._policy_request()` / `VerificationRunner._policy_request()` 生成 `PolicyRequest`。`PolicyEngine.evaluate()` 读取 rules 返回 `PolicyDecision`。若 outcome 是 `REQUIRE_REVIEW`，`ApprovalGate.resolve()` 读取或写入 `approval_grants.jsonl` 并生成 `ApprovalGrant`。`PolicyAuditWriter.append()` 将 `PolicyAuditEntry` 写入 audit JSONL。trace event 由 `PolicyEngine._emit_policy_trace()` 写 `events.jsonl`，payload 仅含 ids、operation、capability、脱敏资源、outcome/risk/rules。trace 与 audit 是两条记录，不互相替代。
+`ApprovalGrant` 不携带 consumed 状态；消费事实由 HMAC chained `GrantConsumptionLedger` 记录。`PolicyAuditEntry` 记录 request/decision 的审计投影，`PolicyEngine._emit_policy_trace()` 记录脱敏 trace event，两者不互相替代。
 
 ## 谁生成这些对象
 
-ToolExecutor、CommandExecutor、mutation、verification 与 plugin manager 生成 `PolicySubject`、`ResourceRef` 和 `PolicyRequest`；rules/engine 生成 `PolicyConstraints` 与 `PolicyDecision`。`PolicyDecision.review()` 生成 `ApprovalScope`/`ApprovalRequirement`，ApprovalGate 或 remote approval生成 `ApprovalGrant`，`PolicyAuditWriter.append()` 生成 `PolicyAuditEntry`。
+`ProductionConfig` 生成 `PermissionProfile`。`AgentGraphBuilder` 生成同 profile 的 `PolicyConfig`、`PolicyEngine`、`ApprovalGate` 和 `SandboxManager`。Tool、command、mutation、verification、plugin manager 生成 `PolicySubject`、`ResourceRef` 和 `PolicyRequest`。`DefaultLocalPolicyRules.decide()` 生成 `PolicyConstraints`、`ApprovalRequirement` 和 `PolicyDecision`。`ApprovalGate` 或 remote approval 生成 `ApprovalGrant`。`PolicyAuditWriter.append()` 生成 `PolicyAuditEntry`。
 
 ## 谁消费这些对象
 
-`PolicyEngine.evaluate()` 消费 request，`ApprovalGate.resolve()` 与执行器消费 decision/requirement/grant。完整 request/decision不进入模型；`ContextManager.add_policy_observation()` 最多追加裁剪后的 policy reason/outcome observation。
+`PolicyEngine.enforce()` 消费 request 并返回 decision。`CommandExecutor`、`WorkspaceMutationManager` 和 `VerificationRunner` 消费 decision，直接处理 allow/deny/review/sandbox_required。`ApprovalGate.authorize()` 消费 review decision 并注册/消费 single-use grant。`SandboxManager` 只消费已经完成权限判定的 `SandboxRequest`，不重新判断 session permission。`ToolProtocolResultBuilder` 不把完整 decision/request/grant/constraints 暴露给模型。
 
 ## 是否落盘
 
-ApprovalGate 将 grant 写受信任 policy home 的 `approval_grants.jsonl`并记录 single-use消费；workspace内 grant store不受信任。`PolicyAuditWriter` 将 `PolicyAuditEntry` 追加到 policy audit JSONL；subject/resource/constraints作为 request/decision/audit嵌套字段。
+`PolicyAuditWriter` 将 `PolicyAuditEntry` 追加到 audit JSONL。`ApprovalGate` 将 grants 写入 workspace 外的 `approval_grants.jsonl`，consumption ledger 写入 workspace 外的 `grant_consumption_ledger.jsonl`。`PermissionProfile` 是内存中的启动时快照；final report 只记录安全摘要。
 
 ## 是否进入 trace / audit
 
-PolicyEngine 发出 `policy_requested`、`policy_decided`、`policy_blocked`，payload仅含 ids、operation、capability、脱敏资源、outcome/risk/rules。Audit entry另保存normalized input hash、grant/result ref；trace与audit是两条记录，不互相替代。
+Trace events.jsonl 记录 `TraceEventType.POLICY_REQUESTED`、`TraceEventType.POLICY_DECIDED`、`TraceEventType.POLICY_BLOCKED`、`TraceEventType.APPROVAL_REQUESTED`、`TraceEventType.APPROVAL_GRANTED`、`TraceEventType.APPROVAL_DENIED`，payload 含 profile 名、action decision、approval result、enforcement 状态和脱敏资源 handle。Audit JSONL 由 `PolicyAuditWriter.append()` 记录 request/decision 的审计投影。模型 context 只接收 `PermissionSummary` 和裁剪后的 policy observation；不接收可伪造审批或绕过策略的内部对象。
 
 ## 失败路径
 
-DecisionOutcome可为 deny、require_review、ask_user、escalate、sandbox_required；非交互 review必须fail-closed转deny。ApprovalGate对拒绝、缺grant、过期/签名/范围不匹配抛对应 approval错误，single-use grant消费后不可复用。
+受保护路径 hard-deny 优先。`approval_policy=never` 把 `REQUIRE_REVIEW` 转为 `DENY`。没有 `InteractionController`、grant store 不可信、grant 过期、scope 不匹配或 single-use 已消费时，`ApprovalGate` fail-closed。OS sandbox 不可用时返回 `backend_unavailable`，不会回退为普通本地执行。
 
 ## 当前结构问题
 
-policy decision、approval grant、trace event和audit entry各有不同敏感度与持久化目的；新增constraint或scope字段时必须同步matching、签名/audit与执行器消费。
+Windows elevated sandbox setup/execution 当前 fail-closed，尚未具备完整账户、ACL、防火墙、restricted token、Job Object、private desktop 执行 backend。`PermissionProfile` 已接入 runtime，但新增 path/resource 入口时仍必须显式调用 protected matcher，防止直接 backend 调用绕过策略。
 
 ## 维护规则
 
-修改本模块相关类、字段、函数、调用链、CLI、schema、manifest、trace event、report schema 或 evaluation result 时，必须同步更新本文件并运行 `python scripts/verify_runtime_docs.py`。展示真实对象时必须列完整字段，不允许只列子集，不允许新增仅服务文档说明的运行时字段。
+修改权限 profile、policy request/decision、approval grant、sandbox request、CLI/config、trace/report schema、model-visible context 或执行边界时，必须同步本文件并运行 `python scripts/verify_runtime_docs.py`。文档只描述当前源码真实结构，不保留旧模式枚举、容器 sandbox backend 或未执行的兼容字段。

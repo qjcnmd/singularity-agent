@@ -182,7 +182,7 @@ class PlannerContextRenderer:
         backend = str(observation.get("backend") or "sandbox")
         if status == "backend_unavailable":
             return "[sandbox] command blocked: backend cannot enforce required isolation."
-        return f"[sandbox] command ran in isolated copy-on-write workspace via {backend}, status={status}."
+        return f"[sandbox] command ran under native OS sandbox enforcement via {backend}, status={status}."
 
     @staticmethod
     def _project_index_summary(evidence: EvidenceLedger) -> dict:

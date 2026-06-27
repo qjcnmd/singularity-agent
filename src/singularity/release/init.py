@@ -58,14 +58,6 @@ def default_config(paths: UserDataPaths) -> dict[str, Any]:
             "mode": paths.mode.value,
             "root": str(paths.root),
         },
-        "policy": {
-            "approval_mode": "auto_safe",
-            "security_mode": "strict",
-        },
-        "sandbox": {
-            "enabled": True,
-            "profile": "local",
-        },
         "model": {
             "provider": "openai_compatible",
             "model_env": "SINGULARITY_MODEL",
@@ -85,7 +77,7 @@ def validate_config(payload: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:
         issues.append("unsupported config schema_version")
-    for key in ("component", "policy", "sandbox", "model", "provider"):
+    for key in ("component", "model", "provider"):
         if not isinstance(payload.get(key), dict):
             issues.append(f"missing {key} section")
     return issues

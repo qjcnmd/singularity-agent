@@ -33,7 +33,13 @@ from singularity.memory.cli import memory_app
 from singularity.observability import TraceRedactor, TraceRecorder, TraceStore
 from singularity.plugins.cli import plugin_app
 from singularity.command import CommandExecutor
-from singularity.policy import ApprovalMode, PolicyConfig, PolicyEngine, SecurityMode
+from singularity.policy import PolicyConfig, PolicyEngine
+from singularity.policy.permissions import (
+    ApprovalPolicy,
+    NetworkAccess,
+    PermissionProfile,
+    PermissionProfileName,
+)
 from singularity.policy.cli import approval_app
 from singularity.planner import Planner, create_or_resume_planner as _create_or_resume_planner
 from singularity.diagnostics import DoctorEngine, RepairEngine
@@ -47,7 +53,7 @@ from singularity.release.repair import (
     repair_user_data,
     uninstall_user_data,
 )
-from singularity.sandbox import SandboxManager
+from singularity.sandbox import SandboxManager, WindowsSandboxBackend
 from singularity.verification import VerificationRunner
 from singularity.workspace_state import (
     WorkspaceHealthReport,
@@ -85,6 +91,7 @@ eval_ab_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_regression_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_report_app = typer.Typer(add_completion=False, no_args_is_help=True)
 system_app = typer.Typer(add_completion=False, no_args_is_help=True)
+sandbox_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
 app.add_typer(index_app, name="index")
 app.add_typer(git_app, name="git")
@@ -93,6 +100,7 @@ app.add_typer(memory_app, name="memory")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(eval_app, name="eval")
 app.add_typer(system_app, name="system")
+app.add_typer(sandbox_app, name="sandbox")
 eval_app.add_typer(eval_task_app, name="task")
 eval_app.add_typer(eval_suite_app, name="suite")
 eval_app.add_typer(eval_trace_app, name="trace")
@@ -127,6 +135,50 @@ def _cli_overrides(names: list[str]) -> set[str] | None:
         if source == click.core.ParameterSource.COMMANDLINE:
             overrides.add(name)
     return overrides
+
+
+@sandbox_app.command("doctor")
+def sandbox_doctor(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print machine-readable capability status.")
+    ] = False,
+) -> None:
+    """Report whether the native Windows sandbox is fully enforceable."""
+    report = WindowsSandboxBackend().doctor().to_dict()
+    if json_output:
+        _write_stdout(json_dumps(report))
+    else:
+        console.print(Panel(json_dumps(report), title="sandbox doctor"))
+    if not report["available"]:
+        raise typer.Exit(1)
+
+
+@sandbox_app.command("setup")
+def sandbox_setup(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print machine-readable setup status.")
+    ] = False,
+) -> None:
+    """Run the elevated native sandbox setup boundary; fail closed if unavailable."""
+    backend = WindowsSandboxBackend()
+    try:
+        setup = backend.setup()
+        payload = setup.to_dict()
+        payload["status"] = "ready"
+        exit_code = 0
+    except Exception as exc:
+        payload = {
+            "status": "backend_unavailable",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+        exit_code = 1
+    if json_output:
+        _write_stdout(json_dumps(payload))
+    else:
+        console.print(Panel(json_dumps(payload), title="sandbox setup"))
+    if exit_code:
+        raise typer.Exit(exit_code)
 
 
 @app.command("run")
@@ -179,20 +231,42 @@ def run_goal(
             help="Build or refresh the project index during kernel boot.",
         ),
     ] = None,
-    approval_mode: Annotated[
-        ApprovalMode | None,
+    permission_profile: Annotated[
+        PermissionProfileName | None,
         typer.Option(
-            "--approval-mode",
+            "--permission-profile",
             case_sensitive=False,
-            help="Policy approval mode: interactive, review_all, auto_safe, read_only, or non_interactive.",
+            help="Session filesystem permission profile: read-only, workspace-write, or danger-full-access.",
         ),
     ] = None,
-    security_mode: Annotated[
-        SecurityMode | None,
+    approval_policy: Annotated[
+        ApprovalPolicy | None,
         typer.Option(
-            "--security-mode",
+            "--approval-policy",
             case_sensitive=False,
-            help="Execution security mode: strict fails closed by default; compat preserves legacy local execution behavior.",
+            help="Approval behavior for review-required actions: on-request or never.",
+        ),
+    ] = None,
+    network_access: Annotated[
+        NetworkAccess | None,
+        typer.Option(
+            "--network-access",
+            case_sensitive=False,
+            help="Session network boundary: denied or allowed.",
+        ),
+    ] = None,
+    additional_writable_directories: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--add-dir",
+            help="Grant write access to an additional directory; repeat for multiple directories.",
+        ),
+    ] = None,
+    windows_sandbox: Annotated[
+        str | None,
+        typer.Option(
+            "--windows-sandbox",
+            help="Windows OS sandbox implementation; currently only elevated is supported.",
         ),
     ] = None,
     trace_dir: Annotated[
@@ -259,8 +333,11 @@ def run_goal(
         project_root=project_root,
         max_turns=max_turns,
         profile=profile,
-        approval_mode=approval_mode,
-        security_mode=security_mode,
+        permission_profile=permission_profile,
+        approval_policy=approval_policy,
+        network_access=network_access,
+        additional_writable_directories=additional_writable_directories,
+        windows_sandbox=windows_sandbox,
         strict=strict,
         dry_run=dry_run,
         trace_dir=trace_dir,
@@ -281,8 +358,11 @@ def run_goal(
                 "project_index_enabled",
                 "project_index_db",
                 "project_index_build_on_boot",
-                "approval_mode",
-                "security_mode",
+                "permission_profile",
+                "approval_policy",
+                "network_access",
+                "additional_writable_directories",
+                "windows_sandbox",
                 "trace_dir",
                 "context_db",
                 "model",
@@ -309,8 +389,13 @@ def run_goal(
                 "max_turns": production_config.max_turns,
                 "profile": production_config.profile,
                 "resume_session": production_config.resume_session,
-                "approval_mode": production_config.approval_mode.value,
-                "security_mode": production_config.security_mode.value,
+                "permission_profile": production_config.permission_profile.value,
+                "approval_policy": production_config.approval_policy.value,
+                "network_access": production_config.network_access.value,
+                "additional_writable_directories": [
+                    str(path) for path in production_config.additional_writable_directories
+                ],
+                "windows_sandbox": production_config.windows_sandbox,
                 "strict": production_config.strict,
                 "dry_run": production_config.dry_run,
                 "raw_artifacts": production_config.raw_artifacts,
@@ -1289,10 +1374,19 @@ def _run_provider_smoke_benchmark(
         model=model,
         base_url=base_url,
         env_root=project_root or Path.cwd(),
-        approval_mode=ApprovalMode.AUTO_SAFE,
-        security_mode=SecurityMode.COMPAT,
+        permission_profile=PermissionProfileName.WORKSPACE_WRITE,
+        approval_policy=ApprovalPolicy.NEVER,
+        network_access=NetworkAccess.DENIED,
         profile="evaluation-provider-smoke",
-        cli_overrides={"max_turns", "model", "base_url", "approval_mode", "security_mode", "profile"},
+        cli_overrides={
+            "max_turns",
+            "model",
+            "base_url",
+            "permission_profile",
+            "approval_policy",
+            "network_access",
+            "profile",
+        },
     )
     kernel = KernelBootstrap(project_root=workspace, config=config, console=console).boot(goal)
     try:
@@ -1370,18 +1464,23 @@ def _evaluation_harness_from_cli(
         return EvaluationHarness(project_root=project_root, output_root=output_root)
     root = output_root or (project_root / "work" / "evaluations")
     audit_root = root / (run_id or "cli_execute")
+    permission_profile = PermissionProfile.default_for_workspace(
+        project_root,
+        profile=PermissionProfileName.WORKSPACE_WRITE,
+        approval_policy=ApprovalPolicy.NEVER,
+        network_access=NetworkAccess.DENIED,
+    )
     policy_engine = PolicyEngine(
         PolicyConfig(
             workspace_root=project_root,
-            approval_mode=ApprovalMode.NON_INTERACTIVE,
-            security_mode=SecurityMode.STRICT,
+            permission_profile=permission_profile,
             audit_log_path=audit_root / "policy-audit.jsonl",
         )
     )
     sandbox_manager = SandboxManager(
         project_root,
         trace=_NoopTrace(),
-        security_mode=SecurityMode.STRICT,
+        permission_profile=permission_profile,
     )
     command_executor = CommandExecutor(
         project_root,

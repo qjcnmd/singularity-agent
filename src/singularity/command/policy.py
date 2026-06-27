@@ -12,9 +12,6 @@ from singularity.command.models import (
     FilesystemMode,
     NetworkMode,
 )
-from singularity.policy.config import SecurityMode
-
-
 READ_ONLY_GIT = {
     "branch",
     "diff",
@@ -85,9 +82,6 @@ INTERPRETERS = {
 
 
 class CommandPolicy:
-    def __init__(self, *, security_mode: SecurityMode | str = SecurityMode.STRICT) -> None:
-        self.security_mode = _security_mode(security_mode)
-
     def evaluate(
         self,
         request: CommandRequest,
@@ -138,23 +132,23 @@ class CommandPolicy:
 
         if CommandRisk.DESTRUCTIVE in risk_tags:
             return CommandPolicyResult(
-                decision=CommandDecision.DENY,
-                reasons=["Destructive commands are denied."],
+                decision=CommandDecision.REQUIRE_REVIEW,
+                reasons=["Destructive commands require explicit review."],
                 risk_tags=risk_tags,
                 required_network=request.network_mode,
                 required_filesystem=request.filesystem_mode,
                 redaction_rules=redaction_rules,
-                error_code="policy_denied",
+                error_code="review_required",
             )
         if CommandRisk.SYSTEM_MUTATION in risk_tags:
             return CommandPolicyResult(
-                decision=CommandDecision.DENY,
-                reasons=["System mutation commands are denied."],
+                decision=CommandDecision.REQUIRE_REVIEW,
+                reasons=["System mutation commands require explicit review."],
                 risk_tags=risk_tags,
                 required_network=request.network_mode,
                 required_filesystem=request.filesystem_mode,
                 redaction_rules=redaction_rules,
-                error_code="policy_denied",
+                error_code="review_required",
             )
         if CommandRisk.NETWORK in risk_tags and request.network_mode == NetworkMode.DISABLED:
             return CommandPolicyResult(
@@ -171,17 +165,6 @@ class CommandPolicy:
                 decision=CommandDecision.REQUIRE_REVIEW,
                 reasons=["Shell commands require review because parsing is delegated to the shell."],
                 risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="review_required",
-            )
-        strict_issue = self._strict_local_execution_issue(request, risk_tags)
-        if strict_issue is not None:
-            return CommandPolicyResult(
-                decision=CommandDecision.REQUIRE_REVIEW,
-                reasons=[strict_issue],
-                risk_tags=sorted_risks({*risk_tags, CommandRisk.UNKNOWN}),
                 required_network=request.network_mode,
                 required_filesystem=request.filesystem_mode,
                 redaction_rules=redaction_rules,
@@ -243,39 +226,6 @@ class CommandPolicy:
             required_filesystem=request.filesystem_mode,
             redaction_rules=redaction_rules,
         )
-
-    def _strict_local_execution_issue(
-        self,
-        request: CommandRequest,
-        risk_tags: list[CommandRisk],
-    ) -> str | None:
-        if self.security_mode == SecurityMode.COMPAT:
-            return None
-        if request.argv is None:
-            return None
-        program = _program_name(request.argv)
-        lowered = [part.lower() for part in request.argv]
-        if CommandRisk.VCS_READ in risk_tags and _is_git_read(program, lowered):
-            return None
-        if request.purpose in {
-            CommandPurpose.PROJECT_VERIFICATION,
-            CommandPurpose.LINT,
-            CommandPurpose.TYPECHECK,
-            CommandPurpose.FORMAT_CHECK,
-            CommandPurpose.BUILD,
-        }:
-            return None
-        if request.filesystem_mode == FilesystemMode.READ_ONLY_WORKSPACE:
-            if program in INTERPRETERS and _has_inline_execution(program, lowered):
-                return "Strict security mode requires review before local inline interpreter execution."
-            if (
-                CommandRisk.READ_ONLY_COMMAND in risk_tags
-                and program not in READ_ONLY_PROGRAM_ALLOWLIST
-            ):
-                return "Strict security mode only auto-allows known read-only local commands."
-            if CommandRisk.UNKNOWN in risk_tags:
-                return "Strict security mode requires review before unknown local command execution."
-        return None
 
     def classify(self, request: CommandRequest) -> list[CommandRisk]:
         tags: set[CommandRisk] = set()
@@ -368,15 +318,6 @@ class CommandPolicy:
 
 def sorted_risks(tags: set[CommandRisk]) -> list[CommandRisk]:
     return sorted(tags, key=lambda tag: tag.value)
-
-
-def _security_mode(value: SecurityMode | str) -> SecurityMode:
-    if isinstance(value, SecurityMode):
-        return value
-    try:
-        return SecurityMode[str(value).upper()]
-    except KeyError:
-        return SecurityMode(str(value))
 
 
 def is_secret_env_name(name: str) -> bool:

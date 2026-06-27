@@ -9,7 +9,6 @@ from singularity.interaction import (
 )
 from singularity.policy import (
     ApprovalGate,
-    ApprovalMode,
     ApprovalRequired,
     Capability,
     DecisionOutcome,
@@ -24,6 +23,7 @@ from singularity.policy import (
 )
 from singularity.policy.approval import _approval_grants_path
 from singularity.policy.config import _default_policy_home
+from singularity.policy.permissions import ApprovalPolicy, PermissionProfile
 from tests.tool_executor_helpers import make_ledger_test_config
 
 
@@ -124,7 +124,13 @@ def test_non_interactive_review_fails_without_blocking(tmp_path: Path) -> None:
 
     with pytest.raises(ApprovalRequired):
         ApprovalGate(
-            PolicyConfig(workspace_root=tmp_path, approval_mode=ApprovalMode.NON_INTERACTIVE),
+            PolicyConfig(
+                workspace_root=tmp_path,
+                permission_profile=PermissionProfile.default_for_workspace(
+                    tmp_path,
+                    approval_policy=ApprovalPolicy.NEVER,
+                ),
+            ),
             interaction=interaction,
         ).resolve(request, decision)
     assert interaction.decisions[0].metadata["fail_closed"] is True

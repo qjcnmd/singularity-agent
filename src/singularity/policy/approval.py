@@ -9,7 +9,7 @@ from typing import Any, Protocol, cast
 from singularity.interaction import DecisionPrompt, InteractionController
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.policy.audit import redact_resource_identifier
-from singularity.policy.config import ApprovalMode, PolicyConfig
+from singularity.policy.config import PolicyConfig
 from singularity.policy.exceptions import (
     ApprovalDenied,
     ApprovalRequired,
@@ -176,11 +176,7 @@ class ApprovalGate:
                 TraceEventType.APPROVAL_DENIED,
                 request,
                 decision,
-                summary=(
-                    "Review required but approval mode is non_interactive."
-                    if self.config.approval_mode == ApprovalMode.NON_INTERACTIVE
-                    else "Review required but no InteractionController is configured."
-                ),
+                summary="Review required but no InteractionController is configured.",
                 severity=TraceSeverity.WARNING,
             )
             raise ApprovalRequired(decision.reason)
@@ -234,6 +230,33 @@ class ApprovalGate:
             severity=TraceSeverity.WARNING,
         )
         raise ApprovalDenied(user_decision.reason or decision.reason)
+
+    def authorize(
+        self,
+        request: PolicyRequest,
+        decision: PolicyDecision,
+    ) -> ApprovalGrant | None:
+        """Resolve and consume one grant at an authoritative execution boundary."""
+        if decision.outcome == DecisionOutcome.ALLOW:
+            return None
+        if decision.outcome != DecisionOutcome.REQUIRE_REVIEW:
+            self.resolve(request, decision)
+            return None
+
+        workspace_root = request.workspace_root or self.config.workspace_root
+        if self.is_grant_store_trusted(workspace_root):
+            existing = self.consume_matching_grant(request)
+            if existing is not None:
+                return existing
+
+        grant = self.resolve(request, decision)
+        if grant is None:
+            raise ApprovalRequired(decision.reason)
+        self.register_grant(grant)
+        consumed = self.consume_grant(grant)
+        if consumed is None:
+            raise ApprovalRequired("Approval grant was already consumed.")
+        return consumed
 
     @staticmethod
     def _review_details(request: PolicyRequest, decision: PolicyDecision) -> dict[str, Any]:

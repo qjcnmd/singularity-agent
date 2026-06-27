@@ -636,8 +636,8 @@ def test_tool_protocol_appends_policy_and_sandbox_results_to_context(tmp_path: P
         if message["role"] == "tool"
     ]
     error_codes = {payload["tool_call_id"]: payload["error_code"] for payload in tool_payloads}
-    assert error_codes["call_policy"] == "policy_denied"
-    assert error_codes["call_sandbox"] in {"sandbox_required", "policy_denied"}
+    assert error_codes["call_policy"] is None
+    assert error_codes["call_sandbox"] in {"sandbox_required", "policy_denied", "review_required"}
 
 
 def test_tool_protocol_traces_only_digests_not_raw_payloads(tmp_path: Path) -> None:

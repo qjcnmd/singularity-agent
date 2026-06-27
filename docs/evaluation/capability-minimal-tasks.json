@@ -25,8 +25,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "quicksort.py"
@@ -73,8 +74,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "greeter.py"
@@ -112,8 +114,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "math_utils.py"
@@ -151,8 +154,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "allowed.py"
@@ -199,8 +203,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "slugger.py"
@@ -238,8 +243,9 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
-        "approval_mode": "auto_safe",
-        "security_mode": "compat"
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [
         "normalizer.py"
@@ -275,8 +281,9 @@
       ],
       "tool_policy": "read_only",
       "strategy": {
-        "approval_mode": "read_only",
-        "security_mode": "strict"
+        "permission_profile": "read-only",
+        "approval_policy": "never",
+        "network_access": "denied"
       },
       "expected_file_changes": [],
       "verification_command": "python -c \"from pathlib import Path; assert not Path('blocked.txt').exists()\"",

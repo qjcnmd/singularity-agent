@@ -14,7 +14,7 @@ from singularity.instructions import PromptAssemblyPipeline
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import ModelRunner
 from singularity.planner import Planner
-from singularity.policy import ApprovalMode, PolicyConfig, PolicyEngine, SecurityMode
+from singularity.policy import PolicyConfig, PolicyEngine
 from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tool_protocol.state import ToolProtocolStateStore
 from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
@@ -119,11 +119,7 @@ class TargetedFailureReplayRunner:
         trace = JsonlTraceRecorder.create(workspace)
         planner.trace = trace
         policy = PolicyEngine(
-            PolicyConfig(
-                workspace_root=workspace,
-                approval_mode=ApprovalMode.AUTO_SAFE,
-                security_mode=SecurityMode.COMPAT,
-            )
+            PolicyConfig(workspace_root=workspace)
         )
         provider = _ScriptedProvider(
             _tool("call_read", "read_file", {"path": "README.md"}),

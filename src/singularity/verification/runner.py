@@ -17,6 +17,7 @@ from singularity.command import (
     SemanticStatus,
 )
 from singularity.policy import (
+    ApprovalGate,
     Capability,
     DecisionOutcome,
     OperationKind,
@@ -62,16 +63,23 @@ class VerificationRunner:
         policy: VerificationPolicy | None = None,
         planner: Any | None = None,
         policy_engine: PolicyEngine | None = None,
+        approval_gate: ApprovalGate | None = None,
         project_index: Any | None = None,
         review_pipeline: Any | None = None,
         memory_pipeline: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
-        self.command_executor = command_executor or CommandExecutor(self.workspace_root, trace=trace)
         self.trace = trace
         self.planner = planner
         self.policy_engine = policy_engine or PolicyEngine(
             PolicyConfig.default_for_workspace(self.workspace_root)
+        )
+        self.approval_gate = approval_gate
+        self.command_executor = command_executor or CommandExecutor(
+            self.workspace_root,
+            trace=trace,
+            policy_engine=self.policy_engine,
+            approval_gate=approval_gate,
         )
         self.project_index = project_index
         self.review_pipeline = review_pipeline
@@ -617,11 +625,7 @@ class VerificationRunner:
         policy_request = self._policy_request(plan, check)
         policy_decision = self.policy_engine.enforce(policy_request)
         self._record_policy_trace(policy_request, policy_decision)
-        sandbox_required = (
-            policy_decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
-            or policy_decision.constraints.sandbox_required
-        )
-        if policy_decision.outcome != DecisionOutcome.ALLOW and not sandbox_required:
+        if policy_decision.outcome == DecisionOutcome.DENY:
             self._record_policy_observation(policy_request, policy_decision)
             return self._policy_blocked_result(check, policy_decision)
         command_result = self.command_executor.run(

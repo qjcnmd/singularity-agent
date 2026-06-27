@@ -5,7 +5,7 @@ from typing import Any
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.policy.audit import PolicyAuditWriter
 from singularity.policy.audit import redact_resource_identifier
-from singularity.policy.config import ApprovalMode, PolicyConfig
+from singularity.policy.config import PolicyConfig
 from singularity.policy.models import (
     DecisionOutcome,
     PolicyDecision,
@@ -52,21 +52,6 @@ class PolicyEngine:
             request=request,
             decision=decision,
         )
-        if (
-            decision.outcome == DecisionOutcome.REQUIRE_REVIEW
-            and self.config.approval_mode == ApprovalMode.NON_INTERACTIVE
-        ):
-            decision = decision.model_copy_with(
-                outcome=DecisionOutcome.DENY,
-                reason="Review required but approval mode is non_interactive.",
-            )
-            self.audit.append(request=request, decision=decision)
-            self._emit_policy_trace(
-                TraceEventType.POLICY_BLOCKED,
-                request=request,
-                decision=decision,
-            )
-            return decision
         return decision
 
     def _decide(self, request: PolicyRequest) -> PolicyDecision:
@@ -103,6 +88,11 @@ class PolicyEngine:
                 "rule_ids": decision.rule_ids if decision else [],
                 "approval_required": bool(
                     decision.required_approval if decision else False
+                ),
+                "permission_profile": (
+                    self.config.permission_profile.profile.value
+                    if self.config.permission_profile is not None
+                    else None
                 ),
             },
             ids={

@@ -304,6 +304,7 @@ def _issue_from_mutation_error(exc: MutationError) -> EditIssue:
         "patch_context_not_found": EditFailureCategory.CONTEXT_MISMATCH,
         "patch_context_ambiguous": EditFailureCategory.CONTEXT_MISMATCH,
         "path_denied": EditFailureCategory.PATH_SCOPE,
+        "protected_path_denied": EditFailureCategory.POLICY_DENIED,
         "file_class_denied": EditFailureCategory.POLICY_DENIED,
         "binary_file_denied": EditFailureCategory.POLICY_DENIED,
     }.get(exc.code, EditFailureCategory.MUTATION_FAILED)

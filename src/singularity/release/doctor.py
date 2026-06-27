@@ -134,7 +134,7 @@ def _critical_component_config_check(paths: UserDataPaths) -> ReleaseCheck:
         )
     missing_sections = [
         section
-        for section in ("sandbox", "policy", "model", "provider")
+        for section in ("model", "provider")
         if not isinstance(config.get(section), dict)
     ]
     missing_env = [
@@ -156,7 +156,7 @@ def _critical_component_config_check(paths: UserDataPaths) -> ReleaseCheck:
             "Model/provider environment is incomplete: " + ", ".join(missing_env),
             suggestion="Set these variables before running model-backed commands.",
         )
-    return ReleaseCheck("component_configuration", "ok", "Critical component sections are configured.")
+    return ReleaseCheck("component_configuration", "ok", "Model/provider sections are configured.")
 
 
 def _optional_dependencies_check() -> ReleaseCheck:

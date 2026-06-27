@@ -1,26 +1,22 @@
 from __future__ import annotations
 
 import time
+import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.observability.protocols import TraceEmitterProtocol
-from singularity.policy.config import SecurityMode
-from singularity.policy.models import PolicyDecision
+from singularity.policy import PermissionProfile
 from singularity.sandbox.backends import SandboxBackend, default_sandbox_backends
 from singularity.sandbox.exceptions import SandboxCapabilityError
 from singularity.sandbox.models import (
     SandboxFilesystemMode,
     SandboxNetworkMode,
-    SandboxProfileName,
     SandboxRequest,
     SandboxResult,
     SandboxStatus,
-    SandboxViolation,
-    default_sandbox_profile,
-    new_sandbox_id,
 )
 from singularity.sandbox.trace_recorder import SandboxJsonlTraceRecorder
 
@@ -44,12 +40,14 @@ class SandboxManager:
         *,
         backends: list[SandboxBackend] | None = None,
         trace: SandboxAppendTraceRecorderProtocol | TraceEmitterProtocol | None = None,
-        security_mode: SecurityMode | str = SecurityMode.COMPAT,
+        permission_profile: PermissionProfile | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.backends = backends if backends is not None else default_sandbox_backends()
         self.trace = trace or SandboxJsonlTraceRecorder.create(self.workspace_root)
-        self.security_mode = _security_mode(security_mode)
+        self.permission_profile = permission_profile or PermissionProfile.default_for_workspace(
+            self.workspace_root
+        )
 
     def run(self, request: SandboxRequest) -> SandboxResult:
         self._throw_if_cancelled()
@@ -61,14 +59,33 @@ class SandboxManager:
             request=request,
             summary=f"Sandbox requested for {request.sandbox_id}.",
         )
+        protected_reason = self._protected_path_violation(request)
+        if protected_reason is not None:
+            result = self._blocked(request, protected_reason, started)
+            self._record_trace(
+                prepared=None,
+                result=result,
+                capabilities=None,
+                request=request,
+            )
+            return result
         try:
-            self._apply_policy_constraints(request)
             backend = self._select_backend(request)
             if backend is None:
-                result = self._unavailable(request, "No sandbox backend is registered.", started)
-                self._record_trace(prepared=prepared, result=result, capabilities=None, request=request)
+                result = self._unavailable(
+                    request,
+                    self._backend_unavailable_reason(),
+                    started,
+                    backend_name=self.backends[0].name() if self.backends else "unavailable",
+                )
+                self._record_trace(
+                    prepared=None,
+                    result=result,
+                    capabilities=None,
+                    request=request,
+                )
                 return result
-            capability_violations = self.ensure_capabilities(request, backend)
+            self.ensure_capabilities(request, backend)
             self._throw_if_cancelled()
             prepared = backend.prepare(request)
             self._throw_if_cancelled()
@@ -80,10 +97,7 @@ class SandboxManager:
                 payload={
                     "sandbox_id": prepared.sandbox_id,
                     "backend": prepared.backend_name,
-                    "sandbox_handle": _relative_handle(
-                        prepared.sandbox_root,
-                        self.workspace_root,
-                    ),
+                    "sandbox_handle": _relative_handle(prepared.sandbox_root, self.workspace_root),
                 },
             )
             self._emit_trace(
@@ -93,8 +107,6 @@ class SandboxManager:
                 summary=f"Sandbox command started in {prepared.sandbox_id}.",
             )
             result = backend.run(prepared)
-            if capability_violations:
-                result.violations.extend(capability_violations)
             self._throw_if_cancelled()
             try:
                 backend.cleanup(prepared)
@@ -166,90 +178,42 @@ class SandboxManager:
             )
             return result
 
-    def ensure_capabilities(
-        self,
-        request: SandboxRequest,
-        backend: SandboxBackend,
-    ) -> list[SandboxViolation]:
+    def ensure_capabilities(self, request: SandboxRequest, backend: SandboxBackend) -> None:
         capabilities = backend.capabilities()
-        violations: list[SandboxViolation] = []
         if request.profile.network.require_hard_isolation and not capabilities.network_isolation:
             raise SandboxCapabilityError("Backend cannot enforce required network isolation.")
         if (
             request.profile.network.mode == SandboxNetworkMode.DENIED
             and not capabilities.network_isolation
         ):
-            # Fail-closed: the profile denies network access but the selected
-            # backend cannot enforce network isolation. Refuse to run rather
-            # than silently executing with an unenforced denial.
             raise SandboxCapabilityError(
-                f"Backend {backend.name()} cannot enforce denied network mode; "
-                "network access is not isolated."
+                f"Backend {backend.name()} cannot enforce denied network mode."
             )
         if (
             request.profile.filesystem.mode == SandboxFilesystemMode.READ_ONLY_WORKSPACE
             and not capabilities.readonly_mount
         ):
-            raise SandboxCapabilityError(
-                "Backend cannot enforce read-only workspace; "
-                "write operations would not be blocked."
-            )
-        if request.profile.resources.max_memory_mb is not None and not capabilities.memory_limit:
+            raise SandboxCapabilityError("Backend cannot enforce read-only workspace.")
+        resources = request.profile.resources
+        if (
+            resources.max_memory_mb is not None or resources.memory_limit is not None
+        ) and not capabilities.memory_limit:
             raise SandboxCapabilityError("Backend cannot enforce memory limits.")
-        if request.profile.resources.max_processes is not None and not capabilities.process_limit:
+        if (
+            resources.max_processes is not None or resources.pids_limit is not None
+        ) and not capabilities.process_limit:
             raise SandboxCapabilityError("Backend cannot enforce process limits.")
-        request_checker = getattr(backend, "ensure_request_supported", None)
-        if callable(request_checker):
-            request_checker(request)
-        return violations
 
-    def capability_summary(self, *, approval_mode: str | None = None) -> dict[str, Any]:
+    def capability_summary(self) -> dict[str, Any]:
         backends: dict[str, dict[str, Any]] = {}
-        selected_capabilities: dict[str, Any] | None = None
         for backend in self.backends:
-            if not self._backend_available(backend):
-                continue
-            name = backend.name()
-            capabilities_dict = backend.capabilities().to_dict()
-            backends[name] = capabilities_dict
-            if selected_capabilities is None:
-                # The first available backend is what `_select_backend` would
-                # pick for a default request; report isolation capabilities
-                # based on this selected backend rather than the union of all
-                # available backends.
-                selected_capabilities = capabilities_dict
-        if selected_capabilities is None:
-            hard_isolation = False
-            soft_workspace_isolation = False
-        else:
-            hard_isolation = selected_capabilities.get("network_isolation") is True
-            soft_workspace_isolation = (
-                selected_capabilities.get("copy_on_write") is True
-                or selected_capabilities.get("filesystem_isolation") is True
-            )
-        default_profile = default_sandbox_profile(
-            SandboxProfileName.ISOLATED_VERIFICATION,
-            workspace_root=self.workspace_root,
-        )
+            if self._backend_available(backend):
+                backends[backend.name()] = backend.capabilities().to_dict()
         return {
-            "hard_isolation": hard_isolation,
-            "soft_workspace_isolation": soft_workspace_isolation,
-            "no_isolation": not hard_isolation and not soft_workspace_isolation,
-            "network_blocked": hard_isolation,
-            "write_scope": default_profile.filesystem.mode.value,
-            "approval_mode": approval_mode,
-            "security_mode": self.security_mode.value,
+            "backend_status": "available" if backends else "backend_unavailable",
             "available_backends": sorted(backends),
             "capabilities": backends,
         }
-
-    @staticmethod
-    def _apply_policy_constraints(request: SandboxRequest) -> None:
-        constraints = request.policy_constraints
-        if constraints is None:
-            return
-        if getattr(constraints, "hard_isolation_required", False):
-            request.profile.network.require_hard_isolation = True
 
     def _select_backend(self, request: SandboxRequest) -> SandboxBackend | None:
         first_capability_error: SandboxCapabilityError | None = None
@@ -268,78 +232,32 @@ class SandboxManager:
 
     @staticmethod
     def _backend_available(backend: SandboxBackend) -> bool:
-        if not hasattr(backend, "is_available"):
+        probe = getattr(backend, "is_available", None)
+        if not callable(probe):
             return True
         try:
-            return bool(backend.is_available())
+            return bool(probe())
         except Exception:
             return False
 
+    def _backend_unavailable_reason(self) -> str:
+        reasons: list[str] = []
+        for backend in self.backends:
+            doctor = getattr(backend, "doctor", None)
+            if callable(doctor):
+                try:
+                    report = doctor()
+                    reason = getattr(report, "reason", None)
+                    if reason:
+                        reasons.append(str(reason))
+                except Exception as exc:
+                    reasons.append(f"{backend.name()}: capability probe failed: {exc}")
+        if reasons:
+            return "; ".join(reasons)
+        return "backend_unavailable: no available OS sandbox backend is registered."
+
     def shutdown(self) -> None:
         return None
-
-    def build_request_from_policy(
-        self,
-        command_request: Any,
-        policy_decision: PolicyDecision,
-        *,
-        session_id: str,
-        task_id: str,
-        action_id: str,
-        profile_name: SandboxProfileName | str | None = None,
-        cwd: Path,
-    ) -> SandboxRequest:
-        profile = default_sandbox_profile(
-            profile_name or self._profile_name(command_request),
-            workspace_root=self.workspace_root,
-        )
-        constraints = policy_decision.constraints
-        if constraints.max_duration_seconds is not None:
-            profile.resources.timeout_seconds = constraints.max_duration_seconds
-        if constraints.max_output_chars is not None:
-            profile.resources.max_output_chars = constraints.max_output_chars
-        filesystem_mode = str(constraints.filesystem_mode or "")
-        if filesystem_mode in SandboxFilesystemMode._value2member_map_:
-            profile.filesystem.mode = SandboxFilesystemMode(filesystem_mode)
-        elif filesystem_mode in {"copy_on_write", "workspace_copy", "copy_on_write_workspace"}:
-            profile.filesystem.mode = SandboxFilesystemMode.COPY_ON_WRITE_WORKSPACE
-        elif filesystem_mode in {"read_only", "readonly", "read_only_workspace"}:
-            profile.filesystem.mode = SandboxFilesystemMode.READ_ONLY_WORKSPACE
-        elif filesystem_mode in {"empty", "empty_temp_workspace"}:
-            profile.filesystem.mode = SandboxFilesystemMode.EMPTY_TEMP_WORKSPACE
-        if profile.filesystem.mode == SandboxFilesystemMode.COPY_ON_WRITE_WORKSPACE:
-            profile.filesystem.detect_changes = True
-        if constraints.network_allowed:
-            profile.network.mode = SandboxNetworkMode.ALLOWED
-        elif getattr(constraints, "hard_isolation_required", False):
-            profile.network.require_hard_isolation = True
-        elif (
-            self.security_mode == SecurityMode.STRICT
-            and constraints.sandbox_required
-        ):
-            profile.network.require_hard_isolation = True
-        if constraints.allowed_hosts:
-            profile.network.allowed_hosts = constraints.allowed_hosts
-        if "hard-network-required" in constraints.allowed_hosts:
-            profile.network.require_hard_isolation = True
-        metadata = {
-            "command_id": getattr(command_request, "command_id", action_id),
-            "purpose": getattr(getattr(command_request, "purpose", None), "value", None),
-        }
-        return SandboxRequest(
-            sandbox_id=new_sandbox_id(),
-            session_id=session_id,
-            task_id=task_id,
-            action_id=action_id,
-            command=command_request.argv if command_request.argv is not None else command_request.shell or "",
-            cwd=cwd,
-            workspace_root=self.workspace_root,
-            profile=profile,
-            policy_decision_id=policy_decision.decision_id,
-            policy_constraints=constraints,
-            reason=policy_decision.reason,
-            metadata=metadata,
-        )
 
     def _unavailable(
         self,
@@ -347,7 +265,7 @@ class SandboxManager:
         reason: str,
         started: float,
         *,
-        backend_name: str = "unavailable",
+        backend_name: str,
     ) -> SandboxResult:
         return SandboxResult(
             sandbox_id=request.sandbox_id,
@@ -360,8 +278,61 @@ class SandboxManager:
             ended_at=_now(),
             duration_ms=int((time.perf_counter() - started) * 1000),
             cleanup_status="not_started",
-            metadata={"error_code": "sandbox_unavailable", "reason": reason},
+            metadata={"error_code": "backend_unavailable", "reason": reason},
         )
+
+    def _blocked(
+        self,
+        request: SandboxRequest,
+        reason: str,
+        started: float,
+    ) -> SandboxResult:
+        return SandboxResult(
+            sandbox_id=request.sandbox_id,
+            backend_name="policy",
+            status=SandboxStatus.POLICY_BLOCKED,
+            exit_code=None,
+            stdout="",
+            stderr=reason,
+            started_at=_now(),
+            ended_at=_now(),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            cleanup_status="not_started",
+            metadata={"error_code": "protected_path_denied"},
+        )
+
+    def _protected_path_violation(self, request: SandboxRequest) -> str | None:
+        candidates: list[tuple[Path, str]] = [(request.cwd, "execute")]
+        for value in (
+            *request.profile.filesystem.writable_paths,
+            *request.profile.filesystem.readonly_paths,
+        ):
+            raw = Path(value).expanduser()
+            path = raw if raw.is_absolute() else request.workspace_root / raw
+            access = "write" if value in request.profile.filesystem.writable_paths else "read"
+            candidates.append((path, access))
+        resources = request.metadata.get("resources")
+        if isinstance(resources, list):
+            for value in resources:
+                if not isinstance(value, str):
+                    continue
+                raw = Path(value).expanduser()
+                candidates.append(
+                    (raw if raw.is_absolute() else request.workspace_root / raw, "execute")
+                )
+        command = request.command if isinstance(request.command, list) else _split_command(request.command)
+        for token in command[1:]:
+            if not _looks_like_path(token):
+                continue
+            raw = Path(token).expanduser()
+            candidates.append(
+                (raw if raw.is_absolute() else request.cwd / raw, "execute")
+            )
+        for path, access in candidates:
+            rule = self.permission_profile.matching_protected_rule(path, access=access)
+            if rule is not None and rule.hard_deny:
+                return "Protected path access denied before sandbox execution."
+        return None
 
     def _record_trace(
         self,
@@ -393,11 +364,7 @@ class SandboxManager:
             request=request,
             result=result,
             summary=f"Sandbox completed with status {result.status.value}.",
-            severity=(
-                TraceSeverity.INFO
-                if result.status == SandboxStatus.SUCCESS
-                else TraceSeverity.WARNING
-            ),
+            severity=(TraceSeverity.INFO if result.status == SandboxStatus.SUCCESS else TraceSeverity.WARNING),
         )
 
     def _emit_trace(
@@ -425,12 +392,8 @@ class SandboxManager:
                 "exit_code": result.exit_code if result else None,
                 "duration_ms": result.duration_ms if result else None,
                 "artifact_count": len(result.artifacts) if result else 0,
-                "changed_files": (
-                    result.filesystem_changes.to_dict() if result else {}
-                ),
-                "violations": [item.to_dict() for item in result.violations]
-                if result
-                else [],
+                "changed_files": result.filesystem_changes.to_dict() if result else {},
+                "violations": [item.to_dict() for item in result.violations] if result else [],
             },
             ids={
                 "session_id": request.session_id if request else None,
@@ -441,30 +404,13 @@ class SandboxManager:
                 "command_id": (request.metadata or {}).get("command_id") if request else None,
             },
             severity=severity,
-            artifact_refs=[
-                artifact.artifact_id for artifact in result.artifacts
-            ]
-            if result
-            else [],
+            artifact_refs=[artifact.artifact_id for artifact in result.artifacts] if result else [],
         )
 
     def _throw_if_cancelled(self) -> None:
         token = getattr(self, "cancellation_token", None)
         if token is not None and hasattr(token, "throw_if_cancelled"):
             token.throw_if_cancelled()
-
-    @staticmethod
-    def _profile_name(command_request: Any) -> SandboxProfileName:
-        purpose = getattr(getattr(command_request, "purpose", None), "value", "")
-        if purpose in {"PROJECT_VERIFICATION", "LINT", "TYPECHECK", "FORMAT_CHECK", "BUILD"}:
-            return SandboxProfileName.ISOLATED_VERIFICATION
-        if purpose == "CODE_GENERATION":
-            return SandboxProfileName.GENERATED_CODE
-        if purpose == "PACKAGE_MANAGER":
-            return SandboxProfileName.PACKAGE_OPERATION
-        if purpose == "LONG_RUNNING":
-            return SandboxProfileName.LONG_RUNNING_SERVICE
-        return SandboxProfileName.READONLY_ANALYSIS
 
 
 def _now() -> str:
@@ -475,17 +421,28 @@ def _is_cancellation_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "CancellationError" and getattr(exc, "code", None) == "cancelled"
 
 
-def _security_mode(value: SecurityMode | str) -> SecurityMode:
-    if isinstance(value, SecurityMode):
-        return value
-    try:
-        return SecurityMode[str(value).upper()]
-    except KeyError:
-        return SecurityMode(str(value))
-
-
 def _relative_handle(path: Path, root: Path) -> str:
     try:
         return path.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix() or "."
     except ValueError:
         return path.name
+
+
+def _split_command(command: str) -> list[str]:
+    try:
+        return shlex.split(command, posix=False)
+    except ValueError:
+        return command.split()
+
+
+def _looks_like_path(value: str) -> bool:
+    token = value.strip("'\";,()[]{}")
+    if not token or token.startswith("-") or "://" in token:
+        return False
+    normalized = token.replace("\\", "/")
+    return (
+        "/" in normalized
+        or normalized.startswith(".")
+        or Path(token).suffix.lower()
+        in {".env", ".json", ".pem", ".key", ".pfx", ".p12"}
+    )

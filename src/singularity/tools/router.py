@@ -80,7 +80,6 @@ class ToolRouter:
         task_state: Any | None = None,
         policy_profile: str | None = None,
         sandbox_mode: str | None = None,
-        security_mode: str | None = None,
         active_user_constraints: list[str] | None = None,
         workspace_state: dict[str, Any] | None = None,
     ) -> ToolExposureDecision:
@@ -88,7 +87,6 @@ class ToolRouter:
         factors = {
             "policy_profile": policy_profile,
             "sandbox_mode": sandbox_mode,
-            "security_mode": security_mode,
             "active_user_constraints": constraints,
             "workspace_state_keys": sorted((workspace_state or {}).keys()),
         }
@@ -107,7 +105,6 @@ class ToolRouter:
                 workspace_state=workspace_state or {},
                 policy_profile=policy_profile,
                 sandbox_mode=sandbox_mode,
-                security_mode=security_mode,
             )
             if record is None:
                 selected.append(spec.name)
@@ -138,19 +135,15 @@ class ToolRouter:
         workspace_state: dict[str, Any],
         policy_profile: str | None,
         sandbox_mode: str | None,
-        security_mode: str | None,
     ) -> ToolExposureRecord | None:
         del task_state
         risk_category = _risk_category(spec)
         factors = {
             "policy_profile": policy_profile,
             "sandbox_mode": sandbox_mode,
-            "security_mode": security_mode,
         }
         if not spec.enabled:
             return _record(spec, "tool_disabled", risk_category, phase, "registry", factors)
-        if _security_blocks(spec, security_mode):
-            return _record(spec, "blocked_by_security_mode", risk_category, phase, "security", factors)
         if _sandbox_blocks(spec, sandbox_mode):
             return _record(spec, "blocked_by_sandbox_mode", risk_category, phase, "sandbox", factors)
         if _constraint_blocks_write(spec, constraints, workspace_state):
@@ -209,10 +202,6 @@ def _risk_category(spec: ToolSpec) -> str:
     if spec.permission_level == PermissionLevel.SHELL:
         return "verification" if "verification" in spec.name else "command"
     return "read_only"
-
-
-def _security_blocks(spec: ToolSpec, security_mode: str | None) -> bool:
-    return security_mode in {"read_only", "no_mutation"} and spec.permission_level == PermissionLevel.WRITE
 
 
 def _sandbox_blocks(spec: ToolSpec, sandbox_mode: str | None) -> bool:

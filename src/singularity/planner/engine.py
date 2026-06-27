@@ -811,7 +811,7 @@ class Planner:
         exit_code = command.get("exit_code")
         if status == "backend_unavailable":
             return "[sandbox] command blocked: backend cannot enforce required isolation."
-        return f"[sandbox] {prefix} in isolated copy-on-write workspace via {backend}, exit_code={exit_code}."
+        return f"[sandbox] {prefix} under native OS sandbox enforcement via {backend}, exit_code={exit_code}."
 
     def record_sandbox_capability(self, snapshot: dict[str, Any]) -> None:
         self._throw_if_cancelled()
@@ -834,7 +834,6 @@ class Planner:
             "reason": observation.get("reason"),
             "risk_level": observation.get("risk_level"),
             "resource": observation.get("resource"),
-            "decision_id": observation.get("decision_id"),
         }
         if payload not in self.evidence.policy_observations:
             self.evidence.policy_observations.append(payload)
@@ -847,7 +846,7 @@ class Planner:
         self._record_event(
             decision="policy_observation",
             reason=str(payload.get("reason") or "Policy observation recorded."),
-            evidence_refs=[str(payload.get("decision_id"))] if payload.get("decision_id") else [],
+            evidence_refs=[],
             extra={"policy_observation": payload},
         )
 
@@ -1558,7 +1557,6 @@ class Planner:
         *,
         policy_profile: str | None = None,
         sandbox_mode: str | None = None,
-        security_mode: str | None = None,
         workspace_state: dict[str, Any] | None = None,
     ) -> ToolExposureDecision:
         self._throw_if_cancelled()
@@ -1585,7 +1583,6 @@ class Planner:
             task_state=state,
             policy_profile=policy_profile,
             sandbox_mode=sandbox_mode or _sandbox_mode(state.sandbox_capability),
-            security_mode=security_mode,
             active_user_constraints=self._active_user_constraints(),
             workspace_state=workspace_state,
         )
@@ -1600,7 +1597,6 @@ class Planner:
         tool_specs: list[ToolSpec] | None = None,
         policy_profile: str | None = None,
         sandbox_mode: str | None = None,
-        security_mode: str | None = None,
         workspace_state: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         self._throw_if_cancelled()
@@ -1610,7 +1606,6 @@ class Planner:
                     tool_specs,
                     policy_profile=policy_profile,
                     sandbox_mode=sandbox_mode,
-                    security_mode=security_mode,
                     workspace_state=workspace_state,
                 ).selected_tool_names
             )

@@ -14,12 +14,16 @@ from singularity.kernel.models import CancellationReason
 from singularity.model import MockModelProvider, ModelRunner, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResult, ModelTurnStatus
 from singularity.planner import Planner
 from singularity.review import ReviewPipeline
-from singularity.sandbox import SandboxManager
+from singularity.sandbox import (
+    SandboxManager,
+    SandboxProfileName,
+    SandboxRequest,
+    default_sandbox_profile,
+)
 from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
 from singularity.tools.models import PermissionLevel, ToolResult, ToolSpec
 from singularity.verification import VerificationRunner
-from tests.test_sandbox_manager import sandbox_request
 from tests.tool_executor_helpers import make_test_policy_engine
 
 
@@ -96,7 +100,7 @@ def test_sandbox_manager_checks_cancellation_before_backend(tmp_path: Path) -> N
     component.cancellation_token = _cancelled_token()
 
     with pytest.raises(CancellationError):
-        component.run(sandbox_request(tmp_path))
+        component.run(_sandbox_request(tmp_path))
 
 
 def test_verification_runner_checks_cancellation_before_running_plan(tmp_path: Path) -> None:
@@ -205,3 +209,19 @@ def _cancelled_token() -> CancellationToken:
     token = CancellationToken()
     token.cancel(CancellationReason.USER_INTERRUPTED, "stop")
     return token
+
+
+def _sandbox_request(workspace: Path) -> SandboxRequest:
+    return SandboxRequest(
+        sandbox_id="sandbox_cancel",
+        session_id="session",
+        task_id="task",
+        action_id="action",
+        command=["python", "-c", "print('cancel')"],
+        cwd=workspace,
+        workspace_root=workspace,
+        profile=default_sandbox_profile(
+            SandboxProfileName.ISOLATED_VERIFICATION,
+            workspace_root=workspace,
+        ),
+    )

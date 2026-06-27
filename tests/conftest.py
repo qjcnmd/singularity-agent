@@ -106,11 +106,10 @@ _SLOW_TEST_IDS: set[str] = {
 }
 
 # ---------------------------------------------------------------------------
-# External-dependency tests: require docker/git/network but are fast when
+# External-dependency tests: require OS sandbox/git/network but are fast when
 # available. Separated from "slow" to avoid misleading duration expectations.
 # ---------------------------------------------------------------------------
 _EXTERNAL_FILE_KEYWORDS: tuple[str, ...] = (
-    "sandbox_backend_docker",
     "sandbox_backend_windows",
 )
 
@@ -123,7 +122,6 @@ _EXTERNAL_FILE_STEMS: set[str] = {
 
 # Explicit test name keywords that indicate external dependency.
 _EXTERNAL_TEST_KEYWORDS: tuple[str, ...] = (
-    "real_docker",
     "backend_windows",
 )
 
@@ -131,7 +129,7 @@ _EXTERNAL_TEST_KEYWORDS: tuple[str, ...] = (
 # Integration-dense files: tests that wire real subsystems together but are
 # not caught by the integration-directory / "integration" keyword heuristics.
 # These are tests doing agent simulation, component.run(), subprocess,
-# multiprocessing, threading, or real git/Docker/network wiring.
+# multiprocessing, threading, or real git/network wiring.
 # ---------------------------------------------------------------------------
 _INTEGRATION_FILE_STEMS: set[str] = {
     # Agent simulation (full AgentLoop wiring with MockProvider)
@@ -161,12 +159,10 @@ _INTEGRATION_FILE_STEMS: set[str] = {
     "test_workspace_lock",
     "test_span_manager",
     "test_test_impact",
-    # Real external dependencies (git / Docker / network)
+    # Real external dependencies (git / OS sandbox / network)
     "test_git_client",
     "test_sandbox_manager",
-    "test_sandbox_backend_docker",
     "test_sandbox_backend_windows",
-    "test_sandbox_backend_local",
     "test_sandbox_environment",
     "test_sandbox_filesystem",
     "test_sandbox_models",
@@ -343,7 +339,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         if item.nodeid in _SLOW_TEST_IDS:
             _add_marker(item, "slow")
 
-        # --- external: docker/git/network dependency ---
+        # --- external: platform/git/network dependency ---
         file_str = str(item.fspath)
         name = item.name
         if (

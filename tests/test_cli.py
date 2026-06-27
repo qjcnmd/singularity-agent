@@ -91,9 +91,10 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
     config_dir = tmp_path / ".singularity"
     config_dir.mkdir()
     (config_dir / "config.toml").write_text(
-        "max_turns = 4\napproval_mode = \"review_all\"\n",
+        "max_turns = 4\n[permissions]\nprofile = \"workspace-write\"\n",
         encoding="utf-8",
     )
+    extra_dir = tmp_path / "shared"
 
     class FakeWorkspaceState:
         baseline = None
@@ -161,7 +162,23 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
 
-    result = runner.invoke(app, ["hello", "--dry-run"])
+    result = runner.invoke(
+        app,
+        [
+            "hello",
+            "--dry-run",
+            "--permission-profile",
+            "read-only",
+            "--approval-policy",
+            "never",
+            "--network-access",
+            "allowed",
+            "--add-dir",
+            str(extra_dir),
+            "--windows-sandbox",
+            "elevated",
+        ],
+    )
 
     assert result.exit_code == 0
     assert ("boot", {"goal": "hello"}) in calls
@@ -173,6 +190,11 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
     )
     assert bootstrap_config.max_turns == 4
     assert bootstrap_config.dry_run is True
+    assert bootstrap_config.permission_profile.value == "read-only"
+    assert bootstrap_config.approval_policy.value == "never"
+    assert bootstrap_config.network_access.value == "allowed"
+    assert bootstrap_config.additional_writable_directories == (extra_dir.resolve(),)
+    assert bootstrap_config.windows_sandbox == "elevated"
     assert bootstrap_config.config_sources["max_turns"] == "config:.singularity/config.toml"
     assert bootstrap_config.config_sources["dry_run"] == "cli"
     assert "final report" in result.output

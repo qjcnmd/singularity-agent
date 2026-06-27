@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from typer.testing import CliRunner
+from typer.main import get_command
 
 from singularity.agent_loop import AgentLoopStatus
 from singularity.cli import app
@@ -25,7 +26,7 @@ from singularity.model import (
 from singularity.observability import TraceRecorder
 from singularity.observability.artifacts import TraceArtifactStore
 from singularity.observability.models import TraceArtifactKind
-from singularity.policy import ApprovalMode, DecisionOutcome, SecurityMode
+from singularity.policy import DecisionOutcome
 from singularity.tool_protocol.models import (
     ToolCallEnvelope,
     ToolCallPhase,
@@ -53,38 +54,56 @@ from tests.tool_executor_helpers import make_test_policy_engine
 
 
 def test_cli_help_exposes_production_baseline_options_without_legacy_copy() -> None:
-    result = CliRunner().invoke(app, ["main", "--help"], terminal_width=220)
+    result = CliRunner().invoke(app, ["main", "--help"], terminal_width=400)
 
     assert result.exit_code == 0
     output = result.output
     assert "production-oriented local CLI coding agent harness" in output
     assert "minimal" not in output.lower()
     assert "read-only agent loop" not in output.lower()
+    command = get_command(app).commands["main"]
+    option_names = {
+        option
+        for parameter in command.params
+        for option in (
+            *getattr(parameter, "opts", ()),
+            *getattr(parameter, "secondary_opts", ()),
+        )
+    }
     for option in [
         "--max-turns",
         "--profile",
-        "--approval-mode",
+        "--permission-profile",
+        "--approval-policy",
+        "--network-access",
+        "--add-dir",
+        "--windows-sandbox",
         "--trace-dir",
         "--context-db",
         "--model",
         "--base-url",
         "--raw-artifacts",
-        "--no-raw-artif",
+        "--no-raw-artifacts",
         "--resume",
         "--dry-run",
         "--strict",
-        "--security-mode",
     ]:
-        assert option in output
+        assert option in option_names
+    assert "--approval-mode" not in option_names
+    assert "--security-mode" not in option_names
 
 
 def test_production_config_maps_cli_policy_and_model_overrides(tmp_path: Path) -> None:
+    extra = tmp_path / "shared"
     config = ProductionConfig.from_cli(
         project_root=tmp_path,
         max_turns=3,
         profile="local-dev",
-        approval_mode="read_only",
-        security_mode="compat",
+        permission_profile="read-only",
+        approval_policy="never",
+        network_access="allowed",
+        additional_writable_directories=[extra],
+        windows_sandbox="elevated",
         strict=True,
         dry_run=True,
         trace_dir=tmp_path / "traces",
@@ -97,8 +116,11 @@ def test_production_config_maps_cli_policy_and_model_overrides(tmp_path: Path) -
 
     assert config.max_turns == 3
     assert config.profile == "local-dev"
-    assert config.approval_mode == ApprovalMode.READ_ONLY
-    assert config.security_mode == SecurityMode.COMPAT
+    assert config.permission_profile.value == "read-only"
+    assert config.approval_policy.value == "never"
+    assert config.network_access.value == "allowed"
+    assert config.additional_writable_directories == (extra.resolve(),)
+    assert config.windows_sandbox == "elevated"
     assert config.strict is True
     assert config.dry_run is True
     assert config.trace_dir == tmp_path / "traces"
@@ -107,8 +129,11 @@ def test_production_config_maps_cli_policy_and_model_overrides(tmp_path: Path) -
     assert config.base_url == "https://example.test/v1"
     assert config.raw_artifacts is False
     assert config.resume_session == "session_1"
-    assert config.to_policy_config().approval_mode == ApprovalMode.READ_ONLY
-    assert config.to_policy_config().security_mode == SecurityMode.COMPAT
+    permission_profile = config.to_permission_profile()
+    assert permission_profile.profile.value == "read-only"
+    assert permission_profile.approval_policy.value == "never"
+    assert permission_profile.network_access.value == "allowed"
+    assert permission_profile.additional_writable_directories == (extra.resolve(),)
     model_config = config.to_model_runner_config()
     assert model_config.default_model == "override-model"
     assert model_config.providers["openai_compatible"]["base_url"] == "https://example.test/v1"
@@ -124,11 +149,19 @@ def test_production_config_merges_cli_env_config_and_defaults(
     (config_dir / "config.toml").write_text(
         """
 max_turns = 4
-approval_mode = "review_all"
-security_mode = "compat"
 model = "config-model"
 base_url = "https://config.example/v1"
 raw_artifacts = true
+
+[permissions]
+profile = "read-only"
+approval_policy = "never"
+network_access = "allowed"
+additional_writable_directories = ["../shared"]
+protected_paths = ["secrets/**"]
+
+[permissions.windows]
+implementation = "elevated"
 
 [project_index]
 enabled = false
@@ -144,14 +177,22 @@ max_files = 123
 
     config = ProductionConfig.from_cli(
         project_root=tmp_path,
-        approval_mode="read_only",
-        cli_overrides={"approval_mode"},
+        permission_profile="danger-full-access",
+        cli_overrides={"permission_profile"},
     )
     effective = config.effective_config()
 
     assert config.max_turns == 6
-    assert config.approval_mode == ApprovalMode.READ_ONLY
-    assert config.security_mode == SecurityMode.COMPAT
+    assert config.permission_profile.value == "danger-full-access"
+    assert config.approval_policy.value == "never"
+    assert config.network_access.value == "allowed"
+    assert config.additional_writable_directories == ((tmp_path / "../shared").resolve(),)
+    assert config.windows_sandbox == "elevated"
+    assert config.protected_paths == ("secrets/**",)
+    assert any(
+        rule.pattern == "secrets/**"
+        for rule in config.to_permission_profile().protected_paths
+    )
     assert config.model == "env-model"
     assert config.base_url == "https://config.example/v1"
     assert config.raw_artifacts is True
@@ -159,8 +200,8 @@ max_files = 123
     assert config.project_index_build_on_boot is False
     assert config.project_index_max_files == 123
     assert effective["sources"]["max_turns"] == "env:SINGULARITY_MAX_TURNS"
-    assert effective["sources"]["approval_mode"] == "cli"
-    assert effective["sources"]["security_mode"] == "config:.singularity/config.toml"
+    assert effective["sources"]["permission_profile"] == "cli"
+    assert effective["sources"]["approval_policy"] == "config:.singularity/config.toml"
     assert effective["sources"]["base_url"] == "config:.singularity/config.toml"
     assert effective["sources"]["dry_run"] == "default"
     assert "api_key" not in json.dumps(effective).lower()

@@ -27,7 +27,7 @@ from singularity.evaluation.models import (
 from singularity.evaluation.store import GoldenTaskStore
 from singularity.interaction import InteractionMode
 from singularity.observability.redaction import TraceRedactor
-from singularity.policy import ApprovalMode, SecurityMode
+from singularity.policy.permissions import ApprovalPolicy, NetworkAccess, PermissionProfileName
 
 
 EVALUATION_TASK_SET_SCHEMA_VERSION = "evaluation.task_set/v1"
@@ -143,14 +143,13 @@ class EvaluationTask:
             raise ValueError(f"evaluation task {self.task_id} requires success.")
         if self.tool_policy not in {"read_write", "read_only", "review_all", "non_interactive"}:
             raise ValueError(f"evaluation task {self.task_id} has unsupported tool_policy.")
-        if self.strategy.get("approval_mode") and str(self.strategy["approval_mode"]).lower() not in {
-            "auto_safe",
-            "read_only",
-            "review_all",
-            "non_interactive",
-            "interactive",
-        }:
-            raise ValueError(f"evaluation task {self.task_id} has unsupported strategy.approval_mode.")
+        removed = {"approval_mode", "security_mode"} & set(self.strategy)
+        if removed:
+            names = ", ".join(sorted(removed))
+            raise ValueError(f"evaluation task {self.task_id} uses removed strategy fields: {names}.")
+        _permission_profile_for_task(self)
+        _approval_policy_for_task(self)
+        _network_access_for_task(self)
         if self.workspace.kind == "repo" and not self.workspace.start_commit and not self.prepare_commands:
             raise ValueError(f"evaluation repo task {self.task_id} requires start_commit or prepare_command.")
 
@@ -519,8 +518,9 @@ class EvaluationRunner:
                 model=self.model,
                 base_url=self.base_url,
                 env_root=self.env_root,
-                approval_mode=_approval_mode_for_task(task),
-                security_mode=_security_mode_for_task(task),
+                permission_profile=_permission_profile_for_task(task),
+                approval_policy=_approval_policy_for_task(task),
+                network_access=_network_access_for_task(task),
                 interaction_mode=InteractionMode.NON_INTERACTIVE,
                 raw_artifacts=False,
                 profile=f"evaluation:{task.task_id}:{task.tool_policy}",
@@ -528,8 +528,9 @@ class EvaluationRunner:
                     "max_turns",
                     "model",
                     "base_url",
-                    "approval_mode",
-                    "security_mode",
+                    "permission_profile",
+                    "approval_policy",
+                    "network_access",
                     "interaction_mode",
                     "raw_artifacts",
                     "profile",
@@ -1301,10 +1302,10 @@ def _reproducible_environment(
         },
         "policy": {
             "tool_policy": task.tool_policy,
-            "approval_mode": config.approval_mode.value,
-            "security_mode": config.security_mode.value,
+            "permission_profile": config.permission_profile.value,
+            "approval_policy": config.approval_policy.value,
+            "network_access": config.network_access.value,
             "interaction_mode": config.interaction_mode.value,
-            "sandbox_strategy": task.strategy.get("sandbox_strategy") or config.security_mode.value,
         },
         "baseline_artifacts": {
             "baseline_result_path": str(baseline_result_path) if baseline_result_path else None,
@@ -1389,15 +1390,23 @@ def _infrastructure_blocked(agent_result: Any, *, usage: dict[str, Any], tool_ca
     return any(marker in answer for marker in ("winerror 10013", "network", "socket", "访问权限不允许"))
 
 
-def _approval_mode_for_task(task: EvaluationTask) -> ApprovalMode:
-    value = str(task.strategy.get("approval_mode") or "").strip().lower()
+def _permission_profile_for_task(task: EvaluationTask) -> PermissionProfileName:
+    value = str(task.strategy.get("permission_profile") or "").strip().lower()
     if not value:
-        value = {
-            "read_only": "read_only",
-            "review_all": "review_all",
-            "non_interactive": "non_interactive",
-        }.get(task.tool_policy, "auto_safe")
-    return _approval_mode(value)
+        value = "read-only" if task.tool_policy == "read_only" else "workspace-write"
+    return PermissionProfileName(value)
+
+
+def _approval_policy_for_task(task: EvaluationTask) -> ApprovalPolicy:
+    value = str(task.strategy.get("approval_policy") or "").strip().lower()
+    if not value:
+        value = "on-request" if task.tool_policy == "review_all" else "never"
+    return ApprovalPolicy(value)
+
+
+def _network_access_for_task(task: EvaluationTask) -> NetworkAccess:
+    value = str(task.strategy.get("network_access") or "denied").strip().lower()
+    return NetworkAccess(value)
 
 
 def _apply_benchmark_constraints(kernel: Any, task: EvaluationTask) -> None:
@@ -1416,21 +1425,6 @@ def _apply_benchmark_constraints(kernel: Any, task: EvaluationTask) -> None:
             "verification_command": verification_command,
         }
     )
-
-
-def _security_mode_for_task(task: EvaluationTask) -> SecurityMode:
-    value = str(task.strategy.get("security_mode") or "").strip().lower() or "compat"
-    try:
-        return SecurityMode[value.upper()]
-    except KeyError:
-        return SecurityMode(value)
-
-
-def _approval_mode(value: str) -> ApprovalMode:
-    try:
-        return ApprovalMode[value.upper()]
-    except KeyError:
-        return ApprovalMode(value)
 
 
 def _agent_status(agent_result: Any) -> str:
