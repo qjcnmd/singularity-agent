@@ -7,12 +7,12 @@ Singularity 测试体系按 pytest marker 分为以下层级：
 | Marker | 测试数 | 说明 | 默认是否运行 |
 |--------|--------|------|-------------|
 | `smoke` | 25 | 核心路径烟雾测试，覆盖 CLI/Context/Planner/Policy/Tool/Verification | ❌ 显式运行 |
-| `unit` | ~626 | 纯函数/类测试，最小化跨组件依赖 | ✅ |
-| `integration` | ~185 | 多组件集成测试，真实子系统连线 | ✅ |
-| `regression` | ~68 | 生产基线、文档一致性、schema 稳定性守卫 | ✅ |
-| `security` | ~54 | 信任边界、脱敏、注入、密钥安全测试 | ✅ |
+| `unit` | 639 | 纯函数/类测试，最小化跨组件依赖 | ✅ |
+| `integration` | 162 | 多组件集成测试，真实子系统连线 | ✅ |
+| `regression` | 68 | 生产基线、文档一致性、schema 稳定性守卫 | ✅ |
+| `security` | 54 | 信任边界、脱敏、注入、密钥安全测试 | ✅ |
 | `flaky` | 4 | 已知偶发失败测试（默认仍运行，见下方处理策略） | ✅ |
-| `evaluation` | ~58 | 评估基础设施：评分、回放、benchmark harness | ❌ 显式运行 |
+| `evaluation` | 58 | 评估基础设施：评分、回放、benchmark harness | ❌ 显式运行 |
 | `slow` | 9 | 真正慢的测试（>5s），agent loop 模拟/并发 | ❌ 显式运行 |
 | `external` | 16 | 依赖外部资源（Docker/git/network），实际很快 | ❌ 显式运行 |
 | `provider_eval` | 1 | 需真实模型 provider 的烟雾测试 | ❌ 显式运行 |
@@ -111,11 +111,11 @@ python -m singularity.cli eval run docs/evaluation/capability-regression-tasks.j
 | 烟雾测试 | `python -m pytest -m smoke` | 25 | ~3s |
 | 默认（提交前） | `python -m pytest` | 906 | ~2.5min |
 | 全量（release） | `python -m pytest -m "not provider_eval"` | 990 | ~3.5min |
-| 单元测试 | `python -m pytest -m unit` | ~626 | ~3.5min |
-| 集成测试 | `python -m pytest -m integration` | ~185 | ~30s |
-| 安全测试 | `python -m pytest -m security` | ~54 | ~11s |
-| 回归测试 | `python -m pytest -m regression` | ~68 | ~13s |
-| 评估测试 | `python -m pytest -m evaluation` | ~58 | ~34s |
+| 单元测试 | `python -m pytest -m unit` | 639 | ~3.5min |
+| 集成测试 | `python -m pytest -m integration` | 162 | ~30s |
+| 安全测试 | `python -m pytest -m security` | 54 | ~11s |
+| 回归测试 | `python -m pytest -m regression` | 68 | ~13s |
+| 评估测试 | `python -m pytest -m evaluation` | 58 | ~34s |
 | 慢测试 | `python -m pytest -m slow` | 9 | ~30s |
 | 外部依赖 | `python -m pytest -m external` | 16 | ~4s |
 | 真实 provider | `SINGULARITY_RUN_PROVIDER_EVAL=1 python -m pytest -m provider_eval` | 1 | 需 .env |
