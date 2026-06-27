@@ -47,15 +47,18 @@ sg = "singularity.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not evaluation and not provider_eval and not slow'"
+addopts = "-m 'not evaluation and not provider_eval and not slow and not external'"
 markers = [
+    "smoke: core path smoke tests that complete in <30s",
     "unit: pure function/class tests with minimal or no cross-component wiring",
     "integration: multi-component tests that wire real subsystems together",
     "regression: production baseline, docs consistency, and schema stability guards",
     "security: trust boundary, redaction, injection, and secret safety tests",
     "evaluation: evaluation harness, scoring, replay, and benchmark infrastructure tests",
     "provider_eval: opt-in tests that call a real configured model provider",
-    "slow: tests that take >5s or require external resources (docker, git, network)",
+    "slow: tests that take >5s due to concurrency or multi-turn agent simulation",
+    "external: tests requiring external resources (docker, git, network) but fast when available",
+    "flaky: tests with known intermittent failures; see docs/testing.md for handling",
 ]
 norecursedirs = [
     ".git",
