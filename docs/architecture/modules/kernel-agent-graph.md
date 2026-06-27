@@ -43,11 +43,15 @@ Kernel 层负责启动配置、trace、workspace lock、组件图、健康检查
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `KernelBootstrap.boot()` -> `AgentGraphBuilder.build()` -> `AgentKernel.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()`。失败时 `KernelBootstrapError` 或 `KernelError` 携带 final report / diagnostics。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`KernelBootstrap.boot()` -> `AgentGraphBuilder.build()` 先生成对象 `RunIdentity`、`KernelContext` 和 `AgentGraph`，并把 trace、policy、sandbox、tools、model、context、planner 按 initialization order 放入 graph。`AgentKernel.run_task()` 读取 `KernelContext.run/session`，创建 `AgentLoop.run()` 并消费返回的 `AgentLoopResult`；`RunLifecycleManager` 生成 `AgentRun`、`AgentSession` 和 `LifecycleEvent`，这些 lifecycle event 写入 trace `events.jsonl`。构图失败抛 `AgentGraphInitializationError` 并由 `KernelBootstrapError` 携带 diagnostics；运行失败由 kernel finalization 写 final report/trace，而不是写入模型请求。
 
 ## 真实对象完整结构
 

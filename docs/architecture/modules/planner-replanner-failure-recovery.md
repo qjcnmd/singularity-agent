@@ -51,12 +51,15 @@ Planner 层维护任务状态、阶段、行动、证据、预算、重规划决
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `AgentLoop.run()` -> `planner.step()` -> tool/model/verification outcomes 写入 `EvidenceLedger` -> `RunController` reduce outcome -> `Planner.replan()` 或 `Planner.finalize()`。
 
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`Planner.start_task()` -> `Planner.step()` -> `Planner.update_from_tool_result()` / `update_from_command()` / `update_from_verification()` 先生成对象 `TaskState`、`TaskPhase`、`TaskPlan` 和 `AgentAction`，再把工具、命令和验证结果写入 `EvidenceLedger` 并更新 `ExecutionBudget`；`Planner._persist()` 再把 state/plan/evidence/budget 写入 `.singularity/planner/<session_id>/state.json`、`plan.json`、`evidence.json`、`budget.json`。completion gate 不满足时 `Planner.replan()` 返回 `ReplanDecision`，失败分析的 `RepairReplanSignal` 通过 `Planner.record_failure_analysis()` 进入同一 evidence/report 链。
 ## 真实对象完整结构
 
 - `TaskState（任务状态）` 完整字段列在字段清单中，是 planner 的主状态对象。

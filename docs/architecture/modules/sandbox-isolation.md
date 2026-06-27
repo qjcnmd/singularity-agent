@@ -43,11 +43,15 @@ Sandbox 层根据 profile、filesystem/network/env/resource policy 准备隔离�
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `PolicyDecision` 要求隔离或 command policy 选择 sandbox backend -> `SandboxManager` 创建 `SandboxRequest` -> backend prepare/run/cleanup -> `SandboxResult` -> command result isolation report / trace。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 后运行测试为例：`SandboxManager.build_request_from_policy()` -> `SandboxManager.run()` 先把 `PolicyDecision.constraints` 和 command 参数生成对象 `SandboxRequest`。`SandboxManager._apply_policy_constraints()` 选择 profile 后，backend prepare/run/cleanup 生成 `PreparedSandbox`、`SandboxArtifact`、`SandboxChangeSummary`、`SandboxViolation` 和 `SandboxResult`；`CommandExecutor._result_from_sandbox()` 再把 sandbox stdout/stderr/exit_code 转成 `CommandResult.isolation_report`。sandbox trace 事件写入 `events.jsonl`，artifact 写入 trace artifact store；backend unavailable、policy hard isolation 不满足或 violation 产生 blocked/failed result，不回退为非隔离执行。
 
 ## 真实对象完整结构
 

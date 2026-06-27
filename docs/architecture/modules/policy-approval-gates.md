@@ -40,12 +40,15 @@ Policy 层把组件、能力、资源、风险、约束和人工 approval 统一
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `ToolExecutor` / `CommandExecutor` / `WorkspaceMutationManager` / `VerificationRunner` 创建 `PolicyRequest` -> `PolicyEngine.evaluate()` -> `ApprovalGate` 可选人工授权 -> ledger/audit -> 执行或拒绝。
 
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 时模型请求写文件或跑命令为例：`ToolExecutor._policy_request()` / `CommandExecutor._policy_request()` / `VerificationRunner._policy_request()` -> `PolicyEngine.evaluate()` -> `ApprovalGate.resolve()` 先生成对象 `PolicyRequest`，再读取 subject、resource、risk 和 constraints 返回 `PolicyDecision`。若 decision 是 review，`ApprovalGate.resolve()` 读取或写入 `approval_grants.jsonl` 并生成 `ApprovalGrant`；随后执行器只在 grant 范围匹配时继续。`PolicyAuditWriter.append()` 写入 `audit.jsonl`，`PolicyEngine._emit_policy_trace()` 写 trace event；deny/ask_user/sandbox_required 返回失败或阻塞结果，不会让 handler 继续执行。
 ## 真实对象完整结构
 
 - `PolicyRequest（策略请求）` 完整字段列在字段清单中，生成者是各执行组件。

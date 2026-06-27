@@ -29,11 +29,15 @@ Artifact 层把过长输出、trace 产物、命令日志、diff、报告和模�
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 组件发现长输出或文件产物 -> `TraceArtifactStore.write_text_artifact()` / `write_bytes_artifact()` / `register_file_artifact()` -> `TraceArtifact` -> trace/event/result/report 只引用 artifact id 或 relative handle。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`TraceArtifactStore.write_text_artifact()` / `write_bytes_artifact()` / `register_file_artifact()` -> `TraceRecorder.write_artifact()` -> `TraceStore.append_artifact()` 先生成对象 `TraceArtifact`，再把 artifact 元数据写入 `artifacts.jsonl` 和 `index.json`。`CommandResult.artifact_path`、`ToolProtocolResultEnvelope.raw_result_ref`、`TraceEvent.artifact_refs` 和 `TraceSummary.key_artifacts` 只消费 artifact 引用；`TraceRecorder.context_summary()` 与 `final_report_summary()` 读取这些引用生成摘要，evaluation report 透传 artifact ref，不把长结果原文重新写入模型 context。
 
 ## 真实对象完整结构
 

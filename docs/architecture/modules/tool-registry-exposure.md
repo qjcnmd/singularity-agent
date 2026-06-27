@@ -39,12 +39,15 @@
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `AgentGraphBuilder._build_tools_protocol()` 创建 `ToolRegistry` -> 注册 mutation/edit/command/workspace/code-index/verification/plugin tools -> `AgentLoop` 调用 `tools.openai_tools()` 生成模型可见 schema。
 
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`AgentGraphBuilder._build_tools_protocol()` -> `ToolRegistry.register()` -> `ToolRegistry.list_model_visible()` / `to_openai_tools()` -> `ModelToolRenderer.render()` 先注册内置 read/edit/command/verification/workspace 工具，为每个 `ToolSpec` 生成对象 `RegisteredToolRecord` 和 `ToolOrigin`，再把 admitted/enabled spec 投影成 provider tool schema。插件工具经过 `PluginManager.activate()` 后也以同一入口注册；registry 本体不写 sqlite/jsonl，执行阶段才由 tool protocol 写 `tool_protocol.sqlite3`。重复名、冻结后注册、非法 backend 或 schema 校验失败会抛错或产生 diagnostic，工具不会暴露给模型。
 ## 真实对象完整结构
 
 - `ToolSpec（工具规格）` 完整字段列在字段清单中，生成者是各 register_* 函数或 plugin manager。

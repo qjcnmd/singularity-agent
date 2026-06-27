@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,7 @@ REQUIRED_HEADINGS = {
     "当前源码位置",
     "关键类、函数、字段",
     "真实运行时调用链",
+    "真实任务中的对象流",
     "真实对象完整结构",
     "谁生成这些对象",
     "谁消费这些对象",
@@ -53,6 +55,22 @@ FORBIDDEN_TEMPLATE_PHRASES = {
     "进入 trace / audit 的内容以",
     "失败路径由当前源码中的异常",
     "当前结构仍大量使用字典 payload 连接组件",
+    "关键符号见本文顶部",
+    "真实对象字段见本文顶部",
+    "对象流小节会直接引用这些名字",
+    "字段完整性由脚本校验",
+}
+
+REAL_TASK_FLOW_MARKERS = {
+    "trace",
+    "sqlite",
+    "jsonl",
+    "artifact",
+    "report",
+    "workspace",
+    "context",
+    "audit",
+    "store",
 }
 
 COMPLETE_FIELD_CHECKS = {
@@ -356,6 +374,12 @@ def _verify_doc(doc: ModuleDataFlowDoc, errors: list[str]) -> None:
         if phrase in doc.text:
             errors.append(f"{label}: forbidden template phrase remains: {phrase}")
 
+    flow_section = _extract_section(doc.text, "## 真实任务中的对象流")
+    if not flow_section:
+        errors.append(f"{label}: missing or empty '## 真实任务中的对象流' section")
+    else:
+        _verify_flow_section(label, flow_section, errors)
+
     existing_sources: list[Path] = []
     for source in doc.source_paths:
         source_path = (REPO_ROOT / source).resolve(strict=False)
@@ -492,6 +516,37 @@ def _extract_headings(text: str) -> set[str]:
             heading = heading.split(" (", 1)[0].strip()
         headings.add(heading)
     return headings
+
+
+def _extract_section(text: str, heading: str) -> str:
+    lines = text.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line.strip() == heading:
+            start = index + 1
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if lines[index].startswith("## "):
+            end = index
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+def _verify_flow_section(label: str, section: str, errors: list[str]) -> None:
+    if len(section) < 120:
+        errors.append(f"{label}: '真实任务中的对象流' section is too short")
+    if "->" not in section:
+        errors.append(f"{label}: '真实任务中的对象流' section must include a concrete call chain with '->'")
+    if not re.search(r"[A-Za-z_][A-Za-z0-9_.]*\(", section):
+        errors.append(f"{label}: '真实任务中的对象流' section must mention at least one concrete function or method call")
+    if re.search(r"(生成|消费|写入|落盘|进入|返回|读取)[^。\n]{0,12}(对象|结果|事件|摘要|报告|store|sqlite|jsonl|artifact)", section) is None:
+        errors.append(f"{label}: '真实任务中的对象流' section must describe at least one generation/consumption/persistence step")
+    lowered = section.lower()
+    if not any(marker in lowered for marker in REAL_TASK_FLOW_MARKERS):
+        errors.append(f"{label}: '真实任务中的对象流' section must mention a concrete runtime sink or store")
 
 
 def _symbols_in_sources(paths: list[Path]) -> set[str]:

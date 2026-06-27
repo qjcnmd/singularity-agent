@@ -36,11 +36,15 @@ Trace 层记录运行事件、span、artifact、timeline 和 summary；audit 相
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 各组件调用 `trace.record()` / `trace.emit()` -> `TraceRecorder` redaction -> `TraceStore` 写 events/spans/artifacts -> timeline/summary/final report/evaluation result 引用。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`TraceRecorder.emit()` / `record()` -> `TraceStore.append_event()` 先生成对象 `TraceEvent` 并写入 run 目录 `events.jsonl`；`TraceRecorder.start_span()` / `end_span()` 生成 `TraceSpan` 写入 `spans.jsonl`，`TraceRecorder.write_artifact()` 生成 `TraceArtifact` 写入 `artifacts.jsonl` 和 `index.json`。`TraceStore.get_timeline()` 读取 events/spans 生成 `TraceTimelineItem`，`TraceStore.summarize()` 生成 `TraceSummary`；final report 和 evaluation result 只消费 summary/artifact refs。policy audit 仍由 `PolicyAuditWriter.append()` 写 `audit.jsonl`，trace event 不能替代 audit entry。
 
 ## 真实对象完整结构
 

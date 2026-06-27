@@ -47,11 +47,15 @@ Verification 层发现、计划并执行验证命令，把命令结果转换为 
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `run_verification` tool -> `VerificationToolHandlers.run_verification()` -> `VerificationRunner.plan_verification()` / `run_plan()` -> `CommandExecutor.run()` -> parsers -> `CompletionAssessor.assess()` -> planner evidence -> `Planner.assess_verification_contract_satisfaction()` -> `AgentLoop._attempt_finalize()`。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 后执行验证为例：`VerificationToolHandlers.run_verification()` -> `VerificationRunner.plan_verification()` 先生成对象 `VerificationCheck` 和 verification plan，`VerificationRunner.run_plan()` 调用 `CommandExecutor.run()` 执行命令并生成 `VerificationResult`。`CompletionAssessor.assess()` 消费 result 列表返回 `CompletionAssessment`，同时 tool observation 写入 `context.sqlite3`，planner evidence 写入 `.singularity/planner/<session_id>/evidence.json`。repair contract 场景中，`Planner.assess_verification_contract_satisfaction()` 读取 `VerificationContract` 和 evidence，生成 `StepEvidence` / `ContractSatisfaction`；failed、blocked、skipped 或 command 不在 contract 时返回 `satisfied=False` 并阻止 `AgentLoop._attempt_finalize()` 完成。
 
 ## 真实对象完整结构
 

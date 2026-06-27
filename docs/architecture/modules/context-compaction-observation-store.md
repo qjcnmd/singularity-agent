@@ -33,11 +33,15 @@
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `ContextManager` 写入 context store -> compaction 生成 `ContextSummaryEnvelope` / `ContextSnapshot` -> recovery 读取最近 bundle、工具状态和 planner 状态 -> `AgentLoop` 恢复下一步。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`ObservationStore.append_message()` / `save_observation()` -> `ContextCompactionPlanner.prepare()` 先读取 dialogue/tool observation 并生成对象 `CompactionPlan`。`ContextCompactionExecutor.summary_envelope_for_plan()` 生成 `ContextSummaryEnvelope`，`ContextCompactionCommitter.commit()` 调用 `ObservationStore.compact_items()` / `append_item()` 标记旧 item 并把 summary item 写入 `context.sqlite3`。恢复时 `ContextCompactionCommitter.recover_after_failure()` 和 context recovery 读取 `ContextSnapshot`、pending tool calls 与最后 bundle；失败会写入 failure payload，不伪造已压缩成功的 context。
 
 ## 真实对象完整结构
 

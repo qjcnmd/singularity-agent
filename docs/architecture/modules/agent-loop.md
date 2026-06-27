@@ -24,11 +24,15 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+关键符号和字段清单按源码声明顺序列出，便于和对象流小节对照。
 
 ## 真实运行时调用链
 
 `AgentKernel.run_task()` 构造 `AgentLoop` -> `AgentLoop.run()` -> `RunController.run_loop()` 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`，最后通过 `Planner.finalize()` 或失败 outcome 结束。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`AgentKernel.run_task()` -> `AgentLoop.run()` -> `ModelRunner.build_request_from_context()` 先生成对象 `ModelTurnRequest`，`ModelRunner.run_turn()` 返回 `ModelTurnResult` 后交给 `ToolProtocolEngine.process_model_turn()`。工具结果通过 `ContextManager.add_tool_protocol_result()` 和 `Planner.update_from_tool_result()` 写入 `context.sqlite3`、planner evidence 和 trace 事件；当 completion gate 通过时，`AgentLoop._attempt_finalize()` 调用 `Planner.finalize()` 生成 `FinalReport` 并写入 `final_answer` trace event。若模型失败，`_outcome_from_model_failure()` 归类 provider 错误，`_terminal_result_from_outcome()` 返回带 `error_code` 的 `AgentLoopResult`。
 
 ## 真实对象完整结构
 

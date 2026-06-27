@@ -46,11 +46,15 @@ Memory 与 code index 层为上下文提供项目约定、失败经验、检索�
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `AgentGraphBuilder._build_infra()` 创建 `ProjectIndex` 与 `MemoryLearningPipeline` -> `_prime_planner_context()` 生成 project index observation 与 `MemoryContextBlock` -> `ContextManager` 纳入模型上下文 -> session end 写入候选 memory。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`ProjectIndex.bootstrap()` -> `ProjectIndex.observation_for_goal()` 先生成 project index observation，`MemoryLearningPipeline.retrieve()` -> `MemoryRetriever.search()` 再生成对象 `MemorySearchResult`。`MemoryInjector.build_block()` 把候选 memory 压缩为 `MemoryContextBlock`，由 `ContextAssembler.build_bundle()` 写入模型 context 和 `context.sqlite3` 的 item 引用。任务结束时 `MemoryLearningPipeline.ingest_final_report()`、`ingest_verification_result()`、`ingest_trace_summary()` 生成候选 memory，`MemoryStore` 写入 `.singularity/memory/auto/candidates.jsonl` 或 `entries.jsonl`；过期、模板-only 或低置信记录会被 policy/maintenance 阻止进入 context。
 
 ## 真实对象完整结构
 

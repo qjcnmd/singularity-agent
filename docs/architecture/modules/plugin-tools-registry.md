@@ -56,11 +56,15 @@ Plugin 层发现、校验、启用插件 manifest，并把插件贡献的工具�
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `AgentGraphBuilder._build_tools_protocol()` -> `PluginManager.activate()` -> discovery/loader/permission checks -> `PluginToolContribution.spec` 注册到 `ToolRegistry` -> 模型工具 schema 暴露。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 且插件提供专用工具为例：`discover_plugins()` -> `PluginStatusStore.enabled_for()` -> `PluginLoader.load()` -> `PluginManager.activate()` 先读取 manifest、status 和权限，生成对象 `DiscoveredPlugin`、`PluginStatus`、`PluginLockEntry`、`PluginLoadResult`。通过 policy gate 后，`PluginToolContribution.spec` 被 `ToolRegistry.register()` 消费并生成 `RegisteredToolRecord` / `ToolOrigin`；随后 `ModelToolRenderer.render()` 把 admitted tool 投影为 provider tool schema。插件状态写入 `.singularity/plugin-status.json`，锁写入 `.singularity/plugin-lock.json`，discover/activated/tool_registered/check_failed 写 trace 事件；失败 diagnostic 会阻止注册，而不是暴露半加载工具。
 
 ## 真实对象完整结构
 

@@ -52,11 +52,15 @@
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+关键符号和字段清单按源码声明顺序列出，便于和对象流小节对照。
 
 ## 真实运行时调用链
 
 `AgentLoop.run()` -> `ModelRunner.build_request_from_context()` -> `PromptAssemblyPipeline` -> provider registry -> provider chat/completion -> `ModelRunner.run_turn()` -> `ModelTurnResult` -> tool protocol 或 finalization。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`ModelRunner.build_request_from_context()` -> `ModelTurnRequestBuilder.build_request()` 先把 `ContextBundle`、`PromptBundle`、`ModelToolRenderer.render()` 生成的 `ModelToolSchema`、planner context 和 allowed tool names 生成对象 `ModelTurnRequest`。`ModelRunner.run_turn()` 把 request 投影成 provider payload，只发送 messages、tool schema、tool choice、budget 与必要生成参数；provider 返回后 `ModelRunner._normalize_tool_calls()` 生成 `ModelToolCall`，`_emit_response_received()` 写 trace 事件，`_write_raw_artifact()` 在配置允许时写 redacted raw artifact。`ModelTurnResult.usage` 被 `ContextManager.record_model_usage()` 消费，`tool_calls` 进入 `ToolProtocolEngine.process_model_turn()`，完整 metadata 不写入 provider payload。
 
 ## 真实对象完整结构
 

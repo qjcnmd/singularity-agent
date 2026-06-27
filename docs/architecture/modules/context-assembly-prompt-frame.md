@@ -49,11 +49,15 @@ Context 层把系统提示、用户目标、planner 状态、memory、project in
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `AgentGraphBuilder._build_model_context()` 创建 `ContextManager` -> `AgentLoop.run()` 每 turn 写入 planner/model/tool/verification 观察 -> `ModelRunner.build_request_from_context()` 读取 bundle 并构造 `ModelTurnRequest`。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`ContextManager.add_user_message()`、`add_planner_state()`、`add_tool_protocol_result()` -> `ObservationStore.append_message()` / `append_item()` 先生成对象 `ContextItem` 并写入 `context.sqlite3`。随后 `ModelRunner.build_request_from_context()` -> `ContextAssembler.build_bundle()` -> `PromptAssemblyPipeline.build()` 读取这些 item，生成 `ContextBundle`、`ContextUsageReport`、`PromptBundle` 和 `PromptManifest`，再映射为 `ModelTurnRequest.messages`。溢出时 `ContextAssembler.needs_compression()` 触发 compaction；失败返回 `ContextOverflowError` 或带 excluded item 的 usage report，不把所有 context 无界送入 provider。
 
 ## 真实对象完整结构
 

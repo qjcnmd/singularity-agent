@@ -56,11 +56,15 @@
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `AgentLoop` 收到 `ModelTurnResult.tool_calls` -> `ToolProtocolValidator.validate_assistant_message()` -> `ToolProtocolScheduler.schedule()` -> `ToolProtocolEngine.process_model_turn()` -> `ToolExecutor.execute_request()` -> `ToolProtocolResultBuilder.build()` -> `ContextManager.add_tool_protocol_result()` -> 后续模型 turn。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 为例：`ToolProtocolEngine.process_model_turn()` -> `ToolProtocolValidator.validate_assistant_message()` 先把 `ModelTurnResult.tool_calls` 生成对象 `ToolCallEnvelope` 和 `ToolCallBatch`，再由 `ToolProtocolScheduler.schedule()` 生成 `ToolExecutionPlan`。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 并返回 `ToolResult`，`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`；`ToolProtocolStateStore.upsert_record()`、`transition()`、`append_event()` 和 `bind_result()` 把 batch、record、event、binding 写入 `tool_protocol.sqlite3`。`ContextManager.add_tool_protocol_result()` 把安全 tool message 写入 `context.sqlite3`，raw result 只通过 artifact ref/digest 进入 trace。
 
 ## 真实对象完整结构
 

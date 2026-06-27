@@ -38,11 +38,15 @@ Evaluation runner 读取 task set manifest，在隔离 workspace 中启动真实
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `python -m singularity.cli eval run <manifest>` -> `EvaluationTaskSet.from_dict()` -> `EvaluationRunner.run()` -> per task `KernelBootstrap.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()` -> verification workspace checks -> `EvaluationTaskResult.to_dict()` -> result/report artifacts。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 的 evaluation task 为例：`load_evaluation_task_set()` -> `EvaluationRunner.run()` -> `EvaluationRunner.run_task()` 先从 manifest 生成对象 `EvaluationTaskSet` 和 `EvaluationTask`，再由 `_materialize_workspace()` 创建 task `workspace`、`baseline-workspace` 和 `verification-workspace`。`KernelBootstrap.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()` 执行真实 agent 后，runner 读取 trace summary、final report、changed files 和 public/hidden verification，生成 `EvaluationTaskResult`。汇总阶段把结果写入 `<run_dir>/result.json`、`report.json`、`report.md`，clean verification workspace 失败时写错误并返回失败结果。
 
 ## 真实对象完整结构
 

@@ -45,11 +45,15 @@
 
 ## 关键类、函数、字段
 
-关键符号见本文顶部 `关键符号:`。真实对象字段见本文顶部 `字段清单:`，字段顺序按源码声明顺序排列。
+本文顶部列出源码证据路径、关键符号和完整字段清单；下文对象流只引用这些真实源码对象。
 
 ## 真实运行时调用链
 
 `AgentLoop._maybe_analyze_failure()` -> `FailureAnalysisRequest.from_planner()` -> `FailureAnalyzer.analyze()` -> `RepairPlanner.plan()` -> `RepairPlanner.to_replan_signal()` -> `Planner.record_failure_analysis()` -> `Planner.replan()`。
+
+## 真实任务中的对象流
+
+以用户要求修复 `quicksort.py` 后验证失败为例：`AgentLoop._maybe_analyze_failure()` -> `FailureAnalysisRequest.from_planner()` 先从 planner evidence、recent tail、changed files 和 outcome 生成对象 `FailureAnalysisRequest`。`FailureAnalyzer.analyze()` 只把 `request.to_model_payload()` 的有界证据发给分析模型，返回 payload 经 `FailureAnalysisResult.from_model_payload()` 生成结果；`RepairPlanner.plan()` 再生成 `RepairContract`、`RepairActionCandidate` 和 `RepairPlan`。`RepairPlanner.to_replan_signal()` 生成 `RepairReplanSignal` 后由 `Planner.record_failure_analysis()` 写入 planner evidence、`planner_events.jsonl`、context item 和 trace；若需要用户输入，`RepairPlanner.blocked_outcome()` 返回 blocked outcome。
 
 ## 真实对象完整结构
 
