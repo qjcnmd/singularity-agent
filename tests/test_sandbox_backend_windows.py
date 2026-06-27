@@ -42,6 +42,7 @@ def test_windows_doctor_reports_primitives_and_setup_separately() -> None:
 
     assert payload["schema_version"] == "sandbox.windows.doctor/v1"
     assert payload["implementation"] == "elevated"
+    assert "status" not in payload
     assert payload["enforcement_status"] in {
         "available",
         "backend_unavailable",
@@ -70,6 +71,7 @@ def test_windows_doctor_reports_primitives_and_setup_separately() -> None:
     assert "execution" in payload
     assert isinstance(payload["blocking_requirements"], list)
     assert "recommended_action" in payload
+    assert isinstance(payload["diagnostics"], list)
     assert report.available == (payload["enforcement_status"] == "available")
     assert report.missing_requirements == tuple(payload["blocking_requirements"])
 
@@ -141,6 +143,173 @@ def test_windows_account_probe_handles_missing_net_command_without_name_error(
     monkeypatch.setattr(windows.shutil, "which", lambda _name: None)
 
     assert windows._account_exists(windows.SANDBOX_ACCOUNT) is False
+
+
+def test_windows_sandbox_account_name_fits_local_user_limit() -> None:
+    assert windows.WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT == 20
+    assert windows.SANDBOX_ACCOUNT == "SingularitySandbox"
+    assert len(windows.SANDBOX_ACCOUNT) <= windows.WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT
+    assert windows._credential_target() == windows.SANDBOX_ACCOUNT
+    assert sandbox.windows_runner.DEFAULT_ACCOUNT_NAME == windows.SANDBOX_ACCOUNT
+    assert sandbox.windows_runner.DEFAULT_CREDENTIAL_TARGET == windows.SANDBOX_ACCOUNT
+
+
+def test_windows_setup_rejects_oversized_account_name_before_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted: list[str] = []
+
+    def fail_create(name: str, _password: str) -> windows._OperationResult:
+        attempted.append(name)
+        raise AssertionError("setup must reject oversized account names before NetUserAdd")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_elevated", lambda: True)
+    monkeypatch.setattr(windows, "SANDBOX_ACCOUNT", "SingularitySandboxRunner")
+    monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
+    monkeypatch.setattr(windows, "_create_sandbox_account", fail_create)
+
+    report = windows.setup_windows_sandbox()
+
+    assert attempted == []
+    assert report.status == "failed"
+    failure = report.failed_steps[0]
+    assert failure["step"] == "sandbox_account"
+    assert "exceeds Windows local user account limit" in failure["reason"]
+    assert failure["details"]["account_name_length"] == len("SingularitySandboxRunner")
+    assert failure["details"]["account_name_limit"] == 20
+    assert failure["details"]["account_name_hash"]
+    assert failure["details"]["account_name_redacted"].startswith("Sin")
+
+
+def test_windows_setup_reports_netuseradd_2202_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeNetApi:
+        def NetUserAdd(self, _server, _level, _buffer, parm_err) -> int:
+            parm_err._obj.value = 0
+            return 2202
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_elevated", lambda: True)
+    monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
+    monkeypatch.setattr(windows, "_account_exists", lambda _name: False)
+    monkeypatch.setattr(windows, "_netapi32", lambda: FakeNetApi())
+    monkeypatch.setattr(windows, "_account_sid", lambda _name: "")
+    monkeypatch.setattr(
+        windows,
+        "_acl_state",
+        lambda _supported: sandbox.WindowsCapabilityState(
+            "missing", True, "no sandbox account", {}
+        ),
+    )
+    monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
+    monkeypatch.setattr(
+        windows,
+        "_runner_smoke_state",
+        lambda: sandbox.WindowsCapabilityState(
+            "missing", True, "no sandbox account", {}
+        ),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_probe_windows_sandbox_uncached",
+        lambda: sandbox.WindowsSandboxDoctorReport.ready_for_tests(),
+    )
+
+    report = windows.setup_windows_sandbox()
+
+    failure = next(item for item in report.failed_steps if item["step"] == "sandbox_account")
+    assert "NetUserAdd failed: code 2202" in failure["reason"]
+    assert "invalid user/group name parameter" in failure["reason"]
+    assert failure["details"]["windows_error_code"] == 2202
+    assert failure["details"]["parm_err"] == 0
+    assert failure["details"]["account_name_length"] == len(windows.SANDBOX_ACCOUNT)
+    assert failure["details"]["account_name_hash"]
+    assert failure["details"]["account_name_redacted"]
+
+
+def test_windows_doctor_and_setup_report_legacy_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = sandbox.WindowsCapabilityState("available", True, "ready", {})
+    legacy = (
+        {
+            "kind": "legacy_sandbox_account",
+            "status": "present",
+            "account_name_length": len("SingularitySandboxRunner"),
+            "account_name_hash": "legacy_hash",
+            "account_name_redacted": "Sin...ner",
+        },
+    )
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: legacy)
+    monkeypatch.setattr(windows, "_primitive", lambda *_args: ready)
+    monkeypatch.setattr(windows, "_command_state", lambda *_args: ready)
+    monkeypatch.setattr(windows, "_powershell_state", lambda *_args: ready)
+    monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(windows, "_acl_state", lambda _supported: ready)
+    monkeypatch.setattr(windows, "_network_state", lambda _sid: ready)
+    monkeypatch.setattr(windows, "_execution_backend_state", lambda _primitives, _sid: ready)
+    monkeypatch.setattr(windows, "_credential_state", lambda: ready)
+    monkeypatch.setattr(windows, "_runner_smoke_state", lambda: ready)
+    monkeypatch.setattr(windows, "_network_probe_state", lambda _sid: ready)
+
+    doctor = windows._probe_windows_sandbox_uncached()
+
+    assert doctor.diagnostics == legacy
+    assert doctor.to_dict()["diagnostics"] == list(legacy)
+    assert "legacy sandbox artifacts detected" in doctor.recommended_action.lower()
+
+    monkeypatch.setattr(windows, "_is_elevated", lambda: True)
+    monkeypatch.setattr(windows, "_account_exists", lambda _name: True)
+    monkeypatch.setattr(windows, "_firewall_rule_ready", lambda: True)
+    monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
+    monkeypatch.setattr(windows, "_probe_windows_sandbox_uncached", lambda: doctor)
+
+    setup = windows.setup_windows_sandbox()
+
+    assert setup.diagnostics == legacy
+    assert setup.to_dict()["diagnostics"] == list(legacy)
+    assert "legacy sandbox artifacts detected" in setup.message.lower()
+
+
+def test_windows_legacy_artifact_diagnostics_report_old_account_credential_and_firewall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        windows,
+        "_account_exists",
+        lambda name: name == windows.LEGACY_SANDBOX_ACCOUNT,
+    )
+    monkeypatch.setattr(
+        windows,
+        "_credential_exists",
+        lambda target: target == windows.LEGACY_SANDBOX_ACCOUNT,
+    )
+    monkeypatch.setattr(
+        windows,
+        "_firewall_rule_exists",
+        lambda name: name == windows.LEGACY_FIREWALL_RULE_NAME,
+    )
+
+    diagnostics = windows._legacy_artifact_diagnostics()
+
+    kinds = {item["kind"] for item in diagnostics}
+    assert kinds == {"legacy_sandbox_account", "legacy_credential", "legacy_firewall_rule"}
+    account = next(item for item in diagnostics if item["kind"] == "legacy_sandbox_account")
+    assert account["account_name_length"] == len(windows.LEGACY_SANDBOX_ACCOUNT)
+    assert account["account_name_redacted"].startswith("Sin")
+    assert account["account_name_hash"]
+    credential = next(item for item in diagnostics if item["kind"] == "legacy_credential")
+    assert credential["target_redacted"].startswith("Sin")
+    assert credential["target_hash"]
+    firewall = next(item for item in diagnostics if item["kind"] == "legacy_firewall_rule")
+    assert firewall["rule_redacted"].startswith("Sin")
+    assert firewall["rule_hash"]
+    assert firewall["group"] == windows.FIREWALL_RULE_GROUP
 
 
 def test_windows_setup_requires_elevation_before_system_mutation(
@@ -675,7 +844,7 @@ def test_windows_sandbox_runner_removes_account_runner_logs(
     monkeypatch.setattr(
         sandbox.windows_runner,
         "_read_generic_credential",
-        lambda _target: ("SingularitySandboxRunner", "secret"),
+        lambda _target: (windows.SANDBOX_ACCOUNT, "secret"),
     )
     monkeypatch.setattr(
         sandbox.windows_runner,

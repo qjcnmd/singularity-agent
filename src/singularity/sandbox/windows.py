@@ -43,13 +43,21 @@ from singularity.sandbox.windows_runner import (
 
 DOCTOR_SCHEMA_VERSION = "sandbox.windows.doctor/v1"
 SETUP_SCHEMA_VERSION = "sandbox.windows.setup/v1"
-SANDBOX_ACCOUNT = "SingularitySandboxRunner"
+WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT = 20
+SANDBOX_ACCOUNT = "SingularitySandbox"
+LEGACY_SANDBOX_ACCOUNT = "SingularitySandboxRunner"
 FIREWALL_RULE_GROUP = "Singularity Sandbox"
-FIREWALL_RULE_NAME = "Singularity Sandbox Runner Outbound Block"
+FIREWALL_RULE_NAME = "Singularity Sandbox Outbound Block"
+LEGACY_FIREWALL_RULE_NAME = "Singularity Sandbox Runner Outbound Block"
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 NERR_SUCCESS = 0
 NERR_USER_EXISTS = 2224
+NERR_INVALID_COMPUTER = 2351
+ERROR_INVALID_NAME = 123
+NERR_USER_NOT_FOUND = 2221
+NERR_GROUP_NOT_FOUND = 2220
+NERR_INVALID_NAME = 2202
 USER_PRIV_USER = 1
 UF_SCRIPT = 0x0001
 UF_DONT_EXPIRE_PASSWD = 0x10000
@@ -172,6 +180,7 @@ class WindowsSandboxDoctorReport:
     enforcement_status: str
     blocking_requirements: tuple[str, ...]
     recommended_action: str
+    diagnostics: tuple[dict[str, Any], ...] = ()
 
     @property
     def missing_requirements(self) -> tuple[str, ...]:
@@ -194,6 +203,7 @@ class WindowsSandboxDoctorReport:
             enforcement_status="available",
             blocking_requirements=(),
             recommended_action="Windows sandbox is ready.",
+            diagnostics=(),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -210,6 +220,7 @@ class WindowsSandboxDoctorReport:
             "blocking_requirements": list(self.blocking_requirements),
             "missing_requirements": list(self.blocking_requirements),
             "recommended_action": self.recommended_action,
+            "diagnostics": list(self.diagnostics),
         }
 
     @property
@@ -228,9 +239,10 @@ class WindowsSandboxSetupReport:
     changed: bool
     completed_steps: tuple[str, ...]
     pending_steps: tuple[str, ...]
-    failed_steps: tuple[dict[str, str], ...]
+    failed_steps: tuple[dict[str, Any], ...]
     available_after_setup: bool
     message: str
+    diagnostics: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def ready_for_tests(cls) -> "WindowsSandboxSetupReport":
@@ -252,6 +264,7 @@ class WindowsSandboxSetupReport:
             failed_steps=(),
             available_after_setup=True,
             message="Windows sandbox setup is ready.",
+            diagnostics=(),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -266,6 +279,7 @@ class WindowsSandboxSetupReport:
             "failed_steps": list(self.failed_steps),
             "available_after_setup": self.available_after_setup,
             "message": self.message,
+            "diagnostics": list(self.diagnostics),
         }
 
 
@@ -613,11 +627,12 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
             failed_steps=({"step": "platform", "reason": "Windows sandbox setup requires Windows."},),
             available_after_setup=False,
             message="Windows sandbox setup is not supported on this platform.",
+            diagnostics=(),
         )
     changed = False
     completed: list[str] = []
     pending: list[str] = []
-    failed: list[dict[str, str]] = []
+    failed: list[dict[str, Any]] = []
     if not _is_elevated():
         return WindowsSandboxSetupReport(
             status="requires_elevation",
@@ -636,9 +651,23 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
             failed_steps=(),
             available_after_setup=False,
             message="Run sandbox setup from an elevated shell to create account and firewall assets.",
+            diagnostics=(),
         )
+    diagnostics = _legacy_artifact_diagnostics()
     password = ""
-    if not _account_exists(SANDBOX_ACCOUNT):
+    account_name_error = _validate_sandbox_account_name(SANDBOX_ACCOUNT)
+    if account_name_error is not None:
+        failed.append(account_name_error)
+        return _setup_report(
+            status="failed",
+            changed=changed,
+            completed=completed,
+            failed=failed,
+            available_after_setup=False,
+            message=account_name_error["reason"],
+            diagnostics=diagnostics,
+        )
+    elif not _account_exists(SANDBOX_ACCOUNT):
         password = _generate_account_password()
         result = _create_sandbox_account(SANDBOX_ACCOUNT, password)
         if result.ok:
@@ -650,7 +679,13 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
             else:
                 failed.append({"step": "credential", "reason": credential.reason})
         else:
-            failed.append({"step": "sandbox_account", "reason": result.reason})
+            failed.append(
+                _operation_failure_step(
+                    "sandbox_account",
+                    result,
+                    account_name=SANDBOX_ACCOUNT,
+                )
+            )
     else:
         completed.append("sandbox_account")
         credential_state = _credential_state()
@@ -667,7 +702,13 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
                 else:
                     failed.append({"step": "credential", "reason": credential.reason})
             else:
-                failed.append({"step": "credential", "reason": reset.reason})
+                failed.append(
+                    _operation_failure_step(
+                        "credential",
+                        reset,
+                        account_name=SANDBOX_ACCOUNT,
+                    )
+                )
     password = ""
     probe_windows_sandbox.cache_clear()
     if not _firewall_rule_ready():
@@ -738,7 +779,45 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
         pending_steps=tuple(pending),
         failed_steps=tuple(failed),
         available_after_setup=doctor.available,
-        message="Windows sandbox setup completed." if doctor.available else doctor.reason,
+        message=_setup_message(doctor, diagnostics),
+        diagnostics=diagnostics,
+    )
+
+
+def _setup_report(
+    *,
+    status: str,
+    changed: bool,
+    completed: list[str],
+    failed: list[dict[str, Any]],
+    available_after_setup: bool,
+    message: str,
+    diagnostics: tuple[dict[str, Any], ...],
+) -> WindowsSandboxSetupReport:
+    pending = [
+        item
+        for item in (
+            "sandbox_account",
+            "credential",
+            "acl_boundary",
+            "network_filter",
+            "private_desktop",
+            "execution_backend",
+            "network_probe",
+        )
+        if item not in completed and not any(step.get("step") == item for step in failed)
+    ]
+    return WindowsSandboxSetupReport(
+        status=status,
+        requested_operation="setup",
+        requires_elevation=False,
+        changed=changed,
+        completed_steps=tuple(dict.fromkeys(completed)),
+        pending_steps=tuple(pending),
+        failed_steps=tuple(failed),
+        available_after_setup=available_after_setup,
+        message=message,
+        diagnostics=diagnostics,
     )
 
 
@@ -760,6 +839,7 @@ def _probe_windows_sandbox_uncached() -> WindowsSandboxDoctorReport:
         private_desktop=_primitive("user32", "CreateDesktopW", "CloseDesktop"),
     )
     sid = _account_sid(SANDBOX_ACCOUNT) if platform_supported else ""
+    diagnostics = _legacy_artifact_diagnostics() if platform_supported else ()
     setup = WindowsSandboxSetup(
         sandbox_account=_state_from_bool(
             bool(sid),
@@ -809,11 +889,8 @@ def _probe_windows_sandbox_uncached() -> WindowsSandboxDoctorReport:
         if available
         else ("not_supported" if not platform_supported else "backend_unavailable"),
         blocking_requirements=tuple(blocking),
-        recommended_action=(
-            "Windows sandbox is ready."
-            if available
-            else "Run `singularity-agent sandbox setup --json` from an elevated shell and rerun doctor."
-        ),
+        recommended_action=_doctor_recommended_action(available, diagnostics),
+        diagnostics=diagnostics,
     )
 
 
@@ -1205,6 +1282,108 @@ def _missing(reason: str, evidence: dict[str, Any]) -> WindowsCapabilityState:
     return WindowsCapabilityState("missing", True, reason, evidence)
 
 
+def _doctor_recommended_action(
+    available: bool,
+    diagnostics: tuple[dict[str, Any], ...],
+) -> str:
+    if available and not diagnostics:
+        return "Windows sandbox is ready."
+    action = (
+        "Windows sandbox is ready."
+        if available
+        else "Run `singularity-agent sandbox setup --json` from an elevated shell and rerun doctor."
+    )
+    if diagnostics:
+        return f"{action} Legacy sandbox artifacts detected; review diagnostics before cleanup."
+    return action
+
+
+def _setup_message(
+    doctor: WindowsSandboxDoctorReport,
+    diagnostics: tuple[dict[str, Any], ...],
+) -> str:
+    message = "Windows sandbox setup completed." if doctor.available else doctor.reason
+    if diagnostics:
+        return f"{message} Legacy sandbox artifacts detected; review diagnostics before cleanup."
+    return message
+
+
+def _validate_sandbox_account_name(name: str) -> dict[str, Any] | None:
+    if len(name) <= WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT:
+        return None
+    details = _account_name_diagnostics(name)
+    details["account_name_limit"] = WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT
+    return {
+        "step": "sandbox_account",
+        "reason": (
+            f"Sandbox account name exceeds Windows local user account limit "
+            f"({len(name)} > {WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT})."
+        ),
+        "details": details,
+    }
+
+
+def _operation_failure_step(
+    step: str,
+    result: "_OperationResult",
+    *,
+    account_name: str,
+) -> dict[str, Any]:
+    details = dict(result.details)
+    details.update(_account_name_diagnostics(account_name))
+    details.setdefault("account_name_limit", WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT)
+    return {"step": step, "reason": result.reason, "details": details}
+
+
+def _account_name_diagnostics(name: str) -> dict[str, Any]:
+    return {
+        "account_name_length": len(name),
+        "account_name_limit": WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT,
+        "account_name_hash": _hash_text(name),
+        "account_name_redacted": _redact_account_name(name),
+    }
+
+
+def _redact_account_name(name: str) -> str:
+    if len(name) <= 6:
+        return "*" * len(name)
+    return f"{name[:3]}...{name[-3:]}"
+
+
+def _legacy_artifact_diagnostics() -> tuple[dict[str, Any], ...]:
+    diagnostics: list[dict[str, Any]] = []
+    if LEGACY_SANDBOX_ACCOUNT and LEGACY_SANDBOX_ACCOUNT != SANDBOX_ACCOUNT:
+        if _account_exists(LEGACY_SANDBOX_ACCOUNT):
+            diagnostics.append(
+                {
+                    "kind": "legacy_sandbox_account",
+                    "status": "present",
+                    **_account_name_diagnostics(LEGACY_SANDBOX_ACCOUNT),
+                }
+            )
+        if _credential_exists(LEGACY_SANDBOX_ACCOUNT):
+            diagnostics.append(
+                {
+                    "kind": "legacy_credential",
+                    "status": "present",
+                    "target_hash": _hash_text(LEGACY_SANDBOX_ACCOUNT),
+                    "target_redacted": _redact_account_name(LEGACY_SANDBOX_ACCOUNT),
+                }
+            )
+    if LEGACY_FIREWALL_RULE_NAME and LEGACY_FIREWALL_RULE_NAME != FIREWALL_RULE_NAME:
+        if _firewall_rule_exists(LEGACY_FIREWALL_RULE_NAME):
+            diagnostics.append(
+                {
+                    "kind": "legacy_firewall_rule",
+                    "status": "present",
+                    "rule_hash": _hash_text(LEGACY_FIREWALL_RULE_NAME),
+                    "rule_redacted": _redact_account_name(LEGACY_FIREWALL_RULE_NAME),
+                    "group": FIREWALL_RULE_GROUP,
+                }
+            )
+    return tuple(diagnostics)
+
+
 def _has_windows_symbols(library: str, *symbols: str) -> bool:
     if os.name != "nt":
         return False
@@ -1219,6 +1398,7 @@ def _has_windows_symbols(library: str, *symbols: str) -> bool:
 class _OperationResult:
     ok: bool
     reason: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 class _USER_INFO_1(ctypes.Structure):
@@ -1294,6 +1474,9 @@ def _advapi32():
 def _create_sandbox_account(name: str, password: str) -> _OperationResult:
     if os.name != "nt":
         return _OperationResult(False, "Windows account creation requires Windows.")
+    name_error = _validate_sandbox_account_name(name)
+    if name_error is not None:
+        return _OperationResult(False, name_error["reason"], dict(name_error["details"]))
     info = _USER_INFO_1()
     info.usri1_name = name
     info.usri1_password = password
@@ -1303,12 +1486,19 @@ def _create_sandbox_account(name: str, password: str) -> _OperationResult:
     code = _netapi32().NetUserAdd(None, 1, ctypes.byref(info), ctypes.byref(param_error))
     if code in {NERR_SUCCESS, NERR_USER_EXISTS}:
         return _OperationResult(True)
-    return _OperationResult(False, f"NetUserAdd failed: code {code}, param {param_error.value}")
+    return _OperationResult(
+        False,
+        _netapi_error_reason("NetUserAdd", code, param_error.value),
+        _netapi_error_details(code, param_error.value),
+    )
 
 
 def _set_account_password(name: str, password: str) -> _OperationResult:
     if os.name != "nt":
         return _OperationResult(False, "Windows account password update requires Windows.")
+    name_error = _validate_sandbox_account_name(name)
+    if name_error is not None:
+        return _OperationResult(False, name_error["reason"], dict(name_error["details"]))
     info = _USER_INFO_1003()
     info.usri1003_password = password
     param_error = wintypes.DWORD()
@@ -1321,7 +1511,11 @@ def _set_account_password(name: str, password: str) -> _OperationResult:
     )
     if code == NERR_SUCCESS:
         return _OperationResult(True)
-    return _OperationResult(False, f"NetUserSetInfo failed: code {code}, param {param_error.value}")
+    return _OperationResult(
+        False,
+        _netapi_error_reason("NetUserSetInfo", code, param_error.value),
+        _netapi_error_details(code, param_error.value),
+    )
 
 
 def _credential_exists(target: str) -> bool:
@@ -1332,6 +1526,36 @@ def _credential_exists(target: str) -> bool:
         return False
     _advapi32().CredFree(credential_ptr)
     return True
+
+
+def _netapi_error_reason(operation: str, code: int, parm_err: int) -> str:
+    explanation = _netapi_error_explanation(code)
+    suffix = f" ({explanation})" if explanation else ""
+    return f"{operation} failed: code {code}, param {parm_err}{suffix}"
+
+
+def _netapi_error_details(code: int, parm_err: int) -> dict[str, Any]:
+    return {
+        "windows_error_code": code,
+        "parm_err": parm_err,
+        "explanation": _netapi_error_explanation(code),
+    }
+
+
+def _netapi_error_explanation(code: int) -> str:
+    if code == NERR_INVALID_NAME:
+        return "invalid user/group name parameter"
+    if code == NERR_USER_EXISTS:
+        return "user already exists"
+    if code == NERR_USER_NOT_FOUND:
+        return "user not found"
+    if code == NERR_GROUP_NOT_FOUND:
+        return "group not found"
+    if code == ERROR_INVALID_NAME:
+        return "invalid name"
+    if code == NERR_INVALID_COMPUTER:
+        return "invalid computer name"
+    return ""
 
 
 def _store_credential(password: str) -> _OperationResult:
@@ -1388,12 +1612,22 @@ def _firewall_rule_ready() -> bool:
     return bool(sid and _network_state(sid).ready)
 
 
+def _firewall_rule_exists(name: str) -> bool:
+    if os.name != "nt":
+        return False
+    completed = _run_powershell(
+        f"if (Get-NetFirewallRule -DisplayName {_ps_quote(name)} -ErrorAction SilentlyContinue) "
+        "{ exit 0 }; exit 1"
+    )
+    return completed.returncode == 0
+
+
 def _generate_account_password() -> str:
     return "Sg!" + secrets.token_urlsafe(32) + "9"
 
 
 def _credential_target() -> str:
-    return "SingularitySandboxRunner"
+    return SANDBOX_ACCOUNT
 
 
 def _run_powershell(command: str) -> subprocess.CompletedProcess[str]:

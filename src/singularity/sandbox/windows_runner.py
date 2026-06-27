@@ -47,8 +47,8 @@ DESKTOP_ACCESS = (
 LOGON_WITH_PROFILE = 0x00000001
 CRED_TYPE_GENERIC = 1
 
-DEFAULT_ACCOUNT_NAME = "SingularitySandboxRunner"
-DEFAULT_CREDENTIAL_TARGET = "SingularitySandboxRunner"
+DEFAULT_ACCOUNT_NAME = "SingularitySandbox"
+DEFAULT_CREDENTIAL_TARGET = "SingularitySandbox"
 NETWORK_PROBE_ENDPOINTS = (("1.1.1.1", 53), ("1.1.1.1", 443), ("8.8.8.8", 53))
 SECRET_KEY_RE = re.compile(
     r"(authorization|cookie|token|api[_-]?key|secret|password|private[_-]?key|database[_-]?url|dsn)",

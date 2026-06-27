@@ -217,7 +217,7 @@ python -m singularity.cli sandbox setup --json
 python -m singularity.cli sandbox doctor --json
 ```
 
-setup 必须创建/验证 `SingularitySandboxRunner` 本地账户、Windows Credential Manager 凭据、`Singularity Sandbox` firewall rule group 的 account-scoped `LocalUser` outbound block、ACL boundary、private desktop、restricted low-integrity runner smoke、network denied smoke 和 timeout/output capture。任何缺项都必须保持 `backend_unavailable`，不能改用普通本地进程获得通过。
+setup 必须创建/验证 `SingularitySandbox` 本地账户、Windows Credential Manager 凭据、`Singularity Sandbox` firewall rule group 的 account-scoped `LocalUser` outbound block、ACL boundary、private desktop、restricted low-integrity runner smoke、network denied smoke 和 timeout/output capture。任何缺项都必须保持 `backend_unavailable`，不能改用普通本地进程获得通过。旧失败状态中的 `SingularitySandboxRunner` account、credential 或 firewall rule 只应作为 legacy diagnostics 报告，不得进入新执行路径。
 
 当前 Windows backend 已支持 workspace COW projection、protected path exclude、run root ACL、workspace-only low-integrity label、private desktop、restricted token、Job Object、timeout、output limit、secret redaction、临时输出清理、artifact refs 和带 host baseline 的 network denied proof。workspace 外 additional writable directories 与 path-specific readonly leases 还没有独立 projection/ACL lease，测试要求它们 fail closed，直到 runtime 真正实现。
 

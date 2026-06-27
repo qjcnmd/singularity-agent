@@ -46,8 +46,8 @@
 - `WindowsSandboxPrimitives`: restricted_token, job_object, low_integrity, acl, firewall, private_desktop
 - `WindowsSandboxSetup`: sandbox_account, acl_boundary, network_filter, private_desktop, execution_backend
 - `WindowsSandboxExecution`: account_sid, credential, launcher, runner_smoke, network_probe
-- `WindowsSandboxDoctorReport`: implementation, platform_supported, platform_status, primitives, setup, execution, available, enforcement_status, blocking_requirements, recommended_action
-- `WindowsSandboxSetupReport`: status, requested_operation, requires_elevation, changed, completed_steps, pending_steps, failed_steps, available_after_setup, message
+- `WindowsSandboxDoctorReport`: implementation, platform_supported, platform_status, primitives, setup, execution, available, enforcement_status, blocking_requirements, recommended_action, diagnostics
+- `WindowsSandboxSetupReport`: status, requested_operation, requires_elevation, changed, completed_steps, pending_steps, failed_steps, available_after_setup, message, diagnostics
 - `WindowsRunnerSpec`: command, cwd, env, timeout_seconds, max_output_chars, network_mode, result_path
 - `WindowsRunnerResult`: exit_code, stdout, stderr, timed_out, started_at, ended_at, duration_ms, output_truncated, job_killed, network_denied_verified, metadata
 
@@ -55,7 +55,7 @@
 
 Sandbox 层消费已经解析完成的 `SandboxRequest`，选择能够满足 filesystem、network 和 resource 要求的 OS-native backend，并统一返回执行结果或明确的 `backend_unavailable`。这一层不决定会话权限、不发放审批，也不把普通本地执行或 workspace copy 表述为强隔离。
 
-Windows 当前实现是 account-backed OS sandbox：父进程准备 COW workspace projection 和 run root ACL，子进程以 `SingularitySandboxRunner` 本地账户启动 `windows_runner.py`，runner 再用 restricted low-integrity token、private desktop 和 kill-on-close Job Object 启动实际验证命令。缺少 sandbox account、Credential Manager 凭据、ACL boundary、account-scoped firewall、private desktop、runner smoke 或 network probe 任意一项时，backend 不可用。
+Windows 当前实现是 account-backed OS sandbox：父进程准备 COW workspace projection 和 run root ACL，子进程以 `SingularitySandbox` 本地账户启动 `windows_runner.py`，runner 再用 restricted low-integrity token、private desktop 和 kill-on-close Job Object 启动实际验证命令。缺少 sandbox account、Credential Manager 凭据、ACL boundary、account-scoped firewall、private desktop、runner smoke 或 network probe 任意一项时，backend 不可用。
 
 ## 当前源码位置
 
@@ -200,6 +200,7 @@ class WindowsSandboxDoctorReport:
     enforcement_status: str
     blocking_requirements: tuple[str, ...]
     recommended_action: str
+    diagnostics: tuple[dict[str, Any], ...] = ()
 ```
 
 ### WindowsSandboxSetupReport（setup 报告）
@@ -215,9 +216,10 @@ class WindowsSandboxSetupReport:
     changed: bool
     completed_steps: tuple[str, ...]
     pending_steps: tuple[str, ...]
-    failed_steps: tuple[dict[str, str], ...]
+    failed_steps: tuple[dict[str, Any], ...]
     available_after_setup: bool
     message: str
+    diagnostics: tuple[dict[str, Any], ...] = ()
 ```
 
 ### WindowsRunnerSpec / WindowsRunnerResult（执行 backend I/O）
@@ -346,7 +348,7 @@ class SandboxNetworkMode(str, Enum):
 
 默认 `SandboxJsonlTraceRecorder` 写入 `<workspace>/.singularity/sandbox/trace.jsonl`。Windows 可用执行会在 workspace 下 `work/sandboxes/<sandbox_id>/` 创建 run root、workspace projection、`runner-spec.json`、`runner-result.json` 和 artifacts；cleanup 成功后删除 run root。doctor/setup 的 smoke 目录位于 `resolve_user_data_paths().state_dir/windows-sandbox/`。
 
-Windows 凭据只写入 Windows Credential Manager target `SingularitySandboxRunner`，不写 plaintext 文件，不进入 trace/report。Firewall rule group 为 `Singularity Sandbox`，规则以 `LocalUser` 绑定 sandbox account SID。doctor evidence 只记录 SID/hash、rule 名称、probe exit 等脱敏信息。
+Windows 凭据只写入 Windows Credential Manager target `SingularitySandbox`，不写 plaintext 文件，不进入 trace/report。Firewall rule group 为 `Singularity Sandbox`，当前规则 display name 为 `Singularity Sandbox Outbound Block`，规则以 `LocalUser` 绑定 sandbox account SID。doctor evidence 只记录 SID/hash、rule 名称、probe exit 等脱敏信息。旧失败状态中的 `SingularitySandboxRunner` account、同名 credential target 或 `Singularity Sandbox Runner Outbound Block` firewall rule 不参与新执行路径；doctor/setup 只在 `diagnostics` 中以 hash/redacted 形式报告这些 legacy artifacts，便于人工清理。
 
 ## 是否进入 trace / audit
 
