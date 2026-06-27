@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
@@ -16,8 +17,26 @@ tempfile.tempdir = str(_PYTEST_TEMP_ROOT)
 
 
 # ---------------------------------------------------------------------------
+# Known markers (must match pyproject.toml [tool.pytest.ini_options].markers).
+# Used for self-check validation.
+# ---------------------------------------------------------------------------
+_KNOWN_MARKERS: set[str] = {
+    "smoke",
+    "unit",
+    "integration",
+    "regression",
+    "security",
+    "evaluation",
+    "provider_eval",
+    "slow",
+    "external",
+    "flaky",
+}
+
+
+# ---------------------------------------------------------------------------
 # Smoke suite: curated tests that cover core paths in <30 seconds.
-# Two mechanisms: _SMOKE_TEST_IDS for specific tests, _SMOKE_FILE_PREFIXES
+# Two mechanisms: _SMOKE_TEST_IDS for specific tests, _SMOKE_FILE_STEMS
 # for files where every test is included.
 # ---------------------------------------------------------------------------
 _SMOKE_TEST_IDS: set[str] = {
@@ -31,6 +50,8 @@ _SMOKE_TEST_IDS: set[str] = {
     "tests/test_approval_gate.py::test_interactive_approve_once_generates_single_use_grant",
     # Verification path
     "tests/test_verification_runner.py::test_verification_runner_executes_checks_through_command_executor_and_records_trace",
+    # Test impact analysis
+    "tests/test_test_impact.py::TestFallbackTests::test_test_impact_fallback_basic_mapping",
 }
 
 # Files where every test is a smoke test (fast, core-path coverage).
@@ -53,21 +74,35 @@ _FLAKY_TEST_IDS: set[str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Slow tests: truly slow (>5s) due to concurrency or multi-turn simulation.
+# Slow tests: truly slow (>3s) due to concurrency or multi-turn simulation.
 # Based on measured --durations data, not filename heuristics.
 # ---------------------------------------------------------------------------
 _SLOW_TEST_IDS: set[str] = {
     # Agent loop simulations (>5s)
     "tests/test_execution_primitives_phase1b.py::test_deterministic_quicksort_tasks_complete_with_write_file_and_apply_patch",
     "tests/test_cli.py::test_cli_eval_targeted_replay_writes_repair_replay_artifacts",
+    # Agent loop simulations (3-5s, multi-turn with verification)
     "tests/test_agent_task_outcome.py::test_verification_failure_replans_instead_of_completing",
     "tests/test_agent_task_outcome.py::test_low_confidence_analysis_blocks_repair_contract",
     "tests/test_agent_task_outcome.py::test_repeated_failure_fingerprint_budget_blocks_after_second_failed_verification",
     "tests/test_agent_task_outcome.py::test_unrepairable_verification_failure_blocks_with_user_input_required",
     "tests/test_agent_task_outcome.py::test_premature_final_then_quicksort_smoke_completes",
     "tests/test_agent_task_outcome.py::test_tool_failure_then_verification_failure_replans_repairs_and_finalizes",
+    # Newly identified from --durations=50 analysis (>3s agent simulations)
+    "tests/test_agent_task_outcome.py::test_analyzer_model_failure_blocks_with_user_input_required",
+    "tests/test_agent_task_outcome.py::test_invalid_analyzer_json_blocks_without_repairing",
+    "tests/test_agent_task_outcome.py::test_unauthorized_affected_files_block_repair_contract",
+    "tests/test_agent_task_outcome.py::test_ready_verification_finalizes_without_extra_model_turn",
+    "tests/test_agent_task_outcome.py::test_policy_denial_blocks_without_bypassing_policy",
     # Concurrency tests (>5s)
     "tests/test_span_manager.py::test_span_manager_concurrent_spans_do_not_interfere",
+    # AgentLoop wiring tests (3-4s)
+    "tests/test_agent.py::test_agent_injects_workspace_state_observation_after_tool_call",
+    "tests/test_agent.py::test_agent_runs_complete_tool_call_loop",
+    # Planner concurrency (3s)
+    "tests/test_planner.py::test_planner_store_concurrent_append_events_do_not_interleave",
+    # Workspace lock cross-process (2.2s, uses multiprocessing)
+    "tests/test_workspace_lock.py::test_workspace_lock_allows_only_one_writer_across_processes",
 }
 
 # ---------------------------------------------------------------------------
@@ -79,11 +114,92 @@ _EXTERNAL_FILE_KEYWORDS: tuple[str, ...] = (
     "sandbox_backend_windows",
 )
 
+# Files whose tests all require real git subprocess calls.
+_EXTERNAL_FILE_STEMS: set[str] = {
+    "test_git_client",
+    "test_singularity_identity",
+    "test_runtime_sqlite_artifacts",
+}
+
 # Explicit test name keywords that indicate external dependency.
 _EXTERNAL_TEST_KEYWORDS: tuple[str, ...] = (
     "real_docker",
     "backend_windows",
 )
+
+
+# ---------------------------------------------------------------------------
+# Curated list self-check: validate that all curated nodeids exist in the
+# collected test session and that marker assignments are consistent.
+# ---------------------------------------------------------------------------
+def _validate_curated_lists(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Validate curated test ID lists against the actual test collection.
+
+    Emits warnings for stale entries.  Never raises, so stale curated lists
+    don't block test execution — but the warnings are visible and can be
+    promoted to errors with ``-W error::pytest.PytestWarning``.
+
+    Nodeid-based checks are skipped when the collection is obviously a
+    subset (e.g. running a single test file), because curated IDs naturally
+    won't be present.
+    """
+    collected_nodeids = {item.nodeid for item in items}
+    collected_stems = {Path(item.fspath).stem for item in items}
+
+    # Only check nodeid-based lists if the collection is large enough
+    # to represent the full suite (at least 100 tests).
+    is_full_collection = len(items) >= 100
+
+    if is_full_collection:
+        for label, id_set in [
+            ("smoke", _SMOKE_TEST_IDS),
+            ("flaky", _FLAKY_TEST_IDS),
+            ("slow", _SLOW_TEST_IDS),
+        ]:
+            stale = id_set - collected_nodeids
+            if stale:
+                warnings.warn(
+                    pytest.PytestWarning(
+                        f"[test-infra] Stale {label} test IDs not found in collection: "
+                        + ", ".join(sorted(stale))
+                    ),
+                )
+
+        # Check file-stem-based lists
+        for label, stem_set in [
+            ("smoke files", _SMOKE_FILE_STEMS),
+            ("external files", _EXTERNAL_FILE_STEMS),
+        ]:
+            stale = stem_set - collected_stems
+            if stale:
+                warnings.warn(
+                    pytest.PytestWarning(
+                        f"[test-infra] Stale {label} stems not found: "
+                        + ", ".join(sorted(stale))
+                    ),
+                )
+
+    # Overlap checks are always safe (no dependency on collection size)
+    overlap = _SMOKE_TEST_IDS & _SLOW_TEST_IDS
+    if overlap:
+        warnings.warn(
+            pytest.PytestWarning(
+                f"[test-infra] Tests in both smoke and slow: "
+                + ", ".join(sorted(overlap))
+            ),
+        )
+
+    overlap_stems = _SMOKE_FILE_STEMS & _EXTERNAL_FILE_STEMS
+    if overlap_stems:
+        warnings.warn(
+            pytest.PytestWarning(
+                f"[test-infra] Files in both smoke and external: "
+                + ", ".join(sorted(overlap_stems))
+            ),
+        )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -127,8 +243,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         # --- external: docker/git/network dependency ---
         file_str = str(item.fspath)
         name = item.name
-        if any(kw in file_str for kw in _EXTERNAL_FILE_KEYWORDS) or \
-           any(kw in name for kw in _EXTERNAL_TEST_KEYWORDS):
+        if (
+            any(kw in file_str for kw in _EXTERNAL_FILE_KEYWORDS)
+            or file_stem in _EXTERNAL_FILE_STEMS
+            or any(kw in name for kw in _EXTERNAL_TEST_KEYWORDS)
+        ):
             _add_marker(item, "external")
 
         # --- If the test has an explicit functional marker, stop here ---
@@ -168,6 +287,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
         # unit: everything else
         _add_marker(item, "unit")
+
+    # --- Self-check: validate curated lists against actual collection ---
+    _validate_curated_lists(config, items)
 
 
 def _explicit_marker_names(item: pytest.Item) -> set[str]:
