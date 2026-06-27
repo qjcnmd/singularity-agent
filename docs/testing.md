@@ -178,11 +178,23 @@ External 测试依赖 git、network 或Windows OS sandbox能力。本地与CI都
 Windows sandbox定向验证：
 
 ```bash
-python -m pytest tests/test_sandbox_backend_windows.py -m external -v
+python -m pytest -m external tests/test_sandbox_backend_windows.py -v
+python -m pytest tests/test_sandbox_backend_windows.py -m "" -v
 python -m pytest tests -k sandbox -m "not evaluation and not provider_eval and not slow" -v
 ```
 
-当前Windows测试覆盖primitive doctor、未完成elevated setup时的fail-closed结果、manager capability enforcement和“未启动进程/未创建workspace projection”。只有未来真实account、ACL、network filter、restricted token、Job Object和private desktop全部接通后，才允许增加成功执行smoke；文件复制或chmod不能作为成功隔离断言。
+当前 Windows 测试覆盖 doctor schema、setup states、未完成 elevated setup 时的 fail-closed、backend unavailable 不启动进程、`CommandExecutor -> SandboxManager -> WindowsSandboxBackend` 的 fake-ready 成功链路、protected path preflight、network denied violation、host outbound baseline 缺失时 network probe fail-closed、timeout/Job Object evidence、runner result 落盘前脱敏、临时 stdout/stderr 清理、output redaction/limit，以及 runner evidence 不能被 backend 硬编码伪造。
+
+真实 Windows account-backed sandbox 需要先在 elevated shell 运行：
+
+```bash
+python -m singularity.cli sandbox setup --json
+python -m singularity.cli sandbox doctor --json
+```
+
+setup 必须创建/验证 `SingularitySandboxRunner` 本地账户、Windows Credential Manager 凭据、`Singularity Sandbox` firewall rule group 的 account-scoped `LocalUser` outbound block、ACL boundary、private desktop、restricted low-integrity runner smoke、network denied smoke 和 timeout/output capture。任何缺项都必须保持 `backend_unavailable`，不能改用普通本地进程获得通过。
+
+当前 Windows backend 已支持 workspace COW projection、protected path exclude、run root ACL、workspace-only low-integrity label、private desktop、restricted token、Job Object、timeout、output limit、secret redaction、临时输出清理、artifact refs 和带 host baseline 的 network denied proof。workspace 外 additional writable directories 与 path-specific readonly leases 还没有独立 projection/ACL lease，测试要求它们 fail closed，直到 runtime 真正实现。
 
 ## 8. Marker 自检方式
 

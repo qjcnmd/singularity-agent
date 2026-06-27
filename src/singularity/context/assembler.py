@@ -418,6 +418,13 @@ class ContextAssembler:
             return self._bounded_text(content, max_tokens=max_tokens)
         if not isinstance(payload, dict):
             return self._bounded_text(content, max_tokens=max_tokens)
+        already_preview_limited = (
+            payload.get("truncated") is True
+            and payload.get("truncation_reason")
+            not in {None, "context_fragment_cap"}
+        )
+        if already_preview_limited:
+            return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         for key in ("preview", "content", "content_preview"):
             if isinstance(payload.get(key), str):
                 payload[key] = self._bounded_text(

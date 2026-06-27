@@ -839,6 +839,12 @@ class VerificationRunner:
             sandbox_artifacts=list(command_result.metadata.get("sandbox_artifacts") or []),
             sandbox_changed_files=dict(command_result.metadata.get("sandbox_changed_files") or {}),
             sandbox_violations=list(command_result.metadata.get("sandbox_violations") or []),
+            enforcement_status=command_result.metadata.get("enforcement_status"),
+            execution_backend=command_result.metadata.get("execution_backend"),
+            network_denied_verified=command_result.metadata.get("network_denied_verified"),
+            process_tree_kill=command_result.metadata.get("process_tree_kill"),
+            job_killed=command_result.metadata.get("job_killed"),
+            timeout_enforced=command_result.metadata.get("timeout_enforced"),
             capability_summary=_capability_summary(command_result.metadata),
         )
         repair_hints = (

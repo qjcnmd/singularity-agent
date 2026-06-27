@@ -156,8 +156,16 @@ class Finalizer:
                     observations.append(
                         {
                             "source": "command",
+                            "backend": sandbox.get("backend"),
                             "status": sandbox.get("status"),
+                            "enforcement_status": sandbox.get("enforcement_status"),
+                            "execution_backend": sandbox.get("execution_backend"),
+                            "network_denied_verified": sandbox.get("network_denied_verified"),
+                            "process_tree_kill": sandbox.get("process_tree_kill"),
+                            "job_killed": sandbox.get("job_killed"),
+                            "timeout_enforced": sandbox.get("timeout_enforced"),
                             "artifact_count": sandbox.get("artifact_count", 0),
+                            "artifact_refs": sandbox.get("artifact_refs") or [],
                             "changed_files_count": sandbox.get("changed_files_count", 0),
                             "violations": sandbox.get("violations") or [],
                             "imported_changes_count": sandbox.get("imported_changes_count", 0),
@@ -170,8 +178,20 @@ class Finalizer:
                         observations.append(
                             {
                                 "source": "verification",
+                                "backend": result_evidence.get("sandbox_backend"),
                                 "status": result_evidence.get("sandbox_status"),
+                                "enforcement_status": result_evidence.get("enforcement_status"),
+                                "execution_backend": result_evidence.get("execution_backend"),
+                                "network_denied_verified": result_evidence.get("network_denied_verified"),
+                                "process_tree_kill": result_evidence.get("process_tree_kill"),
+                                "job_killed": result_evidence.get("job_killed"),
+                                "timeout_enforced": result_evidence.get("timeout_enforced"),
                                 "artifact_count": len(result_evidence.get("sandbox_artifacts") or []),
+                                "artifact_refs": [
+                                    artifact.get("artifact_id")
+                                    for artifact in (result_evidence.get("sandbox_artifacts") or [])
+                                    if isinstance(artifact, dict) and artifact.get("artifact_id")
+                                ],
                                 "changed_files_count": (result_evidence.get("sandbox_changed_files") or {}).get("total_changed_files", 0),
                                 "violations": result_evidence.get("sandbox_violations") or [],
                                 "imported_changes_count": 0,
@@ -183,7 +203,22 @@ class Finalizer:
             "backend_unavailable_count": len([item for item in observations if item.get("status") == "backend_unavailable"]),
             "sandbox_violation_count": sum(len(item.get("violations") or []) for item in observations),
             "timeout_count": len([item for item in observations if item.get("status") == "timeout"]),
+            "selected_backends": sorted(
+                {str(item.get("backend")) for item in observations if item.get("backend")}
+            ),
+            "network_denied_verified_count": len(
+                [item for item in observations if item.get("network_denied_verified") is True]
+            ),
+            "job_killed_count": len([item for item in observations if item.get("job_killed") is True]),
+            "local_process_backend_count": len(
+                [item for item in observations if item.get("backend") == "local_process"]
+            ),
             "artifact_count": sum(int(item.get("artifact_count") or 0) for item in observations),
+            "artifact_refs": [
+                ref
+                for item in observations
+                for ref in (item.get("artifact_refs") or [])
+            ],
             "changed_files_in_sandbox_count": sum(int(item.get("changed_files_count") or 0) for item in observations),
             "imported_changes_count": sum(int(item.get("imported_changes_count") or 0) for item in observations),
         }

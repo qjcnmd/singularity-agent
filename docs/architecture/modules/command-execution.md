@@ -50,6 +50,8 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 
 以用户要求修复 `quicksort.py` 为例：`CommandToolHandlers.run_command()` -> `CommandExecutor.plan()` -> `CommandExecutor.run()` 先把 tool 参数生成对象 `CommandRequest`，再经 command policy 生成 `CommandPolicyResult` 和 `CommandPlan`。若策略要求隔离，`SandboxManager.run()` 返回的 sandbox payload 被 `CommandExecutor._result_from_sandbox()` 转成 `CommandResult`；否则 `_completed_result()` 从 backend exit/stdout/stderr 生成结果。`CommandExecutor._record_trace()` 写入 command trace 事件，长输出写 artifact，`CommandResult.to_observation()` 进入 `context.sqlite3` 并由 `Planner.update_from_command()` 消费为 evidence。
 
+在 `workspace-write` 且 `PolicyDecision.outcome=sandbox_required` 时，普通本地验证命令不得走 `local_process`。Windows backend 可用时，`CommandResult.backend` 为 `windows`，`isolation_report["sandbox"]` 和 metadata 同步记录 `enforcement_status`、`execution_backend`、`backend_is_local_process`、`network_denied_verified`、`process_tree_kill`、`job_killed`、`timeout_enforced`、`artifact_refs`、`sandbox_artifacts`、`sandbox_changed_files` 和 `sandbox_violations`。Windows backend 不可用时，结果是 `ExecutionStatus.BACKEND_ERROR` / `error_code=sandbox_unavailable`，不是普通本地执行。
+
 ## 真实对象完整结构
 
 ### CommandRequest（命令请求）
@@ -113,6 +115,8 @@ class CommandResult:
     side_effects: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 ```
+
+当结果来自 sandbox，`isolation_report["sandbox"]` 是 command 层对 `SandboxResult` 的安全投影，包含 `sandbox_id`、`backend`、`status`、`trace_id`、`enforcement_status`、`execution_backend`、`backend_is_local_process`、`network_denied_verified`、`process_tree_kill`、`job_killed`、`timeout_enforced`、`artifact_count`、`artifacts`、`artifact_refs`、`changed_files`、`changed_files_count`、`violations`、`cleanup_status` 和 `imported_changes_count`。同一批字段的简化版本也进入 `CommandResult.metadata`，供 VerificationRunner、Planner 和 Finalizer 聚合。
 
 ### CommandPolicyResult（命令策略决策）
 
@@ -204,7 +208,7 @@ CommandExecutor 发出 `COMMAND_*` event 与 legacy `command` record，payload �
 
 ## 失败路径
 
-policy 返回 `REVIEW_REQUIRED`/`POLICY_DENIED`、cwd denied、sandbox setup/backend error、timeout/idle timeout、kill 或非零退出时生成非成功 `CommandResult`；process API 通过 `status`、`error_code`、`killed_reason` 表达失败，不把启动失败登记为 running session。
+policy 返回 `REVIEW_REQUIRED`/`POLICY_DENIED`、cwd denied、sandbox setup/backend error、timeout/idle timeout、kill 或非零退出时生成非成功 `CommandResult`；process API 通过 `status`、`error_code`、`killed_reason` 表达失败，不把启动失败登记为 running session。`workspace-write` 下 sandbox backend unavailable 时 `backend` 不得是 `local_process`，`sandbox_availability` 必须说明 backend 状态，输出仍按 `SecretRedactor` 和 output limit 处理。
 
 ## 当前结构问题
 

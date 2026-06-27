@@ -135,6 +135,20 @@ def test_manager_enforces_resolved_request_capabilities_before_prepare(tmp_path:
     assert backend.prepare_calls == 0
 
 
+def test_manager_blocks_protected_command_path_before_prepare(tmp_path: Path) -> None:
+    backend = _Backend(tmp_path, available=True)
+    component = SandboxManager(tmp_path, backends=[backend])
+    request = _request(tmp_path)
+    request.command = ["python", ".env"]
+
+    result = component.run(request)
+
+    assert result.status == SandboxStatus.POLICY_BLOCKED
+    assert result.metadata["error_code"] == "protected_path_denied"
+    assert backend.prepare_calls == 0
+    assert backend.run_calls == 0
+
+
 def test_manager_consumes_request_without_reinterpreting_policy_constraints(
     tmp_path: Path,
 ) -> None:

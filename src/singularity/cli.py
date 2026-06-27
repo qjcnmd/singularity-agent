@@ -164,8 +164,7 @@ def sandbox_setup(
     try:
         setup = backend.setup()
         payload = setup.to_dict()
-        payload["status"] = "ready"
-        exit_code = 0
+        exit_code = 0 if payload.get("status") == "ready" else 1
     except Exception as exc:
         payload = {
             "status": "backend_unavailable",

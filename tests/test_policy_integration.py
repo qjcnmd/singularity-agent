@@ -214,3 +214,30 @@ def test_planner_records_policy_observation_and_final_report_summary(tmp_path: P
 
     assert report.policy_approval_summary["denied_actions_count"] == 1
     assert report.policy_approval_summary["skipped_actions_due_to_policy"] == 1
+
+
+def test_finalizer_sandbox_summary_reports_backend_and_enforcement_evidence() -> None:
+    evidence = EvidenceLedger(
+        sandbox_observations=[
+            {
+                "source": "verification",
+                "backend": "windows",
+                "status": "success",
+                "enforcement_status": "available",
+                "execution_backend": "account_restricted_token",
+                "network_denied_verified": True,
+                "process_tree_kill": True,
+                "job_killed": False,
+                "timeout_enforced": False,
+                "artifact_count": 1,
+                "artifact_refs": ["artifact_stdout"],
+            }
+        ]
+    )
+
+    summary = Finalizer._sandbox_summary(evidence)
+
+    assert summary["selected_backends"] == ["windows"]
+    assert summary["network_denied_verified_count"] == 1
+    assert summary["local_process_backend_count"] == 0
+    assert summary["artifact_refs"] == ["artifact_stdout"]

@@ -48,6 +48,8 @@ Evaluation runner 读取 task set manifest，在隔离 workspace 中启动真实
 
 以用户要求修复 `quicksort.py` 的 evaluation task 为例：`load_evaluation_task_set()` -> `EvaluationRunner.run()` -> `EvaluationRunner.run_task()` 先从 manifest 生成对象 `EvaluationTaskSet` 和 `EvaluationTask`，再由 `_materialize_workspace()` 创建 task `workspace`、`baseline-workspace` 和 `verification-workspace`。`KernelBootstrap.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()` 执行真实 agent 后，runner 读取 trace summary、final report、changed files 和 public/hidden verification，生成 `EvaluationTaskResult`。汇总阶段把结果写入 `<run_dir>/result.json`、`report.json`、`report.md`，clean verification workspace 失败时写错误并返回失败结果。
 
+capability regression task 以 `workspace-write`、`approval_policy=never`、`network_access=denied` 进入真实 `KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop.run` 路径。AgentLoop 内的低风险验证命令由 policy 判为 `sandbox_required` 后必须进入 `CommandExecutor -> SandboxManager -> WindowsSandboxBackend`；Windows setup 或 execution backend 缺失时，task 应记录 sandbox/permission blocker，而不是把普通本地进程当作 verification 通过。
+
 ## 真实对象完整结构
 
 ### EvaluationTask（评估任务）
@@ -185,6 +187,7 @@ COMMAND_FAILED = "command_failed"
 - `EvaluationRunner.run_task()` 消费 `EvaluationTask`。`_task_goal()` 只把 `user_task`、`allowed_paths`、`tool_policy`、`allowed_tools`、`expected_file_changes`、`completion_standard`、`risk_tags` 和可见 verification command 写入用户 goal；hidden command、verification prepare command、`success` 与 `description` 不进入模型请求。`EvaluationTaskSet` 本身不进模型，只由 `EvaluationRunner.run()` 遍历。
 - public/hidden check、success criterion 和 contract satisfaction 消费 `CommandEvalResult`；它发生在 AgentLoop 结束后的独立 evaluator 中，不进入后续模型请求。
 - `summarize_evaluation_results()`、regression compare/report、`FailureCaseReplayRunner` 和 CLI JSON 输出消费 `EvaluationTaskResult`。`TargetedFailureReplayResult.to_dict()`、Markdown renderer 与 `eval targeted-replay` 的退出码逻辑消费 targeted replay result；两种 result 都不再进入模型。
+- final report 的 `sandbox_isolation_summary`、trace artifact refs 和 command evidence 是 evaluation 判断 sandbox blocker 的输入之一；其中应能看到 selected backend、`backend_unavailable_count`、`local_process_backend_count`、`network_denied_verified_count`、`job_killed_count` 和 artifact refs。
 
 ## 是否落盘
 
@@ -204,6 +207,7 @@ COMMAND_FAILED = "command_failed"
 - workspace/task/task-set 输入错误在运行前抛 `ValueError`；缺 workspace 源抛 `FileNotFoundError`，git clone/checkout 失败抛 `RuntimeError`。task 执行阶段异常由 `EvaluationRunner.run_task()` 捕获、脱敏后写 `error_summary`。
 - `CommandEvalResult.failure_category` 明确区分 `command_parse_error`、`command_timeout`、`command_not_found`、`command_execution_error`、`environment_dependency_missing`、`verification_failed` 和 `command_failed`。
 - `EvaluationTaskResult.status` 由 `_task_result()` 归一为 `infrastructure_blocked`、`success`、`policy_blocked`、`verification_failed`、`blocked`、`failed`、`max_turns_exceeded`、`failure` 或 `unknown`；最终通过字段是 `evaluation_passed`，不是 manifest 的 `success`。
+- 真实 AgentLoop 中 verification 被 sandbox backend unavailable 阻塞时，失败摘要应保留 policy/sandbox 分类和 trace/final report artifact；不能用 fake provider、scripted provider 或 `danger-full-access` 替代默认 `workspace-write` 验证。
 - targeted replay 的 `status` 原样取 `AgentLoopResult.status.value`，`agent_completed=False` 使 CLI 退出 1；该 runner 没有总异常捕获，文件或运行异常直接传播。
 
 ## 当前结构问题

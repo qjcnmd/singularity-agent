@@ -21,6 +21,8 @@ from singularity.command import (
 )
 from singularity.policy import DecisionOutcome, PolicyConfig, PolicyEngine
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
+import singularity.sandbox as sandbox
+from singularity.sandbox import SandboxManager
 from singularity.context import ContextManager
 from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
 from singularity.tools.command import register_command_tools
@@ -103,6 +105,81 @@ def test_workspace_write_command_requires_sandbox_instead_of_local_process(tmp_p
     assert result.backend != "local_process"
     assert result.error_code in {"sandbox_unavailable", None}
     assert result.isolation_report["filesystem_isolation"] != "workspace_cwd_advisory"
+
+
+def test_workspace_write_low_risk_verification_runs_through_windows_sandbox(
+    tmp_path: Path,
+) -> None:
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def run(self, prepared):
+            self.calls.append(prepared)
+            now = "2026-01-01T00:00:00+00:00"
+            return sandbox.WindowsRunnerResult(
+                exit_code=0,
+                stdout="pytest passed\n",
+                stderr="",
+                timed_out=False,
+                started_at=now,
+                ended_at=now,
+                duration_ms=3,
+                network_denied_verified=True,
+                metadata={
+                    "restricted_token": True,
+                    "low_integrity": True,
+                    "private_desktop": True,
+                    "job_object": True,
+                },
+            )
+
+    runner = FakeRunner()
+    backend = sandbox.WindowsSandboxBackend(
+        runner=runner,
+        acl_applier=lambda _path: None,
+        doctor_provider=sandbox.WindowsSandboxDoctorReport.ready_for_tests,
+    )
+    profile = PermissionProfile.default_for_workspace(
+        tmp_path,
+        profile=PermissionProfileName.WORKSPACE_WRITE,
+    )
+    component = CommandExecutor(
+        tmp_path,
+        policy_engine=PolicyEngine(
+            PolicyConfig(workspace_root=tmp_path, permission_profile=profile)
+        ),
+        sandbox_manager=SandboxManager(
+            tmp_path,
+            backends=[backend],
+            permission_profile=profile,
+        ),
+    )
+
+    result = component.run(
+        CommandRequest(
+            argv=[sys.executable, "-m", "pytest", "-q"],
+            cwd=".",
+            purpose=CommandPurpose.PROJECT_VERIFICATION,
+        )
+    )
+
+    assert result.execution_status == ExecutionStatus.COMPLETED
+    assert result.backend == "windows"
+    assert result.error_code is None
+    assert result.stdout_preview == "pytest passed\n"
+    assert result.isolation_report["backend"] == "windows"
+    sandbox_report = result.isolation_report["sandbox"]
+    assert len(runner.calls) == 1
+    prepared = runner.calls[0]
+    assert prepared.backend_name == "windows"
+    assert prepared.request.command == [sys.executable, "-m", "pytest", "-q"]
+    assert prepared.baseline["runner_spec"]
+    assert prepared.baseline["runner_result"]
+    assert sandbox_report["backend_is_local_process"] is False
+    assert sandbox_report["network_denied_verified"] is True
+    assert sandbox_report["execution_backend"] == "account_restricted_token"
+    assert result.metadata["network_denied_verified"] is True
 
 
 def test_danger_full_access_allows_inline_interpreter_execution(tmp_path: Path) -> None:

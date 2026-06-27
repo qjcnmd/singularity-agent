@@ -395,6 +395,15 @@ def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path)
                 "hard_isolation_available": False,
                 "absolute_path": str(tmp_path),
             },
+            "sandbox_id": "sandbox_1",
+            "sandbox_backend": "windows",
+            "sandbox_status": "success",
+            "enforcement_status": "available",
+            "execution_backend": "account_restricted_token",
+            "network_denied_verified": True,
+            "process_tree_kill": True,
+            "job_killed": False,
+            "timeout_enforced": False,
         }
     )
     fake = FakeCommandExecutor([result])
@@ -422,6 +431,12 @@ def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path)
             "hard_isolation_available": False,
         },
     }
+    assert evidence["sandbox_backend"] == "windows"
+    assert evidence["enforcement_status"] == "available"
+    assert evidence["execution_backend"] == "account_restricted_token"
+    assert evidence["network_denied_verified"] is True
+    assert evidence["process_tree_kill"] is True
+    assert evidence["timeout_enforced"] is False
     serialized = json.dumps(evidence, sort_keys=True)
     assert "must-not-leak" not in serialized
     assert str(tmp_path) not in serialized

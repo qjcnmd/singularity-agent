@@ -1,12 +1,7 @@
 from singularity.sandbox.artifacts import SandboxArtifactCollector
 from singularity.sandbox.backends import (
     SandboxBackend,
-    WindowsSandboxBackend,
-    WindowsSandboxDoctorReport,
-    WindowsSandboxPrimitives,
-    WindowsSandboxSetup,
     default_sandbox_backends,
-    probe_windows_sandbox,
 )
 from singularity.sandbox.environment import SandboxEnvironmentBuilder
 from singularity.sandbox.exceptions import (
@@ -41,6 +36,22 @@ from singularity.sandbox.models import (
 )
 from singularity.sandbox.manager import SandboxManager
 from singularity.sandbox.trace_recorder import SandboxJsonlTraceRecorder
+from singularity.sandbox.windows import (
+    WindowsCapabilityState,
+    WindowsSandboxBackend,
+    WindowsSandboxDoctorReport,
+    WindowsSandboxExecution,
+    WindowsSandboxPrimitives,
+    WindowsSandboxSetup,
+    WindowsSandboxSetupReport,
+    probe_windows_sandbox,
+    setup_windows_sandbox,
+)
+from singularity.sandbox.windows_runner import (
+    WindowsRunnerResult,
+    WindowsRunnerSpec,
+    WindowsSandboxRunner,
+)
 
 __all__ = [
     "PreparedSandbox",
@@ -74,10 +85,17 @@ __all__ = [
     "SandboxViolation",
     "SandboxViolationError",
     "WindowsSandboxBackend",
+    "WindowsCapabilityState",
     "WindowsSandboxDoctorReport",
+    "WindowsSandboxExecution",
     "WindowsSandboxPrimitives",
     "WindowsSandboxSetup",
+    "WindowsSandboxSetupReport",
+    "WindowsRunnerResult",
+    "WindowsRunnerSpec",
+    "WindowsSandboxRunner",
     "default_sandbox_backends",
     "default_sandbox_profile",
     "probe_windows_sandbox",
+    "setup_windows_sandbox",
 ]

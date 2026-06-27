@@ -7,6 +7,8 @@
 - src/singularity/sandbox/manager.py
 - src/singularity/sandbox/backends.py
 - src/singularity/sandbox/filesystem.py
+- src/singularity/sandbox/windows.py
+- src/singularity/sandbox/windows_runner.py
 - src/singularity/command/executor.py
 
 关键符号:
@@ -15,9 +17,15 @@
 - SandboxResult
 - SandboxViolation
 - SandboxManager
+- SandboxFilesystemManager
 - WindowsSandboxBackend
 - WindowsSandboxDoctorReport
+- WindowsSandboxSetupReport
+- WindowsRunnerSpec
+- WindowsRunnerResult
+- WindowsSandboxRunner
 - probe_windows_sandbox
+- setup_windows_sandbox
 - default_sandbox_profile
 - default_sandbox_backends
 
@@ -34,27 +42,38 @@
 - `SandboxChangeSummary`: created_files, modified_files, deleted_files, total_changed_files, diff_preview, importable
 - `SandboxViolation`: violation_type, message, severity, evidence, detected_at
 - `SandboxResult`: sandbox_id, backend_name, status, exit_code, stdout, stderr, started_at, ended_at, duration_ms, artifacts, filesystem_changes, violations, trace_id, cleanup_status, metadata
+- `WindowsCapabilityState`: status, checked, reason, evidence
 - `WindowsSandboxPrimitives`: restricted_token, job_object, low_integrity, acl, firewall, private_desktop
 - `WindowsSandboxSetup`: sandbox_account, acl_boundary, network_filter, private_desktop, execution_backend
-- `WindowsSandboxDoctorReport`: implementation, platform_supported, primitives, setup, available, missing_requirements
+- `WindowsSandboxExecution`: account_sid, credential, launcher, runner_smoke, network_probe
+- `WindowsSandboxDoctorReport`: implementation, platform_supported, platform_status, primitives, setup, execution, available, enforcement_status, blocking_requirements, recommended_action
+- `WindowsSandboxSetupReport`: status, requested_operation, requires_elevation, changed, completed_steps, pending_steps, failed_steps, available_after_setup, message
+- `WindowsRunnerSpec`: command, cwd, env, timeout_seconds, max_output_chars, network_mode, result_path
+- `WindowsRunnerResult`: exit_code, stdout, stderr, timed_out, started_at, ended_at, duration_ms, output_truncated, job_killed, network_denied_verified, metadata
 
 ## 这一层解决什么问题
 
 Sandbox 层消费已经解析完成的 `SandboxRequest`，选择能够满足 filesystem、network 和 resource 要求的 OS-native backend，并统一返回执行结果或明确的 `backend_unavailable`。这一层不决定会话权限、不发放审批，也不把普通本地执行或 workspace copy 表述为强隔离。
 
+Windows 当前实现是 account-backed OS sandbox：父进程准备 COW workspace projection 和 run root ACL，子进程以 `SingularitySandboxRunner` 本地账户启动 `windows_runner.py`，runner 再用 restricted low-integrity token、private desktop 和 kill-on-close Job Object 启动实际验证命令。缺少 sandbox account、Credential Manager 凭据、ACL boundary、account-scoped firewall、private desktop、runner smoke 或 network probe 任意一项时，backend 不可用。
+
 ## 当前源码位置
 
 - `src/singularity/sandbox/models.py`：请求、profile、capability、prepared/result 等对象。
-- `src/singularity/sandbox/manager.py`：backend 选择、capability 校验、生命周期和 trace。
-- `src/singularity/sandbox/backends.py`：Windows capability/setup 边界及默认 backend 注册。
-- `src/singularity/sandbox/filesystem.py`：workspace projection、变化检测和清理辅助；当前没有可用 backend 调用它执行命令。
-- `src/singularity/command/executor.py`：依据会话级 `PermissionProfile` 构造完整 `SandboxRequest`。
+- `src/singularity/sandbox/manager.py`：backend 选择、capability 校验、protected path preflight、生命周期和 trace。
+- `src/singularity/sandbox/backends.py`：默认 backend 注册；Windows 上注册 `WindowsSandboxBackend`，非 Windows 返回空列表。
+- `src/singularity/sandbox/filesystem.py`：workspace projection、protected glob 排除、变化检测和清理辅助。
+- `src/singularity/sandbox/windows.py`：Windows doctor/setup、account/firewall/ACL probe、backend prepare/run/cleanup。
+- `src/singularity/sandbox/windows_runner.py`：sandbox account runner、restricted token child、private desktop、Job Object、timeout/output/network probe/result JSON。
+- `src/singularity/command/executor.py`：依据会话级 `PermissionProfile` 构造完整 `SandboxRequest`，并把 `SandboxResult` 投影成 command evidence。
 
 ## 关键类、函数、字段
 
-`SandboxManager.run()`只消费由CommandExecutor构造完成的请求，不重新解释`PolicyDecision`。`ensure_capabilities()`校验请求声明的 denied network、read-only workspace、memory limit 和 process limit。`WindowsSandboxBackend.doctor()`返回真实探测报告；当前 `setup()`、`prepare()`和`run()`均 fail-closed，不执行普通本地进程。
+`SandboxManager.run()` 只消费由 `CommandExecutor` 构造完成的请求，不重新解释 `PolicyDecision`。`ensure_capabilities()` 校验 denied network、read-only workspace、memory limit 和 process limit。`WindowsSandboxBackend.doctor()` 返回稳定 JSON schema 的真实探测报告，`setup()` 在 Windows elevated shell 下创建/验证本地账户、Credential Manager 凭据、account-scoped firewall 和 execution smoke；非 elevated setup 返回 `requires_elevation`，不得假成功。
 
-本文顶部字段清单是当前源码对象的完整字段。`SandboxProfile`已无容器 image 字段；backend 也没有容器、镜像、container user 或 daemon availability 配置。
+`WindowsSandboxBackend.prepare()` 先重新检查 doctor 可用性，再拒绝当前未实现的 workspace 外 `writable_paths` 和 path-specific `readonly_paths`，之后调用 `SandboxFilesystemManager.prepare_filesystem()` 创建 COW projection。protected paths 通过 `CommandExecutor` 合入 `exclude_globs`，所以 `.env`、`.git`、`.singularity` 等不会进入 projection；`SandboxManager._protected_path_violation()` 还会在命令参数、cwd 和显式 resource 上做前置 hard deny。`prepare()` 对 run root 授予 sandbox account 修改权限，但只对 `workspace/` projection 设置低完整性标签，避免低完整性命令子进程写入 `runner-spec.json`、`runner-result.json` 等控制面文件。
+
+`WindowsSandboxBackend.run()` 在启动 runner 前再做一次 uncached enforcement probe；如果防火墙、凭据、runner smoke 等状态已失效，返回 `BACKEND_UNAVAILABLE` 且不启动进程。执行成功与否以 `WindowsRunnerResult` 的真实元数据为准，不能硬编码 restricted token、low integrity、private desktop 或 Job Object evidence。`network_access=denied` 需要同时满足宿主机 outbound baseline 可连通、本次 runner socket probe 被拒绝、doctor 的 `setup.network_filter` 和 `execution.network_probe`，否则返回 `SandboxStatus.VIOLATION`。
 
 ## 真实运行时调用链
 
@@ -63,23 +82,38 @@ PolicyEngine / ApprovalGate
 -> CommandExecutor.run()
 -> CommandExecutor._sandbox_request()
 -> SandboxManager.run(SandboxRequest)
+-> SandboxManager._protected_path_violation()
 -> SandboxManager._select_backend()
 -> backend.is_available() + SandboxManager.ensure_capabilities()
--> backend.prepare() -> backend.run() -> backend.cleanup()
+-> WindowsSandboxBackend.prepare()
+   -> SandboxFilesystemManager.prepare_filesystem()
+   -> account ACL run root + low-integrity workspace projection
+   -> runner-spec.json / runner-result.json
+-> WindowsSandboxBackend.run()
+   -> uncached doctor enforcement check
+   -> WindowsSandboxRunner.run()
+   -> CreateProcessWithLogonW(account runner)
+   -> CreateRestrictedToken + low integrity + CreateDesktopW + Job Object + CreateProcessAsUserW(actual command)
+   -> WindowsRunnerResult
+-> WindowsSandboxBackend.cleanup()
 -> SandboxResult
 -> CommandExecutor._result_from_sandbox()
--> CommandResult.isolation_report / trace / planner evidence
+-> CommandResult.isolation_report / trace / planner evidence / final report
 ```
 
-当前 Windows 实际路径在 `backend.is_available()`处结束：doctor 的 setup 状态未完成，manager 返回 `SandboxStatus.BACKEND_UNAVAILABLE`，不调用 `prepare()`，也不启动进程。
+当前本机如果尚未从 elevated shell 运行 `sandbox setup --json`，真实路径仍会在 `backend.is_available()` 或 `run()` 前的 enforcement probe 处返回 `backend_unavailable`；这不是 fallback，也不会启动普通本地进程。
 
 ## 真实任务中的对象流
 
-以 workspace-write 会话运行本地验证为例，`CommandExecutor._sandbox_request()`从共享 `PermissionProfile`和已经产生的 policy decision 生成 `SandboxProfile`及`SandboxRequest`。其中 writable roots、additional writable directories、protected path patterns、network mode、timeout、output limit 和脱敏环境已经解析完成。
+以 `workspace-write` 会话运行 `python -m pytest`、`python -m compileall`、`ruff` 或 `mypy` 为例，`CommandExecutor._sandbox_request()` 从共享 `PermissionProfile` 和 policy decision 生成 `SandboxProfile` 及 `SandboxRequest`。其中 writable roots、additional writable directories、protected path patterns、network mode、timeout、output limit 和脱敏环境已经解析完成。
 
-`SandboxManager.run()`不修改这些边界，只寻找可用 backend 并核验 capability。当前 `WindowsSandboxBackend`探测 restricted token、Job Object、low integrity、ACL、Windows Firewall 和 private desktop primitives，但 `sandbox_account`、`acl_boundary`、`network_filter`、`private_desktop`及`execution_backend` setup 均为 false，因此结果为 `backend_unavailable`。该结果被转换为 command backend error；不存在未隔离本地执行 fallback。
+具体对象链路是：`CommandExecutor._sandbox_request()` -> `SandboxManager.run()` -> `WindowsSandboxBackend.prepare()` -> `WindowsSandboxRunner.run()` -> `WindowsSandboxBackend.run()` -> `CommandExecutor._result_from_sandbox()`。`CommandExecutor._sandbox_request()` 生成请求对象，`SandboxManager.run()` 消费请求并生成 lifecycle trace，Windows backend 生成 runner spec/result 文件，`CommandExecutor._result_from_sandbox()` 消费 `SandboxResult` 并生成 command evidence。
 
-`CommandExecutor._sandbox_request()`生成请求对象 -> `SandboxManager.run()`消费请求并生成结果 -> `CommandExecutor._result_from_sandbox()`消费结果 -> `SandboxJsonlTraceRecorder.append()`把安全字段落盘到`.singularity/sandbox/trace.jsonl`。
+`SandboxManager.run()` 不修改这些边界，只寻找可用 backend 并核验 capability。Windows 可用时，`WindowsSandboxBackend.prepare()` 复制 workspace 到 `work/sandboxes/<sandbox_id>/workspace`，按 exclude globs 排除 protected paths，写入 runner spec/result 路径，并只给 sandbox account 访问本次 run root。runner 作为 sandbox account 读取 spec，再创建 restricted low-integrity child 执行实际命令；stdout/stderr、timeout、network denied proof、Job Object 状态和 artifacts 通过 result JSON 返回父进程。runner 写 result JSON 前会先做本地脱敏，并在读取 account runner 与 child stdout/stderr 后删除临时输出文件，降低 cleanup 失败时的磁盘残留风险。
+
+workspace 外 additional writable directories 当前不会被投影，也不会被 ACL 授权；只要 `writable_paths` 中出现 workspace 外目录，Windows backend 立即 fail closed。path-specific `readonly_paths` 也因尚无目录级 ACL lease 支持而 fail closed。workspace 内 protected paths 通过 projection exclude 和 manager preflight 生效。
+
+`CommandExecutor._result_from_sandbox()` 消费 `SandboxResult`，把 backend、enforcement_status、execution_backend、network_denied_verified、process_tree_kill、job_killed、timeout_enforced、artifact refs、violations 和 changed files 写入 `CommandResult.isolation_report["sandbox"]` 与 metadata。
 
 ## 真实对象完整结构
 
@@ -117,32 +151,99 @@ class SandboxProfile:
 
 ### WindowsSandboxDoctorReport（Windows capability/setup 报告）
 
+`to_dict()` 输出 `schema_version: "sandbox.windows.doctor/v1"`，每个 capability item 都是 `{status, checked, reason, evidence}`，证据经过 `TraceRedactor` 脱敏。
+
 ```python
 @dataclass(frozen=True)
+class WindowsCapabilityState:
+    status: str
+    checked: bool
+    reason: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+@dataclass(frozen=True)
 class WindowsSandboxPrimitives:
-    restricted_token: bool
-    job_object: bool
-    low_integrity: bool
-    acl: bool
-    firewall: bool
-    private_desktop: bool
+    restricted_token: WindowsCapabilityState
+    job_object: WindowsCapabilityState
+    low_integrity: WindowsCapabilityState
+    acl: WindowsCapabilityState
+    firewall: WindowsCapabilityState
+    private_desktop: WindowsCapabilityState
 
 @dataclass(frozen=True)
 class WindowsSandboxSetup:
-    sandbox_account: bool
-    acl_boundary: bool
-    network_filter: bool
-    private_desktop: bool
-    execution_backend: bool
+    sandbox_account: WindowsCapabilityState
+    acl_boundary: WindowsCapabilityState
+    network_filter: WindowsCapabilityState
+    private_desktop: WindowsCapabilityState
+    execution_backend: WindowsCapabilityState
+
+@dataclass(frozen=True)
+class WindowsSandboxExecution:
+    account_sid: WindowsCapabilityState
+    credential: WindowsCapabilityState
+    launcher: WindowsCapabilityState
+    runner_smoke: WindowsCapabilityState
+    network_probe: WindowsCapabilityState
 
 @dataclass(frozen=True)
 class WindowsSandboxDoctorReport:
     implementation: str
     platform_supported: bool
+    platform_status: str
     primitives: WindowsSandboxPrimitives
     setup: WindowsSandboxSetup
+    execution: WindowsSandboxExecution
     available: bool
-    missing_requirements: tuple[str, ...]
+    enforcement_status: str
+    blocking_requirements: tuple[str, ...]
+    recommended_action: str
+```
+
+### WindowsSandboxSetupReport（setup 报告）
+
+`to_dict()` 输出 `schema_version: "sandbox.windows.setup/v1"`。`status` 只能是 `not_supported`、`requires_elevation`、`partial`、`ready` 或 `failed`；只有 doctor 最终 `available=True` 时才报告 `ready`。
+
+```python
+@dataclass(frozen=True)
+class WindowsSandboxSetupReport:
+    status: str
+    requested_operation: str
+    requires_elevation: bool
+    changed: bool
+    completed_steps: tuple[str, ...]
+    pending_steps: tuple[str, ...]
+    failed_steps: tuple[dict[str, str], ...]
+    available_after_setup: bool
+    message: str
+```
+
+### WindowsRunnerSpec / WindowsRunnerResult（执行 backend I/O）
+
+```python
+@dataclass(frozen=True)
+class WindowsRunnerSpec:
+    command: list[str] | str
+    cwd: str
+    env: dict[str, str]
+    timeout_seconds: float | None = None
+    max_output_chars: int | None = None
+    network_mode: str = "denied"
+    result_path: str = ""
+
+@dataclass(frozen=True)
+class WindowsRunnerResult:
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool
+    started_at: str
+    ended_at: str
+    duration_ms: int
+    output_truncated: bool = False
+    job_killed: bool = False
+    network_denied_verified: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 ```
 
 ### PreparedSandbox（已准备环境）
@@ -162,7 +263,7 @@ class PreparedSandbox:
     baseline: dict[str, Any] = field(default_factory=dict)
 ```
 
-`PreparedSandbox`和`SandboxFilesystemManager`保留 projection/capture 数据结构，但当前默认 backend 不会生成它。字段存在不等于当前具备 filesystem isolation。
+`PreparedSandbox.baseline` 在 Windows backend 中包含 workspace file baseline、`runner_spec`、`runner_result` 和 sandbox account 名称。字段存在不等于 backend 可用；只有 doctor/setup 全部通过后才会生成该对象。
 
 ### SandboxResult（沙箱结果）
 
@@ -220,49 +321,61 @@ class SandboxNetworkMode(str, Enum):
     UNSUPPORTED = "unsupported"
 ```
 
-`COPY_ON_WRITE_WORKSPACE`是请求中的 projection 模式名称，不是 backend capability 证明。只有可用 OS backend 的实际 enforcement 才能形成成功隔离结果。
+`COPY_ON_WRITE_WORKSPACE` 是请求中的 projection 模式名称，不是 backend capability 证明。只有可用 OS backend 的实际 enforcement 才能形成成功隔离结果。
 
 ## 谁生成这些对象
 
-- `CommandExecutor._sandbox_request()`生成`SandboxProfile`和`SandboxRequest`。
-- `default_sandbox_profile()`生成基础 profile，CommandExecutor 再写入会话权限边界。
-- `probe_windows_sandbox()`生成`WindowsSandboxDoctorReport`。
-- 可用 backend 才能生成`PreparedSandbox`和执行型`SandboxResult`；当前默认 Windows backend只由manager生成 unavailable result。
+- `CommandExecutor._sandbox_request()` 生成 `SandboxProfile` 和 `SandboxRequest`。
+- `default_sandbox_profile()` 生成基础 profile，`CommandExecutor` 再写入会话权限边界、protected globs、network mode 和 resource limits。
+- `probe_windows_sandbox()` 生成 `WindowsSandboxDoctorReport`。
+- `setup_windows_sandbox()` 生成 `WindowsSandboxSetupReport`，并在 elevated Windows shell 下创建或验证账户、凭据、firewall 和 smoke assets。
+- `WindowsSandboxBackend.prepare()` 生成 `PreparedSandbox` 与 runner spec；`WindowsSandboxBackend.run()` 生成执行型 `SandboxResult`。
+- `WindowsSandboxRunner.run()` / `run_spec()` 生成 `WindowsRunnerResult`。
 
 ## 谁消费这些对象
 
-- `SandboxManager`和 backend 消费 `SandboxRequest`、`SandboxProfile`及`PreparedSandbox`。
-- `CommandExecutor._result_from_sandbox()`消费`SandboxResult`并产生`CommandResult`。
-- trace recorder消费请求、result和安全的 capability 摘要。
-- 完整 request、policy constraints、doctor内部setup对象不进入模型；模型只接收经过 command/tool observation 裁剪的结果。
+- `SandboxManager` 和 backend 消费 `SandboxRequest`、`SandboxProfile` 及 `PreparedSandbox`。
+- `WindowsSandboxRunner` 消费 `runner-spec.json`，写 `runner-result.json`。
+- `CommandExecutor._result_from_sandbox()` 消费 `SandboxResult` 并产生 `CommandResult`。
+- `Planner.update_from_command()`、`VerificationRunner` 和 `Finalizer` 消费 command metadata / isolation report 中的 sandbox evidence。
+- 完整 request、policy constraints、doctor 内部 setup 对象不直接进入模型；模型只接收经过 command/tool observation 裁剪的结果。
 
 ## 是否落盘
 
-默认 `SandboxJsonlTraceRecorder`写入`<workspace>/.singularity/sandbox/trace.jsonl`。当前 Windows backend unavailable 时不会创建 sandbox root、workspace projection或artifact。`SandboxFilesystemManager`只有在未来可用 OS backend 显式调用时才创建临时 projection；projection本身不得被报告为隔离能力。
+默认 `SandboxJsonlTraceRecorder` 写入 `<workspace>/.singularity/sandbox/trace.jsonl`。Windows 可用执行会在 workspace 下 `work/sandboxes/<sandbox_id>/` 创建 run root、workspace projection、`runner-spec.json`、`runner-result.json` 和 artifacts；cleanup 成功后删除 run root。doctor/setup 的 smoke 目录位于 `resolve_user_data_paths().state_dir/windows-sandbox/`。
+
+Windows 凭据只写入 Windows Credential Manager target `SingularitySandboxRunner`，不写 plaintext 文件，不进入 trace/report。Firewall rule group 为 `Singularity Sandbox`，规则以 `LocalUser` 绑定 sandbox account SID。doctor evidence 只记录 SID/hash、rule 名称、probe exit 等脱敏信息。
 
 ## 是否进入 trace / audit
 
-`SandboxManager`可发出`sandbox.requested`、`sandbox.prepared`、`sandbox.started`、`sandbox.cleaned`、`sandbox.capability_failed`、`sandbox.violation`和`sandbox.completed`。当前 backend unavailable 主路径记录 requested/completed及 JSONL unavailable result。sandbox result不直接写policy audit；关联的 policy decision 由Policy层记录。
+`SandboxManager` 可发出 `sandbox.requested`、`sandbox.prepared`、`sandbox.started`、`sandbox.cleaned`、`sandbox.capability_failed`、`sandbox.violation` 和 `sandbox.completed`。`SandboxJsonlTraceRecorder.append()` 写 result、capability、request 安全投影。sandbox result 不直接写 policy audit；关联的 policy decision 由 Policy 层记录。
+
+`CommandExecutor._result_from_sandbox()` 会把 selected backend、enforcement status、execution backend、network denied proof、Job Object/timeout 状态、artifact refs、changed files 和 violations 放入 `CommandResult.isolation_report["sandbox"]`。Planner 和 final report 从这里聚合 `sandbox_isolation_summary`。
 
 ## 失败路径
 
-- 平台不是 Windows：默认 backend 列表为空，返回`backend_unavailable`。
-- Windows primitive或setup缺失：backend不可用，返回`backend_unavailable`且不启动进程。
-- 已注册可用backend无法满足denied network、read-only mount、memory/process limit：`SandboxCapabilityError`转为`backend_unavailable`。
-- prepare/run异常：返回`setup_failed`或backend自身失败状态。
-- cleanup异常：标记`cleanup_failed`，不得保留success。
+- 平台不是 Windows：默认 backend 列表为空，返回 `backend_unavailable`。
+- Windows primitive、sandbox account、credential、ACL boundary、account-scoped firewall、private desktop、runner smoke 或 network probe 缺失：doctor `available=false`，manager 返回 `backend_unavailable`，不启动进程。
+- `sandbox setup --json` 非 elevated：返回 `requires_elevation` 和 exit code 1；不得把 partial/requires_elevation 改写为 ready。
+- workspace 外 additional writable directories 或 path-specific `readonly_paths`：Windows backend 当前返回 `backend_unavailable`，直到实现独立 ACL lease/projection。
+- protected path 显式访问：manager preflight 返回 `POLICY_BLOCKED`；projection 也会通过 exclude globs 排除 protected paths。
+- denied network 下 host outbound baseline、runner socket probe、account-scoped firewall 或 doctor network probe 任一未验证：返回 `SandboxStatus.VIOLATION`。
+- restricted token、low integrity、private desktop 或 Job Object evidence 未验证：返回 `SandboxStatus.VIOLATION`。
+- timeout：runner 通过 Job Object/进程终止路径返回 `SandboxStatus.TIMEOUT`，metadata 记录 `job_killed`。
+- cleanup 异常：标记 `cleanup_failed`，不得保留 success。
 - 所有不可用路径均禁止回退到普通本地执行。
 
 ## 当前结构问题
 
-- Windows elevated setup和native execution尚未实现，所以当前没有可成功执行的强隔离backend。
-- primitive探测只能证明API存在，不能证明sandbox account、ACL、network filter、private desktop或launcher已配置。
-- `SandboxFilesystemManager`仍提供projection辅助，但必须等OS身份、ACL和network enforcement完成后才能由backend使用。
-- `SandboxRequest`仍携带policy关联字段；SandboxManager不消费或修改这些字段，后续应继续保持内部治理对象与模型摘要分离。
+- Windows memory/process limits 当前未实现；`SandboxCapabilities.memory_limit` 和 `process_limit` 保持 false，需要请求这些能力时 fail closed。
+- workspace 外 additional writable directories 还没有独立 projection/ACL lease；当前正确行为是 fail closed。
+- path-specific `readonly_paths` 还没有目录级 ACL lease；当前正确行为是 fail closed。
+- Windows doctor 会运行 account-backed runner/network smoke，可能在 state dir 下创建 probe 目录；这是为了避免把 API primitive 存在误判成可执行 backend。
+- `SandboxFilesystemManager` 只负责 COW projection、exclude globs 和 change detection；不能单独作为隔离 backend。
 
 ## 维护规则
 
-- 新backend必须以真实OS enforcement和external smoke证明capability；workspace copy、chmod或普通子进程不能注册为sandbox backend。
-- capability或setup缺失必须返回`backend_unavailable`，不得静默本地执行。
-- Windows setup、doctor、account/ACL/firewall、restricted token、Job Object或private desktop变化时同步本文件。
-- 修改本模块对象字段、调用链、CLI、trace或report schema后运行`python scripts/verify_runtime_docs.py`；展示对象时必须列完整字段。
+- 新 backend 必须以真实 OS enforcement 和 external smoke 证明 capability；workspace copy、chmod 或普通子进程不能注册为 sandbox backend。
+- capability 或 setup 缺失必须返回 `backend_unavailable`，不得静默本地执行。
+- Windows setup、doctor、account/ACL/firewall、restricted token、Job Object、private desktop、runner result metadata 或 network proof 变化时同步本文件。
+- 修改本模块对象字段、调用链、CLI、trace 或 report schema 后运行 `python scripts/verify_runtime_docs.py`；展示对象时必须列完整字段。

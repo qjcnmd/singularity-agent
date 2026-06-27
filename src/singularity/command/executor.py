@@ -739,8 +739,26 @@ class CommandExecutor:
             "backend": sandbox_result.backend_name,
             "status": sandbox_result.status.value,
             "trace_id": sandbox_result.trace_id,
+            "enforcement_status": sandbox_result.metadata.get("enforcement_status")
+            or (
+                "available"
+                if sandbox_result.status
+                not in {SandboxStatus.BACKEND_UNAVAILABLE, SandboxStatus.SETUP_FAILED}
+                else "backend_unavailable"
+            ),
+            "execution_backend": sandbox_result.metadata.get("execution_backend"),
+            "backend_is_local_process": sandbox_result.backend_name == "local_process",
+            "network_denied_verified": sandbox_result.metadata.get(
+                "network_denied_verified"
+            ),
+            "process_tree_kill": sandbox_result.metadata.get("process_tree_kill"),
+            "job_killed": sandbox_result.metadata.get("job_killed"),
+            "timeout_enforced": sandbox_result.status == SandboxStatus.TIMEOUT,
             "artifact_count": len(sandbox_result.artifacts),
             "artifacts": [artifact.to_dict() for artifact in sandbox_result.artifacts],
+            "artifact_refs": [
+                artifact.artifact_id for artifact in sandbox_result.artifacts
+            ],
             "changed_files": sandbox_result.filesystem_changes.to_dict(),
             "changed_files_count": sandbox_result.filesystem_changes.total_changed_files,
             "violations": [violation.to_dict() for violation in sandbox_result.violations],
@@ -798,6 +816,12 @@ class CommandExecutor:
                 "sandbox_artifacts": [artifact.to_dict() for artifact in sandbox_result.artifacts],
                 "sandbox_changed_files": sandbox_result.filesystem_changes.to_dict(),
                 "sandbox_violations": [violation.to_dict() for violation in sandbox_result.violations],
+                "enforcement_status": sandbox_report["enforcement_status"],
+                "execution_backend": sandbox_report["execution_backend"],
+                "network_denied_verified": sandbox_report["network_denied_verified"],
+                "process_tree_kill": sandbox_report["process_tree_kill"],
+                "job_killed": sandbox_report["job_killed"],
+                "timeout_enforced": sandbox_report["timeout_enforced"],
                 "command_capabilities": self._command_capability_summary(
                     request.resource_limits
                 ),

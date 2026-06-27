@@ -93,11 +93,15 @@ Policy 层把会话级权限边界、动作级策略决策和人工 approval 串
 
 执行时，`ToolExecutor` 只做工具准入和 hard deny；对于 delegated command/mutation，它不提前消费 approval grant。`CommandExecutor._policy_request()`、`WorkspaceMutationManager._policy_request()`、`VerificationRunner._policy_request()` 在真正执行边界生成 `PolicyRequest`，调用 `PolicyEngine.enforce()` 得到 `PolicyDecision`。`REQUIRE_REVIEW` 由该执行边界调用 `ApprovalGate.authorize()` 消费单次授权；`SANDBOX_REQUIRED` 交给 `SandboxManager.run()` 执行已经构造好的 `SandboxRequest`。`approval_policy=never` 在 rules 层把 review 转为 deny。
 
+Windows sandbox backend 不改变 policy 语义：PolicyEngine 只决定普通本地验证命令在 `workspace-write` 下需要 sandbox，ApprovalGate 只处理 review/approval，不创建账户、不放宽到 `danger-full-access`。Sandbox 层随后验证 sandbox account、Credential Manager 凭据、ACL boundary、LocalUser firewall、private desktop、restricted low-integrity token、Job Object 和 network probe。缺任一能力时 command 结果是 sandbox/backend error，不回退到普通本地进程。
+
 ## 真实任务中的对象流
 
 以模型请求写入 `quicksort.py` 并运行验证为例：`ToolExecutor` -> `WorkspaceMutationManager.apply_operations()` -> `PolicyEngine.enforce()` -> `ApprovalGate.authorize()` 或直接执行。Mutation manager 生成 `PolicyRequest`，`PolicyEngine.enforce()` 消费 request、生成 `PolicyDecision`，并通过 `PolicyAuditWriter.append()` 落盘到 policy audit JSONL；workspace 内普通写入在 `workspace-write` 下 allow，`.env`、`.git/config` 或 `.singularity/**` 则因 `PermissionProfile.protected_paths` hard deny。随后命令验证进入 `CommandExecutor.run()` -> `CommandExecutor._sandbox_request()` -> `SandboxManager.run()`；command executor 再次生成 command `PolicyRequest`，在 `workspace-write` 下普通本地命令得到 `sandbox_required`，并生成 `SandboxRequest` 交给 sandbox 层消费。trace 记录 `policy.requested`、`policy.decided` / `policy.blocked`、`sandbox.requested`、`sandbox.completed`；audit JSONL 记录完整 request/decision 投影；模型 context 只收到裁剪后的 outcome/reason 或 `PermissionSummary`。
 
 `PolicyAuditWriter.append()` 写入 JSONL 对象，`PolicyEngine._emit_policy_trace()` 写入 trace 事件，`ApprovalGate.authorize()` 返回 grant 结果。
+
+`PermissionProfile.additional_writable_directories` 仍是会话级边界来源。Windows sandbox 当前只支持 workspace projection；workspace 外 additional writable directories 和 path-specific readonly leases 由 backend fail closed，直到 sandbox 层实现独立 projection/ACL lease，而不是由 policy 层假定可执行。
 
 ## 真实对象完整结构
 
@@ -287,11 +291,11 @@ Trace events.jsonl 记录 `TraceEventType.POLICY_REQUESTED`、`TraceEventType.PO
 
 ## 失败路径
 
-受保护路径 hard-deny 优先。`approval_policy=never` 把 `REQUIRE_REVIEW` 转为 `DENY`。没有 `InteractionController`、grant store 不可信、grant 过期、scope 不匹配或 single-use 已消费时，`ApprovalGate` fail-closed。OS sandbox 不可用时返回 `backend_unavailable`，不会回退为普通本地执行。
+受保护路径 hard-deny 优先。`approval_policy=never` 把 `REQUIRE_REVIEW` 转为 `DENY`。没有 `InteractionController`、grant store 不可信、grant 过期、scope 不匹配或 single-use 已消费时，`ApprovalGate` fail-closed。OS sandbox 不可用、Windows setup 未完成、account-scoped firewall 未验证或 runner smoke 失败时返回 `backend_unavailable`，不会回退为普通本地执行。
 
 ## 当前结构问题
 
-Windows elevated sandbox setup/execution 当前 fail-closed，尚未具备完整账户、ACL、防火墙、restricted token、Job Object、private desktop 执行 backend。`PermissionProfile` 已接入 runtime，但新增 path/resource 入口时仍必须显式调用 protected matcher，防止直接 backend 调用绕过策略。
+Windows account-backed sandbox backend 已接入 runtime，但 elevated setup 资产缺失、外部 additional writable directory projection 或 path-specific readonly ACL lease 缺失时仍 fail closed。`PermissionProfile` 已接入 runtime，但新增 path/resource 入口时仍必须显式调用 protected matcher，防止直接 backend 调用绕过策略。
 
 ## 维护规则
 

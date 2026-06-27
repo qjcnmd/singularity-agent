@@ -330,6 +330,12 @@ class VerificationEvidence:
     sandbox_artifacts: list[dict[str, Any]] = field(default_factory=list)
     sandbox_changed_files: dict[str, Any] = field(default_factory=dict)
     sandbox_violations: list[dict[str, Any]] = field(default_factory=list)
+    enforcement_status: str | None = None
+    execution_backend: str | None = None
+    network_denied_verified: bool | None = None
+    process_tree_kill: bool | None = None
+    job_killed: bool | None = None
+    timeout_enforced: bool | None = None
     capability_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -353,6 +359,12 @@ class VerificationEvidence:
             "sandbox_artifacts": self.sandbox_artifacts,
             "sandbox_changed_files": self.sandbox_changed_files,
             "sandbox_violations": self.sandbox_violations,
+            "enforcement_status": self.enforcement_status,
+            "execution_backend": self.execution_backend,
+            "network_denied_verified": self.network_denied_verified,
+            "process_tree_kill": self.process_tree_kill,
+            "job_killed": self.job_killed,
+            "timeout_enforced": self.timeout_enforced,
             "capability_summary": self.capability_summary,
         }
 
