@@ -70,10 +70,10 @@ def test_readonly_workspace_chmod_failure_fails_closed(monkeypatch, tmp_path: Pa
     (tmp_path / "README.md").write_text("readonly\n", encoding="utf-8")
     manager = SandboxFilesystemManager()
 
-    def fail_chmod(*_args, **_kwargs):
-        raise OSError("chmod denied")
+    def fail_make_readonly(_root: Path) -> None:
+        raise OSError("readonly sandbox capability failed for: /mock/path")
 
-    monkeypatch.setattr("singularity.sandbox.filesystem.os.chmod", fail_chmod)
+    monkeypatch.setattr(SandboxFilesystemManager, "_make_readonly", staticmethod(fail_make_readonly))
 
     with pytest.raises(OSError, match="readonly sandbox capability failed"):
         manager.prepare_filesystem(

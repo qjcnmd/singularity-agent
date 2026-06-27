@@ -75,7 +75,8 @@ def test_long_tool_result_is_truncated_in_message_but_raw_result_is_preserved() 
     payload = json.loads(tool_message["content"])
     assert payload["truncated"] is True
     assert payload["truncation_reason"] == "preview_limit"
-    assert payload["content"].endswith("\n[truncated:context_fragment_cap]")
+    # The manager stores the preview; the assembler adds the context_fragment_cap marker.
+    assert payload["content"] == "x" * 4000
     assert payload["raw_digest"] == observation.raw_digest
     assert long_content not in tool_message["content"]
 

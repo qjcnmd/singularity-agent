@@ -18,8 +18,10 @@ class TraceTimelineBuilder:
         phase_id: str | None = None,
         action_id: str | None = None,
     ) -> list[TraceTimelineItem]:
+        # Materialise the iterable so we can iterate twice (filter + sort key).
+        all_events = list(events)
         items: list[TraceTimelineItem] = []
-        for event in events:
+        for event in all_events:
             if run_id is not None and event.run_id != run_id:
                 continue
             if task_id is not None and event.task_id != task_id:
@@ -42,7 +44,10 @@ class TraceTimelineBuilder:
                     artifact_refs=event.artifact_refs,
                 )
             )
-        return sorted(items, key=lambda item: (item.timestamp, item.event_id))
+        # Sort by timestamp first, then by monotonic_ms for stable ordering
+        # when events share the same wall-clock timestamp.
+        monotonic_by_id = {e.event_id: e.monotonic_ms for e in all_events}
+        return sorted(items, key=lambda item: (item.timestamp, monotonic_by_id.get(item.event_id, 0), item.event_id))
 
 
 def _related_ids(event: TraceEvent) -> list[str]:
