@@ -127,6 +127,56 @@ _EXTERNAL_TEST_KEYWORDS: tuple[str, ...] = (
     "backend_windows",
 )
 
+# ---------------------------------------------------------------------------
+# Integration-dense files: tests that wire real subsystems together but are
+# not caught by the integration-directory / "integration" keyword heuristics.
+# These are tests doing agent simulation, component.run(), subprocess,
+# multiprocessing, threading, or real git/Docker/network wiring.
+# ---------------------------------------------------------------------------
+_INTEGRATION_FILE_STEMS: set[str] = {
+    # Agent simulation (full AgentLoop wiring with MockProvider)
+    "test_agent",
+    "test_agent_task_outcome",
+    "test_agent_host",
+    "test_agent_graph",
+    "test_execution_primitives_phase1b",
+    "test_cancellation",
+    "test_approval_gate",
+    "test_repair_contract_verification",
+    "test_kernel_finalization",
+    # Multi-component wiring (component.run / component.run_plan)
+    "test_command_executor",
+    "test_tool_executor",
+    "test_tool_executor_cache",
+    "test_tool_executor_backend",
+    "test_verification_runner",
+    "test_planner",
+    "test_semantic_planner",
+    "test_semantic_planner_capability",
+    "test_final_reviewer",
+    "test_task_controller",
+    "test_lifecycle_manager",
+    "test_shutdown_manager",
+    # Subprocess / multiprocessing / threading concurrency
+    "test_workspace_lock",
+    "test_span_manager",
+    "test_test_impact",
+    # Real external dependencies (git / Docker / network)
+    "test_git_client",
+    "test_sandbox_manager",
+    "test_sandbox_backend_docker",
+    "test_sandbox_backend_windows",
+    "test_sandbox_backend_local",
+    "test_sandbox_environment",
+    "test_sandbox_filesystem",
+    "test_sandbox_models",
+    "test_sandbox_artifacts",
+    # Remote approval / workspace mutation
+    "test_remote_approval",
+    "test_workspace_mutation",
+    "test_workspace_state_manager",
+}
+
 
 # ---------------------------------------------------------------------------
 # Curated list self-check: validate that all curated nodeids exist in the
@@ -198,6 +248,59 @@ def _validate_curated_lists(
             pytest.PytestWarning(
                 f"[test-infra] Files in both smoke and external: "
                 + ", ".join(sorted(overlap_stems))
+            ),
+        )
+
+    # --- Integration file stems check (full-collection only) ---
+    if is_full_collection:
+        stale_int = _INTEGRATION_FILE_STEMS - collected_stems
+        if stale_int:
+            warnings.warn(
+                pytest.PytestWarning(
+                    f"[test-infra] Stale integration file stems not found: "
+                    + ", ".join(sorted(stale_int))
+                ),
+            )
+
+    # --- Slow/external tests must have non-unit functional classification ---
+    # Functional markers (mutually exclusive): unit, integration, regression,
+    # security, evaluation, provider_eval.
+    _FUNCTIONAL_MARKERS = {
+        "unit", "integration", "regression", "security",
+        "evaluation", "provider_eval",
+    }
+    for item in items:
+        item_markers = {m.name for m in item.iter_markers()}
+        is_slow_or_external = ("slow" in item_markers or "external" in item_markers)
+        if not is_slow_or_external:
+            continue
+        functional = item_markers & _FUNCTIONAL_MARKERS
+        if "unit" in functional:
+            warnings.warn(
+                pytest.PytestWarning(
+                    f"[test-infra] Slow/external test classified as unit: "
+                    f"{item.nodeid}"
+                ),
+            )
+        elif not functional:
+            warnings.warn(
+                pytest.PytestWarning(
+                    f"[test-infra] Slow/external test has no functional "
+                    f"classification: {item.nodeid}"
+                ),
+            )
+
+    # --- Smoke must not overlap with provider_eval ---
+    smoke_provider_overlap: list[str] = []
+    for item in items:
+        item_markers = {m.name for m in item.iter_markers()}
+        if "smoke" in item_markers and "provider_eval" in item_markers:
+            smoke_provider_overlap.append(item.nodeid)
+    if smoke_provider_overlap:
+        warnings.warn(
+            pytest.PytestWarning(
+                f"[test-infra] Tests in both smoke and provider_eval: "
+                + ", ".join(sorted(smoke_provider_overlap))
             ),
         )
 
@@ -285,8 +388,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             _add_marker(item, "integration")
             continue
 
-        # unit: everything else
-        _add_marker(item, "unit")
+        # integration-dense files: curated stems for files that wire real
+        # subsystems but are not caught by directory/keyword heuristics above.
+        if file_stem in _INTEGRATION_FILE_STEMS:
+            _add_marker(item, "integration")
+            continue
+
+        # unit: everything else — but slow/external curated tests MUST NOT
+        # be classified as unit.  Check the item's current markers: if it
+        # already has slow or external, assign integration instead of unit.
+        current_markers = _explicit_marker_names(item)
+        if "slow" in current_markers or "external" in current_markers:
+            _add_marker(item, "integration")
+        else:
+            _add_marker(item, "unit")
 
     # --- Self-check: validate curated lists against actual collection ---
     _validate_curated_lists(config, items)

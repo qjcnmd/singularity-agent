@@ -20,6 +20,7 @@ import pytest
 from tests.conftest import (
     _EXTERNAL_FILE_STEMS,
     _FLAKY_TEST_IDS,
+    _INTEGRATION_FILE_STEMS,
     _KNOWN_MARKERS,
     _SMOKE_FILE_STEMS,
     _SMOKE_TEST_IDS,
@@ -79,9 +80,22 @@ class TestCuratedListIntegrity:
     those markers are excluded.
     """
 
-    def test_smoke_test_ids_all_exist(self, request: pytest.FixtureRequest) -> None:
+    def test_smoke_test_ids_all_exist(
+        self,
+        request: pytest.FixtureRequest,
+        pytestconfig: pytest.Config,
+    ) -> None:
         if not _is_full_collection(request):
             pytest.skip("Requires full test collection")
+        # Smoke tests now carry diverse functional markers (unit, integration,
+        # etc.).  When a marker filter is active, smoke tests with non-matching
+        # functional markers are deselected.
+        override = pytestconfig.getoption("markexpr", default="")
+        if override:
+            pytest.skip(
+                f"Marker filter '-m {override}' active; "
+                f"smoke tests may be deselected"
+            )
         nodeids, _ = _collect_nodeids_and_stems(request)
         missing = _SMOKE_TEST_IDS - nodeids
         assert not missing, (
@@ -178,6 +192,105 @@ class TestMarkerConsistency:
 
 
 # ---------------------------------------------------------------------------
+# Functional classification checks
+# ---------------------------------------------------------------------------
+
+_FUNCTIONAL_MARKERS = {"unit", "integration", "regression", "security", "evaluation", "provider_eval"}
+
+
+class TestFunctionalClassification:
+    """Verify slow/external tests have correct non-unit functional classification."""
+
+    def test_slow_tests_have_non_unit_functional_marker(
+        self,
+        request: pytest.FixtureRequest,
+        pytestconfig: pytest.Config,
+    ) -> None:
+        """Every test in _SLOW_TEST_IDS must have a functional marker other than unit."""
+        if not _is_full_collection(request):
+            pytest.skip("Requires full test collection")
+        if _is_filter_active(pytestconfig, "slow"):
+            pytest.skip("slow tests excluded by default addopts")
+
+        _FUNCTIONAL = {"unit", "integration", "regression", "security", "evaluation", "provider_eval"}
+        violations: list[str] = []
+        for item in request.session.items:
+            if item.nodeid not in _SLOW_TEST_IDS:
+                continue
+            item_markers = {m.name for m in item.iter_markers()}
+            functional = item_markers & _FUNCTIONAL
+            if "unit" in functional or not functional:
+                violations.append(
+                    f"{item.nodeid} has functional={sorted(functional) if functional else 'NONE'}"
+                )
+        assert not violations, (
+            f"Slow tests with unit or no functional marker:\n  "
+            + "\n  ".join(sorted(violations))
+        )
+
+    def test_external_tests_have_non_unit_functional_marker(
+        self,
+        request: pytest.FixtureRequest,
+        pytestconfig: pytest.Config,
+    ) -> None:
+        """Every external test must have a functional marker other than unit."""
+        if not _is_full_collection(request):
+            pytest.skip("Requires full test collection")
+        if _is_filter_active(pytestconfig, "external"):
+            pytest.skip("external tests excluded by default addopts")
+
+        violations: list[str] = []
+        for item in request.session.items:
+            item_markers = {m.name for m in item.iter_markers()}
+            if "external" not in item_markers:
+                continue
+            functional = item_markers & _FUNCTIONAL_MARKERS
+            if "unit" in functional or not functional:
+                violations.append(
+                    f"{item.nodeid} has functional={sorted(functional) if functional else 'NONE'}"
+                )
+        assert not violations, (
+            f"External tests with unit or no functional marker:\n  "
+            + "\n  ".join(sorted(violations))
+        )
+
+    def test_integration_file_stems_all_exist(
+        self,
+        request: pytest.FixtureRequest,
+        pytestconfig: pytest.Config,
+    ) -> None:
+        """All stems in _INTEGRATION_FILE_STEMS must exist in collection."""
+        if not _is_full_collection(request):
+            pytest.skip("Requires full test collection")
+        # When a marker filter is active, integration files may be deselected.
+        override = pytestconfig.getoption("markexpr", default="")
+        if override:
+            pytest.skip(
+                f"Marker filter '-m {override}' active; "
+                f"integration files may be deselected"
+            )
+        _, stems = _collect_nodeids_and_stems(request)
+        missing = _INTEGRATION_FILE_STEMS - stems
+        assert not missing, (
+            f"Integration file stems not found in collection: {sorted(missing)}"
+        )
+
+    def test_smoke_not_in_provider_eval(
+        self,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        """No test should have both smoke and provider_eval markers."""
+        overlap: list[str] = []
+        for item in request.session.items:
+            item_markers = {m.name for m in item.iter_markers()}
+            if "smoke" in item_markers and "provider_eval" in item_markers:
+                overlap.append(item.nodeid)
+        assert not overlap, (
+            f"Tests in both smoke and provider_eval: {sorted(overlap)}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Marker validity checks
 # ---------------------------------------------------------------------------
 
@@ -249,8 +362,8 @@ class TestMarkerCounts:
     # Lists filtered by default addopts have expected count 0.
     _EXPECTED = {
         "smoke": 26,
-        "unit": 550,
-        "integration": 175,
+        "unit": 260,
+        "integration": 589,
         "regression": 68,
         "security": 54,
         "flaky": 4,

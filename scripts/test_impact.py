@@ -34,25 +34,104 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
+# ---------------------------------------------------------------------------
+# Special path mappings for files that are not themselves tests but should
+# trigger specific test suites when changed.  These are checked before the
+# general naming-convention heuristics.
+# ---------------------------------------------------------------------------
+_SPECIAL_PATH_MAP: dict[str, list[str]] = {
+    "scripts/test_impact.py": ["tests/test_test_impact.py"],
+    "tests/conftest.py": ["tests/test_test_infra.py"],
+    "docs/testing.md": ["tests/test_docs_consistency.py"],
+    "pyproject.toml": ["tests/test_test_infra.py"],
+    "scripts/verify_runtime_docs.py": ["tests/test_runtime_docs_verify.py"],
+}
+
+# Additional warnings for special paths (e.g. hint to run smoke collect).
+_SPECIAL_PATH_WARNINGS: dict[str, str] = {
+    "pyproject.toml": (
+        "pyproject.toml changed: verify marker config with "
+        "'python -m pytest --collect-only -m smoke'"
+    ),
+}
+
+
+def _is_pytest_collectable(path: str) -> bool:
+    """Return True if *path* looks like a file pytest can collect tests from.
+
+    Pytest collects ``test_*.py`` and ``*_test.py`` files that live under a
+    directory named ``tests``.  Non-test files like ``conftest.py``,
+    ``__init__.py``, and ``*_helpers.py`` are NOT collectable even if they
+    happen to be under ``tests/``.
+
+    Importantly: a non-test script like ``scripts/test_impact.py`` that
+    happens to start with ``test_`` is NOT collectable because it is not
+    under a ``tests`` directory.
+    """
+    pure = PurePosixPath(path)
+    stem = pure.stem
+    # Must be under a "tests" directory component
+    if "tests" not in pure.parts:
+        return False
+    # Must follow pytest naming convention
+    if not stem.startswith("test_") and not stem.endswith("_test"):
+        return False
+    # Non-collectable files under tests/
+    if stem in ("conftest",):
+        return False
+    return True
+
+
+def _validate_recommendations(tests: list[str]) -> tuple[list[str], list[str]]:
+    """Filter out non-collectable entries from recommended tests.
+
+    Returns (clean_tests, warnings).  Never raises.
+    """
+    clean: list[str] = []
+    warnings: list[str] = []
+    for t in tests:
+        if _is_pytest_collectable(t):
+            clean.append(t)
+        else:
+            warnings.append(
+                f"'{t}' is not a pytest-collectable test file — removed from recommendations"
+            )
+    return sorted(clean), warnings
+
 
 def _fallback_tests(paths: list[str], *, verbose: bool = False) -> tuple[list[str], list[str]]:
     """Path-based test heuristics when no code index is available.
 
     Returns (tests, warnings).
 
-    Naming conventions in this project (observed from tests/ directory):
-      src/singularity/{module}.py          -> tests/test_{module}.py
-      src/singularity/{pkg}/{module}.py    -> tests/test_{pkg}.py
-                                             tests/test_{pkg}_{module}.py
-                                             tests/{pkg}/test_{module}.py
-      src/singularity/{pkg}/{subpkg}/*.py  -> tests/{pkg}/test_*.py
+    Priority order:
+      1. Explicit ``_SPECIAL_PATH_MAP`` entries.
+      2. Already a collectable test file — include directly.
+      3. Non-``.py`` files — check ``_SPECIAL_PATH_MAP``; warn if unmapped.
+      4. Naming-convention heuristics for ``src/singularity/…`` sources.
     """
     tests: list[str] = []
     warnings: list[str] = []
     for path in paths:
         pure = PurePosixPath(path)
-        # Already a test file — include directly
-        if "tests" in pure.parts or pure.name.startswith("test_"):
+
+        # --- 1. Special path map (checked first for all file types) ---
+        path_str = str(pure).replace("\\", "/")
+        if path_str in _SPECIAL_PATH_MAP:
+            mapped = _SPECIAL_PATH_MAP[path_str]
+            for m in mapped:
+                if Path(m).exists():
+                    tests.append(m)
+                    if verbose:
+                        print(f"  [verbose] {path} -> special map -> {m}")
+                else:
+                    warnings.append(f"Special-mapped test not found: {m}")
+            if path_str in _SPECIAL_PATH_WARNINGS:
+                warnings.append(_SPECIAL_PATH_WARNINGS[path_str])
+            continue
+
+        # --- 2. Already a collectable test file — include directly ---
+        if "tests" in pure.parts and _is_pytest_collectable(path):
             if Path(path).exists():
                 tests.append(path)
                 if verbose:
@@ -60,10 +139,26 @@ def _fallback_tests(paths: list[str], *, verbose: bool = False) -> tuple[list[st
             else:
                 warnings.append(f"Test file not found: {path}")
             continue
+
+        # --- 2b. Path under tests/ but NOT a collectable test file ---
+        if "tests" in pure.parts:
+            warnings.append(
+                f"'{path}' is under tests/ but is not a pytest-collectable "
+                f"test file (conftest, __init__, helpers, etc.) — "
+                f"add to _SPECIAL_PATH_MAP if it should trigger tests"
+            )
+            continue
+
+        # --- 3. Non-.py files — warn if unmapped ---
         if pure.suffix != ".py":
             if verbose:
-                print(f"  [verbose] {path} -> skipped (not .py)")
+                print(f"  [verbose] {path} -> skipped (not .py, no special map)")
+            warnings.append(
+                f"No test mapping for non-Python file: {path}"
+            )
             continue
+
+        # --- 4. Naming-convention heuristics for source files ---
         stem = pure.stem
         parts = list(pure.parts)
         candidates: list[str] = []
@@ -289,6 +384,22 @@ def main() -> int:
             [f"python -m pytest {' '.join(likely_tests)}"] if likely_tests else []
         )
         source = "path_heuristics"
+
+    # --- Validate: filter out non-collectable entries from recommendations ---
+    clean_tests, val_warnings = _validate_recommendations(likely_tests)
+    all_warnings.extend(val_warnings)
+    # Rebuild commands with the cleaned test list
+    if clean_tests != likely_tests:
+        likely_tests = clean_tests
+        if source != "code_index":
+            commands = (
+                [f"python -m pytest {' '.join(likely_tests)}"] if likely_tests else []
+            )
+        else:
+            # code_index commands were built before validation; rebuild
+            commands = (
+                [f"python -m pytest {' '.join(likely_tests)}"] if likely_tests else []
+            )
 
     confidence = _compute_confidence(source, likely_tests, all_warnings)
 

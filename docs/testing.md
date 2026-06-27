@@ -2,22 +2,27 @@
 
 ## 1. 测试分层
 
-Singularity 测试体系按 pytest marker 分为以下层级：
+Singularity 测试体系按 pytest marker 分为以下层级。
 
-| Marker | 测试数 | 说明 | 默认是否运行 |
-|--------|--------|------|-------------|
-| `smoke` | 25 | 核心路径烟雾测试，覆盖 CLI/Context/Planner/Policy/Tool/Verification | ❌ 显式运行 |
-| `unit` | ~550 | 纯函数/类测试，最小化跨组件依赖 | ✅ |
-| `integration` | ~175 | 多组件集成测试，真实子系统连线 | ✅ |
-| `regression` | 68 | 生产基线、文档一致性、schema 稳定性守卫 | ✅ |
-| `security` | 54 | 信任边界、脱敏、注入、密钥安全测试 | ✅ |
-| `flaky` | 4 | 已知偶发失败测试（默认仍运行，见下方处理策略） | ✅ |
-| `evaluation` | 58 | 评估基础设施：评分、回放、benchmark harness | ❌ 显式运行 |
-| `slow` | ~25 | 真正慢的测试（>3s），agent loop 模拟/并发 | ❌ 显式运行 |
-| `external` | ~22 | 依赖外部资源（Docker/git/network），实际很快 | ❌ 显式运行 |
-| `provider_eval` | 1 | 需真实模型 provider 的烟雾测试 | ❌ 显式运行 |
+**Marker 语义**：marker 分为两类——
 
-> **注意**：unit/integration/slow/external 的数量会随重分类调整而变化。以实际 `python -m pytest --co -q` 为准。
+- **功能分类**（互斥，每个测试必须有且仅有一个）：`unit`、`integration`、`regression`、`security`、`evaluation`
+- **运行属性**（可叠加，描述执行特征）：`smoke`、`slow`、`external`、`flaky`、`provider_eval`
+
+| Marker | 测试数 | 分类 | 说明 | 默认是否运行 |
+|--------|--------|------|------|-------------|
+| `smoke` | 25 | 运行属性 | 核心路径烟雾测试，覆盖 CLI/Context/Planner/Policy/Tool/Verification | ❌ 显式运行 |
+| `unit` | ~260 | 功能分类 | 纯函数/类测试，最小化跨组件依赖 | ✅ |
+| `integration` | ~589 | 功能分类 | 多组件集成测试（agent simulation、component wiring、subprocess、threading、真实 git/Docker） | ✅ |
+| `regression` | 68 | 功能分类 | 生产基线、文档一致性、schema 稳定性守卫 | ✅ |
+| `security` | 54 | 功能分类 | 信任边界、脱敏、注入、密钥安全测试 | ✅ |
+| `flaky` | 4 | 运行属性 | 已知偶发失败测试（默认仍运行，见下方处理策略） | ✅ |
+| `evaluation` | 58 | 功能分类 | 评估基础设施：评分、回放、benchmark harness | ❌ 显式运行 |
+| `slow` | ~25 | 运行属性 | 真正慢的测试（>3s），agent loop 模拟/并发 | ❌ 显式运行 |
+| `external` | ~22 | 运行属性 | 依赖外部资源（Docker/git/network），实际很快 | ❌ 显式运行 |
+| `provider_eval` | 1 | 运行属性 | 需真实模型 provider 的烟雾测试 | ❌ 显式运行 |
+
+> **注意**：数量会随重分类调整而变化。以实际 `python -m pytest --co -q` 为准。
 
 ## 2. 日常开发
 
@@ -79,7 +84,11 @@ python -m pytest tests/test_verification_runner.py tests/test_repair_contract_ve
 
 ```bash
 # 默认测试（排除 evaluation、provider_eval、slow、external）
+# 相当于: python -m pytest -m "not evaluation and not provider_eval and not slow and not external"
 python -m pytest
+
+# 真正快速 unit（仅纯函数/类测试，排除 slow/external 中的集成测试）
+python -m pytest -m "unit and not slow and not external"
 
 # 带覆盖率
 python -m pytest --cov=singularity --cov-report=term-missing
@@ -178,8 +187,9 @@ python -m pytest tests/test_test_infra.py -v
 自检测试验证：
 - `_SMOKE_TEST_IDS` 中每个 nodeid 在测试集合中存在
 - `_FLAKY_TEST_IDS`、`_SLOW_TEST_IDS` 同理
-- `_SMOKE_FILE_STEMS`、`_EXTERNAL_FILE_STEMS` 同理
-- smoke 与 slow/flaky/external 无交集
+- `_SMOKE_FILE_STEMS`、`_EXTERNAL_FILE_STEMS`、`_INTEGRATION_FILE_STEMS` 同理
+- smoke 与 slow/flaky/external/provider_eval 无交集
+- slow/external 测试必须有非 unit 功能分类（integration/regression/security/evaluation）
 - 所有 marker 值都在 `_KNOWN_MARKERS` 中
 - `_KNOWN_MARKERS` 与 `pyproject.toml` 定义一致
 - 各 marker 数量在合理范围内（±30% 容差）
@@ -229,6 +239,20 @@ python scripts/test_impact.py --git --strict-index
 | `medium` | code index 不可用但 fallback 有命中 | 推荐结果基于路径命名约定 |
 | `low` | 无命中 | 无法确定相关测试，建议运行默认套件 |
 
+### 特殊路径映射
+
+以下文件不是测试文件，但变更时会触发对应测试：
+
+| 变更文件 | 推荐测试 | 说明 |
+|----------|----------|------|
+| `scripts/test_impact.py` | `tests/test_test_impact.py` | 脚本自身测试 |
+| `tests/conftest.py` | `tests/test_test_infra.py` | marker/精选列表配置测试 |
+| `docs/testing.md` | `tests/test_docs_consistency.py` | 文档一致性测试 |
+| `pyproject.toml` | `tests/test_test_infra.py` | pytest 配置测试（附加 `--collect-only -m smoke` 提示） |
+| `scripts/verify_runtime_docs.py` | `tests/test_runtime_docs_verify.py` | 文档验证脚本测试 |
+
+**推荐结果验证**：`recommended_tests` 中的所有条目都必须是 pytest 可收集的测试文件（`tests/test_*.py`），不含 `conftest.py`、`__init__.py`、`*_helpers.py` 等非测试文件。
+
 ### 运行自身测试
 
 ```bash
@@ -240,9 +264,9 @@ python -m pytest tests/test_test_impact.py -v
 | 测试层级 | 目标耗时 | 告警阈值 | 维护规则 |
 |----------|----------|----------|----------|
 | smoke | <10s | >15s | 检查是否有测试变慢 |
-| 默认 (~906 tests) | <4min | >5min | 排查慢测试 |
+| 默认 (~900 tests) | <4min | >5min | 排查慢测试 |
 | release-full (~990 tests) | <6min | >8min | 排查慢测试 |
-| unit | <5min | >6min | 重分类或优化 |
+| fast-unit (`unit and not slow and not external`) | <2min | >3min | 重分类或优化 |
 | integration | <2min | >3min | 排查慢测试 |
 | security | <30s | >1min | 排查慢测试 |
 | evaluation | <1min | >2min | 排查慢测试 |
@@ -336,20 +360,19 @@ def test_test_impact_fallback_basic_mapping() -> None:
 
 | 场景 | 命令 | 测试数 | 耗时 |
 |------|------|--------|------|
-| 烟雾测试 | `python -m pytest -m smoke` | 25 | ~3s |
-| 默认（提交前） | `python -m pytest` | ~906 | ~2.5min |
-| 全量（release） | `python -m pytest -m "not provider_eval"` | ~990 | ~3.5min |
-| 单元测试 | `python -m pytest -m unit` | ~550 | ~3min |
-| 集成测试 | `python -m pytest -m integration` | ~175 | ~30s |
+| 日常核心路径 smoke | `python -m pytest -m smoke` | 25 | ~3s |
+| 提交前默认 gate | `python -m pytest` | ~900 | ~2.5min |
+| 真正快速 unit | `python -m pytest -m "unit and not slow and not external"` | ~260 | ~20s |
+| release-full | `python -m pytest -m "not provider_eval"` | ~1030 | ~3.5min |
+| 集成测试 | `python -m pytest -m integration` | ~589 | ~2min |
 | 安全测试 | `python -m pytest -m security` | 54 | ~11s |
 | 回归测试 | `python -m pytest -m regression` | 68 | ~13s |
 | 评估测试 | `python -m pytest -m evaluation` | 58 | ~34s |
 | 慢测试 | `python -m pytest -m slow` | ~25 | ~1min |
 | 外部依赖 | `python -m pytest -m external` | ~22 | ~4s |
 | 真实 provider | `SINGULARITY_RUN_PROVIDER_EVAL=1 python -m pytest -m provider_eval` | 1 | 需 .env |
-| 按文件推荐 | `python scripts/test_impact.py --git` | — | ~1s |
+| 按改动推荐 | `python scripts/test_impact.py --git --json` | 按变动 | ~1s |
 | 自检 | `python -m pytest tests/test_test_infra.py -v` | ~10 | ~5s |
-| 覆盖 addopts | `python -m pytest -m "not provider_eval"` | — | — |
 
 ## 测试文件组织
 
