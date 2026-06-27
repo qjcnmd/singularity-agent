@@ -52,27 +52,27 @@
 
 ## 谁生成这些对象
 
-这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
+内置register函数或`PluginHost.register_tool()`生成含cache/idempotency/retry policy的`ToolSpec`；`ToolRegistry.register()`生成`ToolOrigin`/`RegisteredToolRecord`。provider tool call或`ToolExecutionRequest.from_envelope()`生成execution request；handler/executor/cache/policy/error分支用`ToolResult.success()`/`failure()`生成结果。
 
 ## 谁消费这些对象
 
-消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
+registry/router/renderer/executor消费spec/record/request。provider只看到`ToolRegistry.openai_tools()`/`ModelToolRenderer`投影的name、description、input schema；origin、permission、risk、handler与policy对象不发送。ToolProtocol将安全`ToolResult`投影回下一轮模型。
 
 ## 是否落盘
 
-落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
+registry/spec/origin/record/request均不落盘；ToolResult本体也无独立store。tool protocol只在`tool_protocol.sqlite3`保存result digest/ref与安全envelope，大正文写trace artifact，context message写`context.sqlite3`。
 
 ## 是否进入 trace / audit
 
-进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
+registry/router/executor trace保存tool name、origin kind、admission/exposure reason、argument digest、status/error/output digest，不保存raw secret arguments/result。ToolExecutor构造的PolicyRequest/Decision进入policy audit，registry record本身不写audit。
 
 ## 失败路径
 
-失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
+registry冻结后注册、重复名、非法write/shell backend或schema会抛错；执行时unknown tool、argument validation、planner/policy denial、approval required、timeout、handler/internal error均转为带`error_code/error`的`ToolResult.failure()`。
 
 ## 当前结构问题
 
-当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
+内部ToolSpec明显宽于provider schema；插件provenance必须留在RegisteredToolRecord，不能为模型解释而加alias字段或把metadata暴露到parameters。
 
 ## 维护规则
 

@@ -70,3 +70,23 @@ def test_forbidden_keyword_list_avoids_literal_old_terms() -> None:
     assert "LEGACY" + "_LIVE" in forbidden
     assert "evaluation." + "live" + "_agent" in forbidden
     assert "Runtime" + " Flow" in forbidden
+
+
+def test_verify_doc_rejects_generic_data_flow_template(tmp_path: Path) -> None:
+    module = _load_verify_module()
+    path = tmp_path / "module.md"
+    phrase = "这些对象由上文列出的源码组件在运行链路中生成"
+    doc = module.ModuleDataFlowDoc(
+        path=path,
+        text=phrase,
+        doc_id="test-module",
+        source_paths=[],
+        symbols=[],
+        field_checks={},
+        headings=set(),
+    )
+    errors: list[str] = []
+
+    module._verify_doc(doc, errors)
+
+    assert any(f"forbidden template phrase remains: {phrase}" in error for error in errors)

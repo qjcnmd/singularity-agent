@@ -42,27 +42,27 @@ Artifact 层把过长输出、trace 产物、命令日志、diff、报告和模�
 
 ## 谁生成这些对象
 
-这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
+`TraceArtifactStore.write_text_artifact()`、`write_bytes_artifact()` 和 `register_file_artifact()` 先写真实文件，再由 `_artifact()` 计算 relative path、size、SHA-256、content type、redaction/sensitivity 并生成 `TraceArtifact`；`TraceArtifactKind` 是调用方选择的固定分类枚举。
 
 ## 谁消费这些对象
 
-消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
+`TraceRecorder.write_artifact()` 消费 `TraceArtifact` 并调用 `TraceStore.append_artifact()`；tool protocol、command、model、trace event、final/evaluation report 只保存 artifact id/path 引用。完整对象和文件正文不进入模型，请求中最多由 `ContentBlock.artifact_ref` 渲染出可识别引用或安全摘要。
 
 ## 是否落盘
 
-落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
+文件默认写 `work/traces/runs/<run_id>/artifacts/<artifact_id>.<ext>`，完整元数据追加到同一 run 的 `artifacts.jsonl`；`index.json` 记录 artifact 索引文件名。其他 store 保存的是 artifact ref，不复制正文。
 
 ## 是否进入 trace / audit
 
-进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
+`TraceEvent.artifact_refs`、`TraceSpan.artifact_refs` 和 `TraceSummary.key_artifacts` 关联 artifact id；元数据由 `TraceStore.append_artifact()` 写 `artifacts.jsonl`。Artifact 层不写 policy audit，audit 只可能保存执行结果引用。
 
 ## 失败路径
 
-失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
+单件/总量超限、源文件不存在、敏感二进制无法脱敏、未知 artifact 分别抛 `TraceArtifactError`；`TraceRecorder.write_artifact()` 缺 text/data/path 时抛 `ValueError`，不会返回一个指向不存在文件的 handle。
 
 ## 当前结构问题
 
-当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
+artifact 文件与 `artifacts.jsonl` 元数据必须保持同一 run 目录和 id 关联；消费者只能传播 ref/安全摘要，不能把 raw long result重新塞回 context。
 
 ## 维护规则
 

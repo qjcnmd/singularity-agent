@@ -56,27 +56,27 @@ Sandbox 层根据 profile、filesystem/network/env/resource policy 准备隔离�
 
 ## 谁生成这些对象
 
-这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
+backend `capabilities()` 生成 `SandboxCapabilities`；default profile与 policy constraints组合 resource/env/filesystem/network policy和 `SandboxProfile`。`SandboxManager.from_command_request()` 生成 `SandboxRequest`，backend `prepare()` 生成 `PreparedSandbox`，backend/artifact collector/manager生成 artifact、change summary、violation与 `SandboxResult`。
 
 ## 谁消费这些对象
 
-消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
+manager/backend消费profile/request/prepared对象；CommandExecutor消费 result并投影为 `CommandResult.isolation_report`。完整 sandbox对象不进模型，只有裁剪后的 status、changed files、violation/artifact摘要经 command tool observation可见。
 
 ## 是否落盘
 
-落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
+prepare阶段创建sandbox root/workspace copy，artifact collector写sandbox artifact文件；cleanup按backend删除临时环境。没有 `SandboxResult` 专属durable store，持久引用是trace artifact ref与CommandResult/context投影。
 
 ## 是否进入 trace / audit
 
-进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
+SandboxManager发出 `sandbox_started`、`sandbox_cleaned`、`sandbox_capability_failed`、`sandbox_violation`、`sandbox_completed`，payload含backend/status/exit/duration/artifact ids/changed files/violations。是否要求sandbox来自PolicyDecision，request/decision由policy audit保存；sandbox result本体不写audit。
 
 ## 失败路径
 
-失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
+能力不满足、backend unavailable、setup failed、violation、timeout与cleanup failed均产生明确status/violation或异常；cleanup异常会改写result metadata/status，不能在隔离未清理时报告success。
 
 ## 当前结构问题
 
-当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
+profile表达需求、capabilities表达backend能力、result表达实际执行；三者必须分别记录，不能用profile声明替代真实隔离证明。
 
 ## 维护规则
 

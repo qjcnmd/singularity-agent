@@ -45,6 +45,16 @@ REQUIRED_HEADINGS = {
     "维护规则",
 }
 
+FORBIDDEN_TEMPLATE_PHRASES = {
+    "这些对象由上文列出的源码组件在运行链路中生成",
+    "生成动作必须来自当前源码路径",
+    "消费方是同一调用链后续组件",
+    "落盘只通过当前源码中的",
+    "进入 trace / audit 的内容以",
+    "失败路径由当前源码中的异常",
+    "当前结构仍大量使用字典 payload 连接组件",
+}
+
 COMPLETE_FIELD_CHECKS = {
     "agent-loop": {
         "AgentLoopResult",
@@ -81,6 +91,8 @@ COMPLETE_FIELD_CHECKS = {
         "ContextUsageReport",
         "ContextSummaryPayload",
         "ContextSummaryEnvelope",
+        "PromptManifest",
+        "PromptBundle",
     },
     "context-compaction-observation-store": {
         "ContextSnapshot",
@@ -138,6 +150,7 @@ COMPLETE_FIELD_CHECKS = {
         "FailureAnalysisRequest",
         "FailureAnalysisResult",
         "RepairContract",
+        "RepairActionCandidate",
         "RepairPlan",
         "RepairReplanSignal",
     },
@@ -147,6 +160,8 @@ COMPLETE_FIELD_CHECKS = {
         "CompletionAssessment",
         "VerificationStep",
         "VerificationContract",
+        "StepEvidence",
+        "ContractSatisfaction",
     },
     "trace-observation-audit-events": {
         "TraceEvent",
@@ -336,6 +351,10 @@ def _verify_doc(doc: ModuleDataFlowDoc, errors: list[str]) -> None:
         errors.append(f"{label}: no 源码证据路径 entries")
     if not doc.symbols:
         errors.append(f"{label}: no 关键符号 entries")
+
+    for phrase in sorted(FORBIDDEN_TEMPLATE_PHRASES):
+        if phrase in doc.text:
+            errors.append(f"{label}: forbidden template phrase remains: {phrase}")
 
     existing_sources: list[Path] = []
     for source in doc.source_paths:

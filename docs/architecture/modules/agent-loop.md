@@ -37,27 +37,35 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 
 ## 谁生成这些对象
 
-这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
+- `AgentLoop.run()` 内部的 `run_turn()` 在 completion gate 通过时调用 `_attempt_finalize()` 构造 `status=completed` 的 `AgentLoopResult`；`on_max_turns()` 构造 `status=max_turns_exceeded` 的结果。
+- `_terminal_result_from_outcome()` 把不可重试的 `ExecutionOutcome` 映射成 `blocked` 或 `failed`，同时把 `outcome.to_dict()` 放入 `diagnostics`。`AgentLoopStatus` 由这些构造点直接选择，不存在第二套字符串状态 alias。
 
 ## 谁消费这些对象
 
-消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
+- `AgentKernel.run_task()` 接收 `AgentLoopResult`，更新 `AgentRun`/`AgentSession` 生命周期并返回 CLI；`EvaluationRunner.run_task()` 读取其 `status`、`turn`、`final_answer` 和 `error_code` 生成 `EvaluationTaskResult`。
+- `AgentLoopResult` 不进入模型请求。模型只在结果生成前接收 `ModelRunner.build_request_from_context()` 构造的 request；结果生成后执行已经终止。
+- CLI 将 `final_answer` 输出给用户，并依据最终状态/内核错误确定退出；targeted replay 读取同一结果生成 `TargetedFailureReplayResult`。
 
 ## 是否落盘
 
-落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
+- `AgentLoopResult` 没有独立 store。`_attempt_finalize()` / `_terminal_result_from_outcome()` / `on_max_turns()` 先写 `final_answer` trace event；evaluation 运行再把结果投影进 `<evaluation_run>/result.json`、`report.json` 和 `report.md`。
+- 主循环创建或复用的 `ContextManager` 把消息、观察和 bundle 写入当前 trace run 目录下的 `context.sqlite3`；该数据库保存的是循环输入证据，不是 `AgentLoopResult` 序列化副本。
 
 ## 是否进入 trace / audit
 
-进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
+- `_record_outcome_context()` 写 `execution_outcome` event，并把同一 outcome 加入 planner context；模型失败由 `_record_model_failure()` 写 `model_failure`，超 turn 另写 `error(type=MaxTurnsExceeded)`。
+- 所有终止分支写 `final_answer` event，payload 来源是 `turn` 与最终文本；trace 记录的是这些事件和 outcome，而不是完整 `AgentLoopResult` 对象。
+- AgentLoop 自身不写 policy audit。tool/command/verification 触发的 `PolicyRequest`/`PolicyDecision` 由相应执行器和 policy audit ledger 记录。
 
 ## 失败路径
 
-失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
+- 模型失败先由 `_outcome_from_model_failure()` 区分 retryable、外部依赖阻塞与 fatal，并设置 `model_runner_failed`、`invalid_json`、`unknown_tool` 或 `schema_mismatch`；retryable/replan 不终止，blocked/fatal 经 `_terminal_result_from_outcome()` 返回结果。
+- completion evidence 不足生成 `completion_rejected` 并继续；final review 未通过生成 `final_review_rejected`，可继续时 replan，不可继续时返回 `blocked`。repair contract 不满足可返回带具体 error code 的 blocked outcome。
+- turn 达到上限返回 `max_turns_exceeded`。未在这些 outcome 分支内转换的异常继续向 `AgentKernel.run_task()` 传播，由 kernel 生成失败 lifecycle/final report，而不是伪造 completed 结果。
 
 ## 当前结构问题
 
-当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
+`run()` 内嵌 turn callback 与 max-turn callback，终止结果同时由 `_attempt_finalize()` 和 `_terminal_result_from_outcome()` 构造；新增状态时必须同时检查 kernel、evaluation 和 targeted replay 的消费分支，避免状态存在但报告层无法分类。
 
 ## 维护规则
 

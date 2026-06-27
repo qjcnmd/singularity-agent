@@ -49,27 +49,27 @@ Trace 层记录运行事件、span、artifact、timeline 和 summary；audit 相
 
 ## 谁生成这些对象
 
-这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
+`TraceRecorder.emit()`经redactor生成`TraceEvent`；SpanManager的start/end生成追加式`TraceSpan`；TraceArtifactStore写文件后生成`TraceArtifact`。`TraceTimelineBuilder`从events派生`TraceTimelineItem`，`TraceSummaryBuilder`从events/spans/artifacts聚合`TraceSummary`。
 
 ## 谁消费这些对象
 
-消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
+TraceStore消费event/span/artifact；CLI、final report、evaluation/replay消费timeline/summary/artifact refs。完整trace对象不自动进入模型；只有`ContextManager.add_trace_summary()`生成的安全文本摘要进入context。
 
 ## 是否落盘
 
-落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
+默认run目录`work/traces/runs/<run_id>/`包含`events.jsonl`、`spans.jsonl`、`artifacts.jsonl`、`index.json`和`artifacts/`文件。Timeline/Summary按需派生不独立落盘；其context投影写`context.sqlite3`。
 
 ## 是否进入 trace / audit
 
-进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
+TraceEvent在append前执行payload redaction并计算payload_hash；span/artifact通过refs关联。Policy audit是独立JSONL，由PolicyAuditWriter保存request/decision摘要，不能用events.jsonl替代审计账本，也不能把audit entry称为TraceEvent。
 
 ## 失败路径
 
-失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
+非法run id抛`ValueError`，未知span抛`TraceStoreError`，artifact错误抛`TraceArtifactError`。`TraceRecorder.emit()`写失败降级返回`trace_write_failed` warning dict并输出脱敏stderr警告；业务执行继续，但final diagnostics应暴露trace不完整。
 
 ## 当前结构问题
 
-当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
+events、spans、artifact index、timeline/summary与policy audit是不同层；新增event时必须定义payload来源、redaction、相关id和artifact refs，不能只在报告端猜测。
 
 ## 维护规则
 

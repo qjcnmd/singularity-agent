@@ -53,27 +53,28 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 
 ## 谁生成这些对象
 
-这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
+- command tool、VerificationRunner 与 evaluation setup 生成 `ResourceLimits`/`CommandRequest`；`CommandPolicy.evaluate()` 或 executor 的 fail-closed 分支生成 `CommandPolicyResult`，`CommandExecutor.plan()` 组合为 `CommandPlan`。
+- `CommandExecutor.run()` 的 backend、sandbox、blocked 分支生成 `CommandResult`；`start_process()`、`read_process_output()`、`stop_process()` 分别生成 `ProcessSession`、`ProcessOutput`、`ProcessStopResult`。
 
 ## 谁消费这些对象
 
-消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
+`CommandExecutor` 消费 request/plan/policy；command tool、verification、planner 消费 result/process objects。`CommandResult.to_observation()` 和 process `to_dict()` 的安全投影进入 tool result/context，模型看不到 env request、raw secret argv 或完整内部 plan。
 
 ## 是否落盘
 
-落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
+Command plan 和 process session 只在 executor 内存；长 stdout/stderr 由 `OutputCollector` 写 artifact，路径放入 `CommandResult.artifact_path` / `ProcessSession.logs_artifact_path`。result 的安全 observation 写 context SQLite，side effects 可写 workspace state journal。
 
 ## 是否进入 trace / audit
 
-进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
+CommandExecutor 发出 `COMMAND_*` event 与 legacy `command` record，payload 包含 status、exit、digest、artifact ref、changed files、policy/isolation 摘要；argv/env/output 在写入前脱敏。Command policy 的 request/decision 进入 policy audit ledger。
 
 ## 失败路径
 
-失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
+policy 返回 `REVIEW_REQUIRED`/`POLICY_DENIED`、cwd denied、sandbox setup/backend error、timeout/idle timeout、kill 或非零退出时生成非成功 `CommandResult`；process API 通过 `status`、`error_code`、`killed_reason` 表达失败，不把启动失败登记为 running session。
 
 ## 当前结构问题
 
-当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
+同步维护 request→policy→plan→backend→result 与 long-running process 两条路径；模型可见边界是 observation，不是完整 `CommandResult.to_dict()`。
 
 ## 维护规则
 

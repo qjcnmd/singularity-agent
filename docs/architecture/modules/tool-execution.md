@@ -6,6 +6,11 @@
 - src/singularity/tool_protocol/models.py
 - src/singularity/tool_protocol/engine.py
 - src/singularity/tool_protocol/state.py
+- src/singularity/tool_protocol/validator.py
+- src/singularity/tool_protocol/scheduler.py
+- src/singularity/tool_protocol/result.py
+- src/singularity/tool_protocol/recovery.py
+- src/singularity/tool_protocol/trace.py
 - src/singularity/tools/executor.py
 
 关键符号:
@@ -16,6 +21,10 @@
 - ToolProtocolResultEnvelope
 - ToolProtocolTurnResult
 - ToolProtocolEngine
+- ToolProtocolValidator
+- ToolProtocolScheduler
+- ToolProtocolResultBuilder
+- ToolProtocolRecoveryManager
 
 字段清单:
 - ToolCallEnvelope: protocol_version, run_id, session_id, task_id, phase_id, model_request_id, model_response_id, assistant_message_id, tool_call_id, tool_name, raw_arguments, parsed_arguments, normalized_arguments, argument_digest, tool_schema_hash, allowed_tool_names, proposed_at, proposed_by_model, parse_status, validation_errors, metadata, phase
@@ -38,6 +47,11 @@
 - src/singularity/tool_protocol/models.py
 - src/singularity/tool_protocol/engine.py
 - src/singularity/tool_protocol/state.py
+- src/singularity/tool_protocol/validator.py
+- src/singularity/tool_protocol/scheduler.py
+- src/singularity/tool_protocol/result.py
+- src/singularity/tool_protocol/recovery.py
+- src/singularity/tool_protocol/trace.py
 - src/singularity/tools/executor.py
 
 ## 关键类、函数、字段
@@ -46,7 +60,7 @@
 
 ## 真实运行时调用链
 
-`AgentLoop` 收到 `ModelTurnResult.tool_calls` -> `ToolProtocolEngine.process_model_turn()` -> `ToolExecutor.execute()` -> `ToolProtocolResultEnvelope` -> `ContextManager.add_tool_observation()` -> 后续模型 turn。
+`AgentLoop` 收到 `ModelTurnResult.tool_calls` -> `ToolProtocolValidator.validate_assistant_message()` -> `ToolProtocolScheduler.schedule()` -> `ToolProtocolEngine.process_model_turn()` -> `ToolExecutor.execute_request()` -> `ToolProtocolResultBuilder.build()` -> `ContextManager.add_tool_protocol_result()` -> 后续模型 turn。
 
 ## 真实对象完整结构
 
@@ -55,27 +69,37 @@
 
 ## 谁生成这些对象
 
-这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
+- `ToolProtocolValidator.validate_assistant_message()` 从模型响应生成 `ToolCallEnvelope`、`ToolCallBatch` 和 `ToolProtocolValidationResult`；`ToolProtocolScheduler.schedule()` 根据 tool side effect/并行安全性生成 `ToolExecutionPlan`。
+- `ToolProtocolStateStore.upsert_record()` / `transition()` 创建并更新 `ToolCallRecord`；`append_event()` 生成协议库内部的 `ToolProtocolEvent`。`ToolProtocolResultBuilder.build()` 或 engine 的 `_synthetic_result()` 生成 `ToolProtocolResultEnvelope`，`bind_result()` 生成 `ToolProtocolResultBinding`。
+- `ToolProtocolEngine.process_model_turn()` 生成正常/拒绝/待批准的 `ToolProtocolTurnResult`；`ToolProtocolRecoveryManager` 从 records、bindings 与 context message 状态生成 `ToolProtocolRecoveryReport` 和恢复用 turn result。
 
 ## 谁消费这些对象
 
-消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
+- scheduler、state store、engine 与 `ToolExecutor.execute_request()` 消费 envelope/batch/plan；这些对象来自模型响应，不回送为下一次模型请求。
+- state binding 与 `ContextManager.add_tool_protocol_result()` 消费 `ToolProtocolResultEnvelope`。ContextManager 只把 redacted `ToolObservationView.to_model_payload()` 作为 tool message 加入下一轮模型请求，不发送 raw arguments、raw result 或完整协议元数据。
+- `AgentLoop`/`RunController` 消费 `ToolProtocolTurnResult`；recovery/controller 消费 recovery report；state query/recovery 消费 `ToolProtocolEvent` 和 `ToolProtocolResultBinding`。validation/plan/turn/recovery 对象本身不进模型。
 
 ## 是否落盘
 
-落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
+- `ToolProtocolStateStore` 位于当前 trace run 目录的 `tool_protocol.sqlite3`。`ToolCallBatch` 写 `tool_call_batches`；`ToolCallRecord` 写 `tool_call_records`；协议内部 event 写 `tool_protocol_events`；`ToolProtocolResultBinding` 与安全 result envelope 写 `tool_result_bindings`。
+- `ToolCallEnvelope` 嵌在 batch/record 的安全 JSON 中；state 写入前剔除 raw result keys 并脱敏 raw arguments。`ToolExecutionPlan`、`ToolProtocolValidationResult`、`ToolProtocolTurnResult` 与 `ToolProtocolRecoveryReport` 不单独落盘。
+- context 回写另写同一 run 的 `context.sqlite3` observations/items/messages；大结果正文由 `ToolProtocolResultBuilder._persist_raw()` 写 trace artifact，binding 只保存 `raw_result_ref`/digest。
 
 ## 是否进入 trace / audit
 
-进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
+- `ToolProtocolTrace.emit()` 写 observability `events.jsonl` 的 `tool_protocol.batch_created`、`plan_built`、call state、`call_completed`、`result_bound` 等事件；payload 只保留 call id、tool name、digest、状态、计数和 artifact refs，明确删除 raw arguments/result/content。
+- `ToolProtocolEvent` 是 `tool_protocol.sqlite3` 内部恢复日志，不是 `TraceRecorder` 的 `TraceEvent`；二者不可互换。协议 event 用于 replay/recovery，observability event 用于 timeline/report。
+- planner/policy gate 产生的 request/decision 由 `ToolExecutor` 的 policy 链写 audit；protocol envelope、validation 与 recovery report 不直接进入 policy audit。
 
 ## 失败路径
 
-失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
+- validator 对 invalid JSON、unknown/disallowed tool、schema mismatch、duplicate/missing call id 返回 invalid `ToolProtocolValidationResult`；engine 将错误转换成 rejected/synthetic result，而不是执行 handler。
+- `ToolCallRecord.phase` 表达 waiting approval、running、succeeded、rejected、failed、cancelled；`ToolProtocolResultEnvelope` 用 `ok/status/error_code/error_kind` 保存执行失败，turn result 汇总 failed/rejected/pending approval 并给出 `next_action`。
+- recovery report 明确列 pending、running、succeeded-but-not-appended、assistant message missing tool message；missing record/binding、conflicting replay 或无法安全 append 时保持阻塞，不伪造成功 tool message。
 
 ## 当前结构问题
 
-当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
+协议状态 SQLite 与 observability trace 是两套持久化系统；修改 call phase、binding 或恢复规则时必须同时核对 state schema、`ToolExecutor.execute_request()`、`ContextManager.add_tool_protocol_result()` 的 append 原子性和 trace 安全投影。
 
 ## 维护规则
 

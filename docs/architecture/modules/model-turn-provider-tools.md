@@ -7,6 +7,10 @@
 - src/singularity/model/runner.py
 - src/singularity/model/request_builder.py
 - src/singularity/model/tools.py
+- src/singularity/model/providers.py
+- src/singularity/model/messages.py
+- src/singularity/model/validation.py
+- src/singularity/model/budget.py
 
 关键符号:
 - ModelTurnRequest
@@ -41,6 +45,10 @@
 - src/singularity/model/runner.py
 - src/singularity/model/request_builder.py
 - src/singularity/model/tools.py
+- src/singularity/model/providers.py
+- src/singularity/model/messages.py
+- src/singularity/model/validation.py
+- src/singularity/model/budget.py
 
 ## 关键类、函数、字段
 
@@ -57,27 +65,29 @@
 
 ## 谁生成这些对象
 
-这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
+context/prompt/message converter 生成 `ContentBlock`/`ModelMessage`；`ModelToolRenderer` 从 registry 生成 `ModelToolSchema`。request builder/调用方生成 choice、preferences、budget 与 `ModelTurnRequest`，provider adapter 提供 capabilities。
+provider response parser/normalizer 生成 `ModelToolCall`/`ModelUsage`；validator 生成 `ModelValidationResult`，ModelRunner 的成功/invalid/failed 分支生成 `ModelTurnResult` 与 `ModelError`。
 
 ## 谁消费这些对象
 
-消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
+ModelRunner/provider adapter 消费 request。provider payload只含安全 messages、tool name/description/parameters/strict、序列化 tool choice 与支持的 generation 参数；message/tool/request metadata、capability/risk、policy/trace metadata、budget 对象不发送。
+AgentLoop 消费 validation/error/turn result，ToolProtocol 消费 tool calls，usage/reporting 消费 usage；这些 response 对象不自动进入下一轮模型，只有 ContextManager 追加的 assistant/tool message进入。
 
 ## 是否落盘
 
-落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
+ModelTurnRequest/Result 没有独立 store；消息与 usage 投影写 `context.sqlite3`，raw provider request/response仅在配置允许时由 `ModelRunner._write_raw_artifact()` 写 redacted trace artifact。evaluation result聚合 token/cache/turn统计，不复制完整对象。
 
 ## 是否进入 trace / audit
 
-进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
+ModelRunner 写 request-created、response-received、tool-call、output-rejected、request-failed events；payload保存 request/response ids、purpose、message/tool count、schema hash、usage、latency/error摘要和 artifact ref，不保存 message正文或 raw secrets。本层不写 policy audit。
 
 ## 失败路径
 
-失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
+`ModelTurnStatus` 区分 invalid、failed、timeout、cancelled、budget_exceeded；provider auth/rate/network/timeout/invalid request映射为 `ModelError.kind/retryable`。validator对 tool call invalid JSON/schema/unknown/duplicate/max-count返回错误，AgentLoop再决定 retry、blocked或fatal。
 
 ## 当前结构问题
 
-当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
+内部 `ModelTurnRequest` 比 provider JSON宽；维护时必须同时核对 `_model_messages_to_openai()`、`_model_tool_to_openai()` 和 tool-choice serialization，防止内部 metadata/provenance泄漏。
 
 ## 维护规则
 

@@ -103,7 +103,7 @@ singularity-agent eval run docs/evaluation/capability-regression-tasks.json --js
 singularity-agent eval provider-smoke --json
 ```
 
-`benchmark` 当前仍作为 `eval` 的同义命令组存在。新增 evaluation 文档、manifest 和 CLI 示例必须使用 `eval` / `evaluation` / `benchmark` / `task` / `task set` / `result` / `report` / `runner` 等主流命名，不得恢复 `live` 命名。
+`eval` 是当前唯一的评估 CLI 命令组；`benchmark` 只表示基准任务、任务集或报告这一领域概念，不是 CLI alias。新增 evaluation 文档、manifest 和 CLI 示例必须使用 `eval` / `evaluation` / `benchmark` / `task` / `task set` / `result` / `report` / `runner` 等主流命名，不得恢复 `live` 命名。
 
 ## 运行链路
 

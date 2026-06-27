@@ -57,27 +57,27 @@ Kernel 层负责启动配置、trace、workspace lock、组件图、健康检查
 
 ## 谁生成这些对象
 
-这些对象由上文列出的源码组件在运行链路中生成。生成动作必须来自当前源码路径，不允许由文档、测试夹具或解释性包装层伪造。
+`KernelBootstrap.boot()` 生成 `RunIdentity` 与 `KernelContext`；`AgentGraphBuilder.build()` 按 initialization order 生成 `AgentGraph`。`RunLifecycleManager` 创建/更新 `AgentRun`、`AgentSession` 与 `LifecycleEvent`，`AgentKernel` 在 task 运行中推进状态。
 
 ## 谁消费这些对象
 
-消费方是同一调用链后续组件、trace/audit 记录器、报告生成器或持久化 store。文档只列当前源码中真实调用的消费方。
+`AgentKernel.run_task()` 消费 graph/context/run/session 并构造 AgentLoop。identity 的 ids 进入 model request、context、trace 与 evaluation 引用；完整 graph/kernel context/run/session 不进入模型。
 
 ## 是否落盘
 
-落盘只通过当前源码中的 trace store、SQLite store、workspace state、evaluation output 或 manifest/report 写入路径发生。没有落盘代码的对象只在内存中传递。
+graph、KernelContext、RunIdentity、AgentRun/Session 本体只在内存；lifecycle event 写 trace，planner/context/workspace 子组件使用各自 store。最终 run/session 状态与 diagnostics 投影进 planner `final_report.json/.md` 和 evaluation result。
 
 ## 是否进入 trace / audit
 
-进入 trace / audit 的内容以 `TraceRecorder`、`JsonlTraceRecorder`、`TraceArtifactStore`、policy audit ledger 和相关 `record` / `emit` 调用为准。对象进入模型前必须经过当前工具协议、上下文组装和 redaction 逻辑。
+`RunLifecycleManager` 发出 boot/session/task/finalization/shutdown lifecycle events，payload 来自状态、component health、diagnostics 与 final report；TraceRecorder 写 `events.jsonl`。Kernel 本身不写 policy audit，各执行组件经共享 PolicyEngine 写 audit。
 
 ## 失败路径
 
-失败路径由当前源码中的异常、状态枚举、policy decision、verification result、planner outcome 和 result/report 字段表达。不得用旧 schema 或旧命名补充解释。
+组件构图失败抛 `AgentGraphInitializationError`，bootstrap 包装为 `KernelBootstrapError`；task 运行异常/取消由 `KernelError`/`CancellationError` 与 `FAILED/BLOCKED/CANCELLED` lifecycle 表达，diagnostics 保留异常类型/脱敏消息并执行 shutdown。
 
 ## 当前结构问题
 
-当前结构仍大量使用字典 payload 连接组件，维护时最容易发生字段漂移。字段清单必须由源码校验脚本约束，不能只依赖人工描述。
+`AgentGraph` 是依赖所有权边界而非持久化 schema；新增组件必须更新 initialization order、health/shutdown、KernelContext diagnostics 和模块文档，不能只加字段后依赖隐式关闭。
 
 ## 维护规则
 

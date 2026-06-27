@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
+from typer.main import get_command
 
 from singularity.cli import app, _run_provider_smoke_benchmark
 from singularity.cli import create_or_resume_planner, workspace_health_summary
@@ -544,13 +545,14 @@ def test_cli_eval_task_validate_and_list_filter_tags(tmp_path: Path) -> None:
     validate = runner.invoke(app, ["eval", "task", "validate", str(task_set), "--json"])
     listed = runner.invoke(
         app,
-        ["benchmark", "task", "list", str(task_set), "--tag", "tool-heavy", "--json"],
+        ["eval", "task", "list", str(task_set), "--tag", "tool-heavy", "--json"],
     )
 
     assert validate.exit_code == 0
     assert '"task_count": 1' in validate.output
     assert listed.exit_code == 0
     assert "task.cli" in listed.output
+    assert "benchmark" not in get_command(app).commands
 
 
 def test_cli_plugin_lifecycle_json_does_not_import_disabled_plugin(tmp_path: Path, monkeypatch) -> None:
@@ -900,9 +902,7 @@ def test_cli_eval_private_uses_private_benchmark_adapter(tmp_path: Path, monkeyp
     removed = runner.invoke(app, ["eval", "live", "private", str(task_set)])
     assert removed.exit_code != 0
     assert "No such command" in removed.output
-    benchmark_removed = runner.invoke(app, ["benchmark", "live", "private", str(task_set)])
-    assert benchmark_removed.exit_code != 0
-    assert "No such command" in benchmark_removed.output
+    assert "benchmark" not in get_command(app).commands
 
 
 def test_cli_eval_run_rejects_unsupported_manifest_schema(
