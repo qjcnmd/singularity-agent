@@ -468,6 +468,22 @@ def _verify_deep_dive_section(doc: ModuleDataFlowDoc, errors: list[str]) -> None
             '(e.g. `VALUE = "value"` or prose listing enum values)'
         )
 
+    # No omission markers allowed in code blocks
+    _OMISSION_PATTERNS = [
+        r"\.\.\.\s*\d*\s*more\s+(fields|members|values)",
+        r"\.\.\.\s*\d*\s*more\b",
+        r"\betc\.\s*\)",
+        r"#\s*\.\.\.",
+    ]
+    for block in code_blocks:
+        for pattern in _OMISSION_PATTERNS:
+            if re.search(pattern, block, re.IGNORECASE):
+                errors.append(
+                    f"{label}: code block in '真实对象完整结构' contains omission marker "
+                    f"('{pattern}'); every field and enum member must be listed in full"
+                )
+                break
+
     # Verify producer/consumer/persistence/trace specificity
     _verify_section_specificity(label, "谁生成这些对象", doc.text, errors,
                                 r"\w+\.\w+\(|def \w+", "at least one concrete method name")

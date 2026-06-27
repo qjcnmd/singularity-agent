@@ -103,7 +103,15 @@ class CommandResult:
     env_denied: list[str] = field(default_factory=list)
     killed_reason: str | None = None
     backend: str = "local_process"
-    # ... 10 more fields for git_before/after, side_effects, metadata, etc.
+    started_at: str | None = None
+    ended_at: str | None = None
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    secret_redactions: int = 0
+    git_before: dict[str, Any] = field(default_factory=dict)
+    git_after: dict[str, Any] = field(default_factory=dict)
+    side_effects: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 ```
 
 ### CommandPolicyResult（命令策略决策）
@@ -132,15 +140,20 @@ class CommandPurpose(str, Enum):     # CommandRequest.purpose
     LINT = "LINT"
     TYPECHECK = "TYPECHECK"
     FORMAT_CHECK = "FORMAT_CHECK"
+    FORMATTER = "FORMATTER"
     BUILD = "BUILD"
     CODE_GENERATION = "CODE_GENERATION"
     PACKAGE_MANAGER = "PACKAGE_MANAGER"
     NETWORK = "NETWORK"
     WRITE_WORKSPACE = "WRITE_WORKSPACE"
     DESTRUCTIVE = "DESTRUCTIVE"
+    LONG_RUNNING = "LONG_RUNNING"
+    SECRET_RISK = "SECRET_RISK"
+    VCS_READ = "VCS_READ"
+    VCS_MUTATION = "VCS_MUTATION"
+    SYSTEM_MUTATION = "SYSTEM_MUTATION"
     EXECUTES_PROJECT_CODE = "EXECUTES_PROJECT_CODE"
     UNKNOWN = "UNKNOWN"
-    # ... 6 more members
 
 class ExecutionStatus(str, Enum):    # CommandResult.execution_status
     COMPLETED = "completed"

@@ -104,7 +104,26 @@ class EvaluationTaskResult:
     verification: CommandEvalResult | None = None
     agent_completed: bool = False
     evaluation_passed: bool = False
-    # ... 20 more fields for policy_blocks, token_usage, etc.
+    patch_applicable: bool = False
+    allowed_scope_passed: bool = False
+    public_verification_passed: bool = False
+    hidden_verification_passed: bool = False
+    repair_attempt_count: int = 0
+    repair_execution_count: int = 0
+    miscompletion_count: int = 0
+    blocked_reason: str = ""
+    failure_category: str = ""
+    request_cache_hit_rates: dict[str, float] = field(default_factory=dict)
+    status: str = "unknown"
+    turn_count: int = 0
+    verification_result: dict[str, Any] = field(default_factory=dict)
+    contract_satisfaction: dict[str, Any] = field(default_factory=dict)
+    final_report_status: str = ""
+    policy_blocks: int = 0
+    token_usage: dict[str, Any] = field(default_factory=dict)
+    cache_usage: dict[str, Any] = field(default_factory=dict)
+    trace_artifact_refs: list[str] = field(default_factory=list)
+    reproducible_environment: dict[str, Any] = field(default_factory=dict)
 ```
 
 ### CommandEvalResult（命令评估结果）

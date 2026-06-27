@@ -164,27 +164,48 @@ class PolicyComponent(str, Enum):    # PolicyRequest.component
     WORKSPACE_STATE = "workspace_state"
     SYSTEM = "system"
 
-class Capability(str, Enum):         # PolicyRequest.capability (19 members)
+class Capability(str, Enum):         # PolicyRequest.capability (20 members)
     READ_WORKSPACE = "read_workspace"
+    READ_OUTSIDE_WORKSPACE = "read_outside_workspace"
+    READ_SECRET = "read_secret"
+    LIST_DIRECTORY = "list_directory"
     MUTATE_WORKSPACE = "mutate_workspace"
     CREATE_FILE = "create_file"
     DELETE_FILE = "delete_file"
+    MOVE_FILE = "move_file"
+    ROLLBACK_MUTATION = "rollback_mutation"
     EXECUTE_COMMAND = "execute_command"
     EXECUTE_PROJECT_CODE = "execute_project_code"
+    EXECUTE_GENERATED_CODE = "execute_generated_code"
     NETWORK_ACCESS = "network_access"
     PACKAGE_INSTALL = "package_install"
-    READ_SECRET = "read_secret"
-    # ... 10 more members
+    PACKAGE_SCRIPT = "package_script"
+    START_LONG_PROCESS = "start_long_process"
+    KILL_PROCESS = "kill_process"
+    READ_ENV = "read_env"
+    WRITE_ENV = "write_env"
+    CHANGE_AGENT_CONFIG = "change_agent_config"
 
 class RiskTag(str, Enum):            # PolicyRequest.risk_tags (19 members)
     WORKSPACE_READ = "workspace_read"
+    OUTSIDE_WORKSPACE = "outside_workspace"
+    SECRET_ACCESS = "secret_access"
     MUTATES_FILES = "mutates_files"
+    MUTATES_CONFIG = "mutates_config"
+    MUTATES_LOCKFILE = "mutates_lockfile"
     DESTRUCTIVE = "destructive"
+    IRREVERSIBLE = "irreversible"
     EXECUTES_CODE = "executes_code"
+    EXECUTES_PROJECT_CODE = "executes_project_code"
+    EXECUTES_GENERATED_CODE = "executes_generated_code"
+    SHELL_EXPANSION = "shell_expansion"
     NETWORK = "network"
+    PACKAGE_MANAGER = "package_manager"
     SUPPLY_CHAIN = "supply_chain"
+    LONG_RUNNING = "long_running"
+    RESOURCE_HEAVY = "resource_heavy"
+    PERSISTENT_SIDE_EFFECT = "persistent_side_effect"
     SECRETS_EXFILTRATION = "secrets_exfiltration"
-    # ... 12 more members
 ```
 
 ### 数据流概述
