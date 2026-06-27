@@ -62,8 +62,147 @@ Planner 层维护任务状态、阶段、行动、证据、预算、重规划决
 以用户要求修复 `quicksort.py` 为例：`Planner.start_task()` -> `Planner.step()` -> `Planner.update_from_tool_result()` / `update_from_command()` / `update_from_verification()` 先生成对象 `TaskState`、`TaskPhase`、`TaskPlan` 和 `AgentAction`，再把工具、命令和验证结果写入 `EvidenceLedger` 并更新 `ExecutionBudget`；`Planner._persist()` 再把 state/plan/evidence/budget 写入 `.singularity/planner/<session_id>/state.json`、`plan.json`、`evidence.json`、`budget.json`。completion gate 不满足时 `Planner.replan()` 返回 `ReplanDecision`，失败分析的 `RepairReplanSignal` 通过 `Planner.record_failure_analysis()` 进入同一 evidence/report 链。
 ## 真实对象完整结构
 
-- `TaskState（任务状态）` 完整字段列在字段清单中，是 planner 的主状态对象。
-- `FinalReport（最终报告）` 完整字段列在字段清单中，消费者是 kernel finalization、evaluation result extraction、memory learning 和 trace。
+### TaskState（任务状态）
+
+planner 的主状态对象，维护任务全生命周期。**边界**：落盘到 `.singularity/planner/<session_id>/state.json`；投影进 planner context 和 trace event，不作为整体进入模型请求。
+
+```python
+@dataclass
+class TaskState:
+    task_id: str
+    session_id: str
+    user_goal: str
+    normalized_goal: str
+    effective_goal: str | None = None
+    goal_revisions: list[dict[str, Any]] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    current_phase: str = "understanding_task"
+    status: TaskStatus = TaskStatus.INITIALIZED
+    risk_level: RiskLevel = RiskLevel.LOW
+    created_at: str = field(default_factory=lambda: _now())
+    updated_at: str = field(default_factory=lambda: _now())
+    completion_criteria: CompletionCriteria = field(default_factory=CompletionCriteria)
+    open_questions: list[str] = field(default_factory=list)
+    blocked_reasons: list[str] = field(default_factory=list)
+    linked_transactions: list[str] = field(default_factory=list)
+    linked_commands: list[str] = field(default_factory=list)
+    linked_verifications: list[str] = field(default_factory=list)
+    final_assessment: dict[str, Any] = field(default_factory=dict)
+    task_contract: dict[str, Any] = field(default_factory=dict)
+    lifecycle_status: str = "created"
+    rolling_plan: dict[str, Any] = field(default_factory=dict)
+    sandbox_capability: dict[str, Any] = field(default_factory=dict)
+    risk_points: list[dict[str, Any]] = field(default_factory=list)
+    verification_strategies: list[dict[str, Any]] = field(default_factory=list)
+    repair_policy: dict[str, Any] | None = None
+```
+
+### AgentAction（智能体行动）
+
+planner 当前阶段的具体行动决策。**边界**：内部治理对象，不落盘为独立文件；action id/kind 进入 trace event。
+
+```python
+@dataclass
+class AgentAction:
+    kind: ActionKind
+    intent: str
+    phase_id: str
+    preconditions: list[str]
+    allowed_tools: list[str]
+    expected_evidence: list[str]
+    risk_level: RiskLevel = RiskLevel.LOW
+    status: ActionStatus = ActionStatus.PROPOSED
+    action_id: str = field(default_factory=lambda: f"action_{uuid4().hex[:12]}")
+    result_ref: str | None = None
+```
+
+### FinalReport（最终报告）
+
+任务完成时的结构化总结。**边界**：落盘到 `.singularity/planner/<session_id>/final_report.json` 和 `final_report.md`；完整 payload 由 kernel `finalization.completed` lifecycle event 记录，不发送给主模型。
+
+```python
+@dataclass
+class FinalReport:
+    user_goal: str
+    status: TaskStatus
+    files_changed: list[str]
+    agent_changes: list[dict[str, Any]]
+    command_side_effects: list[dict[str, Any]]
+    verification_summary: dict[str, Any]
+    unresolved_issues: list[Any]
+    risks: list[Any]
+    rollback_status: dict[str, Any]
+    policy_approval_summary: dict[str, Any]
+    artifacts: list[str]
+    next_steps: list[str]
+    sandbox_isolation_summary: dict[str, Any] = field(default_factory=dict)
+    execution_trace_summary: dict[str, Any] = field(default_factory=dict)
+    model_usage_summary: dict[str, Any] = field(default_factory=dict)
+    context_usage_diagnostic: dict[str, Any] = field(default_factory=dict)
+    instruction_prompt_summary: dict[str, Any] = field(default_factory=dict)
+    component_health_summary: dict[str, Any] = field(default_factory=dict)
+    shutdown_summary: dict[str, Any] = field(default_factory=dict)
+    recovery_summary: dict[str, Any] = field(default_factory=dict)
+    lifecycle_summary: dict[str, Any] = field(default_factory=dict)
+    review_summary: dict[str, Any] = field(default_factory=dict)
+    failure_repair_summary: dict[str, Any] = field(default_factory=dict)
+    contract_satisfaction: dict[str, Any] = field(default_factory=dict)
+```
+
+### 关键枚举值域
+
+```python
+class TaskStatus(str, Enum):         # TaskState.status
+    INITIALIZED = "initialized"
+    UNDERSTANDING_TASK = "understanding_task"
+    INSPECTING_WORKSPACE = "inspecting_workspace"
+    PLANNING_CHANGES = "planning_changes"
+    APPLYING_CHANGES = "applying_changes"
+    RUNNING_VERIFICATION = "running_verification"
+    REPAIRING_FAILURES = "repairing_failures"
+    FINALIZING = "finalizing"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    NEEDS_REVIEW = "needs_review"
+    INTERRUPTED = "interrupted"
+    RECOVERING = "recovering"
+
+class ActionKind(str, Enum):         # AgentAction.kind
+    INSPECT_WORKSPACE = "InspectWorkspace"
+    READ_RELEVANT_FILES = "ReadRelevantFiles"
+    SEARCH_CODE = "SearchCode"
+    ANALYZE_ISSUE = "AnalyzeIssue"
+    PROPOSE_CHANGE_SET = "ProposeChangeSet"
+    APPLY_MUTATION = "ApplyMutation"
+    RUN_VERIFICATION = "RunVerification"
+    PARSE_FAILURE = "ParseFailure"
+    REPAIR_CHANGE = "RepairChange"
+    ASK_USER = "AskUser"
+    REQUIRE_REVIEW = "RequireReview"
+    FINALIZE = "Finalize"
+    ABORT = "Abort"
+
+class ActionStatus(str, Enum):       # AgentAction.status
+    PROPOSED = "proposed"
+    ALLOWED = "allowed"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+
+class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
+    CONTINUE = "continue"
+    REQUIRE_REVIEW = "require_review"
+    ASK_USER = "ask_user"
+    DENY_ACTION = "deny_action"
+    ABORT = "abort"
+```
+
+### 数据流概述
+
+`Planner.start_task()` 生成 `TaskState` 和 `TaskPlan`，`Planner.step()` 生成 `AgentAction`。工具/命令/验证结果写入 `EvidenceLedger`（25 个 evidence bucket），`ExecutionBudget` 跟踪计数器。`Planner._persist()` 写 `state.json`/`plan.json`/`evidence.json`/`budget.json`。`Finalizer.build()` 生成 `FinalReport`，落盘 `final_report.json`/`.md`。`PlannerContextRenderer` 只投影 goal、phase、allowed tools、rolling plan 与选择性 evidence 进入模型上下文。
 
 ## 谁生成这些对象
 
@@ -73,9 +212,9 @@ Planner 层维护任务状态、阶段、行动、证据、预算、重规划决
 
 ## 谁消费这些对象
 
-- Planner、AgentLoop、RunController 和 finalizer 消费 `TaskState`/`TaskPlan`/`CompletionCriteria`；tool exposure/authorization 消费当前 `TaskPhase` 与 `AgentAction`。主模型只接收 `PlannerContextRenderer` 投影的 goal、phase、allowed tools、rolling plan 与选择性 evidence，不接收完整 state/plan。
-- completion/replan/finalizer 消费 `EvidenceLedger`，BudgetController 和 Planner step/replan 消费 `ExecutionBudget`；ledger/budget 全量对象不进模型。`AuthorizationDecision` 由 ToolExecutor 消费，deny reason 可经 tool observation 进入后续模型。
-- planner 状态机消费 `ReplanDecision`/`RiskEscalation`；replan signal 会进入 planner-decision producer 的独立模型请求。`AgentKernel`、CLI、evaluation 和 memory learning 消费 `FinalReport`，final report 不再发送给主模型。
+- `Planner.step()`、`AgentLoop.run()`、`RunController.run_loop()` 和 `Finalizer.build()` 消费 `TaskState`/`TaskPlan`/`CompletionCriteria`；`ToolExecutor.execute_request()` 消费当前 `TaskPhase` 与 `AgentAction`。主模型只接收 `PlannerContextRenderer.render()` 投影的 goal、phase、allowed tools、rolling plan 与选择性 evidence，不接收完整 state/plan。
+- `Planner.assess_completion()` 消费 `EvidenceLedger`，`BudgetController.check_budget()` 和 `Planner.step()` 消费 `ExecutionBudget`；ledger/budget 全量对象不进模型。`AuthorizationDecision` 由 `ToolExecutor.authorize()` 消费，deny reason 可经 tool observation 进入后续模型。
+- `Planner.replan()` 消费 `ReplanDecision`/`RiskEscalation`；replan signal 会进入 planner-decision producer 的独立模型请求。`AgentKernel.run_task()`、CLI、evaluation 和 `MemoryLearningPipeline.ingest_final_report()` 消费 `FinalReport`，final report 不再发送给主模型。
 
 ## 是否落盘
 

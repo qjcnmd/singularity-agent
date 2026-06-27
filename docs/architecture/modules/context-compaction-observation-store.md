@@ -45,8 +45,96 @@
 
 ## 真实对象完整结构
 
-- `ContextSnapshot（上下文快照）` 完整字段列在字段清单中，落盘到 context store。
-- `ToolObservation（工具观察）` 完整字段列在字段清单中，消费者是 context 渲染、planner 证据和 failure analysis。
+### ContextSnapshot（上下文快照）
+
+compaction commit 成功后的上下文检查点。**边界**：落盘对象，写入 `context.sqlite3` 的 `context_snapshots` 表；不进入模型请求。
+
+```python
+@dataclass
+class ContextSnapshot:
+    snapshot_id: str
+    run_id: str
+    session_id: str = ""
+    task_id: str = ""
+    goal: str = ""
+    summary: str = ""
+    retained_item_ids: list[str] = field(default_factory=list)
+    known_observation_ids: list[str] = field(default_factory=list)
+    version: int = 0
+    created_at: str = field(default_factory=lambda: _now())
+    retained_messages: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### ToolObservation（工具观察）
+
+工具执行结果的 context 层记录。**边界**：落盘对象，写入 `context.sqlite3` 的 `observations` 表；其安全 tool message 投影进入下一轮模型请求。
+
+```python
+@dataclass
+class ToolObservation:
+    id: str
+    tool_name: str
+    tool_call_id: str | None
+    ok: bool
+    raw_result: dict[str, Any]
+    preview: str
+    truncated: bool
+    metadata: dict[str, Any] = field(default_factory=dict)
+    run_id: str = ""
+    turn: int = 0
+    created_at: str = ""
+    input_tokens: int = 0
+    preview_tokens: int = 0
+    raw_digest: str = ""
+    source_refs: list[ContextReference] = field(default_factory=list)
+    cache_hit: bool = False
+    duration_seconds: float | None = None
+    error_code: str | None = None
+    tool_version: str | None = None
+    truncation_reason: str | None = None
+    sensitivity: ContextSensitivity = ContextSensitivity.WORKSPACE
+```
+
+### RecoveredContext（恢复上下文）
+
+crash recovery 重建的运行时状态。**边界**：内部治理对象，不落盘；其 messages/items 可进入后续模型请求。
+
+```python
+@dataclass
+class RecoveredContext:
+    run_id: str
+    messages: list[dict[str, Any]]
+    context_items: list[ContextItem] = field(default_factory=list)
+    last_bundle: ContextBundle | None = None
+    planner_state: dict[str, Any] | None = None
+    pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    completed_tool_call_ids: set[str] = field(default_factory=set)
+    pending_policy_approval: dict[str, Any] | None = None
+    active_process_sessions: list[str] = field(default_factory=list)
+    open_mutation_transactions: list[str] = field(default_factory=list)
+    last_verification_status: str | None = None
+    last_safe_checkpoint: dict[str, Any] | None = None
+    recommended_next_action: str = "request_model"
+    recovery_warnings: list[str] = field(default_factory=list)
+    trace_last_event: str | None = None
+```
+
+### 关键枚举值域
+
+`ToolObservation.sensitivity` 使用 `ContextSensitivity` 枚举（与 context-assembly-prompt-frame 模块共享）：
+
+```python
+class ContextSensitivity(str, Enum):
+    PUBLIC = "public"
+    WORKSPACE = "workspace"
+    SENSITIVE = "sensitive"
+    SECRET = "secret"
+```
+
+### 数据流概述
+
+`ContextManager.add_tool_result()` / `add_tool_protocol_result()` 生成 `ToolObservation`，写入 `context.sqlite3`。`ContextCompactionPlanner.prepare()` 生成 `CompactionPlan`，`ContextCompactionExecutor.summary_envelope_for_plan()` 生成 `ContextSummaryEnvelope`，`ContextCompactionCommitter.commit()` 标记旧 item 并写 summary item。恢复时 `RecoveryManager.recover()` 从 SQLite、planner/protocol 状态和 trace 尾事件重建 `RecoveredContext`。observation 生成的安全 tool message 与 recovered messages/items 可进入后续模型请求；snapshot/recovered/range 本体不进入 provider。
 
 ## 谁生成这些对象
 
@@ -54,7 +142,7 @@ compaction commit 成功后生成 `ContextSnapshot`；`ContextManager.add_tool_r
 
 ## 谁消费这些对象
 
-recovery/compaction 消费 snapshot；ContextManager、assembler、planner/failure analysis 消费 tool observation。observation 生成的安全 tool message 与 recovered messages/items 可进入后续模型请求；snapshot/recovered/range 本体不进入 provider。
+`ContextCompactionCommitter.recover_after_failure()` 和 recovery 消费 snapshot；`ContextManager.add_tool_result()`、`ContextAssembler.build_bundle()` 和 `Planner.update_from_tool_result()` 消费 tool observation。observation 生成的安全 tool message 与 recovered messages/items 可进入后续模型请求；snapshot/recovered/range 本体不进入 provider。
 
 ## 是否落盘
 

@@ -57,8 +57,104 @@
 
 ## 真实对象完整结构
 
-- `FailureAnalysisRequest（失败分析请求）` 完整字段列在字段清单中，生成者是 AgentLoop。
-- `RepairContract（修复契约）` 完整字段列在字段清单中，消费者是 replanner、verification contract satisfaction 和 targeted replay。
+### FailureAnalysisRequest（失败分析请求）
+
+从 planner evidence 和当前 outcome 构造的分析请求。**边界**：内部治理对象，不落盘为独立文件；`to_model_payload()` 的有界证据发送给 failure-analysis 模型。
+
+```python
+@dataclass(frozen=True)
+class FailureAnalysisRequest:
+    request_id: str
+    run_id: str
+    session_id: str
+    task_id: str
+    phase_id: str
+    workspace_root: str
+    failure_source: str
+    failure_summary: str
+    failure_sources: list[dict[str, Any]]
+    context_references: list[str] = field(default_factory=list)
+    recent_tail: list[dict[str, Any]] = field(default_factory=list)
+    verification_log_refs: list[str] = field(default_factory=list)
+    changed_files: list[str] = field(default_factory=list)
+    evidence_refs: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    risk_points: list[dict[str, Any]] = field(default_factory=list)
+    repair_policy: dict[str, Any] | None = None
+    verification_strategies: list[dict[str, Any]] = field(default_factory=list)
+```
+
+### FailureAnalysisResult（失败分析结果）
+
+failure-analysis 模型返回的结构化结果。**边界**：内部治理对象，写入 planner `evidence.json`；安全投影写 trace event 和 context failure item。
+
+```python
+@dataclass(frozen=True)
+class FailureAnalysisResult:
+    analysis_id: str
+    request_id: str
+    root_cause: str                     # to_dict() 投影为 {description, evidence, confidence}
+    failure_category: str
+    affected_files: list[str]
+    evidence_refs: list[str]
+    repair_strategy: str
+    next_actions: list[str]
+    verification_plan: list[str]
+    confidence: float
+    needs_user_input: bool
+    blocked_reason: str | None = None
+    raw_response_ref: str | None = None
+    verification_contract: VerificationContract = field(default_factory=VerificationContract.empty)
+```
+
+### RepairContract（修复契约）
+
+修复阶段的授权边界。**边界**：内部治理对象，写入 planner `evidence.json`；约束 target files、allowed tools 和 verification。
+
+```python
+@dataclass(frozen=True)
+class RepairContract:
+    contract_id: str
+    analysis_id: str
+    failure_category: str
+    target_files: list[str]
+    evidence_refs: list[str]
+    action_candidates: list[RepairActionCandidate]
+    verification_plan: list[str]
+    confidence: float
+    allowed_tool_names: list[str]
+    needs_user_input: bool = False
+    blocked_reason: str | None = None
+    validation_errors: list[str] = field(default_factory=list)
+    verification_contract: VerificationContract = field(default_factory=VerificationContract.empty)
+```
+
+`verification_contract` 嵌套来自 verification 模块的 `VerificationContract`（`contract_id`、`steps: list[VerificationStep]`、`status`、`validation_errors`），约束 repair 阶段允许的验证命令。
+
+### 关键状态值域
+
+```python
+# FailureAnalysisResult.failure_category 由模型返回，常见值:
+LOGIC_ERROR = "logic_error"
+SYNTAX_ERROR = "syntax_error"
+TYPE_ERROR = "type_error"
+TEST_FAILURE = "test_failure"
+BUILD_FAILURE = "build_failure"
+DEPENDENCY_ISSUE = "dependency_issue"
+CONFIG_ERROR = "config_error"
+ENVIRONMENT_ISSUE = "environment_issue"
+
+# RepairActionCandidate.action_type 取值:
+EDIT_FILE = "edit_file"
+CREATE_FILE = "create_file"
+DELETE_FILE = "delete_file"
+RUN_COMMAND = "run_command"
+READ_FILE = "read_file"
+```
+
+### 数据流概述
+
+`AgentLoop._maybe_analyze_failure()` 调用 `FailureAnalysisRequest.from_planner()` 从 planner evidence 生成 request。`FailureAnalyzer.analyze()` 只把 `request.to_model_payload()` 发送给 failure-analysis 模型，返回 payload 经 `FailureAnalysisResult.from_model_payload()` 生成结果。`RepairPlanner.plan()` 生成 `RepairContract`、`RepairActionCandidate` 和 `RepairPlan`。`RepairPlanner.to_replan_signal()` 生成 `RepairReplanSignal`，由 `Planner.record_failure_analysis()` 写入 planner evidence、`planner_events.jsonl`、context item 和 trace。
 
 ## 谁生成这些对象
 
@@ -68,9 +164,9 @@
 
 ## 谁消费这些对象
 
-- `FailureAnalyzer` 消费 `FailureAnalysisRequest`；只有 `to_model_payload()` 的有界失败证据进入 failure-analysis 模型，workspace root、raw log 和完整 metadata 不直接发送。
-- `RepairPlanner`、Planner、ContextManager 消费 `FailureAnalysisResult`；`RepairContract`/candidate 限定 target files、allowed tools 和 verification。Planner authorization 与 `VerificationRunner` 是生产消费者，targeted replay 只是读取证据的评估消费者。
-- Planner 与 planner-decision producer 消费 `RepairReplanSignal`，因此 signal 进入的是独立 replanner 模型请求；`RepairPlan`/contract 的安全摘要通过 planner context 进入后续主模型 turn。
+- `FailureAnalyzer.analyze()` 消费 `FailureAnalysisRequest`；只有 `to_model_payload()` 的有界失败证据进入 failure-analysis 模型，workspace root、raw log 和完整 metadata 不直接发送。
+- `RepairPlanner.plan()`、`Planner.record_failure_analysis()` 和 `ContextManager.add_failure_item()` 消费 `FailureAnalysisResult`；`RepairContract`/candidate 限定 target files、allowed tools 和 verification。`Planner.authorize_tool_call()` 与 `VerificationRunner.run_plan()` 是生产消费者，targeted replay 只是读取证据的评估消费者。
+- `Planner.replan()` 和 planner-decision producer 消费 `RepairReplanSignal`，因此 signal 进入的是独立 replanner 模型请求；`RepairPlan`/contract 的安全摘要通过 planner context 进入后续主模型 turn。
 
 ## 是否落盘
 

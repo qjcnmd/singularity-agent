@@ -36,8 +36,35 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 
 ## 真实对象完整结构
 
-- `AgentLoopResult（智能体主循环结果）` 完整字段是 `status`、`final_answer`、`turn`、`error_code`、`diagnostics`。
-- `AgentLoopStatus（主循环状态）` 当前枚举值为 `completed`、`blocked`、`max_turns_exceeded`、`failed`。
+### AgentLoopResult（智能体主循环结果）
+
+AgentLoop 执行的最终返回值。**边界**：内部治理对象，不落盘为独立文件；投影进 evaluation `result.json`、`report.json`、`report.md` 和 trace `final_answer` event。
+
+```python
+@dataclass(frozen=True, eq=False)
+class AgentLoopResult:
+    status: AgentLoopStatus
+    final_answer: str
+    turn: int
+    error_code: str | None = None
+    diagnostics: dict[str, Any] | None = None
+```
+
+### AgentLoopStatus（主循环状态枚举）
+
+`AgentLoopResult.status` 的枚举类型，由 `AgentLoop` 内部各终止分支选择。
+
+```python
+class AgentLoopStatus(str, Enum):
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    MAX_TURNS_EXCEEDED = "max_turns_exceeded"
+    FAILED = "failed"
+```
+
+### 数据流概述
+
+`AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部 `RunController.run_loop()` 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `_attempt_finalize()` 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `_terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
 
 ## 谁生成这些对象
 

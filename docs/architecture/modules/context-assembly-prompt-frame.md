@@ -61,8 +61,142 @@ Context 层把系统提示、用户目标、planner 状态、memory、project in
 
 ## 真实对象完整结构
 
-- `ContextItem（上下文条目）` 完整字段列在字段清单中，既可来自模型、工具、planner、policy、workspace state，也可来自 memory/project index。
-- `ContextBundle（上下文包）` 是进入模型前的消息集合和预算诊断，消费者是 `ModelRunner`。
+### ContextItem（上下文条目）
+
+context 层的核心存储单元，所有组件的观察结果先转为 ContextItem 再进入选择/预算/渲染流程。**边界**：内部治理对象，落盘到 `context.sqlite3` 的 `context_items` 表；只有通过 visibility、预算与 redaction 的 item 内容进入 `ContextBundle.messages`，完整 item 元数据不发送给 provider。
+
+```python
+@dataclass
+class ContextItem:
+    item_id: str
+    run_id: str
+    session_id: str
+    task_id: str
+    phase_id: str
+    layer: ContextLayer
+    source_component: ContextSource
+    item_type: ContextItemType
+    content: Any
+    content_digest: str = ""
+    created_at: str = field(default_factory=lambda: _now())
+    updated_at: str = field(default_factory=lambda: _now())
+    importance: float = 0.5
+    relevance_score: float | None = None
+    authority: ContextAuthority = ContextAuthority.COMPONENT
+    freshness: ContextFreshness = ContextFreshness.CURRENT
+    sensitivity: ContextSensitivity = ContextSensitivity.WORKSPACE
+    token_count: int = 0
+    references: list[ContextReference] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    pinned: bool = False
+    expires_at: str | None = None
+```
+
+### ContextBundle（上下文包）
+
+进入模型前的消息集合和预算诊断。**边界**：内部治理对象，落盘到 `context.sqlite3` 的 `context_bundles` 表；其 `messages` 字段直接组成 `ModelTurnRequest.messages`，`budget`/`render_policy` 只用于内部诊断。
+
+```python
+@dataclass
+class ContextBundle:
+    bundle_id: str
+    run_id: str
+    task_id: str
+    phase_id: str
+    model: str
+    provider: str
+    messages: list[dict[str, Any]]
+    included_item_ids: list[str]
+    excluded_item_ids: list[str]
+    budget: ContextBudgetPlan
+    compression_snapshot_id: str | None = None
+    retrieval_query: str | None = None
+    render_policy: ContextRenderPolicy = field(default_factory=ContextRenderPolicy)
+    created_at: str = field(default_factory=lambda: _now())
+    bundle_digest: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### ContextBudgetPlan（上下文预算计划）
+
+token 预算分配与溢出诊断。**边界**：内部治理对象，嵌入 ContextBundle 行落盘；不独立写 trace 或进入模型。
+
+```python
+@dataclass
+class ContextBudgetPlan:
+    model_context_window: int
+    output_token_reserve: int
+    reasoning_token_reserve: int = 0
+    tool_schema_tokens: int = 0
+    system_tokens: int = 0
+    pinned_tokens: int = 0
+    evidence_tokens: int = 0
+    recent_dialogue_tokens: int = 0
+    summary_tokens: int = 0
+    available_tokens: int = 0
+    used_tokens: int = 0
+    overflow_tokens: int = 0
+    soft_limit: int = 0    # int(model_context_window * 0.9)
+    hard_limit: int = 0    # model_context_window
+    message_tokens: int = 0
+```
+
+### 关键枚举值域
+
+```python
+class ContextLayer(str, Enum):       # ContextItem.layer
+    SYSTEM = "system"
+    USER_GOAL = "user_goal"
+    TASK_STATE = "task_state"
+    PLANNER_STATE = "planner_state"
+    POLICY_STATE = "policy_state"
+    WORKSPACE_STATE = "workspace_state"
+    EVIDENCE = "evidence"
+    TOOL_OBSERVATIONS = "tool_observations"
+    VERIFICATION = "verification"
+    RECENT_DIALOGUE = "recent_dialogue"
+    COMPRESSED_HISTORY = "compressed_history"
+    FAILURE_MEMORY = "failure_memory"
+    REFERENCES = "references"
+    SCRATCHPAD = "scratchpad"
+
+class ContextItemType(str, Enum):    # ContextItem.item_type
+    SYSTEM_INSTRUCTION = "system_instruction"
+    USER_GOAL = "user_goal"
+    USER_MESSAGE = "user_message"
+    ASSISTANT_MESSAGE = "assistant_message"
+    TOOL_OBSERVATION = "tool_observation"
+    PLANNER_STATE = "planner_state"
+    POLICY_OBSERVATION = "policy_observation"
+    EDIT_EVIDENCE = "edit_evidence"
+    MUTATION_EVIDENCE = "mutation_evidence"
+    COMMAND_OBSERVATION = "command_observation"
+    VERIFICATION_EVIDENCE = "verification_evidence"
+    WORKSPACE_STATE = "workspace_state"
+    PROJECT_INDEX = "project_index"
+    MEMORY_CONTEXT = "memory_context"
+    FAILURE = "failure"
+    SUMMARY = "summary"
+    REFERENCE = "reference"
+
+class ContextAuthority(str, Enum):   # ContextItem.authority
+    USER = "user"
+    SYSTEM = "system"
+    COMPONENT = "component"
+    TOOL = "tool"
+    MODEL = "model"
+    SUMMARY = "summary"
+
+class ContextSensitivity(str, Enum): # ContextItem.sensitivity
+    PUBLIC = "public"
+    WORKSPACE = "workspace"
+    SENSITIVE = "sensitive"
+    SECRET = "secret"
+```
+
+### 数据流概述
+
+各组件通过 `ContextManager.add_*()` 入口生成 `ContextItem`，写入 `context.sqlite3`。`ContextAssembler.build_bundle()` 根据 token counter、phase、visibility、freshness、sensitivity 和 `ContextRenderPolicy` 选择 item，生成 `ContextBundle` 和 `ContextUsageReport`。`ContextBundle.messages` 直接组成 `ModelTurnRequest.messages`，但 `ContextBudgetPlan`、`ContextRenderPolicy` 和 `ContextUsageReport` 只用于内部诊断。`PromptAssemblyPipeline.build_for_model_turn()` 收集 instruction sources，`PromptCompiler.compile()` 生成 `PromptManifest` 和 `PromptBundle`；`PromptBundle.messages` 与 context messages 在 request builder 合并，`PromptManifest` 不进模型，只用于 hash、预算、trace 与诊断。
 
 ## 谁生成这些对象
 

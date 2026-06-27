@@ -68,8 +68,140 @@
 
 ## 真实对象完整结构
 
-- `ToolCallEnvelope（工具调用信封）` 完整字段列在字段清单中，是模型 tool call 的规范化边界。
-- `ToolProtocolResultEnvelope（工具协议结果信封）` 完整字段列在字段清单中，是进入 context/tool message 前的结果边界。
+### ToolCallEnvelope（工具调用信封）
+
+模型 tool call 的规范化边界，从 `ModelToolCall` 补充协议字段。**边界**：内部治理对象，嵌入 `ToolCallBatch`/`ToolCallRecord` 的安全 JSON 落盘到 `tool_protocol.sqlite3`；不作为整体进入模型请求。
+
+```python
+@dataclass
+class ToolCallEnvelope(SerializableDataclass):
+    protocol_version: str
+    run_id: str
+    session_id: str
+    task_id: str
+    phase_id: str
+    model_request_id: str
+    model_response_id: str
+    assistant_message_id: str
+    tool_call_id: str
+    tool_name: str
+    raw_arguments: str
+    parsed_arguments: dict[str, Any]
+    normalized_arguments: dict[str, Any]
+    argument_digest: str = ""
+    tool_schema_hash: str = ""
+    allowed_tool_names: list[str] = field(default_factory=list)
+    proposed_at: str = field(default_factory=_now)
+    proposed_by_model: bool = True
+    parse_status: ModelToolParseStatus = ModelToolParseStatus.VALID
+    validation_errors: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    phase: ToolCallPhase = ToolCallPhase.PROPOSED
+```
+
+### ToolCallRecord（工具调用记录）
+
+单个 tool call 的全生命周期状态。**边界**：内部治理对象，落盘到 `tool_protocol.sqlite3` 的 `tool_call_records` 表；不进入模型请求。
+
+```python
+@dataclass
+class ToolCallRecord(SerializableDataclass):
+    record_id: str
+    envelope: ToolCallEnvelope
+    phase: ToolCallPhase
+    previous_phase: ToolCallPhase | None = None
+    policy_decision_id: str | None = None
+    approval_grant_id: str | None = None
+    execution_started_at: str | None = None
+    execution_finished_at: str | None = None
+    tool_result_digest: str | None = None
+    context_message_id: str | None = None
+    error_kind: ToolCallFailureKind | None = None
+    error_message: str | None = None
+    attempts: int = 1
+    created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+```
+
+### ToolProtocolResultEnvelope（工具协议结果信封）
+
+进入 context/tool message 前的结果边界。**边界**：落盘到 `tool_protocol.sqlite3` 的 `tool_result_bindings` 表；其安全投影 `ToolObservationView.to_model_payload()` 作为 tool message 进入下一轮模型请求。
+
+```python
+@dataclass
+class ToolProtocolResultEnvelope(SerializableDataclass):
+    tool_call_id: str
+    tool_name: str
+    ok: bool
+    status: str
+    error_code: str | None = None
+    error_kind: ToolCallFailureKind | None = None
+    content_preview: str = ""
+    content_digest: str = ""
+    raw_result_ref: str | None = None
+    artifact_refs: list[str] = field(default_factory=list)
+    observation_id: str | None = None
+    policy_decision_id: str | None = None
+    approval_grant_id: str | None = None
+    truncated: bool = False
+    redacted: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### 关键枚举值域
+
+```python
+class ToolCallPhase(str, Enum):      # ToolCallEnvelope.phase / ToolCallRecord.phase
+    PROPOSED = "proposed"
+    VALIDATED = "validated"
+    REJECTED = "rejected"
+    WAITING_APPROVAL = "waiting_approval"
+    APPROVED = "approved"
+    SCHEDULED = "scheduled"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    RECOVERED = "recovered"
+    RESULT_APPENDED = "result_appended"
+
+class ToolCallFailureKind(str, Enum): # ToolCallRecord.error_kind / ToolProtocolResultEnvelope.error_kind
+    MISSING_TOOL_CALL_ID = "missing_tool_call_id"
+    DUPLICATE_TOOL_CALL_ID = "duplicate_tool_call_id"
+    UNKNOWN_TOOL = "unknown_tool"
+    DISALLOWED_TOOL = "disallowed_tool"
+    INVALID_JSON = "invalid_json"
+    ARGUMENTS_NOT_OBJECT = "arguments_not_object"
+    SCHEMA_MISMATCH = "schema_mismatch"
+    PROTOCOL_VIOLATION = "protocol_violation"
+    POLICY_DENIED = "policy_denied"
+    APPROVAL_REQUIRED = "approval_required"
+    APPROVAL_DENIED = "approval_denied"
+    SANDBOX_REQUIRED = "sandbox_required"
+    TOOL_EXECUTOR_FAILED = "tool_executor_failed"
+    RESULT_BINDING_FAILED = "result_binding_failed"
+    REPLAY_DETECTED = "replay_detected"
+    CONFLICTING_REPLAY = "conflicting_replay"
+    CONTEXT_APPEND_FAILED = "context_append_failed"
+
+class ToolExecutionMode(str, Enum):  # ToolExecutionPlan.execution_mode
+    SEQUENTIAL = "sequential"
+    PARALLEL_READONLY = "parallel_readonly"
+    BLOCKED = "blocked"
+
+class ToolProtocolTurnStatus(str, Enum): # ToolProtocolTurnResult.status
+    NO_TOOL_CALLS = "no_tool_calls"
+    PROCESSED = "processed"
+    REJECTED = "rejected"
+    PENDING_APPROVAL = "pending_approval"
+    RECOVERED = "recovered"
+    FAILED = "failed"
+    INVALID_ASSISTANT = "invalid_assistant"
+```
+
+### 数据流概述
+
+`ModelTurnResult.tool_calls` -> `ToolProtocolValidator.validate_assistant_message()` 生成 `ToolCallEnvelope` 和 `ToolCallBatch`。`ToolProtocolScheduler.schedule()` 根据 side_effect/并行安全性生成 `ToolExecutionPlan`（sequential/parallel_readonly/blocked）。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 返回 `ToolResult`，`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`。`ContextManager.add_tool_protocol_result()` 只把 redacted `ToolObservationView.to_model_payload()` 作为 tool message 加入下一轮模型请求。
 
 ## 谁生成这些对象
 

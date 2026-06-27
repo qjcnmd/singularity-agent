@@ -55,8 +55,104 @@ Sandbox 层根据 profile、filesystem/network/env/resource policy 准备隔离�
 
 ## 真实对象完整结构
 
-- `SandboxRequest（沙箱请求）` 完整字段列在字段清单中，连接 policy decision 和 backend。
-- `SandboxResult（沙箱结果）` 完整字段列在字段清单中，消费者是 command result、trace 和 final report。
+### SandboxRequest（沙箱请求）
+
+连接 policy decision 和 backend 的执行请求。**边界**：内部治理对象，不落盘；backend 消费后生成 PreparedSandbox。
+
+```python
+@dataclass
+class SandboxRequest:
+    sandbox_id: str
+    session_id: str
+    task_id: str
+    action_id: str
+    command: list[str] | str
+    cwd: Path
+    workspace_root: Path
+    profile: SandboxProfile
+    policy_decision_id: str | None = None
+    policy_constraints: PolicyConstraints | None = None
+    reason: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### SandboxResult（沙箱结果）
+
+沙箱执行的完整结果。**边界**：内部治理对象；投影为 `CommandResult.isolation_report` 写 context，artifact ref 写 trace，不独立落盘。
+
+```python
+@dataclass
+class SandboxResult:
+    sandbox_id: str
+    backend_name: str
+    status: SandboxStatus
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    started_at: str
+    ended_at: str
+    duration_ms: int
+    artifacts: list[SandboxArtifact] = field(default_factory=list)
+    filesystem_changes: SandboxChangeSummary = field(default_factory=SandboxChangeSummary)
+    violations: list[SandboxViolation] = field(default_factory=list)
+    trace_id: str | None = None
+    cleanup_status: str = "not_started"
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### SandboxProfile（沙箱配置）
+
+声明隔离需求的 profile。**边界**：内部治理对象，来自默认 profile 或 policy constraints 组合；不进入模型。
+
+```python
+@dataclass
+class SandboxProfile:
+    name: SandboxProfileName
+    filesystem: SandboxFilesystemPolicy
+    network: SandboxNetworkPolicy
+    env: SandboxEnvPolicy
+    resources: SandboxResourceLimits
+    description: str = ""
+    image_digest: str | None = None
+```
+
+### 关键枚举值域
+
+```python
+class SandboxStatus(str, Enum):          # SandboxResult.status
+    SUCCESS = "success"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    POLICY_BLOCKED = "policy_blocked"
+    VIOLATION = "violation"
+    BACKEND_UNAVAILABLE = "backend_unavailable"
+    SETUP_FAILED = "setup_failed"
+    CLEANUP_FAILED = "cleanup_failed"
+
+class SandboxProfileName(str, Enum):     # SandboxProfile.name
+    READONLY_ANALYSIS = "readonly_analysis"
+    ISOLATED_VERIFICATION = "isolated_verification"
+    GENERATED_CODE = "generated_code"
+    PACKAGE_OPERATION = "package_operation"
+    LONG_RUNNING_SERVICE = "long_running_service"
+
+class SandboxFilesystemMode(str, Enum):  # SandboxFilesystemPolicy.mode
+    NONE = "none"
+    READ_ONLY_WORKSPACE = "read_only_workspace"
+    COPY_ON_WRITE_WORKSPACE = "copy_on_write_workspace"
+    EMPTY_TEMP_WORKSPACE = "empty_temp_workspace"
+    ARTIFACT_OUTPUT_ONLY = "artifact_output_only"
+
+class SandboxNetworkMode(str, Enum):     # SandboxNetworkPolicy.mode
+    DENIED = "denied"
+    ALLOWED = "allowed"
+    ALLOWLIST = "allowlist"
+    UNSUPPORTED = "unsupported"
+```
+
+### 数据流概述
+
+`PolicyDecision` 要求隔离时，`SandboxManager.build_request_from_policy()` 从 `PolicyDecision.constraints` 和 command 参数生成 `SandboxRequest`。`SandboxManager._apply_policy_constraints()` 选择 profile 后，backend `prepare()` 生成 `PreparedSandbox`，`run()` 生成 `SandboxResult`（含 `SandboxArtifact`、`SandboxChangeSummary`、`SandboxViolation`）。`CommandExecutor._result_from_sandbox()` 把 sandbox stdout/stderr/exit_code 转成 `CommandResult.isolation_report`。sandbox trace 事件写 `events.jsonl`，artifact 写 trace artifact store。
 
 ## 谁生成这些对象
 
@@ -64,7 +160,7 @@ backend `capabilities()` 生成 `SandboxCapabilities`；default profile与 polic
 
 ## 谁消费这些对象
 
-manager/backend消费profile/request/prepared对象；CommandExecutor消费 result并投影为 `CommandResult.isolation_report`。完整 sandbox对象不进模型，只有裁剪后的 status、changed files、violation/artifact摘要经 command tool observation可见。
+`SandboxManager.run()` 和 backend `prepare()`/`run()`/`cleanup()` 消费 profile/request/prepared 对象；`CommandExecutor._result_from_sandbox()` 消费 result 并投影为 `CommandResult.isolation_report`。完整 sandbox对象不进模型，只有裁剪后的 status、changed files、violation/artifact摘要经 command tool observation可见。
 
 ## 是否落盘
 

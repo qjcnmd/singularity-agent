@@ -241,6 +241,9 @@ COMPLETE_FIELD_CHECKS = {
         "MemorySearchResult",
         "MemoryContextBlock",
     },
+    "artifact-long-result-handling": {
+        "TraceArtifact",
+    },
 }
 
 SCAN_SUFFIXES = {".md", ".py", ".json", ".toml", ".yaml", ".yml"}
@@ -420,6 +423,77 @@ def _verify_doc(doc: ModuleDataFlowDoc, errors: list[str]) -> None:
             continue
         if class_name not in doc.field_checks:
             errors.append(f"{label}: complete field check missing 字段清单 entry: {class_name}")
+
+    _verify_deep_dive_section(doc, errors)
+
+
+def _verify_deep_dive_section(doc: ModuleDataFlowDoc, errors: list[str]) -> None:
+    """Verify that the doc contains deep-dive inline object definitions, not just field-list pointers."""
+    label = _rel(doc.path)
+    structure_section = _extract_section(doc.text, "## 真实对象完整结构")
+    if not structure_section:
+        errors.append(f"{label}: missing or empty '## 真实完整结构' section")
+        return
+
+    # Must contain at least one code block with type-annotated fields
+    code_blocks = re.findall(r"```[\s\S]*?```", structure_section)
+    has_typed_field = False
+    for block in code_blocks:
+        if re.search(r"\w+\s*:\s*[A-Z]\w+", block):
+            has_typed_field = True
+            break
+    if not has_typed_field:
+        errors.append(
+            f"{label}: '真实对象完整结构' must contain at least one code block "
+            "with type-annotated field definitions (e.g. `field: Type`)"
+        )
+
+    # Must mention at least 2 class names from COMPLETE_FIELD_CHECKS for this doc
+    # (or all available if fewer than 2)
+    complete_classes = COMPLETE_FIELD_CHECKS.get(doc.doc_id, set())
+    mentioned = sum(1 for cls in complete_classes if cls in structure_section)
+    min_required = min(2, len(complete_classes))
+    if mentioned < min_required:
+        errors.append(
+            f"{label}: '真实对象完整结构' must mention at least 2 key class names, "
+            f"found {mentioned}"
+        )
+
+    # Must show at least one enum value domain (either in code block or prose)
+    has_enum_values = bool(re.search(r'[A-Z_]+\s*=\s*"[a-z_]+"', structure_section))
+    has_enum_prose = bool(re.search(r"枚举值[包括为]", structure_section))
+    if not has_enum_values and not has_enum_prose:
+        errors.append(
+            f"{label}: '真实对象完整结构' must show at least one enum value domain "
+            '(e.g. `VALUE = "value"` or prose listing enum values)'
+        )
+
+    # Verify producer/consumer/persistence/trace specificity
+    _verify_section_specificity(label, "谁生成这些对象", doc.text, errors,
+                                r"\w+\.\w+\(|def \w+", "at least one concrete method name")
+    _verify_section_specificity(label, "谁消费这些对象", doc.text, errors,
+                                r"\w+\.\w+\(|def \w+", "at least one concrete method name")
+    _verify_section_specificity(label, "是否落盘", doc.text, errors,
+                                r"(sqlite|jsonl|\.json|\.md|\.txt|artifact|store|落盘)",
+                                "at least one concrete storage path or store name")
+    _verify_section_specificity(label, "是否进入 trace / audit", doc.text, errors,
+                                r"(event|trace|audit|jsonl|\.sqlite|span|artifact)",
+                                "at least one concrete trace/audit reference")
+
+
+def _verify_section_specificity(
+    label: str,
+    heading: str,
+    text: str,
+    errors: list[str],
+    pattern: str,
+    description: str,
+) -> None:
+    section = _extract_section(text, f"## {heading}")
+    if not section:
+        return
+    if not re.search(pattern, section):
+        errors.append(f"{label}: '## {heading}' section must contain {description}")
 
 
 def _verify_doc_tree(errors: list[str]) -> None:

@@ -52,8 +52,125 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 
 ## 真实对象完整结构
 
-- `CommandRequest（命令请求）` 完整字段列在字段清单中，生成者是 command tool、verification runner 或 evaluation runner。
-- `CommandResult（命令结果）` 完整字段列在字段清单中，消费者是 planner evidence、context observation、trace 和 final report。
+### CommandRequest（命令请求）
+
+命令执行的规范化入口。**边界**：内部治理对象，不落盘；投影为 policy request 后进入 policy audit。
+
+```python
+@dataclass(frozen=True)
+class CommandRequest:
+    argv: list[str] | None = None
+    shell: str | None = None
+    cwd: str = "."
+    purpose: CommandPurpose = CommandPurpose.UNKNOWN
+    timeout_seconds: float | None = None
+    idle_timeout_seconds: float | None = None
+    env_request: dict[str, str] = field(default_factory=dict)
+    network_mode: NetworkMode = NetworkMode.DISABLED
+    filesystem_mode: FilesystemMode = FilesystemMode.READ_ONLY_WORKSPACE
+    resource_limits: ResourceLimits = field(default_factory=ResourceLimits)
+    expected_outputs: list[str] = field(default_factory=list)
+    risk_acceptance_reason: str | None = None
+    command_id: str = field(default_factory=lambda: uuid4().hex)
+```
+
+### CommandResult（命令结果）
+
+命令执行的完整结果。**边界**：内部治理对象；`to_observation()` 安全投影写 `context.sqlite3`，`artifact_path` 引用 trace artifact，planner 消费 evidence。
+
+```python
+@dataclass(frozen=True)
+class CommandResult:
+    command_id: str
+    execution_status: ExecutionStatus
+    semantic_status: SemanticStatus
+    exit_code: int | None
+    signal: int | None
+    duration_ms: int
+    timed_out: bool
+    idle_timed_out: bool
+    stdout_preview: str
+    stderr_preview: str
+    combined_output_preview: str
+    output_truncated: bool
+    output_digest: str
+    artifact_path: str | None
+    changed_files: list[str]
+    policy_decision: CommandPolicyResult
+    risk_tags: list[CommandRisk]
+    error_code: str | None
+    isolation_report: dict[str, Any]
+    env_denied: list[str] = field(default_factory=list)
+    killed_reason: str | None = None
+    backend: str = "local_process"
+    # ... 10 more fields for git_before/after, side_effects, metadata, etc.
+```
+
+### CommandPolicyResult（命令策略决策）
+
+command policy 的评估结果。**边界**：内部治理对象，嵌入 CommandPlan/CommandResult；进入 policy audit ledger。
+
+```python
+@dataclass(frozen=True)
+class CommandPolicyResult:
+    decision: CommandDecision
+    reasons: list[str]
+    risk_tags: list[CommandRisk]
+    required_backend: str = "local_process"
+    required_network: NetworkMode = NetworkMode.DISABLED
+    required_filesystem: FilesystemMode = FilesystemMode.READ_ONLY_WORKSPACE
+    redaction_rules: list[str] = field(default_factory=list)
+    error_code: str | None = None
+```
+
+### 关键枚举值域
+
+```python
+class CommandPurpose(str, Enum):     # CommandRequest.purpose
+    READ_ONLY_COMMAND = "READ_ONLY_COMMAND"
+    PROJECT_VERIFICATION = "PROJECT_VERIFICATION"
+    LINT = "LINT"
+    TYPECHECK = "TYPECHECK"
+    FORMAT_CHECK = "FORMAT_CHECK"
+    BUILD = "BUILD"
+    CODE_GENERATION = "CODE_GENERATION"
+    PACKAGE_MANAGER = "PACKAGE_MANAGER"
+    NETWORK = "NETWORK"
+    WRITE_WORKSPACE = "WRITE_WORKSPACE"
+    DESTRUCTIVE = "DESTRUCTIVE"
+    EXECUTES_PROJECT_CODE = "EXECUTES_PROJECT_CODE"
+    UNKNOWN = "UNKNOWN"
+    # ... 6 more members
+
+class ExecutionStatus(str, Enum):    # CommandResult.execution_status
+    COMPLETED = "completed"
+    POLICY_DENIED = "policy_denied"
+    REVIEW_REQUIRED = "review_required"
+    SPAWN_FAILED = "spawn_failed"
+    TIMED_OUT = "timed_out"
+    IDLE_TIMED_OUT = "idle_timed_out"
+    PROCESS_KILLED = "process_killed"
+    BACKEND_ERROR = "backend_error"
+
+class SemanticStatus(str, Enum):     # CommandResult.semantic_status
+    SUCCEEDED = "succeeded"
+    EXIT_NONZERO = "exit_nonzero"
+    TESTS_FAILED = "tests_failed"
+    BUILD_FAILED = "build_failed"
+    LINT_FAILED = "lint_failed"
+    TYPECHECK_FAILED = "typecheck_failed"
+    EXECUTION_FAILED = "execution_failed"
+    POLICY_BLOCKED = "policy_blocked"
+
+class CommandDecision(str, Enum):    # CommandPolicyResult.decision
+    ALLOW = "allow"
+    REQUIRE_REVIEW = "require_review"
+    DENY = "deny"
+```
+
+### 数据流概述
+
+`CommandToolHandlers.run_command()` 生成 `CommandRequest`，`CommandPolicy.evaluate()` 生成 `CommandPolicyResult`，`CommandExecutor.plan()` 组合为 `CommandPlan`。若策略要求隔离，`SandboxManager.run()` 返回 sandbox payload 被 `_result_from_sandbox()` 转成 `CommandResult`；否则 `_completed_result()` 从 backend 生成结果。`CommandResult.to_observation()` 写 `context.sqlite3`，长输出写 trace artifact，`CommandExecutor._record_trace()` 写 trace event。
 
 ## 谁生成这些对象
 

@@ -48,8 +48,128 @@ Trace 层记录运行事件、span、artifact、timeline 和 summary；audit 相
 
 ## 真实对象完整结构
 
-- `TraceEvent（追踪事件）` 完整字段列在字段清单中，payload 需要 redaction。
-- `TraceArtifact（追踪产物）` 完整字段列在字段清单中，消费者是 final report、evaluation report 和 failure case replay。
+### TraceEvent（追踪事件）
+
+所有运行组件的原子记录。**边界**：trace 对象，落盘到 `events.jsonl`；摘要投影进 context，但完整 payload 不进入模型请求。
+
+```python
+@dataclass(frozen=True)
+class TraceEvent:
+    event_id: str
+    event_type: TraceEventType       # 174 个成员的枚举
+    run_id: str
+    session_id: str
+    task_id: str | None
+    phase_id: str | None
+    action_id: str | None
+    parent_event_id: str | None
+    timestamp: datetime
+    monotonic_ms: int
+    component: str
+    severity: TraceSeverity
+    summary: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    artifact_refs: list[str] = field(default_factory=list)
+    policy_decision_id: str | None = None
+    approval_grant_id: str | None = None
+    sandbox_id: str | None = None
+    command_id: str | None = None
+    transaction_id: str | None = None
+    verification_id: str | None = None
+    span_id: str | None = None
+    redaction_applied: bool = True
+    payload_hash: str = ""
+```
+
+### TraceSpan（追踪跨度）
+
+记录有开始/结束时间的操作区间。**边界**：trace 对象，落盘到 `spans.jsonl`；不进入模型请求。
+
+```python
+@dataclass(frozen=True)
+class TraceSpan:
+    span_id: str
+    parent_span_id: str | None
+    run_id: str
+    session_id: str
+    task_id: str | None
+    phase_id: str | None
+    action_id: str | None
+    name: str
+    component: str
+    started_at: datetime
+    ended_at: datetime | None
+    duration_ms: int | None
+    status: TraceStatus
+    error_type: str | None
+    error_message: str | None
+    attributes: dict[str, Any] = field(default_factory=dict)
+    artifact_refs: list[str] = field(default_factory=list)
+```
+
+### TraceArtifact（追踪产物）
+
+大输出（stdout/stderr、diff、report、prompt manifest）的文件引用。**边界**：trace 对象，落盘到 `artifacts.jsonl` + `artifacts/` 文件；artifact ref 进入 final report 和 evaluation result。
+
+```python
+@dataclass(frozen=True)
+class TraceArtifact:
+    artifact_id: str
+    run_id: str
+    session_id: str
+    task_id: str | None
+    kind: TraceArtifactKind
+    path: Path
+    relative_path: str
+    size_bytes: int
+    sha256: str
+    content_type: str
+    redacted: bool
+    sensitive: bool
+    summary: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### 关键枚举值域
+
+```python
+class TraceSeverity(str, Enum):    # TraceEvent.severity
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+class TraceStatus(str, Enum):      # TraceSpan.status
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
+    SKIPPED = "skipped"
+    BLOCKED = "blocked"
+
+class TraceArtifactKind(str, Enum): # TraceArtifact.kind
+    STDOUT = "stdout"
+    STDERR = "stderr"
+    DIFF = "diff"
+    REPORT = "report"
+    SNAPSHOT = "snapshot"
+    SANDBOX = "sandbox"
+    VERIFICATION = "verification"
+    EDIT_PLAN = "edit_plan"
+    MODEL_MESSAGE = "model_message"
+    PROMPT_MANIFEST = "prompt_manifest"
+    COMMAND_LOG = "command_log"
+    POLICY_AUDIT_REF = "policy_audit_ref"
+    GENERIC = "generic"
+```
+
+`TraceEventType` 有 174 个成员，按组件分组的关键子集：`task.started`、`task.completed`、`phase.started`、`phase.completed`、`action.started`、`action.completed`、`model.request_started`、`model.request_completed`、`model.tool_calls_proposed`、`tool.started`、`tool.completed`、`tool.rejected`、`policy.requested`、`policy.decided`、`approval.requested`、`approval.granted`、`command.started`、`command.completed`、`sandbox.started`、`sandbox.completed`、`verification.plan_built`、`verification.check_started`、`verification.check_completed`、`repair.analysis_completed`、`context.item_added`、`context.bundle_built`、`context.rendered_for_model`、`instruction_sources_collected`、`prompt_compiled`、`kernel.boot_completed`、`kernel.task_started`、`kernel.finalization_completed`。
+
+### 数据流概述
+
+`TraceEvent` 是最小单元，写入 `events.jsonl`；`TraceSpan` 是区间单元，写入 `spans.jsonl`；`TraceArtifact` 是文件引用，写入 `artifacts.jsonl` + 实际文件。`TraceStore.get_timeline()` 从 events 派生 `TraceTimelineItem`，`TraceStore.summarize()` 聚合为 `TraceSummary`。Policy audit 是独立层，由 `PolicyAuditWriter.append()` 写 `audit.jsonl`，不能用 trace event 替代。完整 trace 对象不自动进入模型；只有 `ContextManager.add_trace_summary()` 生成的安全文本摘要进入 context。
 
 ## 谁生成这些对象
 

@@ -50,8 +50,108 @@ Evaluation runner 读取 task set manifest，在隔离 workspace 中启动真实
 
 ## 真实对象完整结构
 
-- `EvaluationTask.success（评估通过条件）` 是 manifest 输入字段，不是 result alias；结果判定只使用 `evaluation_passed`。
-- `EvaluationTaskResult（评估任务结果）` 完整字段列在字段清单中，canonical 完成/判定字段为 `agent_completed`、`evaluation_passed`、`miscompletion_count`。
+### EvaluationTask（评估任务）
+
+manifest 输入的单个评估任务定义。**边界**：输入对象，来自 manifest JSON；不进入模型请求，只有 `user_task` 等子集写入用户 goal。
+
+```python
+@dataclass(frozen=True)
+class EvaluationTask:
+    task_id: str
+    workspace: EvaluationWorkspace
+    user_task: str
+    allowed_paths: list[str]
+    verification_command: str
+    success: dict[str, Any]
+    task_type: str = ""
+    description: str = ""
+    allowed_tools: list[str] = field(default_factory=list)
+    tool_policy: str = "read_write"
+    strategy: dict[str, Any] = field(default_factory=dict)
+    expected_file_changes: list[str] = field(default_factory=list)
+    completion_standard: str = ""
+    risk_tags: list[str] = field(default_factory=list)
+    prepare_commands: list[str] = field(default_factory=list)
+    public_verification_command: str = ""
+    hidden_verification_command: str = ""
+    verification_prepare_commands: list[str] = field(default_factory=list)
+    verification_timeout_seconds: int = 120
+```
+
+### EvaluationTaskResult（评估任务结果）
+
+单个 task 的完整评估结果。**边界**：evaluation report 对象，落盘到 `<run_dir>/result.json`；不进入模型请求。
+
+```python
+@dataclass(frozen=True)
+class EvaluationTaskResult:
+    task_id: str
+    tests_passed: bool
+    infrastructure_blocked: bool
+    prompt_tokens: int
+    cached_tokens: int
+    request_cache_hit_rate: float
+    run_cache_hit_rate: float
+    tool_calls: int
+    files_changed: list[str]
+    duration_seconds: float
+    error_summary: str
+    workspace: str
+    trace: str
+    verification_workspace: str = ""
+    patch: dict[str, Any] = field(default_factory=dict)
+    checks: dict[str, Any] = field(default_factory=dict)
+    verification: CommandEvalResult | None = None
+    agent_completed: bool = False
+    evaluation_passed: bool = False
+    # ... 20 more fields for policy_blocks, token_usage, etc.
+```
+
+### CommandEvalResult（命令评估结果）
+
+evaluation runner 独立执行的验证命令结果。**边界**：evaluation report 对象，嵌入 `EvaluationTaskResult.verification`/`checks`；不进入模型请求。
+
+```python
+@dataclass(frozen=True)
+class CommandEvalResult:
+    command: str
+    exit_code: int | None
+    duration_seconds: float
+    timed_out: bool = False
+    error_summary: str = ""
+    raw_command: str = ""
+    resolved_argv: list[str] = field(default_factory=list)
+    interpreter_strategy: dict[str, Any] = field(default_factory=dict)
+    failure_category: str = ""
+```
+
+### 关键枚举/状态值域
+
+```python
+# EvaluationTaskResult.status 由 _task_result() 归一为以下值:
+INFRASTRUCTURE_BLOCKED = "infrastructure_blocked"
+SUCCESS = "success"
+POLICY_BLOCKED = "policy_blocked"
+VERIFICATION_FAILED = "verification_failed"
+BLOCKED = "blocked"
+FAILED = "failed"
+MAX_TURNS_EXCEEDED = "max_turns_exceeded"
+FAILURE = "failure"
+UNKNOWN = "unknown"
+
+# CommandEvalResult.failure_category 区分:
+COMMAND_PARSE_ERROR = "command_parse_error"
+COMMAND_TIMEOUT = "command_timeout"
+COMMAND_NOT_FOUND = "command_not_found"
+COMMAND_EXECUTION_ERROR = "command_execution_error"
+ENVIRONMENT_DEPENDENCY_MISSING = "environment_dependency_missing"
+VERIFICATION_FAILED = "verification_failed"
+COMMAND_FAILED = "command_failed"
+```
+
+### 数据流概述
+
+`load_evaluation_task_set()` 从 manifest JSON 生成 `EvaluationTaskSet`/`EvaluationTask`。`EvaluationRunner.run()` 遍历 task，每个 task 调用 `KernelBootstrap.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()` 执行真实 agent。runner 读取 trace summary、final report、changed files 和 public/hidden verification，由 `_task_result()` 聚合生成 `EvaluationTaskResult`。结果写入 `<run_dir>/result.json`、`report.json`、`report.md`。canonical 完成/判定字段为 `agent_completed`、`evaluation_passed`、`miscompletion_count`，不是 manifest 的 `success`。
 
 ## 谁生成这些对象
 

@@ -64,18 +64,125 @@
 
 ## 真实对象完整结构
 
-- `ModelTurnRequest（模型单轮请求）` 完整字段列在字段清单中，生成者是 `ModelRunner`，消费者是 provider adapter 和 trace recorder。
-- `ModelTurnResult（模型单轮结果）` 完整字段列在字段清单中，生成者是 `ModelRunner`，消费者是 `AgentLoop`、`ContextManager`、`ToolProtocolEngine`。
+### ModelTurnRequest（模型单轮请求）
+
+进入 provider 的完整请求载体。**边界**：模型请求对象，投影成 provider JSON payload 后发送；消息正文、tool schema、tool choice 和生成参数进入 provider，但 `context_metadata`/`policy_metadata`/`trace_metadata` 不发送。
+
+```python
+@dataclass
+class ModelTurnRequest(SerializableDataclass):
+    request_id: str
+    run_id: str
+    session_id: str
+    task_id: str
+    phase_id: str
+    action_id: str
+    purpose: ModelPurpose
+    messages: list[ModelMessage]
+    tools: list[ModelToolSchema] = field(default_factory=list)
+    tool_choice: ToolChoicePolicy = field(default_factory=ToolChoicePolicy)
+    model_preferences: ModelPreferences = field(default_factory=ModelPreferences)
+    budget: ModelBudget = field(default_factory=ModelBudget)
+    context_metadata: dict[str, Any] = field(default_factory=dict)
+    policy_metadata: dict[str, Any] = field(default_factory=dict)
+    trace_metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### ModelTurnResult（模型单轮结果）
+
+provider 响应的规范化载体。**边界**：内部治理对象，不落盘为独立文件；usage 投影写 context，tool_calls 进入 ToolProtocol，error/validation 进入 AgentLoop 决策。
+
+```python
+@dataclass
+class ModelTurnResult(SerializableDataclass):
+    request_id: str
+    response_id: str
+    status: ModelTurnStatus
+    assistant_message: ModelMessage | None = None
+    tool_calls: list[ModelToolCall] = field(default_factory=list)
+    usage: ModelUsage = field(default_factory=ModelUsage)
+    finish_reason: str | None = None
+    validation: ModelValidationResult | None = None
+    error: ModelError | None = None
+    provider_name: str | None = None
+    model_name: str | None = None
+    latency_ms: int | None = None
+    trace_event_ids: list[str] = field(default_factory=list)
+    raw_response_ref: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### ModelError（模型错误）
+
+provider 失败的结构化载体。**边界**：内部治理对象，不落盘；其 kind/message 进入 trace event 和 AgentLoop 重试决策。
+
+```python
+@dataclass
+class ModelError(Exception, SerializableDataclass):
+    kind: ModelErrorKind
+    message: str
+    retryable: bool = False
+    provider_name: str | None = None
+    model_name: str | None = None
+    raw_error_ref: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### 关键枚举值域
+
+```python
+class ModelPurpose(str, Enum):       # ModelTurnRequest.purpose
+    PLAN_NEXT_ACTION = "plan_next_action"
+    FAILURE_ANALYSIS = "failure_analysis"
+    REPAIR_PLANNING = "repair_planning"
+    REPAIR_AFTER_FAILURE = "repair_after_failure"
+    SUMMARIZE_CONTEXT = "summarize_context"
+    FINAL_ANSWER = "final_answer"
+    CLASSIFY_ERROR = "classify_error"
+    VALIDATE_TOOL_CALL = "validate_tool_call"
+    COMPACT_CONTEXT = "compact_context"
+    TASK_CONTRACT_EXTRACTION = "task_contract_extraction"
+    SEMANTIC_PLANNING = "semantic_planning"
+    PLANNER_DECISION = "planner_decision"
+    FINAL_REVIEW = "final_review"
+
+class ModelTurnStatus(str, Enum):    # ModelTurnResult.status
+    SUCCESS = "success"
+    FAILED = "failed"
+    INVALID = "invalid"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    BUDGET_EXCEEDED = "budget_exceeded"
+
+class ModelErrorKind(str, Enum):     # ModelError.kind
+    NETWORK_ERROR = "network_error"
+    TIMEOUT = "timeout"
+    RATE_LIMITED = "rate_limited"
+    PROVIDER_OVERLOADED = "provider_overloaded"
+    AUTH_ERROR = "auth_error"
+    INVALID_REQUEST = "invalid_request"
+    CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    TOOL_CALL_PARSE_ERROR = "tool_call_parse_error"
+    JSON_SCHEMA_VIOLATION = "json_schema_violation"
+    CONTENT_FILTER = "content_filter"
+    UNSUPPORTED_CAPABILITY = "unsupported_capability"
+    UNKNOWN_PROVIDER_ERROR = "unknown_provider_error"
+```
+
+### 数据流概述
+
+`ContextBundle.messages` + `PromptBundle.messages` 在 request builder 合并为 `ModelTurnRequest.messages`，`ModelToolRenderer.render()` 生成 `ModelToolSchema` 列表。provider 只看到 messages、tool schema、tool choice 和生成参数；`context_metadata`/`policy_metadata`/`trace_metadata` 不发送。provider 返回后 `ModelRunner._normalize_tool_calls()` 生成 `ModelToolCall`，`_emit_response_received()` 写 trace event。`ModelTurnResult.usage` 被 `ContextManager.record_model_usage()` 消费，`tool_calls` 进入 `ToolProtocolEngine.process_model_turn()`。
 
 ## 谁生成这些对象
 
-context/prompt/message converter 生成 `ContentBlock`/`ModelMessage`；`ModelToolRenderer` 从 registry 生成 `ModelToolSchema`。request builder/调用方生成 choice、preferences、budget 与 `ModelTurnRequest`，provider adapter 提供 capabilities。
-provider response parser/normalizer 生成 `ModelToolCall`/`ModelUsage`；validator 生成 `ModelValidationResult`，ModelRunner 的成功/invalid/failed 分支生成 `ModelTurnResult` 与 `ModelError`。
+context/prompt/message converter 生成 `ContentBlock`/`ModelMessage`；`ModelToolRenderer.render()` 从 registry 生成 `ModelToolSchema`。`ModelTurnRequestBuilder.build_request()` 生成 choice、preferences、budget 与 `ModelTurnRequest`，provider adapter 提供 capabilities。
+provider response parser/normalizer 生成 `ModelToolCall`/`ModelUsage`；`ModelRunner._validate_response()` 生成 `ModelValidationResult`，`ModelRunner.run_turn()` 的成功/invalid/failed 分支生成 `ModelTurnResult` 与 `ModelError`。
 
 ## 谁消费这些对象
 
 ModelRunner/provider adapter 消费 request。provider payload只含安全 messages、tool name/description/parameters/strict、序列化 tool choice 与支持的 generation 参数；message/tool/request metadata、capability/risk、policy/trace metadata、budget 对象不发送。
-AgentLoop 消费 validation/error/turn result，ToolProtocol 消费 tool calls，usage/reporting 消费 usage；这些 response 对象不自动进入下一轮模型，只有 ContextManager 追加的 assistant/tool message进入。
+`AgentLoop.run_turn()` 消费 validation/error/turn result，`ToolProtocolEngine.process_model_turn()` 消费 tool calls，`ContextManager.record_model_usage()` 消费 usage；这些 response 对象不自动进入下一轮模型，只有 ContextManager 追加的 assistant/tool message进入。
 
 ## 是否落盘
 

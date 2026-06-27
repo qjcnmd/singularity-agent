@@ -50,8 +50,114 @@
 以用户要求修复 `quicksort.py` 为例：`AgentGraphBuilder._build_tools_protocol()` -> `ToolRegistry.register()` -> `ToolRegistry.list_model_visible()` / `to_openai_tools()` -> `ModelToolRenderer.render()` 先注册内置 read/edit/command/verification/workspace 工具，为每个 `ToolSpec` 生成对象 `RegisteredToolRecord` 和 `ToolOrigin`，再把 admitted/enabled spec 投影成 provider tool schema。插件工具经过 `PluginManager.activate()` 后也以同一入口注册；registry 本体不写 sqlite/jsonl，执行阶段才由 tool protocol 写 `tool_protocol.sqlite3`。重复名、冻结后注册、非法 backend 或 schema 校验失败会抛错或产生 diagnostic，工具不会暴露给模型。
 ## 真实对象完整结构
 
-- `ToolSpec（工具规格）` 完整字段列在字段清单中，生成者是各 register_* 函数或 plugin manager。
-- `ToolResult（工具结果）` 完整字段列在字段清单中，消费者是 `ToolExecutor`、tool protocol result envelope 和 context observation。
+### ToolSpec（工具规格）
+
+内置/插件工具的完整注册描述。**边界**：内部治理对象，不落盘、不进入模型；只有 `ModelToolRenderer.render()` 投影的 name/description/parameters_schema 进入 provider。Pydantic BaseModel，`input_model`/`handler`/`resource_resolver` 排除序列化。
+
+```python
+class ToolSpec(BaseModel):
+    name: str
+    version: str = "0.0.1"
+    description: str
+    input_model: type[BaseModel]           # exclude
+    output_model: type[BaseModel] | None = None  # exclude
+    handler: Callable[[Any], Any]          # exclude
+    permission_level: PermissionLevel = PermissionLevel.READ_ONLY
+    risk_tags: tuple[str, ...] = ()
+    timeout_seconds: float = 5.0
+    max_output_chars: int = 20000
+    cacheable: bool = False
+    idempotent: bool = True
+    uses_edit_executor: bool = False
+    uses_mutation_manager: bool = False
+    uses_command_executor: bool = False
+    delegates_policy_constraints: bool = False
+    capabilities: tuple[Capability, ...] = ()
+    operation: OperationKind | None = None
+    resource_resolver: Callable | None = None   # exclude
+    side_effects: ToolSideEffectKind | None = None
+    sensitivity: ToolSensitivityLevel = ToolSensitivityLevel.WORKSPACE
+    cache_policy: ToolCachePolicy | None = None
+    idempotency_policy: ToolIdempotencyPolicy | None = None
+    retry_policy: ToolRetryPolicy = Field(default_factory=ToolRetryPolicy)
+    execution_backend: ToolExecutionBackendKind = ToolExecutionBackendKind.IN_PROCESS
+    approval_profile: dict[str, Any] = Field(default_factory=dict)
+    artifact_policy: dict[str, Any] = Field(default_factory=dict)
+    streamable: bool = False
+    enabled: bool = True
+```
+
+### ToolOrigin（工具来源）
+
+记录工具的注册来源和权限。**边界**：内部治理对象，不进入模型；投影进 trace event 和 plugin lock。
+
+```python
+class ToolOrigin(BaseModel):
+    kind: ToolOriginKind = ToolOriginKind.BUILTIN
+    plugin_id: str | None = None
+    local_tool_name: str | None = None
+    exposed_name: str | None = None
+    manifest_hash: str | None = None
+    source_path: str | None = None
+    required_permissions: tuple[str, ...] = ()
+    approved_permissions: tuple[str, ...] = ()
+    activation_hash: str | None = None
+    schema_digest: str | None = None
+```
+
+### ToolResult（工具结果）
+
+handler 返回值的结构化载体。**边界**：内部治理对象，投影为 `ToolProtocolResultEnvelope` 和 context tool message；不独立落盘。
+
+```python
+class ToolResult(BaseModel):
+    ok: bool
+    content: Any | None = None
+    error_code: str | None = None
+    error: ToolError | None = None
+    truncated: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+```
+
+### 关键枚举值域
+
+```python
+class PermissionLevel(str, Enum):    # ToolSpec.permission_level
+    READ_ONLY = "read_only"
+    WRITE = "write"
+    SHELL = "shell"
+    GIT = "git"
+
+class ToolSideEffectKind(str, Enum): # ToolSpec.side_effects
+    NONE = "none"
+    READ_WORKSPACE = "read_workspace"
+    MUTATE_WORKSPACE = "mutate_workspace"
+    EXECUTE_COMMAND = "execute_command"
+    NETWORK = "network"
+
+class ToolSensitivityLevel(str, Enum): # ToolSpec.sensitivity
+    PUBLIC = "public"
+    WORKSPACE = "workspace"
+    SENSITIVE = "sensitive"
+    SECRET = "secret"
+
+class ToolExecutionBackendKind(str, Enum): # ToolSpec.execution_backend
+    IN_PROCESS = "in_process"
+    DELEGATED_MUTATION_MANAGER = "delegated_mutation_manager"
+    DELEGATED_EDIT_EXECUTOR = "delegated_edit_executor"
+    DELEGATED_COMMAND_EXECUTOR = "delegated_command_executor"
+    DELEGATED_VERIFICATION_RUNNER = "delegated_verification_runner"
+    EXTERNAL_PROCESS = "external_process"
+
+class ToolOriginKind(str, Enum):     # ToolOrigin.kind
+    BUILTIN = "builtin"
+    PLUGIN = "plugin"
+    FUTURE_MCP = "future_mcp"
+```
+
+### 数据流概述
+
+各 `register_*` 函数或 `PluginHost.register_tool()` 生成 `ToolSpec`，`ToolRegistry.register()` 生成 `ToolOrigin` 和 `RegisteredToolRecord`。`ToolRegistry.openai_tools()` / `ModelToolRenderer.render()` 只投影 name、description、parameters_schema 进入 `ModelToolSchema`，不暴露 handler、permission、risk、origin 等内部字段。执行阶段 `ToolExecutionRequest.from_envelope()` 从 `ToolCallEnvelope` 生成 request，handler 返回 `ToolResult`，再投影为 `ToolProtocolResultEnvelope`。
 
 ## 谁生成这些对象
 

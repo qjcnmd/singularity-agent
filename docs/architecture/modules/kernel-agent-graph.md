@@ -55,9 +55,116 @@ Kernel 层负责启动配置、trace、workspace lock、组件图、健康检查
 
 ## 真实对象完整结构
 
-- `AgentGraph（智能体组件图）` 完整字段列在字段清单中，包含配置、trace、policy、sandbox、command、tools、model、context、planner 和 evaluation harness lazy factory。
-- `KernelContext（内核运行上下文）` 保存 project root、identity、run/session 状态、组件状态、diagnostics、workspace lock 和恢复信息。
-- `RunIdentity（运行标识）` 统一 run/session/task id，供 trace、context、kernel lifecycle 和 evaluation result 引用。
+### RunIdentity（运行标识）
+
+统一 run/session/task id，供 trace、context、kernel lifecycle 和 evaluation result 引用。**边界**：内部治理对象，其 id 字段投影进 trace event、context bundle、model request、evaluation result，但 RunIdentity 本身不作为整体发送给模型或落盘。
+
+```python
+@dataclass(frozen=True)
+class RunIdentity:
+    run_id: str        # "run_<uuid_hex_12>"
+    session_id: str    # "session_<uuid_hex_12>"
+    task_id: str       # "task_<uuid_hex_12>"
+```
+
+### KernelContext（内核运行上下文）
+
+保存 project root、identity、run/session 状态、组件状态、diagnostics、workspace lock 和恢复信息。**边界**：内部治理对象，不进入模型请求；diagnostics 投影进 final report 和 trace lifecycle event。
+
+```python
+@dataclass
+class KernelContext:
+    project_root: Path
+    identity: RunIdentity
+    run: AgentRun
+    session: AgentSession | None = None
+    status: KernelStatus = KernelStatus.NEW
+    components: dict[ComponentName, ComponentState] = field(default_factory=dict)
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    workspace_lock_status: str = "not_acquired"
+    recovered_previous_run: bool = False
+    uncertain_transactions: list[str] = field(default_factory=list)
+```
+
+### AgentGraph（智能体组件图）
+
+包含配置、trace、policy、sandbox、command、tools、model、context、planner 和 evaluation harness lazy factory。**边界**：内部治理对象，不进入模型请求、不落盘、不写 trace；graph 内各组件各自产生 trace/audit/report。
+
+```python
+@dataclass
+class AgentGraph:
+    config: ProductionConfig
+    trace: TraceRecorder
+    interaction_controller: InteractionController
+    workspace_state: WorkspaceStateManager
+    project_index: ProjectIndex
+    memory_pipeline: MemoryLearningPipeline
+    policy_engine: PolicyEngine
+    approval_gate: ApprovalGate
+    sandbox_manager: SandboxManager
+    command_executor: CommandExecutor
+    mutation_manager: WorkspaceMutationManager
+    edit_executor: EditExecutor
+    tools: ToolRegistry
+    plugin_manager: PluginManager
+    verification_runner: VerificationRunner
+    review_pipeline: ReviewPipeline
+    prompt_assembly: PromptAssemblyPipeline
+    model_runner: ModelRunner
+    context_manager: ContextManager
+    tool_executor: ToolExecutor
+    tool_protocol: ToolProtocolEngine
+    planner: Planner
+    initialization_order: list[ComponentName] = field(default_factory=...)
+    components: dict[ComponentName, ComponentState] = field(default_factory=dict)
+    _evaluation_harness: EvaluationHarness | None = field(default=None, repr=False)
+    _evaluation_harness_factory: Callable[[], EvaluationHarness] | None = field(default=None, repr=False)
+    _cancellation_token_factory: Callable[[], Any] | None = field(default=None, repr=False)
+```
+
+### 关键枚举值域
+
+```python
+class KernelStatus(str, Enum):   # KernelContext.status
+    NEW = "new"
+    BOOTING = "booting"
+    READY = "ready"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+    SHUTTING_DOWN = "shutting_down"
+    FINALIZED = "finalized"
+    FAILED = "failed"
+
+class RunStatus(str, Enum):      # AgentRun.status
+    CREATED = "created"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+class SessionStatus(str, Enum):  # AgentSession.status
+    CREATED = "created"
+    ACTIVE = "active"
+    CLOSING = "closing"
+    CLOSED = "closed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    RECOVERED = "recovered"
+
+class ComponentState(str, Enum): # AgentGraph.components values
+    PENDING = "pending"
+    INITIALIZED = "initialized"
+    READY = "ready"
+    FAILED = "failed"
+    STOPPED = "stopped"
+```
+
+`ComponentName` 枚举有 22 个成员：`CONFIGURATION`、`OBSERVABILITY`、`INTERACTION`、`WORKSPACE_STATE`、`PROJECT_INDEX`、`MEMORY`、`POLICY`、`SANDBOX`、`COMMAND`、`MUTATION`、`EDIT`、`TOOLS`、`PLUGINS`、`TOOL_EXECUTOR`、`TOOL_PROTOCOL`、`VERIFICATION`、`REVIEW`、`EVALUATION`、`INSTRUCTIONS`、`MODEL`、`CONTEXT`、`PLANNER`。
+
+### 数据流概述
+
+`RunIdentity` 由 `KernelBootstrap.boot()` 创建后，其 id 字段被注入到所有下游对象：`TraceRecorder` 用 `run_id` 标记 event/span，`ContextManager` 用 `run_id/session_id/task_id` 标记 `ContextItem`，`ModelTurnRequest` 携带全部三个 id，`EvaluationTaskResult` 引用 `run_id`。`KernelContext` 在 boot 过程中从 `NEW` -> `BOOTING` -> `READY`，运行时从 `RUNNING` -> `CANCELLING`/`SHUTTING_DOWN` -> `FINALIZED`/`FAILED`。`AgentGraph` 是纯内存依赖容器，graph 生命周期结束后各组件的 store（`context.sqlite3`、`planner state.json`、`events.jsonl`、`tool_protocol.sqlite3`）独立存在。
 
 ## 谁生成这些对象
 

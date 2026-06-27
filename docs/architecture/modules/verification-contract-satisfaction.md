@@ -59,8 +59,112 @@ Verification 层发现、计划并执行验证命令，把命令结果转换为 
 
 ## 真实对象完整结构
 
-- `VerificationCheck（验证检查）` 完整字段列在字段清单中，描述要执行或跳过的验证动作。
-- `VerificationContract（验证契约）` 完整字段列在字段清单中，约束 repair 阶段允许的验证命令。
+### VerificationCheck（验证检查）
+
+描述要执行或跳过的验证动作。**边界**：内部治理对象，不落盘为独立文件；每个 check 产生 `PolicyRequest`/`PolicyDecision` 进入 policy audit。
+
+```python
+@dataclass
+class VerificationCheck:
+    kind: CheckKind
+    command: CommandRequest | None
+    scope: str
+    required: bool
+    timeout: float
+    risk_tags: list[str]
+    failure_policy: str
+    id: str = field(default_factory=lambda: f"check_{uuid4().hex[:12]}")
+    policy_decision: VerificationDecision | None = None
+    policy_reasons: list[str] = field(default_factory=list)
+    skip_reason: str | None = None
+    source: str | None = None
+    contract_step_id: str | None = None
+```
+
+### VerificationResult（验证结果）
+
+单个 check 的执行结果。**边界**：内部治理对象，写入 planner `evidence.json` 和 `context.sqlite3`；安全投影写 trace event。
+
+```python
+@dataclass(frozen=True)
+class VerificationResult:
+    check_id: str
+    kind: CheckKind
+    status: CheckStatus
+    failure_type: FailureType | None
+    evidence: VerificationEvidence
+    repair_hints: list[RepairHint]
+    confidence_impact: float
+    duration_ms: int
+    attempts: list[VerificationEvidence] = field(default_factory=list)
+    policy_decision: CommandPolicyResult | None = None
+```
+
+### ContractSatisfaction（契约满足度）
+
+repair contract 的兑现评估。**边界**：内部治理对象，嵌入 planner evidence/final report；不独立落盘。
+
+```python
+@dataclass(frozen=True)
+class ContractSatisfaction:
+    contract_id: str
+    satisfied: bool
+    completed_steps: list[str]
+    failed_steps: list[str]
+    skipped_steps: list[str]
+    reason: str | None = None
+    step_evidence: list[StepEvidence] = field(default_factory=list)
+```
+
+### 关键枚举值域
+
+```python
+class CheckKind(str, Enum):          # VerificationCheck.kind
+    SYNTAX = "syntax"
+    FORMAT = "format"
+    LINT = "lint"
+    TYPECHECK = "typecheck"
+    UNIT_TEST = "unit_test"
+    INTEGRATION_TEST = "integration_test"
+    BUILD = "build"
+    VERIFICATION_SMOKE = "verification_smoke"
+    SECURITY = "security"
+    CUSTOM = "custom"
+    MANUAL_REVIEW = "manual_review"
+
+class CheckStatus(str, Enum):        # VerificationResult.status
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    BLOCKED = "blocked"
+    FLAKY = "flaky"
+    TIMEOUT = "timeout"
+    INCONCLUSIVE = "inconclusive"
+
+class FailureType(str, Enum):        # VerificationResult.failure_type (28 members)
+    SYNTAX_ERROR = "syntax_error"
+    TYPE_ERROR = "type_error"
+    LINT_ERROR = "lint_error"
+    UNIT_TEST_FAILURE = "unit_test_failure"
+    BUILD_FAILURE = "build_failure"
+    TIMEOUT = "timeout"
+    FLAKY_FAILURE = "flaky_failure"
+    SANDBOX_VIOLATION = "sandbox_violation"
+    REPAIR_BUDGET_EXCEEDED = "repair_budget_exceeded"
+    UNKNOWN_FAILURE = "unknown_failure"
+    # ... 18 more members
+
+class CompletionStatus(str, Enum):   # CompletionAssessment.status
+    READY = "ready"
+    READY_WITH_WARNINGS = "ready_with_warnings"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    NEEDS_REVIEW = "needs_review"
+```
+
+### 数据流概述
+
+`VerificationRunner.plan_verification()` 生成 `VerificationCheck` 列表，`run_plan()` 调用 `CommandExecutor.run()` 执行命令生成 `VerificationResult`。`CompletionAssessor.assess()` 消费 result 列表返回 `CompletionAssessment`。`VerificationContract.from_plan_strings()` 生成 `VerificationContract`。`Planner.assess_verification_contract_satisfaction()` 读取 contract 和 evidence 生成 `StepEvidence` 和 `ContractSatisfaction`。每个 check 产生 `PolicyRequest`/`PolicyDecision` 进入 policy audit ledger。
 
 ## 谁生成这些对象
 

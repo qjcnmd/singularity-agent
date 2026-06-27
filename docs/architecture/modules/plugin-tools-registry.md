@@ -68,8 +68,79 @@ Plugin 层发现、校验、启用插件 manifest，并把插件贡献的工具�
 
 ## 真实对象完整结构
 
-- `PluginManifest（插件清单）` 完整字段列在字段清单中，消费者是 discovery、loader、permission manager 和 status/lock 组件。
-- `PluginToolContribution（插件工具贡献）` 完整字段列在字段清单中，最终转换为 `RegisteredToolRecord`。
+### PluginManifest（插件清单）
+
+插件的声明式描述，来自 `plugin.toml`。**边界**：落盘对象，原始输入是 project/user/plugin path 下的 TOML 文件；不进入模型请求。
+
+```python
+class PluginManifest(BaseModel):
+    id: str
+    name: str
+    version: str
+    api_version: str
+    entrypoint: str
+    type: PluginType
+    capabilities: tuple[str, ...]
+    permissions: tuple[PluginPermission, ...]
+    activation: dict[str, Any]
+    compatibility: CompatibilitySpec
+    config_schema: dict[str, Any]
+```
+
+### PluginToolContribution（插件工具贡献）
+
+插件注册到 ToolRegistry 的工具描述。**边界**：内部治理对象，不落盘；其 `spec` 被 `ToolRegistry.register()` 消费后生成 `RegisteredToolRecord`。
+
+```python
+class PluginToolContribution(BaseModel):
+    plugin_id: str
+    local_name: str
+    exposed_name: str
+    required_permissions: tuple[PluginPermission, ...]
+    spec: ToolSpec = Field(exclude=True)
+```
+
+### PluginLoadResult（插件加载结果）
+
+插件加载的成功/失败结果。**边界**：内部治理对象，不落盘；diagnostics 通过 CLI 和 trace event 保存。
+
+```python
+class PluginLoadResult(BaseModel):
+    plugin_id: str
+    loaded: bool
+    contribution_set: PluginContributionSet | None = None
+    diagnostics: list[PluginDiagnostic] = Field(default_factory=list)
+```
+
+### 关键枚举值域
+
+```python
+class PluginType(str, Enum):         # PluginManifest.type
+    TOOL = "tool"
+    PROVIDER = "provider"
+    PROMPT = "prompt"
+    MEMORY = "memory"
+    EVAL = "eval"
+    PROJECT_ADAPTER = "project_adapter"
+
+class PluginPermission(str, Enum):   # PluginManifest.permissions
+    READ_WORKSPACE = "read_workspace"
+    READ_OUTSIDE_WORKSPACE = "read_outside_workspace"
+    WRITE_WORKSPACE = "write_workspace"
+    EXECUTE_COMMAND = "execute_command"
+    NETWORK_ACCESS = "network_access"
+    READ_ENV = "read_env"
+    CHANGE_CONFIG = "change_config"
+
+class PluginDiagnosticSeverity(str, Enum): # PluginDiagnostic.severity
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+```
+
+### 数据流概述
+
+`discover_plugins()` 扫描三类根目录读取 `PluginManifest`，`PluginStatusStore` 读取 `PluginStatus`，`_lock_entry()` 生成 `PluginLockEntry`。`PluginLoader.load()` 返回 `PluginLoadResult`，通过 policy gate 后 `PluginToolContribution.spec` 被 `ToolRegistry.register()` 消费。插件状态写 `.singularity/plugin-status.json`，锁写 `.singularity/plugin-lock.json`。`_policy_gate()` 构造 `proposed_by_model=False` 的 `PolicyRequest` 进入 policy audit ledger。
 
 ## 谁生成这些对象
 

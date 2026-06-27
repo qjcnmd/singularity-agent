@@ -51,8 +51,145 @@ Policy 层把组件、能力、资源、风险、约束和人工 approval 统一
 以用户要求修复 `quicksort.py` 时模型请求写文件或跑命令为例：`ToolExecutor._policy_request()` / `CommandExecutor._policy_request()` / `VerificationRunner._policy_request()` -> `PolicyEngine.evaluate()` -> `ApprovalGate.resolve()` 先生成对象 `PolicyRequest`，再读取 subject、resource、risk 和 constraints 返回 `PolicyDecision`。若 decision 是 review，`ApprovalGate.resolve()` 读取或写入 `approval_grants.jsonl` 并生成 `ApprovalGrant`；随后执行器只在 grant 范围匹配时继续。`PolicyAuditWriter.append()` 写入 `audit.jsonl`，`PolicyEngine._emit_policy_trace()` 写 trace event；deny/ask_user/sandbox_required 返回失败或阻塞结果，不会让 handler 继续执行。
 ## 真实对象完整结构
 
-- `PolicyRequest（策略请求）` 完整字段列在字段清单中，生成者是各执行组件。
-- `PolicyDecision（策略决策）` 完整字段列在字段清单中，消费者是执行组件、approval gate、trace/audit 和 planner/context。
+### PolicyRequest（策略请求）
+
+执行组件发起的能力/资源评估请求。**边界**：内部治理对象，进入 policy audit ledger；不进入模型请求。
+
+```python
+@dataclass(frozen=True)
+class PolicyRequest:
+    session_id: str
+    task_id: str
+    phase_id: str
+    action_id: str
+    component: PolicyComponent
+    operation: OperationKind
+    capability: Capability
+    subject: PolicySubject
+    resource: ResourceRef
+    reason: str
+    request_id: str = field(default_factory=lambda: f"policy_req_{uuid4().hex[:12]}")
+    proposed_by_model: bool = False
+    risk_tags: list[RiskTag | str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    evidence_refs: list[str] = field(default_factory=list)
+    reversible: bool = True
+    requires_network: bool = False
+    touches_workspace: bool = False
+    touches_secrets: bool = False
+    destructive: bool = False
+    long_running: bool = False
+    interactive: bool = False
+    workspace_root: str | None = None
+```
+
+### PolicyDecision（策略决策）
+
+policy engine 的评估结果。**边界**：内部治理对象，落盘到 audit.jsonl；`outcome`/`reason`/`constraints` 投影进执行器决策，裁剪后 observation 进入 context。
+
+```python
+@dataclass(frozen=True)
+class PolicyDecision:
+    request_id: str
+    outcome: DecisionOutcome
+    reason: str
+    risk_level: RiskLevel = RiskLevel.NONE
+    risk_tags: list[RiskTag | str] = field(default_factory=list)
+    user_message: str = ""
+    constraints: PolicyConstraints = field(default_factory=PolicyConstraints)
+    required_approval: ApprovalRequirement | None = None
+    rule_ids: list[str] = field(default_factory=list)
+    audit_severity: str = "info"
+    context_summary: str = ""
+    decision_id: str = field(default_factory=lambda: f"policy_dec_{uuid4().hex[:12]}")
+    approval_grant_id: str | None = None
+```
+
+### PolicyAuditEntry（策略审计条目）
+
+每次 policy 评估的不可变审计记录。**边界**：audit 对象，落盘到 policy audit JSONL；不进入模型、不写 trace events.jsonl。
+
+```python
+@dataclass(frozen=True)
+class PolicyAuditEntry:
+    timestamp: str
+    session_id: str
+    task_id: str
+    phase_id: str
+    action_id: str
+    request_id: str
+    decision_id: str
+    component: PolicyComponent | str
+    operation: OperationKind | str
+    capability: Capability | str
+    resource_summary: str
+    normalized_input_hash: str
+    risk_level: RiskLevel | str
+    risk_tags: list[RiskTag | str]
+    outcome: DecisionOutcome | str
+    rule_ids: list[str]
+    reason: str
+    approval_required: bool
+    approval_grant_id: str | None = None
+    approved_by_user: bool = False
+    user_decision: str | None = None
+    constraints: dict[str, Any] = field(default_factory=dict)
+    execution_result_ref: str | None = None
+```
+
+### 关键枚举值域
+
+```python
+class DecisionOutcome(str, Enum):    # PolicyDecision.outcome
+    ALLOW = "allow"
+    DENY = "deny"
+    REQUIRE_REVIEW = "require_review"
+    ASK_USER = "ask_user"
+    ESCALATE = "escalate"
+    SANDBOX_REQUIRED = "sandbox_required"
+
+class RiskLevel(str, Enum):          # PolicyDecision.risk_level
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+class PolicyComponent(str, Enum):    # PolicyRequest.component
+    TOOL = "tool"
+    MUTATION = "mutation"
+    COMMAND = "command"
+    VERIFICATION = "verification"
+    PLANNER = "planner"
+    WORKSPACE_STATE = "workspace_state"
+    SYSTEM = "system"
+
+class Capability(str, Enum):         # PolicyRequest.capability (19 members)
+    READ_WORKSPACE = "read_workspace"
+    MUTATE_WORKSPACE = "mutate_workspace"
+    CREATE_FILE = "create_file"
+    DELETE_FILE = "delete_file"
+    EXECUTE_COMMAND = "execute_command"
+    EXECUTE_PROJECT_CODE = "execute_project_code"
+    NETWORK_ACCESS = "network_access"
+    PACKAGE_INSTALL = "package_install"
+    READ_SECRET = "read_secret"
+    # ... 10 more members
+
+class RiskTag(str, Enum):            # PolicyRequest.risk_tags (19 members)
+    WORKSPACE_READ = "workspace_read"
+    MUTATES_FILES = "mutates_files"
+    DESTRUCTIVE = "destructive"
+    EXECUTES_CODE = "executes_code"
+    NETWORK = "network"
+    SUPPLY_CHAIN = "supply_chain"
+    SECRETS_EXFILTRATION = "secrets_exfiltration"
+    # ... 12 more members
+```
+
+### 数据流概述
+
+`ToolExecutor._policy_request()` / `CommandExecutor._policy_request()` / `VerificationRunner._policy_request()` 生成 `PolicyRequest`。`PolicyEngine.evaluate()` 读取 rules 返回 `PolicyDecision`。若 outcome 是 `REQUIRE_REVIEW`，`ApprovalGate.resolve()` 读取或写入 `approval_grants.jsonl` 并生成 `ApprovalGrant`。`PolicyAuditWriter.append()` 将 `PolicyAuditEntry` 写入 audit JSONL。trace event 由 `PolicyEngine._emit_policy_trace()` 写 `events.jsonl`，payload 仅含 ids、operation、capability、脱敏资源、outcome/risk/rules。trace 与 audit 是两条记录，不互相替代。
 
 ## 谁生成这些对象
 
@@ -60,7 +197,7 @@ ToolExecutor、CommandExecutor、mutation、verification 与 plugin manager 生�
 
 ## 谁消费这些对象
 
-PolicyEngine 消费 request，执行器与 ApprovalGate 消费 decision/requirement/grant。完整 request/decision不进入模型；ContextManager最多追加裁剪后的 policy reason/outcome observation。
+`PolicyEngine.evaluate()` 消费 request，`ApprovalGate.resolve()` 与执行器消费 decision/requirement/grant。完整 request/decision不进入模型；`ContextManager.add_policy_observation()` 最多追加裁剪后的 policy reason/outcome observation。
 
 ## 是否落盘
 

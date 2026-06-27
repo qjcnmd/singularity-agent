@@ -41,8 +41,51 @@ Artifact 层把过长输出、trace 产物、命令日志、diff、报告和模�
 
 ## 真实对象完整结构
 
-- `TraceArtifact（追踪产物）` 完整字段列在字段清单中，真实文件在 trace run artifact 目录下。
-- `TraceArtifactStore（追踪产物存储）` 负责大小限制、redaction、hash、content type 和 handle 生成。
+### TraceArtifact（追踪产物）
+
+大输出的文件引用元数据。**边界**：trace 对象，落盘到 `artifacts.jsonl` + `artifacts/` 文件；artifact ref 进入 final report 和 evaluation result，不进入模型请求。
+
+```python
+@dataclass(frozen=True)
+class TraceArtifact:
+    artifact_id: str
+    run_id: str
+    session_id: str
+    task_id: str | None
+    kind: TraceArtifactKind
+    path: Path
+    relative_path: str
+    size_bytes: int
+    sha256: str
+    content_type: str
+    redacted: bool
+    sensitive: bool
+    summary: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### TraceArtifactKind（产物分类枚举）
+
+```python
+class TraceArtifactKind(str, Enum):
+    STDOUT = "stdout"
+    STDERR = "stderr"
+    DIFF = "diff"
+    REPORT = "report"
+    SNAPSHOT = "snapshot"
+    SANDBOX = "sandbox"
+    VERIFICATION = "verification"
+    EDIT_PLAN = "edit_plan"
+    MODEL_MESSAGE = "model_message"
+    PROMPT_MANIFEST = "prompt_manifest"
+    COMMAND_LOG = "command_log"
+    POLICY_AUDIT_REF = "policy_audit_ref"
+    GENERIC = "generic"
+```
+
+### 数据流概述
+
+`TraceArtifactStore.write_text_artifact()` / `write_bytes_artifact()` / `register_file_artifact()` 先写真实文件，再由 `_artifact()` 计算 relative path、size、SHA-256、content type、redaction/sensitivity 并生成 `TraceArtifact`。`TraceRecorder.write_artifact()` 调用 `TraceStore.append_artifact()` 写 `artifacts.jsonl`。`CommandResult.artifact_path`、`ToolProtocolResultEnvelope.raw_result_ref`、`TraceEvent.artifact_refs` 和 `TraceSummary.key_artifacts` 只消费 artifact 引用。
 
 ## 谁生成这些对象
 
