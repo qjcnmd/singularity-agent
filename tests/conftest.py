@@ -301,6 +301,62 @@ def _validate_curated_lists(
         )
 
 
+def _module_imports_integration_indicators(item: pytest.Item) -> bool:
+    """Check whether the test module imports known integration-signaling libraries.
+
+    Integration indicators are imports that reveal the test is doing real
+    subprocess calls, multiprocessing, threading concurrency, or agent
+    simulation — not pure function/class unit tests.  This catches new test
+    files that aren't yet in ``_INTEGRATION_FILE_STEMS``.
+
+    Only acts on ``pytest.Function`` items (the leaf test nodes).  Silently
+    returns ``False`` for other item types so they fall through to the normal
+    auto-classification chain.
+    """
+    import sys
+
+    if not isinstance(item, pytest.Function):
+        return False
+
+    module_name = item.module.__name__ if hasattr(item, "module") else None
+    if module_name is None or module_name not in sys.modules:
+        return False
+
+    module = sys.modules[module_name]
+    module_names = set(dir(module))
+
+    # Libraries whose mere import is a strong signal of integration work.
+    _INTEGRATION_LIBS = {
+        "subprocess",           # real process spawning
+        "multiprocessing",      # cross-process testing
+        "threading",            # concurrent thread testing
+    }
+
+    # Symbols from test helpers that indicate agent simulation.
+    _AGENT_SIMULATION_SYMBOLS = {
+        "make_agent_session",
+        "MockProvider",
+        "MockToolRunner",
+        "AgentLoop",
+    }
+
+    # Symbols that indicate real Docker / git / network wiring.
+    _EXTERNAL_WIRING_SYMBOLS = {
+        "DockerSandboxBackend",
+        "GitClient",
+        "subprocess",  # already in libs but also here for clarity
+    }
+
+    if module_names & _INTEGRATION_LIBS:
+        return True
+    if module_names & _AGENT_SIMULATION_SYMBOLS:
+        return True
+    if module_names & _EXTERNAL_WIRING_SYMBOLS:
+        return True
+
+    return False
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Apply markers to tests based on file path, test name, and curated lists.
 
@@ -393,8 +449,14 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         # unit: everything else — but slow/external curated tests MUST NOT
         # be classified as unit.  Check the item's current markers: if it
         # already has slow or external, assign integration instead of unit.
+        # Also check the test module's imports for integration indicators
+        # (subprocess, multiprocessing, threading, agent_loop_helpers) so
+        # that new test files doing real integration work are not silently
+        # misclassified as unit.
         current_markers = _explicit_marker_names(item)
         if "slow" in current_markers or "external" in current_markers:
+            _add_marker(item, "integration")
+        elif _module_imports_integration_indicators(item):
             _add_marker(item, "integration")
         else:
             _add_marker(item, "unit")

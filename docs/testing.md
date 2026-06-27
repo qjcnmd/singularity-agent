@@ -24,6 +24,31 @@ Singularity 测试体系按 pytest marker 分为以下层级。
 
 > **注意**：数量会随重分类调整而变化。以实际 `python -m pytest --co -q` 为准。
 
+### 自动分类如何工作
+
+`tests/conftest.py` 的 `pytest_collection_modifyitems` 钩子按以下优先级分类：
+
+1. **显式 `@pytest.mark.X`**：开发者手动指定，绝对优先。
+2. **`tests/evaluation/` 目录**：硬约定 → `evaluation`。
+3. **精选列表**（`_SMOKE_TEST_IDS`、`_FLAKY_TEST_IDS`、`_SLOW_TEST_IDS`、`_EXTERNAL_*`）：手动维护。
+4. **关键字推断**：`security/redaction/secret/injection` → `security`；`production/docs_consistency/runtime_docs/runtime_sqlite/singularity_identity` → `regression`；`code_index/diagnostics/edit/interaction/memory/plugins/review/` 子目录 或 文件名含 `integration` → `integration`。
+5. **`_INTEGRATION_FILE_STEMS` 精选列表**：手动维护的 35 个集成密集型文件茎。
+6. **导入特征推断**（`_module_imports_integration_indicators`）：自动检测模块是否 `import subprocess`、`multiprocessing`、`threading`、或使用了 `make_agent_session`/`AgentLoop`/`DockerSandboxBackend` 等集成符号 → `integration`。
+7. **slow/external 后修正**：如果测试已有 `slow`/`external` 标记，绝不落入 `unit`。
+8. **其余** → `unit`。
+
+### 新增测试文件注意事项
+
+新增测试时不需要手动标记，但以下情况建议显式指定 `@pytest.mark.integration`：
+
+- 测试中调用真实 AgentLoop（`agent.run()` 或 `make_agent_session()`）
+- 测试中使用 `component.run()` / `component.run_plan()` 多组件连线
+- 测试中 `import subprocess` / `import multiprocessing` / `import threading`
+
+这些情况通常会被自动推断捕获，但显式标记可确保万无一失。
+
+如果测试耗时 >3s，将其 nodeid 加入 `_SLOW_TEST_IDS` 并运行 `--durations=50` 确认。
+
 ## 2. 日常开发
 
 ### 烟雾测试（~3 秒，25 tests）
