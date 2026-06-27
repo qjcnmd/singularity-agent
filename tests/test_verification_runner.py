@@ -72,6 +72,7 @@ def command_result(
     error_code: str | None = None,
     execution_status: ExecutionStatus = ExecutionStatus.COMPLETED,
     timed_out: bool = False,
+    metadata: dict[str, object] | None = None,
 ) -> CommandResult:
     return CommandResult(
         command_id=command_id,
@@ -97,6 +98,7 @@ def command_result(
         risk_tags=[CommandRisk.PROJECT_VERIFICATION],
         error_code=error_code,
         isolation_report={},
+        metadata=metadata or {},
     )
 
 
@@ -684,6 +686,41 @@ def test_repair_budget_blocks_repeated_same_failure() -> None:
 
     assert controller.can_continue() is False
     assert state.blocked_reason == "same_failure_retry_budget_exceeded"
+
+
+def test_backend_unavailable_classifies_as_sandbox_limitation(tmp_path: Path) -> None:
+    request = CommandRequest(argv=["python", "-m", "pytest", "tests/test_app.py"])
+    fake = FakeCommandExecutor(
+        [
+            command_result(
+                request,
+                command_id="cmd_sandbox_blocked",
+                exit_code=None,
+                semantic_status=SemanticStatus.EXECUTION_FAILED,
+                output="backend_unavailable: Windows sandbox requirements are missing",
+                error_code="backend_unavailable",
+                execution_status=ExecutionStatus.BACKEND_ERROR,
+                metadata={
+                    "sandbox_status": "backend_unavailable",
+                    "enforcement_status": "backend_unavailable",
+                    "sandbox_availability": {"backend_status": "backend_unavailable"},
+                },
+            )
+        ]
+    )
+    component = VerificationRunner(tmp_path, command_executor=fake)
+
+    plan = component.plan_verification(
+        changed_files=[],
+        task_intent="verify sandbox blocked path",
+        smoke_commands=[["python", "-m", "pytest", "tests/test_app.py"]],
+    )
+    observation = component.run_plan(plan.id)
+
+    failed = observation["verification"]["failed_checks"]
+    assert failed[0]["status"] == CheckStatus.BLOCKED.value
+    assert failed[0]["failure_type"] == FailureType.SANDBOX_LIMITATION.value
+    assert failed[0]["evidence"]["sandbox_status"] == "backend_unavailable"
 
 
 def test_completion_assessment_statuses(tmp_path: Path) -> None:

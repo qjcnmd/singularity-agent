@@ -26,6 +26,10 @@ from singularity.tools.verification import register_verification_tools
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.verification import VerificationRunner
 from singularity.workspace import WorkspaceMutationManager
+from singularity.failure_analysis.analyzer import FailureAnalyzer
+from singularity.failure_analysis.request import FailureAnalysisRequest
+from singularity.planner.models import ReplanDecisionKind
+from singularity.repair import RepairPlanner
 from tests.agent_loop_helpers import make_agent_session
 
 
@@ -568,6 +572,63 @@ def test_unauthorized_affected_files_block_repair_contract(tmp_path: Path) -> No
     assert result.error_code == "failure_analysis_user_input_required"
     assert planner.evidence.failure_analyses[-1]["failure_category"] == "failure_analysis_schema_invalid"
     assert "unauthorized target" in planner.evidence.repair_plans[-1]["blocked_reason"]
+
+
+def test_sandbox_backend_unavailable_blocks_without_model_repair(tmp_path: Path) -> None:
+    class NoModelRunner:
+        def run_turn(self, _request: Any) -> Any:
+            raise AssertionError("sandbox backend blockers must not call failure-analysis model")
+
+    request = FailureAnalysisRequest(
+        request_id="failure_analysis_sandbox",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="repairing_failures",
+        workspace_root=str(tmp_path),
+        failure_source="verification",
+        failure_summary="sandbox_limitation",
+        failure_sources=[
+            {
+                "kind": "verification_result",
+                "check_id": "check_sandbox",
+                "status": "blocked",
+                "failure_type": "sandbox_limitation",
+                "evidence": {
+                    "command_id": "cmd_sandbox",
+                    "command": "python -m pytest tests/test_app.py",
+                    "output_excerpt": "backend_unavailable: Windows sandbox requirements are missing",
+                    "parsed_failures": [{"file": "tests/test_app.py", "message": "not a repair target"}],
+                    "sandbox_status": "backend_unavailable",
+                    "capability_summary": {"backend_status": "backend_unavailable"},
+                },
+            }
+        ],
+        evidence_refs=["check_sandbox"],
+    )
+
+    analysis = FailureAnalyzer(model_runner=NoModelRunner()).analyze(request)
+
+    assert request.allowed_target_files == ["tests/test_app.py"]
+    assert analysis.failure_category == "sandbox_limitation"
+    assert analysis.needs_user_input is True
+    assert analysis.affected_files == []
+    assert "sandbox backend unavailable" in (analysis.blocked_reason or "")
+    assert analysis.verification_plan == []
+
+    repair_planner = RepairPlanner()
+    plan = repair_planner.plan(analysis)
+    signal = repair_planner.to_replan_signal(request=request, analysis=analysis, plan=plan)
+    planner = Planner(tmp_path, session_id=request.session_id, task_id=request.task_id)
+    planner.start_task("verify sandbox backend blocker")
+    decision = planner.replan(signal.to_dict())
+
+    assert plan.strategy == "blocked"
+    assert plan.action_candidates == []
+    assert signal.verification_plan == []
+    assert decision.decision == ReplanDecisionKind.ASK_USER
+    assert decision.decision != ReplanDecisionKind.RERUN_VERIFICATION
+    assert any("sandbox backend unavailable" in reason for reason in planner.state.blocked_reasons)
 
 
 def test_repeated_completion_rejected_escalates_to_failure_analyzer(tmp_path: Path) -> None:

@@ -69,7 +69,9 @@ Windows 当前实现是 account-backed OS sandbox：父进程准备 COW workspac
 
 ## 关键类、函数、字段
 
-`SandboxManager.run()` 只消费由 `CommandExecutor` 构造完成的请求，不重新解释 `PolicyDecision`。`ensure_capabilities()` 校验 denied network、read-only workspace、memory limit 和 process limit。`WindowsSandboxBackend.doctor()` 返回稳定 JSON schema 的真实探测报告，`setup()` 在 Windows elevated shell 下创建/验证本地账户、Credential Manager 凭据、account-scoped firewall 和 execution smoke；非 elevated setup 返回 `requires_elevation`，不得假成功。
+`SandboxManager.run()` 只消费由 `CommandExecutor` 构造完成的请求，不重新解释 `PolicyDecision`。`ensure_capabilities()` 校验 denied network、read-only workspace、memory limit 和 process limit。`WindowsSandboxBackend.doctor()` 返回稳定 JSON schema 的真实探测报告，`setup()` 在 Windows elevated shell 下创建/验证本地账户、Credential Manager 凭据、account-scoped firewall、ACL boundary、runner smoke 和 network probe；`WindowsSandboxSetupReport.completed_steps` / `pending_steps` / `failed_steps` 显式包含 `network_probe`。非 elevated setup 在任何 system mutation 前返回 `requires_elevation`，不得假成功。
+
+Windows setup 的 sandbox account 存在性探测由 `_account_exists()` 调用 `_run_net(["user", SANDBOX_ACCOUNT])`，`_run_net()` 只通过 `shutil.which("net")` 定位 Windows `net` 命令并复用 `_run_command()` 返回 `CompletedProcess`。账户创建和密码更新仍由 `_create_sandbox_account()` / `_set_account_password()` 的 `netapi32` helper 执行；firewall 仍由 `_run_powershell()` 执行 `Remove-NetFirewallRule` / `New-NetFirewallRule`，Credential Manager、ACL、runner smoke、network probe 由各自 helper 真实验证。
 
 `WindowsSandboxBackend.prepare()` 先重新检查 doctor 可用性，再拒绝当前未实现的 workspace 外 `writable_paths` 和 path-specific `readonly_paths`，之后调用 `SandboxFilesystemManager.prepare_filesystem()` 创建 COW projection。protected paths 通过 `CommandExecutor` 合入 `exclude_globs`，所以 `.env`、`.git`、`.singularity` 等不会进入 projection；`SandboxManager._protected_path_violation()` 还会在命令参数、cwd 和显式 resource 上做前置 hard deny。`prepare()` 对 run root 授予 sandbox account 修改权限，但只对 `workspace/` projection 设置低完整性标签，避免低完整性命令子进程写入 `runner-spec.json`、`runner-result.json` 等控制面文件。
 
@@ -328,7 +330,7 @@ class SandboxNetworkMode(str, Enum):
 - `CommandExecutor._sandbox_request()` 生成 `SandboxProfile` 和 `SandboxRequest`。
 - `default_sandbox_profile()` 生成基础 profile，`CommandExecutor` 再写入会话权限边界、protected globs、network mode 和 resource limits。
 - `probe_windows_sandbox()` 生成 `WindowsSandboxDoctorReport`。
-- `setup_windows_sandbox()` 生成 `WindowsSandboxSetupReport`，并在 elevated Windows shell 下创建或验证账户、凭据、firewall 和 smoke assets。
+- `setup_windows_sandbox()` 生成 `WindowsSandboxSetupReport`，并在 elevated Windows shell 下创建或验证账户、凭据、account-scoped firewall、ACL boundary、private desktop、runner smoke 和 network probe assets。
 - `WindowsSandboxBackend.prepare()` 生成 `PreparedSandbox` 与 runner spec；`WindowsSandboxBackend.run()` 生成执行型 `SandboxResult`。
 - `WindowsSandboxRunner.run()` / `run_spec()` 生成 `WindowsRunnerResult`。
 
@@ -356,7 +358,8 @@ Windows 凭据只写入 Windows Credential Manager target `SingularitySandboxRun
 
 - 平台不是 Windows：默认 backend 列表为空，返回 `backend_unavailable`。
 - Windows primitive、sandbox account、credential、ACL boundary、account-scoped firewall、private desktop、runner smoke 或 network probe 缺失：doctor `available=false`，manager 返回 `backend_unavailable`，不启动进程。
-- `sandbox setup --json` 非 elevated：返回 `requires_elevation` 和 exit code 1；不得把 partial/requires_elevation 改写为 ready。
+- `sandbox setup --json` 非 elevated：返回 `requires_elevation` 和 exit code 1；不得执行 account、credential、firewall、ACL、runner smoke 或 network probe mutation，也不得把 partial/requires_elevation 改写为 ready。
+- Windows account 探测 helper 缺失或 `net` 不可用：`_run_net()` 返回非零 `CompletedProcess`，setup 不因 `NameError` 崩溃，后续 report 仍通过 failed/partial 状态表达缺失能力。
 - workspace 外 additional writable directories 或 path-specific `readonly_paths`：Windows backend 当前返回 `backend_unavailable`，直到实现独立 ACL lease/projection。
 - protected path 显式访问：manager preflight 返回 `POLICY_BLOCKED`；projection 也会通过 exclude globs 排除 protected paths。
 - denied network 下 host outbound baseline、runner socket probe、account-scoped firewall 或 doctor network probe 任一未验证：返回 `SandboxStatus.VIOLATION`。

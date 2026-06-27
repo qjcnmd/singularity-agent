@@ -49,11 +49,11 @@
 
 ## 真实运行时调用链
 
-`AgentLoop._maybe_analyze_failure()` -> `FailureAnalysisRequest.from_planner()` -> `FailureAnalyzer.analyze()` -> `RepairPlanner.plan()` -> `RepairPlanner.to_replan_signal()` -> `Planner.record_failure_analysis()` -> `Planner.replan()`。
+`AgentLoop._maybe_analyze_failure()` -> `FailureAnalysisRequest.from_planner()` -> `FailureAnalyzer.analyze()` -> `RepairPlanner.plan()` -> `RepairPlanner.to_replan_signal()` -> `Planner.record_failure_analysis()` -> `Planner.replan()`。当 request 的结构化 failure source/evidence 表明 `sandbox_limitation` 且 sandbox/enforcement/backend status 为 `backend_unavailable` 时，`FailureAnalyzer.analyze()` 在模型调用前直接生成 blocked `FailureAnalysisResult`，不把测试文件作为 repair target。
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 后验证失败为例：`AgentLoop._maybe_analyze_failure()` -> `FailureAnalysisRequest.from_planner()` 先从 planner evidence、recent tail、changed files 和 outcome 生成对象 `FailureAnalysisRequest`。`FailureAnalyzer.analyze()` 只把 `request.to_model_payload()` 的有界证据发给分析模型，返回 payload 经 `FailureAnalysisResult.from_model_payload()` 生成结果；`RepairPlanner.plan()` 再生成 `RepairContract`、`RepairActionCandidate` 和 `RepairPlan`。`RepairPlanner.to_replan_signal()` 生成 `RepairReplanSignal` 后由 `Planner.record_failure_analysis()` 写入 planner evidence、`planner_events.jsonl`、context item 和 trace；若需要用户输入，`RepairPlanner.blocked_outcome()` 返回 blocked outcome。
+以用户要求修复 `quicksort.py` 后验证失败为例：`AgentLoop._maybe_analyze_failure()` -> `FailureAnalysisRequest.from_planner()` 先从 planner evidence、recent tail、changed files 和 outcome 生成对象 `FailureAnalysisRequest`。`FailureAnalyzer.analyze()` 只把 `request.to_model_payload()` 的有界证据发给分析模型，返回 payload 经 `FailureAnalysisResult.from_model_payload()` 生成结果；`RepairPlanner.plan()` 再生成 `RepairContract`、`RepairActionCandidate` 和 `RepairPlan`。`RepairPlanner.to_replan_signal()` 生成 `RepairReplanSignal` 后由 `Planner.record_failure_analysis()` 写入 planner evidence、`planner_events.jsonl`、context item 和 trace；若需要用户输入，`RepairPlanner.blocked_outcome()` 返回 blocked outcome。sandbox backend unavailable 属于基础设施 blocker，不进入普通代码修复对象流；对应 blocked result 的 `affected_files=[]`、`verification_plan=[]`、`failure_category="sandbox_limitation"`、`blocked_reason` 指向 sandbox backend unavailable。
 
 ## 真实对象完整结构
 
@@ -154,12 +154,12 @@ READ_FILE = "read_file"
 
 ### 数据流概述
 
-`AgentLoop._maybe_analyze_failure()` 调用 `FailureAnalysisRequest.from_planner()` 从 planner evidence 生成 request。`FailureAnalyzer.analyze()` 只把 `request.to_model_payload()` 发送给 failure-analysis 模型，返回 payload 经 `FailureAnalysisResult.from_model_payload()` 生成结果。`RepairPlanner.plan()` 生成 `RepairContract`、`RepairActionCandidate` 和 `RepairPlan`。`RepairPlanner.to_replan_signal()` 生成 `RepairReplanSignal`，由 `Planner.record_failure_analysis()` 写入 planner evidence、`planner_events.jsonl`、context item 和 trace。
+`AgentLoop._maybe_analyze_failure()` 调用 `FailureAnalysisRequest.from_planner()` 从 planner evidence 生成 request。`FailureAnalyzer.analyze()` 先检查结构化 sandbox blocker；非 sandbox backend blocker 才把 `request.to_model_payload()` 发送给 failure-analysis 模型，返回 payload 经 `FailureAnalysisResult.from_model_payload()` 生成结果。`RepairPlanner.plan()` 生成 `RepairContract`、`RepairActionCandidate` 和 `RepairPlan`。`RepairPlanner.to_replan_signal()` 生成 `RepairReplanSignal`，由 `Planner.record_failure_analysis()` 写入 planner evidence、`planner_events.jsonl`、context item 和 trace。
 
 ## 谁生成这些对象
 
 - `AgentLoop._maybe_analyze_failure()` 调用 `FailureAnalysisRequest.from_planner()`，从 planner evidence、context references、recent tail、changed files 和当前 outcome 生成 request。
-- `FailureAnalyzer.analyze()` 将 `request.to_model_payload()` 发送给失败分析模型，成功响应由 `FailureAnalysisResult.from_model_payload()` 生成；invalid JSON、schema 或不可用模型由 `FailureAnalysisResult.blocked()` 生成明确 blocked result。
+- `FailureAnalyzer.analyze()` 将非 sandbox-backend-blocker 的 `request.to_model_payload()` 发送给失败分析模型，成功响应由 `FailureAnalysisResult.from_model_payload()` 生成；invalid JSON、schema 或不可用模型由 `FailureAnalysisResult.blocked()` 生成明确 blocked result。`sandbox_limitation/backend_unavailable` 由 analyzer 在模型调用前直接 blocked，避免模型把验证命令里的测试文件误判为 `affected_files`。
 - `RepairPlanner.plan()` 先用 `_action_candidates()` 生成 `RepairActionCandidate`，再由 `RepairContract.from_analysis()` / `blocked()` 与 `RepairPlan` 构造修复边界；`RepairPlanner.to_replan_signal()` 调用 `RepairReplanSignal.from_contract()` 生成 replanner 输入。
 
 ## 谁消费这些对象
@@ -183,6 +183,7 @@ READ_FILE = "read_file"
 ## 失败路径
 
 - 无失败、重复 fingerprint 或没有新增证据时 AgentLoop 不重复分析；failure-analysis invalid JSON/schema、低 confidence、越权 target、缺 evidence/target/action 或不可执行 verification 产生 blocked result/contract 与 `needs_user_input`/`blocked_reason`。
+- `VerificationRunner` 将 `sandbox_unavailable` 和 `backend_unavailable` command error 归类为 `FailureType.SANDBOX_LIMITATION` 并标记 check `blocked`；`FailureAnalyzer` 对结构化 `sandbox_limitation/backend_unavailable` 直接返回 blocked result，`RepairPlanner` 因 `blocked_reason` 生成 blocked contract，不生成无意义 rerun verification 循环。
 - `RepairActionCandidate` 校验 action type、target、tool hint、rationale 和 confidence；`RepairContract.validation_errors` 明确记录 unsupported tool、unauthorized target 与 invalid verification contract，Planner fail-closed 拒绝越权工具/路径。
 - replanner 对 ask-user、repeated-failure budget、policy/sandbox/permission 类失败返回阻塞或人工输入；verification failure 保持 `verification_failed=True` 并继续受 contract 限制，不清空旧失败证据。
 

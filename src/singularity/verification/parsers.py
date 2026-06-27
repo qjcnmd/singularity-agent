@@ -185,7 +185,7 @@ def classify_failure(
 ) -> FailureType | None:
     if command_result is None:
         return FailureType.CHECK_BLOCKED
-    if command_result.error_code == "sandbox_unavailable":
+    if command_result.error_code in {"sandbox_unavailable", "backend_unavailable"}:
         return FailureType.SANDBOX_LIMITATION
     if command_result.error_code == "sandbox_violation":
         return FailureType.SANDBOX_VIOLATION

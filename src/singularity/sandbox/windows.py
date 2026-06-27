@@ -241,9 +241,12 @@ class WindowsSandboxSetupReport:
             changed=False,
             completed_steps=(
                 "sandbox_account",
+                "credential",
+                "acl_boundary",
                 "network_filter",
                 "private_desktop",
                 "execution_backend",
+                "network_probe",
             ),
             pending_steps=(),
             failed_steps=(),
@@ -628,6 +631,7 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
                 "network_filter",
                 "acl_boundary",
                 "execution_backend",
+                "network_probe",
             ),
             failed_steps=(),
             available_after_setup=False,
@@ -673,18 +677,18 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
                 f"Remove-NetFirewallRule -DisplayName {_ps_quote(FIREWALL_RULE_NAME)} "
                 "-ErrorAction SilentlyContinue"
             )
-            result = _run_powershell(
+            firewall_result = _run_powershell(
                 "New-NetFirewallRule "
                 f"-DisplayName '{FIREWALL_RULE_NAME}' "
                 f"-Group '{FIREWALL_RULE_GROUP}' "
                 "-Direction Outbound -Action Block -Enabled True "
                 f"-LocalUser '{_firewall_local_user_sddl(sid)}' | Out-Null"
             )
-            if result.returncode == 0:
+            if firewall_result.returncode == 0:
                 changed = True
                 completed.append("network_filter")
             else:
-                failed.append({"step": "network_filter", "reason": _safe_output(result)})
+                failed.append({"step": "network_filter", "reason": _safe_output(firewall_result)})
         else:
             failed.append({"step": "network_filter", "reason": "sandbox account SID unavailable"})
     else:
@@ -705,6 +709,10 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
         failed.append({"step": "execution_backend", "reason": execution_state.reason})
     probe_windows_sandbox.cache_clear()
     doctor = _probe_windows_sandbox_uncached()
+    if doctor.execution.network_probe.ready:
+        completed.append("network_probe")
+    else:
+        failed.append({"step": "network_probe", "reason": doctor.execution.network_probe.reason})
     status = "ready" if doctor.available else "partial"
     if failed:
         status = "failed" if not completed else "partial"
@@ -712,10 +720,12 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
         item
         for item in (
             "sandbox_account",
+            "credential",
             "acl_boundary",
             "network_filter",
             "private_desktop",
             "execution_backend",
+            "network_probe",
         )
         if item not in completed and not any(step.get("step") == item for step in failed)
     ]
@@ -1354,6 +1364,13 @@ def _is_elevated() -> bool:
 
 def _account_exists(name: str) -> bool:
     return _run_net(["user", name]).returncode == 0
+
+
+def _run_net(args: list[str]) -> subprocess.CompletedProcess[str]:
+    executable = shutil.which("net")
+    if executable is None:
+        return subprocess.CompletedProcess(["net", *args], 1, "", "net command unavailable")
+    return _run_command([executable, *args])
 
 
 def _account_sid(name: str) -> str:

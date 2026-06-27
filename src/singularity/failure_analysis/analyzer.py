@@ -28,6 +28,16 @@ class FailureAnalyzer:
 
     def analyze(self, request: FailureAnalysisRequest) -> FailureAnalysisResult:
         self._record("requested", request=request)
+        sandbox_blocker = _sandbox_backend_blocker(request)
+        if sandbox_blocker is not None:
+            analysis = FailureAnalysisResult.blocked(
+                request=request,
+                reason=sandbox_blocker,
+                category="sandbox_limitation",
+                affected_files=[],
+            )
+            self._record("completed", request=request, analysis=analysis)
+            return analysis
         model_request = self._model_request(request)
         result = self.model_runner.run_turn(model_request)
         if result.status != ModelTurnStatus.SUCCESS or result.assistant_message is None:
@@ -142,3 +152,20 @@ class FailureAnalyzer:
             )
         elif hasattr(self.trace, "record"):
             self.trace.record(event, payload)
+
+
+def _sandbox_backend_blocker(request: FailureAnalysisRequest) -> str | None:
+    for source in request.failure_sources:
+        evidence = source.get("evidence") if isinstance(source, dict) else {}
+        evidence_payload = evidence if isinstance(evidence, dict) else {}
+        capability = evidence_payload.get("capability_summary")
+        capability_payload = capability if isinstance(capability, dict) else {}
+        backend_unavailable = (
+            source.get("error_code") in {"backend_unavailable", "sandbox_unavailable"}
+            or evidence_payload.get("sandbox_status") == "backend_unavailable"
+            or evidence_payload.get("enforcement_status") == "backend_unavailable"
+            or capability_payload.get("backend_status") == "backend_unavailable"
+        )
+        if source.get("failure_type") == "sandbox_limitation" and backend_unavailable:
+            return "sandbox backend unavailable: run elevated sandbox setup before verification can proceed"
+    return None

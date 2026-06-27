@@ -99,13 +99,14 @@ class FailureAnalysisResult:
         request: FailureAnalysisRequest,
         reason: str,
         category: str = "failure_analysis_unavailable",
+        affected_files: list[str] | None = None,
     ) -> "FailureAnalysisResult":
         return cls(
             analysis_id=f"failure_{uuid4().hex[:12]}",
             request_id=request.request_id,
             root_cause=reason,
             failure_category=category,
-            affected_files=list(request.allowed_target_files),
+            affected_files=list(request.allowed_target_files if affected_files is None else affected_files),
             evidence_refs=list(request.evidence_refs),
             repair_strategy="blocked",
             next_actions=[reason],

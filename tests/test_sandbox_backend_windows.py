@@ -135,6 +135,128 @@ def test_sandbox_setup_cli_does_not_rewrite_partial_status(monkeypatch: pytest.M
     assert payload["available_after_setup"] is False
 
 
+def test_windows_account_probe_handles_missing_net_command_without_name_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(windows.shutil, "which", lambda _name: None)
+
+    assert windows._account_exists(windows.SANDBOX_ACCOUNT) is False
+
+
+def test_windows_setup_requires_elevation_before_system_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutations = [
+        "_account_exists",
+        "_create_sandbox_account",
+        "_store_credential",
+        "_run_powershell",
+        "_apply_account_acl",
+    ]
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_elevated", lambda: False)
+    for name in mutations:
+        monkeypatch.setattr(
+            windows,
+            name,
+            lambda *args, _name=name, **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"{_name} must not run without elevation")
+            ),
+        )
+
+    report = windows.setup_windows_sandbox()
+
+    assert report.status == "requires_elevation"
+    assert report.requires_elevation is True
+    assert report.changed is False
+    assert report.completed_steps == ()
+    assert set(report.pending_steps) == {
+        "sandbox_account",
+        "credential",
+        "network_filter",
+        "acl_boundary",
+        "execution_backend",
+        "network_probe",
+    }
+
+
+def test_windows_setup_elevated_runs_account_network_acl_and_execution_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    def fake_run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(("command", command))
+        if command[:2] == ["net.exe", "user"]:
+            return subprocess.CompletedProcess(command, 1, "", "not found")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    def fake_create_account(name: str, password: str) -> windows._OperationResult:
+        calls.append(("create_account", name))
+        assert name == windows.SANDBOX_ACCOUNT
+        assert password
+        return windows._OperationResult(True)
+
+    def fake_store_credential(password: str) -> windows._OperationResult:
+        calls.append(("store_credential", bool(password)))
+        return windows._OperationResult(True)
+
+    def fake_run_powershell(command: str) -> subprocess.CompletedProcess[str]:
+        calls.append(("powershell", command))
+        if "New-NetFirewallRule" in command or "Remove-NetFirewallRule" in command:
+            return subprocess.CompletedProcess(["powershell"], 0, "", "")
+        return subprocess.CompletedProcess(["powershell"], 0, "S-1-5-21-123\n", "")
+
+    def fake_doctor() -> sandbox.WindowsSandboxDoctorReport:
+        calls.append(("doctor", "uncached"))
+        return sandbox.WindowsSandboxDoctorReport.ready_for_tests()
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows.shutil, "which", lambda name: "net.exe" if name == "net" else name)
+    monkeypatch.setattr(windows, "_is_elevated", lambda: True)
+    monkeypatch.setattr(windows, "_run_command", fake_run_command)
+    monkeypatch.setattr(windows, "_create_sandbox_account", fake_create_account)
+    monkeypatch.setattr(windows, "_store_credential", fake_store_credential)
+    monkeypatch.setattr(windows, "_run_powershell", fake_run_powershell)
+    monkeypatch.setattr(windows, "_firewall_rule_ready", lambda: False)
+    monkeypatch.setattr(
+        windows,
+        "_acl_state",
+        lambda _supported: sandbox.WindowsCapabilityState(
+            "available", True, "ACL boundary verified.", {}
+        ),
+    )
+    monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
+    monkeypatch.setattr(
+        windows,
+        "_runner_smoke_state",
+        lambda: sandbox.WindowsCapabilityState(
+            "available", True, "runner smoke verified.", {}
+        ),
+    )
+    monkeypatch.setattr(windows, "_probe_windows_sandbox_uncached", fake_doctor)
+
+    report = windows.setup_windows_sandbox()
+
+    assert report.status == "ready"
+    assert report.available_after_setup is True
+    assert set(report.completed_steps) >= {
+        "sandbox_account",
+        "credential",
+        "network_filter",
+        "acl_boundary",
+        "private_desktop",
+        "execution_backend",
+        "network_probe",
+    }
+    assert ("command", ["net.exe", "user", windows.SANDBOX_ACCOUNT]) in calls
+    assert ("create_account", windows.SANDBOX_ACCOUNT) in calls
+    assert ("store_credential", True) in calls
+    assert any(name == "powershell" and "New-NetFirewallRule" in str(payload) for name, payload in calls)
+    assert ("doctor", "uncached") in calls
+
+
 def test_windows_backend_never_prepares_without_completed_setup(tmp_path: Path) -> None:
     backend = sandbox.WindowsSandboxBackend()
 
