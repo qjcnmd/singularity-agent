@@ -222,6 +222,39 @@ SKIP_DIRS = {
     "work",
     "__pycache__",
 }
+RETIRED_DOC_PATHS = {
+    "docs/" + "adr",
+    "docs/evaluation" + "-harness.md",
+    "docs/INSTALLATION" + "_LAYOUT.md",
+    "docs/UPGRADE" + "_AND_MIGRATION.md",
+    "docs/architecture/agent" + "-host-transition.md",
+    "docs/architecture/agent" + "-kernel.md",
+    "docs/architecture/boundary" + "-contracts.md",
+    "docs/architecture/code" + "-index.md",
+    "docs/architecture/command" + "-execution.md",
+    "docs/architecture/desktop" + "-architecture-strategy.md",
+    "docs/architecture/edit" + "-execution.md",
+    "docs/architecture/event" + "-model.md",
+    "docs/architecture/execution" + "-map.md",
+    "docs/architecture/migration" + "-to-desktop.md",
+    "docs/architecture/model" + "-runner.md",
+    "docs/architecture/naming" + "-and-concept-map.md",
+    "docs/architecture/naming.md",
+    "docs/architecture/observability" + "-tracing.md",
+    "docs/architecture/planning" + "-and-run-control.md",
+    "docs/architecture/plugin" + "-management.md",
+    "docs/architecture/policy" + "-approval-engine.md",
+    "docs/architecture/policy" + "-approval.md",
+    "docs/architecture/prompt" + "-assembly.md",
+    "docs/architecture/sandbox" + "-isolation.md",
+    "docs/architecture/state" + "-model.md",
+    "docs/architecture/tool" + "-execution.md",
+    "docs/architecture/tool" + "-protocol.md",
+    "docs/architecture/trace" + "-audit.md",
+    "docs/architecture/verification" + "-runner.md",
+    "docs/architecture/workspace" + "-mutation.md",
+    "docs/architecture/workspace" + "-state-checkpointing.md",
+}
 
 
 @dataclass(frozen=True)
@@ -253,6 +286,7 @@ def main() -> int:
     for doc in docs:
         _verify_doc(doc, errors)
 
+    _verify_doc_tree(errors)
     _verify_forbidden_terms(errors)
 
     if errors:
@@ -343,6 +377,44 @@ def _verify_doc(doc: ModuleDataFlowDoc, errors: list[str]) -> None:
             continue
         if class_name not in doc.field_checks:
             errors.append(f"{label}: complete field check missing 字段清单 entry: {class_name}")
+
+
+def _verify_doc_tree(errors: list[str]) -> None:
+    docs_root = REPO_ROOT / "docs"
+    architecture_root = docs_root / "architecture"
+    modules_root = architecture_root / "modules"
+
+    for relative in sorted(RETIRED_DOC_PATHS):
+        path = REPO_ROOT / relative
+        if path.exists():
+            errors.append(f"retired old documentation path still exists: {relative}")
+
+    if architecture_root.is_dir():
+        for path in sorted(architecture_root.rglob("*.md")):
+            try:
+                path.relative_to(modules_root)
+            except ValueError:
+                errors.append(f"architecture markdown must live under docs/architecture/modules: {_rel(path)}")
+
+    for path in sorted(docs_root.rglob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        if _cjk_count(text) == 0:
+            errors.append(f"{_rel(path)}: markdown document must be Chinese current-state documentation")
+
+    readme = REPO_ROOT / "README.md"
+    if readme.exists():
+        text = readme.read_text(encoding="utf-8")
+        forbidden_refs = [
+            "docs/architecture/execution" + "-map.md",
+            "docs/architecture/naming" + "-and-concept-map.md",
+            "docs/architecture/agent" + "-host-transition.md",
+            "docs/architecture/migration" + "-to-desktop.md",
+            "docs/evaluation" + "-harness.md",
+            "docs/" + "adr/",
+        ]
+        for ref in forbidden_refs:
+            if ref in text:
+                errors.append(f"README.md references retired documentation path: {ref}")
 
 
 def _extract_doc_id(text: str) -> str:
@@ -536,6 +608,10 @@ def _rel(path: Path) -> str:
         return path.relative_to(REPO_ROOT).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+def _cjk_count(text: str) -> int:
+    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
 
 
 if __name__ == "__main__":

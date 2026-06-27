@@ -1,23 +1,22 @@
-# Local Plugin Management
+# Singularity 插件管理
 
-Singularity plugins are local project or user extensions. They are disabled by default and are loaded only after manifest, compatibility, permission, config, status, hash, and policy checks pass.
+Singularity 插件是本地项目或用户扩展。插件发现、manifest 校验、权限审批、启用状态和工具贡献由 `src/singularity/plugins/` 与 `src/singularity/tools/registry.py` 处理。
 
-Use:
+## 当前入口
 
-```text
+```bash
 singularity-agent plugin list --json
-singularity-agent plugin inspect <id> --json
-singularity-agent plugin check [id] --json
-singularity-agent plugin enable <id> --json
-singularity-agent plugin disable <id> --json
+singularity-agent plugin status --json
 ```
 
-Place project plugins under:
+插件启用/禁用能力也由当前 CLI 提供，具体命令以 `singularity-agent plugin --help` 为准。
 
-```text
-.singularity/plugins/<plugin-id>/
-  plugin.toml
-  plugin.py
-```
+## Manifest
 
-The manifest can also be named `singularity-plugin.toml`. See `docs/architecture/plugin-management.md` for the security model, manifest fields, and a complete minimal tool plugin.
+插件 manifest 必须对应 `PluginManifest（插件清单）` 的当前字段。完整字段和消费者见 `docs/architecture/modules/plugin-tools-registry.md`，不要在本文件复制字段子集。
+
+## 维护规则
+
+- 不新增绕过 `PluginManager`、`ToolRegistry`、`PolicyEngine` 或 `ApprovalGate` 的插件入口。
+- 不把旧插件命名或旧 manifest 读取方式作为默认路径。
+- 修改插件 manifest 字段、工具贡献结构、状态文件或 lock 文件时，同步更新 `docs/architecture/modules/plugin-tools-registry.md` 并运行 `python scripts/verify_runtime_docs.py`。

@@ -7,42 +7,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-REQUIRED_ARCHITECTURE_DOCS = [
-    "execution-map.md",
-    "naming-and-concept-map.md",
-    "boundary-contracts.md",
-    "state-model.md",
-    "event-model.md",
-    "tool-protocol.md",
-    "policy-approval.md",
-    "trace-audit.md",
-    "migration-to-desktop.md",
-    "desktop-architecture-strategy.md",
-    "agent-host-transition.md",
-    "naming.md",
-    "agent-kernel.md",
-    "planning-and-run-control.md",
-    "model-runner.md",
-    "prompt-assembly.md",
-    "tool-execution.md",
+MODULE_DOCS = {
+    "agent-loop.md",
+    "artifact-long-result-handling.md",
     "command-execution.md",
-    "workspace-mutation.md",
-    "workspace-state-checkpointing.md",
-    "observability-tracing.md",
-    "verification-runner.md",
-]
-
-REQUIRED_ADRS = [
-    "0001-local-first-agent.md",
-    "0002-cli-is-client-not-core.md",
-    "0003-rust-core-tauri-desktop.md",
-    "0004-python-plugin-management.md",
-    "0005-mcp-through-tool-broker.md",
-    "0006-singularity-project-identity.md",
-    "0007-adopt-rust-core-tauri-desktop-strategy.md",
-    "0008-agenthost-as-product-core-boundary.md",
-    "0009-python-plugin-management.md",
-]
+    "context-assembly-prompt-frame.md",
+    "context-compaction-observation-store.md",
+    "evaluation-benchmark-runner.md",
+    "failure-analysis-repair.md",
+    "kernel-agent-graph.md",
+    "memory-index-context.md",
+    "model-turn-provider-tools.md",
+    "planner-replanner-failure-recovery.md",
+    "plugin-tools-registry.md",
+    "policy-approval-gates.md",
+    "sandbox-isolation.md",
+    "tool-execution.md",
+    "tool-registry-exposure.md",
+    "trace-observation-audit-events.md",
+    "verification-contract-satisfaction.md",
+}
 
 REQUIRED_SCHEMAS = [
     "run-event.schema.json",
@@ -54,24 +38,58 @@ REQUIRED_SCHEMAS = [
     "memory-item.schema.json",
 ]
 
+RETIRED_DOC_PATHS = [
+    "docs/" + "adr",
+    "docs/evaluation" + "-harness.md",
+    "docs/architecture/execution" + "-map.md",
+    "docs/architecture/naming" + "-and-concept-map.md",
+    "docs/architecture/migration" + "-to-desktop.md",
+    "docs/architecture/desktop" + "-architecture-strategy.md",
+    "docs/architecture/agent" + "-host-transition.md",
+]
 
-def test_architecture_contract_docs_exist() -> None:
-    for name in REQUIRED_ARCHITECTURE_DOCS:
-        path = ROOT / "docs" / "architecture" / name
-        assert path.exists(), f"missing docs/architecture/{name}"
-        assert path.read_text(encoding="utf-8").lstrip().startswith("# ")
+
+def test_only_module_architecture_docs_remain() -> None:
+    architecture_root = ROOT / "docs" / "architecture"
+    files = {
+        path.relative_to(architecture_root).as_posix()
+        for path in architecture_root.rglob("*.md")
+    }
+
+    assert files == {f"modules/{name}" for name in MODULE_DOCS}
 
 
-def test_architecture_contract_adr_files_exist() -> None:
-    for name in REQUIRED_ADRS:
-        path = ROOT / "docs" / "adr" / name
-        assert path.exists(), f"missing docs/adr/{name}"
+def test_module_docs_are_chinese_data_flow_docs() -> None:
+    for name in MODULE_DOCS:
+        path = ROOT / "docs" / "architecture" / "modules" / name
         text = path.read_text(encoding="utf-8")
-        assert text.startswith("# ADR ")
-        assert "Status:" in text
+
+        assert text.startswith("# ")
+        assert "模块数据流文档 ID:" in text
+        assert "源码证据路径:" in text
+        assert "字段清单:" in text
+        assert "## 真实运行时调用链" in text
+        assert _cjk_count(text) > 100
 
 
-def test_architecture_contract_schema_files_exist_and_parse() -> None:
+def test_retired_doc_paths_do_not_exist() -> None:
+    for relative in RETIRED_DOC_PATHS:
+        assert not (ROOT / relative).exists(), f"retired doc path still exists: {relative}"
+
+
+def test_readme_points_to_current_module_docs() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert text.startswith("# Singularity")
+    assert "docs/architecture/modules/" in text
+    assert "docs/architecture/execution" + "-map.md" not in text
+    assert "docs/evaluation" + "-harness.md" not in text
+    assert "docs/" + "adr" not in text
+    assert "旧阶段报告" in text
+    assert _cjk_count(text) > 200
+
+
+def test_schema_files_exist_and_parse() -> None:
     for name in REQUIRED_SCHEMAS:
         path = ROOT / "docs" / "schemas" / name
         assert path.exists(), f"missing docs/schemas/{name}"
@@ -81,107 +99,24 @@ def test_architecture_contract_schema_files_exist_and_parse() -> None:
         assert schema["title"]
 
 
-def test_readme_uses_singularity_identity() -> None:
-    text = (ROOT / "README.md").read_text(encoding="utf-8")
-
-    assert text.startswith("# Singularity")
-    assert "Singularity" in text
-
-
-def test_readme_component_names_match_naming_map() -> None:
-    readme_names = _component_names(ROOT / "README.md")
-    naming_map_names = _component_names(ROOT / "docs" / "architecture" / "naming-and-concept-map.md")
-
-    assert readme_names == naming_map_names
-    assert "ContextManager" in readme_names
-    assert "ContextSource" not in readme_names
-    assert "DocumentationPipeline" in readme_names
-    assert "ParallelToolExecutor" in readme_names
-    assert "GitClient" in readme_names
-    assert "MemoryBundleSync" in readme_names
-    assert "RemoteApprovalExchange" in readme_names
-
-
-def test_readme_component_status_table_has_source_or_planned_mapping() -> None:
-    text = (ROOT / "README.md").read_text(encoding="utf-8")
-
-    assert "## Component Capability Status" in text
-    assert "| Capability | Status | Source or boundary |" in text
-    for status in ("implemented", "partial", "planned"):
-        assert f"| {status} |" in text or f" {status} " in text
-    assert "`ContextManager` | implemented | `src/singularity/context/manager.py`" in text
-    assert "`ModelRunner` | implemented | `src/singularity/model/runner.py`" in text
-    assert "`FinalReport` | implemented | kernel: `src/singularity/kernel/finalization.py`" in text
-
-
-def test_readme_implemented_component_source_paths_exist() -> None:
-    text = (ROOT / "README.md").read_text(encoding="utf-8")
-
-    for capability, status, source in _component_status_rows(text):
-        if status != "implemented":
-            continue
-        for relative_path in re.findall(r"`(src/singularity/[^`]+)`", source):
-            path = ROOT / relative_path
-            assert path.exists(), f"{capability} references missing source path: {relative_path}"
-
-
-def test_git_client_docs_match_local_only_contract() -> None:
+def test_docs_do_not_reintroduce_retired_terms() -> None:
     combined = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in [
-            ROOT / "README.md",
-            ROOT / "docs" / "architecture" / "naming-and-concept-map.md",
-            ROOT / "docs" / "architecture" / "command-execution.md",
-            ROOT / "docs" / "architecture" / "code-index.md",
-            ROOT / "docs" / "architecture" / "verification-runner.md",
-        ]
+        for path in (ROOT / "docs").rglob("*.md")
     )
 
-    assert "Git-absent component boundary" not in combined
-    assert "GitClient` is still reserved" not in combined
-    assert "local-only status, diff, and commit" in combined
-    assert "Push, pull, reset, remote branches, pull requests" in combined
+    forbidden = [
+        "Runtime" + " Flow",
+        "deprecated compatibility" + " alias",
+        "migration" + " input",
+        "retired" + " live",
+        "eval" + " live",
+        "Live" + "Eval",
+        "Live" + "Agent",
+    ]
+    for term in forbidden:
+        assert term not in combined
 
 
-def test_config_and_sandbox_docs_match_implemented_evidence() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    naming_map = (ROOT / "docs" / "architecture" / "naming-and-concept-map.md").read_text(
-        encoding="utf-8"
-    )
-    sandbox = (ROOT / "docs" / "architecture" / "sandbox-isolation.md").read_text(
-        encoding="utf-8"
-    )
-
-    assert ".singularity/config.toml" in readme
-    assert "effective config" in readme
-    assert "config source" in readme
-    assert "explicit CLI flag > SINGULARITY_* > .singularity/config.toml > defaults" in readme
-    assert "DockerSandboxBackend" in sandbox
-    assert "LocalStagingBackend" in sandbox
-    assert "hard_isolation" in naming_map
-    assert "soft_workspace_isolation" in naming_map
-    assert "no_isolation" in naming_map
-    assert "fails closed" in readme
-
-
-def _component_names(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
-    match = re.search(
-        r"<!-- architecture-components:start -->(.*?)<!-- architecture-components:end -->",
-        text,
-        re.DOTALL,
-    )
-    assert match, f"missing architecture-components markers in {path}"
-    return re.findall(r"`([^`]+)`", match.group(1))
-
-
-def _component_status_rows(text: str) -> list[tuple[str, str, str]]:
-    rows: list[tuple[str, str, str]] = []
-    for line in text.splitlines():
-        if not line.startswith("| `"):
-            continue
-        parts = [part.strip() for part in line.strip("|").split("|")]
-        if len(parts) != 3:
-            continue
-        rows.append((parts[0], parts[1], parts[2]))
-    return rows
+def _cjk_count(text: str) -> int:
+    return len(re.findall(r"[\u4e00-\u9fff]", text))

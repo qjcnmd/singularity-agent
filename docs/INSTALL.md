@@ -1,91 +1,50 @@
-# Singularity Install
+# Singularity 安装说明
 
-Singularity is packaged as a local Python CLI. Install it from a checkout with:
+Singularity 当前作为本地 Python CLI 运行。
 
-```bash
-python -m pip install .
-```
-
-For isolated user-level installs, prefer:
+## 安装
 
 ```bash
-pipx install .
+pip install -e .
 ```
 
-The console script is:
+安装后可用入口：
 
 ```bash
-singularity-agent
-sg
+singularity-agent --help
+sg --help
 ```
 
-It resolves to `singularity.cli:main`, so installed usage does not depend on running inside the source checkout.
+## 配置
 
-## Component Home
+OpenAI-compatible provider 通过环境变量配置：
 
-By default Singularity stores user-level component data under the platform user data directory, then creates this layout:
-
-```text
-config/
-state/
-cache/
-logs/
-traces/
-memory/
-eval/
-backups/
-tmp/
+```powershell
+$env:SINGULARITY_BASE_URL = "https://api.openai.com/v1"
+$env:SINGULARITY_API_KEY = "..."
+$env:SINGULARITY_MODEL = "gpt-4.1-mini"
 ```
 
-Override the component root for tests, portable installs, or isolated runs:
+API key 只通过环境变量读取，不写入文档、trace、report 或 CLI 参数。
+
+## 本地状态
+
+运行时状态由 release、trace、context、memory、evaluation 和 plugin 组件管理。常用检查命令：
 
 ```bash
-SINGULARITY_HOME=/path/to/singularity-home singularity-agent system init
-```
-
-Portable mode keeps the component under the current project directory:
-
-```bash
-singularity-agent system init --mode portable
-```
-
-Development mode keeps the component under `.singularity/` in the current checkout:
-
-```bash
-singularity-agent system init --mode development
-```
-
-## First Run
-
-Initialize once:
-
-```bash
-singularity-agent system init
-```
-
-The command is idempotent. Existing config and manifest files are preserved unless `--force` is passed.
-
-Check the installation:
-
-```bash
-singularity-agent version
-singularity-agent doctor
-```
-
-Machine-readable variants:
-
-```bash
-singularity-agent version --json
 singularity-agent doctor --json
+singularity-agent repair --dry-run --json
+singularity-agent system init --json
+singularity-agent system export --output singularity-export.zip --json
 ```
 
-## Optional Features
+生成的 trace、evaluation、context、memory 和插件状态不属于源码文档，应保存在 `.singularity/`、`work/` 或显式输出目录中。
 
-Core CLI dependencies are installed by default. Optional extras are separated by feature:
+## 验证
 
 ```bash
-python -m pip install ".[eval]"
-python -m pip install ".[devtools]"
+python -m compileall src scripts
+python -m ruff check .
+python scripts/verify_runtime_docs.py
+python -m pytest tests --basetemp work/pytest-tmp
 ```
-
-The `sandbox` extra currently has no additional Python dependency; sandbox capability is checked at component.

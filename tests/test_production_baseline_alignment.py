@@ -595,8 +595,9 @@ def test_readme_documents_v010_production_architecture() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
 
     assert "# Singularity v0.1.0" in readme
-    assert "Project identity:" in readme
-    assert "production-oriented local coding agent harness" in readme
+    assert "## 当前身份" in readme
+    assert "本地优先的 CLI coding agent harness" in readme
+    assert "docs/architecture/modules/" in readme
     assert (
         "CLI\n"
         "-> KernelBootstrap.boot()\n"
@@ -608,34 +609,28 @@ def test_readme_documents_v010_production_architecture() -> None:
         "-> ModelRunner.build_request_from_context()\n"
         "-> ModelTurnRequestBuilder.build_request()\n"
         "-> PromptAssemblyPipeline.build_for_model_turn()\n"
-        "-> ContextManager.messages()\n"
         "-> ContextManager.build_bundle()\n"
         "-> ModelRunner.run_turn()"
     ) in readme
     assert (
         "ToolProtocolEngine.process_model_turn()\n"
         "-> ToolExecutor.execute_request()\n"
-        "-> PolicyEngine.enforce() / ApprovalGate.consume_matching_grant() / ApprovalGate.resolve()"
+        "-> PolicyEngine.enforce() / ApprovalGate"
     ) in readme
-    assert "ParallelToolExecutor" in readme
-    assert "list_files" in readme
-    assert "read_file" in readme
-    assert "search_text" in readme
-    assert "GitClient" in readme
-    assert "RemoteApprovalExchange" in readme
-    assert "MemoryBundleSync" in readme
-    assert "approval modes" in readme.lower()
+    assert "PolicyEngine（策略引擎）" in readme
+    assert "ApprovalGate（审批闸门）" in readme
+    assert "EvaluationRunner（评估运行器）" in readme
+    assert "singularity-agent eval run docs/evaluation/capability-regression-tasks.json --json" in readme
     assert "<trace-run-dir>/context.sqlite3" in readme
     assert "<trace-run-dir>/tool_protocol.sqlite3" in readme
     assert "--strict" in readme
     assert "--dry-run" in readme
-    assert "--resume" in readme
-    assert "raw tool args" in readme
-    assert "raw tool results" in readme
-    assert "DockerSandboxBackend" in readme
-    assert "hard isolation" in readme
-    assert "soft_workspace_isolation" in readme
-    assert "fails closed" in readme
+    assert "agent_completed" in readme
+    assert "evaluation_passed" in readme
+    assert "miscompletion_count" in readme
+    assert "旧阶段报告" in readme
+    assert "docs/architecture/execution" + "-map.md" not in readme
+    assert "docs/evaluation" + "-harness.md" not in readme
 
 
 class CountingProtocolEngine(ToolProtocolEngine):
