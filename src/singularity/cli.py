@@ -181,6 +181,35 @@ def sandbox_setup(
         raise typer.Exit(exit_code)
 
 
+@sandbox_app.command("cleanup")
+def sandbox_cleanup(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print machine-readable cleanup status.")
+    ] = False,
+) -> None:
+    """Remove Singularity-owned native Windows sandbox assets."""
+    backend = WindowsSandboxBackend()
+    try:
+        cleanup = backend.cleanup_assets()
+        payload = cleanup.to_dict()
+        exit_code = 0 if payload.get("status") == "completed" else 1
+    except Exception as exc:
+        payload = {
+            "status": "failed",
+            "requested_operation": "cleanup",
+            "error_type": type(exc).__name__,
+            "message": "Windows sandbox cleanup failed; inspect diagnostics for operation details.",
+            "diagnostics": (sandbox_exception_diagnostics("sandbox_cleanup", exc),),
+        }
+        exit_code = 1
+    if json_output:
+        _write_stdout(json_dumps(payload))
+    else:
+        console.print(Panel(json_dumps(payload), title="sandbox cleanup"))
+    if exit_code:
+        raise typer.Exit(exit_code)
+
+
 @app.command("run")
 @app.command("main", hidden=True)
 def run_goal(
@@ -329,6 +358,9 @@ def run_goal(
     """Run the production-oriented local CLI coding agent harness."""
 
     project_root = resolve_project_root(project_root)
+    writable_dirs: list[Path | str] | None = (
+        list(additional_writable_directories) if additional_writable_directories is not None else None
+    )
     production_config = ProductionConfig.from_cli(
         project_root=project_root,
         max_turns=max_turns,
@@ -336,7 +368,7 @@ def run_goal(
         permission_profile=permission_profile,
         approval_policy=approval_policy,
         network_access=network_access,
-        additional_writable_directories=additional_writable_directories,
+        additional_writable_directories=writable_dirs,
         windows_sandbox=windows_sandbox,
         strict=strict,
         dry_run=dry_run,

@@ -62,6 +62,10 @@ def test_windows_doctor_reports_primitives_and_setup_separately() -> None:
         assert "secret" not in str(item["evidence"]).lower()
     assert set(payload["setup"]) == {
         "sandbox_account",
+        "login_ui_visibility",
+        "logon_rights",
+        "group_membership",
+        "state_dir_acl",
         "acl_boundary",
         "network_filter",
         "private_desktop",
@@ -84,7 +88,7 @@ def test_windows_backend_is_unavailable_until_all_enforcement_is_configured() ->
         assert backend.capabilities().filesystem_isolation is True
         assert backend.capabilities().network_isolation is True
     else:
-        assert report.setup.execution_backend.ready is False
+        assert report.blocking_requirements
         assert backend.is_available() is False
         assert backend.capabilities().filesystem_isolation is False
         assert backend.capabilities().network_isolation is False
@@ -134,6 +138,32 @@ def test_sandbox_setup_cli_does_not_rewrite_partial_status(monkeypatch: pytest.M
     assert payload["schema_version"] == "sandbox.windows.setup/v1"
     assert payload["status"] == "requires_elevation"
     assert payload["available_after_setup"] is False
+
+
+def test_sandbox_cleanup_cli_reports_machine_readable_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = sandbox.WindowsSandboxCleanupReport(
+        status="completed",
+        requested_operation="cleanup",
+        requires_elevation=False,
+        changed=True,
+        completed_steps=("state_dir",),
+        failed_steps=(),
+        diagnostics=(),
+    )
+    monkeypatch.setattr(sandbox.WindowsSandboxBackend, "cleanup_assets", lambda self: report)
+
+    result = CliRunner().invoke(app, ["sandbox", "cleanup", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == "sandbox.windows.cleanup/v1"
+    assert payload["requested_operation"] == "cleanup"
+    assert payload["status"] == "completed"
+    assert payload["completed"] is True
+    assert payload["failed"] is False
+    assert payload["changed"] is True
 
 
 def test_windows_account_probe_handles_missing_net_command_without_name_error(
@@ -311,6 +341,223 @@ def test_windows_legacy_artifact_diagnostics_report_old_account_credential_and_f
     assert firewall["group"] == windows.FIREWALL_RULE_GROUP
 
 
+def test_windows_cleanup_requires_elevation_before_destructive_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_elevated", lambda: False)
+    for name in (
+        "_delete_sandbox_account",
+        "_delete_credential",
+        "_delete_firewall_rule",
+        "_delete_windows_state_dir",
+        "_remove_login_ui_visibility_entry",
+    ):
+        monkeypatch.setattr(
+            windows,
+            name,
+            lambda *args, _name=name, **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"{_name} must not run without elevation")
+            ),
+        )
+
+    report = windows.cleanup_windows_sandbox_assets()
+
+    assert report.status == "requires_elevation"
+    assert report.requires_elevation is True
+    assert report.changed is False
+
+
+def test_windows_cleanup_removes_current_and_legacy_assets_idempotently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def changed_result(kind: str, target: str) -> windows._OperationResult:
+        calls.append((kind, target))
+        return windows._OperationResult(True, "removed", {"changed": target == windows.LEGACY_SANDBOX_ACCOUNT})
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_elevated", lambda: True)
+    monkeypatch.setattr(
+        windows,
+        "_legacy_artifact_diagnostics",
+        lambda: (
+            {
+                "kind": "legacy_sandbox_account",
+                "status": "present",
+                "account_name_hash": "legacy",
+                "account_name_redacted": "Sin...ner",
+            },
+        ),
+    )
+    monkeypatch.setattr(windows, "_delete_credential", lambda target: changed_result("credential", target))
+    monkeypatch.setattr(windows, "_delete_firewall_rule", lambda target: changed_result("firewall", target))
+    monkeypatch.setattr(
+        windows,
+        "_remove_login_ui_visibility_entry",
+        lambda target: changed_result("visibility", target),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_delete_windows_state_dir",
+        lambda: windows._OperationResult(True, "not_present", {"changed": False}),
+    )
+    monkeypatch.setattr(windows, "_delete_sandbox_account", lambda target: changed_result("account", target))
+
+    report = windows.cleanup_windows_sandbox_assets()
+    payload = report.to_dict()
+    text = json.dumps(payload)
+
+    assert report.status == "completed"
+    assert report.changed is True
+    assert {kind for kind, _target in calls} == {"credential", "firewall", "visibility", "account"}
+    assert ( "account", windows.LEGACY_SANDBOX_ACCOUNT) in calls
+    assert ( "account", windows.SANDBOX_ACCOUNT) in calls
+    assert payload["schema_version"] == "sandbox.windows.cleanup/v1"
+    assert payload["failed_steps"] == []
+    assert "S-1-5-21" not in text
+    assert "password" not in text.lower()
+
+
+def test_login_ui_visibility_state_requires_hidden_userlist_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_powershell(command: str) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(["powershell"], 0, "", "")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_run_powershell", fake_powershell)
+
+    state = windows._login_ui_visibility_state()
+    payload = json.dumps(state.to_dict())
+
+    assert state.status == "available"
+    assert "SpecialAccounts" not in payload
+    assert windows.SANDBOX_ACCOUNT not in payload
+    assert "registry_key_hash" in state.evidence
+    assert calls and "UserList" in calls[0]
+
+
+def test_logon_rights_state_requires_hardened_deny_surface() -> None:
+    hardened = windows._logon_rights_view(
+        [
+            "SeInteractiveLogonRight",
+            "SeDenyRemoteInteractiveLogonRight",
+            "SeDenyNetworkLogonRight",
+            "SeDenyServiceLogonRight",
+            "SeDenyBatchLogonRight",
+        ],
+        "",
+    )
+    overexposed = windows._logon_rights_view(
+        [
+            "SeInteractiveLogonRight",
+            "SeNetworkLogonRight",
+            "SeDenyRemoteInteractiveLogonRight",
+            "SeDenyServiceLogonRight",
+            "SeDenyBatchLogonRight",
+        ],
+        "",
+    )
+
+    assert windows._logon_rights_state(hardened).status == "available"
+    state = windows._logon_rights_state(overexposed)
+    assert state.status == "missing"
+    assert state.evidence["logon_rights"]["network"] is True
+    assert "CreateProcessWithLogonW" in state.evidence["interactive_logon_note"]
+
+
+def test_credential_state_redacts_target_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_credential_exists", lambda _target: True)
+
+    state = windows._credential_state()
+    text = json.dumps(state.to_dict())
+
+    assert state.status == "available"
+    assert "target_hash" in state.evidence
+    assert "target_redacted" in state.evidence
+    assert windows.SANDBOX_ACCOUNT not in text
+
+
+def test_network_state_redacts_firewall_rule_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        windows,
+        "_run_powershell",
+        lambda _command: subprocess.CompletedProcess(["powershell"], 0, "", ""),
+    )
+
+    state = windows._network_state("S-1-5-21-123")
+    text = json.dumps(state.to_dict())
+
+    assert state.status == "available"
+    assert state.evidence["rule_hash"]
+    assert state.evidence["rule_redacted"]
+    assert windows.FIREWALL_RULE_NAME not in text
+    assert "S-1-5-21" not in text
+
+
+def test_setup_logon_hardening_removes_unneeded_allows_and_adds_denies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fake_remove(_sid: str, rights: tuple[str, ...]) -> windows._OperationResult:
+        calls.append(("remove", rights))
+        return windows._OperationResult(True, "removed", {"changed": bool(rights)})
+
+    def fake_add(_sid: str, rights: tuple[str, ...]) -> windows._OperationResult:
+        calls.append(("add", rights))
+        return windows._OperationResult(True, "added", {"changed": bool(rights)})
+
+    states = [
+        windows._logon_rights_view(
+            [
+                "SeInteractiveLogonRight",
+                "SeNetworkLogonRight",
+                "SeBatchLogonRight",
+            ],
+            "",
+        ),
+        windows._logon_rights_view(
+            [
+                "SeInteractiveLogonRight",
+                "SeDenyRemoteInteractiveLogonRight",
+                "SeDenyNetworkLogonRight",
+                "SeDenyServiceLogonRight",
+                "SeDenyBatchLogonRight",
+            ],
+            "",
+        ),
+    ]
+
+    monkeypatch.setattr(windows, "_enumerate_account_logon_rights", lambda _sid: states.pop(0))
+    monkeypatch.setattr(windows, "_remove_account_rights", fake_remove)
+    monkeypatch.setattr(windows, "_add_account_rights", fake_add)
+
+    result = windows._harden_sandbox_logon_rights("S-1-5-21-123")
+
+    assert result.ok is True
+    assert result.details["changed"] is True
+    assert ("remove", ("SeBatchLogonRight", "SeNetworkLogonRight")) in calls
+    added = next(rights for action, rights in calls if action == "add")
+    assert set(added) == {
+        "SeDenyBatchLogonRight",
+        "SeDenyNetworkLogonRight",
+        "SeDenyRemoteInteractiveLogonRight",
+        "SeDenyServiceLogonRight",
+    }
+
+
 def test_windows_setup_requires_elevation_before_system_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -342,10 +589,14 @@ def test_windows_setup_requires_elevation_before_system_mutation(
     assert set(report.pending_steps) == {
         "sandbox_account",
         "credential",
+        "login_ui_visibility",
         "logon_right",
+        "logon_hardening",
         "account_group",
+        "state_dir_acl",
         "network_filter",
         "acl_boundary",
+        "private_desktop",
         "execution_backend",
         "network_probe",
     }
@@ -372,6 +623,18 @@ def test_windows_setup_elevated_runs_account_network_acl_and_execution_helpers(
         calls.append(("store_credential", bool(password)))
         return windows._OperationResult(True)
 
+    def fake_hide_account(name: str) -> windows._OperationResult:
+        calls.append(("hide_account", name))
+        return windows._OperationResult(True, "hidden", {"changed": True})
+
+    def fake_harden_rights(sid: str) -> windows._OperationResult:
+        calls.append(("harden_rights", sid))
+        return windows._OperationResult(True, "hardened", {"changed": True})
+
+    def fake_state_dir_acl() -> windows._OperationResult:
+        calls.append(("state_dir_acl", True))
+        return windows._OperationResult(True, "state_dir_acl_applied", {"changed": True})
+
     def fake_run_powershell(command: str) -> subprocess.CompletedProcess[str]:
         calls.append(("powershell", command))
         if "New-NetFirewallRule" in command or "Remove-NetFirewallRule" in command:
@@ -388,6 +651,9 @@ def test_windows_setup_elevated_runs_account_network_acl_and_execution_helpers(
     monkeypatch.setattr(windows, "_run_command", fake_run_command)
     monkeypatch.setattr(windows, "_create_sandbox_account", fake_create_account)
     monkeypatch.setattr(windows, "_store_credential", fake_store_credential)
+    monkeypatch.setattr(windows, "_hide_account_from_login_ui", fake_hide_account)
+    monkeypatch.setattr(windows, "_harden_sandbox_logon_rights", fake_harden_rights)
+    monkeypatch.setattr(windows, "_ensure_state_dir_acl", fake_state_dir_acl)
     monkeypatch.setattr(windows, "_run_powershell", fake_run_powershell)
     monkeypatch.setattr(windows, "_firewall_rule_ready", lambda: False)
     monkeypatch.setattr(
@@ -436,8 +702,11 @@ def test_windows_setup_elevated_runs_account_network_acl_and_execution_helpers(
     assert set(report.completed_steps) >= {
         "sandbox_account",
         "credential",
+        "login_ui_visibility",
         "logon_right",
+        "logon_hardening",
         "account_group",
+        "state_dir_acl",
         "network_filter",
         "acl_boundary",
         "private_desktop",
@@ -447,6 +716,9 @@ def test_windows_setup_elevated_runs_account_network_acl_and_execution_helpers(
     assert ("command", ["net.exe", "user", windows.SANDBOX_ACCOUNT]) in calls
     assert ("create_account", windows.SANDBOX_ACCOUNT) in calls
     assert ("store_credential", True) in calls
+    assert ("hide_account", windows.SANDBOX_ACCOUNT) in calls
+    assert ("harden_rights", "S-1-5-21-123") in calls
+    assert ("state_dir_acl", True) in calls
     assert any(name == "powershell" and "New-NetFirewallRule" in str(payload) for name, payload in calls)
     assert ("doctor", "uncached") in calls
 
@@ -474,6 +746,21 @@ def test_windows_setup_failed_probe_steps_include_structured_details(
     monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
     monkeypatch.setattr(windows, "_account_exists", lambda _name: True)
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(
+        windows,
+        "_hide_account_from_login_ui",
+        lambda _name: windows._OperationResult(True, "already_hidden", {"changed": False}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_harden_sandbox_logon_rights",
+        lambda _sid: windows._OperationResult(True, "hardened", {"changed": False}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_ensure_state_dir_acl",
+        lambda: windows._OperationResult(True, "state_dir_acl", {"changed": False}),
+    )
     monkeypatch.setattr(
         windows,
         "_enumerate_account_logon_rights",
@@ -1198,7 +1485,8 @@ def test_windows_doctor_launcher_reports_logon_rights_and_blocks_when_right_miss
 ) -> None:
     monkeypatch.setattr(windows.os, "name", "nt", raising=False)
     monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
-    monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "")
+    monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "D:\\anconda3\\python.exe BUILTIN\\Users:(I)(RX)")
+    monkeypatch.setattr(windows.sys, "executable", "D:\\anconda3\\python.exe")
 
     rights = windows._logon_rights_view([], "")
     state = windows._launcher_state("S-1-5-21-123", rights, acl_boundary_ready=True)
@@ -1215,6 +1503,7 @@ def test_windows_doctor_launcher_reports_logon_rights_and_blocks_when_right_miss
     assert evidence["window_station"]["lpDesktop"] is None
     assert evidence["desktop"]["inherits_parent"] is True
     assert evidence["executable"]["path_hash"]
+    assert "D:\\anconda3\\python.exe" not in evidence["executable"]["acl_summary_redacted"]
     assert evidence["working_directory"]["account_has_access"] is True
     assert "S-1-5-21" not in json.dumps(state.to_dict())
 
@@ -1369,6 +1658,21 @@ def _patch_setup_common(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
     monkeypatch.setattr(windows, "_account_exists", lambda _name: True)
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(
+        windows,
+        "_hide_account_from_login_ui",
+        lambda _name: windows._OperationResult(True, "already_hidden", {"changed": False}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_harden_sandbox_logon_rights",
+        lambda _sid: windows._OperationResult(True, "hardened", {"changed": False}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_ensure_state_dir_acl",
+        lambda: windows._OperationResult(True, "state_dir_acl", {"changed": False}),
+    )
     monkeypatch.setattr(
         windows,
         "_credential_state",
