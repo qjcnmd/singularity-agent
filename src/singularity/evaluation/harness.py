@@ -5,16 +5,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from singularity.evaluation.models import BenchmarkTask, EvaluationProfile
 from singularity.evaluation.execution import (
-    EvaluationArtifactWriter,
     BenchmarkTaskExecutor,
+    EvaluationArtifactWriter,
 )
-from singularity.evaluation.runner import (
-    EvaluationRunner,
-    EvaluationTaskSet,
-    SingularityPrivateBenchmarkAdapter,
-)
+from singularity.evaluation.models import BenchmarkTask, EvaluationProfile
 from singularity.evaluation.patch_quality import PatchQualityEvaluator
 from singularity.evaluation.replay import TraceReplayHarness
 from singularity.evaluation.reports import (
@@ -24,6 +19,11 @@ from singularity.evaluation.reports import (
     TaskEvaluationResult,
     metrics_for_results,
     new_report,
+)
+from singularity.evaluation.runner import (
+    EvaluationRunner,
+    EvaluationTaskSet,
+    SingularityPrivateBenchmarkAdapter,
 )
 from singularity.evaluation.scoring import ScoringEngine
 
@@ -51,6 +51,7 @@ class EvaluationHarness:
         self.tool_executor = tool_executor
         self.command_executor = command_executor
         self.mutation_manager = mutation_manager
+        self.cancellation_token: Any | None = None
         self.scoring = ScoringEngine()
         self.patch_quality = PatchQualityEvaluator()
         self.trace_replay_harness = TraceReplayHarness(project_root=self.project_root)

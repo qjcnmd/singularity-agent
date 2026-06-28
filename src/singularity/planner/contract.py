@@ -25,7 +25,7 @@ class AcceptanceCriterion:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "AcceptanceCriterion":
+    def from_dict(cls, payload: dict[str, Any]) -> AcceptanceCriterion:
         return cls(
             criterion_id=str(payload["criterion_id"]),
             description=str(payload.get("description") or payload["criterion_id"]),
@@ -44,7 +44,7 @@ class Deliverable:
         return {"kind": self.kind, "description": self.description, "path": self.path}
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "Deliverable":
+    def from_dict(cls, payload: dict[str, Any]) -> Deliverable:
         return cls(
             kind=str(payload.get("kind") or "artifact"),
             description=str(payload.get("description") or ""),
@@ -61,7 +61,7 @@ class Constraint:
         return {"description": self.description, "source": self.source}
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "Constraint":
+    def from_dict(cls, payload: dict[str, Any]) -> Constraint:
         return cls(
             description=str(payload.get("description") or ""),
             source=str(payload.get("source") or "user"),
@@ -82,7 +82,7 @@ class VerificationRequirement:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "VerificationRequirement":
+    def from_dict(cls, payload: dict[str, Any]) -> VerificationRequirement:
         command = payload.get("command")
         return cls(
             description=str(payload.get("description") or ""),
@@ -105,7 +105,7 @@ class ReportRequirement:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ReportRequirement":
+    def from_dict(cls, payload: dict[str, Any]) -> ReportRequirement:
         return cls(
             description=str(payload.get("description") or ""),
             sections=[str(item) for item in payload.get("sections") or []],
@@ -127,7 +127,7 @@ class EvidenceRequirement:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "EvidenceRequirement":
+    def from_dict(cls, payload: dict[str, Any]) -> EvidenceRequirement:
         return cls(
             evidence_key=str(payload["evidence_key"]),
             description=str(payload.get("description") or payload["evidence_key"]),
@@ -170,7 +170,7 @@ class TaskContract:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TaskContract":
+    def from_dict(cls, payload: dict[str, Any]) -> TaskContract:
         return cls(
             version=int(payload.get("version") or 1),
             source=str(payload.get("source") or "structured_output"),
@@ -196,7 +196,7 @@ class TaskContract:
         )
 
     @classmethod
-    def validate_payload(cls, payload: dict[str, Any]) -> "TaskContract":
+    def validate_payload(cls, payload: dict[str, Any]) -> TaskContract:
         if not isinstance(payload, dict):
             raise TaskContractSchemaError("TaskContract payload must be an object.")
         try:

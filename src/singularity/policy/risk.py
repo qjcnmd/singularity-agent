@@ -16,7 +16,6 @@ from singularity.policy.models import (
     RiskTag,
 )
 
-
 SECRET_NAME_RE = re.compile(
     r"(^\.env(\.|$)|id_rsa|credentials|credential|token|secret|api[_-]?key|password|\.pem$|\.pfx$|\.p12$|\.key$)",
     re.IGNORECASE,

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Literal
 
 
-class ChangeOwnership(str, Enum):
+class ChangeOwnership(StrEnum):
     USER_OWNED = "USER_OWNED"
     AGENT_MUTATION = "AGENT_MUTATION"
     COMMAND_SIDE_EFFECT = "COMMAND_SIDE_EFFECT"
@@ -17,7 +17,7 @@ class ChangeOwnership(str, Enum):
     UNKNOWN_EXTERNAL = "UNKNOWN_EXTERNAL"
 
 
-class WorkspaceHealthStatus(str, Enum):
+class WorkspaceHealthStatus(StrEnum):
     CLEAN = "clean"
     DIRTY = "dirty"
     CONFLICTED = "conflicted"
@@ -25,7 +25,7 @@ class WorkspaceHealthStatus(str, Enum):
     CORRUPTED = "corrupted"
 
 
-class RecoveryStatus(str, Enum):
+class RecoveryStatus(StrEnum):
     CLEAN = "clean"
     RECOVERABLE = "recoverable"
     NEEDS_USER_REVIEW = "needs_user_review"
@@ -68,7 +68,7 @@ class FileSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "FileSnapshot | None":
+    def from_dict(cls, payload: dict[str, Any] | None) -> FileSnapshot | None:
         if payload is None:
             return None
         return cls(
@@ -113,7 +113,7 @@ class WorkspaceBaseline:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "WorkspaceBaseline":
+    def from_dict(cls, payload: dict[str, Any]) -> WorkspaceBaseline:
         return cls(
             workspace_root=str(payload["workspace_root"]),
             baseline_id=str(payload["baseline_id"]),

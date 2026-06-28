@@ -11,7 +11,6 @@ from typing import Any
 from singularity import __version__
 from singularity.release.paths import UserDataPaths, resolve_user_data_paths
 
-
 OPTIONAL_FEATURE_MODULES = {
     "eval": {"yaml": "PyYAML"},
     "sandbox": {},

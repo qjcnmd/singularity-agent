@@ -6,6 +6,7 @@ from pathlib import Path
 from singularity.memory.extractor import MemoryExtractor
 from singularity.memory.maintenance import MemoryMaintenance
 from singularity.memory.models import (
+    TTL,
     ConflictStatus,
     MemoryEntry,
     MemoryEvidenceRef,
@@ -14,7 +15,6 @@ from singularity.memory.models import (
     MemoryStatus,
     MemoryType,
     Provenance,
-    TTL,
 )
 from singularity.memory.store import MemoryStore
 from singularity.review import (

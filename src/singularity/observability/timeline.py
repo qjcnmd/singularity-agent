@@ -4,7 +4,6 @@ from collections.abc import Iterable
 
 from singularity.observability.models import TraceEvent, TraceTimelineItem
 
-
 NOISY_EVENT_TYPES = {"command.output_chunk"}
 
 

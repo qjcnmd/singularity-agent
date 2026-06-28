@@ -6,10 +6,10 @@ from types import SimpleNamespace
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.planner import Planner
 from singularity.run_controller import (
-    RunOutcomeReducer,
-    RunController,
     RunControlEventKind,
+    RunController,
     RunLifecycleStatus,
+    RunOutcomeReducer,
 )
 
 

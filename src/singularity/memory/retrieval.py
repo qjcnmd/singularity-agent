@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import UTC, datetime
-from typing import Iterable
 
 from singularity.memory.models import (
     MemoryAuthorType,

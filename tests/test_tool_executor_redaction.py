@@ -4,8 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor, ToolSpec
 from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry, ToolSpec
 from tests.tool_executor_helpers import make_test_policy_engine
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 from singularity.context.models import (
     CacheAttribution,
@@ -18,7 +18,7 @@ class ContextSummaryValidationError(ValueError):
 
 class ContextCompressor:
     SUMMARY_VERSION = 1
-    REQUIRED_KEYS = {
+    REQUIRED_KEYS: ClassVar[set[str]] = {
         "goal",
         "current_state",
         "completed_actions",

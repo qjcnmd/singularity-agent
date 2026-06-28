@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
 
 from singularity.model.models import (
@@ -56,11 +56,11 @@ class ToolProtocolVersion(SerializableDataclass):
     version: str = "1.0"
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ToolProtocolVersion":
+    def from_dict(cls, payload: dict[str, Any]) -> ToolProtocolVersion:
         return cls(version=str(payload.get("version") or "1.0"))
 
 
-class ToolCallPhase(str, Enum):
+class ToolCallPhase(StrEnum):
     PROPOSED = "proposed"
     VALIDATED = "validated"
     REJECTED = "rejected"
@@ -75,7 +75,7 @@ class ToolCallPhase(str, Enum):
     RESULT_APPENDED = "result_appended"
 
 
-class ToolCallFailureKind(str, Enum):
+class ToolCallFailureKind(StrEnum):
     missing_tool_call_id = "missing_tool_call_id"
     duplicate_tool_call_id = "duplicate_tool_call_id"
     unknown_tool = "unknown_tool"
@@ -95,13 +95,13 @@ class ToolCallFailureKind(str, Enum):
     context_append_failed = "context_append_failed"
 
 
-class ToolExecutionMode(str, Enum):
+class ToolExecutionMode(StrEnum):
     SEQUENTIAL = "sequential"
     PARALLEL_READONLY = "parallel_readonly"
     BLOCKED = "blocked"
 
 
-class ToolProtocolTurnStatus(str, Enum):
+class ToolProtocolTurnStatus(StrEnum):
     NO_TOOL_CALLS = "no_tool_calls"
     PROCESSED = "processed"
     REJECTED = "rejected"
@@ -158,7 +158,7 @@ class ToolCallEnvelope(SerializableDataclass):
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ToolCallEnvelope":
+    def from_dict(cls, payload: dict[str, Any]) -> ToolCallEnvelope:
         return cls(
             protocol_version=str(payload.get("protocol_version") or "1.0"),
             run_id=str(payload.get("run_id") or ""),
@@ -217,7 +217,7 @@ class ToolCallBatch(SerializableDataclass):
             )
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ToolCallBatch":
+    def from_dict(cls, payload: dict[str, Any]) -> ToolCallBatch:
         return cls(
             batch_id=str(payload.get("batch_id") or ""),
             run_id=str(payload.get("run_id") or ""),
@@ -267,7 +267,7 @@ class ToolExecutionPlan(SerializableDataclass):
         self.reasons = list(self.reasons)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ToolExecutionPlan":
+    def from_dict(cls, payload: dict[str, Any]) -> ToolExecutionPlan:
         return cls(
             plan_id=str(payload.get("plan_id") or ""),
             batch_id=str(payload.get("batch_id") or ""),
@@ -320,7 +320,7 @@ class ToolCallRecord(SerializableDataclass):
         return self.envelope.tool_call_id
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ToolCallRecord":
+    def from_dict(cls, payload: dict[str, Any]) -> ToolCallRecord:
         return cls(
             record_id=str(payload.get("record_id") or ""),
             envelope=ToolCallEnvelope.from_dict(payload.get("envelope") or {}),
@@ -340,7 +340,7 @@ class ToolCallRecord(SerializableDataclass):
         )
 
 
-class ToolObservationVisibility(str, Enum):
+class ToolObservationVisibility(StrEnum):
     FULL = "full"
     SUMMARY = "summary"
     REFERENCE_ONLY = "reference_only"
@@ -372,10 +372,10 @@ class ToolObservationView(SerializableDataclass):
     @classmethod
     def from_protocol_result(
         cls,
-        envelope: "ToolProtocolResultEnvelope",
+        envelope: ToolProtocolResultEnvelope,
         *,
         visibility: ToolObservationVisibility | str = ToolObservationVisibility.SUMMARY,
-    ) -> "ToolObservationView":
+    ) -> ToolObservationView:
         return cls(
             tool_call_id=envelope.tool_call_id,
             tool_name=envelope.tool_name,
@@ -455,7 +455,7 @@ class ToolProtocolResultEnvelope(SerializableDataclass):
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ToolProtocolResultEnvelope":
+    def from_dict(cls, payload: dict[str, Any]) -> ToolProtocolResultEnvelope:
         error_kind = payload.get("error_kind")
         return cls(
             tool_call_id=str(payload.get("tool_call_id") or ""),
@@ -545,7 +545,7 @@ class ToolProtocolEvent(SerializableDataclass):
         self.payload = dict(self.payload)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ToolProtocolEvent":
+    def from_dict(cls, payload: dict[str, Any]) -> ToolProtocolEvent:
         return cls(
             event_id=str(payload.get("event_id") or ""),
             run_id=str(payload.get("run_id") or ""),
@@ -577,7 +577,7 @@ class ToolProtocolResultBinding(SerializableDataclass):
         self.metadata = dict(self.metadata)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ToolProtocolResultBinding":
+    def from_dict(cls, payload: dict[str, Any]) -> ToolProtocolResultBinding:
         return cls(
             binding_id=str(payload.get("binding_id") or ""),
             record_id=str(payload.get("record_id") or ""),

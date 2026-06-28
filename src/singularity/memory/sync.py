@@ -16,7 +16,6 @@ from singularity.memory.models import (
 )
 from singularity.memory.store import MemoryStore
 
-
 BUNDLE_SCHEMA = "singularity.memory_sync_bundle/v1"
 
 

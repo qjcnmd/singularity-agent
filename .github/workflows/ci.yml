@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 18 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.11"
+          - "3.14"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install locked project and quality dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "uv==0.11.7"
+          uv sync --locked --extra eval --group dev
+
+      - name: Ruff
+        run: uv run --no-sync python -m ruff check .
+
+      - name: Mypy
+        run: uv run --no-sync python -m mypy
+
+      - name: Compile Python sources
+        run: uv run --no-sync python -m compileall src scripts
+
+      - name: Verify runtime documentation
+        run: uv run --no-sync python scripts/verify_runtime_docs.py
+
+      - name: Run deterministic test suite
+        run: uv run --no-sync python -m pytest tests --basetemp work/pytest-tmp -m "not provider_eval and not external and not slow"
+
+  provider-evaluation:
+    name: Real provider evaluation
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Check provider configuration
+        id: provider-config
+        env:
+          SINGULARITY_API_KEY: ${{ secrets.SINGULARITY_API_KEY }}
+          SINGULARITY_MODEL: ${{ secrets.SINGULARITY_MODEL }}
+          SINGULARITY_BASE_URL: ${{ secrets.SINGULARITY_BASE_URL }}
+        run: |
+          if [[ -n "$SINGULARITY_API_KEY" && -n "$SINGULARITY_MODEL" && -n "$SINGULARITY_BASE_URL" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report missing provider configuration
+        if: steps.provider-config.outputs.configured != 'true'
+        run: echo "::notice::provider_eval skipped - SINGULARITY_API_KEY, SINGULARITY_MODEL, or SINGULARITY_BASE_URL is not configured"
+
+      - name: Install locked project and evaluation dependencies
+        if: steps.provider-config.outputs.configured == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "uv==0.11.7"
+          uv sync --locked --extra eval --group dev
+
+      - name: Run real-provider tests
+        if: steps.provider-config.outputs.configured == 'true'
+        env:
+          SINGULARITY_API_KEY: ${{ secrets.SINGULARITY_API_KEY }}
+          SINGULARITY_MODEL: ${{ secrets.SINGULARITY_MODEL }}
+          SINGULARITY_BASE_URL: ${{ secrets.SINGULARITY_BASE_URL }}
+          SINGULARITY_RUN_PROVIDER_EVAL: "1"
+        run: uv run --no-sync python -m pytest tests -m provider_eval -v
+
+      - name: Run real evaluation benchmark
+        if: steps.provider-config.outputs.configured == 'true'
+        env:
+          SINGULARITY_API_KEY: ${{ secrets.SINGULARITY_API_KEY }}
+          SINGULARITY_MODEL: ${{ secrets.SINGULARITY_MODEL }}
+          SINGULARITY_BASE_URL: ${{ secrets.SINGULARITY_BASE_URL }}
+        run: uv run --no-sync python -m singularity.cli eval run docs/evaluation/capability-regression-tasks.json --run-id nightly-${{ github.run_id }} --json

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
-from typing import Iterable
 
 from singularity.code_index.language import LanguagePlugin, safe_read_text
 from singularity.code_index.models import (
@@ -34,9 +34,10 @@ class PythonPlugin(LanguagePlugin):
         self, workspace_root: Path, files: Iterable[FileRecord]
     ) -> list[ProjectRootRecord]:
         paths = {file.path for file in files}
-        if not ({"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"} & paths):
-            if not any(file.language == LanguageId.PYTHON for file in files):
-                return []
+        if not ({"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"} & paths) and not any(
+            file.language == LanguageId.PYTHON for file in files
+        ):
+            return []
         return [
             ProjectRootRecord(
                 root_path=".",

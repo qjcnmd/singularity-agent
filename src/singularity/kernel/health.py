@@ -6,7 +6,6 @@ from typing import Any
 from singularity.kernel.exceptions import ComponentHealthError
 from singularity.kernel.models import ComponentName
 
-
 DEFAULT_HEALTH_COMPONENTS = [
     ComponentName.CONFIGURATION,
     ComponentName.OBSERVABILITY,

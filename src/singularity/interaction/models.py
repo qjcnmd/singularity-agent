@@ -3,24 +3,24 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
 
 
-class ControlCommand(str, Enum):
+class ControlCommand(StrEnum):
     CANCEL = "cancel"
     CONTINUE = "continue"
     REVISE = "revise"
     ABORT = "abort"
 
 
-class InteractionMode(str, Enum):
+class InteractionMode(StrEnum):
     INTERACTIVE = "interactive"
     NON_INTERACTIVE = "non_interactive"
 
 
-class OutcomeStatus(str, Enum):
+class OutcomeStatus(StrEnum):
     SUCCESS = "success"
     PARTIAL_SUCCESS = "partial_success"
     FAILED = "failed"
@@ -63,7 +63,7 @@ class InteractionEvent:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "InteractionEvent":
+    def from_dict(cls, payload: dict[str, Any]) -> InteractionEvent:
         return cls(
             event_id=str(payload.get("event_id") or f"interaction_evt_{uuid4().hex[:12]}"),
             event_type=str(payload["event_type"]),
@@ -84,7 +84,7 @@ class InteractionEvent:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, default=str)
 
     @classmethod
-    def from_json(cls, text: str) -> "InteractionEvent":
+    def from_json(cls, text: str) -> InteractionEvent:
         return cls.from_dict(json.loads(text))
 
 
@@ -142,7 +142,7 @@ class ProgressEvent:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ProgressEvent":
+    def from_dict(cls, payload: dict[str, Any]) -> ProgressEvent:
         return cls(
             event_id=str(payload.get("event_id") or f"progress_evt_{uuid4().hex[:12]}"),
             phase=str(payload["phase"]),
@@ -185,7 +185,7 @@ class DecisionPrompt:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "DecisionPrompt":
+    def from_dict(cls, payload: dict[str, Any]) -> DecisionPrompt:
         return cls(
             prompt_id=str(payload.get("prompt_id") or f"decision_prompt_{uuid4().hex[:12]}"),
             title=str(payload.get("title") or ""),
@@ -221,7 +221,7 @@ class UserDecision:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "UserDecision":
+    def from_dict(cls, payload: dict[str, Any]) -> UserDecision:
         return cls(
             prompt_id=str(payload["prompt_id"]),
             decision=str(payload["decision"]),
@@ -255,7 +255,7 @@ class ClarificationRequest:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ClarificationRequest":
+    def from_dict(cls, payload: dict[str, Any]) -> ClarificationRequest:
         return cls(
             request_id=str(payload.get("request_id") or f"clarification_{uuid4().hex[:12]}"),
             question=str(payload.get("question") or ""),
@@ -287,7 +287,7 @@ class ClarificationAnswer:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ClarificationAnswer":
+    def from_dict(cls, payload: dict[str, Any]) -> ClarificationAnswer:
         return cls(
             request_id=str(payload["request_id"]),
             answer=str(payload.get("answer") or ""),
@@ -342,7 +342,7 @@ class FinalReport:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "FinalReport":
+    def from_dict(cls, payload: dict[str, Any]) -> FinalReport:
         return cls(
             title=str(payload.get("title") or "Final Report"),
             outcome=payload["outcome"],

@@ -9,12 +9,12 @@ from rich.console import Console
 from singularity.agent_loop import AgentLoop
 from singularity.context import ContextManager
 from singularity.instructions import PromptAssemblyPipeline
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import ModelRunner
 from singularity.planner import Planner
 from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tool_protocol.state import ToolProtocolStateStore
-from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
 from singularity.workspace_state import WorkspaceStateManager
 from tests.tool_executor_helpers import make_test_policy_engine
 

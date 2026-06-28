@@ -16,7 +16,7 @@ class PlanDependency:
         return {"step_id": self.step_id, "reason": self.reason}
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "PlanDependency":
+    def from_dict(cls, payload: dict[str, Any]) -> PlanDependency:
         return cls(step_id=str(payload["step_id"]), reason=str(payload.get("reason") or "requires_previous_step"))
 
 
@@ -34,7 +34,7 @@ class ExpectedEvidence:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ExpectedEvidence":
+    def from_dict(cls, payload: dict[str, Any]) -> ExpectedEvidence:
         return cls(
             evidence_key=str(payload["evidence_key"]),
             acceptance_criterion_id=payload.get("acceptance_criterion_id"),
@@ -56,7 +56,7 @@ class FallbackStep:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "FallbackStep":
+    def from_dict(cls, payload: dict[str, Any]) -> FallbackStep:
         return cls(
             reason=str(payload["reason"]),
             next_action=str(payload.get("next_action") or "replan"),
@@ -90,7 +90,7 @@ class PlanStep:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "PlanStep":
+    def from_dict(cls, payload: dict[str, Any]) -> PlanStep:
         return cls(
             step_id=str(payload["step_id"]),
             title=str(payload.get("title") or payload["step_id"]),
@@ -128,7 +128,7 @@ class RollingPlan:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "RollingPlan":
+    def from_dict(cls, payload: dict[str, Any]) -> RollingPlan:
         steps = [PlanStep.from_dict(item) for item in payload.get("steps") or []]
         return cls(
             plan_id=str(payload.get("plan_id") or f"rolling_{uuid4().hex[:12]}"),

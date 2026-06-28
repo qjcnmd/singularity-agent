@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from singularity.tools import ToolRegistry
-from singularity.tools.models import PermissionLevel, ToolExecutionBackendKind, ToolSideEffectKind, ToolSpec
 from singularity.tool_protocol.models import ToolCallBatch, ToolCallEnvelope, ToolExecutionMode
 from singularity.tool_protocol.scheduler import ToolProtocolScheduler
+from singularity.tools import ToolRegistry
+from singularity.tools.models import PermissionLevel, ToolExecutionBackendKind, ToolSideEffectKind, ToolSpec
 
 
 class EmptyInput(BaseModel):

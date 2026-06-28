@@ -21,7 +21,6 @@ from singularity.tool_protocol.models import (
 )
 from singularity.tools.models import ToolSideEffectKind
 
-
 _STATE_REDACTOR = ContextRedactor()
 _RAW_RESULT_KEYS = {"raw_result", "raw_args", "result"}
 

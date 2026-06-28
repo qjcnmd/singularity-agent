@@ -45,7 +45,7 @@ from singularity.model.models import (
 from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.models import ReplanDecision
 from singularity.planner.replanner import Replanner
-from singularity.planner.semantic import RollingPlan, SemanticPlanner
+from singularity.planner.semantic import SemanticPlanner
 from singularity.planner.semantic_objects import (
     PlannerDecision,
     RepairPolicy,
@@ -62,7 +62,7 @@ def _json_payload(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if not match:
-            raise ValueError("model response did not contain a JSON object")
+            raise ValueError("model response did not contain a JSON object") from None
         value = json.loads(match.group(0))
     if not isinstance(value, dict):
         raise ValueError("model response JSON was not an object")
@@ -143,7 +143,7 @@ class TaskContractProducer:
                 )
             self._emit_ok("task_contract", context_payload)
             return contract
-        except Exception as exc:  # noqa: BLE001 - any failure falls back
+        except Exception as exc:
             return self._fallback(user_goal, reason=f"model error: {type(exc).__name__}: {exc}")
 
     def _call_model(self, user_goal: str, context_payload: dict[str, Any]) -> dict[str, Any]:
@@ -262,7 +262,7 @@ class SemanticPlanProducer:
                 ids=_request_ids(context_payload),
             )
             return plan
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return self._fallback_initial(
                 task_contract, reason=f"model error: {type(exc).__name__}: {exc}"
             )
@@ -299,7 +299,7 @@ class SemanticPlanProducer:
                 ids=_request_ids(context_payload),
             )
             return plan
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return self._fallback_repair(
                 failure_analysis, task_contract, reason=f"model error: {type(exc).__name__}: {exc}"
             )
@@ -469,7 +469,7 @@ class PlannerDecisionProducer:
                 ids=_request_ids(context_payload),
             )
             return decision
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return self._fallback(signal, reason=f"model error: {type(exc).__name__}: {exc}")
 
     def _call_model(
@@ -576,7 +576,7 @@ class PlannerProducerBundle:
         rule_replanner: Replanner,
         model_runner: Any | None = None,
         trace: Any | None = None,
-    ) -> "PlannerProducerBundle":
+    ) -> PlannerProducerBundle:
         """Build a bundle; when ``model_runner`` is None all producers fall back."""
         return cls(
             task_contract=TaskContractProducer(

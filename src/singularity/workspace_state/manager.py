@@ -34,7 +34,6 @@ from singularity.workspace_state.models import (
 )
 from singularity.workspace_state.store import WorkspaceStateStore
 
-
 WORKSPACE_STATE_ERROR_CODES = {
     "baseline_failed",
     "snapshot_failed",
@@ -92,7 +91,7 @@ class WorkspaceStatePolicy:
 
 
 class ArtifactStore:
-    def __init__(self, workspace_state_manager: "WorkspaceStateManager") -> None:
+    def __init__(self, workspace_state_manager: WorkspaceStateManager) -> None:
         self.component = workspace_state_manager
 
     def save(
@@ -783,8 +782,8 @@ class WorkspaceStateManager:
         return FileSnapshot(
             path=getattr(snapshot, "path", path),
             canonical_path=canonical,
-            sha256=getattr(snapshot, "sha256"),
-            size=int(getattr(snapshot, "size")),
+            sha256=snapshot.sha256,
+            size=int(snapshot.size),
             mtime_ns=int(getattr(snapshot, "mtime_ns", int(getattr(snapshot, "mtime", 0) * 1_000_000_000))),
             file_type=getattr(snapshot, "file_type", "file"),
             encoding=getattr(snapshot, "encoding", None),

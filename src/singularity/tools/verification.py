@@ -5,8 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.command import CommandExecutor
+from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.tools.models import (
     PermissionLevel,
     ToolExecutionBackendKind,

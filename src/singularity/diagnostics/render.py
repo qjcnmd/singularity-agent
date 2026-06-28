@@ -8,7 +8,6 @@ from rich.table import Table
 
 from singularity.diagnostics.models import DiagnosticResult, RepairPlan
 
-
 SEVERITY_STYLES = {
     "error": "red",
     "warning": "yellow",

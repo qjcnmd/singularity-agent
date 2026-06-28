@@ -36,7 +36,7 @@ class ModelRunnerConfig:
         base_url: str | None = None,
         model: str | None = None,
         store_raw_responses: bool | None = None,
-    ) -> "ModelRunnerConfig":
+    ) -> ModelRunnerConfig:
         providers: dict[str, dict[str, Any]] = {}
         resolved_base_url = base_url or os.getenv("SINGULARITY_BASE_URL")
         resolved_model = model or os.getenv("SINGULARITY_MODEL")

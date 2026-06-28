@@ -10,7 +10,6 @@ from typer.testing import CliRunner
 from singularity.cli import app
 from singularity.git_client import GitClient
 
-
 runner = CliRunner()
 
 

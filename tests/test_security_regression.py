@@ -34,7 +34,6 @@ from singularity.policy import (
     GrantConsumptionLedgerTamperError,
     OperationKind,
     PolicyComponent,
-    PolicyConfig,
     PolicyRequest,
     PolicySubject,
     ResourceRef,
@@ -42,7 +41,6 @@ from singularity.policy import (
 from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
 from singularity.tools.command import register_command_tools
 from tests.tool_executor_helpers import make_ledger_test_config, make_test_policy_engine
-
 
 # ---------------------------------------------------------------------------
 # 1. Grant field tampering attack

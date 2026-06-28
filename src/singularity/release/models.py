@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-
 CONFIG_SCHEMA_VERSION = 1
 MEMORY_SCHEMA_VERSION = 1
 TRACE_SCHEMA_VERSION = 1
@@ -31,7 +30,7 @@ class InstallationManifest:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "InstallationManifest":
+    def from_dict(cls, payload: dict[str, Any]) -> InstallationManifest:
         return cls(
             app_version=str(payload.get("app_version") or "0.0.0"),
             config_schema_version=int(payload.get("config_schema_version") or 0),

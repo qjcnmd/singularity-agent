@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 import singularity.sandbox as sandbox
 import singularity.sandbox.windows as windows
@@ -14,10 +15,8 @@ from singularity.sandbox import (
     SandboxCapabilityError,
     SandboxProfileName,
     SandboxRequest,
-    SandboxResult,
     SandboxStatus,
 )
-from typer.testing import CliRunner
 
 
 def _request(tmp_path: Path) -> SandboxRequest:
@@ -1122,8 +1121,9 @@ def test_windows_sandbox_runner_removes_account_runner_logs(
     stdout_path.write_text("sk-test-secret-value", encoding="utf-8")
     stderr_path.write_text("stderr", encoding="utf-8")
     class FakeAccountProcess:
-        args = ["python"]
-        returncode = 0
+        def __init__(self) -> None:
+            self.args = ["python"]
+            self.returncode = 0
 
         def wait(self, timeout=None):
             return 0

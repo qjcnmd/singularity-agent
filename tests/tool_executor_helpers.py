@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from singularity.policy import PolicyConfig, PolicyEngine
-from singularity.policy.permissions import ApprovalPolicy, PermissionProfile
 from singularity.policy.operator_key import generate_operator_key
+from singularity.policy.permissions import ApprovalPolicy, PermissionProfile
 
 
 def make_test_policy_engine(workspace_root: Path) -> PolicyEngine:

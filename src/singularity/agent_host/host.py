@@ -1,21 +1,22 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+from singularity.agent_host.models import (
+    ApprovalEvent,
+    HostedRunResult,
+    RunEvent,
+    RunSession,
+    RunStateSnapshot,
+)
 from singularity.config import ProductionConfig
 from singularity.kernel import KernelBootstrap
 from singularity.kernel.models import CancellationReason, RunIdentity
 from singularity.observability.artifacts import TraceArtifactStore
 from singularity.observability.store import TraceStore
 from singularity.policy import ApprovalGrant
-from singularity.agent_host.models import (
-    ApprovalEvent,
-    HostedRunResult,
-    RunStateSnapshot,
-    RunEvent,
-    RunSession,
-)
 
 
 class AgentHostError(RuntimeError):

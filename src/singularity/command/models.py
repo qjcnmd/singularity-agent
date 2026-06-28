@@ -4,12 +4,11 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any, TypeVar
 from uuid import uuid4
 
 from singularity.observability.redaction import TraceRedactor
-
 
 _COMMAND_REDACTOR = TraceRedactor()
 _SECRET_ARG_FLAG_RE = re.compile(
@@ -20,7 +19,7 @@ _SECRET_ARG_FLAG_RE = re.compile(
 EnumT = TypeVar("EnumT", bound=Enum)
 
 
-class CommandPurpose(str, Enum):
+class CommandPurpose(StrEnum):
     READ_ONLY_COMMAND = "READ_ONLY_COMMAND"
     PROJECT_VERIFICATION = "PROJECT_VERIFICATION"
     LINT = "LINT"
@@ -42,7 +41,7 @@ class CommandPurpose(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
-class CommandRisk(str, Enum):
+class CommandRisk(StrEnum):
     READ_ONLY_COMMAND = "READ_ONLY_COMMAND"
     PROJECT_VERIFICATION = "PROJECT_VERIFICATION"
     FORMATTER = "FORMATTER"
@@ -61,13 +60,13 @@ class CommandRisk(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
-class CommandDecision(str, Enum):
+class CommandDecision(StrEnum):
     ALLOW = "allow"
     REQUIRE_REVIEW = "require_review"
     DENY = "deny"
 
 
-class ExecutionStatus(str, Enum):
+class ExecutionStatus(StrEnum):
     COMPLETED = "completed"
     POLICY_DENIED = "policy_denied"
     REVIEW_REQUIRED = "review_required"
@@ -78,7 +77,7 @@ class ExecutionStatus(str, Enum):
     BACKEND_ERROR = "backend_error"
 
 
-class SemanticStatus(str, Enum):
+class SemanticStatus(StrEnum):
     SUCCEEDED = "succeeded"
     EXIT_NONZERO = "exit_nonzero"
     TESTS_FAILED = "tests_failed"
@@ -89,14 +88,14 @@ class SemanticStatus(str, Enum):
     POLICY_BLOCKED = "policy_blocked"
 
 
-class NetworkMode(str, Enum):
+class NetworkMode(StrEnum):
     DISABLED = "DISABLED"
     ALLOW_PACKAGE_REGISTRIES = "ALLOW_PACKAGE_REGISTRIES"
     ALLOW_GIT_HOSTS = "ALLOW_GIT_HOSTS"
     ALLOW_ALL = "ALLOW_ALL"
 
 
-class FilesystemMode(str, Enum):
+class FilesystemMode(StrEnum):
     READ_ONLY_WORKSPACE = "READ_ONLY_WORKSPACE"
     READ_WRITE_WORKSPACE = "READ_WRITE_WORKSPACE"
     READ_WRITE_SELECTED_PATHS = "READ_WRITE_SELECTED_PATHS"
@@ -121,7 +120,7 @@ class ResourceLimits:
         *,
         timeout_seconds: float | None,
         idle_timeout_seconds: float | None,
-    ) -> "ResourceLimits":
+    ) -> ResourceLimits:
         return replace(
             self,
             timeout_seconds=(

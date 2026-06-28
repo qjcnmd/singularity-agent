@@ -200,6 +200,8 @@ python -m pytest -m external -v
 
 External 测试依赖 git、network 或Windows OS sandbox能力。本地与CI都必须按实际平台能力运行；backend capability/setup缺失时应断言`backend_unavailable`，不能改用普通本地进程获得通过。
 
+`tests/evaluation/test_targeted_failure_replay.py` 需要可用的 OS sandbox 才能完成真实 verification/repair 回放，因此同时标记为 `evaluation` 和 `external`。sandbox 未完成 setup 时测试必须明确 `skip` 并保留 `sandbox backend unavailable` 原因，不能切换到普通本地进程或伪造完成。
+
 Windows sandbox定向验证：
 
 ```bash

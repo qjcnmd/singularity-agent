@@ -11,9 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from singularity.code_index.models import SCHEMA_VERSION as INDEX_SCHEMA_VERSION
+from singularity.diagnostics.models import (
+    DiagnosticCheck,
+    DiagnosticContext,
+    DiagnosticFinding,
+    DiagnosticSeverity,
+)
 from singularity.evaluation.store import TASK_SET_SCHEMA_VERSION
 from singularity.memory.models import SCHEMA_VERSION as MEMORY_ENTRY_SCHEMA_VERSION
-from singularity.release.init import default_config, load_config, validate_config
+from singularity.release.init import load_config, validate_config
 from singularity.release.metadata import optional_feature_status, requires_python, version_info
 from singularity.release.migrations import load_manifest, pending_migrations
 from singularity.release.models import (
@@ -21,14 +27,6 @@ from singularity.release.models import (
     EVAL_SCHEMA_VERSION,
     MEMORY_SCHEMA_VERSION,
     TRACE_SCHEMA_VERSION,
-    read_json,
-)
-
-from singularity.diagnostics.models import (
-    DiagnosticCheck,
-    DiagnosticContext,
-    DiagnosticFinding,
-    DiagnosticSeverity,
 )
 
 
@@ -262,7 +260,7 @@ def _provider_check(context: DiagnosticContext) -> DiagnosticFinding:
             DiagnosticSeverity.ERROR,
             "failed",
             "Provider config is missing required environment variable references.",
-            "missing references: " + ", ".join(missing_refs + ["SINGULARITY_API_KEY"]),
+            "missing references: " + ", ".join([*missing_refs, "SINGULARITY_API_KEY"]),
             "Run singularity-agent repair --apply to merge default provider/model fields.",
             auto_repairable=True,
             details={"repair": "merge_default_config", "missing_refs": missing_refs, "refs": refs},

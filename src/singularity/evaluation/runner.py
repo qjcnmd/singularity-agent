@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import shlex
 import shutil
 import subprocess
-import time
-import difflib
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,7 +29,6 @@ from singularity.interaction import InteractionMode
 from singularity.observability.redaction import TraceRedactor
 from singularity.policy.permissions import ApprovalPolicy, NetworkAccess, PermissionProfileName
 
-
 EVALUATION_TASK_SET_SCHEMA_VERSION = "evaluation.task_set/v1"
 EVALUATION_RESULT_SCHEMA_VERSION = "evaluation.result/v1"
 
@@ -44,7 +43,7 @@ class EvaluationWorkspace:
     start_commit: str | None = None
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "EvaluationWorkspace":
+    def from_dict(cls, payload: dict[str, Any]) -> EvaluationWorkspace:
         kind = str(payload.get("type") or payload.get("kind") or "").strip()
         start_commit = payload.get("start_commit")
         if kind in {"fixture", "fixture_workspace", "inline_files"}:
@@ -93,7 +92,7 @@ class EvaluationTask:
     verification_timeout_seconds: int = 120
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "EvaluationTask":
+    def from_dict(cls, payload: dict[str, Any]) -> EvaluationTask:
         workspace_payload = _workspace_payload(payload)
         prepare_commands = payload.get("prepare_commands")
         if prepare_commands is None:
@@ -189,7 +188,7 @@ class EvaluationTaskSet:
     schema_version: str = EVALUATION_TASK_SET_SCHEMA_VERSION
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any], *, base_dir: Path) -> "EvaluationTaskSet":
+    def from_dict(cls, payload: dict[str, Any], *, base_dir: Path) -> EvaluationTaskSet:
         schema_version = str(payload.get("schema_version") or "")
         if schema_version != EVALUATION_TASK_SET_SCHEMA_VERSION:
             raise ValueError(f"Unsupported evaluation schema_version: {schema_version}")

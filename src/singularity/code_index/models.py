@@ -3,14 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
-
 
 SCHEMA_VERSION = "1.0.0"
 
 
-class FreshnessStatus(str, Enum):
+class FreshnessStatus(StrEnum):
     FRESH = "fresh"
     STALE_CONTENT = "stale_content"
     STALE_DEPENDENCY = "stale_dependency"
@@ -20,13 +19,13 @@ class FreshnessStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
-class TrustLevel(str, Enum):
+class TrustLevel(StrEnum):
     COMPONENT_GENERATED = "component_generated"
     WORKSPACE_UNTRUSTED = "workspace_untrusted"
     EXTERNAL_UNTRUSTED = "external_untrusted"
 
 
-class LanguageId(str, Enum):
+class LanguageId(StrEnum):
     PYTHON = "python"
     JAVASCRIPT = "javascript"
     TYPESCRIPT = "typescript"
@@ -39,7 +38,7 @@ class LanguageId(str, Enum):
     UNKNOWN = "unknown"
 
 
-class FileRole(str, Enum):
+class FileRole(StrEnum):
     SOURCE = "source"
     TEST = "test"
     CONFIG = "config"
@@ -54,7 +53,7 @@ class FileRole(str, Enum):
     UNKNOWN = "unknown"
 
 
-class SymbolKind(str, Enum):
+class SymbolKind(StrEnum):
     MODULE = "module"
     CLASS = "class"
     FUNCTION = "function"
@@ -68,7 +67,7 @@ class SymbolKind(str, Enum):
     UNKNOWN = "unknown"
 
 
-class DependencyKind(str, Enum):
+class DependencyKind(StrEnum):
     IMPORT = "import"
     EXPORT = "export"
     USE = "use"
@@ -78,7 +77,7 @@ class DependencyKind(str, Enum):
     UNKNOWN = "unknown"
 
 
-class ProjectKind(str, Enum):
+class ProjectKind(StrEnum):
     SINGLE_PROJECT = "single_project"
     MONOREPO = "monorepo"
     PACKAGE = "package"

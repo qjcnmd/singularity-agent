@@ -4,22 +4,22 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.tools import (
     PermissionLevel,
     ToolCachePolicy,
     ToolExecutionBackendKind,
+    ToolExecutor,
     ToolIdempotencyPolicy,
     ToolOutputEnvelope,
     ToolRegistry,
     ToolRetryPolicy,
-    ToolExecutor,
     ToolSensitivityLevel,
     ToolSideEffectKind,
     ToolSpec,
 )
 from singularity.tools.policy import ToolPolicy
-from singularity.jsonl_trace import JsonlTraceRecorder
 from tests.tool_executor_helpers import make_test_policy_engine
 
 

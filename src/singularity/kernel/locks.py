@@ -4,7 +4,7 @@ import json
 import os
 import socket
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -172,17 +172,15 @@ class WorkspaceLockManager:
                 )
             except FileExistsError:
                 if self._guard_is_stale():
-                    try:
+                    with suppress(PermissionError):
                         self.guard_path.unlink(missing_ok=True)
-                    except PermissionError:
-                        pass
                     continue
                 if time.monotonic() >= deadline:
                     raise WorkspaceLockError(
                         "Workspace lock guard is busy.",
                         code="workspace_lock_busy",
                         details={"guard_path": str(self.guard_path)},
-                    )
+                    ) from None
                 time.sleep(0.01)
         try:
             os.write(

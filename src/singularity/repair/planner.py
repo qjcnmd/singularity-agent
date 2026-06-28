@@ -4,8 +4,8 @@ from typing import Any
 from uuid import uuid4
 
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
-from singularity.failure_analysis.result import FailureAnalysisResult
 from singularity.failure_analysis.request import FailureAnalysisRequest
+from singularity.failure_analysis.result import FailureAnalysisResult
 
 from .contract import BLOCKED_FAILURE_CATEGORIES, RepairActionCandidate, RepairContract
 from .plan import RepairPlan

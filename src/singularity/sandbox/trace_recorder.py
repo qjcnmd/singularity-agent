@@ -13,7 +13,7 @@ class SandboxJsonlTraceRecorder:
         self.path = path
 
     @classmethod
-    def create(cls, workspace_root: Path) -> "SandboxJsonlTraceRecorder":
+    def create(cls, workspace_root: Path) -> SandboxJsonlTraceRecorder:
         path = workspace_root / ".singularity" / "sandbox" / "trace.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         return cls(path)

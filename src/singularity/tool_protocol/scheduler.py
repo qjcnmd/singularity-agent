@@ -99,9 +99,7 @@ def _is_readonly(call: ToolCallEnvelope, spec: ToolSpec | None) -> bool:
         return False
     if spec.side_effects not in {ToolSideEffectKind.NONE, ToolSideEffectKind.READ_WORKSPACE}:
         return False
-    if spec.uses_mutation_manager or spec.uses_command_executor:
-        return False
-    return True
+    return not (spec.uses_mutation_manager or spec.uses_command_executor)
 
 
 def _is_parallel_safe_readonly(call: ToolCallEnvelope, spec: ToolSpec | None) -> bool:

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
-from typing import Iterable
 
 from singularity.code_index.language import LanguagePlugin, safe_read_text
 from singularity.code_index.models import (
@@ -21,7 +21,6 @@ from singularity.code_index.models import (
     TestMappingRecord,
     TrustLevel,
 )
-
 
 IMPORT_RE = re.compile(r"""(?:import\s+(?:.+?\s+from\s+)?|export\s+.+?\s+from\s+|require\()\s*['"]([^'"]+)['"]""")
 FUNCTION_RE = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", re.M)

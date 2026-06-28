@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
-from typing import Iterable
 
 from singularity.code_index.language import LanguagePlugin, safe_read_text
 from singularity.code_index.models import (
@@ -20,7 +20,6 @@ from singularity.code_index.models import (
     TestMappingRecord,
     TrustLevel,
 )
-
 
 RUST_SYMBOL_RE = re.compile(r"^\s*(?:pub\s+)?(fn|struct|enum|trait|impl)\s+([A-Za-z_][A-Za-z0-9_]*)?", re.M)
 RUST_USE_RE = re.compile(r"^\s*(?:pub\s+)?(?:use|mod)\s+([^;{]+)", re.M)

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any, ClassVar
 from uuid import uuid4
 
 
-class TaskStatus(str, Enum):
+class TaskStatus(StrEnum):
     INITIALIZED = "initialized"
     UNDERSTANDING_TASK = "understanding_task"
     INSPECTING_WORKSPACE = "inspecting_workspace"
@@ -24,7 +24,7 @@ class TaskStatus(str, Enum):
     RECOVERING = "recovering"
 
 
-class ActionKind(str, Enum):
+class ActionKind(StrEnum):
     INSPECT_WORKSPACE = "InspectWorkspace"
     READ_RELEVANT_FILES = "ReadRelevantFiles"
     SEARCH_CODE = "SearchCode"
@@ -40,7 +40,7 @@ class ActionKind(str, Enum):
     ABORT = "Abort"
 
 
-class ActionStatus(str, Enum):
+class ActionStatus(StrEnum):
     PROPOSED = "proposed"
     ALLOWED = "allowed"
     RUNNING = "running"
@@ -49,14 +49,14 @@ class ActionStatus(str, Enum):
     BLOCKED = "blocked"
 
 
-class RiskLevel(str, Enum):
+class RiskLevel(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
 
 
-class RiskDecisionKind(str, Enum):
+class RiskDecisionKind(StrEnum):
     CONTINUE = "continue"
     REQUIRE_REVIEW = "require_review"
     ASK_USER = "ask_user"
@@ -64,7 +64,7 @@ class RiskDecisionKind(str, Enum):
     ABORT = "abort"
 
 
-class ReplanDecisionKind(str, Enum):
+class ReplanDecisionKind(StrEnum):
     CONTINUE = "continue"
     RETRY_WITH_NEW_CONTEXT = "retry_with_new_context"
     READ_FRESH_FILE = "read_fresh_file"
@@ -110,7 +110,7 @@ class CompletionCriteria:
         return self.__dict__.copy()
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "CompletionCriteria":
+    def from_dict(cls, payload: dict[str, Any]) -> CompletionCriteria:
         return cls(**payload)
 
 
@@ -183,7 +183,7 @@ class TaskState:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TaskState":
+    def from_dict(cls, payload: dict[str, Any]) -> TaskState:
         return cls(
             task_id=str(payload["task_id"]),
             session_id=str(payload["session_id"]),
@@ -249,7 +249,7 @@ class TaskPhase:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TaskPhase":
+    def from_dict(cls, payload: dict[str, Any]) -> TaskPhase:
         return cls(
             phase_id=str(payload["phase_id"]),
             name=str(payload["name"]),
@@ -299,7 +299,7 @@ class TaskPlan:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TaskPlan":
+    def from_dict(cls, payload: dict[str, Any]) -> TaskPlan:
         return cls(
             plan_id=str(payload["plan_id"]),
             task_id=str(payload["task_id"]),
@@ -338,7 +338,7 @@ class AgentAction:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "AgentAction":
+    def from_dict(cls, payload: dict[str, Any]) -> AgentAction:
         return cls(
             action_id=str(payload.get("action_id") or f"action_{uuid4().hex[:12]}"),
             kind=ActionKind(payload["kind"]),
@@ -478,7 +478,7 @@ class EvidenceLedger:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "EvidenceLedger":
+    def from_dict(cls, payload: dict[str, Any]) -> EvidenceLedger:
         return cls(
             inspected_files=list(payload.get("inspected_files") or []),
             relevant_symbols=list(payload.get("relevant_symbols") or []),
@@ -532,7 +532,7 @@ class ExecutionBudget:
         return self.__dict__.copy()
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ExecutionBudget":
+    def from_dict(cls, payload: dict[str, Any]) -> ExecutionBudget:
         return cls(**payload)
 
 
@@ -638,7 +638,7 @@ class FinalReport:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "FinalReport":
+    def from_dict(cls, payload: dict[str, Any]) -> FinalReport:
         return cls(
             user_goal=str(payload["user_goal"]),
             status=TaskStatus(payload["status"]),

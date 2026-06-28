@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 _PYTEST_TEMP_ROOT = Path(__file__).resolve().parents[1] / "work" / "pytest-tmp-root"
 _PYTEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -116,6 +115,7 @@ _EXTERNAL_FILE_KEYWORDS: tuple[str, ...] = (
 # Files whose tests all require real git subprocess calls.
 _EXTERNAL_FILE_STEMS: set[str] = {
     "test_git_client",
+    "test_targeted_failure_replay",
     "test_singularity_identity",
     "test_runtime_sqlite_artifacts",
 }
@@ -212,6 +212,7 @@ def _validate_curated_lists(
                         f"[test-infra] Stale {label} test IDs not found in collection: "
                         + ", ".join(sorted(stale))
                     ),
+                    stacklevel=2,
                 )
 
         # Check file-stem-based lists
@@ -226,6 +227,7 @@ def _validate_curated_lists(
                         f"[test-infra] Stale {label} stems not found: "
                         + ", ".join(sorted(stale))
                     ),
+                    stacklevel=2,
                 )
 
     # Overlap checks are always safe (no dependency on collection size)
@@ -233,18 +235,20 @@ def _validate_curated_lists(
     if overlap:
         warnings.warn(
             pytest.PytestWarning(
-                f"[test-infra] Tests in both smoke and slow: "
+                "[test-infra] Tests in both smoke and slow: "
                 + ", ".join(sorted(overlap))
             ),
+            stacklevel=2,
         )
 
     overlap_stems = _SMOKE_FILE_STEMS & _EXTERNAL_FILE_STEMS
     if overlap_stems:
         warnings.warn(
             pytest.PytestWarning(
-                f"[test-infra] Files in both smoke and external: "
+                "[test-infra] Files in both smoke and external: "
                 + ", ".join(sorted(overlap_stems))
             ),
+            stacklevel=2,
         )
 
     # --- Integration file stems check (full-collection only) ---
@@ -253,9 +257,10 @@ def _validate_curated_lists(
         if stale_int:
             warnings.warn(
                 pytest.PytestWarning(
-                    f"[test-infra] Stale integration file stems not found: "
+                    "[test-infra] Stale integration file stems not found: "
                     + ", ".join(sorted(stale_int))
                 ),
+                stacklevel=2,
             )
 
     # --- Slow/external tests must have non-unit functional classification ---
@@ -277,6 +282,7 @@ def _validate_curated_lists(
                     f"[test-infra] Slow/external test classified as unit: "
                     f"{item.nodeid}"
                 ),
+                stacklevel=2,
             )
         elif not functional:
             warnings.warn(
@@ -284,6 +290,7 @@ def _validate_curated_lists(
                     f"[test-infra] Slow/external test has no functional "
                     f"classification: {item.nodeid}"
                 ),
+                stacklevel=2,
             )
 
     # --- Smoke must not overlap with provider_eval ---
@@ -295,9 +302,10 @@ def _validate_curated_lists(
     if smoke_provider_overlap:
         warnings.warn(
             pytest.PytestWarning(
-                f"[test-infra] Tests in both smoke and provider_eval: "
+                "[test-infra] Tests in both smoke and provider_eval: "
                 + ", ".join(sorted(smoke_provider_overlap))
             ),
+            stacklevel=2,
         )
 
 
@@ -351,10 +359,7 @@ def _module_imports_integration_indicators(item: pytest.Item) -> bool:
         return True
     if module_names & _AGENT_SIMULATION_SYMBOLS:
         return True
-    if module_names & _EXTERNAL_WIRING_SYMBOLS:
-        return True
-
-    return False
+    return bool(module_names & _EXTERNAL_WIRING_SYMBOLS)
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -454,9 +459,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         # that new test files doing real integration work are not silently
         # misclassified as unit.
         current_markers = _explicit_marker_names(item)
-        if "slow" in current_markers or "external" in current_markers:
-            _add_marker(item, "integration")
-        elif _module_imports_integration_indicators(item):
+        if "slow" in current_markers or "external" in current_markers or _module_imports_integration_indicators(item):
             _add_marker(item, "integration")
         else:
             _add_marker(item, "unit")

@@ -1,32 +1,33 @@
 from __future__ import annotations
 
-import json
 import difflib
+import json
 import os
 import shutil
 import tempfile
 import time
 from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.observability.models import TraceEventType
+from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.policy import (
     ApprovalGate,
     Capability,
     DecisionOutcome,
     OperationKind,
+    PolicyComponent,
     PolicyConfig,
-    PolicyRequest,
     PolicyEngine,
+    PolicyError,
+    PolicyRequest,
     PolicySubject,
     ResourceRef,
-    PolicyComponent,
-    PolicyError,
 )
 from singularity.policy.audit import redact
 from singularity.workspace.diff import (
@@ -97,10 +98,10 @@ class ChangeSet:
         if not self.operations:
             raise MutationError("invalid_operation", "ChangeSet has no operations.")
 
-    def apply(self, manager: "WorkspaceMutationManager") -> "MutationResult":
+    def apply(self, manager: WorkspaceMutationManager) -> MutationResult:
         return manager.apply_changeset(self)
 
-    def reject(self, reason: str = "Rejected before apply.") -> "MutationResult":
+    def reject(self, reason: str = "Rejected before apply.") -> MutationResult:
         return MutationResult(
             ok=False,
             status="rejected",
@@ -111,7 +112,7 @@ class ChangeSet:
             diffs=self.diffs,
         )
 
-    def rollback(self, manager: "WorkspaceMutationManager", transaction_id: str) -> "MutationResult":
+    def rollback(self, manager: WorkspaceMutationManager, transaction_id: str) -> MutationResult:
         return RollbackManager(manager).rollback(transaction_id)
 
     def explain(self) -> dict[str, object]:
@@ -198,7 +199,7 @@ class AtomicWriter:
 
 
 class MutationJournal:
-    def __init__(self, manager: "WorkspaceMutationManager", transaction_id: str) -> None:
+    def __init__(self, manager: WorkspaceMutationManager, transaction_id: str) -> None:
         self.component = manager
         self.transaction_id = transaction_id
         self.dir = manager.workspace_root / ".singularity" / "journals" / transaction_id
@@ -231,7 +232,7 @@ class WorkspaceMutationManager:
         diff_context_lines: int = 3,
         max_inline_diff_lines: int = 200,
         verification_hook: Any | None = None,
-        workspace_state_manager: "WorkspaceStateManager | None" = None,
+        workspace_state_manager: WorkspaceStateManager | None = None,
         planner: Any | None = None,
         policy_engine: PolicyEngine | None = None,
         approval_gate: ApprovalGate | None = None,
@@ -263,10 +264,10 @@ class WorkspaceMutationManager:
         self.workspace_state_manager = workspace_state_manager
         self.planner = planner
         self.project_index = project_index
-        self._journals: "OrderedDict[str, MutationJournal]" = OrderedDict()
-        self._changesets: "OrderedDict[str, ChangeSet]" = OrderedDict()
-        self._changeset_transactions: "OrderedDict[str, str]" = OrderedDict()
-        self._changeset_results: "OrderedDict[str, MutationResult]" = OrderedDict()
+        self._journals: OrderedDict[str, MutationJournal] = OrderedDict()
+        self._changesets: OrderedDict[str, ChangeSet] = OrderedDict()
+        self._changeset_transactions: OrderedDict[str, str] = OrderedDict()
+        self._changeset_results: OrderedDict[str, MutationResult] = OrderedDict()
         self._changeset_order: list[str] = []
 
     def preview_operations(
@@ -662,10 +663,8 @@ class WorkspaceMutationManager:
         tx_dirs.sort(key=lambda item: item[0])
         for _, tx_dir in tx_dirs[: len(tx_dirs) - self._MAX_BEFORE_ARTIFACTS]:
             for before_file in tx_dir.glob("*.before"):
-                try:
+                with suppress(OSError):
                     before_file.unlink()
-                except OSError:
-                    pass
 
     def _artifact_refs(self, *, ids: list[str], diffs: list[FileDiff]) -> list[str]:
         refs = [f"workspace:{path}" for path in sorted({diff.path for diff in diffs})]

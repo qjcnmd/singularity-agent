@@ -7,15 +7,14 @@ evidence backfill, and Planner authorization of verification commands.
 from __future__ import annotations
 
 import json
-import shlex
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from pydantic import BaseModel
 
-from singularity.command import CommandRequest, SemanticStatus
 from singularity.agent_loop import AgentLoopStatus
+from singularity.command import CommandRequest, SemanticStatus
 from singularity.failure_analysis import (
     MIN_REPAIR_CONFIDENCE,
     FailureAnalysisRequest,
@@ -23,19 +22,17 @@ from singularity.failure_analysis import (
 )
 from singularity.kernel.models import AgentRun, KernelContext, KernelStatus, RunIdentity
 from singularity.planner import Planner, TaskStatus
-from singularity.planner.models import AuthorizationDecision, EvidenceLedger
 from singularity.repair import (
     BLOCKED_FAILURE_CATEGORIES,
     RepairActionCandidate,
     RepairContract,
     RepairPlan,
     RepairPlanner,
-    RepairReplanSignal,
 )
 from singularity.tools.models import PermissionLevel, ToolSpec
 from singularity.verification import VerificationRunner
 from singularity.verification.contract import VerificationContract, VerificationStep
-from singularity.verification.models import CheckKind, VerificationCheck
+from singularity.verification.models import CheckKind
 from singularity.verification.satisfaction import ContractSatisfaction, StepEvidence
 from tests.test_verification_runner import FakeCommandExecutor, command_result
 
@@ -558,7 +555,7 @@ class TestPlannerVerificationContract:
             "verification_failed": True,
         }
         planner.replan(signal)
-        decision = planner.replan(signal)
+        planner.replan(signal)
         assert planner.state.status == TaskStatus.BLOCKED
         assert "repeated_failure" in planner.state.blocked_reasons
 
@@ -652,7 +649,7 @@ class TestPlannerVerificationAuthorization:
 
     def test_contract_command_allowed(self, tmp_path: Path) -> None:
         """run_verification with contract-matching command is allowed."""
-        planner, contract = self._setup_repair_planner(tmp_path)
+        planner, _contract = self._setup_repair_planner(tmp_path)
         spec = self._make_spec("run_verification")
         decision = planner.authorize_tool_call(
             tool_name="run_verification",
@@ -705,7 +702,7 @@ class TestPlannerVerificationAuthorization:
 
     def test_arbitrary_command_rejected(self, tmp_path: Path) -> None:
         """run_verification with a command NOT in the contract is rejected."""
-        planner, contract = self._setup_repair_planner(tmp_path)
+        planner, _contract = self._setup_repair_planner(tmp_path)
         spec = self._make_spec("run_verification")
         decision = planner.authorize_tool_call(
             tool_name="run_verification",
@@ -718,7 +715,7 @@ class TestPlannerVerificationAuthorization:
 
     def test_no_smoke_commands_allowed(self, tmp_path: Path) -> None:
         """run_verification without smoke_commands (uses defaults) is allowed."""
-        planner, contract = self._setup_repair_planner(tmp_path)
+        planner, _contract = self._setup_repair_planner(tmp_path)
         spec = self._make_spec("run_verification")
         decision = planner.authorize_tool_call(
             tool_name="run_verification",
@@ -730,7 +727,7 @@ class TestPlannerVerificationAuthorization:
 
     def test_get_verification_result_allowed(self, tmp_path: Path) -> None:
         """get_verification_result is always allowed during repair."""
-        planner, contract = self._setup_repair_planner(tmp_path)
+        planner, _contract = self._setup_repair_planner(tmp_path)
         spec = self._make_spec("get_verification_result")
         decision = planner.authorize_tool_call(
             tool_name="get_verification_result",
@@ -742,7 +739,7 @@ class TestPlannerVerificationAuthorization:
 
     def test_multiple_commands_one_disallowed_rejects_all(self, tmp_path: Path) -> None:
         """If one of multiple smoke_commands is not in the contract, reject."""
-        planner, contract = self._setup_repair_planner(tmp_path)
+        planner, _contract = self._setup_repair_planner(tmp_path)
         spec = self._make_spec("run_verification")
         decision = planner.authorize_tool_call(
             tool_name="run_verification",
@@ -768,7 +765,7 @@ class TestPlannerVerificationAuthorization:
         ``python -m pytest ...`` was rejected because the rules-based contract
         only allowed ``python math_utils.py``.
         """
-        planner, contract = self._setup_repair_planner(tmp_path)
+        planner, _contract = self._setup_repair_planner(tmp_path)
         planner.apply_benchmark_constraints(
             {
                 "task_id": "evaluation.fix_math_test",
@@ -794,7 +791,7 @@ class TestPlannerVerificationAuthorization:
 
     def test_benchmark_does_not_weaken_gate(self, tmp_path: Path) -> None:
         """A command that is neither in the contract nor the benchmark is still rejected."""
-        planner, contract = self._setup_repair_planner(tmp_path)
+        planner, _contract = self._setup_repair_planner(tmp_path)
         planner.apply_benchmark_constraints(
             {
                 "task_id": "evaluation.fix_math_test",
@@ -1299,7 +1296,7 @@ class TestAgentLoopContractIntegration:
 
     def test_external_command_rejected(self, tmp_path: Path) -> None:
         """Planner-level: model tries a command NOT in the VerificationContract → rejected by authorize_tool_call."""
-        planner, contract = _make_agent_loop_planner(tmp_path)
+        planner, _contract = _make_agent_loop_planner(tmp_path)
         spec = _make_verification_spec("run_verification")
 
         decision = planner.authorize_tool_call(
@@ -1318,12 +1315,12 @@ class TestAgentLoopContractIntegration:
 
     def test_missing_step_evidence_blocks_completion(self, tmp_path: Path) -> None:
         """AgentLoop-level: no step_evidence → completion blocked by contract_satisfaction check."""
-        from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
+        from singularity.tools import ToolRegistry
         from singularity.tools.verification import register_verification_tools
         from tests.agent_loop_helpers import make_agent_session
 
         # Same setup but with a contract that doesn't match the smoke command
-        planner, contract = _make_agent_loop_planner(tmp_path, inject_repair_plan=False)
+        planner, _contract = _make_agent_loop_planner(tmp_path, inject_repair_plan=False)
 
         # Inject a repair plan with a contract that doesn't match any smoke command
         rp_no_contract = RepairPlan(
@@ -1477,7 +1474,7 @@ class TestAgentLoopContractIntegration:
             max_turns=4,
         )
 
-        answer = agent.run("fix the bug")
+        agent.run("fix the bug")
 
         # Turn 1: completion_rejected → no failure analysis (first rejection)
         # Turn 2: completion_rejected again with same snapshot → escalation → FailureAnalyzer invoked
@@ -1825,7 +1822,6 @@ class TestCompletionRejectedRepairTelemetry:
     def test_kernel_finalizer_planner_summary_has_repair_fields(self, tmp_path: Path) -> None:
         """KernelFinalizer wraps planner summary and repair fields are accessible."""
         from singularity.kernel.finalization import KernelFinalizer
-        from singularity.kernel.models import KernelContext, RunIdentity, RunStatus
 
         planner = Planner(tmp_path, session_id="s1", task_id="t1")
         planner.start_task("fix the bug")

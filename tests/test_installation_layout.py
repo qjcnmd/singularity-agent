@@ -14,7 +14,6 @@ from singularity.release.migrations import Migration, apply_migrations, load_man
 from singularity.release.models import atomic_write_json, read_json
 from singularity.release.paths import UserDataMode, resolve_user_data_paths
 
-
 runner = CliRunner()
 
 

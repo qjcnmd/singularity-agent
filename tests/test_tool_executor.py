@@ -6,15 +6,8 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field
 
-from singularity.tools import (
-    PermissionLevel,
-    ToolExecutionRequest,
-    ToolPolicy,
-    ToolRegistry,
-    ToolExecutor,
-    ToolSpec,
-)
 from singularity.edit import EditExecutor
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.planner import (
     ActionKind,
     AgentAction,
@@ -23,8 +16,15 @@ from singularity.planner import (
     RiskLevel,
     TaskStatus,
 )
+from singularity.tools import (
+    PermissionLevel,
+    ToolExecutionRequest,
+    ToolExecutor,
+    ToolPolicy,
+    ToolRegistry,
+    ToolSpec,
+)
 from singularity.tools.edit import register_edit_tools
-from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.workspace import WorkspaceMutationManager
 from tests.tool_executor_helpers import default_policy_engine, make_test_policy_engine
 

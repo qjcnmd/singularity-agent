@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
 
 from singularity.release.init import load_config, validate_config
 from singularity.release.metadata import optional_feature_status, requires_python, version_info

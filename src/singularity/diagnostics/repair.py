@@ -8,12 +8,6 @@ from typing import Any
 from uuid import uuid4
 
 from singularity.code_index import ProjectIndex
-from singularity.memory.store import MemoryStore
-from singularity.release.init import default_config, initialize_user_data
-from singularity.release.migrations import apply_migrations
-from singularity.release.models import atomic_write_json, read_json
-from singularity.release.paths import UserDataPaths
-
 from singularity.diagnostics.models import (
     DiagnosticFinding,
     DiagnosticResult,
@@ -22,6 +16,11 @@ from singularity.diagnostics.models import (
     RepairPlan,
     now_iso,
 )
+from singularity.memory.store import MemoryStore
+from singularity.release.init import default_config, initialize_user_data
+from singularity.release.migrations import apply_migrations
+from singularity.release.models import atomic_write_json, read_json
+from singularity.release.paths import UserDataPaths
 
 
 class RepairEngine:

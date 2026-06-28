@@ -16,7 +16,6 @@ from singularity.memory.models import (
 from singularity.memory.pipeline import MemoryLearningPipeline
 from singularity.memory.sync import MemoryBundleSync
 
-
 runner = CliRunner()
 
 

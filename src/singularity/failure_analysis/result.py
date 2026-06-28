@@ -47,7 +47,7 @@ class FailureAnalysisResult:
         *,
         request: FailureAnalysisRequest,
         raw_response_ref: str | None = None,
-    ) -> "FailureAnalysisResult":
+    ) -> FailureAnalysisResult:
         needs_user_input = _bool_required(payload, "needs_user_input")
         confidence = _confidence_required(payload.get("confidence"))
         category = _required_text(payload, "failure_category")
@@ -100,7 +100,7 @@ class FailureAnalysisResult:
         reason: str,
         category: str = "failure_analysis_unavailable",
         affected_files: list[str] | None = None,
-    ) -> "FailureAnalysisResult":
+    ) -> FailureAnalysisResult:
         return cls(
             analysis_id=f"failure_{uuid4().hex[:12]}",
             request_id=request.request_id,
@@ -145,7 +145,7 @@ def _json_payload(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if not match:
-            raise ValueError("model response did not contain a JSON object")
+            raise ValueError("model response did not contain a JSON object") from None
         value = json.loads(match.group(0))
     if not isinstance(value, dict):
         raise ValueError("model response JSON was not an object")

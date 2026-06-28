@@ -25,7 +25,6 @@ from singularity.verification import VerificationRunner
 from singularity.verification.contract import VerificationContract
 from singularity.workspace import WorkspaceMutationManager
 
-
 TARGETED_REPLAY_SCHEMA_VERSION = "evaluation.targeted_failure_replay/v1"
 
 

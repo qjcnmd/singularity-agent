@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from singularity.execution_outcome import ExecutionOutcome
+from singularity.observability.protocols import TraceRecorderProtocol
 from singularity.planner.budget import BudgetController
-from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.context import PlannerContextRenderer
-from singularity.planner.finalizer import Finalizer, FinalReportRenderer
+from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.final_reviewer import FinalReviewer
+from singularity.planner.finalizer import Finalizer, FinalReportRenderer
 from singularity.planner.models import (
     ActionKind,
     ActionStatus,
@@ -29,10 +32,10 @@ from singularity.planner.models import (
 from singularity.planner.policy import (
     DIFF_TOOLS,
     EDIT_PLAN_TOOLS,
-    PlannerPolicy,
-    READ_TOOLS,
     MUTATION_TOOLS,
+    READ_TOOLS,
     VERIFICATION_TOOLS,
+    PlannerPolicy,
 )
 from singularity.planner.replanner import Replanner
 from singularity.planner.retrieval import LessonExtractor, RetrievalOrchestrator
@@ -54,8 +57,6 @@ from singularity.tools.router import (
 )
 from singularity.verification.contract import VerificationContract, VerificationStep
 from singularity.verification.satisfaction import ContractSatisfaction, StepEvidence
-from singularity.observability.protocols import TraceRecorderProtocol
-from singularity.execution_outcome import ExecutionOutcome
 
 
 class Planner:
@@ -1410,7 +1411,7 @@ class Planner:
         if artifact_ref not in report.artifacts:
             report.artifacts.append(artifact_ref)
             report.artifacts.sort()
-        artifact_path = self.final_report_renderer.write_markdown(
+        self.final_report_renderer.write_markdown(
             report=report,
             state=self._state(),
             evidence=self.evidence,
@@ -1469,10 +1470,8 @@ class Planner:
             )
             self.review_pipeline = review_pipeline
         elif getattr(review_pipeline, "planner", None) is None:
-            try:
+            with suppress(Exception):
                 review_pipeline.planner = self
-            except Exception:
-                pass
         report = review_pipeline.final_review(
             task_state=self._state(),
             task_plan=self._plan(),
@@ -1524,7 +1523,7 @@ class Planner:
         session_id: str,
         *,
         workspace_health: dict[str, Any] | None = None,
-    ) -> "Planner":
+    ) -> Planner:
         self._throw_if_cancelled()
         state, plan, evidence, budget, final_report = self.store.load(session_id)
         self.session_id = session_id

@@ -4,6 +4,7 @@ from singularity.command.backend import (
     SandboxBackend,
 )
 from singularity.command.errors import COMMAND_ERROR_CODES
+from singularity.command.executor import CommandExecutor
 from singularity.command.models import (
     CommandDecision,
     CommandPlan,
@@ -22,11 +23,11 @@ from singularity.command.models import (
     SemanticStatus,
 )
 from singularity.command.policy import CommandPolicy
-from singularity.command.executor import CommandExecutor
 
 __all__ = [
-    "CommandDecision",
     "COMMAND_ERROR_CODES",
+    "CommandDecision",
+    "CommandExecutor",
     "CommandPlan",
     "CommandPolicy",
     "CommandPolicyResult",
@@ -34,7 +35,6 @@ __all__ = [
     "CommandRequest",
     "CommandResult",
     "CommandRisk",
-    "CommandExecutor",
     "ExecutionBackend",
     "ExecutionStatus",
     "FilesystemMode",

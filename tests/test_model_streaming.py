@@ -1,17 +1,17 @@
 from singularity.model import (
+    MockModelProvider,
+    ModelPurpose,
+    ModelRunner,
     ModelToolParseStatus,
+    ModelTurnRequest,
     ProviderStreamEvent,
     ProviderStreamEventType,
     StreamingAccumulator,
-    MockModelProvider,
-    ModelRunner,
-    ModelTurnRequest,
-    ModelPurpose,
-    ToolChoicePolicy,
     ToolChoiceMode,
+    ToolChoicePolicy,
 )
-from singularity.tools import ToolRegistry
 from singularity.observability import TraceRecorder
+from singularity.tools import ToolRegistry
 
 
 def test_streaming_accumulator_buffers_text_and_tool_calls_without_executing() -> None:

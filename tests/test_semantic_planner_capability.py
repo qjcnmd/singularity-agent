@@ -13,10 +13,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 from singularity.model.models import (
     ModelMessage,
@@ -25,22 +22,17 @@ from singularity.model.models import (
     ModelTurnResult,
     ModelTurnStatus,
 )
-from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.context import PlannerContextRenderer
+from singularity.planner.contract import TaskContractBuilder
 from singularity.planner.engine import Planner
 from singularity.planner.models import (
     ActionKind,
-    EvidenceLedger,
-    ReplanDecision,
     ReplanDecisionKind,
     TaskPlan,
-    TaskState,
-    TaskStatus,
 )
 from singularity.planner.replanner import Replanner
-from singularity.planner.semantic import RollingPlan, SemanticPlanner
+from singularity.planner.semantic import SemanticPlanner
 from singularity.planner.semantic_objects import (
-    PlannerDecision,
     RepairPolicy,
     RiskPoint,
     SemanticPlan,
@@ -52,7 +44,6 @@ from singularity.planner.semantic_producers import (
     SemanticPlanProducer,
     TaskContractProducer,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -258,7 +249,7 @@ def _bundle(runner: Any, trace: Any = None) -> PlannerProducerBundle:
 
 
 def _default_plan(task_id: str) -> TaskPlan:
-    from singularity.planner.models import ActionKind, TaskPhase
+    from singularity.planner.models import TaskPhase
 
     return TaskPlan(
         plan_id="plan_test",

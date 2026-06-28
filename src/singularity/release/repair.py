@@ -11,7 +11,6 @@ from singularity.release.init import initialize_user_data
 from singularity.release.migrations import load_manifest
 from singularity.release.paths import UserDataPaths
 
-
 PROTECTED_USER_DATA_DIRS = {"memory", "traces", "eval", "logs"}
 
 

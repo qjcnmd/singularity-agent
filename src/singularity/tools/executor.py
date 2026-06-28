@@ -7,8 +7,10 @@ import pickle
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
+from contextlib import suppress
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -16,17 +18,18 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from singularity.observability.models import TraceEventType, TraceSeverity
+from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.observability.redaction import TraceRedactor
 from singularity.policy import (
     ApprovalGate,
     Capability,
     DecisionOutcome,
     OperationKind,
+    PolicyComponent,
     PolicyDecision,
     PolicyRequest,
     PolicySubject,
     ResourceRef,
-    PolicyComponent,
 )
 from singularity.policy.audit import redact_resource_identifier
 from singularity.policy.config import PolicyConfig
@@ -51,7 +54,6 @@ from singularity.tools.models import (
 )
 from singularity.tools.policy import ToolPolicy
 from singularity.tools.registry import ToolRegistry
-from singularity.observability.protocols import TraceEmitterProtocol
 
 
 @dataclass
@@ -99,7 +101,7 @@ def _send_tool_process_payload(conn: Any, payload: dict[str, Any]) -> None:
     try:
         conn.send(payload)
     except Exception as exc:
-        try:
+        with suppress(Exception):
             conn.send(
                 {
                     "status": "exception",
@@ -107,8 +109,6 @@ def _send_tool_process_payload(conn: Any, payload: dict[str, Any]) -> None:
                     "type": type(exc).__name__,
                 }
             )
-        except Exception:
-            pass
 
 
 def _json_safe_process_value(value: Any) -> Any:
@@ -1015,10 +1015,8 @@ class ToolExecutor:
             payload = parent_conn.recv()
         finally:
             parent_conn.close()
-            try:
+            with suppress(ValueError):
                 process.close()
-            except ValueError:
-                pass
 
         return self._process_payload_to_result(spec, payload)
 
@@ -1239,13 +1237,14 @@ class ToolExecutor:
                 message="Write tools must execute through WorkspaceMutationManager.",
                 details={"tool_name": spec.name},
             )
-        if spec.execution_backend == ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR:
-            if not spec.uses_edit_executor or not spec.uses_mutation_manager:
-                return ToolResult.failure(
-                    code="invalid_operation",
-                    message="EditExecutor tools must declare edit executor usage and mutation delegation.",
-                    details={"tool_name": spec.name},
-                )
+        if spec.execution_backend == ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR and (
+            not spec.uses_edit_executor or not spec.uses_mutation_manager
+        ):
+            return ToolResult.failure(
+                code="invalid_operation",
+                message="EditExecutor tools must declare edit executor usage and mutation delegation.",
+                details={"tool_name": spec.name},
+            )
         if (
             spec.permission_level == PermissionLevel.SHELL
             and not spec.uses_command_executor

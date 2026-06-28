@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from uuid import uuid4
 
 from singularity.observability.artifacts import TraceArtifactStore
@@ -62,7 +63,7 @@ class TraceRecorder:
         run_id: str | None = None,
         session_id: str | None = None,
         trace_dir: Path | str | None = None,
-    ) -> "TraceRecorder":
+    ) -> TraceRecorder:
         resolved_run_id = run_id or _new_run_id()
         return cls(
             root=root,

@@ -7,8 +7,8 @@ from singularity.tool_protocol.models import (
     ToolCallEnvelope,
     ToolCallFailureKind,
     ToolCallPhase,
-    ToolProtocolResultEnvelope,
     ToolProtocolRecoveryReport,
+    ToolProtocolResultEnvelope,
     ToolProtocolTurnStatus,
 )
 from singularity.tool_protocol.recovery import ToolProtocolRecoveryManager

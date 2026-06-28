@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from singularity.diagnostics.checks import default_checks
 from singularity.diagnostics.models import (
@@ -20,7 +20,7 @@ class DoctorEngine:
         self.checks = list(checks)
 
     @classmethod
-    def default(cls) -> "DoctorEngine":
+    def default(cls) -> DoctorEngine:
         return cls(default_checks())
 
     def run(

@@ -95,5 +95,5 @@ class PolicyConfig:
             object.__setattr__(self, "operator_key_path", Path(self.operator_key_path))
 
     @classmethod
-    def default_for_workspace(cls, workspace_root: Path | str) -> "PolicyConfig":
+    def default_for_workspace(cls, workspace_root: Path | str) -> PolicyConfig:
         return cls(workspace_root=workspace_root)

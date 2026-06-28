@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any
 
 from singularity.tool_protocol.models import ToolCallBatch, ToolCallEnvelope
-from singularity.tools import ToolResult, ToolExecutor
+from singularity.tools import ToolExecutor, ToolResult
 from singularity.tools.models import ToolExecutionRequest
 
 

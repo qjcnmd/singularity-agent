@@ -7,7 +7,6 @@ from typer.testing import CliRunner
 from singularity.cli import app
 from singularity.release.paths import resolve_user_data_paths
 
-
 runner = CliRunner()
 
 

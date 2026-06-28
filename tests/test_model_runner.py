@@ -7,14 +7,14 @@ from singularity.model import (
     ModelCapabilities,
     ModelErrorKind,
     ModelMessage,
-    ModelRole,
     ModelPurpose,
+    ModelRole,
     ModelRunner,
     ModelRunnerConfig,
-    ModelTurnRequest,
-    ModelTurnStatus,
     ModelToolCall,
     ModelToolParseStatus,
+    ModelTurnRequest,
+    ModelTurnStatus,
     ModelUsage,
     ToolChoiceMode,
     ToolChoicePolicy,
@@ -253,11 +253,11 @@ def test_model_runner_records_cache_hit_ratio_in_result_and_trace(tmp_path: Path
     )
 
     assert result.metadata["cache"]["cache_hit_ratio"] == 0.75
-    response = [
+    response = next(
         event
         for event in trace.store.query_events()
         if event.event_type.value == "model.response.received"
-    ][0]
+    )
     assert response.payload["cache"]["cached_input_tokens"] == 75
     assert response.payload["cache"]["cache_attribution"]["source"] == "provider_native"
 

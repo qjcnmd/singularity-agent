@@ -16,7 +16,6 @@ from singularity.policy.models import (
     stable_hash,
 )
 
-
 SECRET_KEY_RE = re.compile(
     r"(authorization|token|api[_-]?key|secret|password|database[_-]?url|dsn|conn(?:ection)?[_-]?(?:str|string))",
     re.IGNORECASE,

@@ -4,14 +4,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.planner import (
     ActionKind,
     AgentAction,
     AuthorizationDecision,
     RiskLevel,
 )
-from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolExecutor, ToolSpec
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.tools import PermissionLevel, ToolExecutor, ToolPolicy, ToolRegistry, ToolSpec
 from tests.tool_executor_helpers import make_test_policy_engine
 
 

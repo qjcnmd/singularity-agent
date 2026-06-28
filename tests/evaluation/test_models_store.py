@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 
 from singularity.evaluation import (
-    BenchmarkTask,
     BenchmarkAdapterKind,
+    BenchmarkTask,
     BenchmarkTaskKind,
     BenchmarkVisibility,
     EvaluationHook,
@@ -108,17 +108,17 @@ def test_benchmark_task_supports_public_repo_issue_and_terminal_task_schema() ->
 def test_benchmark_task_rejects_unknown_type_visibility_or_adapter() -> None:
     payload = _task().to_dict()
     payload["task_type"] = "unknown"
-    with pytest.raises(ValueError, match="BenchmarkTask.task_type"):
+    with pytest.raises(ValueError, match=r"BenchmarkTask.task_type"):
         BenchmarkTask.from_dict(payload)
 
     payload = _task().to_dict()
     payload["visibility"] = "secret"
-    with pytest.raises(ValueError, match="BenchmarkTask.visibility"):
+    with pytest.raises(ValueError, match=r"BenchmarkTask.visibility"):
         BenchmarkTask.from_dict(payload)
 
     payload = _task().to_dict()
     payload["adapter"] = "random"
-    with pytest.raises(ValueError, match="BenchmarkTask.adapter"):
+    with pytest.raises(ValueError, match=r"BenchmarkTask.adapter"):
         BenchmarkTask.from_dict(payload)
 
 
@@ -181,7 +181,7 @@ def test_golden_contract_task_set_covers_required_scenarios(tmp_path: Path) -> N
 
 
 def test_task_validation_rejects_missing_prompt_and_invalid_tag() -> None:
-    with pytest.raises(ValueError, match="input.prompt"):
+    with pytest.raises(ValueError, match=r"input.prompt"):
         BenchmarkTask.from_dict(
             {
                 "task_id": "bad",
@@ -237,7 +237,7 @@ def test_golden_task_store_rejects_unknown_document_versions(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="GoldenTaskSet.schema_version"):
+    with pytest.raises(ValueError, match=r"GoldenTaskSet.schema_version"):
         GoldenTaskStore(store_path).load()
 
 

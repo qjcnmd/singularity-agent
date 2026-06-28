@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pytest
 
+from singularity.command import CommandDecision, CommandPolicyResult, CommandRisk, SemanticStatus
 from singularity.evaluation import (
     BenchmarkTask,
+    EvaluationHarness,
     EvaluationHook,
     EvaluationProfile,
-    EvaluationHarness,
     ExpectedOutcome,
     ExpectedOutcomeKind,
     PatchQualityEvaluator,
@@ -18,7 +19,6 @@ from singularity.evaluation import (
     WorkspaceSnapshot,
     WorkspaceSnapshotKind,
 )
-from singularity.command import CommandDecision, CommandPolicyResult, CommandRisk, SemanticStatus
 from singularity.observability import TraceEventType, TraceRecorder
 
 

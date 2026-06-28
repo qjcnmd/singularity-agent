@@ -8,7 +8,6 @@ from typing import Any
 
 from singularity.review.models import ReviewEvidence, ReviewFreshness, ReviewTrustLevel
 
-
 SENSITIVE_KEYS = {
     "api_key",
     "apikey",

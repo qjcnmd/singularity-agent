@@ -4,15 +4,14 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
-
 
 SCHEMA_VERSION = 1
 
 
-class MemoryScope(str, Enum):
+class MemoryScope(StrEnum):
     SESSION = "session"
     WORKSPACE = "workspace"
     PROJECT = "project"
@@ -20,7 +19,7 @@ class MemoryScope(str, Enum):
     TOOL_EXECUTOR = "tool_executor"
 
 
-class MemoryType(str, Enum):
+class MemoryType(StrEnum):
     PROJECT_CONVENTION = "project_convention"
     BUILD_COMMAND = "build_command"
     TEST_COMMAND = "test_command"
@@ -33,7 +32,7 @@ class MemoryType(str, Enum):
     VERIFICATION_FACT = "verification_fact"
 
 
-class MemorySource(str, Enum):
+class MemorySource(StrEnum):
     TRACE = "trace"
     FINAL_REPORT = "final_report"
     REVIEW = "review"
@@ -46,7 +45,7 @@ class MemorySource(str, Enum):
     UNKNOWN = "unknown"
 
 
-class Confidence(str, Enum):
+class Confidence(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -62,14 +61,14 @@ class Confidence(str, Enum):
         }[self]
 
 
-class ConflictStatus(str, Enum):
+class ConflictStatus(StrEnum):
     NONE = "none"
     CONFLICTED = "conflicted"
     MANUAL_REVIEW_REQUIRED = "manual_review_required"
     SUPERSEDED = "superseded"
 
 
-class MemoryStatus(str, Enum):
+class MemoryStatus(StrEnum):
     CANDIDATE = "candidate"
     ACTIVE = "active"
     QUARANTINED = "quarantined"
@@ -78,7 +77,7 @@ class MemoryStatus(str, Enum):
     EXPIRED = "expired"
 
 
-class MemoryAuthorType(str, Enum):
+class MemoryAuthorType(StrEnum):
     HUMAN = "human"
     AGENT = "agent"
 
@@ -102,7 +101,7 @@ class MemoryEvidenceRef:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "MemoryEvidenceRef":
+    def from_dict(cls, payload: dict[str, Any]) -> MemoryEvidenceRef:
         return cls(
             source=payload.get("source") or MemorySource.UNKNOWN,
             ref_id=str(payload.get("ref_id") or payload.get("id") or ""),
@@ -140,7 +139,7 @@ class Provenance:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "Provenance":
+    def from_dict(cls, payload: dict[str, Any] | None) -> Provenance:
         payload = payload or {}
         return cls(
             evidence=[
@@ -176,7 +175,7 @@ class TTL:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "TTL":
+    def from_dict(cls, payload: dict[str, Any] | None) -> TTL:
         payload = payload or {}
         return cls(
             expires_at=payload.get("expires_at"),
@@ -261,7 +260,7 @@ class MemoryEntry:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "MemoryEntry":
+    def from_dict(cls, payload: dict[str, Any]) -> MemoryEntry:
         if int(payload.get("schema_version") or 1) != SCHEMA_VERSION:
             raise ValueError(f"Unsupported memory entry schema: {payload.get('schema_version')}")
         return cls(
@@ -330,7 +329,7 @@ class MemoryCandidate:
             self.ttl = TTL.from_dict(self.ttl)
 
     @classmethod
-    def from_entry(cls, entry: MemoryEntry) -> "MemoryCandidate":
+    def from_entry(cls, entry: MemoryEntry) -> MemoryCandidate:
         return cls(
             id=f"cand_{entry.id}",
             scope=entry.scope,
@@ -351,7 +350,7 @@ class MemoryCandidate:
             metadata=dict(entry.metadata),
         )
 
-    def with_status(self, status: MemoryStatus, *, reason: str | None = None) -> "MemoryCandidate":
+    def with_status(self, status: MemoryStatus, *, reason: str | None = None) -> MemoryCandidate:
         payload = self.to_dict()
         payload["status"] = status.value
         payload["decision_reason"] = reason
@@ -389,7 +388,7 @@ class MemoryCandidate:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "MemoryCandidate":
+    def from_dict(cls, payload: dict[str, Any]) -> MemoryCandidate:
         if int(payload.get("schema_version") or 1) != SCHEMA_VERSION:
             raise ValueError(f"Unsupported memory candidate schema: {payload.get('schema_version')}")
         return cls(

@@ -6,8 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from singularity.policy import Capability, OperationKind, ResourceRef
-from singularity.tools.models import PermissionLevel, ToolSpec
-from singularity.tools.models import ToolSideEffectKind, ToolSensitivityLevel
+from singularity.tools.models import PermissionLevel, ToolSensitivityLevel, ToolSideEffectKind, ToolSpec
 from singularity.workspace_state import WorkspaceStateManager
 
 

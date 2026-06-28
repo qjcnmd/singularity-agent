@@ -9,12 +9,12 @@ from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.tools.models import (
     PermissionLevel,
     ToolExecutionBackendKind,
-    ToolSideEffectKind,
-    ToolSensitivityLevel,
     ToolExecutionFailure,
+    ToolSensitivityLevel,
+    ToolSideEffectKind,
     ToolSpec,
 )
-from singularity.workspace import CreateFile, DeleteFile, MoveFile, WorkspaceMutationManager, ReplaceText
+from singularity.workspace import CreateFile, DeleteFile, MoveFile, ReplaceText, WorkspaceMutationManager
 
 
 class ReplaceTextInput(BaseModel):

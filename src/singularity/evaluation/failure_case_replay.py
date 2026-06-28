@@ -6,7 +6,6 @@ from typing import Any
 
 from singularity.evaluation.models import FailureCaseRecord
 
-
 FAILURE_CASE_REPLAY_SCHEMA_VERSION = "evaluation.failure_case_replay/v1"
 
 

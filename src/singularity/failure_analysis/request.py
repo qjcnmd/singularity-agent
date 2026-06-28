@@ -49,7 +49,7 @@ class FailureAnalysisRequest:
         failure_source: str,
         outcome: ExecutionOutcome | None = None,
         turn: int | None = None,
-    ) -> "FailureAnalysisRequest":
+    ) -> FailureAnalysisRequest:
         state = getattr(planner, "state", None)
         evidence = getattr(planner, "evidence", None)
         task_id = str(getattr(state, "task_id", "") or getattr(planner, "task_id", "") or "")

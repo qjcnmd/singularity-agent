@@ -9,7 +9,6 @@ from typing import Any
 
 from singularity.context.models import ContextSensitivity
 
-
 SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)([A-Za-z0-9._\-]{8,})"),
     re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]{8,})"),

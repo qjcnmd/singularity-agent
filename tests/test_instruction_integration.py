@@ -3,11 +3,11 @@ from pathlib import Path
 from singularity.context import ContextManager
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.model import (
-    ModelTurnRequestBuilder,
-    ModelCapabilities,
     MockModelProvider,
+    ModelCapabilities,
     ModelPurpose,
     ModelRunner,
+    ModelTurnRequestBuilder,
     ModelTurnStatus,
 )
 from singularity.observability import TraceRecorder

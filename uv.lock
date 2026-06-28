@@ -1265,6 +1265,7 @@ dev = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 release = [
@@ -1274,6 +1275,7 @@ release = [
 test = [
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
@@ -1295,6 +1297,7 @@ dev = [
     { name = "mypy", specifier = ">=1.10" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=5.0" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 release = [
@@ -1304,6 +1307,7 @@ release = [
 test = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=5.0" },
+    { name = "pyyaml", specifier = ">=6" },
 ]
 
 [[package]]

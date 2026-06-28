@@ -13,7 +13,6 @@ from singularity.policy.approval import ApprovalGate
 from singularity.policy.config import PolicyConfig
 from singularity.policy.remote import RemoteApprovalExchange
 
-
 approval_app = typer.Typer(add_completion=False, no_args_is_help=True)
 remote_app = typer.Typer(add_completion=False, no_args_is_help=True)
 approval_app.add_typer(remote_app, name="remote")

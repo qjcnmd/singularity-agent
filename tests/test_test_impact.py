@@ -10,7 +10,6 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -21,9 +20,7 @@ from scripts.test_impact import (
     _fallback_tests,
     _is_pytest_collectable,
     _validate_recommendations,
-    main,
 )
-
 
 # ---------------------------------------------------------------------------
 # _fallback_tests
@@ -35,7 +32,7 @@ class TestFallbackTests:
     def test_test_file_input_returned_directly(self) -> None:
         """A test file path that exists is returned as-is."""
         # Use a real existing test file from the repo
-        result, warnings = _fallback_tests(["tests/test_cli.py"])
+        result, _warnings = _fallback_tests(["tests/test_cli.py"])
         assert "tests/test_cli.py" in result
 
     def test_nonexistent_test_file_not_returned(self) -> None:
@@ -113,12 +110,19 @@ class TestSpecialPathMappings:
         assert "tests/test_docs_consistency.py" in result
         assert len(warnings) == 0
 
-    def test_pyproject_toml_maps_to_test_infra(self) -> None:
-        """pyproject.toml -> tests/test_test_infra.py + smoke collect warning"""
+    def test_pyproject_toml_maps_to_quality_and_test_infra(self) -> None:
+        """pyproject.toml -> static/test infrastructure contract tests."""
         result, warnings = _fallback_tests(["pyproject.toml"])
         assert "tests/test_test_infra.py" in result
+        assert "tests/test_quality_gates.py" in result
         assert any("pyproject.toml changed" in w for w in warnings)
         assert any("collect-only" in w for w in warnings)
+
+    def test_ci_workflow_maps_to_quality_gate_contract(self) -> None:
+        """CI workflow changes must run their repository contract test."""
+        result, warnings = _fallback_tests([".github/workflows/ci.yml"])
+        assert result == ["tests/test_quality_gates.py"]
+        assert warnings == []
 
     def test_test_impact_py_maps_to_self_test(self) -> None:
         """scripts/test_impact.py -> tests/test_test_impact.py"""

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from singularity.command import CommandPurpose, CommandRequest, CommandExecutor
+from singularity.command import CommandExecutor, CommandPurpose, CommandRequest
 
 
 @dataclass(frozen=True)

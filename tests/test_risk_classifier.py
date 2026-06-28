@@ -3,13 +3,13 @@ from pathlib import Path
 from singularity.policy import (
     Capability,
     OperationKind,
+    PolicyComponent,
     PolicyRequest,
     PolicySubject,
     ResourceRef,
     RiskClassifier,
     RiskLevel,
     RiskTag,
-    PolicyComponent,
 )
 
 

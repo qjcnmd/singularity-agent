@@ -41,23 +41,23 @@ from singularity.policy import (
     Capability,
     DecisionOutcome,
     OperationKind,
+    PermissionProfileName,
+    PolicyComponent,
     PolicyConfig,
-    PolicyRequest,
     PolicyEngine,
+    PolicyError,
+    PolicyRequest,
     PolicySubject,
     ResourceRef,
-    PolicyComponent,
-    PolicyError,
-    PermissionProfileName,
 )
 from singularity.policy.audit import redact, redact_resource_identifier
 from singularity.sandbox import (
     SandboxFilesystemMode,
+    SandboxManager,
     SandboxNetworkMode,
     SandboxProfileName,
     SandboxRequest,
     SandboxResult,
-    SandboxManager,
     SandboxStatus,
     default_sandbox_profile,
 )
@@ -85,7 +85,7 @@ class WorkspaceSnapshot:
     files: dict[str, str]
 
     @classmethod
-    def capture(cls, workspace_root: Path) -> "WorkspaceSnapshot":
+    def capture(cls, workspace_root: Path) -> WorkspaceSnapshot:
         files: dict[str, str] = {}
         if not workspace_root.exists():
             return cls(files)
@@ -104,7 +104,7 @@ class WorkspaceSnapshot:
                 continue
         return cls(files)
 
-    def changed_files(self, after: "WorkspaceSnapshot") -> list[str]:
+    def changed_files(self, after: WorkspaceSnapshot) -> list[str]:
         changed = {
             path
             for path, digest in after.files.items()
@@ -130,7 +130,7 @@ class CommandExecutor:
         backend: ExecutionBackend | None = None,
         trace: TraceEmitterProtocol | None = None,
         env_policy: EnvPolicy | None = None,
-        workspace_state_manager: "WorkspaceStateManager | None" = None,
+        workspace_state_manager: WorkspaceStateManager | None = None,
         planner: Any | None = None,
         policy_engine: PolicyEngine | None = None,
         approval_gate: ApprovalGate | None = None,
@@ -197,19 +197,15 @@ class CommandExecutor:
         )
         approved_escalation = False
         approval_grant_id: str | None = None
-        if policy_decision.outcome == DecisionOutcome.REQUIRE_REVIEW:
-            if self.approval_gate is not None:
-                try:
-                    grant = self.approval_gate.authorize(policy_request, policy_decision)
-                except PolicyError:
-                    grant = None
-                if grant is not None:
-                    approval_grant_id = grant.grant_id
-                    approved_escalation = True
-                    sandbox_required = (
-                        self.permission_profile.profile
-                        == PermissionProfileName.READ_ONLY
-                    )
+        if policy_decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate is not None:
+            try:
+                grant = self.approval_gate.authorize(policy_request, policy_decision)
+            except PolicyError:
+                grant = None
+            if grant is not None:
+                approval_grant_id = grant.grant_id
+                approved_escalation = True
+                sandbox_required = self.permission_profile.profile == PermissionProfileName.READ_ONLY
         if policy_decision.outcome != DecisionOutcome.ALLOW and not sandbox_required:
             if approved_escalation:
                 pass

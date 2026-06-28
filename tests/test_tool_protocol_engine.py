@@ -8,29 +8,33 @@ from typing import Any
 from pydantic import BaseModel
 
 from singularity.context import ContextManager
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import (
+    MockModelProvider,
+    ModelCapabilities,
     ModelMessage,
     ModelPurpose,
-    ModelCapabilities,
     ModelRunner,
+    ModelToolCall,
+    ModelToolParseStatus,
     ModelTurnRequest,
     ModelTurnResult,
     ModelTurnStatus,
-    ModelToolCall,
-    ModelToolParseStatus,
-    MockModelProvider,
 )
-from singularity.tool_protocol.models import ToolExecutionMode, ToolProtocolTurnStatus
-from singularity.tool_protocol.models import ToolCallFailureKind, ToolCallPhase
+from singularity.policy import DecisionOutcome
 from singularity.tool_protocol.engine import ToolProtocolEngine
+from singularity.tool_protocol.models import (
+    ToolCallFailureKind,
+    ToolCallPhase,
+    ToolExecutionMode,
+    ToolProtocolTurnStatus,
+)
 from singularity.tool_protocol.state import ToolProtocolStateStore
-from singularity.tools import ToolExecutionRequest, ToolPolicy, ToolRegistry, ToolResult, ToolExecutor
+from singularity.tools import ToolExecutionRequest, ToolExecutor, ToolPolicy, ToolRegistry, ToolResult
 from singularity.tools.command import register_command_tools
 from singularity.tools.models import PermissionLevel, ToolExecutionFailure, ToolSideEffectKind, ToolSpec
-from singularity.jsonl_trace import JsonlTraceRecorder
-from tests.tool_executor_helpers import make_test_policy_engine
 from tests.test_tool_executor_policy_approval import SequencedPolicyEngine
-from singularity.policy import DecisionOutcome
+from tests.tool_executor_helpers import make_test_policy_engine
 
 
 def _make_request(tmp_path: Path) -> tuple[ModelTurnRequest, ContextManager]:

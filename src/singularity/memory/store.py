@@ -16,7 +16,6 @@ from singularity.memory.models import (
     _now,
 )
 
-
 HUMAN_FILES = {
     "project": "project.md",
     "commands": "commands.md",

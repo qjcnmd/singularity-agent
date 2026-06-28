@@ -5,8 +5,8 @@ from singularity.model import (
     MessageConverter,
     ModelCapabilities,
     ModelMessage,
-    ProviderRequest,
     ModelRole,
+    ProviderRequest,
 )
 from singularity.model.providers import _model_messages_to_openai
 

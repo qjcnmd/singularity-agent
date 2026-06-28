@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 
 from singularity.interaction import (
-    InteractionMode,
     InteractionController,
+    InteractionMode,
     UserDecision,
 )
 from singularity.policy import (
@@ -13,12 +13,12 @@ from singularity.policy import (
     Capability,
     DecisionOutcome,
     OperationKind,
+    PolicyComponent,
     PolicyConfig,
     PolicyDecision,
     PolicyRequest,
     PolicySubject,
     ResourceRef,
-    PolicyComponent,
     SandboxRequired,
 )
 from singularity.policy.approval import _approval_grants_path
@@ -200,7 +200,7 @@ def test_repeated_import_without_grant_id_does_not_amplify(tmp_path: Path) -> No
     # from ``decision_id`` + ``request_id`` + ``approved_by``, and
     # ``register_grant`` dedups by grant_id OR decision_id, so the second
     # import replaces the first instead of appending a new consumable grant.
-    from singularity.policy import ApprovalGrant, ApprovalScope
+    from singularity.policy import ApprovalGrant
     from singularity.policy.approval import _approval_grants_path
 
     grants_path = tmp_path / "outside_grants.jsonl"

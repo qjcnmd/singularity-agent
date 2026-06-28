@@ -4,47 +4,46 @@ import copy
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, TypeVar, cast
-
 
 SCHEMA_VERSION = "evaluation.benchmark_task/v1"
 FAILURE_CASE_RECORD_SCHEMA_VERSION = "evaluation.failure_case_record/v1"
 EnumT = TypeVar("EnumT", bound=Enum)
 
 
-class TaskDifficulty(str, Enum):
+class TaskDifficulty(StrEnum):
     EASY = "easy"
     MEDIUM = "medium"
     HARD = "hard"
 
 
-class BenchmarkTaskKind(str, Enum):
+class BenchmarkTaskKind(StrEnum):
     REPO_ISSUE_REPAIR = "repo_issue_repair"
     TERMINAL_TASK = "terminal_task"
     SINGULARITY_INTERNAL = "singularity_internal"
 
 
-class BenchmarkVisibility(str, Enum):
+class BenchmarkVisibility(StrEnum):
     PUBLIC = "public"
     PRIVATE = "private"
 
 
-class BenchmarkAdapterKind(str, Enum):
+class BenchmarkAdapterKind(StrEnum):
     SINGULARITY_PRIVATE = "singularity_private"
     SWE_BENCH = "swe_bench"
     TERMINAL_BENCH = "terminal_bench"
 
 
-class WorkspaceSnapshotKind(str, Enum):
+class WorkspaceSnapshotKind(StrEnum):
     GIT_REF = "git_ref"
     ARCHIVE_PATH = "archive_path"
     INLINE_FILES = "inline_files"
     BASELINE_TRACE_RUN_ID = "baseline_trace_run_id"
 
 
-class ExpectedOutcomeKind(str, Enum):
+class ExpectedOutcomeKind(StrEnum):
     TEST = "test"
     ASSERTION = "assertion"
     DIFF = "diff"
@@ -82,7 +81,7 @@ class TaskInput:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | str) -> "TaskInput":
+    def from_dict(cls, payload: dict[str, Any] | str) -> TaskInput:
         if isinstance(payload, str):
             return cls(prompt=payload)
         return cls(
@@ -128,7 +127,7 @@ class WorkspaceSnapshot:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "WorkspaceSnapshot":
+    def from_dict(cls, payload: dict[str, Any]) -> WorkspaceSnapshot:
         return cls(
             kind=_enum(WorkspaceSnapshotKind, str(payload.get("kind", ""))),
             git_ref=payload.get("git_ref"),
@@ -171,7 +170,7 @@ class ExpectedOutcome:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ExpectedOutcome":
+    def from_dict(cls, payload: dict[str, Any]) -> ExpectedOutcome:
         return cls(
             kind=_enum(ExpectedOutcomeKind, str(payload.get("kind", ""))),
             weight=float(payload.get("weight", 1.0)),
@@ -213,7 +212,7 @@ class EvaluationHook:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "EvaluationHook":
+    def from_dict(cls, payload: dict[str, Any]) -> EvaluationHook:
         return cls(
             name=str(payload.get("name", "")),
             stage=str(payload.get("stage", "")),
@@ -257,7 +256,7 @@ class GoldenTaskContract:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "GoldenTaskContract":
+    def from_dict(cls, payload: dict[str, Any]) -> GoldenTaskContract:
         missing = sorted(field for field in GOLDEN_CONTRACT_FIELDS if field not in payload)
         if missing:
             raise ValueError(f"golden_contract missing fields: {', '.join(missing)}")
@@ -394,7 +393,7 @@ class BenchmarkTask:
         if invalid:
             raise ValueError(f"Unsupported benchmark tag or difficulty tag: {', '.join(invalid)}")
 
-    def with_updates(self, **updates: Any) -> "BenchmarkTask":
+    def with_updates(self, **updates: Any) -> BenchmarkTask:
         payload = self.to_dict()
         for key, value in updates.items():
             if key == "input_prompt":
@@ -444,7 +443,7 @@ class BenchmarkTask:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "BenchmarkTask":
+    def from_dict(cls, payload: dict[str, Any]) -> BenchmarkTask:
         return cls(
             task_id=str(payload.get("task_id", "")),
             version=str(payload.get("version", "")),
@@ -508,7 +507,7 @@ class EvaluationProfile:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "EvaluationProfile":
+    def from_dict(cls, payload: dict[str, Any] | None) -> EvaluationProfile:
         payload = payload or {}
         return cls(
             name=str(payload.get("name", "baseline")),
@@ -621,7 +620,7 @@ class FailureCaseRecord:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "FailureCaseRecord":
+    def from_dict(cls, payload: dict[str, Any]) -> FailureCaseRecord:
         return cls(
             task_id=str(payload.get("task_id") or ""),
             status=str(payload.get("status") or ""),

@@ -9,7 +9,15 @@ import pytest
 from typer.testing import CliRunner
 
 from singularity.cli import app
-from singularity.command import CommandRequest, CommandExecutor
+from singularity.command import (
+    CommandDecision,
+    CommandExecutor,
+    CommandPolicyResult,
+    CommandRequest,
+    CommandRisk,
+    ExecutionStatus,
+    SemanticStatus,
+)
 from singularity.context.manager import ContextManager
 from singularity.observability.models import TraceEventType
 from singularity.observability.recorder import TraceRecorder
@@ -18,26 +26,17 @@ from singularity.planner.finalizer import Finalizer
 from singularity.policy import (
     Capability,
     OperationKind,
+    PolicyComponent,
     PolicyConfig,
-    PolicyRequest,
     PolicyEngine,
+    PolicyRequest,
     PolicySubject,
     ResourceRef,
-    PolicyComponent,
 )
 from singularity.policy.approval import ApprovalGate
-from singularity.policy.permissions import ApprovalPolicy, PermissionProfile, PermissionProfileName
 from singularity.policy.exceptions import ApprovalRequired
 from singularity.policy.models import DecisionOutcome
-from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
-from singularity.workspace import CreateFile, WorkspaceMutationManager
-from singularity.command import (
-    CommandPolicyResult,
-    CommandDecision,
-    CommandRisk,
-    ExecutionStatus,
-    SemanticStatus,
-)
+from singularity.policy.permissions import ApprovalPolicy, PermissionProfile, PermissionProfileName
 from singularity.sandbox import (
     SandboxManager,
     SandboxNetworkMode,
@@ -45,7 +44,9 @@ from singularity.sandbox import (
     SandboxRequest,
     default_sandbox_profile,
 )
+from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
 from singularity.verification import VerificationRunner
+from singularity.workspace import CreateFile, WorkspaceMutationManager
 from tests.tool_executor_helpers import make_test_policy_engine
 
 

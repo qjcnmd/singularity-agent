@@ -5,7 +5,6 @@ import json
 import re
 from typing import Any
 
-
 SECRET_KEY_RE = re.compile(
     r"(authorization|cookie|token|api[_-]?key|secret|password|private[_-]?key|database[_-]?url|dsn|conn(?:ection)?[_-]?(?:str|string)|openai_api_key|anthropic_api_key|github_token|npm_token)",
     re.IGNORECASE,

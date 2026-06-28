@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterator
+from typing import Any
 
 from singularity.context.models import (
     ContextBundle,
@@ -20,7 +21,6 @@ from singularity.context.models import (
     digest_value,
 )
 from singularity.context.redaction import ContextRedactor, SensitivityClassifier
-
 
 _RAW_OBSERVATION_KEYS = {"raw_result", "raw_args", "raw_arguments", "result"}
 
@@ -1271,7 +1271,7 @@ class ObservationStore:
     def _emit_trace(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.trace is None or not hasattr(self.trace, "emit"):
             return
-        try:
+        with suppress(Exception):
             self.trace.emit(
                 event_type,
                 component="context",
@@ -1279,8 +1279,6 @@ class ObservationStore:
                 payload=payload,
                 ids={"run_id": payload.get("run_id")},
             )
-        except Exception:
-            pass
 
     @staticmethod
     def _now() -> str:

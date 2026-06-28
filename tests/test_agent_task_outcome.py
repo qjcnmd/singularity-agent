@@ -6,30 +6,30 @@ from singularity.agent_loop import AgentLoopStatus
 from singularity.command import CommandExecutor
 from singularity.context import ContextManager
 from singularity.edit import EditExecutor
+from singularity.failure_analysis.analyzer import FailureAnalyzer
+from singularity.failure_analysis.request import FailureAnalysisRequest
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import ModelError, ModelErrorKind
 from singularity.planner import Planner, TaskStatus
+from singularity.planner.models import ReplanDecisionKind
 from singularity.policy import (
     DecisionOutcome,
     OperationKind,
     PolicyConfig,
     PolicyDecision,
-    PolicyRequest,
     PolicyEngine,
+    PolicyRequest,
     RiskLevel,
 )
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
+from singularity.repair import RepairPlanner
 from singularity.run_controller import RunLifecycleStatus
 from singularity.tools import ToolRegistry
 from singularity.tools.edit import register_edit_tools
 from singularity.tools.mutation import register_mutation_tools
 from singularity.tools.verification import register_verification_tools
-from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.verification import VerificationRunner
 from singularity.workspace import WorkspaceMutationManager
-from singularity.failure_analysis.analyzer import FailureAnalyzer
-from singularity.failure_analysis.request import FailureAnalysisRequest
-from singularity.planner.models import ReplanDecisionKind
-from singularity.repair import RepairPlanner
 from tests.agent_loop_helpers import make_agent_session
 
 

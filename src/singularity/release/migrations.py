@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 from singularity.release.init import default_config, validate_config
 from singularity.release.metadata import package_version
@@ -15,7 +15,6 @@ from singularity.release.models import (
     read_json,
 )
 from singularity.release.paths import UserDataPaths
-
 
 MigrationFn = Callable[[UserDataPaths], None]
 

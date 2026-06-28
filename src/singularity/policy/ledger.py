@@ -26,7 +26,7 @@ import hashlib
 import json
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -114,7 +114,7 @@ class GrantConsumptionRecord:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "GrantConsumptionRecord":
+    def from_dict(cls, payload: dict[str, Any]) -> GrantConsumptionRecord:
         return cls(
             record_id=str(payload["record_id"]),
             grant_id=str(payload["grant_id"]),
@@ -148,7 +148,7 @@ class _LedgerHead:
         return {**self.canonical_payload(), "head_hmac": self.head_hmac}
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "_LedgerHead":
+    def from_dict(cls, payload: dict[str, Any]) -> _LedgerHead:
         return cls(
             last_record_id=str(payload.get("last_record_id") or ""),
             last_record_hash=str(payload.get("last_record_hash") or ""),
@@ -268,7 +268,7 @@ class GrantConsumptionLedger:
             return
         operator_key = self._load_operator_key()
         previous_wire_hash = ""
-        for index, record in enumerate(records):
+        for _index, record in enumerate(records):
             if record.previous_record_hash != previous_wire_hash:
                 raise GrantConsumptionLedgerTamperError(
                     f"Consumption ledger record {record.record_id} has a broken "
@@ -310,12 +310,11 @@ class GrantConsumptionLedger:
         request: PolicyRequest | None,
     ) -> GrantConsumptionRecord:
         operator_key = self._load_operator_key()
-        if records:
-            previous_wire_hash = hashlib.sha256(
-                records[-1].to_jsonl_line().encode("utf-8")
-            ).hexdigest()
-        else:
-            previous_wire_hash = ""
+        previous_wire_hash = (
+            hashlib.sha256(records[-1].to_jsonl_line().encode("utf-8")).hexdigest()
+            if records
+            else ""
+        )
         if request is not None:
             request_digest = stable_hash(
                 {

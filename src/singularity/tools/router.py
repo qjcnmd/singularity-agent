@@ -5,7 +5,6 @@ from typing import Any
 
 from singularity.tools.models import PermissionLevel, ToolSpec
 
-
 LOW_LEVEL_INTERNAL_TOOLS = {
     "workspace_replace_text",
     "workspace_create_file",

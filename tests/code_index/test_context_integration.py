@@ -1,8 +1,8 @@
 from pathlib import Path
 
+from singularity.code_index import ProjectIndex
 from singularity.context import ContextManager
 from singularity.planner import Planner
-from singularity.code_index import ProjectIndex
 
 
 class FakeTrace:

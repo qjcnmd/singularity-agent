@@ -5,7 +5,6 @@ from typing import Any
 from singularity.planner.models import ActionKind, TaskPhase
 from singularity.tools.models import PermissionLevel, ToolSpec
 
-
 INDEX_TOOLS = {"index_relevant", "index_symbols", "index_explain", "index_impact", "index_tests"}
 READ_TOOLS = {"list_files", "read_file", "search_text", "workspace_health", *INDEX_TOOLS}
 DIFF_TOOLS = {"inspect_diff"}

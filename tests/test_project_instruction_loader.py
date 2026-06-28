@@ -3,9 +3,9 @@ from pathlib import Path
 import pytest
 
 from singularity.instructions import (
-    PromptAssemblyConfig,
     InstructionSourceType,
     ProjectInstructionLoader,
+    PromptAssemblyConfig,
     TrustLevel,
 )
 from singularity.instructions.exceptions import InstructionSourceError

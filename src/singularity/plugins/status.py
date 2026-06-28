@@ -8,7 +8,6 @@ from singularity.plugins.compatibility import compatibility_status
 from singularity.plugins.models import (
     DiscoveredPlugin,
     PluginLockEntry,
-    PluginPermission,
     PluginStatus,
 )
 

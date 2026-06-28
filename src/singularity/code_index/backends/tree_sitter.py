@@ -9,7 +9,7 @@ class TreeSitterBackend:
 
     def available(self) -> bool:
         try:
-            import tree_sitter  # noqa: F401
+            pass
         except Exception:
             return False
         return True

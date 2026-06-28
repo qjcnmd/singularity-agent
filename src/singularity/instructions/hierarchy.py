@@ -10,7 +10,6 @@ from singularity.instructions.models import (
     _priority_rank,
 )
 
-
 UNTRUSTED_SOURCE_TYPES = {
     InstructionSourceType.PROJECT_FILE,
     InstructionSourceType.README,

@@ -3,19 +3,19 @@ from pathlib import Path
 from singularity.policy import (
     ApprovalGate,
     ApprovalGrant,
-    ApprovalScope,
     ApprovalPolicy,
+    ApprovalScope,
     Capability,
     DecisionOutcome,
     OperationKind,
-    PolicyConfig,
-    PolicyRequest,
-    PolicyEngine,
-    PolicySubject,
-    ResourceRef,
-    PolicyComponent,
     PermissionProfile,
     PermissionProfileName,
+    PolicyComponent,
+    PolicyConfig,
+    PolicyEngine,
+    PolicyRequest,
+    PolicySubject,
+    ResourceRef,
 )
 from tests.tool_executor_helpers import make_ledger_test_config
 

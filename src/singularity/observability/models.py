@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -12,7 +12,7 @@ from singularity.observability.exceptions import TraceSerializationError
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
-class TraceSeverity(str, Enum):
+class TraceSeverity(StrEnum):
     DEBUG = "debug"
     INFO = "info"
     WARNING = "warning"
@@ -20,7 +20,7 @@ class TraceSeverity(str, Enum):
     CRITICAL = "critical"
 
 
-class TraceEventType(str, Enum):
+class TraceEventType(StrEnum):
     TASK_STARTED = "task.started"
     TASK_COMPLETED = "task.completed"
     TASK_FAILED = "task.failed"
@@ -176,7 +176,7 @@ class TraceEventType(str, Enum):
     FINAL_REPORT_COMPLETED = "final_report.completed"
 
 
-class TraceStatus(str, Enum):
+class TraceStatus(StrEnum):
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
@@ -186,7 +186,7 @@ class TraceStatus(str, Enum):
     BLOCKED = "blocked"
 
 
-class TraceArtifactKind(str, Enum):
+class TraceArtifactKind(StrEnum):
     STDOUT = "stdout"
     STDERR = "stderr"
     DIFF = "diff"
@@ -265,14 +265,14 @@ class TraceEvent:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TraceEvent":
+    def from_dict(cls, payload: dict[str, Any]) -> TraceEvent:
         return cls(**payload)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, default=str)
 
     @classmethod
-    def from_json(cls, text: str) -> "TraceEvent":
+    def from_json(cls, text: str) -> TraceEvent:
         try:
             return cls.from_dict(json.loads(text))
         except Exception as exc:
@@ -328,7 +328,7 @@ class TraceSpan:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TraceSpan":
+    def from_dict(cls, payload: dict[str, Any]) -> TraceSpan:
         return cls(**payload)
 
 
@@ -374,7 +374,7 @@ class TraceArtifact:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TraceArtifact":
+    def from_dict(cls, payload: dict[str, Any]) -> TraceArtifact:
         data = dict(payload)
         data.pop("artifact_ref", None)
         data.pop("relative_handle", None)
@@ -456,7 +456,7 @@ class TraceSummary:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TraceSummary":
+    def from_dict(cls, payload: dict[str, Any]) -> TraceSummary:
         return cls(**payload)
 
 

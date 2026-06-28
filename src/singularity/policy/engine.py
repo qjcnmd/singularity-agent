@@ -3,8 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from singularity.observability.models import TraceEventType, TraceSeverity
-from singularity.policy.audit import PolicyAuditWriter
-from singularity.policy.audit import redact_resource_identifier
+from singularity.policy.audit import PolicyAuditWriter, redact_resource_identifier
 from singularity.policy.config import PolicyConfig
 from singularity.policy.models import (
     DecisionOutcome,

@@ -3,23 +3,23 @@ from __future__ import annotations
 import fnmatch
 import os
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
 
 
-class PermissionProfileName(str, Enum):
+class PermissionProfileName(StrEnum):
     READ_ONLY = "read-only"
     WORKSPACE_WRITE = "workspace-write"
     DANGER_FULL_ACCESS = "danger-full-access"
 
 
-class ApprovalPolicy(str, Enum):
+class ApprovalPolicy(StrEnum):
     ON_REQUEST = "on-request"
     NEVER = "never"
 
 
-class NetworkAccess(str, Enum):
+class NetworkAccess(StrEnum):
     DENIED = "denied"
     ALLOWED = "allowed"
 

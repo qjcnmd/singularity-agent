@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
-
 
 APP_NAME = "singularity"
 
 
-class UserDataMode(str, Enum):
+class UserDataMode(StrEnum):
     USER = "user"
     DEVELOPMENT = "development"
     PORTABLE = "portable"
@@ -71,9 +70,7 @@ def resolve_user_data_paths(
         root = Path(home).expanduser()
     elif env_home:
         root = Path(env_home).expanduser()
-    elif resolved_mode == UserDataMode.DEVELOPMENT:
-        root = Path(project_root or Path.cwd()).expanduser() / ".singularity"
-    elif resolved_mode == UserDataMode.PORTABLE:
+    elif resolved_mode == UserDataMode.DEVELOPMENT or resolved_mode == UserDataMode.PORTABLE:
         root = Path(project_root or Path.cwd()).expanduser() / ".singularity"
     else:
         root = _user_data_root()

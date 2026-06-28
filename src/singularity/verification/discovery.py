@@ -20,7 +20,6 @@ from singularity.verification.models import (
     WorkspaceKind,
 )
 
-
 PACKAGE_LOCKS = {
     "pnpm-lock.yaml": "pnpm",
     "yarn.lock": "yarn",

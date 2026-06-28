@@ -1,13 +1,13 @@
 from singularity.git_client.client import (
+    GitClient,
     GitCommitResult,
     GitDiffStat,
-    GitClient,
     GitStatus,
 )
 
 __all__ = [
+    "GitClient",
     "GitCommitResult",
     "GitDiffStat",
-    "GitClient",
     "GitStatus",
 ]

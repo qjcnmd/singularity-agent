@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any
 from uuid import uuid4
 
 from singularity.code_index.context import build_project_index_observation
@@ -22,8 +23,8 @@ from singularity.code_index.models import (
     EntryPointRecord,
     Evidence,
     FileRecord,
-    IndexSummary,
     IncrementalIndexResult,
+    IndexSummary,
     ProjectRootRecord,
     ReferenceRecord,
     SymbolRecord,

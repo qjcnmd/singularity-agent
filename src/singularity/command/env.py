@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from singularity.command.output import SecretRedactor
 from singularity.command.policy import is_secret_env_name
 
-
 DEFAULT_INHERITED_ENV = {
     "COMSPEC",
     "HOME",

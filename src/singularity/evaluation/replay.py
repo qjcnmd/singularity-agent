@@ -12,7 +12,6 @@ from singularity.evaluation.models import (
 )
 from singularity.observability.models import TraceEvent, TraceEventType
 
-
 SIDE_EFFECT_EVENT_TYPES = {
     TraceEventType.COMMAND_STARTED.value,
     TraceEventType.COMMAND_COMPLETED.value,

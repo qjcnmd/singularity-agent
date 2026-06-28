@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable
 
 from singularity.code_index.exceptions import IndexBudgetExceededError, PathOutsideWorkspaceError
 from singularity.code_index.models import (
@@ -15,7 +15,6 @@ from singularity.code_index.models import (
     LanguageId,
     TrustLevel,
 )
-
 
 DEFAULT_IGNORE_DIRS = {
     ".git",

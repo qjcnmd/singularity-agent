@@ -2,6 +2,7 @@ from singularity.memory.extractor import MemoryExtractor
 from singularity.memory.injector import MemoryInjector
 from singularity.memory.maintenance import MemoryMaintenance
 from singularity.memory.models import (
+    TTL,
     Confidence,
     ConflictStatus,
     MemoryAuthorType,
@@ -16,32 +17,33 @@ from singularity.memory.models import (
     MemoryStatus,
     MemoryType,
     Provenance,
-    TTL,
 )
+from singularity.memory.pipeline import MemoryLearningPipeline
 from singularity.memory.policy import AdmissionAction, AdmissionDecision, MemoryPolicy
 from singularity.memory.retrieval import MemoryRetriever
 from singularity.memory.rules import PathScopedRule
-from singularity.memory.pipeline import MemoryLearningPipeline
 from singularity.memory.store import MemoryStore
-from singularity.memory.sync import MemorySyncExport, MemorySyncImport, MemoryBundleSync
+from singularity.memory.sync import MemoryBundleSync, MemorySyncExport, MemorySyncImport
 
 __all__ = [
+    "TTL",
     "AdmissionAction",
     "AdmissionDecision",
     "Confidence",
     "ConflictStatus",
-    "MemoryCandidate",
     "MemoryAuthorType",
+    "MemoryBundleSync",
+    "MemoryCandidate",
     "MemoryContextBlock",
     "MemoryEntry",
     "MemoryEvidenceRef",
     "MemoryExtractor",
     "MemoryInjector",
+    "MemoryLearningPipeline",
     "MemoryMaintenance",
     "MemoryPolicy",
     "MemoryQuery",
     "MemoryRetriever",
-    "MemoryLearningPipeline",
     "MemoryScope",
     "MemorySearchResult",
     "MemorySource",
@@ -49,9 +51,7 @@ __all__ = [
     "MemoryStore",
     "MemorySyncExport",
     "MemorySyncImport",
-    "MemoryBundleSync",
     "MemoryType",
     "PathScopedRule",
     "Provenance",
-    "TTL",
 ]

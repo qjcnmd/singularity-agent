@@ -20,7 +20,6 @@ class VerificationStep:
     @property
     def command_argv(self) -> list[str]:
         """Normalized argv for command matching."""
-        import shlex
 
         text = self.command.strip()
         if not text:
@@ -52,7 +51,7 @@ class VerificationStep:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "VerificationStep":
+    def from_dict(cls, payload: dict[str, Any]) -> VerificationStep:
         return cls(
             step_id=str(payload.get("step_id") or ""),
             command=str(payload.get("command") or ""),
@@ -83,7 +82,7 @@ class VerificationContract:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "VerificationContract":
+    def from_dict(cls, payload: dict[str, Any]) -> VerificationContract:
         steps = [VerificationStep.from_dict(item) for item in (payload.get("steps") or [])]
         return cls(
             contract_id=str(payload.get("contract_id") or ""),
@@ -95,7 +94,7 @@ class VerificationContract:
     @classmethod
     def from_plan_strings(
         cls, plan: list[str], *, contract_id: str | None = None
-    ) -> "VerificationContract":
+    ) -> VerificationContract:
         steps: list[VerificationStep] = []
         for index, text in enumerate(plan):
             text = text.strip()
@@ -115,7 +114,7 @@ class VerificationContract:
         )
 
     @classmethod
-    def empty(cls) -> "VerificationContract":
+    def empty(cls) -> VerificationContract:
         return cls(contract_id=f"vcontract_{uuid4().hex[:12]}", steps=[])
 
     @property

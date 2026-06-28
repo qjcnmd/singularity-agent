@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from typer.testing import CliRunner
 from typer.main import get_command
+from typer.testing import CliRunner
 
 from singularity.agent_loop import AgentLoopStatus
 from singularity.cli import app
@@ -14,33 +14,33 @@ from singularity.context import ContextManager
 from singularity.context.models import ContextItemType, ContextSource
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import (
+    MockModelProvider,
     ModelMessage,
     ModelPurpose,
     ModelRunner,
-    ModelTurnResult,
-    ModelTurnStatus,
     ModelToolCall,
     ModelToolParseStatus,
-    MockModelProvider,
+    ModelTurnResult,
+    ModelTurnStatus,
 )
 from singularity.observability import TraceRecorder
 from singularity.observability.artifacts import TraceArtifactStore
 from singularity.observability.models import TraceArtifactKind
 from singularity.policy import DecisionOutcome
+from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tool_protocol.models import (
     ToolCallEnvelope,
     ToolCallPhase,
     ToolProtocolResultEnvelope,
     ToolProtocolTurnStatus,
 )
-from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tool_protocol.state import ToolProtocolStateStore
 from singularity.tools import (
     PermissionLevel,
     ToolExecutionBackendKind,
+    ToolExecutor,
     ToolPolicy,
     ToolRegistry,
-    ToolExecutor,
     ToolSideEffectKind,
     ToolSpec,
 )

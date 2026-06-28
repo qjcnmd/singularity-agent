@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -14,7 +14,7 @@ from uuid import uuid4
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
-class PolicyComponent(str, Enum):
+class PolicyComponent(StrEnum):
     TOOL = "tool"
     MUTATION = "mutation"
     COMMAND = "command"
@@ -24,7 +24,7 @@ class PolicyComponent(str, Enum):
     SYSTEM = "system"
 
 
-class OperationKind(str, Enum):
+class OperationKind(StrEnum):
     READ_FILE = "read_file"
     LIST_DIRECTORY = "list_directory"
     SEARCH = "search"
@@ -43,7 +43,7 @@ class OperationKind(str, Enum):
     VERIFICATION = "verification"
 
 
-class Capability(str, Enum):
+class Capability(StrEnum):
     READ_WORKSPACE = "READ_WORKSPACE"
     READ_OUTSIDE_WORKSPACE = "READ_OUTSIDE_WORKSPACE"
     READ_SECRET = "READ_SECRET"
@@ -66,7 +66,7 @@ class Capability(str, Enum):
     CHANGE_AGENT_CONFIG = "CHANGE_AGENT_CONFIG"
 
 
-class RiskTag(str, Enum):
+class RiskTag(StrEnum):
     WORKSPACE_READ = "WORKSPACE_READ"
     OUTSIDE_WORKSPACE = "OUTSIDE_WORKSPACE"
     SECRET_ACCESS = "SECRET_ACCESS"
@@ -88,7 +88,7 @@ class RiskTag(str, Enum):
     SECRETS_EXFILTRATION = "SECRETS_EXFILTRATION"
 
 
-class RiskLevel(str, Enum):
+class RiskLevel(StrEnum):
     NONE = "none"
     LOW = "low"
     MEDIUM = "medium"
@@ -96,7 +96,7 @@ class RiskLevel(str, Enum):
     CRITICAL = "critical"
 
 
-class DecisionOutcome(str, Enum):
+class DecisionOutcome(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     REQUIRE_REVIEW = "require_review"
@@ -320,7 +320,7 @@ class ApprovalGrant:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ApprovalGrant":
+    def from_dict(cls, payload: dict[str, Any]) -> ApprovalGrant:
         decision_id = str(payload["decision_id"])
         request_id = str(payload["request_id"])
         approved_by = str(payload["approved_by"])
@@ -393,7 +393,7 @@ class PolicyDecision:
         risk_level: RiskLevel = RiskLevel.MEDIUM,
         risk_tags: list[RiskTag | str] | None = None,
         review_kind: str = "generic",
-    ) -> "PolicyDecision":
+    ) -> PolicyDecision:
         return cls(
             request_id=request.request_id,
             outcome=DecisionOutcome.REQUIRE_REVIEW,
@@ -414,7 +414,7 @@ class PolicyDecision:
             context_summary=policy_context_summary(request, DecisionOutcome.REQUIRE_REVIEW, reason),
         )
 
-    def model_copy_with(self, **updates: Any) -> "PolicyDecision":
+    def model_copy_with(self, **updates: Any) -> PolicyDecision:
         payload: dict[str, Any] = {
             "request_id": self.request_id,
             "outcome": self.outcome,

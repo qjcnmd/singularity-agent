@@ -5,18 +5,18 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import PolicyConfig, PolicyEngine, ResourceRef
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.tools import (
     ToolCachePolicy,
+    ToolExecutor,
     ToolPolicy,
     ToolRegistry,
-    ToolExecutor,
     ToolSpec,
 )
 from singularity.tools.mutation import register_mutation_tools
 from singularity.workspace import WorkspaceMutationManager
-from singularity.jsonl_trace import JsonlTraceRecorder
 from tests.tool_executor_helpers import make_test_policy_engine
 
 
@@ -579,7 +579,7 @@ def test_concurrent_read_only_calls_do_not_raise_runtime_error(tmp_path: Path) -
                         tool_call_id=f"call_thread_{threading.get_ident()}_{index}",
                     )
                 )
-        except BaseException as exc:  # noqa: BLE001 - record any failure
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=worker) for _ in range(8)]
@@ -665,14 +665,14 @@ def test_concurrent_invalidate_and_read_does_not_corrupt_cache(tmp_path: Path) -
                         tool_call_id=f"call_reader_{threading.get_ident()}_{index}",
                     )
                 )
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     def invalidator() -> None:
         try:
             for _ in range(50):
                 component.invalidate_paths(["target.txt"])
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [

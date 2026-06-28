@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from singularity.instructions.prompt_config import PromptAssemblyConfig
 from singularity.instructions.exceptions import InstructionSourceError
 from singularity.instructions.models import (
     InstructionPriority,
@@ -12,6 +11,7 @@ from singularity.instructions.models import (
     TrustLevel,
     _new_id,
 )
+from singularity.instructions.prompt_config import PromptAssemblyConfig
 
 
 class ProjectInstructionLoader:

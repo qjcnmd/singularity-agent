@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from singularity.release.paths import UserDataPaths
-
 
 DIAGNOSTIC_RESULT_SCHEMA = "diagnostic-result/v1"
 REPAIR_PLAN_SCHEMA = "repair-plan/v1"
 
 
-class DiagnosticSeverity(str, Enum):
+class DiagnosticSeverity(StrEnum):
     ERROR = "error"
     WARNING = "warning"
     INFO = "info"

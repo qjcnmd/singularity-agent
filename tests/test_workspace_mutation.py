@@ -4,23 +4,23 @@ from pathlib import Path
 import pytest
 
 from singularity.context import ContextManager
-from singularity.tools import PermissionLevel, ToolPolicy, ToolRegistry, ToolExecutor, ToolSpec
-from singularity.policy import DecisionOutcome, OperationKind
-from singularity.tools.models import ToolExecutionBackendKind, ToolResult
 from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.policy import DecisionOutcome, OperationKind
+from singularity.tools import PermissionLevel, ToolExecutor, ToolPolicy, ToolRegistry, ToolSpec
+from singularity.tools.models import ToolExecutionBackendKind, ToolResult
+from singularity.tools.mutation import register_mutation_tools
 from singularity.workspace import (
     CreateFile,
     MutationError,
-    WorkspaceMutationManager,
     ReplaceText,
     RollbackManager,
+    WorkspaceMutationManager,
     WorkspacePathResolver,
     WorkspacePolicy,
 )
-from tests.tool_executor_helpers import default_policy_engine
-from singularity.tools.mutation import register_mutation_tools
+from singularity.workspace_state import WorkspaceHealthStatus, WorkspaceStateManager
 from tests.test_tool_executor_policy_approval import SequencedPolicyEngine
-from singularity.workspace_state import WorkspaceStateManager, WorkspaceHealthStatus
+from tests.tool_executor_helpers import default_policy_engine
 
 
 def tool_call(name: str, arguments: dict, *, tool_call_id: str = "call_1") -> dict:
@@ -282,8 +282,8 @@ def test_mutation_observation_can_be_added_to_context_manager(tmp_path: Path) ->
 def test_tool_executor_rejects_write_tool_that_does_not_use_mutation_manager(
     tmp_path: Path,
 ) -> None:
-    from pydantic import BaseModel
     import pytest
+    from pydantic import BaseModel
 
     class RawWriteInput(BaseModel):
         path: str

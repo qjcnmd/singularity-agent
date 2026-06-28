@@ -5,16 +5,16 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import Capability, OperationKind
 from singularity.tools import (
     PermissionLevel,
     ToolExecutionBackendKind,
+    ToolExecutor,
     ToolPolicy,
     ToolRegistry,
-    ToolExecutor,
     ToolSpec,
 )
-from singularity.jsonl_trace import JsonlTraceRecorder
 from tests.tool_executor_helpers import default_policy_engine, make_test_policy_engine
 
 

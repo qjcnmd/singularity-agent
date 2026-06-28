@@ -291,7 +291,7 @@ def test_add_tool_protocol_result_redacts_error_code_field(tmp_path) -> None:
         content_digest="digest_err",
     )
 
-    observation = context.add_tool_protocol_result(envelope)
+    context.add_tool_protocol_result(envelope)
 
     tool_message = context.messages()[-1]
     payload = json.loads(tool_message["content"])

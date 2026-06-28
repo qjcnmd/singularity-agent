@@ -11,7 +11,6 @@ from singularity.cli_paths import resolve_project_root
 from singularity.memory.pipeline import MemoryLearningPipeline
 from singularity.memory.sync import MemoryBundleSync
 
-
 memory_app = typer.Typer(add_completion=False, no_args_is_help=True)
 rules_app = typer.Typer(add_completion=False, no_args_is_help=True)
 sync_app = typer.Typer(add_completion=False, no_args_is_help=True)

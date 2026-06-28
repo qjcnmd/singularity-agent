@@ -11,7 +11,6 @@ from rich.panel import Panel
 from singularity.cli_paths import resolve_project_root
 from singularity.git_client.client import GitClient
 
-
 git_app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
 ProjectRootOption = Annotated[

@@ -11,16 +11,16 @@ from singularity.policy.models import (
     ApprovalGrant,
     ApprovalRequirement,
     ApprovalScope,
+    Capability,
     DecisionOutcome,
     OperationKind,
-    Capability,
     PolicyComponent,
     PolicyConstraints,
     PolicyDecision,
     PolicyRequest,
-    RiskLevel,
     PolicySubject,
     ResourceRef,
+    RiskLevel,
     stable_hash,
 )
 from singularity.policy.operator_key import (
@@ -28,7 +28,6 @@ from singularity.policy.operator_key import (
     sign_grant,
     verify_grant_signature,
 )
-
 
 REQUEST_SCHEMA = "singularity.remote_approval_request/v1"
 GRANT_SCHEMA = "singularity.remote_approval_grant/v1"

@@ -12,7 +12,6 @@ from singularity.review.models import (
     ReviewTarget,
 )
 
-
 VALIDATION_CATEGORY_MAP = {
     "diff_budget": ReviewCategory.OVER_EDITING,
     "over_modification": ReviewCategory.OVER_EDITING,

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from abc import ABC
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from singularity.code_index.models import (
     BackendInfo,
@@ -19,7 +18,7 @@ from singularity.code_index.models import (
 )
 
 
-class LanguagePlugin(ABC):
+class LanguagePlugin:
     name = "base"
     version = "1.0.0"
     languages: tuple[str, ...] = ()

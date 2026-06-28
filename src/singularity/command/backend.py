@@ -6,6 +6,7 @@ import signal
 import subprocess
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -355,7 +356,7 @@ class ProcessSupervisor:
 
     @staticmethod
     def _kill_windows_tree(pid: int) -> None:
-        try:
+        with suppress(Exception):
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 stdout=subprocess.DEVNULL,
@@ -363,8 +364,6 @@ class ProcessSupervisor:
                 check=False,
                 timeout=5,
             )
-        except Exception:
-            pass
 
     @staticmethod
     def _kill_posix_tree(

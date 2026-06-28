@@ -9,7 +9,6 @@ from singularity.instructions.models import (
     _new_id,
 )
 
-
 DETECT_SOURCE_TYPES = {
     InstructionSourceType.PROJECT_FILE,
     InstructionSourceType.README,

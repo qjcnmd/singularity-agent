@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import time
 import shlex
+import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -152,10 +153,8 @@ class SandboxManager:
         except Exception as exc:
             if _is_cancellation_error(exc):
                 if prepared is not None and backend is not None:
-                    try:
+                    with suppress(Exception):
                         backend.cleanup(prepared)
-                    except Exception:
-                        pass
                 raise
             result = SandboxResult(
                 sandbox_id=request.sandbox_id,

@@ -17,8 +17,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import pytest
-
 from singularity.model.models import (
     ModelMessage,
     ModelPurpose,
@@ -32,15 +30,14 @@ from singularity.planner.final_reviewer import (
     CriterionAssessment,
     FinalReviewer,
 )
-from singularity.planner.models import EvidenceLedger, TaskState, TaskStatus
+from singularity.planner.models import EvidenceLedger, TaskState
+from singularity.planner.semantic import PlanStep, RollingPlan
 from singularity.planner.semantic_objects import (
     RepairPolicy,
     RiskPoint,
     SemanticPlan,
     VerificationStrategy,
 )
-from singularity.planner.semantic import PlanStep, RollingPlan
-
 
 # ---------------------------------------------------------------------------
 # Fakes (same pattern as test_semantic_planner_capability.py)

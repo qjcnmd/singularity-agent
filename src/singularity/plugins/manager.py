@@ -24,11 +24,11 @@ from singularity.policy import (
     Capability,
     DecisionOutcome,
     OperationKind,
-    PolicyRequest,
+    PolicyComponent,
     PolicyEngine,
+    PolicyRequest,
     PolicySubject,
     ResourceRef,
-    PolicyComponent,
 )
 from singularity.release.paths import UserDataMode, UserDataPaths
 from singularity.tools import ToolOrigin, ToolOriginKind, ToolRegistry

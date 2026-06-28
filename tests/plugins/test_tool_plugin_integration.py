@@ -7,8 +7,7 @@ from singularity.observability import TraceRecorder
 from singularity.plugins.discovery import discover_plugins
 from singularity.plugins.manager import PluginManager
 from singularity.plugins.status import PluginStatusStore
-from singularity.tools import ToolOriginKind, ToolPolicy, ToolRegistry, ToolExecutor
-
+from singularity.tools import ToolExecutor, ToolOriginKind, ToolPolicy, ToolRegistry
 from tests.tool_executor_helpers import make_test_policy_engine
 
 

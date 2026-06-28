@@ -3,13 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from singularity.agent_host import AgentHost, RunEvent, ToolCallEvent
 from singularity.config import ProductionConfig
-from singularity.policy.permissions import ApprovalPolicy
 from singularity.kernel.models import RunIdentity, RunStatus
 from singularity.observability import TraceRecorder
 from singularity.observability.models import TraceArtifactKind
 from singularity.policy import ApprovalGrant, ApprovalScope
-from singularity.agent_host import AgentHost, RunEvent, ToolCallEvent
+from singularity.policy.permissions import ApprovalPolicy
 
 
 def test_agent_host_projects_trace_events_with_sequence_and_replay(tmp_path: Path) -> None:
@@ -115,15 +115,15 @@ def test_tool_call_event_projects_from_run_event() -> None:
 
 
 class _Bootstrap:
-    def __init__(self, kernel: "_Kernel") -> None:
+    def __init__(self, kernel: _Kernel) -> None:
         self.kernel = kernel
 
-    def boot(self, _goal: str) -> "_Kernel":
+    def boot(self, _goal: str) -> _Kernel:
         return self.kernel
 
 
 class _Kernel:
-    def __init__(self, *, trace: TraceRecorder, approval_gate: "_ApprovalGate") -> None:
+    def __init__(self, *, trace: TraceRecorder, approval_gate: _ApprovalGate) -> None:
         identity = RunIdentity(run_id=trace.run_id, session_id=trace.session_id, task_id="task_kernel")
         self.context = SimpleNamespace(identity=identity)
         self.graph = SimpleNamespace(trace=trace, approval_gate=approval_gate)

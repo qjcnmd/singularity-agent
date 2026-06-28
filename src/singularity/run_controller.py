@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, TypeVar
+from enum import StrEnum
+from typing import Any, TypeVar
 
+from singularity.context.models import ToolObservation
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.planner import Planner, PlannerStore
-from singularity.context.models import ToolObservation
 
 
-class RunLifecycleStatus(str, Enum):
+class RunLifecycleStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     WAITING_USER = "waiting_user"
@@ -24,7 +25,7 @@ class RunLifecycleStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-class RunControlEventKind(str, Enum):
+class RunControlEventKind(StrEnum):
     TASK_STARTED = "task_started"
     OUTCOME_RECORDED = "outcome_recorded"
     PROTOCOL_NEXT_ACTION = "protocol_next_action"

@@ -7,6 +7,8 @@ from typing import Any
 from uuid import uuid4
 
 from singularity.context.models import (
+    CacheAttribution,
+    CacheAttributionSource,
     ContextAuthority,
     ContextBudget,
     ContextBudgetPlan,
@@ -18,12 +20,9 @@ from singularity.context.models import (
     ContextRenderPolicy,
     ContextSensitivity,
     ContextUsageReport,
-    CacheAttribution,
-    CacheAttributionSource,
 )
 from singularity.context.redaction import ContextRedactor
 from singularity.context.tokens import TokenCounter
-
 
 MAX_CONTEXT_FRAGMENT_TOKENS = 1000
 MAX_CONTEXT_FRAGMENT_BYTES = 12000
@@ -108,7 +107,7 @@ class ContextAssembler:
             )
 
         for group in optional:
-            candidate = selected + [group]
+            candidate = [*selected, group]
             if self._budget_for_groups(candidate, tool_tokens).total_tokens <= self.model_context_window:
                 selected.append(group)
 
@@ -260,7 +259,7 @@ class ContextAssembler:
                 groups[latest_protocol_index],
                 score=groups[latest_protocol_index].score + LATEST_PROTOCOL_GROUP_SCORE_BONUS,
             )
-        for call_id, tool in tool_by_call.items():
+        for _call_id, tool in tool_by_call.items():
             if tool.item_id not in grouped_ids:
                 standalone.append(tool)
         for item in standalone:

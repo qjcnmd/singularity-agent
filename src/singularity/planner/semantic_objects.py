@@ -60,7 +60,7 @@ class RiskPoint:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "RiskPoint":
+    def from_dict(cls, payload: dict[str, Any]) -> RiskPoint:
         return cls(
             risk_id=str(payload["risk_id"]),
             description=str(payload.get("description") or ""),
@@ -100,7 +100,7 @@ class VerificationStrategy:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "VerificationStrategy":
+    def from_dict(cls, payload: dict[str, Any]) -> VerificationStrategy:
         raw_command = payload.get("command")
         command = [str(item) for item in raw_command] if raw_command is not None else None
         return cls(
@@ -143,7 +143,7 @@ class RepairPolicy:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "RepairPolicy":
+    def from_dict(cls, payload: dict[str, Any]) -> RepairPolicy:
         return cls(
             failure_category_pattern=str(payload["failure_category_pattern"]),
             allowed_repair_actions=[str(item) for item in payload.get("allowed_repair_actions") or []],
@@ -180,7 +180,7 @@ class SemanticPlan:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "SemanticPlan":
+    def from_dict(cls, payload: dict[str, Any]) -> SemanticPlan:
         rolling_plan = RollingPlan.from_dict(payload.get("rolling_plan") or {})
         return cls(
             rolling_plan=rolling_plan,
@@ -225,7 +225,7 @@ class PlannerDecision:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "PlannerDecision":
+    def from_dict(cls, payload: dict[str, Any]) -> PlannerDecision:
         next_action_raw = payload.get("next_action")
         next_action = ActionKind(next_action_raw) if next_action_raw else None
         return cls(

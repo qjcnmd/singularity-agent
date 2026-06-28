@@ -1,26 +1,25 @@
 import json
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
 from singularity.context import ContextManager
 from singularity.instructions import PromptAssemblyPipeline
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import MockModelProvider, ModelPurpose, ModelRunner
 from singularity.planner import Planner, TaskStatus
 from singularity.tools import ToolRegistry
 from singularity.tools.code_index import register_code_index_tools
 from singularity.tools.command import register_command_tools
 from singularity.tools.edit import register_edit_tools
-from singularity.tools.mutation import register_mutation_tools
-from singularity.tools.verification import register_verification_tools
-from singularity.tools.workspace_state import register_workspace_state_tools
 from singularity.tools.models import (
     PermissionLevel,
     ToolExecutionBackendKind,
     ToolSpec,
 )
-from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.tools.mutation import register_mutation_tools
+from singularity.tools.verification import register_verification_tools
+from singularity.tools.workspace_state import register_workspace_state_tools
 
 
 class EmptyInput(BaseModel):

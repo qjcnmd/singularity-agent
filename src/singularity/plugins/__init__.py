@@ -1,6 +1,7 @@
 from singularity.plugins.discovery import discover_plugins
 from singularity.plugins.host import PluginHost
 from singularity.plugins.loader import PluginLoader
+from singularity.plugins.manager import PluginManager
 from singularity.plugins.models import (
     API_VERSION,
     DiscoveredPlugin,
@@ -14,7 +15,6 @@ from singularity.plugins.models import (
     PluginToolContribution,
     PluginType,
 )
-from singularity.plugins.manager import PluginManager
 from singularity.plugins.status import PluginLockStore, PluginStatusStore
 
 __all__ = [
@@ -27,9 +27,9 @@ __all__ = [
     "PluginLoader",
     "PluginLockEntry",
     "PluginLockStore",
+    "PluginManager",
     "PluginManifest",
     "PluginPermission",
-    "PluginManager",
     "PluginStatus",
     "PluginStatusStore",
     "PluginToolContribution",

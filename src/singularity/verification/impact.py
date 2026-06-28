@@ -4,7 +4,6 @@ from pathlib import PurePosixPath
 
 from singularity.verification.models import ImpactAnalysis, ProjectProfile
 
-
 DOC_SUFFIXES = {".md", ".mdx", ".rst", ".txt", ".adoc"}
 SOURCE_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".rs", ".go", ".java"}
 CONFIG_NAMES = {

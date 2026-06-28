@@ -95,7 +95,7 @@ class RepairContract:
         analysis: FailureAnalysisResult,
         *,
         action_candidates: list[RepairActionCandidate],
-    ) -> "RepairContract":
+    ) -> RepairContract:
         allowed = _allowed_tools_from_candidates(action_candidates)
         if analysis.verification_plan or analysis.verification_contract.steps:
             allowed.extend(["run_verification", "get_verification_result"])
@@ -122,7 +122,7 @@ class RepairContract:
         )
 
     @classmethod
-    def blocked(cls, analysis: FailureAnalysisResult, *, reason: str) -> "RepairContract":
+    def blocked(cls, analysis: FailureAnalysisResult, *, reason: str) -> RepairContract:
         return cls(
             contract_id=f"repair_contract_{uuid4().hex[:12]}",
             analysis_id=analysis.analysis_id,

@@ -2,7 +2,7 @@ from pathlib import Path
 
 from singularity.code_index import ProjectIndex
 from singularity.verification import CheckKind, VerificationRunner
-from singularity.workspace import WorkspaceMutationManager, ReplaceText
+from singularity.workspace import ReplaceText, WorkspaceMutationManager
 
 
 def test_verification_runner_uses_project_index_targeted_test_mapping(tmp_path: Path) -> None:

@@ -21,7 +21,6 @@ from singularity.observability.models import (
 from singularity.observability.summary import TraceSummaryBuilder
 from singularity.observability.timeline import TraceTimelineBuilder
 
-
 _RUN_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 

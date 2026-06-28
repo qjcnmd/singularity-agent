@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
 from rich.console import Console
 
-from singularity.agent_loop import AgentLoop
-from singularity.agent_loop import AgentLoopStatus
+from singularity.agent_loop import AgentLoop, AgentLoopStatus
 from singularity.interaction import (
     ControlCommand,
-    FinalReport as InteractionFinalReport,
     InteractionController,
 )
-
+from singularity.interaction import (
+    FinalReport as InteractionFinalReport,
+)
 from singularity.kernel.cancellation import CancellationManager
 from singularity.kernel.exceptions import CancellationError, KernelError
 from singularity.kernel.finalization import FinalReport, KernelFinalizer
@@ -81,15 +82,13 @@ class AgentKernel:
                 trace=getattr(self.graph, "trace", None),
                 cancellation_manager=self.cancellation,
             )
-            try:
-                setattr(self.graph, "interaction_controller", interaction_controller)
-            except Exception:
-                pass
+            with suppress(Exception):
+                self.graph.interaction_controller = interaction_controller
         self.interaction_controller: InteractionController = interaction_controller
         self.interaction_controller.cancellation_manager = self.cancellation
         self.graph.install_cancellation_tokens(self.cancellation.child_token)
 
-    def boot(self) -> "AgentKernel":
+    def boot(self) -> AgentKernel:
         self.context.status = KernelStatus.READY
         return self
 
@@ -176,7 +175,7 @@ class AgentKernel:
                 cancelled=True,
                 cancellation_reason="KeyboardInterrupt",
             )
-            raise CancellationError("Cancelled by KeyboardInterrupt.", code="keyboard_interrupt")
+            raise CancellationError("Cancelled by KeyboardInterrupt.", code="keyboard_interrupt") from None
         except CancellationError:
             self.interaction_controller.handle_command(
                 ControlCommand.CANCEL,

@@ -1,5 +1,5 @@
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -11,9 +11,9 @@ from singularity.context.models import (
     ContextItemType,
     ContextLayer,
     ContextReference,
-    ContextSource,
     ContextSensitivity,
     ContextSnapshot,
+    ContextSource,
 )
 
 

@@ -9,8 +9,8 @@ from singularity.tools import (
     ToolExecutionBackendKind,
     ToolOriginKind,
     ToolRegistry,
-    ToolSpec,
     ToolSideEffectKind,
+    ToolSpec,
 )
 
 

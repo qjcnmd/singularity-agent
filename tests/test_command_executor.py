@@ -6,32 +6,32 @@ from pathlib import Path
 
 import pytest
 
-from singularity.command.backend import RunningProcess
+import singularity.sandbox as sandbox
 from singularity.command import (
     CommandDecision,
+    CommandExecutor,
     CommandPlan,
     CommandPolicy,
     CommandPurpose,
     CommandRequest,
     CommandRisk,
-    CommandExecutor,
     ExecutionStatus,
     FilesystemMode,
     NetworkMode,
     ResourceLimits,
     SemanticStatus,
 )
+from singularity.command.backend import RunningProcess
+from singularity.context import ContextManager
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import DecisionOutcome, PolicyConfig, PolicyEngine
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
-import singularity.sandbox as sandbox
 from singularity.sandbox import SandboxManager
-from singularity.context import ContextManager
-from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
+from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
 from singularity.tools.command import register_command_tools
 from singularity.tools.models import ToolResult
-from singularity.jsonl_trace import JsonlTraceRecorder
-from tests.tool_executor_helpers import default_policy_engine
 from tests.test_tool_executor_policy_approval import SequencedPolicyEngine
+from tests.tool_executor_helpers import default_policy_engine
 
 
 class SimpleTokenCounter:

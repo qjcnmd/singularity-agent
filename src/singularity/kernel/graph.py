@@ -5,47 +5,45 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from singularity.agent_loop import SYSTEM_PROMPT
+from singularity.code_index import ProjectIndex
 from singularity.command import CommandExecutor
 from singularity.config import ProductionConfig
-from singularity.code_index import ProjectIndex
-from singularity.edit import EditExecutor
-from singularity.agent_loop import SYSTEM_PROMPT
 from singularity.context import ContextManager
+from singularity.edit import EditExecutor
 from singularity.evaluation import EvaluationHarness
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.interaction import InteractionController
-from singularity.model import (
-    ModelProviderRegistry,
-    ModelRunner,
-    OpenAICompatibleModelProvider,
-)
-from singularity.memory import MemoryLearningPipeline
-from singularity.observability import TraceRecorder
-from singularity.policy import ApprovalGate, PolicyConfig, PolicyEngine
-from singularity.plugins import PluginManager
-from singularity.planner import Planner, create_or_resume_planner
-from singularity.review import ReviewPipeline
-from singularity.sandbox import SandboxManager
-from singularity.tool_protocol.engine import ToolProtocolEngine
-from singularity.tool_protocol.state import ToolProtocolStateStore
-from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
-from singularity.tools.command import register_command_tools
-from singularity.tools.code_index import register_code_index_tools
-from singularity.tools.edit import register_edit_tools
-from singularity.tools.mutation import register_mutation_tools
-from singularity.tools.verification import register_verification_tools
-from singularity.tools.workspace_state import register_workspace_state_tools
-from singularity.verification import VerificationRunner
-from singularity.workspace import WorkspaceMutationManager
-from singularity.workspace_state import WorkspaceStateManager, WorkspaceHealthReport
-
 from singularity.kernel.exceptions import AgentGraphInitializationError
 from singularity.kernel.models import (
     ComponentName,
     ComponentState,
     RunIdentity,
 )
-
+from singularity.memory import MemoryLearningPipeline
+from singularity.model import (
+    ModelProviderRegistry,
+    ModelRunner,
+    OpenAICompatibleModelProvider,
+)
+from singularity.observability import TraceRecorder
+from singularity.planner import Planner, create_or_resume_planner
+from singularity.plugins import PluginManager
+from singularity.policy import ApprovalGate, PolicyConfig, PolicyEngine
+from singularity.review import ReviewPipeline
+from singularity.sandbox import SandboxManager
+from singularity.tool_protocol.engine import ToolProtocolEngine
+from singularity.tool_protocol.state import ToolProtocolStateStore
+from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
+from singularity.tools.code_index import register_code_index_tools
+from singularity.tools.command import register_command_tools
+from singularity.tools.edit import register_edit_tools
+from singularity.tools.mutation import register_mutation_tools
+from singularity.tools.verification import register_verification_tools
+from singularity.tools.workspace_state import register_workspace_state_tools
+from singularity.verification import VerificationRunner
+from singularity.workspace import WorkspaceMutationManager
+from singularity.workspace_state import WorkspaceHealthReport, WorkspaceStateManager
 
 AGENT_COMPONENT_INITIALIZATION_ORDER = [
     ComponentName.CONFIGURATION,
@@ -194,9 +192,9 @@ class AgentGraph:
             ) from exc
         evaluation_harness.planner = self.planner
         if self._cancellation_token_factory is not None:
-            setattr(evaluation_harness, "cancellation_token", self._cancellation_token_factory())
+            evaluation_harness.cancellation_token = self._cancellation_token_factory()
         else:
-            setattr(evaluation_harness, "cancellation_token", None)
+            evaluation_harness.cancellation_token = None
         self._evaluation_harness = evaluation_harness
         self._evaluation_harness_factory = None
         return evaluation_harness
@@ -221,12 +219,12 @@ class AgentGraph:
     def reset_cancellation_tokens(self) -> None:
         self._cancellation_token_factory = None
         for _name, component in self.cancellation_targets():
-            setattr(component, "cancellation_token", None)
+            component.cancellation_token = None
 
     def install_cancellation_tokens(self, token_factory: Callable[[], Any]) -> None:
         self._cancellation_token_factory = token_factory
         for _name, component in self.cancellation_targets():
-            setattr(component, "cancellation_token", token_factory())
+            component.cancellation_token = token_factory()
 
     def components_for_health(self) -> dict[str, Any]:
         return {
@@ -717,9 +715,13 @@ class AgentGraphBuilder:
         planner.project_index = infra.project_index
         planner.memory_pipeline = infra.memory_pipeline
         if planner.state is not None:
-            permission_summary = (
-                policy_sandbox.policy_engine.config.permission_profile.summary().to_dict()
-            )
+            permission_profile = policy_sandbox.policy_engine.config.permission_profile
+            if permission_profile is None:
+                raise AgentGraphInitializationError(
+                    "PolicyEngine permission profile is not initialized.",
+                    code="permission_profile_unavailable",
+                )
+            permission_summary = permission_profile.summary().to_dict()
             planner.record_sandbox_capability(
                 {
                     "mode": permission_summary["profile"],

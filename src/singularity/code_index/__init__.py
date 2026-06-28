@@ -1,6 +1,7 @@
 from singularity.code_index.context import ProjectIndexObservation, build_project_index_observation
 from singularity.code_index.impact import ProjectImpactAnalyzer
 from singularity.code_index.incremental import IncrementalIndexer
+from singularity.code_index.index import ProjectIndex, ProjectIndexConfig
 from singularity.code_index.models import (
     CallEdgeRecord,
     CodeImpactAnalysis,
@@ -22,7 +23,6 @@ from singularity.code_index.models import (
     TrustLevel,
 )
 from singularity.code_index.query import ProjectIndexQueryService
-from singularity.code_index.index import ProjectIndex, ProjectIndexConfig
 from singularity.code_index.scanner import ScannerBudget, WorkspaceScanner
 from singularity.code_index.store import ProjectIndexStore
 
@@ -41,10 +41,10 @@ __all__ = [
     "IndexSummary",
     "LanguageId",
     "ProjectImpactAnalyzer",
-    "ProjectIndexObservation",
-    "ProjectIndexQueryService",
     "ProjectIndex",
     "ProjectIndexConfig",
+    "ProjectIndexObservation",
+    "ProjectIndexQueryService",
     "ProjectIndexStore",
     "ProjectRootRecord",
     "RelevantFileCandidate",

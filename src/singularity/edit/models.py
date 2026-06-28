@@ -4,18 +4,18 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
 
 
-class EditStrategyKind(str, Enum):
+class EditStrategyKind(StrEnum):
     TARGETED_PATCH = "targeted_patch"
     FULL_FILE_REWRITE = "full_file_rewrite"
     STRUCTURED_EDIT = "structured_edit"
 
 
-class EditOperationKind(str, Enum):
+class EditOperationKind(StrEnum):
     REPLACE_TEXT = "replace_text"
     INSERT_BEFORE = "insert_before"
     INSERT_AFTER = "insert_after"
@@ -28,14 +28,14 @@ class EditOperationKind(str, Enum):
     UNIFIED_DIFF = "unified_diff"
 
 
-class EditIssueSeverity(str, Enum):
+class EditIssueSeverity(StrEnum):
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
     REVIEW = "review"
 
 
-class EditFailureCategory(str, Enum):
+class EditFailureCategory(StrEnum):
     NONE = "none"
     PATH_SCOPE = "path_scope"
     FRESHNESS = "freshness"

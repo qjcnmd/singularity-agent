@@ -6,12 +6,20 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from singularity.command import CommandPurpose, CommandRequest, CommandExecutor
+from singularity.command import CommandExecutor, CommandPurpose, CommandRequest
 from singularity.context import ContextManager
 from singularity.kernel.cancellation import CancellationManager, CancellationToken
 from singularity.kernel.exceptions import CancellationError
 from singularity.kernel.models import CancellationReason
-from singularity.model import MockModelProvider, ModelRunner, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResult, ModelTurnStatus
+from singularity.model import (
+    MockModelProvider,
+    ModelRunner,
+    ModelToolCall,
+    ModelToolParseStatus,
+    ModelTurnRequest,
+    ModelTurnResult,
+    ModelTurnStatus,
+)
 from singularity.planner import Planner
 from singularity.review import ReviewPipeline
 from singularity.sandbox import (
@@ -21,7 +29,7 @@ from singularity.sandbox import (
     default_sandbox_profile,
 )
 from singularity.tool_protocol.engine import ToolProtocolEngine
-from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
+from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
 from singularity.tools.models import PermissionLevel, ToolResult, ToolSpec
 from singularity.verification import VerificationRunner
 from tests.tool_executor_helpers import make_test_policy_engine

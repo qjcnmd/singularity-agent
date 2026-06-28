@@ -8,12 +8,12 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import ExitStack, suppress
 from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NEW_CONSOLE = 0x00000010
@@ -93,7 +93,7 @@ class WindowsRunnerSpec:
     result_path: str = ""
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "WindowsRunnerSpec":
+    def from_dict(cls, payload: dict[str, Any]) -> WindowsRunnerSpec:
         command = payload.get("command")
         if not isinstance(command, (list, str)):
             raise ValueError("runner spec command must be a list or string.")
@@ -133,7 +133,7 @@ class WindowsRunnerResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "WindowsRunnerResult":
+    def from_dict(cls, payload: dict[str, Any]) -> WindowsRunnerResult:
         return cls(
             exit_code=payload.get("exit_code"),
             stdout=str(payload.get("stdout") or ""),
@@ -228,10 +228,8 @@ class WindowsSandboxRunner:
                 process.wait(timeout=wait_timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
-                try:
+                with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
             account_stdout = _process_stdout_text(process)
             account_stderr = _process_stderr_text(process)
         finally:
@@ -319,7 +317,7 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
         )
 
 
-def _start_restricted_child(spec: WindowsRunnerSpec) -> "_WindowsChildProcess | subprocess.Popen[bytes]":
+def _start_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildProcess | subprocess.Popen[bytes]:
     if os.name == "nt":
         return _start_windows_restricted_child(spec)
     if isinstance(spec.command, list):
@@ -363,7 +361,7 @@ def _assign_to_kill_on_close_job(process_handle: int) -> tuple[int | None, bool]
     return job, True
 
 
-def _terminate_child(process: "_WindowsChildProcess | subprocess.Popen[bytes]") -> bool:
+def _terminate_child(process: _WindowsChildProcess | subprocess.Popen[bytes]) -> bool:
     kill = getattr(process, "kill", None)
     if callable(kill):
         kill()
@@ -435,7 +433,7 @@ def _verify_network_denied(spec: WindowsRunnerSpec) -> bool:
 
 
 def _child_output(
-    process: "_WindowsChildProcess | subprocess.Popen[bytes] | None",
+    process: _WindowsChildProcess | subprocess.Popen[bytes] | None,
     max_chars: int | None,
 ) -> tuple[str, str, bool]:
     if process is None:
@@ -590,10 +588,8 @@ class _WindowsChildProcess:
 
     def _close_streams(self) -> None:
         for stream in self._streams:
-            try:
+            with suppress(Exception):
                 stream.close()
-            except Exception:
-                pass
         self._streams.clear()
 
     def _close_handles(self) -> None:
@@ -606,10 +602,8 @@ class _WindowsChildProcess:
         if self._job_handle:
             _close_handle(self._job_handle)
         if self._desktop_handle:
-            try:
+            with suppress(Exception):
                 _user32().CloseDesktop(self._desktop_handle)
-            except Exception:
-                pass
 
 
 def _start_windows_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildProcess:
@@ -619,73 +613,69 @@ def _start_windows_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildPro
     cwd = Path(spec.cwd)
     stdout_path = cwd / f".singularity-windows-sandbox-{os.getpid()}-{time.time_ns()}.stdout"
     stderr_path = cwd / f".singularity-windows-sandbox-{os.getpid()}-{time.time_ns()}.stderr"
-    stdout_file = stdout_path.open("w+b")
-    stderr_file = stderr_path.open("w+b")
-    stdin_file = open(os.devnull, "rb")
-    streams: list[object] = [stdout_file, stderr_file, stdin_file]
     desktop_name = f"SingularitySandbox-{os.getpid()}-{time.time_ns()}"
     desktop_handle = None
     job_handle = None
     try:
-        for stream in streams:
-            os.set_handle_inheritable(msvcrt.get_osfhandle(stream.fileno()), True)
-        desktop_handle = _create_private_desktop(desktop_name)
-        startup = STARTUPINFO()
-        startup.cb = ctypes.sizeof(STARTUPINFO)
-        startup.lpDesktop = desktop_name
-        startup.dwFlags = STARTF_USESTDHANDLES
-        startup.hStdInput = msvcrt.get_osfhandle(stdin_file.fileno())
-        startup.hStdOutput = msvcrt.get_osfhandle(stdout_file.fileno())
-        startup.hStdError = msvcrt.get_osfhandle(stderr_file.fileno())
-        process_info = PROCESS_INFORMATION()
-        command_line = ctypes.create_unicode_buffer(_windows_command_line(spec.command))
-        env_block = ctypes.create_unicode_buffer(_windows_env_block(spec.env))
-        flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED
-        ok = _advapi32().CreateProcessAsUserW(
-            token,
-            None,
-            command_line,
-            None,
-            None,
-            True,
-            flags,
-            env_block,
-            str(cwd),
-            ctypes.byref(startup),
-            ctypes.byref(process_info),
-        )
-        if not ok:
-            raise _last_winerror("CreateProcessAsUserW")
-        job_handle, job_assigned = _assign_to_kill_on_close_job(process_info.hProcess)
-        if not job_assigned:
-            raise OSError("AssignProcessToJobObject failed")
-        if _kernel32().ResumeThread(process_info.hThread) == 0xFFFFFFFF:
-            raise _last_winerror("ResumeThread")
-        return _WindowsChildProcess(
-            command=spec.command,
-            process_handle=process_info.hProcess,
-            thread_handle=process_info.hThread,
-            process_id=process_info.dwProcessId,
-            job_handle=job_handle,
-            job_assigned=job_assigned,
-            desktop_handle=desktop_handle,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            streams=streams,
-        )
+        with ExitStack() as stream_stack:
+            stdout_file = stream_stack.enter_context(stdout_path.open("w+b"))
+            stderr_file = stream_stack.enter_context(stderr_path.open("w+b"))
+            stdin_file = stream_stack.enter_context(Path(os.devnull).open("rb"))
+            streams: list[object] = [stdout_file, stderr_file, stdin_file]
+            for stream in streams:
+                os.set_handle_inheritable(msvcrt.get_osfhandle(stream.fileno()), True)
+            desktop_handle = _create_private_desktop(desktop_name)
+            startup = STARTUPINFO()
+            startup.cb = ctypes.sizeof(STARTUPINFO)
+            startup.lpDesktop = desktop_name
+            startup.dwFlags = STARTF_USESTDHANDLES
+            startup.hStdInput = msvcrt.get_osfhandle(stdin_file.fileno())
+            startup.hStdOutput = msvcrt.get_osfhandle(stdout_file.fileno())
+            startup.hStdError = msvcrt.get_osfhandle(stderr_file.fileno())
+            process_info = PROCESS_INFORMATION()
+            command_line = ctypes.create_unicode_buffer(_windows_command_line(spec.command))
+            env_block = ctypes.create_unicode_buffer(_windows_env_block(spec.env))
+            flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED
+            ok = _advapi32().CreateProcessAsUserW(
+                token,
+                None,
+                command_line,
+                None,
+                None,
+                True,
+                flags,
+                env_block,
+                str(cwd),
+                ctypes.byref(startup),
+                ctypes.byref(process_info),
+            )
+            if not ok:
+                raise _last_winerror("CreateProcessAsUserW")
+            job_handle, job_assigned = _assign_to_kill_on_close_job(process_info.hProcess)
+            if not job_assigned:
+                raise OSError("AssignProcessToJobObject failed")
+            if _kernel32().ResumeThread(process_info.hThread) == 0xFFFFFFFF:
+                raise _last_winerror("ResumeThread")
+            child = _WindowsChildProcess(
+                command=spec.command,
+                process_handle=process_info.hProcess,
+                thread_handle=process_info.hThread,
+                process_id=process_info.dwProcessId,
+                job_handle=job_handle,
+                job_assigned=job_assigned,
+                desktop_handle=desktop_handle,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                streams=streams,
+            )
+            stream_stack.pop_all()
+        return child
     except Exception:
-        for stream in streams:
-            try:
-                stream.close()
-            except Exception:
-                pass
         if job_handle:
             _close_handle(job_handle)
         if desktop_handle:
-            try:
+            with suppress(Exception):
                 _user32().CloseDesktop(desktop_handle)
-            except Exception:
-                pass
         raise
     finally:
         _close_handle(token)
@@ -806,57 +796,55 @@ def _start_account_process(
 ) -> _WindowsChildProcess:
     stdout_path = cwd / "account-runner.stdout"
     stderr_path = cwd / "account-runner.stderr"
-    stdout_file = stdout_path.open("w+b")
-    stderr_file = stderr_path.open("w+b")
-    stdin_file = open(os.devnull, "rb")
-    streams: list[object] = [stdout_file, stderr_file, stdin_file]
     process_info = PROCESS_INFORMATION()
     try:
         import msvcrt
 
-        for stream in streams:
-            os.set_handle_inheritable(msvcrt.get_osfhandle(stream.fileno()), True)
-        startup = STARTUPINFO()
-        startup.cb = ctypes.sizeof(STARTUPINFO)
-        startup.dwFlags = STARTF_USESTDHANDLES
-        startup.hStdInput = msvcrt.get_osfhandle(stdin_file.fileno())
-        startup.hStdOutput = msvcrt.get_osfhandle(stdout_file.fileno())
-        startup.hStdError = msvcrt.get_osfhandle(stderr_file.fileno())
-        command_line = ctypes.create_unicode_buffer(_windows_command_line(command))
-        env_block = ctypes.create_unicode_buffer(_windows_env_block(env))
-        ok = _advapi32().CreateProcessWithLogonW(
-            username,
-            ".",
-            password,
-            LOGON_WITH_PROFILE,
-            None,
-            command_line,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            env_block,
-            str(cwd),
-            ctypes.byref(startup),
-            ctypes.byref(process_info),
-        )
-        if not ok:
-            raise _last_winerror("CreateProcessWithLogonW")
-        return _WindowsChildProcess(
-            command=command,
-            process_handle=process_info.hProcess,
-            thread_handle=process_info.hThread,
-            process_id=process_info.dwProcessId,
-            job_handle=None,
-            job_assigned=False,
-            desktop_handle=None,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            streams=streams,
-        )
+        with ExitStack() as stream_stack:
+            stdout_file = stream_stack.enter_context(stdout_path.open("w+b"))
+            stderr_file = stream_stack.enter_context(stderr_path.open("w+b"))
+            stdin_file = stream_stack.enter_context(Path(os.devnull).open("rb"))
+            streams: list[object] = [stdout_file, stderr_file, stdin_file]
+            for stream in streams:
+                os.set_handle_inheritable(msvcrt.get_osfhandle(stream.fileno()), True)
+            startup = STARTUPINFO()
+            startup.cb = ctypes.sizeof(STARTUPINFO)
+            startup.dwFlags = STARTF_USESTDHANDLES
+            startup.hStdInput = msvcrt.get_osfhandle(stdin_file.fileno())
+            startup.hStdOutput = msvcrt.get_osfhandle(stdout_file.fileno())
+            startup.hStdError = msvcrt.get_osfhandle(stderr_file.fileno())
+            command_line = ctypes.create_unicode_buffer(_windows_command_line(command))
+            env_block = ctypes.create_unicode_buffer(_windows_env_block(env))
+            ok = _advapi32().CreateProcessWithLogonW(
+                username,
+                ".",
+                password,
+                LOGON_WITH_PROFILE,
+                None,
+                command_line,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                env_block,
+                str(cwd),
+                ctypes.byref(startup),
+                ctypes.byref(process_info),
+            )
+            if not ok:
+                raise _last_winerror("CreateProcessWithLogonW")
+            child = _WindowsChildProcess(
+                command=command,
+                process_handle=process_info.hProcess,
+                thread_handle=process_info.hThread,
+                process_id=process_info.dwProcessId,
+                job_handle=None,
+                job_assigned=False,
+                desktop_handle=None,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                streams=streams,
+            )
+            stream_stack.pop_all()
+        return child
     except Exception:
-        for stream in streams:
-            try:
-                stream.close()
-            except Exception:
-                pass
         if process_info.hProcess:
             _close_handle(process_info.hProcess)
         if process_info.hThread:
@@ -948,10 +936,11 @@ def _current_process_identity() -> tuple[str, str]:
             _kernel32().LocalFree(sid_ptr.value)
         name_buffer = ctypes.create_unicode_buffer(256)
         name_len = wintypes.DWORD(256)
-        if advapi32.GetUserNameW(name_buffer, ctypes.byref(name_len)):
-            name = name_buffer.value or ""
-        else:
-            name = ""
+        name = (
+            name_buffer.value or ""
+            if advapi32.GetUserNameW(name_buffer, ctypes.byref(name_len))
+            else ""
+        )
         return name, sid_string
     finally:
         _close_handle(token.value)
@@ -1213,10 +1202,8 @@ def _user32():
 
 def _close_handle(handle: int | None) -> None:
     if handle:
-        try:
+        with suppress(Exception):
             _kernel32().CloseHandle(handle)
-        except Exception:
-            pass
 
 
 def _last_winerror(function: str) -> OSError:

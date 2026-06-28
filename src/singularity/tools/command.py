@@ -4,15 +4,15 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.command import (
+    CommandExecutor,
     CommandPurpose,
     CommandRequest,
-    CommandExecutor,
     FilesystemMode,
     NetworkMode,
     ResourceLimits,
 )
+from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.tools.models import (
     PermissionLevel,
     ToolExecutionBackendKind,
@@ -40,7 +40,7 @@ class RunCommandInput(BaseModel):
     risk_acceptance_reason: str | None = None
 
     @model_validator(mode="after")
-    def _argv_or_shell(self) -> "RunCommandInput":
+    def _argv_or_shell(self) -> RunCommandInput:
         if bool(self.argv) == bool(self.shell):
             raise ValueError("Exactly one of argv or shell is required.")
         if self.argv is not None and len(self.argv) == 0:

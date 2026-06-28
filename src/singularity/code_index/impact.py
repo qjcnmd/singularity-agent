@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import PurePosixPath
-from typing import Iterable
 
 from singularity.code_index.models import (
     CodeImpactAnalysis,

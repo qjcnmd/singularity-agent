@@ -4,12 +4,12 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
 
 
-class ContextSource(str, Enum):
+class ContextSource(StrEnum):
     MODEL = "model"
     TOOL = "tool"
     TOOL_PROTOCOL = "tool_protocol"
@@ -27,7 +27,7 @@ class ContextSource(str, Enum):
     SUMMARY = "summary"
 
 
-class ContextItemType(str, Enum):
+class ContextItemType(StrEnum):
     SYSTEM_INSTRUCTION = "system_instruction"
     USER_GOAL = "user_goal"
     USER_MESSAGE = "user_message"
@@ -47,7 +47,7 @@ class ContextItemType(str, Enum):
     REFERENCE = "reference"
 
 
-class ContextLayer(str, Enum):
+class ContextLayer(StrEnum):
     SYSTEM = "system"
     USER_GOAL = "user_goal"
     TASK_STATE = "task_state"
@@ -64,7 +64,7 @@ class ContextLayer(str, Enum):
     SCRATCHPAD = "scratchpad"
 
 
-class ContextAuthority(str, Enum):
+class ContextAuthority(StrEnum):
     USER = "user"
     SYSTEM = "system"
     COMPONENT = "component"
@@ -73,20 +73,20 @@ class ContextAuthority(str, Enum):
     SUMMARY = "summary"
 
 
-class ContextFreshness(str, Enum):
+class ContextFreshness(StrEnum):
     CURRENT = "current"
     STALE = "stale"
     OBSOLETE = "obsolete"
 
 
-class ContextSensitivity(str, Enum):
+class ContextSensitivity(StrEnum):
     PUBLIC = "public"
     WORKSPACE = "workspace"
     SENSITIVE = "sensitive"
     SECRET = "secret"
 
 
-class CacheAttributionSource(str, Enum):
+class CacheAttributionSource(StrEnum):
     PROVIDER_NATIVE = "provider_native"
     COMPONENT_INFERRED = "component_inferred"
     UNKNOWN = "unknown"
@@ -146,7 +146,7 @@ class ContextReference:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ContextReference":
+    def from_dict(cls, payload: dict[str, Any]) -> ContextReference:
         return cls(
             ref_id=str(payload.get("ref_id") or payload.get("id") or ""),
             ref_type=str(payload.get("ref_type") or payload.get("type") or ""),
@@ -206,7 +206,7 @@ class ContextItem:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ContextItem":
+    def from_dict(cls, payload: dict[str, Any]) -> ContextItem:
         return cls(
             item_id=str(payload["item_id"]),
             run_id=str(payload["run_id"]),
@@ -341,7 +341,7 @@ class ContextBundle:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ContextBundle":
+    def from_dict(cls, payload: dict[str, Any]) -> ContextBundle:
         return cls(
             bundle_id=str(payload["bundle_id"]),
             run_id=str(payload["run_id"]),
@@ -374,7 +374,7 @@ class ContextUsageReport:
     cached_input_tokens: int = 0
     cache_hit_ratio: float = 0.0
     cache_miss_reasons: list[str] = field(default_factory=list)
-    cache_attribution: "CacheAttribution" = field(default_factory=lambda: CacheAttribution())
+    cache_attribution: CacheAttribution = field(default_factory=lambda: CacheAttribution())
     recommendations: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -404,7 +404,7 @@ class ContextSnapshot:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ContextSnapshot":
+    def from_dict(cls, payload: dict[str, Any]) -> ContextSnapshot:
         return cls(
             snapshot_id=str(payload.get("snapshot_id") or payload.get("id") or ""),
             run_id=str(payload.get("run_id") or ""),
@@ -536,7 +536,7 @@ class ContextSummaryPayload:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ContextSummaryPayload":
+    def from_dict(cls, payload: dict[str, Any]) -> ContextSummaryPayload:
         return cls(
             goal=str(payload.get("goal") or ""),
             current_state=str(payload.get("current_state") or ""),
@@ -570,7 +570,7 @@ class CacheAttribution:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "CacheAttribution":
+    def from_dict(cls, payload: dict[str, Any] | None) -> CacheAttribution:
         payload = payload or {}
         return cls(
             source=payload.get("source") or CacheAttributionSource.UNKNOWN,
@@ -611,7 +611,7 @@ class ContextSummaryEnvelope:
         return _to_plain(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ContextSummaryEnvelope":
+    def from_dict(cls, payload: dict[str, Any]) -> ContextSummaryEnvelope:
         raw_payload = payload.get("summary_payload")
         if raw_payload is None and isinstance(payload.get("payload"), dict):
             raw_payload = payload.get("payload")

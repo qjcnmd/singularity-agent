@@ -12,7 +12,6 @@ from singularity.model.errors import (
     ModelRunnerError,
     ModelToolCallParseError,
 )
-from singularity.model.request_builder import ModelTurnRequestBuilder
 from singularity.model.messages import MessageConverter
 from singularity.model.models import (
     ContentBlock,
@@ -45,6 +44,7 @@ from singularity.model.providers import (
     ProviderResponse,
 )
 from singularity.model.registry import ModelProviderRegistry
+from singularity.model.request_builder import ModelTurnRequestBuilder
 from singularity.model.retry import ModelRetryController, RetryPolicy
 from singularity.model.runner import ModelRunner
 from singularity.model.streaming import (
@@ -68,7 +68,6 @@ __all__ = [
     "ModelCapabilities",
     "ModelCapabilityError",
     "ModelContextTooLong",
-    "ModelTurnRequestBuilder",
     "ModelError",
     "ModelErrorKind",
     "ModelMessage",
@@ -80,6 +79,7 @@ __all__ = [
     "ModelPurpose",
     "ModelRequestValidationError",
     "ModelResponseValidationError",
+    "ModelResponseValidator",
     "ModelRetryController",
     "ModelRetryExhausted",
     "ModelRole",
@@ -92,6 +92,7 @@ __all__ = [
     "ModelToolRenderer",
     "ModelToolSchema",
     "ModelTurnRequest",
+    "ModelTurnRequestBuilder",
     "ModelTurnResult",
     "ModelTurnStatus",
     "ModelUsage",
@@ -106,5 +107,4 @@ __all__ = [
     "ToolCallNormalizer",
     "ToolChoiceMode",
     "ToolChoicePolicy",
-    "ModelResponseValidator",
 ]

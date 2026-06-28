@@ -4,13 +4,12 @@ import json
 from pathlib import Path
 
 from singularity.edit import (
+    EditExecutor,
     EditIntent,
     EditOperation,
-    EditExecutor,
     EditScope,
     EditStrategyKind,
 )
-from singularity.workspace import WorkspaceMutationManager
 from singularity.review import (
     ReviewDecision,
     ReviewDecisionAction,
@@ -18,6 +17,7 @@ from singularity.review import (
     ReviewStage,
     ReviewTarget,
 )
+from singularity.workspace import WorkspaceMutationManager
 
 
 class _Impact:

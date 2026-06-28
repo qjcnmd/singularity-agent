@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from singularity.instructions.compiler import PromptCompiler
-from singularity.instructions.prompt_config import PromptAssemblyConfig
 from singularity.instructions.exceptions import PromptBudgetExceeded, PromptInjectionWarning
 from singularity.instructions.injection import PromptInjectionDetector
 from singularity.instructions.models import (
@@ -15,6 +14,7 @@ from singularity.instructions.models import (
     PromptBundle,
     ResolvedInstructions,
 )
+from singularity.instructions.prompt_config import PromptAssemblyConfig
 from singularity.instructions.resolver import InstructionResolver
 from singularity.instructions.sources import InstructionSourceCollector
 from singularity.model.models import ModelPurpose

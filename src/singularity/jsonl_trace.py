@@ -14,7 +14,7 @@ class JsonlTraceRecorder:
         self.path = path
 
     @classmethod
-    def create(cls, project_root: Path) -> "JsonlTraceRecorder":
+    def create(cls, project_root: Path) -> JsonlTraceRecorder:
         run_id = cls._new_run_id()
         trace_dir = project_root / ".singularity" / "runs"
         trace_dir.mkdir(parents=True, exist_ok=True)

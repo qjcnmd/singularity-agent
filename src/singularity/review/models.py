@@ -3,28 +3,28 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-class ReviewStage(str, Enum):
+class ReviewStage(StrEnum):
     PRE_EDIT = "pre_edit"
     POST_PATCH = "post_patch"
     POST_VERIFICATION = "post_verification"
     FINAL = "final"
 
 
-class ReviewSeverity(str, Enum):
+class ReviewSeverity(StrEnum):
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
     CRITICAL = "critical"
 
 
-class ReviewCategory(str, Enum):
+class ReviewCategory(StrEnum):
     GOAL_MISMATCH = "goal_mismatch"
     OVER_EDITING = "over_editing"
     BUG_RISK = "bug_risk"
@@ -37,7 +37,7 @@ class ReviewCategory(str, Enum):
     POLICY_RISK = "policy_risk"
 
 
-class ReviewDecisionAction(str, Enum):
+class ReviewDecisionAction(StrEnum):
     ACCEPT = "accept"
     REPAIR = "repair"
     REPLAN = "replan"
@@ -45,7 +45,7 @@ class ReviewDecisionAction(str, Enum):
     NEEDS_HUMAN_APPROVAL = "needs_human_approval"
 
 
-class ReviewTrustLevel(str, Enum):
+class ReviewTrustLevel(StrEnum):
     TRUSTED_COMPONENT = "trusted_component"
     TRUSTED_OPERATOR = "trusted_operator"
     WORKSPACE_DERIVED = "workspace_derived"
@@ -54,7 +54,7 @@ class ReviewTrustLevel(str, Enum):
     UNKNOWN = "unknown"
 
 
-class ReviewFreshness(str, Enum):
+class ReviewFreshness(StrEnum):
     FRESH = "fresh"
     STALE = "stale"
     UNKNOWN = "unknown"
@@ -159,7 +159,7 @@ class ReviewDecision(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def default_route(self) -> "ReviewDecision":
+    def default_route(self) -> ReviewDecision:
         if self.route is None:
             self.route = {
                 ReviewDecisionAction.ACCEPT: "approve",

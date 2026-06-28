@@ -14,7 +14,7 @@ class ContextUsageReporter:
         store: Any,
         provider: Any | None = None,
         model_runner: Any | None = None,
-        emit_context_event: Callable[[str, dict[str, Any]], None] | None = None,
+        emit_context_event: Callable[[str, dict[str, Any]], Exception | None] | None = None,
     ) -> None:
         self.run_id = run_id
         self.store = store

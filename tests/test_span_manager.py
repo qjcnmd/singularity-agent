@@ -11,9 +11,11 @@ from singularity.observability.recorder import TraceRecorder
 def test_span_manager_start_end_and_context_manager_success(tmp_path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
 
-    with trace.span("outer", component="planner", ids={"task_id": "task_1"}) as outer:
-        with trace.span("inner", component="command", ids={"task_id": "task_1"}) as inner:
-            assert inner.parent_span_id == outer.span_id
+    with (
+        trace.span("outer", component="planner", ids={"task_id": "task_1"}) as outer,
+        trace.span("inner", component="command", ids={"task_id": "task_1"}) as inner,
+    ):
+        assert inner.parent_span_id == outer.span_id
 
     spans = trace.store.latest_spans()
     assert spans[outer.span_id].status == TraceStatus.SUCCESS
@@ -25,9 +27,8 @@ def test_span_manager_start_end_and_context_manager_success(tmp_path) -> None:
 def test_span_manager_context_manager_records_failed_status(tmp_path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
 
-    with pytest.raises(ValueError):
-        with trace.span("broken", component="tool", ids={"task_id": "task_1"}):
-            raise ValueError("boom")
+    with pytest.raises(ValueError), trace.span("broken", component="tool", ids={"task_id": "task_1"}):
+        raise ValueError("boom")
 
     span = next(iter(trace.store.latest_spans().values()))
     assert span.status == TraceStatus.FAILED
@@ -63,7 +64,7 @@ def test_span_manager_stack_is_thread_local(tmp_path) -> None:
             assert len(trace.spans._stack) == 1
             trace.spans.end_span(top.span_id, status=TraceStatus.SUCCESS)
             assert len(trace.spans._stack) == 0
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [
@@ -101,7 +102,7 @@ def test_span_manager_concurrent_spans_do_not_interfere(tmp_path) -> None:
                     assert all(
                         entry[0] == span.span_id for entry in trace.spans._stack
                     )
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [

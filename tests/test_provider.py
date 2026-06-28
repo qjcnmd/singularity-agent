@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
@@ -19,7 +19,7 @@ class FakeResponse:
 
 
 class FakeClient:
-    payloads: list[dict[str, Any]] = []
+    payloads: ClassVar[list[dict[str, Any]]] = []
 
     def __init__(self, *, timeout: float) -> None:
         self.timeout = timeout

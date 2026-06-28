@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from multiprocessing import Queue, Process
 import os
 from datetime import UTC, datetime, timedelta
+from multiprocessing import Process, Queue
 from pathlib import Path
 
 import pytest

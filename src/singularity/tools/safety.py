@@ -5,7 +5,6 @@ from pathlib import Path
 
 from singularity.observability.redaction import TraceRedactor
 
-
 SENSITIVE_NAME_RE = re.compile(
     r"(^\.env(?:\..*)?$|^id_rsa$|^id_dsa$|^id_ecdsa$|^id_ed25519$|"
     r".*\.(?:pem|key|p12|pfx)$|.*(?:credential|credentials|token|secret|api[_-]?key).*)",

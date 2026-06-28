@@ -5,13 +5,13 @@ from pathlib import Path
 from singularity.kernel.models import (
     AgentRun,
     AgentSession,
+    ComponentName,
+    ComponentState,
     KernelContext,
     KernelStatus,
     LifecycleEvent,
     RunIdentity,
     RunStatus,
-    ComponentName,
-    ComponentState,
     SessionStatus,
     ShutdownReason,
 )

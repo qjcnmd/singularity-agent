@@ -45,7 +45,6 @@ from singularity.model.models import (
 from singularity.planner.contract import TaskContract
 from singularity.planner.models import EvidenceLedger, TaskState
 from singularity.planner.semantic_objects import (
-    RepairPolicy,
     RiskPoint,
     SemanticPlan,
     VerificationStrategy,
@@ -89,7 +88,7 @@ class CriterionAssessment:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "CriterionAssessment":
+    def from_dict(cls, payload: dict[str, Any]) -> CriterionAssessment:
         return cls(
             criterion_id=str(payload["criterion_id"]),
             description=str(payload.get("description") or payload["criterion_id"]),
@@ -126,7 +125,7 @@ class CompletionAssessment:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "CompletionAssessment":
+    def from_dict(cls, payload: dict[str, Any]) -> CompletionAssessment:
         return cls(
             overall_satisfied=bool(payload.get("overall_satisfied", False)),
             criteria=[
@@ -151,7 +150,7 @@ def _json_payload(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if not match:
-            raise ValueError("model response did not contain a JSON object")
+            raise ValueError("model response did not contain a JSON object") from None
         value = json.loads(match.group(0))
     if not isinstance(value, dict):
         raise ValueError("model response JSON was not an object")
@@ -352,7 +351,7 @@ class FinalReviewer:
         """Ask the model to confirm criteria; model can only confirm (not override)."""
         try:
             payload = self._call_model(criteria, evidence, context_payload)
-        except Exception as exc:  # noqa: BLE001 - any failure falls back to rules
+        except Exception as exc:
             _emit(
                 self.trace,
                 "final_reviewer.assess.fallback",

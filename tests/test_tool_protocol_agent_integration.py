@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import json
 import inspect
+import json
 from pathlib import Path
 from typing import Any
 
-from singularity.agent_loop import AgentLoop
-from singularity.agent_loop import AgentLoopStatus
+from singularity.agent_loop import AgentLoop, AgentLoopStatus
 from singularity.context import ContextManager
 from singularity.jsonl_trace import JsonlTraceRecorder
-from singularity.observability.models import TraceEvent
-from singularity.observability.models import TraceEventType
+from singularity.observability.models import TraceEvent, TraceEventType
 from singularity.observability.summary import TraceSummaryBuilder
 from singularity.planner import Planner
 from tests.agent_loop_helpers import make_agent_session

@@ -15,11 +15,11 @@ class ToolPolicy:
     )
 
     @classmethod
-    def read_only(cls) -> "ToolPolicy":
+    def read_only(cls) -> ToolPolicy:
         return cls()
 
     @classmethod
-    def coding_agent(cls) -> "ToolPolicy":
+    def coding_agent(cls) -> ToolPolicy:
         return cls(
             allowed_permissions=frozenset(
                 {

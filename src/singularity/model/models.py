@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, is_dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
 
@@ -15,7 +15,7 @@ class SerializableDataclass:
         return _from_payload(cls, payload)
 
 
-class ModelPurpose(str, Enum):
+class ModelPurpose(StrEnum):
     PLAN_NEXT_ACTION = "plan_next_action"
     FAILURE_ANALYSIS = "failure_analysis"
     REPAIR_PLANNING = "repair_planning"
@@ -31,7 +31,7 @@ class ModelPurpose(str, Enum):
     FINAL_REVIEW = "final_review"
 
 
-class ModelRole(str, Enum):
+class ModelRole(StrEnum):
     SYSTEM = "system"
     DEVELOPER = "developer"
     USER = "user"
@@ -39,14 +39,14 @@ class ModelRole(str, Enum):
     TOOL = "tool"
 
 
-class ContentBlockType(str, Enum):
+class ContentBlockType(StrEnum):
     TEXT = "text"
     TOOL_RESULT = "tool_result"
     ERROR_SUMMARY = "error_summary"
     ARTIFACT_REF = "artifact_ref"
 
 
-class ToolChoiceMode(str, Enum):
+class ToolChoiceMode(StrEnum):
     NONE = "none"
     AUTO = "auto"
     REQUIRED = "required"
@@ -54,14 +54,14 @@ class ToolChoiceMode(str, Enum):
     ALLOWED_TOOLS = "allowed_tools"
 
 
-class ModelToolParseStatus(str, Enum):
+class ModelToolParseStatus(StrEnum):
     VALID = "valid"
     INVALID_JSON = "invalid_json"
     SCHEMA_MISMATCH = "schema_mismatch"
     UNKNOWN_TOOL = "unknown_tool"
 
 
-class ModelErrorKind(str, Enum):
+class ModelErrorKind(StrEnum):
     NETWORK_ERROR = "network_error"
     TIMEOUT = "timeout"
     RATE_LIMITED = "rate_limited"
@@ -77,7 +77,7 @@ class ModelErrorKind(str, Enum):
     UNKNOWN_PROVIDER_ERROR = "unknown_provider_error"
 
 
-class ModelTurnStatus(str, Enum):
+class ModelTurnStatus(StrEnum):
     SUCCESS = "success"
     FAILED = "failed"
     INVALID = "invalid"
@@ -94,7 +94,7 @@ class ContentBlock(SerializableDataclass):
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_text(cls, text: str, **metadata: Any) -> "ContentBlock":
+    def from_text(cls, text: str, **metadata: Any) -> ContentBlock:
         return cls(type=ContentBlockType.TEXT, text=text, metadata=metadata)
 
 
@@ -107,7 +107,7 @@ class ModelMessage(SerializableDataclass):
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def assistant_text(cls, text: str) -> "ModelMessage":
+    def assistant_text(cls, text: str) -> ModelMessage:
         return cls(role=ModelRole.ASSISTANT, content=[ContentBlock.from_text(text)])
 
     @property
@@ -228,7 +228,7 @@ class ModelTurnRequest(SerializableDataclass):
         *,
         messages: list[ModelMessage | dict[str, Any]],
         purpose: ModelPurpose = ModelPurpose.PLAN_NEXT_ACTION,
-    ) -> "ModelTurnRequest":
+    ) -> ModelTurnRequest:
         request_id = f"model_req_{uuid4().hex[:12]}"
         return cls(
             request_id=request_id,

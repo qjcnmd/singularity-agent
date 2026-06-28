@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,15 +28,15 @@ from singularity.context.models import (
     ContextLayer,
     ContextReference,
     ContextRenderPolicy,
-    ContextSource,
     ContextSensitivity,
     ContextSnapshot,
+    ContextSource,
     ContextSummaryEnvelope,
     ContextSummaryPayload,
     MutationEvidence,
+    PartialCompactionRange,
     PlannerState,
     PolicyObservation,
-    PartialCompactionRange,
     ToolObservation,
     VerificationEvidence,
     digest_value,
@@ -452,7 +453,7 @@ class ContextManager:
 
     def add_tool_protocol_result(
         self,
-        envelope: "ToolProtocolResultEnvelope | dict[str, Any]",
+        envelope: ToolProtocolResultEnvelope | dict[str, Any],
         *,
         turn: int = 0,
     ) -> ToolObservation:
@@ -1092,14 +1093,12 @@ class ContextManager:
         plan: CompactionPlan | None,
         failure_payload: dict[str, Any],
     ) -> None:
-        try:
+        with suppress(Exception):
             self.store.record_event(
                 self.run_id,
                 event_type="context.compaction_failed",
                 payload=failure_payload,
             )
-        except Exception:
-            pass
         self._emit_context_event("context.compaction_failed", failure_payload)
 
     def _fallback_messages_for_compaction_failure(
@@ -1246,7 +1245,7 @@ class ContextManager:
             elif hasattr(self.trace, "record"):
                 self.trace.record(event_type, payload)
         except Exception as exc:
-            try:
+            with suppress(Exception):
                 self.store.record_event(
                     self.run_id,
                     event_type="context.event_recording_failed",
@@ -1256,8 +1255,6 @@ class ContextManager:
                         "message": str(exc),
                     },
                 )
-            except Exception:
-                pass
             return exc
         return None
 

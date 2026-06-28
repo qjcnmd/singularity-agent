@@ -15,11 +15,12 @@ from singularity.command import (
 )
 from singularity.command.models import CommandResult
 from singularity.context import ContextManager
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.planner import Planner
-from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
+from singularity.review import ReviewPipeline
+from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
 from singularity.tools.command import register_command_tools
 from singularity.tools.verification import register_verification_tools
-from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.verification import (
     CheckKind,
     CheckStatus,
@@ -37,7 +38,6 @@ from singularity.verification import (
     VerificationRunner,
     WorkspaceKind,
 )
-from singularity.review import ReviewPipeline
 from singularity.verification.models import DiscoveredCommand, VerificationCheck, VerificationPlan
 from tests.tool_executor_helpers import default_policy_engine
 

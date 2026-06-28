@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from singularity.instructions.prompt_config import PromptAssemblyConfig
 from singularity.instructions.models import (
     InstructionPriority,
     InstructionScope,
@@ -14,8 +13,8 @@ from singularity.instructions.models import (
     _new_id,
 )
 from singularity.instructions.project import ProjectInstructionLoader
+from singularity.instructions.prompt_config import PromptAssemblyConfig
 from singularity.observability.redaction import TraceRedactor
-
 
 SYSTEM_INVARIANTS = "\n".join(
     [

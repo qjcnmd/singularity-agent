@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from singularity.edit import EditIntent, EditOperation, EditExecutor, EditScope
+from singularity.edit import EditExecutor, EditIntent, EditOperation, EditScope
 from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.tools.models import (
     PermissionLevel,
@@ -105,7 +105,7 @@ class ApplyPatchInput(BaseModel):
     allow_new_files: bool = Field(True, description="Whether the patch may create new files.")
 
     @model_validator(mode="after")
-    def _requires_patch_text(self) -> "ApplyPatchInput":
+    def _requires_patch_text(self) -> ApplyPatchInput:
         if not self.patch and not self.unified_diff:
             raise ValueError("patch or unified_diff is required.")
         return self

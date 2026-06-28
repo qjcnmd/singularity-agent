@@ -9,7 +9,6 @@ from threading import Lock
 from singularity.command.models import ResourceLimits
 from singularity.command.policy import is_secret_env_name
 
-
 SECRET_VALUE_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|DSN|CONN_STR|CONN_STRING|CONNECTION_STRING)|DATABASE_URL|AWS_[A-Z0-9_]+|GITHUB_TOKEN|OPENAI_API_KEY)=([^\s]+)"
 )
@@ -92,7 +91,7 @@ class OutputCollector:
         text = self.redactor.redact(text)
         encoded_len = len(text.encode("utf-8"))
         with self._lock:
-            self._digest.update(f"{stream}:".encode("utf-8"))
+            self._digest.update(f"{stream}:".encode())
             self._digest.update(text.encode("utf-8"))
             self._write_artifact(stream, text)
             if stream == "stdout":

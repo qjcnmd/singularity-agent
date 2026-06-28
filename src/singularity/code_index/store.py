@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator, TypeVar
+from typing import Any, TypeVar
 
 from singularity.code_index.exceptions import IndexStoreError
 from singularity.code_index.models import (
@@ -25,7 +26,6 @@ from singularity.code_index.models import (
     TestMappingRecord,
     stable_id,
 )
-
 
 T = TypeVar("T", bound=IndexFact)
 

@@ -5,6 +5,7 @@ import hashlib
 import os
 import shutil
 import stat
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -51,11 +52,7 @@ class SandboxFilesystemManager:
         artifact_root = sandbox_root / "artifacts"
         artifact_root.mkdir(parents=True, exist_ok=True)
 
-        if policy.mode == SandboxFilesystemMode.EMPTY_TEMP_WORKSPACE:
-            workspace_copy_root = sandbox_root / "workspace"
-            workspace_copy_root.mkdir(parents=True, exist_ok=True)
-            execution_cwd = workspace_copy_root
-        elif policy.mode == SandboxFilesystemMode.ARTIFACT_OUTPUT_ONLY:
+        if policy.mode == SandboxFilesystemMode.EMPTY_TEMP_WORKSPACE or policy.mode == SandboxFilesystemMode.ARTIFACT_OUTPUT_ONLY:
             workspace_copy_root = sandbox_root / "workspace"
             workspace_copy_root.mkdir(parents=True, exist_ok=True)
             execution_cwd = workspace_copy_root
@@ -213,7 +210,5 @@ def _clear_readonly_tree(root: Path) -> None:
     # Restore write access on the staged tree so shutil.rmtree can remove it
     # even when READ_ONLY_WORKSPACE marked files/directories read-only.
     for path in (root, *root.rglob("*")):
-        try:
+        with suppress(OSError):
             os.chmod(path, path.stat().st_mode | stat.S_IWRITE)
-        except OSError:
-            pass

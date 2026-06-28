@@ -7,18 +7,18 @@ from typing import Any
 
 import pytest
 
+from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
+from singularity.evaluation.models import FAILURE_CASE_RECORD_SCHEMA_VERSION
 from singularity.evaluation.runner import (
     EVALUATION_RESULT_SCHEMA_VERSION,
     EVALUATION_TASK_SET_SCHEMA_VERSION,
     EvaluationRunner,
-    EvaluationTaskSet,
     EvaluationTaskResult,
+    EvaluationTaskSet,
     SingularityPrivateBenchmarkAdapter,
     load_evaluation_task_set,
     summarize_evaluation_results,
 )
-from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
-from singularity.evaluation.models import FAILURE_CASE_RECORD_SCHEMA_VERSION
 from singularity.kernel.finalization import FinalReport
 from singularity.kernel.models import RunStatus
 from tests.agent_loop_helpers import make_agent_session

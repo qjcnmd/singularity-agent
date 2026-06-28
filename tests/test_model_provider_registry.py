@@ -1,23 +1,25 @@
-import pytest
+from typing import ClassVar
+
 import httpx
+import pytest
 
 from singularity.config import Settings
 from singularity.model import (
+    ContentBlock,
     MockModelProvider,
     ModelCapabilities,
     ModelCapabilityError,
     ModelError,
     ModelErrorKind,
-    ModelPreferences,
     ModelMessage,
-    ModelRole,
-    OpenAICompatibleModelProvider,
+    ModelPreferences,
     ModelProviderNotFound,
     ModelProviderRegistry,
+    ModelRole,
+    OpenAICompatibleModelProvider,
     ProviderRequest,
     ToolChoiceMode,
     ToolChoicePolicy,
-    ContentBlock,
 )
 
 
@@ -139,7 +141,7 @@ class _FakeErrorResponse:
 
 
 class _FakeClient:
-    payloads: list[dict] = []
+    payloads: ClassVar[list[dict]] = []
 
     def __init__(self, *, timeout: float) -> None:
         self.timeout = timeout

@@ -7,7 +7,6 @@ from typing import Any
 from singularity.observability.models import TraceEvent
 from singularity.policy import ApprovalGrant
 
-
 SCHEMA_VERSION = "1.0"
 
 
@@ -31,7 +30,7 @@ class RunEvent:
     schema_version: str = SCHEMA_VERSION
 
     @classmethod
-    def from_trace_event(cls, event: TraceEvent, *, sequence: int) -> "RunEvent":
+    def from_trace_event(cls, event: TraceEvent, *, sequence: int) -> RunEvent:
         return cls(
             event_id=event.event_id,
             event_type=event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type),
@@ -87,7 +86,7 @@ class ApprovalEvent:
     schema_version: str = SCHEMA_VERSION
 
     @classmethod
-    def from_grant(cls, grant: ApprovalGrant, *, status: str = "granted") -> "ApprovalEvent":
+    def from_grant(cls, grant: ApprovalGrant, *, status: str = "granted") -> ApprovalEvent:
         return cls(
             request_id=grant.request_id,
             decision_id=grant.decision_id,
@@ -139,7 +138,7 @@ class ToolCallEvent:
     schema_version: str = SCHEMA_VERSION
 
     @classmethod
-    def from_run_event(cls, event: RunEvent) -> "ToolCallEvent":
+    def from_run_event(cls, event: RunEvent) -> ToolCallEvent:
         payload = dict(event.payload or {})
         return cls(
             tool_call_id=str(payload.get("tool_call_id") or event.action_id or ""),
@@ -196,7 +195,7 @@ class RunSession:
         event_count: int,
         artifact_count: int,
         last_sequence: int | None,
-    ) -> "RunStateSnapshot":
+    ) -> RunStateSnapshot:
         return RunStateSnapshot(
             run_id=self.run_id,
             session_id=self.session_id,

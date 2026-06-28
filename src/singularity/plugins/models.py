@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -9,13 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from singularity.tools import ToolSpec
 
-
 API_VERSION = "1"
 PLUGIN_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 PLUGIN_TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
-class PluginType(str, Enum):
+class PluginType(StrEnum):
     TOOL = "tool"
     PROVIDER = "provider"
     PROMPT = "prompt"
@@ -24,7 +23,7 @@ class PluginType(str, Enum):
     PROJECT_ADAPTER = "project_adapter"
 
 
-class PluginPermission(str, Enum):
+class PluginPermission(StrEnum):
     READ_WORKSPACE = "read_workspace"
     READ_OUTSIDE_WORKSPACE = "read_outside_workspace"
     WRITE_WORKSPACE = "write_workspace"
@@ -34,7 +33,7 @@ class PluginPermission(str, Enum):
     CHANGE_CONFIG = "change_config"
 
 
-class PluginDiagnosticSeverity(str, Enum):
+class PluginDiagnosticSeverity(StrEnum):
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
@@ -86,7 +85,7 @@ class PluginManifest(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _valid_api(self) -> "PluginManifest":
+    def _valid_api(self) -> PluginManifest:
         if self.api_version != API_VERSION:
             raise ValueError(f"api_version must be {API_VERSION}")
         return self
@@ -100,7 +99,7 @@ class DiscoveredPlugin(BaseModel):
     plugin_dir: Path
     source: str
     manifest_hash: str
-    diagnostics: list["PluginDiagnostic"] = Field(default_factory=list)
+    diagnostics: list[PluginDiagnostic] = Field(default_factory=list)
 
     def to_summary(self, *, enabled: bool = False, compatibility_status: str = "unchecked") -> dict[str, Any]:
         return {

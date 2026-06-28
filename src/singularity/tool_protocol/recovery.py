@@ -68,10 +68,7 @@ class ToolProtocolRecoveryManager:
         elif running_call_ids:
             next_action = "await_tool_result"
             status = ToolProtocolTurnStatus.RECOVERED
-        elif succeeded_but_not_appended_call_ids:
-            next_action = "append_tool_message"
-            status = ToolProtocolTurnStatus.RECOVERED
-        elif missing_tool_messages:
+        elif succeeded_but_not_appended_call_ids or missing_tool_messages:
             next_action = "append_tool_message"
             status = ToolProtocolTurnStatus.RECOVERED
 
@@ -188,10 +185,7 @@ class ToolProtocolRecoveryManager:
         elif running_call_ids:
             next_action = "await_tool_result"
             status = ToolProtocolTurnStatus.RECOVERED
-        elif succeeded_but_not_appended_call_ids:
-            next_action = "append_tool_message"
-            status = ToolProtocolTurnStatus.RECOVERED
-        elif missing_tool_messages:
+        elif succeeded_but_not_appended_call_ids or missing_tool_messages:
             next_action = "append_tool_message"
             status = ToolProtocolTurnStatus.RECOVERED
 

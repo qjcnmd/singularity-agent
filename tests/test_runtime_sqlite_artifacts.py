@@ -5,7 +5,6 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUN_STATE_SQLITE_NAMES = {
     "context.sqlite3",

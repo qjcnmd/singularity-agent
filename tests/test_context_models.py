@@ -6,8 +6,8 @@ from singularity.context.models import (
     ContextLayer,
     ContextReference,
     ContextRenderPolicy,
-    ContextSource,
     ContextSensitivity,
+    ContextSource,
 )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from singularity.memory.models import (
+    TTL,
     Confidence,
     ConflictStatus,
     MemoryAuthorType,
@@ -12,7 +13,6 @@ from singularity.memory.models import (
     MemorySource,
     MemoryType,
     Provenance,
-    TTL,
 )
 
 

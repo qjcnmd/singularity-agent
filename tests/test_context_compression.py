@@ -1,18 +1,18 @@
-import json
 import inspect
+import json
 import sqlite3
 
 import pytest
 
-from singularity.context.compression import (
-    ContextCompressor,
-    ContextSummaryValidationError,
-)
 from singularity.context import ContextManager
 from singularity.context.compaction import (
     ContextCompactionCommitter,
     ContextCompactionExecutor,
     ContextCompactionPlanner,
+)
+from singularity.context.compression import (
+    ContextCompressor,
+    ContextSummaryValidationError,
 )
 from singularity.context.models import (
     ContextAuthority,
@@ -20,10 +20,10 @@ from singularity.context.models import (
     ContextItem,
     ContextItemType,
     ContextLayer,
-    PartialCompactionRange,
-    ContextSource,
     ContextSensitivity,
+    ContextSource,
     MutationEvidence,
+    PartialCompactionRange,
     VerificationEvidence,
 )
 
@@ -402,11 +402,11 @@ def test_context_manager_marks_omitted_items_stale_and_avoids_repeat_compaction(
         output_token_reserve=20,
     )
     context.add_assistant_message({"role": "assistant", "content": "history " * 200})
-    old_item_id = [
+    old_item_id = next(
         item.item_id
         for item in context.store.query_items(run_id=context.run_id)
         if item.item_type == ContextItemType.ASSISTANT_MESSAGE
-    ][0]
+    )
 
     context.messages(persist=True)
     context.messages(persist=True)
@@ -769,18 +769,18 @@ def test_partial_compact_requires_explicit_turn_range_and_preserves_out_of_range
         result={"ok": True, "content": "tool turn two", "metadata": {}},
         turn=2,
     )
-    one_id = [
+    one_id = next(
         item.item_id
         for item in context.store.query_items(run_id=context.run_id)
         if item.item_type == ContextItemType.ASSISTANT_MESSAGE
         and item.metadata.get("turn") == 1
-    ][0]
-    two_id = [
+    )
+    two_id = next(
         item.item_id
         for item in context.store.query_items(run_id=context.run_id)
         if item.item_type == ContextItemType.ASSISTANT_MESSAGE
         and item.metadata.get("turn") == 2
-    ][0]
+    )
 
     assert context.partial_compact(PartialCompactionRange(start_turn=1, end_turn=1)) is True
 
@@ -863,18 +863,18 @@ def test_partial_compact_checkpoint_id_has_metadata_path(tmp_path) -> None:
             "metadata": {"checkpoint_id": "checkpoint_b"},
         }
     )
-    checkpoint_a_id = [
+    checkpoint_a_id = next(
         item.item_id
         for item in context.store.query_items(run_id=context.run_id)
         if item.item_type == ContextItemType.ASSISTANT_MESSAGE
         and item.metadata.get("checkpoint_id") == "checkpoint_a"
-    ][0]
-    checkpoint_b_id = [
+    )
+    checkpoint_b_id = next(
         item.item_id
         for item in context.store.query_items(run_id=context.run_id)
         if item.item_type == ContextItemType.ASSISTANT_MESSAGE
         and item.metadata.get("checkpoint_id") == "checkpoint_b"
-    ][0]
+    )
 
     assert context.partial_compact(PartialCompactionRange(checkpoint_id="checkpoint_a")) is True
 

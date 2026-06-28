@@ -6,13 +6,13 @@ from singularity.policy import (
     Capability,
     DecisionOutcome,
     OperationKind,
+    PolicyComponent,
     PolicyConstraints,
     PolicyDecision,
     PolicyRequest,
     PolicySubject,
     ResourceRef,
     RiskLevel,
-    PolicyComponent,
 )
 
 

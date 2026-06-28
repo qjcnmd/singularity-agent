@@ -4,7 +4,6 @@ from typing import Any
 
 from singularity.planner.models import RiskDecisionKind, RiskEscalation, RiskLevel
 
-
 HIGH_RISK_PATH_PARTS = {
     ".env",
     "pyproject.toml",

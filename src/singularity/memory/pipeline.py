@@ -14,8 +14,8 @@ from singularity.memory.models import (
     MemoryEntry,
     MemoryEvidenceRef,
     MemoryQuery,
-    MemorySearchResult,
     MemoryScope,
+    MemorySearchResult,
     MemorySource,
     MemoryStatus,
     MemoryType,
@@ -26,9 +26,7 @@ from singularity.memory.models import (
 from singularity.memory.policy import AdmissionAction, MemoryPolicy
 from singularity.memory.retrieval import MemoryRetriever
 from singularity.memory.rules import PathScopedRule, load_rules
-from singularity.memory.store import HUMAN_FILES
-from singularity.memory.store import _is_template_only
-from singularity.memory.store import MemoryStore
+from singularity.memory.store import HUMAN_FILES, MemoryStore, _is_template_only
 
 
 class MemoryLearningPipeline:

@@ -43,7 +43,8 @@ _SPECIAL_PATH_MAP: dict[str, list[str]] = {
     "scripts/test_impact.py": ["tests/test_test_impact.py"],
     "tests/conftest.py": ["tests/test_test_infra.py"],
     "docs/testing.md": ["tests/test_docs_consistency.py"],
-    "pyproject.toml": ["tests/test_test_infra.py"],
+    ".github/workflows/ci.yml": ["tests/test_quality_gates.py"],
+    "pyproject.toml": ["tests/test_quality_gates.py", "tests/test_test_infra.py"],
     "scripts/verify_runtime_docs.py": ["tests/test_runtime_docs_verify.py"],
 }
 
@@ -77,9 +78,7 @@ def _is_pytest_collectable(path: str) -> bool:
     if not stem.startswith("test_") and not stem.endswith("_test"):
         return False
     # Non-collectable files under tests/
-    if stem in ("conftest",):
-        return False
-    return True
+    return stem not in ("conftest",)
 
 
 def _validate_recommendations(tests: list[str]) -> tuple[list[str], list[str]]:
@@ -194,10 +193,7 @@ def _fallback_tests(paths: list[str], *, verbose: bool = False) -> tuple[list[st
 
 def _git_changed_files(base: str | None) -> list[str]:
     """Get changed files from git diff."""
-    if base:
-        cmd = ["git", "diff", "--name-only", f"{base}...HEAD"]
-    else:
-        cmd = ["git", "diff", "--name-only", "HEAD"]
+    cmd = ["git", "diff", "--name-only", f"{base}...HEAD"] if base else ["git", "diff", "--name-only", "HEAD"]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 

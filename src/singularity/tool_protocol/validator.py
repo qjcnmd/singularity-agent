@@ -4,6 +4,8 @@ import json
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from singularity.model.models import (
     ModelCapabilities,
     ModelToolParseStatus,
@@ -11,7 +13,6 @@ from singularity.model.models import (
     ToolChoicePolicy,
 )
 from singularity.model.tools import coerce_json_string_fields
-from pydantic import ValidationError
 from singularity.tool_protocol.errors import ToolProtocolValidationError
 from singularity.tool_protocol.models import (
     ToolCallBatch,

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from singularity.workspace.pathing import ResolvedWorkspacePath
-
 
 PUBLIC_SOURCE = "PUBLIC_SOURCE"
 PROJECT_CONFIG = "PROJECT_CONFIG"
@@ -33,7 +33,7 @@ class PolicyDecision:
 
 
 class FileClassifier:
-    binary_extensions = {
+    binary_extensions: ClassVar[set[str]] = {
         ".7z",
         ".avif",
         ".bin",
@@ -53,7 +53,7 @@ class FileClassifier:
         ".webp",
         ".zip",
     }
-    source_extensions = {
+    source_extensions: ClassVar[set[str]] = {
         ".c",
         ".cpp",
         ".cs",
@@ -72,8 +72,8 @@ class FileClassifier:
         ".ts",
         ".tsx",
     }
-    docs_extensions = {".adoc", ".md", ".rst", ".txt"}
-    config_names = {
+    docs_extensions: ClassVar[set[str]] = {".adoc", ".md", ".rst", ".txt"}
+    config_names: ClassVar[set[str]] = {
         ".editorconfig",
         ".flake8",
         ".gitignore",
@@ -88,7 +88,7 @@ class FileClassifier:
         "tox.ini",
         "tsconfig.json",
     }
-    lock_names = {
+    lock_names: ClassVar[set[str]] = {
         "cargo.lock",
         "go.sum",
         "package-lock.json",
@@ -98,8 +98,8 @@ class FileClassifier:
         "uv.lock",
         "yarn.lock",
     }
-    build_names = {"dockerfile", "makefile", "justfile"}
-    generated_dirs = {
+    build_names: ClassVar[set[str]] = {"dockerfile", "makefile", "justfile"}
+    generated_dirs: ClassVar[set[str]] = {
         ".coverage",
         ".deepeval",
         ".singularity",
@@ -164,9 +164,9 @@ class FileClassifier:
 
 
 class WorkspacePolicy:
-    denied_file_classes = {SECRET, VCS_INTERNAL, BINARY, LARGE_ARTIFACT}
-    review_file_classes = {PROJECT_CONFIG, DEPENDENCY_LOCK, BUILD_SCRIPT}
-    denied_dirs = {
+    denied_file_classes: ClassVar[set[str]] = {SECRET, VCS_INTERNAL, BINARY, LARGE_ARTIFACT}
+    review_file_classes: ClassVar[set[str]] = {PROJECT_CONFIG, DEPENDENCY_LOCK, BUILD_SCRIPT}
+    denied_dirs: ClassVar[set[str]] = {
         ".git",
         ".hg",
         ".singularity",

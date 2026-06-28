@@ -5,20 +5,20 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from singularity.interaction import InteractionController, UserDecision
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import (
     ApprovalGate,
-    approval_scope_for_request,
     DecisionOutcome,
     PolicyConfig,
     PolicyDecision,
     PolicyRequest,
-    RiskLevel,
     ResourceRef,
+    RiskLevel,
+    approval_scope_for_request,
 )
-from singularity.interaction import InteractionController, UserDecision
-from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor, ToolSpec
+from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry, ToolSpec
 from tests.tool_executor_helpers import make_ledger_test_config
-from singularity.jsonl_trace import JsonlTraceRecorder
 
 
 class EmptyInput(BaseModel):

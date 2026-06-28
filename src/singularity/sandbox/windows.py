@@ -10,13 +10,15 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from contextlib import suppress
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 from singularity.observability.redaction import TraceRedactor
 from singularity.release.paths import resolve_user_data_paths
@@ -29,8 +31,8 @@ from singularity.sandbox.models import (
     SandboxCapabilities,
     SandboxNetworkMode,
     SandboxRequest,
-    SandboxResult,
     SandboxResourceLimits,
+    SandboxResult,
     SandboxStatus,
     SandboxViolation,
 )
@@ -40,7 +42,6 @@ from singularity.sandbox.windows_runner import (
     WindowsRunnerSpec,
     WindowsSandboxRunner,
 )
-
 
 DOCTOR_SCHEMA_VERSION = "sandbox.windows.doctor/v1"
 SETUP_SCHEMA_VERSION = "sandbox.windows.setup/v1"
@@ -200,7 +201,7 @@ class WindowsSandboxDoctorReport:
         return self.blocking_requirements
 
     @classmethod
-    def ready_for_tests(cls) -> "WindowsSandboxDoctorReport":
+    def ready_for_tests(cls) -> WindowsSandboxDoctorReport:
         ready = _available("test verified", {"source": "test"})
         primitives = WindowsSandboxPrimitives(ready, ready, ready, ready, ready, ready)
         setup = WindowsSandboxSetup(ready, ready, ready, ready, ready)
@@ -258,7 +259,7 @@ class WindowsSandboxSetupReport:
     diagnostics: tuple[dict[str, Any], ...] = ()
 
     @classmethod
-    def ready_for_tests(cls) -> "WindowsSandboxSetupReport":
+    def ready_for_tests(cls) -> WindowsSandboxSetupReport:
         return cls(
             status="ready",
             requested_operation="setup",
@@ -1452,10 +1453,8 @@ def _account_python_smoke(
     spec_path = cwd / "runner-spec.json"
     result_path = cwd / "runner-result.json"
     for path in (spec_path, result_path):
-        try:
+        with suppress(FileNotFoundError):
             path.unlink()
-        except FileNotFoundError:
-            pass
     spec = WindowsRunnerSpec(
         command=[sys.executable, "-c", code],
         cwd=str(cwd),
@@ -1715,7 +1714,7 @@ def _validate_sandbox_account_name(name: str) -> dict[str, Any] | None:
 
 def _operation_failure_step(
     step: str,
-    result: "_OperationResult",
+    result: _OperationResult,
     *,
     account_name: str,
 ) -> dict[str, Any]:
@@ -1760,17 +1759,20 @@ def _legacy_artifact_diagnostics() -> tuple[dict[str, Any], ...]:
                     "target_redacted": _redact_account_name(LEGACY_SANDBOX_ACCOUNT),
                 }
             )
-    if LEGACY_FIREWALL_RULE_NAME and LEGACY_FIREWALL_RULE_NAME != FIREWALL_RULE_NAME:
-        if _firewall_rule_exists(LEGACY_FIREWALL_RULE_NAME):
-            diagnostics.append(
-                {
-                    "kind": "legacy_firewall_rule",
-                    "status": "present",
-                    "rule_hash": _hash_text(LEGACY_FIREWALL_RULE_NAME),
-                    "rule_redacted": _redact_account_name(LEGACY_FIREWALL_RULE_NAME),
-                    "group": FIREWALL_RULE_GROUP,
-                }
-            )
+    if (
+        LEGACY_FIREWALL_RULE_NAME
+        and LEGACY_FIREWALL_RULE_NAME != FIREWALL_RULE_NAME
+        and _firewall_rule_exists(LEGACY_FIREWALL_RULE_NAME)
+    ):
+        diagnostics.append(
+            {
+                "kind": "legacy_firewall_rule",
+                "status": "present",
+                "rule_hash": _hash_text(LEGACY_FIREWALL_RULE_NAME),
+                "rule_redacted": _redact_account_name(LEGACY_FIREWALL_RULE_NAME),
+                "group": FIREWALL_RULE_GROUP,
+            }
+        )
     return tuple(diagnostics)
 
 
@@ -2412,7 +2414,7 @@ def _windows_state_dir_path() -> Path:
         program_data = os.environ.get("PROGRAMDATA")
         if program_data:
             return Path(program_data) / "Singularity" / "windows-sandbox"
-        system_drive = os.environ.get("SystemDrive") or "C:"
+        system_drive = os.environ.get("SYSTEMDRIVE") or "C:"
         return Path(system_drive + "\\ProgramData") / "Singularity" / "windows-sandbox"
     return resolve_user_data_paths().state_dir / "windows-sandbox"
 

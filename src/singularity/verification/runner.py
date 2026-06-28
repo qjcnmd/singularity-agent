@@ -7,30 +7,30 @@ from pathlib import Path
 from typing import Any
 
 from singularity.command import (
+    CommandDecision,
+    CommandExecutor,
+    CommandPolicyResult,
     CommandPurpose,
     CommandRequest,
-    CommandExecutor,
-    CommandDecision,
-    CommandPolicyResult,
     CommandRisk,
     ExecutionStatus,
     SemanticStatus,
 )
+from singularity.observability.models import TraceEventType, TraceSeverity
+from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.policy import (
     ApprovalGate,
     Capability,
     DecisionOutcome,
     OperationKind,
+    PolicyComponent,
     PolicyConfig,
-    PolicyRequest,
     PolicyEngine,
+    PolicyRequest,
     PolicySubject,
     ResourceRef,
-    PolicyComponent,
 )
 from singularity.policy.audit import redact
-from singularity.observability.models import TraceEventType, TraceSeverity
-from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.verification.assessor import CompletionAssessor
 from singularity.verification.discovery import ProjectDetector
 from singularity.verification.failure_analysis import FailureAnalysisPipeline, RepairPlanner
@@ -1300,7 +1300,6 @@ def _resolve_contract_step_id(
     steps = verification_contract.get("steps") if isinstance(verification_contract, dict) else None
     if not steps:
         return None
-    import shlex
 
     argv_str = " ".join(str(item) for item in argv)
     for step in steps:

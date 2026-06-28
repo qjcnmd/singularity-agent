@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from singularity.config import ProductionConfig
-from singularity.policy.permissions import ApprovalPolicy
-from singularity.kernel.graph import AgentGraphBuilder, AgentGraph
+from singularity.kernel.graph import AgentGraph, AgentGraphBuilder
 from singularity.kernel.health import ComponentHealthChecker
 from singularity.kernel.models import ComponentName, ComponentState, RunIdentity
 from singularity.observability import TraceRecorder
 from singularity.planner.models import TaskState
+from singularity.policy.permissions import ApprovalPolicy
 
 
 def test_agent_graph_initializes_components_in_declared_order(tmp_path: Path, monkeypatch) -> None:
@@ -159,7 +159,7 @@ def test_agent_graph_owns_cancellation_token_targets(tmp_path: Path, monkeypatch
         "context_manager",
     ]
     assert graph._evaluation_harness is None
-    assert all(getattr(component, "cancellation_token") is None for _name, component in graph.cancellation_targets())
+    assert all(component.cancellation_token is None for _name, component in graph.cancellation_targets())
 
 
 def test_agent_graph_installs_cancellation_tokens_without_forcing_lazy_evaluation(
@@ -187,14 +187,14 @@ def test_agent_graph_installs_cancellation_tokens_without_forcing_lazy_evaluatio
 
     assert constructed == []
     assert all(
-        getattr(component, "cancellation_token") in tokens
+        component.cancellation_token in tokens
         for _name, component in graph.cancellation_targets()
     )
 
     evaluation_harness = graph.evaluation_harness
 
     assert len(constructed) == 1
-    assert getattr(evaluation_harness, "cancellation_token") in tokens
+    assert evaluation_harness.cancellation_token in tokens
 
 
 def test_agent_graph_defers_evaluation_harness_until_used(tmp_path: Path, monkeypatch) -> None:

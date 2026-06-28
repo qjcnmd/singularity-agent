@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
 from singularity.command import CommandPolicyResult, CommandRequest
 
 
-class ProjectLanguage(str, Enum):
+class ProjectLanguage(StrEnum):
     PYTHON = "python"
     JAVASCRIPT = "javascript"
     TYPESCRIPT = "typescript"
@@ -18,13 +18,13 @@ class ProjectLanguage(str, Enum):
     UNKNOWN = "unknown"
 
 
-class WorkspaceKind(str, Enum):
+class WorkspaceKind(StrEnum):
     SINGLE_PROJECT = "single_project"
     MONOREPO = "monorepo"
     UNKNOWN = "unknown"
 
 
-class CheckKind(str, Enum):
+class CheckKind(StrEnum):
     SYNTAX = "syntax"
     FORMAT = "format"
     LINT = "lint"
@@ -38,7 +38,7 @@ class CheckKind(str, Enum):
     MANUAL_REVIEW = "manual_review"
 
 
-class CheckStatus(str, Enum):
+class CheckStatus(StrEnum):
     PASSED = "passed"
     FAILED = "failed"
     SKIPPED = "skipped"
@@ -48,7 +48,7 @@ class CheckStatus(str, Enum):
     INCONCLUSIVE = "inconclusive"
 
 
-class FailureType(str, Enum):
+class FailureType(StrEnum):
     PROJECT_PROFILE_UNKNOWN = "project_profile_unknown"
     COMMAND_DISCOVERY_FAILED = "command_discovery_failed"
     VERIFICATION_PLAN_FAILED = "verification_plan_failed"
@@ -79,14 +79,14 @@ class FailureType(str, Enum):
     UNKNOWN_FAILURE = "unknown_failure"
 
 
-class VerificationDecision(str, Enum):
+class VerificationDecision(StrEnum):
     ALLOW = "allow"
     REQUIRE_REVIEW = "require_review"
     DENY = "deny"
     BLOCKED = "blocked"
 
 
-class CompletionStatus(str, Enum):
+class CompletionStatus(StrEnum):
     READY = "ready"
     READY_WITH_WARNINGS = "ready_with_warnings"
     BLOCKED = "blocked"

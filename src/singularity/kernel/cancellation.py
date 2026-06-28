@@ -15,7 +15,7 @@ class CancellationState:
 
 
 class CancellationToken:
-    def __init__(self, parent: "CancellationToken | None" = None) -> None:
+    def __init__(self, parent: CancellationToken | None = None) -> None:
         self._parent = parent
         self._state = CancellationState(cancelled=False)
         self._children: list[CancellationToken] = []
@@ -54,7 +54,7 @@ class CancellationToken:
                 details={"reason": state.reason.value if state.reason else None},
             )
 
-    def child_token(self) -> "CancellationToken":
+    def child_token(self) -> CancellationToken:
         with self._lock:
             child = CancellationToken(parent=self)
             self._children.append(child)

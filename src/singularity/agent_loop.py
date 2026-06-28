@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -14,15 +14,14 @@ from singularity.failure_analysis import FailureAnalysisRequest, FailureAnalyzer
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.interaction import InteractionController, ProgressEvent
 from singularity.model import ModelErrorKind, ModelPurpose, ModelRunner, ModelTurnStatus
+from singularity.observability.protocols import TraceStorageProtocol
 from singularity.planner import Planner, TaskStatus
-from singularity.provider import OpenAICompatibleProvider
 from singularity.policy import PolicyEngine
+from singularity.provider import OpenAICompatibleProvider
 from singularity.repair import RepairPlanner
 from singularity.run_controller import RunController
 from singularity.tool_protocol.engine import ToolProtocolEngine
-from singularity.tools import ToolRegistry, ToolExecutor
-from singularity.observability.protocols import TraceStorageProtocol
-
+from singularity.tools import ToolExecutor, ToolRegistry
 
 SYSTEM_PROMPT = """You are Singularity, a local coding agent harness.
 
@@ -43,7 +42,7 @@ When you have enough information, answer the user directly.
 """
 
 
-class AgentLoopStatus(str, Enum):
+class AgentLoopStatus(StrEnum):
     COMPLETED = "completed"
     BLOCKED = "blocked"
     MAX_TURNS_EXCEEDED = "max_turns_exceeded"
@@ -480,9 +479,7 @@ class AgentLoop:
             return False
         if int(getattr(protocol_result, "failed_count", 0) or 0):
             return False
-        if int(getattr(protocol_result, "rejected_count", 0) or 0):
-            return False
-        return True
+        return not int(getattr(protocol_result, "rejected_count", 0) or 0)
 
     def _outcome_from_model_failure(self, result: Any) -> ExecutionOutcome:
         message = (

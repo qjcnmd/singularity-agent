@@ -12,6 +12,7 @@ from singularity.command.models import (
     FilesystemMode,
     NetworkMode,
 )
+
 READ_ONLY_GIT = {
     "branch",
     "diff",
@@ -491,4 +492,4 @@ def _is_destructive(program: str, lowered: list[str], joined: str) -> bool:
         return True
     if program == "git" and len(lowered) > 1 and lowered[1] in {"clean", "reset"}:
         return True
-    return "rm -rf" in joined or "remove-item" in joined and "-recurse" in joined
+    return "rm -rf" in joined or ("remove-item" in joined and "-recurse" in joined)

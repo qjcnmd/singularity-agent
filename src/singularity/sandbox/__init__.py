@@ -15,6 +15,7 @@ from singularity.sandbox.exceptions import (
     SandboxViolationError,
 )
 from singularity.sandbox.filesystem import SandboxFilesystemManager
+from singularity.sandbox.manager import SandboxManager
 from singularity.sandbox.models import (
     PreparedSandbox,
     SandboxArtifact,
@@ -34,7 +35,6 @@ from singularity.sandbox.models import (
     SandboxViolation,
     default_sandbox_profile,
 )
-from singularity.sandbox.manager import SandboxManager
 from singularity.sandbox.trace_recorder import SandboxJsonlTraceRecorder
 from singularity.sandbox.windows import (
     WindowsCapabilityState,
@@ -84,16 +84,16 @@ __all__ = [
     "SandboxUnavailable",
     "SandboxViolation",
     "SandboxViolationError",
-    "WindowsSandboxBackend",
     "WindowsCapabilityState",
+    "WindowsRunnerResult",
+    "WindowsRunnerSpec",
+    "WindowsSandboxBackend",
     "WindowsSandboxDoctorReport",
     "WindowsSandboxExecution",
     "WindowsSandboxPrimitives",
+    "WindowsSandboxRunner",
     "WindowsSandboxSetup",
     "WindowsSandboxSetupReport",
-    "WindowsRunnerResult",
-    "WindowsRunnerSpec",
-    "WindowsSandboxRunner",
     "default_sandbox_backends",
     "default_sandbox_profile",
     "probe_windows_sandbox",

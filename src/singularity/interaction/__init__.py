@@ -1,20 +1,20 @@
 from singularity.interaction.cli_renderer import RichCliRenderer, RichInteractionProvider
+from singularity.interaction.controller import (
+    InteractionController,
+    InteractionProvider,
+    interaction_event_from_trace_event,
+)
 from singularity.interaction.models import (
     ClarificationAnswer,
     ClarificationRequest,
     ControlCommand,
     DecisionPrompt,
     FinalReport,
+    InteractionEvent,
     InteractionMode,
     OutcomeStatus,
     ProgressEvent,
-    InteractionEvent,
     UserDecision,
-)
-from singularity.interaction.controller import (
-    InteractionProvider,
-    InteractionController,
-    interaction_event_from_trace_event,
 )
 
 __all__ = [
@@ -23,14 +23,14 @@ __all__ = [
     "ControlCommand",
     "DecisionPrompt",
     "FinalReport",
+    "InteractionController",
+    "InteractionEvent",
     "InteractionMode",
     "InteractionProvider",
-    "InteractionController",
     "OutcomeStatus",
     "ProgressEvent",
     "RichCliRenderer",
     "RichInteractionProvider",
-    "InteractionEvent",
     "UserDecision",
     "interaction_event_from_trace_event",
 ]

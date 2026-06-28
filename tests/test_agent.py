@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from singularity.agent_loop import AgentLoopStatus
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import ModelError, ModelErrorKind
 from singularity.planner import Planner
 from singularity.review import (
@@ -14,7 +15,6 @@ from singularity.review import (
 )
 from singularity.tools import ToolRegistry
 from singularity.tools.mutation import register_mutation_tools
-from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.workspace import WorkspaceMutationManager
 from singularity.workspace_state import WorkspaceStateManager
 from tests.agent_loop_helpers import make_agent_session

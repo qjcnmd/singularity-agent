@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -10,7 +10,7 @@ from uuid import uuid4
 from singularity.policy.models import PolicyConstraints
 
 
-class SandboxStatus(str, Enum):
+class SandboxStatus(StrEnum):
     SUCCESS = "success"
     FAILED = "failed"
     TIMEOUT = "timeout"
@@ -21,7 +21,7 @@ class SandboxStatus(str, Enum):
     CLEANUP_FAILED = "cleanup_failed"
 
 
-class SandboxFilesystemMode(str, Enum):
+class SandboxFilesystemMode(StrEnum):
     NONE = "none"
     READ_ONLY_WORKSPACE = "read_only_workspace"
     COPY_ON_WRITE_WORKSPACE = "copy_on_write_workspace"
@@ -29,14 +29,14 @@ class SandboxFilesystemMode(str, Enum):
     ARTIFACT_OUTPUT_ONLY = "artifact_output_only"
 
 
-class SandboxNetworkMode(str, Enum):
+class SandboxNetworkMode(StrEnum):
     DENIED = "denied"
     ALLOWED = "allowed"
     ALLOWLIST = "allowlist"
     UNSUPPORTED = "unsupported"
 
 
-class SandboxProfileName(str, Enum):
+class SandboxProfileName(StrEnum):
     READONLY_ANALYSIS = "readonly_analysis"
     ISOLATED_VERIFICATION = "isolated_verification"
     GENERATED_CODE = "generated_code"

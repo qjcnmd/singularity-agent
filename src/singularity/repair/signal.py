@@ -41,7 +41,7 @@ class RepairReplanSignal:
         analysis: FailureAnalysisResult,
         plan: RepairPlan,
         contract: RepairContract,
-    ) -> "RepairReplanSignal":
+    ) -> RepairReplanSignal:
         return cls(
             signal_id=f"repair_signal_{uuid4().hex[:12]}",
             repair_plan_id=plan.plan_id,

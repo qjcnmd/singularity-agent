@@ -12,7 +12,7 @@ from singularity.edit.models import (
     EditResult,
     PatchValidationResult,
 )
-from singularity.edit.patch import PatchBuildError, PatchBuilder
+from singularity.edit.patch import PatchBuilder, PatchBuildError
 from singularity.edit.planner import EditPlanBuilder
 from singularity.edit.repair import EditRepairController
 from singularity.edit.validation import PatchValidator

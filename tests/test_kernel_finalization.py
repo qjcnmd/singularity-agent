@@ -4,22 +4,22 @@ from pathlib import Path
 
 import pytest
 
-from singularity.config import ProductionConfig
 from singularity.agent_loop import AgentLoopResult, AgentLoopStatus
+from singularity.config import ProductionConfig
 from singularity.kernel import CancellationError
+from singularity.kernel.agent_kernel import AgentKernel
 from singularity.kernel.cancellation import CancellationManager
 from singularity.kernel.finalization import KernelFinalizer
 from singularity.kernel.lifecycle import RunLifecycleManager
 from singularity.kernel.models import (
     AgentRun,
+    CancellationReason,
     KernelContext,
     KernelStatus,
-    CancellationReason,
     RunIdentity,
     RunStatus,
     ShutdownReason,
 )
-from singularity.kernel.agent_kernel import AgentKernel
 from singularity.kernel.shutdown import ShutdownSummary
 from singularity.workspace_state import WorkspaceHealthReport, WorkspaceHealthStatus
 
@@ -262,7 +262,7 @@ class _Graph:
 
     def install_cancellation_tokens(self, token_factory) -> None:
         for _name, component in self.cancellation_targets():
-            setattr(component, "cancellation_token", token_factory())
+            component.cancellation_token = token_factory()
 
 
 class _Lock:

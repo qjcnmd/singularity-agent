@@ -22,7 +22,6 @@ from singularity.context.models import (
 )
 from singularity.provider import ToolChoiceMode
 
-
 COMPACTION_RECENT_TAIL_MESSAGES = 8
 COMPACTION_FRAGMENT_LIMIT = 8000
 
@@ -337,9 +336,7 @@ class ContextCompactionPlanner:
         if turn is not None:
             if compaction_range.start_turn is not None and turn < compaction_range.start_turn:
                 return False
-            if compaction_range.end_turn is not None and turn > compaction_range.end_turn:
-                return False
-            return True
+            return compaction_range.end_turn is None or turn <= compaction_range.end_turn
         checkpoint_id = str(item.metadata.get("checkpoint_id") or "")
         return bool(compaction_range.checkpoint_id and checkpoint_id == compaction_range.checkpoint_id)
 
@@ -523,8 +520,10 @@ class ContextCompactionExecutor:
                 ModelMessage,
                 ModelPurpose,
                 ModelTurnRequest,
-                ToolChoiceMode as ContextToolChoiceMode,
                 ToolChoicePolicy,
+            )
+            from singularity.model import (
+                ToolChoiceMode as ContextToolChoiceMode,
             )
 
             request_id = f"model_compact_{uuid4().hex[:12]}"
@@ -1089,9 +1088,7 @@ def message_in_partial_range(
     if turn is not None:
         if compaction_range.start_turn is not None and turn < compaction_range.start_turn:
             return False
-        if compaction_range.end_turn is not None and turn > compaction_range.end_turn:
-            return False
-        return True
+        return compaction_range.end_turn is None or turn <= compaction_range.end_turn
     checkpoint_id = str(metadata.get("checkpoint_id") or "")
     return bool(compaction_range.checkpoint_id and checkpoint_id == compaction_range.checkpoint_id)
 

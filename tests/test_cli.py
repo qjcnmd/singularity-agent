@@ -4,11 +4,10 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
 from typer.main import get_command
+from typer.testing import CliRunner
 
-from singularity.cli import app, _run_provider_smoke_benchmark
-from singularity.cli import create_or_resume_planner, workspace_health_summary
+from singularity.cli import _run_provider_smoke_benchmark, app, create_or_resume_planner, workspace_health_summary
 from singularity.evaluation import (
     BenchmarkTask,
     ExpectedOutcome,
@@ -17,13 +16,12 @@ from singularity.evaluation import (
     WorkspaceSnapshot,
     WorkspaceSnapshotKind,
 )
-from singularity.observability import TraceEventType, TraceRecorder
 from singularity.kernel import CancellationError
 from singularity.kernel.finalization import FinalReport
 from singularity.kernel.models import RunStatus
+from singularity.observability import TraceEventType, TraceRecorder
 from singularity.planner import Planner, TaskStatus
 from singularity.workspace_state import WorkspaceHealthReport, WorkspaceHealthStatus
-
 
 runner = CliRunner()
 

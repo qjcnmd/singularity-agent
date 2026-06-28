@@ -6,8 +6,8 @@ from singularity.context.models import (
     ContextItem,
     ContextItemType,
     ContextLayer,
-    ContextSource,
     ContextSensitivity,
+    ContextSource,
 )
 from singularity.context.tokens import TokenCounter
 

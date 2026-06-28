@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 import httpx
@@ -25,8 +26,7 @@ from singularity.model.models import (
     ToolChoiceMode,
     ToolChoicePolicy,
 )
-from singularity.model.streaming import ProviderStreamEvent
-from singularity.model.streaming import ProviderStreamEventType
+from singularity.model.streaming import ProviderStreamEvent, ProviderStreamEventType
 
 
 @dataclass
@@ -59,7 +59,7 @@ class ProviderResponse:
         *,
         provider_name: str,
         model_name: str | None,
-    ) -> "ProviderResponse":
+    ) -> ProviderResponse:
         choices = payload.get("choices") or []
         choice = choices[0] if choices else {}
         message_payload = choice.get("message") or {}
@@ -170,8 +170,7 @@ class MockModelProvider:
 
     def stream(self, request: ProviderRequest) -> Iterable[ProviderStreamEvent]:
         self.stream_calls += 1
-        for event in self.stream_events:
-            yield event
+        yield from self.stream_events
 
 
 class ChatProviderModelProvider:

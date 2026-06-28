@@ -11,14 +11,13 @@ from singularity.policy import (
     ApprovalScope,
     Capability,
     OperationKind,
+    PolicyComponent,
     PolicyConfig,
     PolicyDecision,
     PolicyRequest,
     PolicySubject,
     ResourceRef,
-    PolicyComponent,
 )
-from singularity.policy.models import stable_hash
 from singularity.policy.operator_key import (
     default_operator_key_path,
     generate_operator_key,
@@ -127,7 +126,7 @@ def test_remote_approval_rejects_tampered_request_digest(
         message="Approve test command?",
     )
     remote = RemoteApprovalExchange(tmp_path)
-    exported = remote.export_request(request, decision)
+    remote.export_request(request, decision)
 
     grant = ApprovalGrant(
         decision_id=decision.decision_id,

@@ -2,24 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from singularity.policy import Capability, OperationKind, ResourceRef
 
 
-class PermissionLevel(str, Enum):
+class PermissionLevel(StrEnum):
     READ_ONLY = "read_only"
     WRITE = "write"
     SHELL = "shell"
     GIT = "git"
 
 
-class ToolSideEffectKind(str, Enum):
+class ToolSideEffectKind(StrEnum):
     NONE = "none"
     READ_WORKSPACE = "read_workspace"
     MUTATE_WORKSPACE = "mutate_workspace"
@@ -27,14 +28,14 @@ class ToolSideEffectKind(str, Enum):
     NETWORK = "network"
 
 
-class ToolSensitivityLevel(str, Enum):
+class ToolSensitivityLevel(StrEnum):
     PUBLIC = "public"
     WORKSPACE = "workspace"
     SENSITIVE = "sensitive"
     SECRET = "secret"
 
 
-class ToolExecutionBackendKind(str, Enum):
+class ToolExecutionBackendKind(StrEnum):
     IN_PROCESS = "in_process"
     DELEGATED_MUTATION_MANAGER = "delegated_mutation_manager"
     DELEGATED_EDIT_EXECUTOR = "delegated_edit_executor"
@@ -43,7 +44,7 @@ class ToolExecutionBackendKind(str, Enum):
     EXTERNAL_PROCESS = "external_process"
 
 
-class ToolOriginKind(str, Enum):
+class ToolOriginKind(StrEnum):
     BUILTIN = "builtin"
     PLUGIN = "plugin"
     FUTURE_MCP = "future_mcp"
@@ -123,7 +124,7 @@ class ToolOrigin(BaseModel):
 
 @dataclass(frozen=True)
 class RegisteredToolRecord:
-    spec: "ToolSpec"
+    spec: ToolSpec
     origin: ToolOrigin = field(default_factory=ToolOrigin)
     admitted: bool = True
     admission_reason: str = "registered"
@@ -158,7 +159,7 @@ class ToolExecutionRequest:
             )
 
     @classmethod
-    def from_provider_tool_call(cls, tool_call: dict[str, Any]) -> "ToolExecutionRequest":
+    def from_provider_tool_call(cls, tool_call: dict[str, Any]) -> ToolExecutionRequest:
         function = tool_call.get("function") if isinstance(tool_call, dict) else {}
         function = function if isinstance(function, dict) else {}
         return cls(
@@ -173,7 +174,7 @@ class ToolExecutionRequest:
         envelope: Any,
         *,
         batch: Any | None = None,
-    ) -> "ToolExecutionRequest":
+    ) -> ToolExecutionRequest:
         metadata = dict(getattr(envelope, "metadata", {}) or {})
         batch_id = getattr(batch, "batch_id", None) or metadata.get("batch_id")
         return cls(
@@ -224,7 +225,7 @@ class ToolResult(BaseModel):
         content: Any,
         truncated: bool = False,
         metadata: dict[str, Any] | None = None,
-    ) -> "ToolResult":
+    ) -> ToolResult:
         return cls(
             ok=True,
             content=content,
@@ -240,7 +241,7 @@ class ToolResult(BaseModel):
         message: str,
         details: Any | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> "ToolResult":
+    ) -> ToolResult:
         return cls(
             ok=False,
             error_code=code,
@@ -331,7 +332,7 @@ class ToolSpec(BaseModel):
         return value if isinstance(value, ToolExecutionBackendKind) else ToolExecutionBackendKind(value)
 
     @model_validator(mode="after")
-    def _apply_compatibility_defaults(self) -> "ToolSpec":
+    def _apply_compatibility_defaults(self) -> ToolSpec:
         if self.capabilities == ():
             self.capabilities = _default_capabilities(self.permission_level)
         if self.operation is None:

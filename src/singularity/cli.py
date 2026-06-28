@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import sys
 import subprocess
+import sys
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4
@@ -13,11 +13,14 @@ from rich.panel import Panel
 
 from singularity.cli_paths import resolve_project_root
 from singularity.code_index import ProjectIndex
+from singularity.command import CommandExecutor
 from singularity.config import ProductionConfig, adaptive_default_max_turns
+from singularity.diagnostics import DoctorEngine, RepairEngine
+from singularity.diagnostics.render import render_diagnostic_result, render_repair_plan
 from singularity.evaluation import (
-    EvaluationRunner,
-    EvaluationProfile,
     EvaluationHarness,
+    EvaluationProfile,
+    EvaluationRunner,
     GoldenTaskStore,
     RegressionDetector,
     SingularityPrivateBenchmarkAdapter,
@@ -30,20 +33,18 @@ from singularity.interaction import RichCliRenderer
 from singularity.kernel import CancellationError, KernelBootstrap
 from singularity.kernel.models import RunStatus
 from singularity.memory.cli import memory_app
-from singularity.observability import TraceRedactor, TraceRecorder, TraceStore
+from singularity.observability import TraceRecorder, TraceRedactor, TraceStore
+from singularity.planner import Planner
+from singularity.planner import create_or_resume_planner as _create_or_resume_planner
 from singularity.plugins.cli import plugin_app
-from singularity.command import CommandExecutor
 from singularity.policy import PolicyConfig, PolicyEngine
+from singularity.policy.cli import approval_app
 from singularity.policy.permissions import (
     ApprovalPolicy,
     NetworkAccess,
     PermissionProfile,
     PermissionProfileName,
 )
-from singularity.policy.cli import approval_app
-from singularity.planner import Planner, create_or_resume_planner as _create_or_resume_planner
-from singularity.diagnostics import DoctorEngine, RepairEngine
-from singularity.diagnostics.render import render_diagnostic_result, render_repair_plan
 from singularity.release.init import initialize_user_data
 from singularity.release.metadata import version_info
 from singularity.release.migrations import apply_migrations
@@ -1513,10 +1514,7 @@ def _print_report(report, *, json_output: bool) -> None:
 
 
 def _print_eval_payload(payload: object, *, json_output: bool, title: str) -> None:
-    if isinstance(payload, str):
-        text = payload
-    else:
-        text = json_dumps(payload)
+    text = payload if isinstance(payload, str) else json_dumps(payload)
     if json_output:
         _write_stdout(text)
         return

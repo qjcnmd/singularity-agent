@@ -9,7 +9,6 @@ from singularity.edit.models import (
     EditRepairAttempt,
 )
 
-
 RECOVERABLE_CATEGORIES = {
     EditFailureCategory.FRESHNESS,
     EditFailureCategory.CONTEXT_MISMATCH,

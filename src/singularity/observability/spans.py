@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Any, Iterator
+from typing import Any
 from uuid import uuid4
 
 from singularity.observability.models import TraceSpan, TraceStatus

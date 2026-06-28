@@ -10,8 +10,8 @@ from singularity.memory.models import (
     MemorySource,
     MemoryType,
     Provenance,
-    new_memory_id,
     _now,
+    new_memory_id,
 )
 
 

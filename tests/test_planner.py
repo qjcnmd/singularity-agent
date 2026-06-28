@@ -1,11 +1,14 @@
 import json
 from pathlib import Path
 
+from pydantic import BaseModel
+
+from singularity.command import CommandExecutor, CommandRequest
 from singularity.planner import (
     ActionKind,
-    Planner,
     FinalReport,
     FinalReportRenderer,
+    Planner,
     ReplanDecisionKind,
     RiskDecisionKind,
     TaskContract,
@@ -13,10 +16,6 @@ from singularity.planner import (
     TaskContractSchemaError,
     TaskStatus,
 )
-from singularity.tools.models import ToolExecutionBackendKind, ToolResult, ToolSpec, PermissionLevel
-from pydantic import BaseModel
-from singularity.workspace import CreateFile, WorkspaceMutationManager
-from singularity.command import CommandRequest, CommandExecutor
 from singularity.policy import PolicyConfig, PolicyEngine
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.review import (
@@ -26,7 +25,9 @@ from singularity.review import (
     ReviewStage,
     ReviewTarget,
 )
+from singularity.tools.models import PermissionLevel, ToolExecutionBackendKind, ToolResult, ToolSpec
 from singularity.verification import VerificationRunner
+from singularity.workspace import CreateFile, WorkspaceMutationManager
 
 
 class EmptyInput(BaseModel):
@@ -1004,9 +1005,6 @@ def test_planner_store_concurrent_append_events_do_not_interleave(tmp_path: Path
 
 
 def test_planner_store_save_is_atomic_across_files(tmp_path: Path) -> None:
-    from singularity.planner.store import PlannerStore
-
-    store = PlannerStore(tmp_path)
     planner = Planner(tmp_path, session_id="session_save_atomic", task_id="task_save")
     planner.start_task("Atomic save task")
 

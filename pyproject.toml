@@ -24,12 +24,14 @@ devtools = [
 
 [dependency-groups]
 dev = [
+    "PyYAML>=6",
     "mypy>=1.10",
     "pytest-cov>=5.0",
     "pytest>=8.0",
     "ruff>=0.6",
 ]
 test = [
+    "PyYAML>=6",
     "pytest-cov>=5.0",
     "pytest>=8.0",
 ]
@@ -87,14 +89,14 @@ exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E9", "F63", "F7", "F82"]
+select = ["E9", "F", "I", "B", "SIM", "UP", "RUF"]
+allowed-confusables = ["，", "：", "（", "）"]
 
 [tool.mypy]
 python_version = "3.11"
 warn_unused_configs = true
 ignore_missing_imports = true
-check_untyped_defs = false
-follow_imports = "skip"
+check_untyped_defs = true
 # Focused type gate over stable utilities plus the core agent harness path.
 # `python -m mypy src/singularity` is tracked as a separate full-source backlog
 # check until the package is type-clean.

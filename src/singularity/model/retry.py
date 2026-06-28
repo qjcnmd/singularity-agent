@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, ClassVar
 
 from singularity.model.errors import ModelRetryExhausted
 from singularity.model.models import ModelError, ModelErrorKind
@@ -16,7 +17,7 @@ class RetryPolicy:
 
 
 class ModelRetryController:
-    RETRYABLE = {
+    RETRYABLE: ClassVar[set[ModelErrorKind]] = {
         ModelErrorKind.NETWORK_ERROR,
         ModelErrorKind.TIMEOUT,
         ModelErrorKind.RATE_LIMITED,

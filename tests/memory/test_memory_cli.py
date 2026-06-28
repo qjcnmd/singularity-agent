@@ -17,7 +17,6 @@ from singularity.memory.models import (
 from singularity.memory.pipeline import MemoryLearningPipeline
 from singularity.memory.store import MemoryStore
 
-
 runner = CliRunner()
 
 

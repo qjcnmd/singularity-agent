@@ -7,15 +7,12 @@ from rich.console import Console
 
 from singularity.config import ProductionConfig
 from singularity.interaction import (
-    InteractionMode,
     InteractionController,
+    InteractionMode,
     RichCliRenderer,
     RichInteractionProvider,
 )
-from singularity.observability import TraceRecorder
-from singularity.policy import PermissionProfileName
-from singularity.workspace_state import WorkspaceStateManager
-
+from singularity.kernel.agent_kernel import AgentKernel
 from singularity.kernel.cancellation import CancellationManager
 from singularity.kernel.exceptions import KernelBootstrapError
 from singularity.kernel.finalization import KernelFinalizer
@@ -30,8 +27,10 @@ from singularity.kernel.models import (
     ShutdownReason,
 )
 from singularity.kernel.recovery import CrashRecoveryManager
-from singularity.kernel.agent_kernel import AgentKernel
 from singularity.kernel.shutdown import ShutdownSummary
+from singularity.observability import TraceRecorder
+from singularity.policy import PermissionProfileName
+from singularity.workspace_state import WorkspaceStateManager
 
 
 class KernelBootstrap:

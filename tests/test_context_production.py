@@ -1,8 +1,8 @@
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -393,8 +393,7 @@ def test_store_detects_version_conflicts_and_rolls_back_failed_transactions(
         store.bump_version(run_id, expected_version=first_version)
 
     before_count = store.observation_count(run_id)
-    with pytest.raises(RuntimeError):
-        with store.transaction(run_id, expected_version=store.current_version(run_id)):
-            store._connection.execute("insert into observations(id, run_id) values(?, ?)", ("bad", run_id))
-            raise RuntimeError("abort")
+    with pytest.raises(RuntimeError), store.transaction(run_id, expected_version=store.current_version(run_id)):
+        store._connection.execute("insert into observations(id, run_id) values(?, ?)", ("bad", run_id))
+        raise RuntimeError("abort")
     assert store.observation_count(run_id) == before_count

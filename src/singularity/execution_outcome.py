@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class ExecutionOutcomeStatus(str, Enum):
+class ExecutionOutcomeStatus(StrEnum):
     SUCCESS = "success"
     RETRYABLE = "retryable"
     REPLAN_REQUIRED = "replan_required"
@@ -46,7 +46,7 @@ class ExecutionOutcome:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ExecutionOutcome":
+    def from_dict(cls, payload: dict[str, Any]) -> ExecutionOutcome:
         return cls(
             status=ExecutionOutcomeStatus(payload["status"]),
             source=str(payload.get("source") or "unknown"),

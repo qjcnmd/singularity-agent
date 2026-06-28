@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
 
@@ -20,7 +20,7 @@ class SerializableDataclass:
         return _from_payload(cls, payload)
 
 
-class InstructionPriority(str, Enum):
+class InstructionPriority(StrEnum):
     SYSTEM_INVARIANT = "system_invariant"
     SINGULARITY_DEVELOPER = "singularity_developer"
     USER_SESSION = "user_session"
@@ -51,7 +51,7 @@ class InstructionPriority(str, Enum):
         return _priority_rank(self) >= _priority_rank(other)
 
 
-class TrustLevel(str, Enum):
+class TrustLevel(StrEnum):
     TRUSTED_SYSTEM = "trusted_system"
     TRUSTED_SINGULARITY = "trusted_singularity"
     TRUSTED_USER = "trusted_user"
@@ -61,7 +61,7 @@ class TrustLevel(str, Enum):
     MODEL_GENERATED = "model_generated"
 
 
-class InstructionSourceType(str, Enum):
+class InstructionSourceType(StrEnum):
     SYSTEM = "system"
     SINGULARITY = "singularity"
     USER_MESSAGE = "user_message"
@@ -91,9 +91,7 @@ class InstructionScope(SerializableDataclass):
     def matches(self, *, purpose: str | None = None, component: str | None = None) -> bool:
         if purpose and self.applies_to_purpose and purpose not in self.applies_to_purpose:
             return False
-        if component and self.applies_to_component and component not in self.applies_to_component:
-            return False
-        return True
+        return not (component and self.applies_to_component and component not in self.applies_to_component)
 
 
 @dataclass

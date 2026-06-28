@@ -6,23 +6,23 @@ from pathlib import Path
 import pytest
 
 from singularity.command import (
+    CommandExecutor,
     CommandPurpose,
     CommandRequest,
-    CommandExecutor,
     FilesystemMode,
 )
 from singularity.context import ContextManager
+from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import PolicyConfig, PolicyEngine
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.tools.models import ToolResult
 from singularity.tools.workspace_state import WorkspaceHealthInput, WorkspaceHealthToolHandlers
-from singularity.jsonl_trace import JsonlTraceRecorder
-from singularity.workspace import WorkspaceMutationManager, ReplaceText
+from singularity.workspace import ReplaceText, WorkspaceMutationManager
 from singularity.workspace_state import (
     ChangeOwnership,
-    WorkspaceStateManager,
     RecoveryStatus,
     WorkspaceHealthStatus,
+    WorkspaceStateManager,
 )
 
 

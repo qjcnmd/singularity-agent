@@ -13,16 +13,15 @@ from singularity.model.errors import (
     ModelCapabilityError,
     ModelContextTooLong,
 )
-from singularity.model.request_builder import ModelTurnRequestBuilder
 from singularity.model.messages import MessageConverter
 from singularity.model.models import (
     ContentBlock,
     ModelError,
     ModelErrorKind,
     ModelMessage,
-    ModelRole,
     ModelPreferences,
     ModelPurpose,
+    ModelRole,
     ModelToolCall,
     ModelTurnRequest,
     ModelTurnResult,
@@ -40,6 +39,7 @@ from singularity.model.providers import (
     ProviderResponse,
 )
 from singularity.model.registry import ModelProviderRegistry
+from singularity.model.request_builder import ModelTurnRequestBuilder
 from singularity.model.retry import ModelRetryController, RetryPolicy
 from singularity.model.streaming import ProviderStreamEventType, StreamingAccumulator
 from singularity.model.tools import ModelToolRenderer, ToolCallNormalizer
@@ -50,7 +50,6 @@ from singularity.observability.models import (
     TraceSeverity,
 )
 from singularity.tools.registry import ToolRegistry
-
 
 SECRET_PATTERNS = (
     re.compile(r"\b[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=", re.IGNORECASE),
@@ -92,7 +91,7 @@ class ModelRunner:
         tool_registry: ToolRegistry,
         config: ModelRunnerConfig | None = None,
         trace: Any | None = None,
-    ) -> "ModelRunner":
+    ) -> ModelRunner:
         registry = ModelProviderRegistry(default_provider_name=provider.name())
         registry.register(provider)
         return cls(
@@ -111,7 +110,7 @@ class ModelRunner:
         config: ModelRunnerConfig | None = None,
         trace: Any | None = None,
         provider_name: str = "legacy_chat",
-    ) -> "ModelRunner":
+    ) -> ModelRunner:
         adapter = ChatProviderModelProvider(provider, provider_name=provider_name)
         registry = ModelProviderRegistry(default_provider_name=adapter.name())
         registry.register(adapter)

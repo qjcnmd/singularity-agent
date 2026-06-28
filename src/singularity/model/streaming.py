@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from singularity.model.models import ModelToolCall, ModelToolParseStatus
 
 
-class ProviderStreamEventType(str, Enum):
+class ProviderStreamEventType(StrEnum):
     TEXT_DELTA = "text_delta"
     TOOL_CALL_DELTA = "tool_call_delta"
     TOOL_CALL_COMPLETED = "tool_call_completed"

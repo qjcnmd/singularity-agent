@@ -3,13 +3,24 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from singularity.evaluation.targeted_replay import TargetedFailureReplayRunner
+
+pytestmark = [pytest.mark.evaluation, pytest.mark.external]
+
+
+def _require_available_sandbox(result) -> None:
+    blocked_reason = str(result.repair_contract_summary.get("blocked_reason") or "")
+    if result.status == "blocked" and "sandbox backend unavailable" in blocked_reason:
+        pytest.skip(f"requires an available OS sandbox: {blocked_reason}")
 
 
 def test_targeted_failure_replay_runner_activates_repair_chain_and_completes(tmp_path):
     runner = TargetedFailureReplayRunner(workspace_root=tmp_path, max_turns=6)
 
     result = runner.run_smoke()
+    _require_available_sandbox(result)
     payload = result.to_dict()
 
     assert payload["entered_agent_loop"] is True
@@ -67,7 +78,9 @@ def test_targeted_failure_replay_runner_writes_bounded_json_and_markdown_reports
     output_dir = tmp_path / "reports"
 
     result = runner.run(output_dir=output_dir)
+    _require_available_sandbox(result)
     rerun = runner.run(output_dir=output_dir)
+    _require_available_sandbox(rerun)
 
     json_path = output_dir / "targeted_replay_result.json"
     markdown_path = output_dir / "targeted_replay_result.md"

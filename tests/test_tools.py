@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-from singularity.tools import ToolPolicy, ToolRegistry, ToolExecutor
 from singularity.jsonl_trace import JsonlTraceRecorder
+from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
 from tests.tool_executor_helpers import make_test_policy_engine
 
 

@@ -4,8 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from singularity.evaluation.models import BenchmarkTask, SCHEMA_VERSION
-
+from singularity.evaluation.models import SCHEMA_VERSION, BenchmarkTask
 
 TASK_SET_SCHEMA_VERSION = "evaluation.golden_task_set/v1"
 

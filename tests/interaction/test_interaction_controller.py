@@ -11,12 +11,12 @@ from singularity.interaction import (
     ControlCommand,
     DecisionPrompt,
     FinalReport,
-    InteractionMode,
     InteractionController,
+    InteractionEvent,
+    InteractionMode,
     OutcomeStatus,
     ProgressEvent,
     RichCliRenderer,
-    InteractionEvent,
     UserDecision,
 )
 from singularity.kernel.cancellation import CancellationManager

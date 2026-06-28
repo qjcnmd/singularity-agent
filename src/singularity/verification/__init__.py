@@ -42,6 +42,7 @@ from singularity.verification.repair import RepairHintGenerator, RepairLoopContr
 from singularity.verification.runner import VerificationRunner
 
 __all__ = [
+    "VERIFICATION_ERROR_CODES",
     "CheckKind",
     "CheckStatus",
     "CommandDiscovery",
@@ -49,10 +50,10 @@ __all__ = [
     "CompletionAssessor",
     "CompletionStatus",
     "DiscoveredCommand",
-    "FailureParser",
-    "FailureParserRegistry",
     "FailureAnalysis",
     "FailureAnalysisPipeline",
+    "FailureParser",
+    "FailureParserRegistry",
     "FailureType",
     "ImpactAnalysis",
     "ImpactAnalyzer",
@@ -70,7 +71,6 @@ __all__ = [
     "RepairPlanner",
     "RepairStep",
     "RootCauseHypothesis",
-    "VERIFICATION_ERROR_CODES",
     "VerificationCheck",
     "VerificationDecision",
     "VerificationEvidence",

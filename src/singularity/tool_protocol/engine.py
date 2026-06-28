@@ -29,7 +29,7 @@ from singularity.tool_protocol.scheduler import ToolProtocolScheduler
 from singularity.tool_protocol.state import ToolProtocolStateStore
 from singularity.tool_protocol.trace import ToolProtocolTrace
 from singularity.tool_protocol.validator import ToolProtocolValidator
-from singularity.tools import ToolExecutionRequest, ToolRegistry, ToolExecutor
+from singularity.tools import ToolExecutionRequest, ToolExecutor, ToolRegistry
 
 
 class ToolProtocolEngine:

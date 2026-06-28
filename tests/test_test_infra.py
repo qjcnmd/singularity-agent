@@ -14,6 +14,7 @@ for complete validation including slow/external lists.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -22,11 +23,10 @@ from tests.conftest import (
     _FLAKY_TEST_IDS,
     _INTEGRATION_FILE_STEMS,
     _KNOWN_MARKERS,
+    _SLOW_TEST_IDS,
     _SMOKE_FILE_STEMS,
     _SMOKE_TEST_IDS,
-    _SLOW_TEST_IDS,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,10 +62,7 @@ def _is_filter_active(pytestconfig: pytest.Config, *markers: str) -> bool:
     if override:
         sources.append(override)
     combined = " ".join(sources)
-    for marker in markers:
-        if f"not {marker}" in combined:
-            return True
-    return False
+    return any(f"not {marker}" in combined for marker in markers)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +221,7 @@ class TestFunctionalClassification:
                     f"{item.nodeid} has functional={sorted(functional) if functional else 'NONE'}"
                 )
         assert not violations, (
-            f"Slow tests with unit or no functional marker:\n  "
+            "Slow tests with unit or no functional marker:\n  "
             + "\n  ".join(sorted(violations))
         )
 
@@ -250,7 +247,7 @@ class TestFunctionalClassification:
                     f"{item.nodeid} has functional={sorted(functional) if functional else 'NONE'}"
                 )
         assert not violations, (
-            f"External tests with unit or no functional marker:\n  "
+            "External tests with unit or no functional marker:\n  "
             + "\n  ".join(sorted(violations))
         )
 
@@ -360,7 +357,7 @@ class TestMarkerCounts:
 
     # Expected counts (approximate, used for soft validation).
     # Lists filtered by default addopts have expected count 0.
-    _EXPECTED = {
+    _EXPECTED: ClassVar[dict[str, int]] = {
         "smoke": 26,
         "unit": 260,
         "integration": 589,
@@ -398,5 +395,6 @@ class TestMarkerCounts:
                 import warnings
                 warnings.warn(
                     f"Marker '{marker}' count {actual} outside expected "
-                    f"range [{low}, {high}] (expected ~{expected})"
+                    f"range [{low}, {high}] (expected ~{expected})",
+                    stacklevel=2,
                 )

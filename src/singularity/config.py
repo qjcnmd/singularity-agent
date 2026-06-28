@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -38,7 +39,7 @@ class Settings(BaseModel):
         *,
         base_url: str | None = None,
         model: str | None = None,
-    ) -> "Settings":
+    ) -> Settings:
         missing = [name for name in ("SINGULARITY_API_KEY",) if not os.getenv(name)]
         if base_url is None and not os.getenv("SINGULARITY_BASE_URL"):
             missing.append("SINGULARITY_BASE_URL")
@@ -195,7 +196,7 @@ class ProductionConfig:
         env_root: Path | str | None = None,
         cli_overrides: set[str] | None = None,
         default_max_turns: int | None = None,
-    ) -> "ProductionConfig":
+    ) -> ProductionConfig:
         root = Path(project_root).expanduser().resolve(strict=False)
         env_base = Path(env_root).expanduser().resolve(strict=False) if env_root is not None else root
         env_file = env_base / ".env"
@@ -353,7 +354,7 @@ class ProductionConfig:
             protected_paths=self.protected_paths,
         )
 
-    def to_model_runner_config(self) -> "ModelRunnerConfig":
+    def to_model_runner_config(self) -> ModelRunnerConfig:
         from singularity.model.config import ModelRunnerConfig
 
         config = ModelRunnerConfig.from_env(

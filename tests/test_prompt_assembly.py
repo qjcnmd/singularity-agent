@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 
 from singularity.instructions import (
-    PromptAssemblyPipeline,
     PromptAssemblyConfig,
+    PromptAssemblyPipeline,
     PromptBudgetExceeded,
 )
 from singularity.model import ModelPurpose, ModelRole

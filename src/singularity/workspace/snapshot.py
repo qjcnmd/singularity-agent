@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from singularity.workspace.errors import MutationError
 from singularity.policy import PermissionProfile
+from singularity.workspace.errors import MutationError
 from singularity.workspace.pathing import WorkspacePathResolver
 
 
@@ -21,7 +21,7 @@ class FileSnapshot:
     is_binary: bool
 
     @classmethod
-    def from_path(cls, path: Path, *, relative_path: str) -> "FileSnapshot":
+    def from_path(cls, path: Path, *, relative_path: str) -> FileSnapshot:
         try:
             raw = path.read_bytes()
             stat = path.stat()

@@ -9,14 +9,13 @@ from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.tools.models import (
     PermissionLevel,
     ToolCachePolicy,
+    ToolExecutionFailure,
     ToolIdempotencyPolicy,
     ToolSensitivityLevel,
     ToolSideEffectKind,
-    ToolExecutionFailure,
     ToolSpec,
 )
 from singularity.tools.safety import FileSensitivityClassifier, redact_secret_text
-
 
 SKIP_DIRS = {
     ".git",

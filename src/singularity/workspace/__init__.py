@@ -1,5 +1,11 @@
 from singularity.workspace.diff import DiffEngine, DiffHunk, FileDiff
 from singularity.workspace.errors import MUTATION_ERROR_CODES, MutationError
+from singularity.workspace.mutation_manager import (
+    ChangeSet,
+    MutationResult,
+    RollbackManager,
+    WorkspaceMutationManager,
+)
 from singularity.workspace.operations import (
     ApplyUnifiedDiff,
     CreateFile,
@@ -20,15 +26,10 @@ from singularity.workspace.pathing import (
     WorkspaceRoot,
 )
 from singularity.workspace.policy import FileClassifier, PolicyDecision, WorkspacePolicy
-from singularity.workspace.mutation_manager import (
-    ChangeSet,
-    MutationResult,
-    WorkspaceMutationManager,
-    RollbackManager,
-)
 from singularity.workspace.snapshot import FileSnapshot, WorkspaceIndex
 
 __all__ = [
+    "MUTATION_ERROR_CODES",
     "ApplyUnifiedDiff",
     "ChangeSet",
     "CreateFile",
@@ -42,10 +43,8 @@ __all__ = [
     "InsertAfter",
     "InsertBefore",
     "MoveFile",
-    "MUTATION_ERROR_CODES",
     "MutationError",
     "MutationResult",
-    "WorkspaceMutationManager",
     "PolicyDecision",
     "ReplaceRange",
     "ReplaceText",
@@ -55,6 +54,7 @@ __all__ = [
     "UpdateToml",
     "UpdateYaml",
     "WorkspaceIndex",
+    "WorkspaceMutationManager",
     "WorkspacePathResolver",
     "WorkspacePolicy",
     "WorkspaceRoot",

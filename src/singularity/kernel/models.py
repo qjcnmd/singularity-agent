@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 
-class KernelStatus(str, Enum):
+class KernelStatus(StrEnum):
     NEW = "new"
     BOOTING = "booting"
     READY = "ready"
@@ -19,7 +19,7 @@ class KernelStatus(str, Enum):
     FAILED = "failed"
 
 
-class RunStatus(str, Enum):
+class RunStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -28,7 +28,7 @@ class RunStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-class SessionStatus(str, Enum):
+class SessionStatus(StrEnum):
     CREATED = "created"
     ACTIVE = "active"
     CLOSING = "closing"
@@ -38,7 +38,7 @@ class SessionStatus(str, Enum):
     RECOVERED = "recovered"
 
 
-class ShutdownReason(str, Enum):
+class ShutdownReason(StrEnum):
     NORMAL = "normal"
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
@@ -47,7 +47,7 @@ class ShutdownReason(str, Enum):
     KEYBOARD_INTERRUPT = "keyboard_interrupt"
 
 
-class CancellationReason(str, Enum):
+class CancellationReason(StrEnum):
     USER_INTERRUPTED = "user_interrupted"
     SHUTDOWN_REQUESTED = "shutdown_requested"
     POLICY_ABORT = "policy_abort"
@@ -55,7 +55,7 @@ class CancellationReason(str, Enum):
     INTERNAL_ERROR = "internal_error"
 
 
-class ComponentName(str, Enum):
+class ComponentName(StrEnum):
     CONFIGURATION = "config"
     OBSERVABILITY = "trace"
     INTERACTION = "interaction"
@@ -80,7 +80,7 @@ class ComponentName(str, Enum):
     PLANNER = "planner"
 
 
-class ComponentState(str, Enum):
+class ComponentState(StrEnum):
     PENDING = "pending"
     INITIALIZED = "initialized"
     READY = "ready"
@@ -101,7 +101,7 @@ class RunIdentity:
         run_id: str | None = None,
         session_id: str | None = None,
         task_id: str | None = None,
-    ) -> "RunIdentity":
+    ) -> RunIdentity:
         base = uuid4().hex[:12]
         resolved_run_id = run_id or f"run_{base}"
         return cls(
@@ -202,7 +202,7 @@ class LifecycleEvent:
         identity: RunIdentity,
         *,
         payload: dict[str, Any] | None = None,
-    ) -> "LifecycleEvent":
+    ) -> LifecycleEvent:
         return cls(
             event_type=event_type,
             run_id=identity.run_id,

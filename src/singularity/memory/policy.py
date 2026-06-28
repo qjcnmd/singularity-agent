@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
+from typing import ClassVar
 
 from singularity.memory.models import (
     Confidence,
@@ -14,7 +15,7 @@ from singularity.memory.models import (
 )
 
 
-class AdmissionAction(str, Enum):
+class AdmissionAction(StrEnum):
     ACCEPT = "accept"
     QUARANTINE = "quarantine"
     REJECT = "reject"
@@ -28,7 +29,7 @@ class AdmissionDecision:
 
 
 class MemoryPolicy:
-    stable_sources = {
+    stable_sources: ClassVar[set[MemorySource]] = {
         MemorySource.TRACE,
         MemorySource.FINAL_REPORT,
         MemorySource.REVIEW,
@@ -38,7 +39,7 @@ class MemoryPolicy:
         MemorySource.MANUAL,
         MemorySource.HUMAN_FILE,
     }
-    long_term_scopes = {
+    long_term_scopes: ClassVar[set[MemoryScope]] = {
         MemoryScope.WORKSPACE,
         MemoryScope.PROJECT,
         MemoryScope.USER_PREFERENCE,
@@ -64,9 +65,10 @@ class MemoryPolicy:
             evidence_sources & {MemorySource.VERIFICATION, MemorySource.REVIEW, MemorySource.ROLLBACK}
         ):
             reasons.append("failure guess is quarantined until concrete evidence exists")
-        if sanitized.scope == MemoryScope.USER_PREFERENCE or sanitized.type == MemoryType.USER_PREFERENCE:
-            if sanitized.source not in {MemorySource.USER, MemorySource.MANUAL} and MemorySource.MANUAL not in evidence_sources:
-                reasons.append("user preference memory requires explicit user source or manual acceptance")
+        if (
+            sanitized.scope == MemoryScope.USER_PREFERENCE or sanitized.type == MemoryType.USER_PREFERENCE
+        ) and sanitized.source not in {MemorySource.USER, MemorySource.MANUAL} and MemorySource.MANUAL not in evidence_sources:
+            reasons.append("user preference memory requires explicit user source or manual acceptance")
         if reasons:
             return AdmissionDecision(
                 AdmissionAction.QUARANTINE,

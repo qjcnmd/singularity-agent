@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from singularity.policy.config import PolicyConfig
@@ -34,7 +34,7 @@ class RuleResult:
     outcome: DecisionOutcome
     reason: str
     rule_id: str
-    constraints: PolicyConstraints = PolicyConstraints()
+    constraints: PolicyConstraints = field(default_factory=PolicyConstraints)
     review_kind: str = "generic"
     user_message: str = ""
 

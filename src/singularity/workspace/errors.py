@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 MUTATION_ERROR_CODES = frozenset(
     {
         "path_outside_workspace",
