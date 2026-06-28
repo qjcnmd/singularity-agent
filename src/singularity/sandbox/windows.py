@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -738,7 +739,7 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
     if acl_state.ready:
         completed.append("acl_boundary")
     else:
-        failed.append({"step": "acl_boundary", "reason": acl_state.reason})
+        failed.append({"step": "acl_boundary", "reason": acl_state.reason, "details": acl_state.evidence})
     if _has_windows_symbols("user32", "CreateDesktopW", "CloseDesktop"):
         completed.append("private_desktop")
     else:
@@ -747,13 +748,25 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
     if execution_state.ready:
         completed.append("execution_backend")
     else:
-        failed.append({"step": "execution_backend", "reason": execution_state.reason})
+        failed.append(
+            {
+                "step": "execution_backend",
+                "reason": execution_state.reason,
+                "details": execution_state.evidence,
+            }
+        )
     probe_windows_sandbox.cache_clear()
     doctor = _probe_windows_sandbox_uncached()
     if doctor.execution.network_probe.ready:
         completed.append("network_probe")
     else:
-        failed.append({"step": "network_probe", "reason": doctor.execution.network_probe.reason})
+        failed.append(
+            {
+                "step": "network_probe",
+                "reason": doctor.execution.network_probe.reason,
+                "details": doctor.execution.network_probe.evidence,
+            }
+        )
     status = "ready" if doctor.available else "partial"
     if failed:
         status = "failed" if not completed else "partial"
@@ -840,6 +853,9 @@ def _probe_windows_sandbox_uncached() -> WindowsSandboxDoctorReport:
     )
     sid = _account_sid(SANDBOX_ACCOUNT) if platform_supported else ""
     diagnostics = _legacy_artifact_diagnostics() if platform_supported else ()
+    state_dir = _state_dir_state() if platform_supported else None
+    if state_dir is not None and not state_dir.ready:
+        diagnostics = (*diagnostics, {"kind": "windows_sandbox_state_dir", **state_dir.to_dict()})
     setup = WindowsSandboxSetup(
         sandbox_account=_state_from_bool(
             bool(sid),
@@ -966,66 +982,129 @@ def _powershell_state(command: str) -> WindowsCapabilityState:
 def _acl_state(platform_supported: bool) -> WindowsCapabilityState:
     if not platform_supported:
         return _missing("Windows ACL boundary requires Windows.", {"tool": "icacls"})
-    root = _windows_state_dir() / "acl-probe"
+    state_dir = _windows_state_dir_path()
+    root = state_dir / "acl-probe"
     sid = _account_sid(SANDBOX_ACCOUNT)
     if not sid or not _credential_state().ready:
         return _missing(
             "ACL boundary probe requires sandbox account and credential.",
-            {"probe": "acl_boundary"},
+            {
+                "probe": "acl_boundary",
+                "state_dir_hash": _hash_path(state_dir),
+                "probe_root_hash": _hash_path(root),
+            },
         )
     try:
+        state_dir = _windows_state_dir()
+        root = state_dir / "acl-probe"
         root.mkdir(parents=True, exist_ok=True)
         allowed = root / "allowed"
         denied = root / "denied"
         allowed.mkdir(parents=True, exist_ok=True)
         denied.mkdir(parents=True, exist_ok=True)
+        control = _apply_account_acl(root, low_integrity_root=allowed)
+        if not control.ok:
+            return _missing(
+                "ACL probe control directory setup failed.",
+                {
+                    **_probe_evidence("acl_probe_control_acl", state_dir=state_dir, probe_root=root, path=root),
+                    "reason": control.reason,
+                    "details": control.details,
+                },
+            )
         grant = _apply_account_acl(allowed)
         icacls = shutil.which("icacls")
         if icacls is None:
-            return _missing("icacls is required for ACL probe.", {"tool": "icacls"})
-        deny = subprocess.run(
+            return _missing(
+                "icacls is required for ACL probe.",
+                _probe_evidence(
+                    "acl_probe_icacls_missing",
+                    state_dir=state_dir,
+                    probe_root=root,
+                    path=denied,
+                    extra={"tool": "icacls"},
+                ),
+            )
+        deny = _run_command(
             [icacls, str(denied), "/inheritance:r", "/remove:g", SANDBOX_ACCOUNT, "/T", "/C"],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=20,
         )
         if not grant.ok or deny.returncode != 0:
+            details = grant.details if not grant.ok else _completed_process_diagnostics(
+                "acl_probe_deny_icacls",
+                deny,
+                state_dir=state_dir,
+                probe_root=root,
+                path=denied,
+            )
             return _missing(
                 "ACL probe setup failed.",
-                {"grant_ok": grant.ok, "deny_exit": deny.returncode},
+                {
+                    **_probe_evidence("acl_probe_setup", state_dir=state_dir, probe_root=root),
+                    "grant_ok": grant.ok,
+                    "deny_exit": deny.returncode,
+                    "details": details,
+                },
             )
         allowed_result = _account_python_smoke(
             cwd=allowed,
             code="from pathlib import Path; Path('ok.txt').write_text('ok', encoding='utf-8')",
             timeout_seconds=5,
+            operation_prefix="acl_allowed",
         )
         denied_result = _account_python_smoke(
-            cwd=denied,
+            cwd=root,
             code=(
                 "from pathlib import Path\n"
+                f"target = Path({str(denied / 'blocked.txt')!r})\n"
                 "try:\n"
-                "    Path('blocked.txt').write_text('bad', encoding='utf-8')\n"
+                "    target.write_text('bad', encoding='utf-8')\n"
                 "except OSError:\n"
                 "    raise SystemExit(0)\n"
                 "raise SystemExit(7)\n"
             ),
             timeout_seconds=5,
+            operation_prefix="acl_denied",
         )
         ready = allowed_result.exit_code == 0 and denied_result.exit_code == 0
+        evidence = _probe_evidence(
+            "acl_boundary",
+            state_dir=state_dir,
+            probe_root=root,
+            extra={
+                "account_sid_hash": _hash_sid(sid),
+                "allowed": _runner_result_summary(
+                    "acl_allowed_write",
+                    allowed_result,
+                    state_dir=state_dir,
+                    probe_root=root,
+                    path=allowed,
+                ),
+                "denied": _runner_result_summary(
+                    "acl_denied_write",
+                    denied_result,
+                    state_dir=state_dir,
+                    probe_root=root,
+                    path=denied,
+                ),
+            },
+        )
         return _state_from_bool(
             ready,
             "ACL boundary self-test passed for sandbox account.",
             "ACL boundary self-test failed for sandbox account.",
-            {
-                "probe": "acl_boundary",
-                "account_sid_hash": _hash_sid(sid),
-                "allowed_exit": allowed_result.exit_code,
-                "denied_exit": denied_result.exit_code,
-            },
+            evidence,
         )
     except OSError as exc:
-        return _missing("ACL probe directory could not be created.", {"error_type": type(exc).__name__})
+        return _missing(
+            "ACL probe directory could not be created.",
+            _exception_diagnostics(
+                "acl_probe_root_mkdir",
+                exc,
+                state_dir=state_dir,
+                probe_root=root,
+                path=root,
+            ),
+        )
 
 
 def _network_state(sid: str) -> WindowsCapabilityState:
@@ -1104,18 +1183,32 @@ def _runner_smoke_state() -> WindowsCapabilityState:
     if not runner.ready:
         return runner
     if not _credential_state().ready or not _account_sid(SANDBOX_ACCOUNT):
+        state_dir = _windows_state_dir_path()
         return _missing(
             "Windows runner smoke requires sandbox account and credential.",
-            {"runner": "windows_runner.py"},
+            _probe_evidence(
+                "runner_smoke_prerequisites",
+                state_dir=state_dir,
+                probe_root=state_dir / "runner-smoke",
+                extra={"runner": "windows_runner.py"},
+            ),
         )
-    root = _windows_state_dir() / "runner-smoke"
+    state_dir = _windows_state_dir_path()
+    root = state_dir / "runner-smoke"
     try:
+        state_dir = _windows_state_dir()
+        root = state_dir / "runner-smoke"
         root.mkdir(parents=True, exist_ok=True)
         acl = _apply_account_acl(root)
         if not acl.ok:
             return _missing(
                 "Windows runner smoke ACL setup failed.",
-                {"runner": "windows_runner.py", "reason": acl.reason},
+                {
+                    **_probe_evidence("runner_smoke_acl", state_dir=state_dir, probe_root=root),
+                    "runner": "windows_runner.py",
+                    "reason": acl.reason,
+                    "details": acl.details,
+                },
             )
         spec_path = root / "runner-spec.json"
         result_path = root / "runner-result.json"
@@ -1128,34 +1221,67 @@ def _runner_smoke_state() -> WindowsCapabilityState:
             network_mode="allowed",
             result_path=str(result_path),
         )
-        spec_path.write_text(json.dumps(spec.to_dict(), ensure_ascii=False), encoding="utf-8")
+        try:
+            spec_path.write_text(json.dumps(spec.to_dict(), ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            return _missing(
+                "Windows runner smoke spec could not be written.",
+                _exception_diagnostics(
+                    "runner_smoke_spec_write",
+                    exc,
+                    state_dir=state_dir,
+                    probe_root=root,
+                    path=spec_path,
+                ),
+            )
         prepared = SimpleNamespace(
             sandbox_root=root,
             baseline={"runner_spec": str(spec_path), "runner_result": str(result_path)},
             request=SimpleNamespace(profile=SimpleNamespace(resources=SandboxResourceLimits(timeout_seconds=5))),
         )
-        result = WindowsSandboxRunner().run(prepared)
-        return _state_from_bool(
+        try:
+            result = WindowsSandboxRunner().run(prepared)
+        except Exception as exc:
+            return _missing(
+                "Windows account-backed runner smoke failed.",
+                _exception_diagnostics(
+                    _runner_exception_operation("runner_smoke", exc),
+                    exc,
+                    state_dir=state_dir,
+                    probe_root=root,
+                    path=root,
+                ),
+            )
+        ready = (
             result.exit_code == 0
             and "sandbox-smoke" in result.stdout
             and bool(result.metadata.get("restricted_token"))
             and bool(result.metadata.get("low_integrity"))
             and bool(result.metadata.get("private_desktop"))
-            and bool(result.metadata.get("job_object")),
+            and bool(result.metadata.get("job_object"))
+        )
+        return _state_from_bool(
+            ready,
             "Windows account-backed runner smoke passed.",
             "Windows account-backed runner smoke failed.",
-            {
-                "exit_code": result.exit_code,
-                "restricted_token": result.metadata.get("restricted_token"),
-                "low_integrity": result.metadata.get("low_integrity"),
-                "private_desktop": result.metadata.get("private_desktop"),
-                "job_object": result.metadata.get("job_object"),
-            },
+            _runner_result_summary(
+                _runner_result_operation("runner_smoke", result),
+                result,
+                state_dir=state_dir,
+                probe_root=root,
+                path=root,
+            ),
         )
     except Exception as exc:
         return _missing(
             "Windows account-backed runner smoke failed.",
-            {"error_type": type(exc).__name__},
+            _exception_diagnostics(
+                _runner_exception_operation("runner_smoke", exc),
+                exc,
+                state_dir=state_dir,
+                probe_root=root,
+                path=root,
+            ),
         )
 
 
@@ -1164,6 +1290,7 @@ def _account_python_smoke(
     cwd: Path,
     code: str,
     timeout_seconds: int,
+    operation_prefix: str = "account_python_smoke",
 ) -> WindowsRunnerResult:
     spec_path = cwd / "runner-spec.json"
     result_path = cwd / "runner-result.json"
@@ -1181,7 +1308,19 @@ def _account_python_smoke(
         network_mode="allowed",
         result_path=str(result_path),
     )
-    spec_path.write_text(json.dumps(spec.to_dict(), ensure_ascii=False), encoding="utf-8")
+    state_dir = _windows_state_dir_path()
+    try:
+        spec_path.write_text(json.dumps(spec.to_dict(), ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        return _probe_failure_runner_result(
+            _exception_diagnostics(
+                f"{operation_prefix}_spec_write",
+                exc,
+                state_dir=state_dir,
+                probe_root=cwd,
+                path=spec_path,
+            )
+        )
     prepared = SimpleNamespace(
         sandbox_root=cwd,
         baseline={"runner_spec": str(spec_path), "runner_result": str(result_path)},
@@ -1189,25 +1328,53 @@ def _account_python_smoke(
             profile=SimpleNamespace(resources=SandboxResourceLimits(timeout_seconds=timeout_seconds))
         ),
     )
-    return WindowsSandboxRunner().run(prepared)
+    try:
+        return WindowsSandboxRunner().run(prepared)
+    except Exception as exc:
+        return _probe_failure_runner_result(
+            _exception_diagnostics(
+                _runner_exception_operation(operation_prefix, exc),
+                exc,
+                state_dir=state_dir,
+                probe_root=cwd,
+                path=cwd,
+            )
+        )
 
 
 def _network_probe_state(sid: str) -> WindowsCapabilityState:
     if os.name != "nt":
         return _missing("Network probe requires Windows.", {"probe": "socket connect"})
     if not sid or not _network_state(sid).ready:
-        return _missing("Network probe requires configured firewall rule.", {"probe": "socket connect"})
+        state_dir = _windows_state_dir_path()
+        return _missing(
+            "Network probe requires configured firewall rule.",
+            _probe_evidence(
+                "network_probe_firewall_rule_missing",
+                state_dir=state_dir,
+                probe_root=state_dir / "network-smoke",
+                extra={"probe": "socket connect", "local_user_sid_hash": _hash_sid(sid) if sid else None},
+            ),
+        )
     host_baseline = _host_network_baseline_state()
     if not host_baseline.ready:
         return host_baseline
+    state_dir = _windows_state_dir_path()
+    root = state_dir / "network-smoke"
     try:
-        root = _windows_state_dir() / "network-smoke"
+        state_dir = _windows_state_dir()
+        root = state_dir / "network-smoke"
         root.mkdir(parents=True, exist_ok=True)
         acl = _apply_account_acl(root)
         if not acl.ok:
             return _missing(
                 "Network denied smoke ACL setup failed for sandbox account.",
-                {"probe": "runtime", "reason": acl.reason},
+                {
+                    **_probe_evidence("network_probe_acl", state_dir=state_dir, probe_root=root),
+                    "probe": "runtime",
+                    "reason": acl.reason,
+                    "details": acl.details,
+                },
             )
         spec_path = root / "runner-spec.json"
         result_path = root / "runner-result.json"
@@ -1220,29 +1387,76 @@ def _network_probe_state(sid: str) -> WindowsCapabilityState:
             network_mode=SandboxNetworkMode.DENIED.value,
             result_path=str(result_path),
         )
-        spec_path.write_text(json.dumps(spec.to_dict(), ensure_ascii=False), encoding="utf-8")
+        try:
+            spec_path.write_text(json.dumps(spec.to_dict(), ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            return _missing(
+                "Network denied smoke spec could not be written.",
+                _exception_diagnostics(
+                    "network_probe_spec_write",
+                    exc,
+                    state_dir=state_dir,
+                    probe_root=root,
+                    path=spec_path,
+                ),
+            )
         prepared = SimpleNamespace(
             sandbox_root=root,
             baseline={"runner_spec": str(spec_path), "runner_result": str(result_path)},
             request=SimpleNamespace(profile=SimpleNamespace(resources=SandboxResourceLimits(timeout_seconds=5))),
         )
-        result = WindowsSandboxRunner().run(prepared)
+        try:
+            result = WindowsSandboxRunner().run(prepared)
+        except Exception as exc:
+            return _missing(
+                "Network denied smoke failed for sandbox account.",
+                _exception_diagnostics(
+                    "network_probe_runner_launch",
+                    exc,
+                    state_dir=state_dir,
+                    probe_root=root,
+                    path=root,
+                ),
+            )
+        operation = (
+            "network_probe"
+            if result.exit_code == 0 and result.network_denied_verified
+            else "network_probe_sandbox_network_not_blocked"
+            if result.exit_code == 0
+            else _runner_result_operation("network_probe", result)
+        )
         return _state_from_bool(
             result.exit_code == 0 and result.network_denied_verified,
             "Network denied smoke passed for sandbox account.",
             "Network denied smoke failed for sandbox account.",
-            {"probe": "runtime", "exit_code": result.exit_code},
+            _runner_result_summary(
+                operation,
+                result,
+                state_dir=state_dir,
+                probe_root=root,
+                path=root,
+                extra={"probe": "runtime", "local_user_sid_hash": _hash_sid(sid)},
+            ),
         )
     except Exception as exc:
         return _missing(
             "Network denied smoke failed for sandbox account.",
-            {"probe": "runtime", "error_type": type(exc).__name__},
+            _exception_diagnostics(
+                "network_probe_runner_launch",
+                exc,
+                state_dir=state_dir,
+                probe_root=root,
+                path=root,
+                extra={"probe": "runtime", "local_user_sid_hash": _hash_sid(sid)},
+            ),
         )
 
 
 def _host_network_baseline_state() -> WindowsCapabilityState:
     if os.name != "nt":
         return _missing("Host outbound connectivity baseline requires Windows.", {"probe": "host_network"})
+    state_dir = _windows_state_dir_path()
+    failures: list[dict[str, Any]] = []
     for host, port in NETWORK_PROBE_ENDPOINTS:
         try:
             with socket.create_connection((host, int(port)), timeout=2):
@@ -1250,13 +1464,32 @@ def _host_network_baseline_state() -> WindowsCapabilityState:
                     True,
                     "Host outbound connectivity baseline passed.",
                     "Host outbound connectivity baseline failed.",
-                    {"probe": "host_network", "endpoint_hash": _hash_text(f"{host}:{port}")},
+                    _probe_evidence(
+                        "network_probe_host_outbound_baseline",
+                        state_dir=state_dir,
+                        probe_root=state_dir / "network-smoke",
+                        extra={"probe": "host_network", "endpoint_hash": _hash_text(f"{host}:{port}")},
+                    ),
                 )
-        except OSError:
+        except OSError as exc:
+            failures.append(
+                _exception_diagnostics(
+                    "network_probe_host_outbound_baseline",
+                    exc,
+                    state_dir=state_dir,
+                    probe_root=state_dir / "network-smoke",
+                    extra={"probe": "host_network", "endpoint_hash": _hash_text(f"{host}:{port}")},
+                )
+            )
             continue
     return _missing(
         "Host outbound connectivity baseline failed; cannot prove sandbox firewall denial.",
-        {"probe": "host_network"},
+        _probe_evidence(
+            "network_probe_host_outbound_baseline_failed",
+            state_dir=state_dir,
+            probe_root=state_dir / "network-smoke",
+            extra={"probe": "host_network", "attempts": failures},
+        ),
     )
 
 
@@ -1656,7 +1889,12 @@ def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
             timeout=20,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return subprocess.CompletedProcess(command, 1, "", str(exc))
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            "",
+            json.dumps(sandbox_exception_diagnostics("subprocess", exc), ensure_ascii=False),
+        )
 
 
 def _apply_account_acl(path: Path, *, low_integrity_root: Path | None = None) -> _OperationResult:
@@ -1677,7 +1915,17 @@ def _apply_account_acl(path: Path, *, low_integrity_root: Path | None = None) ->
         ]
     )
     if grant.returncode != 0:
-        return _OperationResult(False, _safe_output(grant))
+        return _OperationResult(
+            False,
+            _safe_output(grant),
+            _completed_process_diagnostics(
+                "acl_grant",
+                grant,
+                state_dir=_windows_state_dir_path(),
+                probe_root=path,
+                path=path,
+            ),
+        )
     integrity = _run_command(
         [
             icacls,
@@ -1689,7 +1937,17 @@ def _apply_account_acl(path: Path, *, low_integrity_root: Path | None = None) ->
         ]
     )
     if integrity.returncode != 0:
-        return _OperationResult(False, _safe_output(integrity))
+        return _OperationResult(
+            False,
+            _safe_output(integrity),
+            _completed_process_diagnostics(
+                "acl_low_integrity",
+                integrity,
+                state_dir=_windows_state_dir_path(),
+                probe_root=path,
+                path=low_integrity_target,
+            ),
+        )
     return _OperationResult(True)
 
 
@@ -1698,16 +1956,288 @@ def _safe_output(result: subprocess.CompletedProcess[str]) -> str:
     return TraceRedactor().redact_text(text)[:500] or f"exit {result.returncode}"
 
 
+def sandbox_exception_diagnostics(operation: str, exc: BaseException) -> dict[str, Any]:
+    return _exception_diagnostics(operation, exc, state_dir=_windows_state_dir_path())
+
+
+def _state_dir_state() -> WindowsCapabilityState:
+    path = _windows_state_dir_path()
+    try:
+        _windows_state_dir()
+    except OSError as exc:
+        return _missing(
+            "Windows sandbox machine state directory is unavailable.",
+            _exception_diagnostics(
+                "windows_state_dir_mkdir",
+                exc,
+                state_dir=path,
+                path=path,
+            ),
+        )
+    return _available(
+        "Windows sandbox machine state directory is available.",
+        _probe_evidence("windows_state_dir", state_dir=path, path=path),
+    )
+
+
 def _windows_state_dir() -> Path:
-    path = resolve_user_data_paths().state_dir / "windows-sandbox"
+    path = _windows_state_dir_path()
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _windows_state_dir_path() -> Path:
+    if os.name == "nt":
+        program_data = os.environ.get("PROGRAMDATA")
+        if program_data:
+            return Path(program_data) / "Singularity" / "windows-sandbox"
+        system_drive = os.environ.get("SystemDrive") or "C:"
+        return Path(system_drive + "\\ProgramData") / "Singularity" / "windows-sandbox"
+    return resolve_user_data_paths().state_dir / "windows-sandbox"
+
+
+def _probe_evidence(
+    operation: str,
+    *,
+    state_dir: Path | None = None,
+    probe_root: Path | None = None,
+    path: Path | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "operation": operation,
+        "elevated": _safe_is_elevated(),
+    }
+    if path is not None:
+        evidence["path_hash"] = _hash_path(path)
+    if state_dir is not None:
+        evidence["state_dir_hash"] = _hash_path(state_dir)
+    if probe_root is not None:
+        evidence["probe_root_hash"] = _hash_path(probe_root)
+    if extra:
+        evidence.update(extra)
+    return evidence
+
+
+def _exception_diagnostics(
+    operation: str,
+    exc: BaseException,
+    *,
+    state_dir: Path | None = None,
+    probe_root: Path | None = None,
+    path: Path | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    diagnostics = _probe_evidence(
+        operation,
+        state_dir=state_dir,
+        probe_root=probe_root,
+        path=path,
+        extra=extra,
+    )
+    diagnostics["error_type"] = type(exc).__name__
+    diagnostics["errno"] = getattr(exc, "errno", None)
+    diagnostics["winerror"] = getattr(exc, "winerror", None)
+    diagnostics["strerror"] = _diagnostic_text(str(getattr(exc, "strerror", "") or str(exc)), state_dir, probe_root, path)
+    diagnostics["returncode"] = None
+    diagnostics["stdout_summary"] = ""
+    diagnostics["stderr_summary"] = diagnostics["strerror"]
+    return diagnostics
+
+
+def _completed_process_diagnostics(
+    operation: str,
+    result: subprocess.CompletedProcess[str],
+    *,
+    state_dir: Path | None = None,
+    probe_root: Path | None = None,
+    path: Path | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    embedded = _embedded_subprocess_diagnostics(result.stderr)
+    diagnostics = _probe_evidence(
+        operation,
+        state_dir=state_dir,
+        probe_root=probe_root,
+        path=path,
+        extra=extra,
+    )
+    diagnostics["returncode"] = result.returncode
+    diagnostics["stdout_summary"] = _diagnostic_text(
+        str(embedded.get("stdout_summary") or result.stdout or "") if embedded else (result.stdout or ""),
+        state_dir,
+        probe_root,
+        path,
+    )
+    diagnostics["stderr_summary"] = _diagnostic_text(
+        str(embedded.get("stderr_summary") or embedded.get("strerror") or result.stderr or "")
+        if embedded
+        else (result.stderr or ""),
+        state_dir,
+        probe_root,
+        path,
+    )
+    diagnostics["errno"] = embedded.get("errno") if embedded else None
+    diagnostics["winerror"] = embedded.get("winerror") if embedded else None
+    diagnostics["strerror"] = (
+        _diagnostic_text(str(embedded.get("strerror") or ""), state_dir, probe_root, path) if embedded else ""
+    )
+    if embedded and embedded.get("operation"):
+        diagnostics["subprocess_operation"] = embedded.get("operation")
+    if embedded and embedded.get("error_type"):
+        diagnostics["error_type"] = embedded.get("error_type")
+    return diagnostics
+
+
+def _runner_result_summary(
+    operation: str,
+    result: WindowsRunnerResult,
+    *,
+    state_dir: Path | None = None,
+    probe_root: Path | None = None,
+    path: Path | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    summary = _probe_evidence(
+        operation,
+        state_dir=state_dir,
+        probe_root=probe_root,
+        path=path,
+        extra=extra,
+    )
+    summary.update(
+        {
+            "returncode": result.exit_code,
+            "stdout_summary": _diagnostic_text(result.stdout, state_dir, probe_root, path),
+            "stderr_summary": _diagnostic_text(result.stderr, state_dir, probe_root, path),
+            "restricted_process": result.metadata.get("restricted_token"),
+            "low_integrity": result.metadata.get("low_integrity"),
+            "private_desktop": result.metadata.get("private_desktop"),
+            "job_object": result.metadata.get("job_object"),
+            "job_killed": result.job_killed,
+            "network_denied_verified": result.network_denied_verified,
+            "runner_error_code": result.metadata.get("error_code"),
+            "runner_error_type": result.metadata.get("error_type"),
+        }
+    )
+    return summary
+
+
+def _runner_result_operation(prefix: str, result: WindowsRunnerResult) -> str:
+    error_code = str(result.metadata.get("error_code") or "")
+    error_type = str(result.metadata.get("error_type") or "")
+    stderr = result.stderr.lower()
+    if error_code == "runner_result_missing":
+        return f"{prefix}_result_write_missing"
+    if "createprocesswithlogonw" in stderr:
+        return f"{prefix}_create_process_with_logon"
+    if "createprocessasuserw" in stderr:
+        return f"{prefix}_create_process_as_user"
+    if "createrestrictedtoken" in stderr:
+        return f"{prefix}_restricted_token"
+    if "settokeninformation" in stderr or "low integrity" in stderr:
+        return f"{prefix}_low_integrity"
+    if "createdesktopw" in stderr:
+        return f"{prefix}_private_desktop"
+    if "assignprocesstojobobject" in stderr:
+        return f"{prefix}_job_object"
+    if result.exit_code not in {0, None}:
+        return f"{prefix}_child_exit_nonzero"
+    if error_type:
+        return f"{prefix}_runner_error"
+    return prefix
+
+
+def _runner_exception_operation(prefix: str, exc: BaseException) -> str:
+    text = str(exc).lower()
+    if "createprocesswithlogonw" in text:
+        return f"{prefix}_create_process_with_logon"
+    if "createprocessasuserw" in text:
+        return f"{prefix}_create_process_as_user"
+    if "createrestrictedtoken" in text:
+        return f"{prefix}_restricted_token"
+    if "settokeninformation" in text or "low integrity" in text:
+        return f"{prefix}_low_integrity"
+    if "createdesktopw" in text:
+        return f"{prefix}_private_desktop"
+    if "assignprocesstojobobject" in text:
+        return f"{prefix}_job_object"
+    return f"{prefix}_launch"
+
+
+def _probe_failure_runner_result(diagnostics: dict[str, Any]) -> WindowsRunnerResult:
+    return WindowsRunnerResult(
+        exit_code=None,
+        stdout="",
+        stderr=str(diagnostics.get("strerror") or diagnostics.get("error_type") or "probe failed"),
+        timed_out=False,
+        started_at=_now(),
+        ended_at=_now(),
+        duration_ms=0,
+        output_truncated=False,
+        job_killed=False,
+        network_denied_verified=False,
+        metadata={
+            "error_code": diagnostics.get("operation"),
+            "error_type": diagnostics.get("error_type"),
+            "diagnostics": diagnostics,
+        },
+    )
+
+
+def _safe_is_elevated() -> bool:
+    try:
+        return bool(_is_elevated())
+    except Exception:
+        return False
+
+
+def _embedded_subprocess_diagnostics(text: str | None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or "operation" not in payload:
+        return None
+    return payload
+
+
+def _diagnostic_text(
+    text: str,
+    state_dir: Path | None = None,
+    probe_root: Path | None = None,
+    path: Path | None = None,
+) -> str:
+    sanitized = TraceRedactor().redact_text(str(text).strip())
+    for item in (state_dir, probe_root, path):
+        if item is None:
+            continue
+        path_text = str(item)
+        resolved_text = str(item.expanduser().resolve(strict=False))
+        replacement = f"<path:{_hash_path(item)}>"
+        candidates = {path_text, resolved_text, path_text.replace("\\", "/"), resolved_text.replace("\\", "/")}
+        candidates.update({candidate.replace("\\", "\\\\") for candidate in list(candidates)})
+        for candidate in candidates:
+            if candidate:
+                sanitized = sanitized.replace(candidate, replacement)
+    sanitized = re.sub(
+        r"(?i)\b[A-Z]:[\\/][^\s\"'<>|]+",
+        lambda match: f"<path:{_hash_text(match.group(0))}>",
+        sanitized,
+    )
+    return sanitized[:500]
 
 
 def _hash_text(value: str) -> str:
     import hashlib
 
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _hash_path(value: Path) -> str:
+    return _hash_text(str(value.expanduser().resolve(strict=False)))
 
 
 def _hash_sid(value: str) -> str:

@@ -75,6 +75,10 @@ Windows setup 的 sandbox account 存在性探测由 `_account_exists()` 调用 
 
 `WindowsSandboxBackend.prepare()` 先重新检查 doctor 可用性，再拒绝当前未实现的 workspace 外 `writable_paths` 和 path-specific `readonly_paths`，之后调用 `SandboxFilesystemManager.prepare_filesystem()` 创建 COW projection。protected paths 通过 `CommandExecutor` 合入 `exclude_globs`，所以 `.env`、`.git`、`.singularity` 等不会进入 projection；`SandboxManager._protected_path_violation()` 还会在命令参数、cwd 和显式 resource 上做前置 hard deny。`prepare()` 对 run root 授予 sandbox account 修改权限，但只对 `workspace/` projection 设置低完整性标签，避免低完整性命令子进程写入 `runner-spec.json`、`runner-result.json` 等控制面文件。
 
+Windows doctor/setup 的 probe state 不再使用当前登录用户的 user-data 目录，而是使用 machine-level state 目录 `%PROGRAMDATA%\Singularity\windows-sandbox`（非 Windows 测试路径仍使用 `resolve_user_data_paths().state_dir/windows-sandbox/`）。该目录用于管理员 setup shell 和 `SingularitySandbox` 本地账户之间共享 probe 控制面文件，diagnostics 只暴露 `state_dir_hash`、`probe_root_hash` 或 `path_hash`，不暴露完整路径。
+
+ACL boundary probe 分三层验证：probe root 作为 runner spec/result 控制面目录，`allowed/` 目录必须能由 sandbox account 写入，`denied/` 目录必须拒绝 sandbox account 写入。通过条件是 allowed 写入 smoke 退出 0，denied 写入 smoke 因 `OSError` 退出 0；只创建目录不算通过。
+
 `WindowsSandboxBackend.run()` 在启动 runner 前再做一次 uncached enforcement probe；如果防火墙、凭据、runner smoke 等状态已失效，返回 `BACKEND_UNAVAILABLE` 且不启动进程。执行成功与否以 `WindowsRunnerResult` 的真实元数据为准，不能硬编码 restricted token、low integrity、private desktop 或 Job Object evidence。`network_access=denied` 需要同时满足宿主机 outbound baseline 可连通、本次 runner socket probe 被拒绝、doctor 的 `setup.network_filter` 和 `execution.network_probe`，否则返回 `SandboxStatus.VIOLATION`。
 
 ## 真实运行时调用链
@@ -346,9 +350,9 @@ class SandboxNetworkMode(str, Enum):
 
 ## 是否落盘
 
-默认 `SandboxJsonlTraceRecorder` 写入 `<workspace>/.singularity/sandbox/trace.jsonl`。Windows 可用执行会在 workspace 下 `work/sandboxes/<sandbox_id>/` 创建 run root、workspace projection、`runner-spec.json`、`runner-result.json` 和 artifacts；cleanup 成功后删除 run root。doctor/setup 的 smoke 目录位于 `resolve_user_data_paths().state_dir/windows-sandbox/`。
+默认 `SandboxJsonlTraceRecorder` 写入 `<workspace>/.singularity/sandbox/trace.jsonl`。Windows 可用执行会在 workspace 下 `work/sandboxes/<sandbox_id>/` 创建 run root、workspace projection、`runner-spec.json`、`runner-result.json` 和 artifacts；cleanup 成功后删除 run root。doctor/setup 的 smoke 目录位于 `%PROGRAMDATA%\Singularity\windows-sandbox\acl-probe`、`runner-smoke` 和 `network-smoke`；该 machine-level state dir 是为了让 elevated setup、普通 doctor 和 sandbox account runner 共享可 ACL 管理的 probe 控制面。
 
-Windows 凭据只写入 Windows Credential Manager target `SingularitySandbox`，不写 plaintext 文件，不进入 trace/report。Firewall rule group 为 `Singularity Sandbox`，当前规则 display name 为 `Singularity Sandbox Outbound Block`，规则以 `LocalUser` 绑定 sandbox account SID。doctor evidence 只记录 SID/hash、rule 名称、probe exit 等脱敏信息。旧失败状态中的 `SingularitySandboxRunner` account、同名 credential target 或 `Singularity Sandbox Runner Outbound Block` firewall rule 不参与新执行路径；doctor/setup 只在 `diagnostics` 中以 hash/redacted 形式报告这些 legacy artifacts，便于人工清理。
+Windows 凭据只写入 Windows Credential Manager target `SingularitySandbox`，不写 plaintext 文件，不进入 trace/report。Firewall rule group 为 `Singularity Sandbox`，当前规则 display name 为 `Singularity Sandbox Outbound Block`，规则以 `LocalUser` 绑定 sandbox account SID。doctor/setup evidence 只记录 SID hash、state/probe/path hash、operation、errno、winerror、strerror、returncode、stdout/stderr 摘要和 elevated 状态等脱敏信息。旧失败状态中的 `SingularitySandboxRunner` account、同名 credential target 或 `Singularity Sandbox Runner Outbound Block` firewall rule 不参与新执行路径；doctor/setup 只在 `diagnostics` 中以 hash/redacted 形式报告这些 legacy artifacts，便于人工清理。
 
 ## 是否进入 trace / audit
 
@@ -361,7 +365,9 @@ Windows 凭据只写入 Windows Credential Manager target `SingularitySandbox`�
 - 平台不是 Windows：默认 backend 列表为空，返回 `backend_unavailable`。
 - Windows primitive、sandbox account、credential、ACL boundary、account-scoped firewall、private desktop、runner smoke 或 network probe 缺失：doctor `available=false`，manager 返回 `backend_unavailable`，不启动进程。
 - `sandbox setup --json` 非 elevated：返回 `requires_elevation` 和 exit code 1；不得执行 account、credential、firewall、ACL、runner smoke 或 network probe mutation，也不得把 partial/requires_elevation 改写为 ready。
+- Windows machine state dir 不可创建或不可写：doctor/setup 通过 `windows_sandbox_state_dir` diagnostic 或对应 probe failure details 返回 `operation=windows_state_dir_mkdir` / `acl_probe_root_mkdir` 等结构化信息，仍保持 `available=false`。
 - Windows account 探测 helper 缺失或 `net` 不可用：`_run_net()` 返回非零 `CompletedProcess`，setup 不因 `NameError` 崩溃，后续 report 仍通过 failed/partial 状态表达缺失能力。
+- ACL probe directory、runner smoke、network probe 的 `OSError`、subprocess 失败或 runner result 缺失都会写入结构化 details：`operation` 区分 spec 写入失败、result 写入缺失、`CreateProcessWithLogonW`、`CreateProcessAsUserW`、restricted token、low integrity、private desktop、Job Object、child exit 非 0、host outbound baseline、firewall rule missing、runner launch 和 sandbox network not blocked。
 - workspace 外 additional writable directories 或 path-specific `readonly_paths`：Windows backend 当前返回 `backend_unavailable`，直到实现独立 ACL lease/projection。
 - protected path 显式访问：manager preflight 返回 `POLICY_BLOCKED`；projection 也会通过 exclude globs 排除 protected paths。
 - denied network 下 host outbound baseline、runner socket probe、account-scoped firewall 或 doctor network probe 任一未验证：返回 `SandboxStatus.VIOLATION`。
@@ -376,6 +382,7 @@ Windows 凭据只写入 Windows Credential Manager target `SingularitySandbox`�
 - workspace 外 additional writable directories 还没有独立 projection/ACL lease；当前正确行为是 fail closed。
 - path-specific `readonly_paths` 还没有目录级 ACL lease；当前正确行为是 fail closed。
 - Windows doctor 会运行 account-backed runner/network smoke，可能在 state dir 下创建 probe 目录；这是为了避免把 API primitive 存在误判成可执行 backend。
+- Windows probe diagnostics 只允许使用 redaction/hash 后的路径、SID、account/rule 名称和输出摘要，不得输出完整 credential、token、SID 原文或完整敏感路径。
 - `SandboxFilesystemManager` 只负责 COW projection、exclude globs 和 change detection；不能单独作为隔离 backend。
 
 ## 维护规则

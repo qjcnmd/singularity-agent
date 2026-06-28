@@ -426,6 +426,47 @@ def test_windows_setup_elevated_runs_account_network_acl_and_execution_helpers(
     assert ("doctor", "uncached") in calls
 
 
+def test_windows_setup_failed_probe_steps_include_structured_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acl_evidence = {
+        "operation": "acl_probe_root_mkdir",
+        "state_dir_hash": "statehash",
+        "probe_root_hash": "roothash",
+        "errno": 13,
+        "winerror": 5,
+    }
+    missing_acl = sandbox.WindowsCapabilityState(
+        "missing",
+        True,
+        "ACL probe directory could not be created.",
+        acl_evidence,
+    )
+    ready = sandbox.WindowsCapabilityState("available", True, "ready", {})
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_elevated", lambda: True)
+    monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
+    monkeypatch.setattr(windows, "_account_exists", lambda _name: True)
+    monkeypatch.setattr(windows, "_credential_state", lambda: ready)
+    monkeypatch.setattr(windows, "_firewall_rule_ready", lambda: True)
+    monkeypatch.setattr(windows, "_acl_state", lambda _supported: missing_acl)
+    monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
+    monkeypatch.setattr(windows, "_runner_smoke_state", lambda: ready)
+    monkeypatch.setattr(
+        windows,
+        "_probe_windows_sandbox_uncached",
+        lambda: sandbox.WindowsSandboxDoctorReport.ready_for_tests(),
+    )
+
+    report = windows.setup_windows_sandbox()
+
+    failure = next(item for item in report.failed_steps if item["step"] == "acl_boundary")
+    assert failure["reason"] == "ACL probe directory could not be created."
+    assert failure["details"] == acl_evidence
+    assert report.to_dict()["failed_steps"][0]["details"]["operation"] == "acl_probe_root_mkdir"
+
+
 def test_windows_backend_never_prepares_without_completed_setup(tmp_path: Path) -> None:
     backend = sandbox.WindowsSandboxBackend()
 
@@ -740,6 +781,228 @@ def test_network_probe_requires_host_connectivity_baseline(
     assert state.status == "missing"
     assert "baseline" in state.reason.lower()
     assert launched is False
+
+
+def test_acl_probe_mkdir_oserror_reports_structured_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_root = Path("C:/Users/Lenovo/AppData/Local/Singularity/windows-sandbox/acl-probe")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(
+        windows,
+        "_credential_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "credential", {}),
+    )
+    monkeypatch.setattr(windows, "_windows_state_dir", lambda: probe_root.parent)
+
+    def fail_mkdir(self: Path, *args, **kwargs) -> None:
+        if self == probe_root:
+            exc = PermissionError(13, "Access is denied")
+            exc.winerror = 5
+            raise exc
+        return None
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+
+    state = windows._acl_state(True)
+
+    assert state.status == "missing"
+    assert "ACL probe directory could not be created" in state.reason
+    evidence = state.evidence
+    assert evidence["operation"] == "acl_probe_root_mkdir"
+    assert evidence["errno"] == 13
+    assert evidence["winerror"] == 5
+    assert evidence["strerror"] == "Access is denied"
+    assert evidence["elevated"] in {True, False}
+    assert evidence["state_dir_hash"]
+    assert evidence["probe_root_hash"]
+    assert "C:/Users" not in json.dumps(evidence)
+    assert "S-1-5-21" not in json.dumps(evidence)
+
+
+def test_runner_smoke_oserror_reports_structured_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_root = Path("C:/ProgramData/Singularity/windows-sandbox/runner-smoke")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        windows,
+        "_runner_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "runner", {}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_credential_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "credential", {}),
+    )
+    monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(windows, "_windows_state_dir", lambda: probe_root.parent)
+    monkeypatch.setattr(windows, "_apply_account_acl", lambda _path: windows._OperationResult(True))
+
+    class FailingRunner:
+        def run(self, _prepared):
+            exc = OSError(22, "Invalid argument")
+            exc.winerror = 87
+            raise exc
+
+    monkeypatch.setattr(windows, "WindowsSandboxRunner", lambda: FailingRunner())
+
+    state = windows._runner_smoke_state()
+
+    assert state.status == "missing"
+    evidence = state.evidence
+    assert evidence["operation"] == "runner_smoke_launch"
+    assert evidence["errno"] == 22
+    assert evidence["winerror"] == 87
+    assert evidence["state_dir_hash"]
+    assert evidence["probe_root_hash"]
+    assert "C:/ProgramData" not in json.dumps(evidence)
+
+
+def test_network_probe_oserror_reports_structured_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_root = Path("C:/ProgramData/Singularity/windows-sandbox/network-smoke")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        windows,
+        "_network_state",
+        lambda _sid: sandbox.WindowsCapabilityState("available", True, "firewall", {}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_host_network_baseline_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "host baseline", {}),
+    )
+    monkeypatch.setattr(windows, "_windows_state_dir", lambda: probe_root.parent)
+    monkeypatch.setattr(windows, "_apply_account_acl", lambda _path: windows._OperationResult(True))
+
+    class FailingRunner:
+        def run(self, _prepared):
+            exc = OSError(5, "Access is denied")
+            exc.winerror = 5
+            raise exc
+
+    monkeypatch.setattr(windows, "WindowsSandboxRunner", lambda: FailingRunner())
+
+    state = windows._network_probe_state("S-1-5-21-123")
+
+    assert state.status == "missing"
+    evidence = state.evidence
+    assert evidence["operation"] == "network_probe_runner_launch"
+    assert evidence["errno"] == 5
+    assert evidence["winerror"] == 5
+    assert evidence["probe_root_hash"]
+    assert "S-1-5-21" not in json.dumps(evidence)
+
+
+def test_windows_state_dir_unwritable_fails_closed_with_hash_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = Path("C:/ProgramData/Singularity/windows-sandbox")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows.os.environ, "get", lambda name, default=None: "C:\\ProgramData" if name == "PROGRAMDATA" else default)
+
+    def fail_mkdir(self: Path, *args, **kwargs) -> None:
+        if self == state_root:
+            exc = PermissionError(13, "Access is denied")
+            exc.winerror = 5
+            raise exc
+        return None
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+
+    state = windows._state_dir_state()
+
+    assert state.status == "missing"
+    assert "state directory is unavailable" in state.reason
+    assert state.evidence["operation"] == "windows_state_dir_mkdir"
+    assert state.evidence["state_dir_hash"]
+    assert state.evidence["winerror"] == 5
+    assert "C:/ProgramData" not in json.dumps(state.evidence)
+
+
+def test_probe_completed_process_diagnostics_sanitizes_paths() -> None:
+    probe_root = Path("C:/Users/Lenovo/AppData/Local/Singularity/windows-sandbox/acl-probe")
+    result = subprocess.CompletedProcess(
+        ["icacls", str(probe_root)],
+        5,
+        f"processed file: {probe_root}",
+        f"{probe_root}: Access is denied",
+    )
+
+    details = windows._completed_process_diagnostics(
+        "acl_probe_deny_icacls",
+        result,
+        state_dir=probe_root.parent,
+        probe_root=probe_root,
+        path=probe_root / "denied",
+    )
+
+    encoded = json.dumps(details)
+    assert "C:/Users" not in encoded
+    assert "AppData" not in encoded
+    assert "<path:" in details["stdout_summary"]
+    assert "<path:" in details["stderr_summary"]
+    assert details["path_hash"]
+
+
+def test_probe_completed_process_diagnostics_preserves_wrapped_subprocess_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_root = Path("C:/Users/Lenovo/AppData/Local/Singularity/windows-sandbox/acl-probe")
+
+    def fail_run(*args, **kwargs):
+        exc = PermissionError(13, f"Access denied: {probe_root}")
+        exc.winerror = 5
+        raise exc
+
+    monkeypatch.setattr(windows.subprocess, "run", fail_run)
+
+    completed = windows._run_command(["icacls", str(probe_root)])
+    details = windows._completed_process_diagnostics(
+        "acl_probe_deny_icacls",
+        completed,
+        state_dir=probe_root.parent,
+        probe_root=probe_root,
+        path=probe_root / "denied",
+    )
+
+    encoded = json.dumps(details)
+    assert details["returncode"] == 1
+    assert details["errno"] == 13
+    assert details["winerror"] == 5
+    assert details["error_type"] == "PermissionError"
+    assert details["subprocess_operation"] == "subprocess"
+    assert "C:/Users" not in encoded
+    assert "AppData" not in encoded
+
+
+def test_sandbox_setup_cli_reports_structured_exception_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_setup(self):
+        exc = OSError(22, "Invalid argument: C:/Users/Lenovo/AppData/Local/Singularity")
+        exc.winerror = 87
+        raise exc
+
+    monkeypatch.setattr(sandbox.WindowsSandboxBackend, "setup", fail_setup)
+
+    result = CliRunner().invoke(app, ["sandbox", "setup", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "backend_unavailable"
+    assert payload["message"] == "Windows sandbox setup failed; inspect diagnostics for operation details."
+    assert "C:/Users" not in payload["message"]
+    assert payload["diagnostics"][0]["operation"] == "sandbox_setup"
+    assert payload["diagnostics"][0]["errno"] == 22
+    assert payload["diagnostics"][0]["winerror"] == 87
 
 
 def test_windows_runner_result_serialization_redacts_output() -> None:

@@ -54,6 +54,7 @@ from singularity.release.repair import (
     uninstall_user_data,
 )
 from singularity.sandbox import SandboxManager, WindowsSandboxBackend
+from singularity.sandbox.windows import sandbox_exception_diagnostics
 from singularity.verification import VerificationRunner
 from singularity.workspace_state import (
     WorkspaceHealthReport,
@@ -169,7 +170,8 @@ def sandbox_setup(
         payload = {
             "status": "backend_unavailable",
             "error_type": type(exc).__name__,
-            "message": str(exc),
+            "message": "Windows sandbox setup failed; inspect diagnostics for operation details.",
+            "diagnostics": (sandbox_exception_diagnostics("sandbox_setup", exc),),
         }
         exit_code = 1
     if json_output:
