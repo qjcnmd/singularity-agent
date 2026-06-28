@@ -218,6 +218,22 @@ def test_active_verification_contract_getter_failure_fails_closed(tmp_path: Path
     )
 
 
+def test_active_verification_contract_does_not_call_private_planner_fallback(tmp_path: Path) -> None:
+    class PrivateOnlyPlanner:
+        def __init__(self) -> None:
+            self.called = False
+
+        def _active_repair_verification_contract(self):
+            self.called = True
+            raise AssertionError("private planner fallback should not be called")
+
+    planner = PrivateOnlyPlanner()
+    runner = VerificationRunner(tmp_path, planner=planner)
+
+    assert runner._active_verification_contract() is None
+    assert planner.called is False
+
+
 def test_impact_analysis_handles_docs_source_and_high_risk_files(tmp_path: Path) -> None:
     profile = ProjectDetector(tmp_path).detect()
     analyzer = ImpactAnalyzer()

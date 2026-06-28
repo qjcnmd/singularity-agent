@@ -155,13 +155,11 @@ class VerificationRunner:
     def _active_verification_contract(self) -> Any | None:
         """Retrieve the active VerificationContract from the planner, if any.
 
-        Prefers the public ``get_active_verification_contract()`` method;
-        falls back to ``_active_repair_verification_contract()`` for backward
-        compatibility with older Planner instances.
+        External planner integration uses the public
+        ``get_active_verification_contract()`` method only.
         """
         if self.planner is None:
             return None
-        # Prefer public API
         getter = getattr(self.planner, "get_active_verification_contract", None)
         if callable(getter):
             try:
@@ -172,20 +170,6 @@ class VerificationRunner:
                     "active_verification_contract_error",
                     {
                         "source": "get_active_verification_contract",
-                        "error_type": type(exc).__name__,
-                    },
-                )
-                raise RuntimeError("active verification contract unavailable") from exc
-        # Fallback to private method for backward compat
-        if hasattr(self.planner, "_active_repair_verification_contract"):
-            try:
-                contract = self.planner._active_repair_verification_contract()
-                return contract if contract is not None and getattr(contract, "steps", None) else None
-            except Exception as exc:
-                self._record_trace(
-                    "active_verification_contract_error",
-                    {
-                        "source": "_active_repair_verification_contract",
                         "error_type": type(exc).__name__,
                     },
                 )
