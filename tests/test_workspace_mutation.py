@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import singularity.workspace.mutation_manager as workspace_mutation_module
 from singularity.context import ContextManager
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import DecisionOutcome, OperationKind
@@ -18,6 +19,7 @@ from singularity.workspace import (
     WorkspacePathResolver,
     WorkspacePolicy,
 )
+from singularity.workspace.git import GitState
 from singularity.workspace_state import WorkspaceHealthStatus, WorkspaceStateManager
 from tests.test_tool_executor_policy_approval import SequencedPolicyEngine
 from tests.tool_executor_helpers import default_policy_engine
@@ -132,6 +134,34 @@ def test_replace_text_generates_changeset_diff_apply_and_trace(tmp_path: Path) -
     assert audit["after_sha256"]
     assert audit["diff_digest"]
     assert audit["applied"] is True
+
+
+def test_mutation_continues_when_git_state_collection_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Path] = []
+
+    def unavailable_git_state(root: Path) -> GitState:
+        calls.append(root)
+        return GitState(available=False, error="git probe unavailable")
+
+    monkeypatch.setattr(workspace_mutation_module, "collect_git_state", unavailable_git_state)
+    component = WorkspaceMutationManager(tmp_path)
+
+    result = component.apply_operations(
+        [CreateFile(path="src/app.py", content="print('ok')\n")],
+        intent="create source file",
+        created_by="test",
+    )
+
+    assert result.ok is True
+    assert (tmp_path / "src" / "app.py").read_text(encoding="utf-8") == "print('ok')\n"
+    assert result.git_before is not None
+    assert result.git_after is not None
+    assert result.git_before.available is False
+    assert result.git_after.available is False
+    assert calls == [tmp_path, tmp_path]
 
 
 def test_snapshot_hash_mismatch_rejects_write(tmp_path: Path) -> None:

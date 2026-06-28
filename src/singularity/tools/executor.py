@@ -4,15 +4,12 @@ import hashlib
 import json
 import multiprocessing
 import pickle
-import threading
 import time
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -41,6 +38,8 @@ from singularity.policy.exceptions import (
     PolicyEscalationRequired,
     SandboxRequired,
 )
+from singularity.tools.cache import ToolResultCache
+from singularity.tools.idempotency import IdempotencyLedger
 from singularity.tools.models import (
     PermissionLevel,
     ToolExecutionBackendKind,
@@ -53,20 +52,6 @@ from singularity.tools.models import (
 )
 from singularity.tools.policy import ToolPolicy
 from singularity.tools.registry import ToolRegistry
-
-
-@dataclass
-class _CacheEntry:
-    result: ToolResult
-    created_at: float
-    touched_paths: tuple[str, ...]
-
-
-@dataclass
-class _ReplayEntry:
-    args_fingerprint: str
-    result: ToolResult
-    replay_allowed: bool
 
 
 def _tool_process_entrypoint(handler: Any, validated_args: Any, conn: Any) -> None:
@@ -112,120 +97,6 @@ def _send_tool_process_payload(conn: Any, payload: dict[str, Any]) -> None:
 
 def _json_safe_process_value(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
-
-
-class ToolResultCache:
-    def __init__(self) -> None:
-        self._entries: OrderedDict[str, _CacheEntry] = OrderedDict()
-        # Re-entrant lock so nested calls within the same thread (and
-        # compound operations like get+move_to_end) stay safe under
-        # concurrent tool execution.
-        self._lock = threading.RLock()
-
-    def get(self, key: str, *, ttl_seconds: float | None) -> ToolResult | None:
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                return None
-            if ttl_seconds is not None and time.time() - entry.created_at > ttl_seconds:
-                self._entries.pop(key, None)
-                return None
-            self._entries.move_to_end(key)
-            return entry.result.model_copy(deep=True)
-
-    def set(
-        self,
-        key: str,
-        result: ToolResult,
-        *,
-        max_entries: int,
-        touched_paths: tuple[str, ...],
-    ) -> None:
-        with self._lock:
-            self._entries[key] = _CacheEntry(
-                result=result.model_copy(deep=True),
-                created_at=time.time(),
-                touched_paths=touched_paths,
-            )
-            self._entries.move_to_end(key)
-            while len(self._entries) > max_entries:
-                self._entries.popitem(last=False)
-
-    def invalidate_paths(self, paths: list[str]) -> None:
-        with self._lock:
-            normalized = {Path(path).as_posix() for path in paths}
-            for key, entry in list(self._entries.items()):
-                if any(
-                    _paths_overlap(changed, touched)
-                    for changed in normalized
-                    for touched in entry.touched_paths
-                ):
-                    self._entries.pop(key, None)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._entries.clear()
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._entries)
-
-
-class IdempotencyLedger:
-    def __init__(self, *, max_entries: int = 512) -> None:
-        if max_entries <= 0:
-            raise ValueError("max_entries must be greater than zero.")
-        self.max_entries = max_entries
-        self._entries: OrderedDict[str, _ReplayEntry] = OrderedDict()
-        self._lock = threading.RLock()
-
-    def check(
-        self,
-        tool_call_id: str | None,
-        args_fingerprint: str,
-        *,
-        replay_allowed: bool,
-    ) -> ToolResult | None:
-        if not tool_call_id:
-            return None
-        with self._lock:
-            existing = self._entries.get(tool_call_id)
-            if existing is None:
-                return None
-            self._entries.move_to_end(tool_call_id)
-            if existing.args_fingerprint != args_fingerprint:
-                return ToolResult.failure(
-                    code="conflicting_replay",
-                    message="Duplicate tool_call_id was reused with different arguments.",
-                )
-            if not existing.replay_allowed:
-                return ToolResult.failure(
-                    code="replay_not_allowed",
-                    message="Duplicate tool_call_id replay is not allowed for this tool.",
-                )
-            replay = existing.result.model_copy(deep=True)
-            replay.metadata["replay"] = True
-            return replay
-
-    def remember(
-        self,
-        tool_call_id: str | None,
-        args_fingerprint: str,
-        result: ToolResult,
-        *,
-        replay_allowed: bool,
-    ) -> None:
-        if not tool_call_id:
-            return
-        with self._lock:
-            self._entries[tool_call_id] = _ReplayEntry(
-                args_fingerprint=args_fingerprint,
-                result=result.model_copy(deep=True),
-                replay_allowed=replay_allowed,
-            )
-            self._entries.move_to_end(tool_call_id)
-            while len(self._entries) > self.max_entries:
-                self._entries.popitem(last=False)
 
 
 class ToolPolicyEngineProtocol(Protocol):
@@ -1547,16 +1418,6 @@ def _is_cancellation_error(exc: BaseException) -> bool:
     return (
         getattr(exc, "code", None) == "cancelled"
         or exc.__class__.__name__ == "CancellationError"
-    )
-
-
-def _paths_overlap(left: str, right: str) -> bool:
-    left_parts = PurePosixPath(Path(left).as_posix()).parts
-    right_parts = PurePosixPath(Path(right).as_posix()).parts
-    return (
-        left_parts == right_parts
-        or left_parts[: len(right_parts)] == right_parts
-        or right_parts[: len(left_parts)] == left_parts
     )
 
 

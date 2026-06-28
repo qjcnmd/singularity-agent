@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-
-from singularity.command import CommandExecutor, CommandPurpose, CommandRequest
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ def collect_git_state(workspace_root: Path) -> GitState:
         if not line:
             continue
         code = line[:2]
-        path = line[3:]
+        path = _status_path(code, line[3:])
         dirty.append(path)
         if code == "??":
             untracked.append(path)
@@ -52,15 +52,28 @@ def collect_git_state(workspace_root: Path) -> GitState:
 
 
 def _git(workspace_root: Path, *args: str) -> str:
-    result = CommandExecutor(workspace_root).run(
-        CommandRequest(
-            argv=["git", *args],
-            cwd=".",
-            purpose=CommandPurpose.VCS_READ,
-            timeout_seconds=5,
-        )
+    result = subprocess.run(
+        ["git", *args],
+        cwd=workspace_root,
+        env={
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
     )
-    if result.exit_code != 0:
-        message = result.stderr_preview or result.stdout_preview or result.error_code
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "git command failed").strip()
         raise RuntimeError(message or "git command failed")
-    return result.stdout_preview
+    return result.stdout
+
+
+def _status_path(code: str, raw_path: str) -> str:
+    if "R" in code or "C" in code:
+        _old, separator, new = raw_path.rpartition(" -> ")
+        if separator:
+            return new
+    return raw_path

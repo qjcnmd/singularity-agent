@@ -11,7 +11,9 @@
 - src/singularity/tool_protocol/result.py
 - src/singularity/tool_protocol/recovery.py
 - src/singularity/tool_protocol/trace.py
+- src/singularity/tools/cache.py
 - src/singularity/tools/executor.py
+- src/singularity/tools/idempotency.py
 
 关键符号:
 - ToolCallEnvelope
@@ -25,6 +27,8 @@
 - ToolProtocolScheduler
 - ToolProtocolResultBuilder
 - ToolProtocolRecoveryManager
+- ToolResultCache
+- IdempotencyLedger
 
 字段清单:
 - ToolCallEnvelope: protocol_version, run_id, session_id, task_id, phase_id, model_request_id, model_response_id, assistant_message_id, tool_call_id, tool_name, raw_arguments, parsed_arguments, normalized_arguments, argument_digest, tool_schema_hash, allowed_tool_names, proposed_at, proposed_by_model, parse_status, validation_errors, metadata, phase
@@ -52,7 +56,9 @@
 - src/singularity/tool_protocol/result.py
 - src/singularity/tool_protocol/recovery.py
 - src/singularity/tool_protocol/trace.py
+- src/singularity/tools/cache.py
 - src/singularity/tools/executor.py
+- src/singularity/tools/idempotency.py
 
 ## 关键类、函数、字段
 
@@ -64,7 +70,7 @@
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`ToolProtocolEngine.process_model_turn()` -> `ToolProtocolValidator.validate_assistant_message()` 先把 `ModelTurnResult.tool_calls` 生成对象 `ToolCallEnvelope` 和 `ToolCallBatch`，再由 `ToolProtocolScheduler.schedule()` 生成 `ToolExecutionPlan`。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 并返回 `ToolResult`，`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`；`ToolProtocolStateStore.upsert_record()`、`transition()`、`append_event()` 和 `bind_result()` 把 batch、record、event、binding 写入 `tool_protocol.sqlite3`。`ContextManager.add_tool_protocol_result()` 把安全 tool message 写入 `context.sqlite3`，raw result 只通过 artifact ref/digest 进入 trace。
+以用户要求修复 `quicksort.py` 为例：`ToolProtocolEngine.process_model_turn()` -> `ToolProtocolValidator.validate_assistant_message()` 先把 `ModelTurnResult.tool_calls` 生成对象 `ToolCallEnvelope` 和 `ToolCallBatch`，再由 `ToolProtocolScheduler.schedule()` 生成 `ToolExecutionPlan`。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 并返回 `ToolResult`；其中 read-only 且可缓存的结果由 `ToolResultCache` 按参数、schema、workspace 与 touched paths 指纹保存，重复 `tool_call_id` 由 `IdempotencyLedger` 做冲突检测或安全 replay。`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`；`ToolProtocolStateStore.upsert_record()`、`transition()`、`append_event()` 和 `bind_result()` 把 batch、record、event、binding 写入 `tool_protocol.sqlite3`。`ContextManager.add_tool_protocol_result()` 把安全 tool message 写入 `context.sqlite3`，raw result 只通过 artifact ref/digest 进入 trace。
 
 ## 真实对象完整结构
 

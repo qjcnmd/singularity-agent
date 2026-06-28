@@ -13,7 +13,7 @@ from singularity.tools import (
     ToolResult,
     ToolSpec,
 )
-from singularity.tools.executor import IdempotencyLedger
+from singularity.tools.idempotency import IdempotencyLedger
 from tests.tool_executor_helpers import make_test_policy_engine
 
 
