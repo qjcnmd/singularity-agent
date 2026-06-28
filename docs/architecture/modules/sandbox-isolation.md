@@ -69,9 +69,13 @@ Windows 当前实现是 account-backed OS sandbox：父进程准备 COW workspac
 
 ## 关键类、函数、字段
 
-`SandboxManager.run()` 只消费由 `CommandExecutor` 构造完成的请求，不重新解释 `PolicyDecision`。`ensure_capabilities()` 校验 denied network、read-only workspace、memory limit 和 process limit。`WindowsSandboxBackend.doctor()` 返回稳定 JSON schema 的真实探测报告，`setup()` 在 Windows elevated shell 下创建/验证本地账户、Credential Manager 凭据、account-scoped firewall、ACL boundary、runner smoke 和 network probe；`WindowsSandboxSetupReport.completed_steps` / `pending_steps` / `failed_steps` 显式包含 `network_probe`。非 elevated setup 在任何 system mutation 前返回 `requires_elevation`，不得假成功。
+`SandboxManager.run()` 只消费由 `CommandExecutor` 构造完成的请求，不重新解释 `PolicyDecision`。`ensure_capabilities()` 校验 denied network、read-only workspace、memory limit 和 process limit。`WindowsSandboxBackend.doctor()` 返回稳定 JSON schema 的真实探测报告，`setup()` 在 Windows elevated shell 下创建/验证本地账户、Credential Manager 凭据、`SeInteractiveLogonRight`（经 LSA `LsaAddAccountRights` 授予，并移除 `SeDenyInteractive/Batch/ServiceLogonRight` 等 deny right，因 SE_DENY 覆盖同名 allow right）、`Users` 本地组成员（为 `python.exe` 与系统目录提供 RX 和 traverse）、account-scoped firewall、ACL boundary、runner smoke 和 network probe；`WindowsSandboxSetupReport.completed_steps` / `pending_steps` / `failed_steps` 显式包含 `logon_right`、`account_group` 与 `network_probe`。非 elevated setup 在任何 system mutation 前返回 `requires_elevation`，不得假成功。
 
 Windows setup 的 sandbox account 存在性探测由 `_account_exists()` 调用 `_run_net(["user", SANDBOX_ACCOUNT])`，`_run_net()` 只通过 `shutil.which("net")` 定位 Windows `net` 命令并复用 `_run_command()` 返回 `CompletedProcess`。账户创建和密码更新仍由 `_create_sandbox_account()` / `_set_account_password()` 的 `netapi32` helper 执行；firewall 仍由 `_run_powershell()` 执行 `Remove-NetFirewallRule` / `New-NetFirewallRule`，Credential Manager、ACL、runner smoke、network probe 由各自 helper 真实验证。
+
+`execution.launcher` 不再只检查 `CreateProcessWithLogonW` / `CreateProcessAsUserW` 符号是否存在，而是真实报告该 launcher 的文档化前置条件：`account_logon_rights`（经 LSA `LsaEnumerateAccountRights` 枚举账户**直接** right，区分 `SeInteractiveLogonRight`、`SeBatchLogonRight` 与三个 `SeDeny*LogonRight`；group 继承的 right 不枚举，empirical proof 由 runner_smoke 兜底）、`window_station` / `desktop`（`lpDesktop=NULL` 继承父进程，账户依赖继承的 winsta/desktop DACL，无 just-in-time ACE 授予）、`executable`（`sys.executable` 的 path hash 与 `icacls` 摘要）、`working_directory`（代表性 path hash 与 `account_has_access`）、`domain_username_form`（`.\\<redacted>`）和 `logon_flags`（`LOGON_WITH_PROFILE (0x1)`）。`launcher.status=available` 当且仅当符号存在、账户持 `SeInteractiveLogonRight`（或非提权枚举返回 `STATUS_ACCESS_DENIED 0xC0000022` 无法判定时，defer 到 runner_smoke）且无 `SeDenyInteractiveLogonRight`。
+
+`WindowsSandboxRunner.run` 把 `windows_runner.py`（自包含、仅 stdlib）物化到 ACL 授权的 `sandbox_root`（`windows_runner_<pid>_<ns>.py`），使 sandbox account 能读取 runner 脚本而不在宿主 repo 留持久 ACL；账户进程（Level-1）由 `CreateProcessWithLogonW` 以 `.\SingularitySandbox` + `LOGON_WITH_PROFILE` 启动。Level-1 账户进程在 `main()` 调用 `SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)`，使 Level-2 sandboxed child（restricted low-integrity token）启动失败时不弹 Windows hard-error 对话框；`run()` 还在 profile 未设 timeout 时强制有限默认 wait（40s），避免无法在 restricted token 下初始化的工具（如 `git.exe`）无限挂起。Level-1 账户进程在 `run_spec` 内通过 `OpenProcessToken` + `GetTokenInformation(TokenUser)` + `ConvertSidToStringSidW` 读取自身 token user SID，只把 `account_sid_hash`（`sha256[:16]`）与 `account_name` 写入 `WindowsRunnerResult.metadata`；doctor 的 `runner_smoke` 据此校验 `account_sid_hash == _hash_sid(sandbox_account_sid)`，不匹配即 `missing`（fail-closed，证明非 admin 当前用户回退）。
 
 `WindowsSandboxBackend.prepare()` 先重新检查 doctor 可用性，再拒绝当前未实现的 workspace 外 `writable_paths` 和 path-specific `readonly_paths`，之后调用 `SandboxFilesystemManager.prepare_filesystem()` 创建 COW projection。protected paths 通过 `CommandExecutor` 合入 `exclude_globs`，所以 `.env`、`.git`、`.singularity` 等不会进入 projection；`SandboxManager._protected_path_violation()` 还会在命令参数、cwd 和显式 resource 上做前置 hard deny。`prepare()` 对 run root 授予 sandbox account 修改权限，但只对 `workspace/` projection 设置低完整性标签，避免低完整性命令子进程写入 `runner-spec.json`、`runner-result.json` 等控制面文件。
 
@@ -98,16 +102,17 @@ PolicyEngine / ApprovalGate
 -> WindowsSandboxBackend.run()
    -> uncached doctor enforcement check
    -> WindowsSandboxRunner.run()
-   -> CreateProcessWithLogonW(account runner)
-   -> CreateRestrictedToken + low integrity + CreateDesktopW + Job Object + CreateProcessAsUserW(actual command)
-   -> WindowsRunnerResult
+   -> materialize windows_runner.py into ACL'd sandbox_root (account-readable copy)
+   -> CreateProcessWithLogonW(account runner)  # needs SeInteractiveLogonRight + executable RX
+   -> SetErrorMode (suppress child hard-error dialogs) + CreateRestrictedToken + low integrity + CreateDesktopW + Job Object + CreateProcessAsUserW(actual command)
+   -> WindowsRunnerResult(metadata.account_sid_hash = self-identity proof)
 -> WindowsSandboxBackend.cleanup()
 -> SandboxResult
 -> CommandExecutor._result_from_sandbox()
 -> CommandResult.isolation_report / trace / planner evidence / final report
 ```
 
-当前本机如果尚未从 elevated shell 运行 `sandbox setup --json`，真实路径仍会在 `backend.is_available()` 或 `run()` 前的 enforcement probe 处返回 `backend_unavailable`；这不是 fallback，也不会启动普通本地进程。
+`sandbox setup --json`（elevated）会预先授予 `SeInteractiveLogonRight`、移除 deny right、加入 `Users` 组；`run()` 时 runner 脚本物化到 sandbox_root，账户依赖继承的 winsta/desktop DACL（无 ACE 授予）。当前本机如果尚未从 elevated shell 运行 `sandbox setup --json`，真实路径仍会在 `backend.is_available()` 或 `run()` 前的 enforcement probe 处返回 `backend_unavailable`；这不是 fallback，也不会启动普通本地进程。
 
 ## 真实任务中的对象流
 
@@ -254,6 +259,8 @@ class WindowsRunnerResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 ```
 
+`WindowsRunnerResult.metadata` 在成功路径写入 `restricted_token`、`low_integrity`、`private_desktop`、`job_object`、`pid`、`account_name`、`account_sid_hash`（Level-1 账户进程自身 token user SID 的 `sha256[:16]`，供 doctor 校验非 admin 回退）；`run_spec` 异常路径写入 `error_type`，`WindowsSandboxRunner.run` 在 result 文件缺失时写入 `error_code="runner_result_missing"`。
+
 ### PreparedSandbox（已准备环境）
 
 ```python
@@ -364,6 +371,10 @@ Windows 凭据只写入 Windows Credential Manager target `SingularitySandbox`�
 
 - 平台不是 Windows：默认 backend 列表为空，返回 `backend_unavailable`。
 - Windows primitive、sandbox account、credential、ACL boundary、account-scoped firewall、private desktop、runner smoke 或 network probe 缺失：doctor `available=false`，manager 返回 `backend_unavailable`，不启动进程。
+- sandbox account 缺少 `SeInteractiveLogonRight` 或持 `SeDenyInteractiveLogonRight`（SE_DENY 覆盖同名 allow right）：`execution.launcher` 报告 `missing` 并带 `account_logon_rights` 证据，doctor `available=false`，返回 `backend_unavailable`；setup 的 `logon_right` step 负责授予并复查，doctor 据此证明非靠 admin 当前用户回退。
+- runner smoke 子进程退出 0、enforcement evidence 全部为真，但 `WindowsRunnerResult.metadata.account_sid_hash` 与 sandbox account SID hash 不匹配（疑似 admin 当前用户回退）：`runner_smoke` 报告 `missing`（`account_identity_verified=false`），fail-closed，不伪造 available。
+- `CreateProcessWithLogonW` 因 `SeInteractiveLogonRight` 缺失或 executable RX 缺失返回 `ERROR_ACCESS_DENIED (5)`：runner_smoke / network_probe / acl_boundary 捕获 `OSError`，写入 `operation=*_create_process_with_logon`、`winerror=5`、`errno=5` 结构化 details；setup 通过 `logon_right`（LSA `SeInteractiveLogonRight`）与 `account_group`（`Users` 成员，提供 `python.exe`/系统目录 RX）补齐；账户依赖继承的 winsta/desktop DACL（无 ACE 授予）。
+- sandboxed 命令无法在 restricted low-integrity token 下初始化（如 `git.exe` 的 DLL init 失败）：`SetErrorMode` 抑制 Windows hard-error 对话框，`run()` 有限默认 wait 防止无限挂起；命令以 exit non-zero 失败，调用方（如 `collect_git_state`）处理失败，不弹窗、不回退本地执行。
 - `sandbox setup --json` 非 elevated：返回 `requires_elevation` 和 exit code 1；不得执行 account、credential、firewall、ACL、runner smoke 或 network probe mutation，也不得把 partial/requires_elevation 改写为 ready。
 - Windows machine state dir 不可创建或不可写：doctor/setup 通过 `windows_sandbox_state_dir` diagnostic 或对应 probe failure details 返回 `operation=windows_state_dir_mkdir` / `acl_probe_root_mkdir` 等结构化信息，仍保持 `available=false`。
 - Windows account 探测 helper 缺失或 `net` 不可用：`_run_net()` 返回非零 `CompletedProcess`，setup 不因 `NameError` 崩溃，后续 report 仍通过 failed/partial 状态表达缺失能力。
@@ -383,11 +394,14 @@ Windows 凭据只写入 Windows Credential Manager target `SingularitySandbox`�
 - path-specific `readonly_paths` 还没有目录级 ACL lease；当前正确行为是 fail closed。
 - Windows doctor 会运行 account-backed runner/network smoke，可能在 state dir 下创建 probe 目录；这是为了避免把 API primitive 存在误判成可执行 backend。
 - Windows probe diagnostics 只允许使用 redaction/hash 后的路径、SID、account/rule 名称和输出摘要，不得输出完整 credential、token、SID 原文或完整敏感路径。
+- `execution.launcher` 的 `account_logon_rights` 只枚举账户在 LSA 中的**直接** right，不展开 group 继承的 right；group 级 deny-interactive（罕见）不会被该字段发现，empirical proof 仍由 runner_smoke 兜底。
+- 账户依赖继承的 winsta/desktop DACL 访问（不授予 ACE）；在 winsta/desktop ACL 严格的宿主上 `CreateProcessWithLogonW` 可能仍 error 5，届时 runner_smoke 会以 `winerror=5` 报告并 fail-closed。
+- 无法在 restricted low-integrity token 下初始化的工具（如 `git.exe`）在 sandbox 内以 exit non-zero 失败（约 40s 内）；`SetErrorMode` 抑制弹窗、有限默认 wait 防挂起，但此类命令的 sandbox 路由仍带来延迟，理想方案是 policy 把只读/VCS 命令路由到 local（属后续 policy 工作）。
 - `SandboxFilesystemManager` 只负责 COW projection、exclude globs 和 change detection；不能单独作为隔离 backend。
 
 ## 维护规则
 
 - 新 backend 必须以真实 OS enforcement 和 external smoke 证明 capability；workspace copy、chmod 或普通子进程不能注册为 sandbox backend。
 - capability 或 setup 缺失必须返回 `backend_unavailable`，不得静默本地执行。
-- Windows setup、doctor、account/ACL/firewall、restricted token、Job Object、private desktop、runner result metadata 或 network proof 变化时同步本文件。
+- Windows setup、doctor、account/ACL/firewall、restricted token、Job Object、private desktop、runner result metadata 或 network proof 变化时同步本文件；LSA logon right（`SeInteractiveLogonRight` 及 deny right）、`Users` 组成员、runner-script 物化、`SetErrorMode` 子进程弹窗抑制、有限默认 wait、`account_sid_hash` 身份证明同属本文件维护范围。
 - 修改本模块对象字段、调用链、CLI、trace 或 report schema 后运行 `python scripts/verify_runtime_docs.py`；展示对象时必须列完整字段。

@@ -46,6 +46,20 @@ DESKTOP_ACCESS = (
 )
 LOGON_WITH_PROFILE = 0x00000001
 CRED_TYPE_GENERIC = 1
+# Token / identity introspection (Level-1 account process proves its own identity
+# so doctor can verify the launch was not an admin-current-user fallback).
+TokenUser = 1
+# Error-mode flags inherited by the Level-2 sandboxed child: suppress Windows
+# hard-error / WER dialogs when a sandboxed executable fails to initialize
+# (e.g. a tool whose DLLs cannot init under a restricted low-integrity token).
+# The launch failure is still reported via the runner result; only the popup
+# is suppressed.
+SEM_FAILCRITICALERRORS = 0x0001
+SEM_NOGPFAULTERRORBOX = 0x0002
+SEM_NOOPENFILEERRORBOX = 0x8000
+CHILD_ERROR_MODE = (
+    SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+)
 
 DEFAULT_ACCOUNT_NAME = "SingularitySandbox"
 DEFAULT_CREDENTIAL_TARGET = "SingularitySandbox"
@@ -164,6 +178,24 @@ class WindowsSandboxRunner:
         self.credential_target = credential_target
         self.python_executable = python_executable or sys.executable
 
+    @staticmethod
+    def _materialize_runner_script(sandbox_root: Path) -> Path:
+        """Copy windows_runner.py into the ACL'd sandbox_root.
+
+        The sandbox account cannot read windows_runner.py from the host repo
+        (the repo lives under the user's private profile, which does not grant
+        the sandbox account read access). The runner module is self-contained
+        (stdlib only), so materializing a copy into the per-run sandbox_root --
+        which is ACL'd to the account -- lets the account process read it
+        without leaving a persistent ACL on the host repo. A unique filename is
+        used so a non-elevated doctor can create the file fresh instead of
+        overwriting a copy a prior elevated run left with a restrictive owner.
+        """
+        source = Path(__file__).resolve()
+        dest = sandbox_root / f"windows_runner_{os.getpid()}_{time.time_ns()}.py"
+        dest.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        return dest
+
     def run(self, prepared: Any) -> WindowsRunnerResult:
         if os.name != "nt":
             return run_spec(_spec_from_prepared(prepared))
@@ -173,10 +205,11 @@ class WindowsSandboxRunner:
         account_stdout = ""
         account_stderr = ""
         try:
+            runner_script = self._materialize_runner_script(Path(prepared.sandbox_root))
             process = _start_account_process(
                 [
                     self.python_executable,
-                    str(Path(__file__).resolve()),
+                    str(runner_script),
                     "--spec",
                     str(spec_path),
                 ],
@@ -187,7 +220,12 @@ class WindowsSandboxRunner:
             )
             try:
                 timeout = prepared.request.profile.resources.timeout_seconds
-                process.wait(timeout=(float(timeout) + 10) if timeout is not None else None)
+                # Enforce a finite default wait so a sandboxed command that fails
+                # to initialize under the restricted low-integrity token (e.g. a
+                # tool whose DLLs cannot init) cannot hang the runner forever;
+                # the profile timeout is used when explicitly set.
+                wait_timeout = (float(timeout) + 10) if timeout is not None else 40.0
+                process.wait(timeout=wait_timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
                 try:
@@ -239,6 +277,7 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
             job_killed = _terminate_child(process) or job_killed
         stdout, stderr, output_truncated = _child_output(process, spec.max_output_chars)
         network_denied_verified = _verify_network_denied(spec)
+        account_name, account_sid = _current_process_identity()
         return WindowsRunnerResult(
             exit_code=None if timed_out else process.returncode,
             stdout=stdout,
@@ -257,6 +296,8 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
                 and bool(getattr(process, "private_desktop", False)),
                 "job_object": bool(getattr(process, "job_assigned", False)),
                 "pid": getattr(process, "pid", None),
+                "account_name": account_name,
+                "account_sid_hash": _hash_text(account_sid) if account_sid else "",
             },
         )
     except Exception as exc:
@@ -863,6 +904,59 @@ def _has_symbol(library: str, symbol: str) -> bool:
         return False
 
 
+def _hash_text(value: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _current_process_identity() -> tuple[str, str]:
+    """Return (account_name, sid_string) for the current process token.
+
+    The Level-1 account process runs as the sandbox account, so its token user
+    SID is the proof that CreateProcessWithLogonW did not silently fall back to
+    the admin current user. Called inside the account-launched runner so the raw
+    SID never crosses the process boundary; only its hash is written to disk.
+    """
+    if os.name != "nt":
+        return "", ""
+    advapi32 = _advapi32()
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        _kernel32().GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)
+    ):
+        return "", ""
+    try:
+        length = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, TokenUser, None, 0, ctypes.byref(length))
+        if not length.value:
+            return "", ""
+        buffer = (ctypes.c_byte * length.value)()
+        if not advapi32.GetTokenInformation(
+            token, TokenUser, buffer, length.value, ctypes.byref(length)
+        ):
+            return "", ""
+        user = ctypes.cast(buffer, ctypes.POINTER(TOKEN_USER)).contents
+        sid_ptr = ctypes.c_void_p()
+        if not advapi32.ConvertSidToStringSidW(user.User.Sid, ctypes.byref(sid_ptr)) or not sid_ptr.value:
+            return "", ""
+        try:
+            sid_string = ctypes.wstring_at(sid_ptr.value)
+        except Exception:
+            return "", ""
+        finally:
+            _kernel32().LocalFree(sid_ptr.value)
+        name_buffer = ctypes.create_unicode_buffer(256)
+        name_len = wintypes.DWORD(256)
+        if advapi32.GetUserNameW(name_buffer, ctypes.byref(name_len)):
+            name = name_buffer.value or ""
+        else:
+            name = ""
+        return name, sid_string
+    finally:
+        _close_handle(token.value)
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -971,6 +1065,10 @@ class CREDENTIALW(ctypes.Structure):
     ]
 
 
+class TOKEN_USER(ctypes.Structure):
+    _fields_ = [("User", SID_AND_ATTRIBUTES)]
+
+
 def _kernel32():
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.GetCurrentProcess.argtypes = []
@@ -1000,6 +1098,8 @@ def _kernel32():
     kernel32.LocalFree.restype = wintypes.LPVOID
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.SetErrorMode.argtypes = [wintypes.UINT]
+    kernel32.SetErrorMode.restype = wintypes.UINT
     return kernel32
 
 
@@ -1074,6 +1174,24 @@ def _advapi32():
     advapi32.CredReadW.restype = wintypes.BOOL
     advapi32.CredFree.argtypes = [ctypes.c_void_p]
     advapi32.CredFree.restype = None
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.GetUserNameW.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetUserNameW.restype = wintypes.BOOL
     return advapi32
 
 
@@ -1107,6 +1225,13 @@ def _last_winerror(function: str) -> OSError:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # This process is the account-launched Level-1 runner. Suppress Windows
+    # hard-error / WER dialogs so the Level-2 sandboxed child (CreateProcessAsUserW
+    # with a restricted low-integrity token) does not pop up "application was
+    # unable to start correctly" dialogs when a tool's DLLs fail to initialize
+    # under the restricted token. The error mode is inherited by the child.
+    if os.name == "nt":
+        _kernel32().SetErrorMode(CHILD_ERROR_MODE)
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", required=True)
     args = parser.parse_args(argv)

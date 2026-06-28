@@ -4,6 +4,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from singularity.command.backend import RunningProcess
 from singularity.command import (
     CommandDecision,
@@ -64,7 +66,13 @@ def unrestricted_command_executor(tmp_path: Path, **kwargs) -> CommandExecutor:
     )
 
 
-def test_strict_mode_blocks_inline_interpreter_readonly_command(tmp_path: Path) -> None:
+def test_strict_mode_blocks_inline_interpreter_readonly_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Force the sandbox backend list to be empty so this executor-level test
+    # deterministically exercises the no-local-fallback path regardless of
+    # whether the host has a configured (available) Windows sandbox.
+    monkeypatch.setattr("singularity.sandbox.manager.default_sandbox_backends", lambda: [])
     component = CommandExecutor(tmp_path)
 
     result = component.run(
@@ -86,7 +94,12 @@ def test_strict_mode_blocks_inline_interpreter_readonly_command(tmp_path: Path) 
     assert not (tmp_path / "x").exists()
 
 
-def test_workspace_write_command_requires_sandbox_instead_of_local_process(tmp_path: Path) -> None:
+def test_workspace_write_command_requires_sandbox_instead_of_local_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Deterministic no-local-fallback check: empty backend list means the
+    # sandbox is unavailable regardless of host configuration.
+    monkeypatch.setattr("singularity.sandbox.manager.default_sandbox_backends", lambda: [])
     component = CommandExecutor(
         tmp_path,
         policy_engine=PolicyEngine(
@@ -241,7 +254,12 @@ def test_command_executor_can_build_command_plan(tmp_path: Path) -> None:
     assert plan.backend == "local_process"
 
 
-def test_shell_string_is_marked_high_risk_and_requires_review(tmp_path: Path) -> None:
+def test_shell_string_is_marked_high_risk_and_requires_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Deterministic no-local-fallback check: empty backend list means the
+    # sandbox is unavailable regardless of host configuration.
+    monkeypatch.setattr("singularity.sandbox.manager.default_sandbox_backends", lambda: [])
     component = CommandExecutor(tmp_path)
 
     result = component.run(

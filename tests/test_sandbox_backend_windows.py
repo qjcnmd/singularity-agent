@@ -343,6 +343,8 @@ def test_windows_setup_requires_elevation_before_system_mutation(
     assert set(report.pending_steps) == {
         "sandbox_account",
         "credential",
+        "logon_right",
+        "account_group",
         "network_filter",
         "acl_boundary",
         "execution_backend",
@@ -404,6 +406,28 @@ def test_windows_setup_elevated_runs_account_network_acl_and_execution_helpers(
             "available", True, "runner smoke verified.", {}
         ),
     )
+    monkeypatch.setattr(
+        windows,
+        "_enumerate_account_logon_rights",
+        lambda _sid: {
+            "interactive": True,
+            "batch": False,
+            "deny_interactive": False,
+            "deny_batch": False,
+            "deny_service": False,
+            "rights": ["SeInteractiveLogonRight"],
+            "lsa_status": "",
+        },
+    )
+    monkeypatch.setattr(windows, "_grant_logon_right", lambda _sid: windows._OperationResult(True))
+    monkeypatch.setattr(
+        windows, "_remove_deny_logon_rights", lambda _sid: windows._OperationResult(True)
+    )
+    monkeypatch.setattr(
+        windows,
+        "_add_account_to_users_group",
+        lambda _name: windows._OperationResult(True, "added"),
+    )
     monkeypatch.setattr(windows, "_probe_windows_sandbox_uncached", fake_doctor)
 
     report = windows.setup_windows_sandbox()
@@ -413,6 +437,8 @@ def test_windows_setup_elevated_runs_account_network_acl_and_execution_helpers(
     assert set(report.completed_steps) >= {
         "sandbox_account",
         "credential",
+        "logon_right",
+        "account_group",
         "network_filter",
         "acl_boundary",
         "private_desktop",
@@ -448,6 +474,29 @@ def test_windows_setup_failed_probe_steps_include_structured_details(
     monkeypatch.setattr(windows, "_is_elevated", lambda: True)
     monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
     monkeypatch.setattr(windows, "_account_exists", lambda _name: True)
+    monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(
+        windows,
+        "_enumerate_account_logon_rights",
+        lambda _sid: {
+            "interactive": True,
+            "batch": False,
+            "deny_interactive": False,
+            "deny_batch": False,
+            "deny_service": False,
+            "rights": ["SeInteractiveLogonRight"],
+            "lsa_status": "",
+        },
+    )
+    monkeypatch.setattr(windows, "_grant_logon_right", lambda _sid: windows._OperationResult(True))
+    monkeypatch.setattr(
+        windows, "_remove_deny_logon_rights", lambda _sid: windows._OperationResult(True)
+    )
+    monkeypatch.setattr(
+        windows,
+        "_add_account_to_users_group",
+        lambda _name: windows._OperationResult(True, "added"),
+    )
     monkeypatch.setattr(windows, "_credential_state", lambda: ready)
     monkeypatch.setattr(windows, "_firewall_rule_ready", lambda: True)
     monkeypatch.setattr(windows, "_acl_state", lambda _supported: missing_acl)
@@ -1120,3 +1169,357 @@ def test_windows_sandbox_runner_removes_account_runner_logs(
     assert runner_result.exit_code == 0
     assert not stdout_path.exists()
     assert not stderr_path.exists()
+
+
+def test_account_logon_rights_view_classifies_rights() -> None:
+    empty = windows._logon_rights_view([], "")
+    assert empty["interactive"] is False
+    assert empty["deny_interactive"] is False
+    assert empty["rights"] == []
+
+    granted = windows._logon_rights_view(
+        ["SeInteractiveLogonRight", "SeBatchLogonRight"], ""
+    )
+    assert granted["interactive"] is True
+    assert granted["batch"] is True
+    assert granted["deny_interactive"] is False
+
+    denied = windows._logon_rights_view(
+        ["SeInteractiveLogonRight", "SeDenyInteractiveLogonRight", "SeDenyBatchLogonRight"],
+        "",
+    )
+    assert denied["interactive"] is True
+    assert denied["deny_interactive"] is True
+    assert denied["deny_batch"] is True
+
+
+def test_windows_doctor_launcher_reports_logon_rights_and_blocks_when_right_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
+    monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "")
+
+    rights = windows._logon_rights_view([], "")
+    state = windows._launcher_state("S-1-5-21-123", rights, acl_boundary_ready=True)
+
+    assert state.status == "missing"
+    evidence = state.evidence
+    assert evidence["api"] == "CreateProcessWithLogonW"
+    assert evidence["logon_flags"] == "LOGON_WITH_PROFILE (0x1)"
+    assert evidence["domain_username_form"].startswith(".\\")
+    assert evidence["symbol_present"] is True
+    assert evidence["account_logon_rights"]["interactive"] is False
+    assert evidence["account_logon_rights"]["deny_interactive"] is False
+    assert evidence["window_station"]["inherits_parent"] is True
+    assert evidence["window_station"]["lpDesktop"] is None
+    assert evidence["desktop"]["inherits_parent"] is True
+    assert evidence["executable"]["path_hash"]
+    assert evidence["working_directory"]["account_has_access"] is True
+    assert "S-1-5-21" not in json.dumps(state.to_dict())
+
+
+def test_windows_doctor_launcher_available_when_interactive_right_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
+    monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "")
+
+    rights = windows._logon_rights_view(["SeInteractiveLogonRight"], "")
+    state = windows._launcher_state("S-1-5-21-123", rights, acl_boundary_ready=False)
+
+    assert state.status == "available"
+    assert state.evidence["account_logon_rights"]["interactive"] is True
+
+
+def test_windows_doctor_launcher_blocks_when_deny_interactive_right_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
+    monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "")
+
+    rights = windows._logon_rights_view(
+        ["SeInteractiveLogonRight", "SeDenyInteractiveLogonRight"], ""
+    )
+    state = windows._launcher_state("S-1-5-21-123", rights, acl_boundary_ready=True)
+
+    assert state.status == "missing"
+    assert state.evidence["account_logon_rights"]["deny_interactive"] is True
+
+
+def test_windows_doctor_launcher_defers_when_rights_unverifiable_non_elevated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # After an elevated setup grants SeInteractiveLogonRight, a non-elevated
+    # LsaEnumerateAccountRights may return STATUS_ACCESS_DENIED (0xC0000022)
+    # for an account that DOES hold rights. launcher must defer to runner_smoke
+    # rather than falsely block the backend after the right was granted.
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
+    monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "")
+
+    rights = windows._logon_rights_view([], "0xC0000022")
+    state = windows._launcher_state("S-1-5-21-123", rights, acl_boundary_ready=False)
+
+    assert state.status == "available"
+    assert state.evidence["account_logon_rights"]["lsa_status"] == "0xC0000022"
+
+
+def test_runner_smoke_blocks_when_account_identity_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        windows,
+        "_runner_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "runner", {}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_credential_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "credential", {}),
+    )
+    monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(windows, "_windows_state_dir", lambda: tmp_path)
+    monkeypatch.setattr(windows, "_apply_account_acl", lambda _path: windows._OperationResult(True))
+
+    class MismatchedRunner:
+        def run(self, _prepared):
+            return sandbox.WindowsRunnerResult(
+                exit_code=0,
+                stdout="sandbox-smoke\n",
+                stderr="",
+                timed_out=False,
+                started_at="2026-06-28T00:00:00+00:00",
+                ended_at="2026-06-28T00:00:01+00:00",
+                duration_ms=1,
+                metadata={
+                    "restricted_token": True,
+                    "low_integrity": True,
+                    "private_desktop": True,
+                    "job_object": True,
+                    "account_sid_hash": "mismatch",
+                    "account_name": "OtherUser",
+                },
+            )
+
+    monkeypatch.setattr(windows, "WindowsSandboxRunner", lambda: MismatchedRunner())
+
+    state = windows._runner_smoke_state()
+
+    assert state.status == "missing"
+    assert state.evidence["account_identity_verified"] is False
+    assert state.evidence["account_sid_hash"] == "mismatch"
+
+
+def test_runner_smoke_passes_when_account_identity_matches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        windows,
+        "_runner_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "runner", {}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_credential_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "credential", {}),
+    )
+    expected_hash = windows._hash_sid("S-1-5-21-123")
+    monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(windows, "_windows_state_dir", lambda: tmp_path)
+    monkeypatch.setattr(windows, "_apply_account_acl", lambda _path: windows._OperationResult(True))
+
+    class MatchingRunner:
+        def run(self, _prepared):
+            return sandbox.WindowsRunnerResult(
+                exit_code=0,
+                stdout="sandbox-smoke\n",
+                stderr="",
+                timed_out=False,
+                started_at="2026-06-28T00:00:00+00:00",
+                ended_at="2026-06-28T00:00:01+00:00",
+                duration_ms=1,
+                metadata={
+                    "restricted_token": True,
+                    "low_integrity": True,
+                    "private_desktop": True,
+                    "job_object": True,
+                    "account_sid_hash": expected_hash,
+                    "account_name": windows.SANDBOX_ACCOUNT,
+                },
+            )
+
+    monkeypatch.setattr(windows, "WindowsSandboxRunner", lambda: MatchingRunner())
+
+    state = windows._runner_smoke_state()
+
+    assert state.status == "available"
+    assert state.evidence["account_identity_verified"] is True
+
+
+def _patch_setup_common(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_elevated", lambda: True)
+    monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
+    monkeypatch.setattr(windows, "_account_exists", lambda _name: True)
+    monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(
+        windows,
+        "_credential_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "credential", {}),
+    )
+    monkeypatch.setattr(windows, "_firewall_rule_ready", lambda: True)
+    monkeypatch.setattr(
+        windows,
+        "_acl_state",
+        lambda _supported: sandbox.WindowsCapabilityState("available", True, "acl", {}),
+    )
+    monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
+    monkeypatch.setattr(
+        windows,
+        "_runner_smoke_state",
+        lambda: sandbox.WindowsCapabilityState("available", True, "smoke", {}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_probe_windows_sandbox_uncached",
+        lambda: sandbox.WindowsSandboxDoctorReport.ready_for_tests(),
+    )
+
+
+def test_setup_logon_right_step_grants_and_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_setup_common(monkeypatch)
+    enumerate_calls: list[str] = []
+
+    def fake_enumerate(_sid: str) -> dict[str, object]:
+        enumerate_calls.append(_sid)
+        if len(enumerate_calls) == 1:
+            return windows._logon_rights_view([], "")
+        return windows._logon_rights_view(["SeInteractiveLogonRight"], "")
+
+    grant_calls: list[str] = []
+
+    def fake_grant(sid: str) -> windows._OperationResult:
+        grant_calls.append(sid)
+        return windows._OperationResult(True)
+
+    monkeypatch.setattr(windows, "_enumerate_account_logon_rights", fake_enumerate)
+    monkeypatch.setattr(windows, "_grant_logon_right", fake_grant)
+    monkeypatch.setattr(windows, "_remove_deny_logon_rights", lambda _sid: windows._OperationResult(True))
+    monkeypatch.setattr(
+        windows, "_add_account_to_users_group", lambda _name: windows._OperationResult(True, "added")
+    )
+
+    report = windows.setup_windows_sandbox()
+
+    assert "logon_right" in report.completed_steps
+    assert "account_group" in report.completed_steps
+    assert grant_calls == ["S-1-5-21-123"]
+    assert report.changed is True
+
+
+def test_setup_logon_right_step_fails_when_grant_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_setup_common(monkeypatch)
+    monkeypatch.setattr(
+        windows,
+        "_enumerate_account_logon_rights",
+        lambda _sid: windows._logon_rights_view([], ""),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_grant_logon_right",
+        lambda _sid: windows._OperationResult(False, "LsaAddAccountRights failed: lsa_status=0xC0000034"),
+    )
+    monkeypatch.setattr(windows, "_remove_deny_logon_rights", lambda _sid: windows._OperationResult(True))
+    monkeypatch.setattr(
+        windows, "_add_account_to_users_group", lambda _name: windows._OperationResult(True, "added")
+    )
+
+    report = windows.setup_windows_sandbox()
+
+    failure = next(item for item in report.failed_steps if item["step"] == "logon_right")
+    assert "LsaAddAccountRights failed" in failure["reason"]
+    assert failure["details"]["grant_ok"] is False
+    assert "logon_right" not in report.completed_steps
+
+
+def test_setup_logon_right_step_fails_when_post_verify_lacks_right(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_setup_common(monkeypatch)
+    monkeypatch.setattr(
+        windows,
+        "_enumerate_account_logon_rights",
+        lambda _sid: windows._logon_rights_view([], ""),
+    )
+    monkeypatch.setattr(windows, "_grant_logon_right", lambda _sid: windows._OperationResult(True))
+    monkeypatch.setattr(windows, "_remove_deny_logon_rights", lambda _sid: windows._OperationResult(True))
+    monkeypatch.setattr(
+        windows, "_add_account_to_users_group", lambda _name: windows._OperationResult(True, "added")
+    )
+
+    report = windows.setup_windows_sandbox()
+
+    failure = next(item for item in report.failed_steps if item["step"] == "logon_right")
+    assert failure["reason"] == "SeInteractiveLogonRight not verified after grant"
+    assert failure["details"]["logon_rights"]["interactive"] is False
+
+
+def test_setup_account_group_step_records_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_setup_common(monkeypatch)
+    monkeypatch.setattr(
+        windows,
+        "_enumerate_account_logon_rights",
+        lambda _sid: windows._logon_rights_view(["SeInteractiveLogonRight"], ""),
+    )
+    monkeypatch.setattr(windows, "_grant_logon_right", lambda _sid: windows._OperationResult(True))
+    monkeypatch.setattr(windows, "_remove_deny_logon_rights", lambda _sid: windows._OperationResult(True))
+    monkeypatch.setattr(
+        windows,
+        "_add_account_to_users_group",
+        lambda _name: windows._OperationResult(
+            False, "NetLocalGroupAddMembers failed: code 5", {"windows_error_code": 5}
+        ),
+    )
+
+    report = windows.setup_windows_sandbox()
+
+    failure = next(item for item in report.failed_steps if item["step"] == "account_group")
+    assert "NetLocalGroupAddMembers failed" in failure["reason"]
+    assert failure["details"]["windows_error_code"] == 5
+    assert "account_group" not in report.completed_steps
+    assert "logon_right" in report.completed_steps
+
+
+def test_windows_child_process_close_handles_is_idempotent() -> None:
+    import singularity.sandbox.windows_runner as runner
+
+    child = runner._WindowsChildProcess(
+        command=["python"],
+        process_handle=0,
+        thread_handle=0,
+        process_id=0,
+        job_handle=None,
+        job_assigned=False,
+        desktop_handle=None,
+        stdout_path=Path("stdout"),
+        stderr_path=Path("stderr"),
+        streams=[],
+    )
+
+    child._close_handles()
+    # Second call must be a no-op (the _closed guard short-circuits).
+    child._close_handles()
+    assert child._closed is True

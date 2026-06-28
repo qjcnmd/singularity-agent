@@ -62,6 +62,18 @@ NERR_INVALID_NAME = 2202
 USER_PRIV_USER = 1
 UF_SCRIPT = 0x0001
 UF_DONT_EXPIRE_PASSWD = 0x10000
+# LSA account-right management: CreateProcessWithLogonW requires the target
+# account to hold SeInteractiveLogonRight ("Log On Locally"); SE_DENY rights
+# override matching allow rights, so deny rights must also be removed.
+POLICY_LOOKUP_NAMES = 0x00000800
+POLICY_CREATE_ACCOUNT = 0x00000010
+SE_INTERACTIVE_LOGON_NAME = "SeInteractiveLogonRight"
+SE_BATCH_LOGON_NAME = "SeBatchLogonRight"
+SE_DENY_INTERACTIVE_LOGON_NAME = "SeDenyInteractiveLogonRight"
+SE_DENY_BATCH_LOGON_NAME = "SeDenyBatchLogonRight"
+SE_DENY_SERVICE_LOGON_NAME = "SeDenyServiceLogonRight"
+NERR_MEMBER_IN_GROUP = 2118
+ERROR_MEMBER_IN_ALIAS = 1378
 
 
 @dataclass(frozen=True)
@@ -255,6 +267,8 @@ class WindowsSandboxSetupReport:
             completed_steps=(
                 "sandbox_account",
                 "credential",
+                "logon_right",
+                "account_group",
                 "acl_boundary",
                 "network_filter",
                 "private_desktop",
@@ -644,6 +658,8 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
             pending_steps=(
                 "sandbox_account",
                 "credential",
+                "logon_right",
+                "account_group",
                 "network_filter",
                 "acl_boundary",
                 "execution_backend",
@@ -711,6 +727,72 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
                     )
                 )
     password = ""
+    sid = _account_sid(SANDBOX_ACCOUNT)
+    pre_rights = (
+        _enumerate_account_logon_rights(sid) if sid else _logon_rights_view([], "no_sid")
+    )
+    needs_grant = bool(sid) and not pre_rights.get("interactive")
+    needs_deny_remove = bool(sid) and (
+        pre_rights.get("deny_interactive")
+        or pre_rights.get("deny_batch")
+        or pre_rights.get("deny_service")
+    )
+    logon_grant = (
+        _grant_logon_right(sid)
+        if needs_grant
+        else _OperationResult(True, "SeInteractiveLogonRight already present")
+    )
+    logon_deny = (
+        _remove_deny_logon_rights(sid)
+        if needs_deny_remove
+        else _OperationResult(True, "no deny logon rights present")
+    )
+    if logon_grant.ok and logon_deny.ok:
+        post_rights = (
+            _enumerate_account_logon_rights(sid) if sid else _logon_rights_view([], "no_sid")
+        )
+        if post_rights.get("interactive") and not post_rights.get("deny_interactive"):
+            if needs_grant or needs_deny_remove:
+                changed = True
+            completed.append("logon_right")
+        else:
+            failed.append(
+                {
+                    "step": "logon_right",
+                    "reason": "SeInteractiveLogonRight not verified after grant",
+                    "details": {
+                        "logon_rights": post_rights,
+                        "grant_reason": logon_grant.reason,
+                        "deny_reason": logon_deny.reason,
+                    },
+                }
+            )
+    else:
+        failed.append(
+            {
+                "step": "logon_right",
+                "reason": logon_grant.reason or logon_deny.reason,
+                "details": {
+                    "grant_ok": logon_grant.ok,
+                    "deny_ok": logon_deny.ok,
+                    "grant_reason": logon_grant.reason,
+                    "deny_reason": logon_deny.reason,
+                },
+            }
+        )
+    group_result = _add_account_to_users_group(SANDBOX_ACCOUNT)
+    if group_result.ok:
+        if group_result.reason == "added":
+            changed = True
+        completed.append("account_group")
+    else:
+        failed.append(
+            {
+                "step": "account_group",
+                "reason": group_result.reason,
+                "details": group_result.details,
+            }
+        )
     probe_windows_sandbox.cache_clear()
     if not _firewall_rule_ready():
         sid = _account_sid(SANDBOX_ACCOUNT)
@@ -775,6 +857,8 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
         for item in (
             "sandbox_account",
             "credential",
+            "logon_right",
+            "account_group",
             "acl_boundary",
             "network_filter",
             "private_desktop",
@@ -812,6 +896,8 @@ def _setup_report(
         for item in (
             "sandbox_account",
             "credential",
+            "logon_right",
+            "account_group",
             "acl_boundary",
             "network_filter",
             "private_desktop",
@@ -852,6 +938,9 @@ def _probe_windows_sandbox_uncached() -> WindowsSandboxDoctorReport:
         private_desktop=_primitive("user32", "CreateDesktopW", "CloseDesktop"),
     )
     sid = _account_sid(SANDBOX_ACCOUNT) if platform_supported else ""
+    logon_rights = (
+        _enumerate_account_logon_rights(sid) if sid else _logon_rights_view([], "no_sid")
+    )
     diagnostics = _legacy_artifact_diagnostics() if platform_supported else ()
     state_dir = _state_dir_state() if platform_supported else None
     if state_dir is not None and not state_dir.ready:
@@ -861,7 +950,11 @@ def _probe_windows_sandbox_uncached() -> WindowsSandboxDoctorReport:
             bool(sid),
             "sandbox account exists",
             "sandbox account is missing",
-            {"account": SANDBOX_ACCOUNT, "sid": _hash_sid(sid) if sid else None},
+            {
+                "account": SANDBOX_ACCOUNT,
+                "sid": _hash_sid(sid) if sid else None,
+                "logon_rights": logon_rights,
+            },
         ),
         acl_boundary=_acl_state(platform_supported),
         network_filter=_network_state(sid),
@@ -881,13 +974,7 @@ def _probe_windows_sandbox_uncached() -> WindowsSandboxDoctorReport:
             {"sid_hash": _hash_sid(sid) if sid else None},
         ),
         credential=_credential_state(),
-        launcher=_state_from_bool(
-            _has_windows_symbols("advapi32", "CreateProcessWithLogonW")
-            and _has_windows_symbols("advapi32", "CreateProcessAsUserW"),
-            "Windows account launcher primitive is available",
-            "Windows account launcher primitive is missing",
-            {"api": "CreateProcessWithLogonW/CreateProcessAsUserW"},
-        ),
+        launcher=_launcher_state(sid, logon_rights, setup.acl_boundary.ready),
         runner_smoke=_runner_smoke_state(),
         network_probe=_network_probe_state(sid),
     )
@@ -1152,6 +1239,71 @@ def _execution_backend_state(
     )
 
 
+def _executable_acl_summary() -> str:
+    icacls = shutil.which("icacls")
+    if not icacls:
+        return ""
+    return _safe_output(_run_command([icacls, sys.executable]))
+
+
+def _launcher_state(
+    sid: str,
+    logon_rights: dict[str, Any],
+    acl_boundary_ready: bool,
+) -> WindowsCapabilityState:
+    if os.name != "nt":
+        return _missing("Windows launcher probe requires Windows.", {"api": "CreateProcessWithLogonW"})
+    symbol_present = _has_windows_symbols("advapi32", "CreateProcessWithLogonW") and _has_windows_symbols(
+        "advapi32", "CreateProcessAsUserW"
+    )
+    interactive = bool(logon_rights.get("interactive"))
+    deny_interactive = bool(logon_rights.get("deny_interactive"))
+    lsa_status = str(logon_rights.get("lsa_status", ""))
+    # LsaEnumerateAccountRights definitively proves the right is absent only when
+    # it succeeds (lsa_status empty -> the rights list is authoritative) or
+    # reports the account has no LSA row (STATUS_OBJECT_NAME_NOT_FOUND
+    # 0xC0000034). A non-elevated caller may receive STATUS_ACCESS_DENIED
+    # (0xC0000022) for an account that DOES hold rights; in that case we cannot
+    # prove absence and defer to the empirical runner_smoke probe rather than
+    # falsely blocking the backend after an elevated setup granted the right.
+    rights_definitively_missing = (not interactive) and lsa_status in {"", "0xC0000034"}
+    evidence = {
+        "api": "CreateProcessWithLogonW",
+        "logon_flags": "LOGON_WITH_PROFILE (0x1)",
+        "domain_username_form": f".\\{_redact_account_name(SANDBOX_ACCOUNT)}",
+        "symbol_present": symbol_present,
+        "account_logon_rights": logon_rights,
+        "window_station": {
+            "lpDesktop": None,
+            "inherits_parent": True,
+            "access": "inherited_default (account relies on the inherited window-station DACL)",
+        },
+        "desktop": {
+            "inherits_parent": True,
+            "access": "inherited_default (account relies on the inherited desktop DACL)",
+        },
+        "executable": {
+            "path_hash": _hash_text(sys.executable),
+            "acl_summary_redacted": _executable_acl_summary(),
+        },
+        "working_directory": {
+            "representative_hash": _hash_path(_windows_state_dir_path()),
+            "account_has_access": acl_boundary_ready,
+        },
+    }
+    ready = (
+        symbol_present
+        and not rights_definitively_missing
+        and not deny_interactive
+    )
+    return _state_from_bool(
+        ready,
+        "CreateProcessWithLogonW preconditions satisfied (SeInteractiveLogonRight present or unverifiable non-elevated, no deny right, symbols available).",
+        "CreateProcessWithLogonW preconditions missing (account definitively lacks SeInteractiveLogonRight, has a deny right, or symbols missing).",
+        evidence,
+    )
+
+
 def _credential_state() -> WindowsCapabilityState:
     # We intentionally do not read or print credential material. Presence is
     # tested through the Windows Credential Manager target only.
@@ -1182,7 +1334,8 @@ def _runner_smoke_state() -> WindowsCapabilityState:
     runner = _runner_state()
     if not runner.ready:
         return runner
-    if not _credential_state().ready or not _account_sid(SANDBOX_ACCOUNT):
+    sid = _account_sid(SANDBOX_ACCOUNT)
+    if not _credential_state().ready or not sid:
         state_dir = _windows_state_dir_path()
         return _missing(
             "Windows runner smoke requires sandbox account and credential.",
@@ -1252,6 +1405,8 @@ def _runner_smoke_state() -> WindowsCapabilityState:
                     path=root,
                 ),
             )
+        account_sid_hash = result.metadata.get("account_sid_hash")
+        account_identity_verified = bool(account_sid_hash) and account_sid_hash == _hash_sid(sid)
         ready = (
             result.exit_code == 0
             and "sandbox-smoke" in result.stdout
@@ -1259,6 +1414,7 @@ def _runner_smoke_state() -> WindowsCapabilityState:
             and bool(result.metadata.get("low_integrity"))
             and bool(result.metadata.get("private_desktop"))
             and bool(result.metadata.get("job_object"))
+            and account_identity_verified
         )
         return _state_from_bool(
             ready,
@@ -1270,6 +1426,7 @@ def _runner_smoke_state() -> WindowsCapabilityState:
                 state_dir=state_dir,
                 probe_root=root,
                 path=root,
+                extra={"account_identity_verified": account_identity_verified},
             ),
         )
     except Exception as exc:
@@ -1668,6 +1825,29 @@ class _CREDENTIALW(ctypes.Structure):
     ]
 
 
+class _LSA_UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("MaximumLength", wintypes.USHORT),
+        ("Buffer", wintypes.LPWSTR),
+    ]
+
+
+class _LSA_OBJECT_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.ULONG),
+        ("RootDirectory", wintypes.HANDLE),
+        ("ObjectName", ctypes.POINTER(_LSA_UNICODE_STRING)),
+        ("Attributes", wintypes.ULONG),
+        ("SecurityDescriptor", wintypes.LPVOID),
+        ("SecurityQualityOfService", wintypes.LPVOID),
+    ]
+
+
+class _LOCALGROUP_MEMBERS_INFO_0(ctypes.Structure):
+    _fields_ = [("lgrmi0_sid", wintypes.LPVOID)]
+
+
 def _netapi32():
     dll = ctypes.WinDLL("netapi32", use_last_error=True)
     dll.NetUserAdd.argtypes = [
@@ -1685,6 +1865,14 @@ def _netapi32():
         ctypes.POINTER(wintypes.DWORD),
     ]
     dll.NetUserSetInfo.restype = wintypes.DWORD
+    dll.NetLocalGroupAddMembers.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    dll.NetLocalGroupAddMembers.restype = wintypes.DWORD
     return dll
 
 
@@ -1701,6 +1889,44 @@ def _advapi32():
     dll.CredReadW.restype = wintypes.BOOL
     dll.CredFree.argtypes = [ctypes.c_void_p]
     dll.CredFree.restype = None
+    dll.LsaOpenPolicy.argtypes = [
+        ctypes.POINTER(_LSA_UNICODE_STRING),
+        ctypes.POINTER(_LSA_OBJECT_ATTRIBUTES),
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    dll.LsaOpenPolicy.restype = wintypes.ULONG
+    dll.LsaClose.argtypes = [wintypes.HANDLE]
+    dll.LsaClose.restype = wintypes.ULONG
+    dll.LsaAddAccountRights.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        ctypes.POINTER(_LSA_UNICODE_STRING),
+        wintypes.ULONG,
+    ]
+    dll.LsaAddAccountRights.restype = wintypes.ULONG
+    dll.LsaEnumerateAccountRights.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        ctypes.POINTER(ctypes.POINTER(_LSA_UNICODE_STRING)),
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    dll.LsaEnumerateAccountRights.restype = wintypes.ULONG
+    dll.LsaRemoveAccountRights.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.BOOL,
+        ctypes.POINTER(_LSA_UNICODE_STRING),
+        wintypes.ULONG,
+    ]
+    dll.LsaRemoveAccountRights.restype = wintypes.ULONG
+    dll.LsaFreeMemory.argtypes = [wintypes.LPVOID]
+    dll.LsaFreeMemory.restype = wintypes.ULONG
+    dll.ConvertStringSidToSidW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    dll.ConvertStringSidToSidW.restype = wintypes.BOOL
     return dll
 
 
@@ -1838,6 +2064,201 @@ def _account_sid(name: str) -> str:
         "if ($u) { $u.SID.Value; exit 0 }; exit 1"
     )
     return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
+def _local_free(ptr: int) -> None:
+    if not ptr:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LocalFree.argtypes = [wintypes.LPVOID]
+        kernel32.LocalFree.restype = wintypes.LPVOID
+        kernel32.LocalFree(ptr)
+    except OSError:
+        pass
+
+
+def _account_psid(sid_string: str) -> int:
+    """Convert a SID string to a native PSID (caller must _local_free it)."""
+    if os.name != "nt" or not sid_string:
+        return 0
+    psid = wintypes.LPVOID()
+    if not _advapi32().ConvertStringSidToSidW(sid_string, ctypes.byref(psid)):
+        return 0
+    return psid.value or 0
+
+
+def _lsa_open(access: int) -> int:
+    attrs = _LSA_OBJECT_ATTRIBUTES()
+    attrs.Length = ctypes.sizeof(_LSA_OBJECT_ATTRIBUTES)
+    handle = wintypes.HANDLE()
+    status = _advapi32().LsaOpenPolicy(None, ctypes.byref(attrs), access, ctypes.byref(handle))
+    if status != 0:
+        return 0
+    return handle.value or 0
+
+
+def _lsa_close(handle: int) -> None:
+    if handle:
+        _advapi32().LsaClose(handle)
+
+
+def _logon_rights_view(rights: list[str], lsa_status: str) -> dict[str, Any]:
+    return {
+        "interactive": SE_INTERACTIVE_LOGON_NAME in rights,
+        "batch": SE_BATCH_LOGON_NAME in rights,
+        "deny_interactive": SE_DENY_INTERACTIVE_LOGON_NAME in rights,
+        "deny_batch": SE_DENY_BATCH_LOGON_NAME in rights,
+        "deny_service": SE_DENY_SERVICE_LOGON_NAME in rights,
+        "rights": sorted(rights),
+        "lsa_status": lsa_status,
+    }
+
+
+def _enumerate_account_logon_rights(sid_string: str) -> dict[str, Any]:
+    if os.name != "nt" or not sid_string:
+        return _logon_rights_view([], "not_windows")
+    psid = _account_psid(sid_string)
+    if not psid:
+        return _logon_rights_view([], "sid_lookup_failed")
+    try:
+        handle = _lsa_open(POLICY_LOOKUP_NAMES)
+        if not handle:
+            return _logon_rights_view([], "lsa_open_failed")
+        array_ptr = ctypes.POINTER(_LSA_UNICODE_STRING)()
+        count = wintypes.ULONG(0)
+        try:
+            status = _advapi32().LsaEnumerateAccountRights(
+                handle, psid, ctypes.byref(array_ptr), ctypes.byref(count)
+            )
+            if status != 0 or not array_ptr:
+                return _logon_rights_view(
+                    [], f"0x{status & 0xFFFFFFFF:08X}" if status else "empty"
+                )
+            rights: list[str] = []
+            for index in range(count.value):
+                entry = array_ptr[index]
+                if entry.Length and entry.Buffer:
+                    rights.append(ctypes.wstring_at(entry.Buffer, entry.Length // 2))
+            return _logon_rights_view(rights, "")
+        finally:
+            if array_ptr:
+                _advapi32().LsaFreeMemory(array_ptr)
+            _lsa_close(handle)
+    finally:
+        _local_free(psid)
+
+
+def _grant_logon_right(sid_string: str) -> _OperationResult:
+    if os.name != "nt":
+        return _OperationResult(False, "LSA logon right grant requires Windows.")
+    if not sid_string:
+        return _OperationResult(False, "sandbox account SID unavailable for logon right grant")
+    psid = _account_psid(sid_string)
+    if not psid:
+        return _OperationResult(False, "sandbox account PSID conversion failed")
+    try:
+        handle = _lsa_open(POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT)
+        if not handle:
+            return _OperationResult(False, "LsaOpenPolicy failed for logon right grant")
+        try:
+            name = SE_INTERACTIVE_LOGON_NAME
+            name_buffer = ctypes.create_unicode_buffer(name)
+            rights = (_LSA_UNICODE_STRING * 1)()
+            rights[0].Length = len(name) * 2
+            rights[0].MaximumLength = (len(name) + 1) * 2
+            rights[0].Buffer = ctypes.cast(name_buffer, wintypes.LPWSTR)
+            status = _advapi32().LsaAddAccountRights(handle, psid, rights, 1)
+            if status != 0:
+                return _OperationResult(
+                    False,
+                    f"LsaAddAccountRights failed: lsa_status=0x{status & 0xFFFFFFFF:08X}",
+                )
+        finally:
+            _lsa_close(handle)
+    finally:
+        _local_free(psid)
+    return _OperationResult(True)
+
+
+def _remove_deny_logon_rights(sid_string: str) -> _OperationResult:
+    if os.name != "nt":
+        return _OperationResult(False, "LSA deny right removal requires Windows.")
+    if not sid_string:
+        return _OperationResult(False, "sandbox account SID unavailable for deny right removal")
+    psid = _account_psid(sid_string)
+    if not psid:
+        return _OperationResult(False, "sandbox account PSID conversion failed")
+    try:
+        existing = _enumerate_account_logon_rights(sid_string)
+        to_remove = [
+            name
+            for name, present in (
+                (SE_DENY_INTERACTIVE_LOGON_NAME, existing["deny_interactive"]),
+                (SE_DENY_BATCH_LOGON_NAME, existing["deny_batch"]),
+                (SE_DENY_SERVICE_LOGON_NAME, existing["deny_service"]),
+            )
+            if present
+        ]
+        if not to_remove:
+            return _OperationResult(True, "no deny logon rights present")
+        handle = _lsa_open(POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT)
+        if not handle:
+            return _OperationResult(False, "LsaOpenPolicy failed for deny right removal")
+        try:
+            buffers = [ctypes.create_unicode_buffer(name) for name in to_remove]
+            rights = (_LSA_UNICODE_STRING * len(to_remove))()
+            for index, name in enumerate(to_remove):
+                rights[index].Length = len(name) * 2
+                rights[index].MaximumLength = (len(name) + 1) * 2
+                rights[index].Buffer = ctypes.cast(buffers[index], wintypes.LPWSTR)
+            status = _advapi32().LsaRemoveAccountRights(
+                handle, psid, False, rights, len(to_remove)
+            )
+            if status != 0:
+                return _OperationResult(
+                    False,
+                    f"LsaRemoveAccountRights failed: lsa_status=0x{status & 0xFFFFFFFF:08X}",
+                )
+        finally:
+            _lsa_close(handle)
+    finally:
+        _local_free(psid)
+    return _OperationResult(True, f"removed {len(to_remove)} deny right(s)")
+
+
+def _add_account_to_users_group(name: str) -> _OperationResult:
+    """Add the sandbox account to the local Users group for executable RX.
+
+    CreateProcessWithLogonW accesses python.exe and the runner script in the
+    target account's security context; Users membership provides the standard
+    traverse+RX on Program Files/Windows that every local user has. Sandbox
+    isolation is still enforced by the restricted token, low integrity, network
+    denial and per-run ACL boundary, not by Users-group exclusion.
+    """
+    if os.name != "nt":
+        return _OperationResult(False, "Users group membership requires Windows.")
+    sid = _account_sid(name)
+    if not sid:
+        return _OperationResult(False, "sandbox account SID unavailable for Users group membership")
+    psid = _account_psid(sid)
+    if not psid:
+        return _OperationResult(False, "sandbox account PSID conversion failed")
+    try:
+        info = (_LOCALGROUP_MEMBERS_INFO_0 * 1)()
+        info[0].lgrmi0_sid = psid
+        code = _netapi32().NetLocalGroupAddMembers(None, "Users", 0, info, 1)
+        if code == NERR_SUCCESS:
+            return _OperationResult(True, "added")
+        if code == ERROR_MEMBER_IN_ALIAS:
+            return _OperationResult(True, "already_member")
+        return _OperationResult(
+            False,
+            f"NetLocalGroupAddMembers failed: code {code}",
+            {"windows_error_code": code},
+        )
+    finally:
+        _local_free(psid)
 
 
 def _firewall_rule_ready() -> bool:
@@ -2118,6 +2539,7 @@ def _runner_result_summary(
             "network_denied_verified": result.network_denied_verified,
             "runner_error_code": result.metadata.get("error_code"),
             "runner_error_type": result.metadata.get("error_type"),
+            "account_sid_hash": result.metadata.get("account_sid_hash"),
         }
     )
     return summary
