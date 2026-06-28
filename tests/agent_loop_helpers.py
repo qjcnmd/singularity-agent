@@ -81,7 +81,6 @@ def make_agent_session(
         console=console or Console(file=StringIO(), force_terminal=False),
         max_turns=max_turns,
         planner=resolved_planner,
-        policy_engine=resolved_policy,
         tool_executor=resolved_tool_executor,
         tool_protocol=resolved_tool_protocol,
         prompt_assembly=resolved_prompt_assembly,

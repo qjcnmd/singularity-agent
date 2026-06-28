@@ -33,9 +33,7 @@ from singularity.interaction import RichCliRenderer
 from singularity.kernel import CancellationError, KernelBootstrap
 from singularity.kernel.models import RunStatus
 from singularity.memory.cli import memory_app
-from singularity.observability import TraceRecorder, TraceRedactor, TraceStore
-from singularity.planner import Planner
-from singularity.planner import create_or_resume_planner as _create_or_resume_planner
+from singularity.observability import TraceRedactor, TraceStore
 from singularity.plugins.cli import plugin_app
 from singularity.policy import PolicyConfig, PolicyEngine
 from singularity.policy.cli import approval_app
@@ -723,25 +721,6 @@ def workspace_health_summary(health: WorkspaceHealthReport) -> str:
         f"recommended_next_action: {payload['recommended_next_action']}",
     ]
     return "\n".join(lines)
-
-
-def create_or_resume_planner(
-    *,
-    workspace_root: Path,
-    session_id: str | None,
-    task_id: str,
-    user_goal: str,
-    trace: TraceRecorder | None,
-    workspace_health: WorkspaceHealthReport,
-) -> Planner:
-    return _create_or_resume_planner(
-        workspace_root=workspace_root,
-        session_id=session_id,
-        task_id=task_id,
-        user_goal=user_goal,
-        trace=trace,
-        workspace_health=workspace_health,
-    )
 
 
 def _workspace_health_panel(health: WorkspaceHealthReport) -> Panel:

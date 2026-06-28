@@ -75,7 +75,6 @@ class ShutdownManager:
     def _steps(self) -> list[tuple[str, Callable[[], None]]]:
         return [
             ("stop_planner", self._stop_planner),
-            ("reject_actions", lambda: None),
             ("cancel_model", self._cancel_model),
             ("terminate_commands", self._terminate_commands),
             ("terminate_sandbox", self._terminate_sandbox),

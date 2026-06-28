@@ -13,7 +13,6 @@ class PromptAssemblyConfig:
             ".singularity/AGENTS.md",
         ]
     )
-    enable_readme_context_as_instruction: bool = False
     max_project_instruction_bytes: int = 64 * 1024
     max_untrusted_content_bytes: int = 16 * 1024
     max_prompt_tokens: int | None = None

@@ -10,8 +10,10 @@ from singularity.tools import (
     ToolIdempotencyPolicy,
     ToolPolicy,
     ToolRegistry,
+    ToolResult,
     ToolSpec,
 )
+from singularity.tools.executor import IdempotencyLedger
 from tests.tool_executor_helpers import make_test_policy_engine
 
 
@@ -121,4 +123,33 @@ def test_non_idempotent_duplicate_does_not_auto_replay(tmp_path: Path) -> None:
     assert second.ok is False
     assert second.error_code == "replay_not_allowed"
     assert calls == ["x"]
+
+
+def test_idempotency_ledger_evicts_oldest_entry_when_capacity_is_exceeded() -> None:
+    ledger = IdempotencyLedger(max_entries=2)
+
+    ledger.remember(
+        "call_1",
+        "args_1",
+        ToolResult.success(content={"value": "old"}),
+        replay_allowed=True,
+    )
+    ledger.remember(
+        "call_2",
+        "args_2",
+        ToolResult.success(content={"value": "second"}),
+        replay_allowed=True,
+    )
+    assert ledger.check("call_1", "args_1", replay_allowed=True) is not None
+
+    ledger.remember(
+        "call_3",
+        "args_3",
+        ToolResult.success(content={"value": "new"}),
+        replay_allowed=True,
+    )
+
+    assert ledger.check("call_2", "args_2", replay_allowed=True) is None
+    assert ledger.check("call_1", "args_1", replay_allowed=True) is not None
+    assert ledger.check("call_3", "args_3", replay_allowed=True) is not None
 

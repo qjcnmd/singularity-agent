@@ -740,8 +740,8 @@ class AgentGraphBuilder:
         tool_protocol.tool_executor.planner = planner
         # Inject Semantic Planner producer bundle so Planner.start_task/replan/
         # record_failure_analysis go through model-driven producers with rule
-        # fallback. infra.model_runner is the ModelRunner instance built in
-        # _build_infra; when None (test/CI), producers auto-fallback to rules.
+        # fallback. model_runner comes from _build_model_context; when None
+        # (test/CI), producers auto-fallback to rules.
         from singularity.planner.semantic_producers import PlannerProducerBundle
 
         bundle = PlannerProducerBundle.with_rule_fallback(

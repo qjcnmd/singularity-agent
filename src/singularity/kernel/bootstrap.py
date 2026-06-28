@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from rich.console import Console
 
@@ -166,7 +165,3 @@ class KernelBootstrap:
                 details={"error_type": type(exc).__name__, "message": str(exc)},
                 final_report=final_report,
             ) from exc
-
-
-def build_config_from_cli(**kwargs: Any) -> ProductionConfig:
-    return ProductionConfig.from_cli(**kwargs)

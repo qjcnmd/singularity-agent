@@ -477,3 +477,26 @@ def test_policy_allows_reads_outside_policy_dir(tmp_path: Path) -> None:
         )
     )
     assert read.outcome == DecisionOutcome.ALLOW
+
+
+def test_policy_evaluate_and_enforce_share_request_evaluation(tmp_path: Path, monkeypatch) -> None:
+    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
+    request = req(
+        tmp_path,
+        operation=OperationKind.READ_FILE,
+        capability=Capability.READ_WORKSPACE,
+        resource_type="file",
+        identifier="README.md",
+    )
+    expected = component.evaluate(request)
+    calls: list[PolicyRequest] = []
+
+    def evaluate_once(candidate: PolicyRequest):
+        calls.append(candidate)
+        return expected
+
+    monkeypatch.setattr(component, "_evaluate_request", evaluate_once)
+
+    assert component.evaluate(request) is expected
+    assert component.enforce(request) is expected
+    assert calls == [request, request]

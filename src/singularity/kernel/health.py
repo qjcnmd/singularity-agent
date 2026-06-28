@@ -82,8 +82,6 @@ class ComponentHealthChecker:
         report = ComponentHealthReport(ok=ok, summary=summary, diagnostics=diagnostics)
         if self.trace is not None and hasattr(self.trace, "record"):
             self.trace.record("component.health_checked", report.to_dict())
-        if not ok and any(item["critical"] for item in diagnostics):
-            return report
         return report
 
     def enforce(self, components: dict[str | ComponentName, Any]) -> ComponentHealthReport:

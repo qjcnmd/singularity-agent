@@ -137,7 +137,7 @@ class ContextUsageReporter:
             config = getattr(self.model_runner, "config", None)
             model_name = getattr(config, "default_model", None) or getattr(config, "model", None)
         elif self.provider is not None:
-            provider_name = getattr(self.provider, "provider_name", None) or getattr(self.provider, "name", lambda: None)()
+            provider_name = _provider_name(self.provider)
         reasons = []
         evidence = []
         confidence = 0.0
@@ -244,3 +244,15 @@ def _ratio(numerator: int, denominator: int) -> float:
     if denominator <= 0:
         return 0.0
     return round(numerator / denominator, 4)
+
+
+def _provider_name(provider: Any) -> str | None:
+    explicit = getattr(provider, "provider_name", None)
+    if explicit:
+        return str(explicit)
+    name = getattr(provider, "name", None)
+    if callable(name):
+        name = name()
+    if name:
+        return str(name)
+    return None

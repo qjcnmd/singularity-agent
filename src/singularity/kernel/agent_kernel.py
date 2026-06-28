@@ -104,7 +104,6 @@ class AgentKernel:
                 console=self.console,
                 max_turns=self.graph.config.max_turns,
                 planner=self.graph.planner,
-                policy_engine=self.graph.policy_engine,
                 tool_executor=self.graph.tool_executor,
                 tool_protocol=self.graph.tool_protocol,
                 prompt_assembly=self.graph.prompt_assembly,

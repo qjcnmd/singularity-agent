@@ -43,7 +43,6 @@ from singularity.policy.exceptions import (
 )
 from singularity.tools.models import (
     PermissionLevel,
-    ToolError,
     ToolExecutionBackendKind,
     ToolExecutionFailure,
     ToolExecutionRequest,
@@ -173,8 +172,11 @@ class ToolResultCache:
 
 
 class IdempotencyLedger:
-    def __init__(self) -> None:
-        self._entries: dict[str, _ReplayEntry] = {}
+    def __init__(self, *, max_entries: int = 512) -> None:
+        if max_entries <= 0:
+            raise ValueError("max_entries must be greater than zero.")
+        self.max_entries = max_entries
+        self._entries: OrderedDict[str, _ReplayEntry] = OrderedDict()
         self._lock = threading.RLock()
 
     def check(
@@ -190,6 +192,7 @@ class IdempotencyLedger:
             existing = self._entries.get(tool_call_id)
             if existing is None:
                 return None
+            self._entries.move_to_end(tool_call_id)
             if existing.args_fingerprint != args_fingerprint:
                 return ToolResult.failure(
                     code="conflicting_replay",
@@ -220,6 +223,9 @@ class IdempotencyLedger:
                 result=result.model_copy(deep=True),
                 replay_allowed=replay_allowed,
             )
+            self._entries.move_to_end(tool_call_id)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
 
 
 class ToolPolicyEngineProtocol(Protocol):
@@ -1293,13 +1299,6 @@ class ToolExecutor:
             code="delegated_backend_unavailable",
             message=f"Delegated backend is unavailable: {spec.execution_backend.value}",
             metadata={"backend": spec.execution_backend.value},
-        )
-
-    def _failure_from_tool_error(self, error: ToolError) -> ToolResult:
-        return ToolResult.failure(
-            code=error.code,
-            message=self._redactor.redact_text(error.message),
-            details=self._redactor.redact_value(error.details),
         )
 
     @staticmethod

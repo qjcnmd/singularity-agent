@@ -16,7 +16,6 @@ from singularity.interaction import InteractionController, ProgressEvent
 from singularity.model import ModelErrorKind, ModelPurpose, ModelRunner, ModelTurnStatus
 from singularity.observability.protocols import TraceStorageProtocol
 from singularity.planner import Planner, TaskStatus
-from singularity.policy import PolicyEngine
 from singularity.provider import OpenAICompatibleProvider
 from singularity.repair import RepairPlanner
 from singularity.run_controller import RunController
@@ -94,7 +93,6 @@ class AgentLoop:
         console: Console,
         max_turns: int,
         planner: Planner,
-        policy_engine: PolicyEngine | None = None,
         tool_executor: ToolExecutor,
         tool_protocol: ToolProtocolEngine,
         prompt_assembly: PromptAssemblyPipeline,
@@ -126,7 +124,6 @@ class AgentLoop:
         self.console = console
         self.max_turns = max_turns
         self.planner = planner
-        self.policy_engine = policy_engine
         self.tool_executor = tool_executor
         self.tool_protocol = tool_protocol
         self.prompt_assembly = prompt_assembly
@@ -907,22 +904,4 @@ class AgentLoop:
             ]
             if not assistant_message["content"]:
                 assistant_message["content"] = None
-        return assistant_message
-
-    @staticmethod
-    def _extract_assistant_message(response: dict[str, Any]) -> dict[str, Any]:
-        choices = response.get("choices") or []
-        if not choices:
-            raise ValueError("Model response did not include choices.")
-
-        message = choices[0].get("message") or {}
-        if message.get("role") != "assistant":
-            message["role"] = "assistant"
-
-        assistant_message: dict[str, Any] = {
-            "role": "assistant",
-            "content": message.get("content"),
-        }
-        if message.get("tool_calls"):
-            assistant_message["tool_calls"] = message["tool_calls"]
         return assistant_message

@@ -30,18 +30,12 @@ class PolicyEngine:
         self.trace = trace
 
     def evaluate(self, request: PolicyRequest) -> PolicyDecision:
-        decision = self._decide(request)
-        self.audit.append(request=request, decision=decision)
-        self._emit_policy_trace(
-            TraceEventType.POLICY_DECIDED
-            if decision.outcome == DecisionOutcome.ALLOW
-            else TraceEventType.POLICY_BLOCKED,
-            request=request,
-            decision=decision,
-        )
-        return decision
+        return self._evaluate_request(request)
 
     def enforce(self, request: PolicyRequest) -> PolicyDecision:
+        return self._evaluate_request(request)
+
+    def _evaluate_request(self, request: PolicyRequest) -> PolicyDecision:
         decision = self._decide(request)
         self.audit.append(request=request, decision=decision)
         self._emit_policy_trace(
