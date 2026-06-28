@@ -245,27 +245,8 @@ class OpenAICompatibleModelProvider:
         return self._capabilities
 
     def complete(self, request: ProviderRequest) -> ProviderResponse:
-        payload: dict[str, Any] = {
-            "model": request.preferences.model_name or self.settings.model,
-            "messages": _model_messages_to_openai(
-                request.messages,
-                self.capabilities(),
-            ),
-            "tools": [_model_tool_to_openai(tool) for tool in request.tools],
-            "tool_choice": _serialize_tool_choice(request.tool_choice),
-        }
-        if request.preferences.temperature is not None:
-            payload["temperature"] = request.preferences.temperature
-        if request.preferences.top_p is not None:
-            payload["top_p"] = request.preferences.top_p
-        if request.preferences.max_output_tokens is not None:
-            payload["max_tokens"] = request.preferences.max_output_tokens
-        if request.preferences.json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        headers = {
-            "Authorization": f"Bearer {self.settings.api_key}",
-            "Content-Type": "application/json",
-        }
+        payload = self._chat_completion_payload(request)
+        headers = self._headers()
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
                 response = client.post(self._chat_completions_url(), headers=headers, json=payload)
@@ -305,31 +286,80 @@ class OpenAICompatibleModelProvider:
         )
 
     def stream(self, request: ProviderRequest) -> Iterable[ProviderStreamEvent]:
-        response = self.complete(request)
-        if response.message.text:
-            yield ProviderStreamEvent(
-                type=ProviderStreamEventType.TEXT_DELTA,
-                text_delta=response.message.text,
-            )
-        for call in response.tool_calls:
-            yield ProviderStreamEvent(
-                type=ProviderStreamEventType.TOOL_CALL_DELTA,
-                tool_call_id=call.tool_call_id,
-                tool_name=call.tool_name,
-                arguments_delta=call.raw_arguments,
-            )
-            yield ProviderStreamEvent(
-                type=ProviderStreamEventType.TOOL_CALL_COMPLETED,
-                tool_call_id=call.tool_call_id,
-            )
-        yield ProviderStreamEvent(
-            type=ProviderStreamEventType.USAGE_DELTA,
-            usage_delta=response.usage.to_dict(),
-        )
-        yield ProviderStreamEvent(
-            type=ProviderStreamEventType.RESPONSE_COMPLETED,
-            metadata={"finish_reason": response.finish_reason or "stop"},
-        )
+        payload = {
+            **self._chat_completion_payload(request),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        headers = self._headers()
+        model_name = str(payload["model"])
+        try:
+            with (
+                httpx.Client(timeout=self.timeout_seconds) as client,
+                client.stream(
+                    "POST",
+                    self._chat_completions_url(),
+                    headers=headers,
+                    json=payload,
+                ) as response,
+            ):
+                response.raise_for_status()
+                state = _StreamParseState()
+                for line in response.iter_lines():
+                    yield from _events_from_sse_line(line, state=state)
+        except httpx.TimeoutException as exc:
+            raise ModelError(
+                kind=ModelErrorKind.TIMEOUT,
+                message=str(exc),
+                retryable=True,
+                provider_name=self.provider_name,
+                model_name=model_name,
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            raise ModelError(
+                kind=_error_kind_for_status(status),
+                message=f"Provider returned HTTP {status}.",
+                retryable=status in {408, 409, 429, 500, 502, 503, 504},
+                provider_name=self.provider_name,
+                model_name=model_name,
+                metadata={"http_status": status},
+            ) from exc
+        except httpx.RequestError as exc:
+            retryable = not _request_error_is_permission_denied(exc)
+            raise ModelError(
+                kind=ModelErrorKind.NETWORK_ERROR,
+                message=str(exc),
+                retryable=retryable,
+                provider_name=self.provider_name,
+                model_name=model_name,
+            ) from exc
+
+    def _chat_completion_payload(self, request: ProviderRequest) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": request.preferences.model_name or self.settings.model,
+            "messages": _model_messages_to_openai(
+                request.messages,
+                self.capabilities(),
+            ),
+            "tools": [_model_tool_to_openai(tool) for tool in request.tools],
+            "tool_choice": _serialize_tool_choice(request.tool_choice),
+        }
+        if request.preferences.temperature is not None:
+            payload["temperature"] = request.preferences.temperature
+        if request.preferences.top_p is not None:
+            payload["top_p"] = request.preferences.top_p
+        if request.preferences.max_output_tokens is not None:
+            payload["max_tokens"] = request.preferences.max_output_tokens
+        if request.preferences.json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.settings.api_key}",
+            "Content-Type": "application/json",
+        }
 
     def _chat_completions_url(self) -> str:
         base_url = self.settings.base_url.rstrip("/")
@@ -338,6 +368,14 @@ class OpenAICompatibleModelProvider:
         if base_url.endswith("/v1"):
             return f"{base_url}/chat/completions"
         return f"{base_url}/v1/chat/completions"
+
+
+@dataclass
+class _StreamParseState:
+    tool_call_ids_by_index: dict[int, str] = field(default_factory=dict)
+    seen_tool_call_ids: set[str] = field(default_factory=set)
+    completed_tool_call_ids: set[str] = field(default_factory=set)
+    finish_reason: str = "stop"
 
 
 def _model_messages_to_openai(
@@ -426,6 +464,127 @@ def _raw_provider_tool_call(tool_call: dict[str, Any]) -> ModelToolCall:
         parse_status=parse_status,
         provider_metadata={"raw_tool_call": tool_call},
     )
+
+
+def _events_from_sse_line(
+    line: str | bytes,
+    *,
+    state: _StreamParseState,
+) -> Iterable[ProviderStreamEvent]:
+    text = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else str(line)
+    text = text.strip()
+    if not text or text.startswith(":"):
+        return []
+    if text.startswith("data:"):
+        text = text.removeprefix("data:").strip()
+    if text == "[DONE]":
+        completed_events = [
+            ProviderStreamEvent(
+                type=ProviderStreamEventType.TOOL_CALL_COMPLETED,
+                tool_call_id=call_id,
+            )
+            for call_id in sorted(state.seen_tool_call_ids - state.completed_tool_call_ids)
+        ]
+        completed_events.append(
+            ProviderStreamEvent(
+                type=ProviderStreamEventType.RESPONSE_COMPLETED,
+                metadata={"finish_reason": state.finish_reason},
+            )
+        )
+        return completed_events
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return [
+            ProviderStreamEvent(
+                type=ProviderStreamEventType.ERROR,
+                error=f"Invalid provider stream chunk: {text[:80]}",
+            )
+        ]
+
+    events: list[ProviderStreamEvent] = []
+    usage_payload = payload.get("usage")
+    if isinstance(usage_payload, dict):
+        events.append(
+            ProviderStreamEvent(
+                type=ProviderStreamEventType.USAGE_DELTA,
+                usage_delta=_usage_delta_from_payload(usage_payload),
+            )
+        )
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta") or {}
+        if not isinstance(delta, dict):
+            delta = {}
+        content = delta.get("content")
+        if content:
+            events.append(
+                ProviderStreamEvent(
+                    type=ProviderStreamEventType.TEXT_DELTA,
+                    text_delta=str(content),
+                )
+            )
+        for tool_event in _tool_delta_events(delta.get("tool_calls"), state):
+            events.append(tool_event)
+        finish_reason = choice.get("finish_reason")
+        if finish_reason:
+            state.finish_reason = str(finish_reason)
+            for call_id in sorted(state.seen_tool_call_ids - state.completed_tool_call_ids):
+                state.completed_tool_call_ids.add(call_id)
+                events.append(
+                    ProviderStreamEvent(
+                        type=ProviderStreamEventType.TOOL_CALL_COMPLETED,
+                        tool_call_id=call_id,
+                    )
+                )
+    return events
+
+
+def _tool_delta_events(
+    tool_calls: Any,
+    state: _StreamParseState,
+) -> Iterable[ProviderStreamEvent]:
+    if not isinstance(tool_calls, list):
+        return []
+    events: list[ProviderStreamEvent] = []
+    for index, tool_call in enumerate(tool_calls):
+        if not isinstance(tool_call, dict):
+            continue
+        raw_index = tool_call.get("index", index)
+        try:
+            call_index = int(raw_index)
+        except (TypeError, ValueError):
+            call_index = index
+        if tool_call.get("id"):
+            state.tool_call_ids_by_index[call_index] = str(tool_call["id"])
+        call_id = state.tool_call_ids_by_index.get(call_index, f"call_stream_{call_index}")
+        raw_function = tool_call.get("function")
+        function = raw_function if isinstance(raw_function, dict) else {}
+        name = function.get("name")
+        arguments_delta = function.get("arguments")
+        state.seen_tool_call_ids.add(call_id)
+        events.append(
+            ProviderStreamEvent(
+                type=ProviderStreamEventType.TOOL_CALL_DELTA,
+                tool_call_id=call_id,
+                tool_name=str(name) if name else None,
+                arguments_delta=str(arguments_delta) if arguments_delta is not None else None,
+            )
+        )
+    return events
+
+
+def _usage_delta_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    prompt_details = payload.get("prompt_tokens_details") or {}
+    completion_details = payload.get("completion_tokens_details") or {}
+    return {
+        "input_tokens": int(payload.get("prompt_tokens") or 0),
+        "output_tokens": int(payload.get("completion_tokens") or 0),
+        "total_tokens": int(payload.get("total_tokens") or 0),
+        "cached_input_tokens": int(prompt_details.get("cached_tokens") or 0),
+        "reasoning_tokens": int(completion_details.get("reasoning_tokens") or 0),
+    }
 
 
 def _chat_accepts_tool_choice(provider: Any) -> bool:

@@ -46,13 +46,31 @@ def test_model_runner_consumes_streaming_provider(tmp_path):
 
     class _StreamingProvider(MockModelProvider):
         def __init__(self) -> None:
-            super().__init__(text="", stream_events=[
-                ProviderStreamEvent(type=ProviderStreamEventType.TEXT_DELTA, text_delta="he"),
-                ProviderStreamEvent(type=ProviderStreamEventType.TEXT_DELTA, text_delta="llo"),
-                ProviderStreamEvent(type=ProviderStreamEventType.TOOL_CALL_DELTA, tool_call_id="call_1", tool_name="read_file", arguments_delta='{"path":"README.md"}'),
-                ProviderStreamEvent(type=ProviderStreamEventType.TOOL_CALL_COMPLETED, tool_call_id="call_1"),
-                ProviderStreamEvent(type=ProviderStreamEventType.RESPONSE_COMPLETED),
-            ])
+            super().__init__(
+                text="",
+                stream_events=[
+                    ProviderStreamEvent(type=ProviderStreamEventType.TEXT_DELTA, text_delta="he"),
+                    ProviderStreamEvent(type=ProviderStreamEventType.TEXT_DELTA, text_delta="llo"),
+                    ProviderStreamEvent(
+                        type=ProviderStreamEventType.TOOL_CALL_DELTA,
+                        tool_call_id="call_1",
+                        tool_name="read_file",
+                        arguments_delta='{"path":"README.md"}',
+                    ),
+                    ProviderStreamEvent(type=ProviderStreamEventType.TOOL_CALL_COMPLETED, tool_call_id="call_1"),
+                    ProviderStreamEvent(
+                        type=ProviderStreamEventType.USAGE_DELTA,
+                        usage_delta={
+                            "input_tokens": 3,
+                            "output_tokens": 4,
+                            "total_tokens": 7,
+                            "cached_input_tokens": 1,
+                            "reasoning_tokens": 2,
+                        },
+                    ),
+                    ProviderStreamEvent(type=ProviderStreamEventType.RESPONSE_COMPLETED),
+                ],
+            )
 
         def complete(self, request):
             raise AssertionError("streaming path should not call complete()")
@@ -79,3 +97,5 @@ def test_model_runner_consumes_streaming_provider(tmp_path):
     assert result.assistant_message is not None
     assert result.assistant_message.text == "hello"
     assert result.tool_calls[0].tool_name == "read_file"
+    assert result.usage.input_tokens == 3
+    assert result.usage.cached_input_tokens == 1

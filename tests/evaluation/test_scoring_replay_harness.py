@@ -19,6 +19,7 @@ from singularity.evaluation import (
     WorkspaceSnapshot,
     WorkspaceSnapshotKind,
 )
+from singularity.evaluation.execution import BenchmarkTaskExecutor
 from singularity.observability import TraceEventType, TraceRecorder
 
 
@@ -116,6 +117,32 @@ def test_patch_quality_evaluator_penalizes_large_and_redundant_diffs() -> None:
     assert small.metrics["tests_passed"] is True
     assert large.metrics["redundant_code"] is True
     assert "large_diff" in large.warnings
+
+
+def test_benchmark_executor_diff_summary_reports_real_complexity_and_redundancy() -> None:
+    summary = BenchmarkTaskExecutor.diff_summary_from_snapshots(
+        {"app.py": "def run():\n    return 1\n"},
+        {
+            "app.py": (
+                "def run(flag):\n"
+                "    if flag:\n"
+                "        return 1\n"
+                "    if flag:\n"
+                "        return 1\n"
+                "    return 0\n"
+            )
+        },
+    )
+
+    assert summary == [
+        {
+            "path": "app.py",
+            "added_lines": 6,
+            "removed_lines": 2,
+            "complexity": 2,
+            "redundant_code": True,
+        }
+    ]
 
 
 def test_trace_replay_is_deterministic_for_same_trace_and_profile(tmp_path: Path) -> None:
@@ -559,6 +586,91 @@ def test_evaluation_report_includes_golden_contract_evidence(tmp_path: Path) -> 
     assert "benchmark.contract.create_file_smoke_verify" in markdown
     assert "quicksort.py" in markdown
     assert "python -m pytest tests/test_quicksort.py" in markdown
+
+
+def test_golden_contract_observes_runtime_evidence_from_trace_and_hooks(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "quicksort.py").write_text("def quicksort(values):\n    return values\n", encoding="utf-8")
+    task = _contract_task()
+    executor = BenchmarkTaskExecutor(project_root=project)
+
+    contract = executor.evaluate_golden_contract(
+        task,
+        verification={"status": "ready", "results": [{"command": "python -m pytest tests/test_quicksort.py"}]},
+        assertions={"results": [{"assertion": "file_exists:quicksort.py", "passed": True}]},
+        diff={"changed_paths": ["quicksort.py"]},
+        diff_summary=[
+            {"path": "quicksort.py", "added_lines": 2, "removed_lines": 0},
+        ],
+        hook_results=[
+            {"name": "final_report", "stage": "after_run", "status": "success", "args": {"artifact": "final_report"}},
+            {"name": "repair", "stage": "after_run", "status": "success", "args": {"repair_applied": True}},
+            {"name": "sandbox", "stage": "after_run", "status": "blocked", "error_code": "sandbox_backend_unavailable", "args": {"sandbox_fail_closed": True}},
+        ],
+        trace_metrics={
+            "final_report_written": True,
+            "repair_attempt_count": 1,
+            "policy_denials": 1,
+        },
+    )
+
+    observed = {
+        item["name"]: item["observed"]
+        for item in contract["expected_evidence"]
+    }
+    assert observed["file_created"] is True
+    assert observed["verification_passed"] is True
+    assert observed["final_report_written"] is True
+
+    extra_task = task.with_updates(
+        golden_contract={
+            **task.golden_contract.to_dict(),
+            "expected_evidence": [
+                "repair_applied",
+                "sandbox_fail_closed",
+                "approval_required",
+            ],
+        }
+    )
+    extra = executor.evaluate_golden_contract(
+        extra_task,
+        verification={"status": "ready"},
+        assertions={},
+        diff={},
+        diff_summary=[],
+        hook_results=[
+            {"status": "success", "args": {"repair_applied": True}},
+            {"status": "blocked", "error_code": "sandbox_backend_unavailable"},
+        ],
+        trace_metrics={
+            "repair_attempt_count": 1,
+            "approval_required": True,
+        },
+    )
+    assert {item["name"]: item["observed"] for item in extra["expected_evidence"]} == {
+        "repair_applied": True,
+        "sandbox_fail_closed": True,
+        "approval_required": True,
+    }
+
+    failed_hook = executor.evaluate_golden_contract(
+        extra_task,
+        verification={"status": "ready"},
+        assertions={},
+        diff={},
+        diff_summary=[],
+        hook_results=[
+            {"status": "failed", "args": {"repair_applied": True}},
+            {"name": "final_report", "status": "failed", "args": {"artifact": "final_report"}},
+        ],
+        trace_metrics={},
+    )
+    assert {item["name"]: item["observed"] for item in failed_hook["expected_evidence"]} == {
+        "repair_applied": False,
+        "sandbox_fail_closed": False,
+        "approval_required": False,
+    }
 
 
 @pytest.mark.parametrize(

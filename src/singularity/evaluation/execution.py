@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 from dataclasses import dataclass, field
+from difflib import ndiff
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ from singularity.verification.models import CheckKind, VerificationCheck
 from singularity.verification.runner import VerificationRunner
 from singularity.workspace import WorkspaceMutationManager
 from singularity.workspace.errors import MutationError
-from singularity.workspace.operations import CreateFile
+from singularity.workspace.operations import CreateFile, EditOperation
 from singularity.workspace.pathing import WorkspacePathResolver
 
 
@@ -117,8 +118,10 @@ class BenchmarkTaskExecutor:
             assertions=assertions,
             diff=diff,
             diff_summary=diff_summary,
+            hook_results=hook_results,
+            trace_metrics=trace_metrics,
         )
-        failure_reasons = []
+        failure_reasons: list[str] = []
         failure_reasons.extend(snapshot.get("failure_reasons") or [])
         if diff.get("failure_reason"):
             failure_reasons.append(str(diff["failure_reason"]))
@@ -139,7 +142,11 @@ class BenchmarkTaskExecutor:
 
     def prepare_snapshot(self, task: BenchmarkTask, *, execute: bool) -> dict[str, Any]:
         snapshot = task.workspace_snapshot
-        payload = {"kind": snapshot.kind.value, "prepared": False, "execute": execute}
+        payload: dict[str, Any] = {
+            "kind": snapshot.kind.value,
+            "prepared": False,
+            "execute": execute,
+        }
         if snapshot.kind == WorkspaceSnapshotKind.GIT_REF:
             payload["git_ref"] = snapshot.git_ref
             payload["prepared"] = True
@@ -152,7 +159,7 @@ class BenchmarkTaskExecutor:
             payload["failure_reasons"] = ["snapshot_requires_execution"]
             return payload
         if snapshot.kind == WorkspaceSnapshotKind.INLINE_FILES:
-            operations = [
+            operations: list[EditOperation] = [
                 CreateFile(path=path, content=content)
                 for path, content in sorted(snapshot.inline_files.items())
             ]
@@ -282,7 +289,7 @@ class BenchmarkTaskExecutor:
                 "failure_reason": "diff_requires_execution",
             }
         after = _capture_text_snapshot(self.project_root)
-        summary = _diff_summary(before_snapshot, after)
+        summary = self.diff_summary_from_snapshots(before_snapshot, after)
         changed_paths = {item["path"] for item in summary}
         passed = 0
         failed = 0
@@ -332,6 +339,8 @@ class BenchmarkTaskExecutor:
         assertions: dict[str, Any],
         diff: dict[str, Any],
         diff_summary: list[dict[str, Any]],
+        hook_results: list[dict[str, Any]] | None = None,
+        trace_metrics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         contract = task.golden_contract
         if contract is None:
@@ -377,6 +386,8 @@ class BenchmarkTaskExecutor:
                         verification=verification,
                         diff_summary=diff_summary,
                         assertions=assertion_sources,
+                        hook_results=hook_results or [],
+                        trace_metrics=trace_metrics or {},
                     ),
                 }
                 for name in contract.expected_evidence
@@ -394,6 +405,13 @@ class BenchmarkTaskExecutor:
                 for kind in contract.required_trace_artifacts
             ],
         }
+
+    @staticmethod
+    def diff_summary_from_snapshots(
+        before: dict[str, str],
+        after: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        return _diff_summary(before, after)
 
     def _run_hook(self, hook: EvaluationHook, *, execute: bool) -> dict[str, Any]:
         if not execute:
@@ -694,21 +712,23 @@ def _diff_summary(before: dict[str, str], after: dict[str, str]) -> list[dict[st
             continue
         old_lines = old.splitlines() if old is not None else []
         new_lines = new.splitlines() if new is not None else []
-        added = max(0, len(new_lines) - len(old_lines))
-        removed = max(0, len(old_lines) - len(new_lines))
+        diff_lines = list(ndiff(old_lines, new_lines))
+        added = sum(1 for line in diff_lines if line.startswith("+ "))
+        removed = sum(1 for line in diff_lines if line.startswith("- "))
         if added == 0 and removed == 0:
             digest_old = hashlib.sha256((old or "").encode("utf-8")).hexdigest()
             digest_new = hashlib.sha256((new or "").encode("utf-8")).hexdigest()
             changed = 1 if digest_old != digest_new else 0
             added = changed
             removed = changed
+        added_lines = [line[2:].strip() for line in diff_lines if line.startswith("+ ")]
         summary.append(
             {
                 "path": path,
                 "added_lines": added,
                 "removed_lines": removed,
-                "complexity": 0,
-                "redundant_code": False,
+                "complexity": _diff_complexity(added_lines),
+                "redundant_code": _has_redundant_added_lines(added_lines),
             }
         )
     return summary
@@ -720,8 +740,12 @@ def _evidence_observed(
     verification: dict[str, Any],
     diff_summary: list[dict[str, Any]],
     assertions: set[str],
+    hook_results: list[dict[str, Any]] | None = None,
+    trace_metrics: dict[str, Any] | None = None,
 ) -> bool:
     normalized = name.strip().lower()
+    hook_results = hook_results or []
+    trace_metrics = trace_metrics or {}
     if normalized in {"verification_passed", "test_passed", "smoke_verified"}:
         return str(verification.get("status", "")).lower() in {
             "ready",
@@ -735,20 +759,111 @@ def _evidence_observed(
         return bool(diff_summary)
     if normalized in {"assertion_passed", "report_artifact_written"}:
         return bool(assertions)
+    if normalized == "final_report_written":
+        return _metric_truthy(trace_metrics, normalized) or _hook_reports(
+            hook_results,
+            {"final_report", "final_report_written", "report"},
+        )
+    if normalized == "repair_applied":
+        return _metric_positive(trace_metrics, "repair_attempt_count") or _hook_arg_truthy(
+            hook_results,
+            "repair_applied",
+        )
+    if normalized == "approval_required":
+        return _metric_truthy(trace_metrics, normalized) or _metric_positive(
+            trace_metrics,
+            "policy_denials",
+        )
+    if normalized == "sandbox_fail_closed":
+        return _metric_truthy(trace_metrics, normalized) or any(
+            "sandbox" in str(item.get("error_code", "")).lower()
+            and str(item.get("status", "")).lower() in {"blocked", "failed"}
+            for item in hook_results
+        )
+    if normalized in {"completion_rejected", "continued_after_rejection", "review_rejected"}:
+        return _metric_truthy(trace_metrics, normalized) or _hook_arg_truthy(
+            hook_results,
+            normalized,
+        )
     if normalized in {
-        "completion_rejected",
-        "continued_after_rejection",
-        "review_rejected",
-        "repair_applied",
-        "approval_required",
         "resume_recorded",
-        "sandbox_fail_closed",
         "dynamic_retrieval_recorded",
         "memory_write_gated",
-        "final_report_written",
     }:
-        return False
+        return _metric_truthy(trace_metrics, normalized) or _hook_arg_truthy(
+            hook_results,
+            normalized,
+        )
     return False
+
+
+def _diff_complexity(added_lines: list[str]) -> int:
+    control_markers = (
+        "if ",
+        "elif ",
+        "else:",
+        "for ",
+        "while ",
+        "try:",
+        "except ",
+        "match ",
+        "case ",
+        "with ",
+        "&&",
+        "||",
+        " and ",
+        " or ",
+    )
+    return sum(1 for line in added_lines if any(marker in line for marker in control_markers))
+
+
+def _has_redundant_added_lines(added_lines: list[str]) -> bool:
+    meaningful = [
+        line
+        for line in added_lines
+        if line and not line.startswith("#") and line not in {"pass", "return None"}
+    ]
+    return len(meaningful) != len(set(meaningful))
+
+
+def _metric_truthy(metrics: dict[str, Any], name: str) -> bool:
+    return bool(metrics.get(name))
+
+
+def _metric_positive(metrics: dict[str, Any], name: str) -> bool:
+    try:
+        return int(metrics.get(name) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _hook_reports(hook_results: list[dict[str, Any]], names: set[str]) -> bool:
+    for item in hook_results:
+        name = str(item.get("name") or "").lower()
+        raw_args = item.get("args")
+        args = raw_args if isinstance(raw_args, dict) else {}
+        if not _hook_status_positive(item):
+            continue
+        if name in names:
+            return True
+        if str(args.get("artifact") or "").lower() in names:
+            return True
+    return False
+
+
+def _hook_arg_truthy(hook_results: list[dict[str, Any]], name: str) -> bool:
+    for item in hook_results:
+        if not _hook_status_positive(item):
+            continue
+        raw_args = item.get("args")
+        args = raw_args if isinstance(raw_args, dict) else {}
+        if args.get(name):
+            return True
+    return False
+
+
+def _hook_status_positive(item: dict[str, Any]) -> bool:
+    return str(item.get("status", "")).lower() in {"success", "ready", "passed"}
 
 
 def _regressions_from_report_json(json_text: str) -> list[dict[str, Any]]:

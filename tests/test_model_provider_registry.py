@@ -1,3 +1,4 @@
+import json as json_module
 from typing import ClassVar
 
 import httpx
@@ -185,6 +186,89 @@ class _FakePermissionDeniedClient(_FakeClient):
         )
 
 
+class _FakeStreamResponse:
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    def __enter__(self) -> "_FakeStreamResponse":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_lines(self):
+        yield from self._lines
+
+
+class _FakeStreamClient(_FakeClient):
+    def post(self, url: str, *, headers: dict[str, str], json: dict) -> _FakeResponse:
+        raise AssertionError("streaming path should not call non-streaming post()")
+
+    def stream(self, method: str, url: str, *, headers: dict[str, str], json: dict):
+        _ = method, url, headers
+        self.payloads.append(json)
+        chunks = [
+            {"id": "chunk_1", "model": "test-model", "choices": [{"delta": {"content": "he"}}]},
+            {"id": "chunk_1", "model": "test-model", "choices": [{"delta": {"content": "llo"}}]},
+            {
+                "id": "chunk_1",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"path":',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+            },
+            {
+                "id": "chunk_1",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": '"README.md"}'},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+            {
+                "id": "chunk_1",
+                "model": "test-model",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 7,
+                    "total_tokens": 12,
+                    "prompt_tokens_details": {"cached_tokens": 2},
+                    "completion_tokens_details": {"reasoning_tokens": 3},
+                },
+            },
+        ]
+        return _FakeStreamResponse(
+            [f"data: {json_module.dumps(chunk)}" for chunk in chunks] + ["data: [DONE]"]
+        )
+
+
 def test_openai_compatible_model_provider_serializes_model_turn_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -222,10 +306,11 @@ def test_openai_compatible_provider_keeps_parallel_tool_compatibility() -> None:
     assert provider.capabilities().supports_streaming is True
 
 
-def test_openai_compatible_provider_streams_complete_response_fallback(
+def test_openai_compatible_provider_streams_chat_completion_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("singularity.model.providers.httpx.Client", _FakeToolClient)
+    _FakeStreamClient.payloads = []
+    monkeypatch.setattr("singularity.model.providers.httpx.Client", _FakeStreamClient)
     provider = OpenAICompatibleModelProvider(
         Settings(base_url="https://example.test/v1", api_key="test-key", model="test-model")
     )
@@ -246,13 +331,28 @@ def test_openai_compatible_provider_streams_complete_response_fallback(
     )
 
     assert [event.type.value for event in events] == [
+        "text_delta",
+        "text_delta",
+        "tool_call_delta",
         "tool_call_delta",
         "tool_call_completed",
         "usage_delta",
         "response_completed",
     ]
-    assert events[0].tool_name == "read_file"
-    assert events[0].arguments_delta == '{"path":"README.md"}'
+    assert _FakeStreamClient.payloads[0]["stream"] is True
+    assert _FakeStreamClient.payloads[0]["stream_options"] == {"include_usage": True}
+    assert events[0].text_delta == "he"
+    assert events[2].tool_name == "read_file"
+    assert events[2].arguments_delta == '{"path":'
+    assert events[3].arguments_delta == '"README.md"}'
+    assert events[4].tool_call_id == "call_1"
+    assert events[5].usage_delta == {
+        "input_tokens": 5,
+        "output_tokens": 7,
+        "total_tokens": 12,
+        "cached_input_tokens": 2,
+        "reasoning_tokens": 3,
+    }
 
 
 def test_openai_compatible_provider_records_cached_prompt_tokens(
