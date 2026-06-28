@@ -3,9 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 
 from singularity.config import ProductionConfig
+from singularity.kernel.agent_kernel import AgentKernel
 from singularity.kernel.graph import AgentGraph, AgentGraphBuilder
 from singularity.kernel.health import ComponentHealthChecker
-from singularity.kernel.models import ComponentName, ComponentState, RunIdentity
+from singularity.kernel.lifecycle import RunLifecycleManager
+from singularity.kernel.models import (
+    ComponentName,
+    ComponentState,
+    KernelContext,
+    KernelStatus,
+    RunIdentity,
+)
+from singularity.model import ModelMessage, ModelTurnResult, ModelTurnStatus
 from singularity.observability import TraceRecorder
 from singularity.planner.models import TaskState
 from singularity.policy.permissions import ApprovalPolicy
@@ -219,6 +228,77 @@ def test_agent_graph_defers_evaluation_harness_until_used(tmp_path: Path, monkey
     assert evaluation_harness.verification_runner is graph.verification_runner
     assert evaluation_harness.memory_pipeline is graph.memory_pipeline
     assert evaluation_harness.planner is graph.planner
+
+
+def test_graph_kernel_agentloop_model_request_chain_uses_built_components(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    graph = _build_graph(tmp_path, monkeypatch, user_goal="Summarize project")
+    real_model_runner = graph.model_runner
+    request_ids: list[str] = []
+
+    class FakeModelRunner:
+        def __init__(self, delegate) -> None:
+            self.delegate = delegate
+
+        def build_request_from_context(self, *args, **kwargs):
+            request = self.delegate.build_request_from_context(*args, **kwargs)
+            request_ids.append(request.request_id)
+            return request
+
+        def run_turn(self, request):
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id="resp_kernel_chain",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text("kernel chain completed"),
+            )
+
+    fake_model_runner = FakeModelRunner(real_model_runner)
+    graph.model_runner = fake_model_runner  # type: ignore[assignment]
+    graph.context_manager.model_runner = fake_model_runner  # type: ignore[assignment]
+    graph.planner.assess_completion = lambda mark_blocked=False: {  # type: ignore[method-assign]
+        "status": "completed",
+        "unmet": [],
+        "criteria": {},
+        "verification_contract_satisfaction": {"satisfied": True},
+    }
+    identity = RunIdentity.new(
+        run_id=graph.trace.run_id,
+        session_id=graph.trace.session_id,
+        task_id=graph.trace.run_id,
+    )
+    lifecycle = RunLifecycleManager(identity=identity, trace=graph.trace)
+    run = lifecycle.create_run("Summarize project")
+    session = lifecycle.start_session()
+    context = KernelContext(
+        project_root=tmp_path,
+        identity=identity,
+        run=run,
+        session=session,
+        status=KernelStatus.READY,
+        workspace_lock_status="acquired",
+    )
+
+    class Lock:
+        released = False
+
+        def release_lock(self) -> None:
+            self.released = True
+
+    result = AgentKernel(
+        context=context,
+        graph=graph,
+        lifecycle=lifecycle,
+        workspace_lock=Lock(),
+    ).run_task("Summarize project")
+
+    assert result.final_answer == "kernel chain completed"
+    assert request_ids
+    assert request_ids[0].startswith("model_req_")
+    events = graph.trace.store.query_events()
+    assert any(event.event_type.value == "final_report.completed" for event in events)
 
 
 def test_component_health_reports_missing_evaluation_as_critical() -> None:

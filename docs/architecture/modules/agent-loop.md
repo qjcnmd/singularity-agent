@@ -28,7 +28,7 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 
 ## 真实运行时调用链
 
-`AgentKernel.run_task()` 构造 `AgentLoop` -> `AgentLoop.run()` -> `RunController.run_loop()` 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`，最后通过 `Planner.finalize()` 或失败 outcome 结束。
+`AgentKernel.run_task()` 构造 `AgentLoop` -> `AgentLoop.run()` 创建 `RunController` 并启动 planner 状态；`run()` 内部的 `run_turn()` callback 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`，最后通过 `Planner.finalize()` 或失败 outcome 结束。
 
 ## 真实任务中的对象流
 
@@ -64,7 +64,7 @@ class AgentLoopStatus(str, Enum):
 
 ### 数据流概述
 
-`AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部 `RunController.run_loop()` 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `_attempt_finalize()` 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `_terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
+`AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部创建 `RunController`，再把每一轮执行封装在局部 `run_turn()` callback 中：`planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `_attempt_finalize()` 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `_terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
 
 ## 谁生成这些对象
 

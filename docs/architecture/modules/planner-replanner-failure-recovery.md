@@ -212,7 +212,7 @@ class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
 
 ## 谁消费这些对象
 
-- `Planner.step()`、`AgentLoop.run()`、`RunController.run_loop()` 和 `Finalizer.build()` 消费 `TaskState`/`TaskPlan`/`CompletionCriteria`；`ToolExecutor.execute_request()` 消费当前 `TaskPhase` 与 `AgentAction`。主模型只接收 `PlannerContextRenderer.render()` 投影的 goal、phase、allowed tools、rolling plan 与选择性 evidence，不接收完整 state/plan。
+- `Planner.step()`、`AgentLoop.run()` 内部 `run_turn()`、`RunController.apply_protocol_result()` / `apply_outcome()` 和 `Finalizer.build()` 消费 `TaskState`/`TaskPlan`/`CompletionCriteria`；`ToolExecutor.execute_request()` 消费当前 `TaskPhase` 与 `AgentAction`。主模型只接收 `PlannerContextRenderer.render()` 投影的 goal、phase、allowed tools、rolling plan 与选择性 evidence，不接收完整 state/plan。
 - `Planner.assess_completion()` 消费 `EvidenceLedger`，`BudgetController.check_budget()` 和 `Planner.step()` 消费 `ExecutionBudget`；ledger/budget 全量对象不进模型。`AuthorizationDecision` 由 `ToolExecutor.authorize()` 消费，deny reason 可经 tool observation 进入后续模型。
 - `Planner.replan()` 消费 `ReplanDecision`/`RiskEscalation`；replan signal 会进入 planner-decision producer 的独立模型请求。`AgentKernel.run_task()`、CLI、evaluation 和 `MemoryLearningPipeline.ingest_final_report()` 消费 `FinalReport`，final report 不再发送给主模型。
 

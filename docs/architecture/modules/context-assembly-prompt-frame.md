@@ -16,8 +16,16 @@
 - ContextReference
 - ContextBudgetPlan
 - ContextBundle
+- ContextSnapshot
+- ToolObservation
+- PlannerState
+- PolicyObservation
+- VerificationEvidence
+- MutationEvidence
+- CommandObservation
 - ContextSummaryPayload
 - ContextSummaryEnvelope
+- CacheAttribution
 - PromptManifest
 - PromptBundle
 
@@ -27,7 +35,15 @@
 - ContextBudgetPlan: model_context_window, output_token_reserve, reasoning_token_reserve, tool_schema_tokens, system_tokens, pinned_tokens, evidence_tokens, recent_dialogue_tokens, summary_tokens, available_tokens, used_tokens, overflow_tokens, soft_limit, hard_limit, message_tokens
 - ContextRenderPolicy: include_raw_tool_outputs, include_policy_details, include_secret_content, include_full_diff, include_failed_attempts, max_tool_preview_tokens, max_evidence_items, max_recent_turns, require_references_for_claims, redact_sensitive, phase_aware
 - ContextBundle: bundle_id, run_id, task_id, phase_id, model, provider, messages, included_item_ids, excluded_item_ids, budget, compression_snapshot_id, retrieval_query, render_policy, created_at, bundle_digest, metadata
+- ContextSnapshot: snapshot_id, run_id, session_id, task_id, goal, summary, retained_item_ids, known_observation_ids, version, created_at, retained_messages, metadata
+- ToolObservation: id, tool_name, tool_call_id, ok, raw_result, preview, truncated, metadata, run_id, turn, created_at, input_tokens, preview_tokens, raw_digest, source_refs, cache_hit, duration_seconds, error_code, tool_version, truncation_reason, sensitivity
+- PlannerState: task_id, current_phase, status, current_plan, completion_criteria, open_actions, blocked_actions, risk_escalations, evidence_refs
+- PolicyObservation: decision_id, request_id, outcome, risk_level, reason, constraints_summary, user_decision, approval_grant_id, component, operation, resource, reference
+- VerificationEvidence: check_id, command, status, failure_summary, parsed_failures, repair_hints, logs_ref, confidence
+- MutationEvidence: transaction_id, files_changed, diff_summary, rollback_ref, status
+- CommandObservation: command_id, command_preview, exit_code, status, stdout_preview, stderr_preview, output_ref, resource_limits, policy_decision_id
 - ContextUsageReport: layer_token_usage, included_item_ids, excluded_item_ids, stale_item_ids, summary_item_ids, recent_tail_item_ids, input_tokens, cached_input_tokens, cache_hit_ratio, cache_miss_reasons, cache_attribution, recommendations
+- CacheAttribution: source, confidence, reasons, evidence, provider_name, model_name
 - ContextSummaryPayload: goal, current_state, completed_actions, pending_actions, verified_facts, failed_attempts, policy_constraints, workspace_changes, verification_status, open_questions, reference_ids, omitted_item_ids, confidence
 - ContextSummaryEnvelope: version, summary_id, summary_payload, source_item_ids, cache_attribution, previous_summary_digest, summary_digest, rendered_summary, created_at, metadata
 - PromptManifest: manifest_id, bundle_id, purpose, source_count, section_count, trust_summary, priority_summary, conflict_count, injection_warning_count, redaction_applied, prompt_hash, token_estimate, folded_developer_into_system, metadata
@@ -57,7 +73,7 @@ Context 层把系统提示、用户目标、planner 状态、memory、project in
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`ContextManager.add_user_message()`、`add_planner_state()`、`add_tool_protocol_result()` -> `ObservationStore.append_message()` / `append_item()` 先生成对象 `ContextItem` 并写入 `context.sqlite3`。随后 `ModelRunner.build_request_from_context()` -> `ContextAssembler.build_bundle()` -> `PromptAssemblyPipeline.build()` 读取这些 item，生成 `ContextBundle`、`ContextUsageReport`、`PromptBundle` 和 `PromptManifest`，再映射为 `ModelTurnRequest.messages`。溢出时 `ContextAssembler.needs_compression()` 触发 compaction；失败返回 `ContextOverflowError` 或带 excluded item 的 usage report，不把所有 context 无界送入 provider。
+以用户要求修复 `quicksort.py` 为例：`ContextManager.add_user_message()`、`add_assistant_message()`、`add_tool_result()`、`add_tool_protocol_result()`、`add_synthetic_tool_error()`、`add_trace_summary()`、`add_policy_observation()`、`add_planner_state()`、`add_mutation_evidence()`、`add_command_observation()`、`add_verification_evidence()`、`add_workspace_state()`、`add_edit_result()`、`add_project_index()`、`add_memory_context_block()` 与 `add_failure()` 把组件观察投影成 `ContextItem`、`ContextReference` 或专门 observation dataclass，并通过 `ObservationStore.append_message()` / `append_item()` 写入 `context.sqlite3`。随后 `ModelRunner.build_request_from_context()` -> `ContextManager.build_bundle()` -> `ContextAssembler.build_bundle()` 读取这些 item，生成 `ContextBundle` 与 `ContextUsageReport`；同一 request 构建过程调用 `PromptAssemblyPipeline.build_for_model_turn()`，它内部通过 `collect_sources()`、`resolve()`、`build_prompt_bundle()` 和 `compile_prompt()` 生成 `PromptBundle` 与 `PromptManifest`，再由 `ModelTurnRequestBuilder.build_request()` 合并为 `ModelTurnRequest.messages`。溢出时 `ContextAssembler.needs_compression()` 触发 compaction；失败返回 `ContextOverflowError` 或带 excluded item 的 usage report，不把所有 context 无界送入 provider。
 
 ## 真实对象完整结构
 
@@ -139,6 +155,118 @@ class ContextBudgetPlan:
     soft_limit: int = 0    # int(model_context_window * 0.9)
     hard_limit: int = 0    # model_context_window
     message_tokens: int = 0
+```
+
+### Context 观察与快照对象
+
+这些对象是 ContextManager 的 typed observation 输入或 context store snapshot。**边界**：内部对象；可投影成 ContextItem 或 snapshot 行落盘，只有经过 `ContextAssembler.build_bundle()` 选择、预算与 redaction 的摘要进入模型消息。
+
+```python
+@dataclass
+class ContextSnapshot:
+    snapshot_id: str
+    run_id: str
+    session_id: str = ""
+    task_id: str = ""
+    goal: str = ""
+    summary: str = ""
+    retained_item_ids: list[str] = field(default_factory=list)
+    known_observation_ids: list[str] = field(default_factory=list)
+    version: int = 0
+    created_at: str = field(default_factory=lambda: _now())
+    retained_messages: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class ToolObservation:
+    id: str
+    tool_name: str
+    tool_call_id: str | None
+    ok: bool
+    raw_result: dict[str, Any]
+    preview: str
+    truncated: bool
+    metadata: dict[str, Any] = field(default_factory=dict)
+    run_id: str = ""
+    turn: int = 0
+    created_at: str = ""
+    input_tokens: int = 0
+    preview_tokens: int = 0
+    raw_digest: str = ""
+    source_refs: list[ContextReference] = field(default_factory=list)
+    cache_hit: bool = False
+    duration_seconds: float | None = None
+    error_code: str | None = None
+    tool_version: str | None = None
+    truncation_reason: str | None = None
+    sensitivity: ContextSensitivity = ContextSensitivity.WORKSPACE
+
+@dataclass
+class PlannerState:
+    task_id: str
+    current_phase: str
+    status: str
+    current_plan: list[Any]
+    completion_criteria: dict[str, Any]
+    open_actions: list[Any]
+    blocked_actions: list[Any]
+    risk_escalations: list[Any]
+    evidence_refs: list[str]
+
+@dataclass
+class PolicyObservation:
+    decision_id: str
+    request_id: str
+    outcome: str
+    risk_level: str
+    reason: str
+    constraints_summary: list[str]
+    user_decision: str | None
+    approval_grant_id: str | None
+    component: str
+    operation: str
+    resource: str
+    reference: str | None = None
+
+@dataclass
+class VerificationEvidence:
+    check_id: str
+    command: str
+    status: str
+    failure_summary: str | None
+    parsed_failures: list[Any]
+    repair_hints: list[Any]
+    logs_ref: str | None
+    confidence: float
+
+@dataclass
+class MutationEvidence:
+    transaction_id: str
+    files_changed: list[str]
+    diff_summary: str
+    rollback_ref: str | None
+    status: str
+
+@dataclass
+class CommandObservation:
+    command_id: str
+    command_preview: str
+    exit_code: int | None
+    status: str
+    stdout_preview: str
+    stderr_preview: str
+    output_ref: str | None
+    resource_limits: dict[str, Any]
+    policy_decision_id: str | None
+
+@dataclass
+class CacheAttribution:
+    source: CacheAttributionSource = CacheAttributionSource.UNKNOWN
+    confidence: float = 0.0
+    reasons: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    provider_name: str | None = None
+    model_name: str | None = None
 ```
 
 ### 关键枚举值域

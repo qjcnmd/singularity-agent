@@ -15,6 +15,7 @@ from singularity.tools import (
     ToolRegistry,
     ToolSpec,
 )
+from singularity.tools.models import ToolExecutionFailure
 from tests.tool_executor_helpers import default_policy_engine, make_test_policy_engine
 
 
@@ -141,6 +142,60 @@ def test_delegated_backend_contract_does_not_require_legacy_boolean(tmp_path: Pa
     assert result.ok is False
     assert result.error_code == "sandbox_required"
     assert called is False
+
+
+def test_delegated_backend_preflight_failure_does_not_fall_back_to_handler(tmp_path: Path) -> None:
+    class DelegatedOwner:
+        def __init__(self) -> None:
+            self.called = False
+
+        def _request(self, args: EmptyInput) -> dict[str, str]:
+            _ = args
+            return {"shell": "python -m pytest"}
+
+        def validate_direct_command(self, request: dict[str, str]) -> None:
+            _ = request
+            raise ToolExecutionFailure(
+                "Direct command rejected.",
+                code="direct_command_denied",
+                details={"reason": "preflight"},
+            )
+
+        def handler(self, args: EmptyInput) -> dict[str, str]:
+            _ = args
+            self.called = True
+            return {"ran": "handler"}
+
+    owner = DelegatedOwner()
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="preflight_command",
+            description="delegated",
+            input_model=EmptyInput,
+            handler=owner.handler,
+            permission_level=PermissionLevel.SHELL,
+            capabilities=(Capability.EXECUTE_COMMAND,),
+            operation=OperationKind.EXECUTE_COMMAND,
+            execution_backend=ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR,
+            uses_command_executor=True,
+        )
+    )
+    component = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.coding_agent(),
+        trace=JsonlTraceRecorder.create(tmp_path),
+        workspace_root=tmp_path,
+        standalone_can_execute=True,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+
+    result = component.execute_tool_call(make_tool_call("preflight_command"))
+
+    assert result.ok is False
+    assert result.error_code == "direct_command_denied"
+    assert result.error.details == {"reason": "preflight"}
+    assert owner.called is False
 
 
 def test_delegated_backend_does_not_use_process_isolation(tmp_path: Path) -> None:

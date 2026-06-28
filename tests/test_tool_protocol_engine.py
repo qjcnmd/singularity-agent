@@ -199,6 +199,82 @@ def test_tool_protocol_passes_structured_execution_request(tmp_path: Path) -> No
     assert execution_request.argument_digest
 
 
+def test_tool_protocol_replay_prevents_executor_ledger_reexecution(tmp_path: Path) -> None:
+    class EchoInput(BaseModel):
+        value: str
+
+    calls: list[str] = []
+
+    def handler(args: EchoInput) -> dict[str, str]:
+        calls.append(args.value)
+        return {"value": args.value}
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="echo",
+            description="echo",
+            input_model=EchoInput,
+            handler=handler,
+            permission_level=PermissionLevel.READ_ONLY,
+            side_effects=ToolSideEffectKind.READ_WORKSPACE,
+            idempotent=True,
+        )
+    )
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_executor = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+
+    def result(response_id: str) -> ModelTurnResult:
+        return ModelTurnResult(
+            request_id="req_replay",
+            response_id=response_id,
+            status=ModelTurnStatus.SUCCESS,
+            assistant_message=ModelMessage.assistant_text(""),
+            tool_calls=[
+                ModelToolCall(
+                    tool_call_id="call_echo",
+                    tool_name="echo",
+                    arguments={"value": "x"},
+                    raw_arguments='{"value":"x"}',
+                    parse_status=ModelToolParseStatus.VALID,
+                )
+            ],
+        )
+
+    first = tool_protocol.process_model_turn(
+        request=None,
+        result=result("resp_first"),
+        turn=1,
+        context=context,
+        tool_executor=tool_executor,
+    )
+    second = tool_protocol.process_model_turn(
+        request=None,
+        result=result("resp_second"),
+        turn=2,
+        context=context,
+        tool_executor=tool_executor,
+    )
+
+    assert first.executed_count == 1
+    assert second.executed_count == 0
+    assert second.appended_tool_message_count == 0
+    assert calls == ["x"]
+    assert tool_protocol.state_store.result_binding_by_tool_call_id("call_echo") is not None
+    assert json.loads(context.messages()[-1]["content"])["ok"] is True
+
+
 def test_tool_protocol_executes_parallel_read_only_group_concurrently(tmp_path: Path) -> None:
     barrier = threading.Barrier(2, timeout=3)
     calls_started: list[str] = []

@@ -106,6 +106,14 @@ COMPLETE_FIELD_CHECKS = {
         "ContextRenderPolicy",
         "ContextBundle",
         "ContextUsageReport",
+        "ContextSnapshot",
+        "ToolObservation",
+        "PlannerState",
+        "PolicyObservation",
+        "VerificationEvidence",
+        "MutationEvidence",
+        "CommandObservation",
+        "CacheAttribution",
         "ContextSummaryPayload",
         "ContextSummaryEnvelope",
         "PromptManifest",
@@ -424,6 +432,17 @@ def _verify_doc(doc: ModuleDataFlowDoc, errors: list[str]) -> None:
             errors.append(f"{label}: complete field check missing 字段清单 entry: {class_name}")
 
     _verify_deep_dive_section(doc, errors)
+    _verify_doc_specific_contracts(doc, errors)
+
+
+def _verify_doc_specific_contracts(doc: ModuleDataFlowDoc, errors: list[str]) -> None:
+    label = _rel(doc.path)
+    removed_prompt_entrypoint = "PromptAssemblyPipeline." + "build()"
+    if doc.doc_id == "context-assembly-prompt-frame" and removed_prompt_entrypoint in doc.text:
+        errors.append(
+            f"{label}: PromptAssemblyPipeline has no build() entrypoint; "
+            "document build_for_model_turn()/build_prompt_bundle() instead"
+        )
 
 
 def _verify_deep_dive_section(doc: ModuleDataFlowDoc, errors: list[str]) -> None:
