@@ -87,7 +87,7 @@ singularity-agent "inspect and verify this project" \
 - `on-request`允许高风险动作进入审批；`never`把需要审批的动作转为拒绝。
 - protected paths由Policy、command、tool和workspace mutation边界执行，不能由模型提供的参数关闭。
 
-当前 sandbox 只注册OS-native方向的`WindowsSandboxBackend`。它会探测restricted token、Job Object、low integrity、ACL、Windows Firewall和private desktop能力，但当前elevated setup及native launcher尚未完成，因此报告`backend_unavailable`。Sandbox-required命令不会回退到普通本地进程；workspace projection或文件复制也不会被表述为强隔离。非Windows平台在实现对应native backend前同样明确不可用。
+当前 sandbox 只注册OS-native方向的`WindowsSandboxBackend`。Windows实现是account-backed OS sandbox：通过elevated setup创建/加固专用本地账户、Credential Manager凭据、登录UI隐藏项、logon rights、Users组、state dir ACL和account-scoped firewall；执行时以该账户启动runner，再用restricted low-integrity token、private desktop和Job Object运行命令。缺少任一doctor/setup/execution能力时仍报告`backend_unavailable`并fail closed，不回退到普通本地进程；workspace projection或文件复制也不会被表述为强隔离。非Windows平台在实现对应native backend前同样明确不可用。
 
 ## CLI
 
