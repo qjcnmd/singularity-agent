@@ -413,7 +413,7 @@ def _optional_int(value: object) -> int | None:
         return None
     if isinstance(value, bool):
         return int(value)
-    if isinstance(value, (int, float, str)):
+    if isinstance(value, int | float | str):
         return int(value)
     return None
 

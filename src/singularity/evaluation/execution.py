@@ -895,7 +895,7 @@ def _hook_args_to_argv(args: dict[str, Any]) -> list[str]:
         if value is True:
             argv.append(flag)
             continue
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list | tuple):
             for item in value:
                 argv.extend([flag, str(item)])
             continue

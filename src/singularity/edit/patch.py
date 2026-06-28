@@ -142,7 +142,7 @@ class PatchBuilder:
         tree = ast.parse(self._read_text(operation.path), filename=operation.path)
         candidates: list[ast.AST] = []
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol_name:
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) and node.name == symbol_name:
                 if operation.symbol_kind and _node_kind(node) != operation.symbol_kind:
                     continue
                 candidates.append(node)
@@ -315,6 +315,6 @@ def _coalesce(*values: str | None) -> str:
 def _node_kind(node: ast.AST) -> str:
     if isinstance(node, ast.ClassDef):
         return "class"
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
         return "function"
     return "unknown"

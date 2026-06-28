@@ -651,7 +651,7 @@ def _symbols_in_sources(paths: list[Path]) -> set[str]:
             if isinstance(node, ast.ClassDef):
                 symbols.add(node.name)
                 for child in node.body:
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
                         symbols.add(f"{node.name}.{child.name}")
                     elif isinstance(child, ast.Assign):
                         for target in child.targets:
@@ -659,7 +659,7 @@ def _symbols_in_sources(paths: list[Path]) -> set[str]:
                                 symbols.add(f"{node.name}.{target.id}")
                     elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
                         symbols.add(f"{node.name}.{child.target.id}")
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 symbols.add(node.name)
             elif isinstance(node, ast.Assign):
                 for target in node.targets:

@@ -1223,7 +1223,7 @@ class WorkspaceMutationManager:
             payload = self._deep_update(payload, operation.updates)
             final_texts[path] = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
             return
-        if isinstance(operation, (UpdateYaml, UpdateToml)):
+        if isinstance(operation, UpdateYaml | UpdateToml):
             raise MutationError(
                 "invalid_operation",
                 f"{operation_type(operation)} interface is reserved for a structured parser.",

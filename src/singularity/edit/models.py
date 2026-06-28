@@ -334,7 +334,7 @@ def _to_plain(value: Any) -> Any:
         return {key: _to_plain(item) for key, item in asdict(value).items()}
     if isinstance(value, dict):
         return {str(key): _to_plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, list | tuple | set):
         return [_to_plain(item) for item in value]
     return value
 

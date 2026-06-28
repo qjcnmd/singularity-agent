@@ -340,7 +340,7 @@ def _model_usage_summary(events: list[TraceEvent]) -> ModelUsageSummary:
 def _safe_int(value: Any) -> int:
     if isinstance(value, bool) or value is None:
         return 0
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return int(value)
     if isinstance(value, str):
         try:

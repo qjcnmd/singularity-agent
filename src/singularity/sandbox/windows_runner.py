@@ -13,7 +13,7 @@ from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NEW_CONSOLE = 0x00000010
@@ -95,7 +95,7 @@ class WindowsRunnerSpec:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> WindowsRunnerSpec:
         command = payload.get("command")
-        if not isinstance(command, (list, str)):
+        if not isinstance(command, list | str):
             raise ValueError("runner spec command must be a list or string.")
         env = payload.get("env") or {}
         if not isinstance(env, dict):
@@ -951,7 +951,7 @@ def _now() -> str:
 
 
 class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
         ("PerProcessUserTimeLimit", ctypes.c_int64),
         ("PerJobUserTimeLimit", ctypes.c_int64),
         ("LimitFlags", ctypes.c_uint32),
@@ -965,7 +965,7 @@ class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
 
 
 class IO_COUNTERS(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
         ("ReadOperationCount", ctypes.c_uint64),
         ("WriteOperationCount", ctypes.c_uint64),
         ("OtherOperationCount", ctypes.c_uint64),
@@ -976,7 +976,7 @@ class IO_COUNTERS(ctypes.Structure):
 
 
 class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
         ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
         ("IoInfo", IO_COUNTERS),
         ("ProcessMemoryLimit", ctypes.c_size_t),
@@ -987,7 +987,7 @@ class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
 
 
 class SECURITY_ATTRIBUTES(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
         ("nLength", wintypes.DWORD),
         ("lpSecurityDescriptor", wintypes.LPVOID),
         ("bInheritHandle", wintypes.BOOL),
@@ -995,7 +995,7 @@ class SECURITY_ATTRIBUTES(ctypes.Structure):
 
 
 class STARTUPINFO(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
         ("cb", wintypes.DWORD),
         ("lpReserved", wintypes.LPWSTR),
         ("lpDesktop", wintypes.LPWSTR),
@@ -1018,7 +1018,7 @@ class STARTUPINFO(ctypes.Structure):
 
 
 class PROCESS_INFORMATION(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
         ("hProcess", wintypes.HANDLE),
         ("hThread", wintypes.HANDLE),
         ("dwProcessId", wintypes.DWORD),
@@ -1027,18 +1027,18 @@ class PROCESS_INFORMATION(ctypes.Structure):
 
 
 class SID_AND_ATTRIBUTES(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
         ("Sid", wintypes.LPVOID),
         ("Attributes", wintypes.DWORD),
     ]
 
 
 class TOKEN_MANDATORY_LABEL(ctypes.Structure):
-    _fields_ = [("Label", SID_AND_ATTRIBUTES)]
+    _fields_: ClassVar[list[tuple[str, Any]]] = [("Label", SID_AND_ATTRIBUTES)]
 
 
 class CREDENTIALW(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
         ("Flags", wintypes.DWORD),
         ("Type", wintypes.DWORD),
         ("TargetName", wintypes.LPWSTR),
@@ -1055,7 +1055,7 @@ class CREDENTIALW(ctypes.Structure):
 
 
 class TOKEN_USER(ctypes.Structure):
-    _fields_ = [("User", SID_AND_ATTRIBUTES)]
+    _fields_: ClassVar[list[tuple[str, Any]]] = [("User", SID_AND_ATTRIBUTES)]
 
 
 def _kernel32():

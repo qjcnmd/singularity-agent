@@ -156,7 +156,7 @@ class PythonPlugin(LanguagePlugin):
                 symbols.append(
                     _symbol(file.path, node.name, qualified, SymbolKind.CLASS, node, self.backend.name, self.backend.version)
                 )
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 kind = SymbolKind.TEST if node.name.startswith("test_") or file.is_test else SymbolKind.FUNCTION
                 qualified = f"{module_name}.{node.name}"
                 symbols.append(
@@ -345,7 +345,7 @@ def _symbol(path: str, name: str, qualified: str, kind: SymbolKind, node: ast.AS
 
 
 def _signature(node: ast.AST) -> str | None:
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
         args = [arg.arg for arg in node.args.args]
         return f"{node.name}({', '.join(args)})"
     if isinstance(node, ast.ClassDef):

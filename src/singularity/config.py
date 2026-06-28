@@ -610,7 +610,7 @@ def _path_tuple(value: Any, *, root: Path) -> tuple[Path, ...]:
         return ()
     if isinstance(value, str):
         items = [item for item in value.split(os.pathsep) if item]
-    elif isinstance(value, (list, tuple)):
+    elif isinstance(value, list | tuple):
         items = list(value)
     else:
         raise ValueError("additional_writable_directories must be a list of paths")
@@ -630,7 +630,7 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
         return ()
     if isinstance(value, str):
         items = value.split(os.pathsep)
-    elif isinstance(value, (list, tuple)):
+    elif isinstance(value, list | tuple):
         items = value
     else:
         raise ValueError("protected_paths must be a list of path patterns")

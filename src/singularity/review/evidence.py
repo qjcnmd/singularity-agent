@@ -70,7 +70,7 @@ def to_bounded_plain(value: Any, *, max_chars: int = 1800, _depth: int = 0) -> A
             else:
                 bounded[text_key] = to_bounded_plain(item, max_chars=max_chars, _depth=_depth + 1)
         return bounded
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, list | tuple | set):
         items = list(value)
         return [to_bounded_plain(item, max_chars=max_chars, _depth=_depth + 1) for item in items[:50]]
     if isinstance(value, str):
@@ -80,7 +80,7 @@ def to_bounded_plain(value: Any, *, max_chars: int = 1800, _depth: int = 0) -> A
         head = max(0, (max_chars - len(marker)) // 2)
         tail = max(0, max_chars - len(marker) - head)
         return f"{value[:head]}{marker}{value[-tail:]}"
-    if isinstance(value, (int, float, bool)) or value is None:
+    if isinstance(value, int | float | bool) or value is None:
         return value
     return str(value)[:max_chars]
 

@@ -773,6 +773,6 @@ def _to_jsonish(value: Any) -> Any:
         return str(value)
     if isinstance(value, dict):
         return {str(key): _to_jsonish(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_to_jsonish(item) for item in value]
     return value

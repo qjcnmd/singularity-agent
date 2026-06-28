@@ -100,4 +100,4 @@ class TraceRedactor:
 def _is_safe_numeric_metric(key: object, value: Any) -> bool:
     if str(key).lower() not in SAFE_NUMERIC_METRIC_KEYS:
         return False
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, int | float) and not isinstance(value, bool)

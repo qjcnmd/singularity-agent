@@ -287,7 +287,7 @@ class RegressionDetector:
                 continue
             base = baseline.metrics.get(metric, 0)
             cand = candidate.metrics.get(metric, 0)
-            if not isinstance(base, (int, float)) or not isinstance(cand, (int, float)):
+            if not isinstance(base, int | float) or not isinstance(cand, int | float):
                 continue
             delta = cand - base
             regressed = (
