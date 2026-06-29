@@ -734,10 +734,15 @@ def test_cli_eval_targeted_replay_writes_repair_replay_artifacts(tmp_path: Path,
         ],
     )
 
-    assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["entered_agent_loop"] is True
-    assert payload["status"] == "completed"
+    blocked_reason = str(payload.get("repair_contract_summary", {}).get("blocked_reason") or "")
+    if "sandbox backend unavailable" in blocked_reason:
+        assert result.exit_code == 1, result.output
+        assert payload["status"] == "blocked"
+    else:
+        assert result.exit_code == 0, result.output
+        assert payload["status"] == "completed"
     assert payload["repairing_failures_seen"] is True
     assert "model_visible_objects" not in payload
     assert "evaluator_internal_objects" not in payload

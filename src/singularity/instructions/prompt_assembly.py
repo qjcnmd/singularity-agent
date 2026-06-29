@@ -130,7 +130,6 @@ class PromptAssemblyPipeline:
         user_session_instructions: list[str] | None = None,
         component_observations: list[dict[str, Any]] | None = None,
         retrieved_content: list[dict[str, Any]] | None = None,
-        tool_protocol_summary: str | None = None,
         supports_developer_message: bool = True,
         ids: dict[str, Any] | None = None,
     ) -> PromptBundle:
@@ -152,7 +151,6 @@ class PromptAssemblyPipeline:
                     user_session_instructions=user_session_instructions,
                     component_observations=component_observations,
                     retrieved_content=retrieved_content,
-                    tool_protocol_summary=tool_protocol_summary,
                 )
                 self._emit_sources_collected(sources, ids=trace_ids)
                 bundle = self.build_prompt_bundle(

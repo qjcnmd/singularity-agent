@@ -34,6 +34,7 @@ from singularity.command.models import (
 )
 from singularity.command.output import OutputCollector, OutputSnapshot, SecretRedactor
 from singularity.command.policy import CommandPolicy
+from singularity.error_codes import ErrorCode
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.policy import (
@@ -51,6 +52,7 @@ from singularity.policy import (
     ResourceRef,
 )
 from singularity.policy.audit import redact, redact_resource_identifier
+from singularity.policy.permissions import PermissionProfile, ProtectedPathRule
 from singularity.sandbox import (
     SandboxFilesystemMode,
     SandboxManager,
@@ -205,7 +207,7 @@ class CommandExecutor:
             if grant is not None:
                 approval_grant_id = grant.grant_id
                 approved_escalation = True
-                sandbox_required = self.permission_profile.profile == PermissionProfileName.READ_ONLY
+                sandbox_required = self._permission_profile().profile == PermissionProfileName.READ_ONLY
         if policy_decision.outcome != DecisionOutcome.ALLOW and not sandbox_required:
             if approved_escalation:
                 pass
@@ -379,7 +381,7 @@ class CommandExecutor:
                 cwd=request.cwd,
                 started_at=started_at,
                 owner_transaction=transaction_id,
-                error_code="verification_runner_required",
+                error_code=ErrorCode.VERIFICATION_RUNNER_REQUIRED.value,
             )
         decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
         policy_request = self._policy_request(request)
@@ -398,7 +400,7 @@ class CommandExecutor:
             or policy_decision.constraints.sandbox_required
             or (
                 approved_escalation
-                and self.permission_profile.profile == PermissionProfileName.READ_ONLY
+                and self._permission_profile().profile == PermissionProfileName.READ_ONLY
             )
         ):
             return ProcessSession(
@@ -411,7 +413,7 @@ class CommandExecutor:
                 cwd=request.cwd,
                 started_at=started_at,
                 owner_transaction=transaction_id,
-                error_code="sandbox_required",
+                error_code=ErrorCode.SANDBOX_REQUIRED.value,
             )
         if policy_decision.outcome != DecisionOutcome.ALLOW and not approved_escalation:
             return ProcessSession(
@@ -456,7 +458,7 @@ class CommandExecutor:
                 cwd=request.cwd,
                 started_at=started_at,
                 owner_transaction=transaction_id,
-                error_code="cwd_denied",
+                error_code=ErrorCode.CWD_DENIED.value,
             )
 
         env_result = self.env_policy.build(request.env_request)
@@ -526,7 +528,7 @@ class CommandExecutor:
                 status="not_found",
                 exit_code=None,
                 killed_reason=None,
-                error_code="process_not_found",
+                error_code=ErrorCode.PROCESS_NOT_FOUND.value,
             )
         exit_code = None
         if isinstance(self.backend, LocalProcessBackend):
@@ -615,23 +617,13 @@ class CommandExecutor:
         env: dict[str, str],
         collector: OutputCollector,
     ) -> BackendRunResult:
-        try:
-            return self.backend.execute(
-                request=request,
-                cwd=cwd,
-                env=env,
-                collector=collector,
-                cancellation_token=getattr(self, "cancellation_token", None),
-            )
-        except TypeError as exc:
-            if "cancellation_token" not in str(exc):
-                raise
-            return self.backend.execute(
-                request=request,
-                cwd=cwd,
-                env=env,
-                collector=collector,
-            )
+        return self.backend.execute(
+            request=request,
+            cwd=cwd,
+            env=env,
+            collector=collector,
+            cancellation_token=getattr(self, "cancellation_token", None),
+        )
 
     def _throw_if_cancelled(self) -> None:
         token = getattr(self, "cancellation_token", None)
@@ -860,7 +852,7 @@ class CommandExecutor:
             changed_files=[],
             policy_decision=decision,
             risk_tags=decision.risk_tags,
-            error_code=decision.error_code or "policy_denied",
+            error_code=decision.error_code or ErrorCode.POLICY_DENIED.value,
             isolation_report=self._isolation_report(request.resource_limits),
             backend=self.backend.name,
             started_at=started_at,
@@ -886,7 +878,7 @@ class CommandExecutor:
             required_network=request.network_mode,
             required_filesystem=request.filesystem_mode,
             redaction_rules=decision.redaction_rules,
-            error_code="cwd_denied",
+            error_code=ErrorCode.CWD_DENIED.value,
         )
         return self._blocked_result(
             request,
@@ -1084,7 +1076,11 @@ class CommandExecutor:
 
     @staticmethod
     def _execution_status(backend_result: BackendRunResult) -> ExecutionStatus:
-        if backend_result.error_code in {"command_not_found", "spawn_failed", "permission_error"}:
+        if backend_result.error_code in {
+            ErrorCode.COMMAND_NOT_FOUND.value,
+            ErrorCode.SPAWN_FAILED.value,
+            ErrorCode.PERMISSION_ERROR.value,
+        }:
             return ExecutionStatus.SPAWN_FAILED
         if backend_result.error_code:
             return ExecutionStatus.BACKEND_ERROR
@@ -1163,20 +1159,20 @@ class CommandExecutor:
         if backend_result.error_code:
             return backend_result.error_code
         if backend_result.timed_out:
-            return "timeout"
+            return ErrorCode.TIMEOUT.value
         if backend_result.idle_timed_out:
-            return "idle_timeout"
+            return ErrorCode.IDLE_TIMEOUT.value
         if semantic_status in {
             SemanticStatus.TESTS_FAILED,
             SemanticStatus.BUILD_FAILED,
             SemanticStatus.LINT_FAILED,
             SemanticStatus.TYPECHECK_FAILED,
         }:
-            return "semantic_failure"
+            return ErrorCode.SEMANTIC_FAILURE.value
         if semantic_status == SemanticStatus.EXIT_NONZERO:
-            return "exit_nonzero"
+            return ErrorCode.EXIT_NONZERO.value
         if output.output_truncated:
-            return "output_limit_exceeded"
+            return ErrorCode.OUTPUT_LIMIT_EXCEEDED.value
         return None
 
     @staticmethod
@@ -1185,11 +1181,11 @@ class CommandExecutor:
         semantic_status: SemanticStatus,
     ) -> str | None:
         if sandbox_result.status == SandboxStatus.BACKEND_UNAVAILABLE:
-            return "sandbox_unavailable"
+            return ErrorCode.SANDBOX_UNAVAILABLE.value
         if sandbox_result.status == SandboxStatus.VIOLATION:
-            return "sandbox_violation"
+            return ErrorCode.SANDBOX_VIOLATION.value
         if sandbox_result.status == SandboxStatus.TIMEOUT:
-            return "timeout"
+            return ErrorCode.TIMEOUT.value
         if sandbox_result.metadata.get("error_code"):
             return str(sandbox_result.metadata["error_code"])
         if semantic_status in {
@@ -1198,11 +1194,11 @@ class CommandExecutor:
             SemanticStatus.LINT_FAILED,
             SemanticStatus.TYPECHECK_FAILED,
         }:
-            return "semantic_failure"
+            return ErrorCode.SEMANTIC_FAILURE.value
         if semantic_status == SemanticStatus.EXIT_NONZERO:
-            return "exit_nonzero"
+            return ErrorCode.EXIT_NONZERO.value
         if sandbox_result.metadata.get("output_truncated"):
-            return "output_limit_exceeded"
+            return ErrorCode.OUTPUT_LIMIT_EXCEEDED.value
         return None
 
     @staticmethod
@@ -1318,34 +1314,35 @@ class CommandExecutor:
         policy_decision: Any,
         cwd: Path,
     ) -> SandboxRequest:
+        permission_profile = self._permission_profile()
         profile_name = (
             SandboxProfileName.READONLY_ANALYSIS
-            if self.permission_profile.profile == PermissionProfileName.READ_ONLY
+            if permission_profile.profile == PermissionProfileName.READ_ONLY
             else SandboxProfileName.ISOLATED_VERIFICATION
         )
         profile = default_sandbox_profile(profile_name, workspace_root=self.workspace_root)
-        if self.permission_profile.profile != PermissionProfileName.READ_ONLY:
+        if permission_profile.profile != PermissionProfileName.READ_ONLY:
             profile.filesystem.mode = SandboxFilesystemMode.COPY_ON_WRITE_WORKSPACE
             profile.filesystem.writable_paths = [
                 str(path)
                 for path in (
-                    *self.permission_profile.workspace_roots,
-                    *self.permission_profile.additional_writable_directories,
+                    *permission_profile.workspace_roots,
+                    *permission_profile.additional_writable_directories,
                 )
             ]
         profile.filesystem.exclude_globs = sorted(
             {
                 *profile.filesystem.exclude_globs,
-                *(rule.pattern for rule in self.permission_profile.protected_paths),
+                *self._protected_path_patterns(permission_profile),
             }
         )
         profile.network.mode = SandboxNetworkMode(
-            self.permission_profile.network_access.value
+            permission_profile.network_access.value
         )
         profile.network.require_hard_isolation = (
             profile.network.mode == SandboxNetworkMode.DENIED
         )
-        profile.resources.timeout_seconds = request.resource_limits.timeout_seconds
+        profile.resources.timeout_seconds = int(request.resource_limits.timeout_seconds)
         profile.resources.max_output_chars = request.resource_limits.max_combined_output_bytes
         env_result = self.env_policy.build(request.env_request)
         profile.env.extra_env = dict(env_result.env)
@@ -1364,9 +1361,21 @@ class CommandExecutor:
             reason=policy_decision.reason,
             metadata={
                 "command_id": request.command_id,
-                "permission_profile": self.permission_profile.profile.value,
+                "permission_profile": permission_profile.profile.value,
             },
         )
+
+    def _permission_profile(self) -> PermissionProfile:
+        if self.permission_profile is None:
+            raise RuntimeError("policy engine must provide a permission profile")
+        return self.permission_profile
+
+    @staticmethod
+    def _protected_path_patterns(permission_profile: PermissionProfile) -> list[str]:
+        return [
+            rule.pattern if isinstance(rule, ProtectedPathRule) else str(rule)
+            for rule in permission_profile.protected_paths
+        ]
 
     def _policy_blocked_result(
         self,
@@ -1530,16 +1539,16 @@ def _looks_like_package_manager(request: CommandRequest) -> bool:
 
 def _policy_error_code(outcome: DecisionOutcome) -> str:
     mapping = {
-        DecisionOutcome.DENY: "policy_denied",
-        DecisionOutcome.REQUIRE_REVIEW: "review_required",
-        DecisionOutcome.SANDBOX_REQUIRED: "sandbox_required",
-        DecisionOutcome.ASK_USER: "policy_ask_user_required",
-        DecisionOutcome.ESCALATE: "policy_escalation_required",
+        DecisionOutcome.DENY: ErrorCode.POLICY_DENIED.value,
+        DecisionOutcome.REQUIRE_REVIEW: ErrorCode.REVIEW_REQUIRED.value,
+        DecisionOutcome.SANDBOX_REQUIRED: ErrorCode.SANDBOX_REQUIRED.value,
+        DecisionOutcome.ASK_USER: ErrorCode.POLICY_ASK_USER_REQUIRED.value,
+        DecisionOutcome.ESCALATE: ErrorCode.POLICY_ESCALATION_REQUIRED.value,
     }
-    return mapping.get(outcome, "policy_denied")
+    return mapping.get(outcome, ErrorCode.POLICY_DENIED.value)
 
 
 def _policy_process_status(outcome: DecisionOutcome) -> str:
     if outcome == DecisionOutcome.REQUIRE_REVIEW:
-        return "review_required"
+        return ErrorCode.REVIEW_REQUIRED.value
     return _policy_error_code(outcome)

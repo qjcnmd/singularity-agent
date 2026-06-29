@@ -204,7 +204,6 @@ class TargetedFailureReplayRunner:
             console=Console(file=None, force_terminal=False),
             max_turns=self.max_turns,
             planner=planner,
-            policy_engine=policy,
             tool_executor=ToolExecutor(
                 registry=tools,
                 policy=ToolPolicy.coding_agent(),

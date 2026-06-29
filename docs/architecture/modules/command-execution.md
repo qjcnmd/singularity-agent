@@ -7,6 +7,7 @@
 - src/singularity/command/executor.py
 - src/singularity/command/policy.py
 - src/singularity/tools/command.py
+- src/singularity/error_codes.py
 
 关键符号:
 - CommandRequest
@@ -37,6 +38,7 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 - src/singularity/command/executor.py
 - src/singularity/command/policy.py
 - src/singularity/tools/command.py
+- src/singularity/error_codes.py
 
 ## 关键类、函数、字段
 
@@ -44,7 +46,7 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 
 ## 真实运行时调用链
 
-`run_command` / verification tools -> `CommandExecutor.run()` -> `CommandRequest` -> command policy -> optional sandbox/backend -> `CommandResult` -> trace/context/planner evidence。
+`run_command` / verification tools -> `CommandExecutor.run()` -> `CommandRequest` -> command policy -> optional sandbox/backend -> `CommandResult` -> trace/context/planner evidence。`ExecutionBackend.execute()` 的当前签名必须接收 `cancellation_token` 关键字参数；`CommandExecutor` 不再静默回退到旧签名。
 
 ## 真实任务中的对象流
 
@@ -188,6 +190,8 @@ class CommandDecision(str, Enum):    # CommandPolicyResult.decision
 ### 数据流概述
 
 `CommandToolHandlers.run_command()` 生成 `CommandRequest`，`CommandPolicy.evaluate()` 生成 `CommandPolicyResult`，`CommandExecutor.plan()` 组合为 `CommandPlan`。若策略要求隔离，`SandboxManager.run()` 返回 sandbox payload 被 `_result_from_sandbox()` 转成 `CommandResult`；否则 `_completed_result()` 从 backend 生成结果。`CommandResult.to_observation()` 写 `context.sqlite3`，长输出写 trace artifact，`CommandExecutor._record_trace()` 写 trace event。
+
+命令执行层的核心 `error_code` 值来自 `singularity.error_codes.ErrorCode`：policy、sandbox、timeout、idle timeout、semantic failure、exit nonzero、output limit、process not found、verification runner required 等分支仍输出原字符串值，但不再在 `CommandExecutor` 内维护独立字面量映射。
 
 ## 谁生成这些对象
 

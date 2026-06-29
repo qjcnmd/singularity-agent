@@ -4,6 +4,7 @@
 
 源码证据路径:
 - src/singularity/agent_loop.py
+- src/singularity/error_codes.py
 
 关键符号:
 - AgentLoop
@@ -21,6 +22,7 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 ## 当前源码位置
 
 - src/singularity/agent_loop.py
+- src/singularity/error_codes.py
 
 ## 关键类、函数、字段
 
@@ -61,6 +63,10 @@ class AgentLoopStatus(str, Enum):
     MAX_TURNS_EXCEEDED = "max_turns_exceeded"
     FAILED = "failed"
 ```
+
+### ErrorCode（错误码注册表）
+
+`AgentLoop` 不再在终止分支中维护分散的错误码字面量集合。`max_turns_exceeded`、`completion_rejected`、`final_review_rejected`、`model_runner_failed`、`repair_budget_exceeded` 以及 failure-analysis 排除集合来自 `singularity.error_codes.ErrorCode` 和 `FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES`；对外仍序列化为同名字符串。
 
 ### 数据流概述
 

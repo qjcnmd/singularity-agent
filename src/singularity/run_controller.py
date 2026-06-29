@@ -6,6 +6,12 @@ from enum import StrEnum
 from typing import Any, TypeVar
 
 from singularity.context.models import ToolObservation
+from singularity.error_codes import (
+    TOOL_BLOCKING_ERROR_CODES,
+    TOOL_REPLAN_ERROR_CODES,
+    TOOL_RETRYABLE_ERROR_CODES,
+    ErrorCode,
+)
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.planner import Planner, PlannerStore
 
@@ -147,36 +153,28 @@ class RunOutcomeReducer:
         pending_count = int(getattr(protocol_result, "pending_approval_count", 0) or 0)
         summary = self._protocol_observation_summary(observations, protocol_result)
 
-        if pending_count or next_action == "pending_approval" or "approval_required" in error_codes:
+        if pending_count or next_action == "pending_approval" or ErrorCode.APPROVAL_REQUIRED.value in error_codes:
             return ExecutionOutcome(
                 status=ExecutionOutcomeStatus.APPROVAL_REQUIRED,
                 source="protocol",
                 reason="Tool execution is waiting for approval.",
-                error_code="approval_required",
+                error_code=ErrorCode.APPROVAL_REQUIRED.value,
                 next_action="wait_for_approval",
                 observation_summary=summary,
                 retry_allowed=False,
             )
-        if "policy_ask_user_required" in error_codes:
+        if ErrorCode.POLICY_ASK_USER_REQUIRED.value in error_codes:
             return ExecutionOutcome(
                 status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
                 source="tool",
                 reason="Policy requires user input.",
-                error_code="policy_ask_user_required",
+                error_code=ErrorCode.POLICY_ASK_USER_REQUIRED.value,
                 next_action="ask_user",
                 observation_summary=summary,
                 retry_allowed=False,
             )
-        blocked_codes = {
-            "policy_denied",
-            "approval_denied",
-            "action_not_allowed",
-            "risk_escalated",
-            "sandbox_required",
-            "policy_escalation_required",
-        }
-        if any(code in blocked_codes for code in error_codes):
-            code = next(code for code in error_codes if code in blocked_codes)
+        if any(code in TOOL_BLOCKING_ERROR_CODES for code in error_codes):
+            code = next(code for code in error_codes if code in TOOL_BLOCKING_ERROR_CODES)
             return ExecutionOutcome(
                 status=ExecutionOutcomeStatus.BLOCKED,
                 source="tool",
@@ -186,19 +184,8 @@ class RunOutcomeReducer:
                 observation_summary=summary,
                 retry_allowed=False,
             )
-        replan_codes = {
-            "snapshot_mismatch",
-            "external_change_detected",
-            "file_changed",
-            "rollback_conflict",
-            "semantic_failure",
-            "verification_failed",
-            "blocked_by_verification",
-            "command_not_found",
-            "timeout",
-        }
-        if any(code in replan_codes for code in error_codes):
-            code = next(code for code in error_codes if code in replan_codes)
+        if any(code in TOOL_REPLAN_ERROR_CODES for code in error_codes):
+            code = next(code for code in error_codes if code in TOOL_REPLAN_ERROR_CODES)
             return ExecutionOutcome(
                 status=ExecutionOutcomeStatus.REPLAN_REQUIRED,
                 source="tool",
@@ -208,20 +195,8 @@ class RunOutcomeReducer:
                 observation_summary=summary,
                 retry_allowed=True,
             )
-        retryable_codes = {
-            "bad_arguments_json",
-            "invalid_json",
-            "arguments_not_object",
-            "validation_error",
-            "schema_mismatch",
-            "unknown_tool",
-            "tool_not_found",
-            "disallowed_tool",
-            "protocol_violation",
-            "internal_error",
-        }
-        if any(code in retryable_codes for code in error_codes):
-            code = next(code for code in error_codes if code in retryable_codes)
+        if any(code in TOOL_RETRYABLE_ERROR_CODES for code in error_codes):
+            code = next(code for code in error_codes if code in TOOL_RETRYABLE_ERROR_CODES)
             return ExecutionOutcome(
                 status=ExecutionOutcomeStatus.RETRYABLE,
                 source="protocol" if "json" in code or "schema" in code else "tool",
@@ -238,7 +213,7 @@ class RunOutcomeReducer:
                 status=ExecutionOutcomeStatus.RETRYABLE,
                 source="protocol",
                 reason="Protocol fail-safe requested another model turn.",
-                error_code=str(reason or "protocol_fail_safe"),
+                error_code=str(reason or ErrorCode.PROTOCOL_FAIL_SAFE.value),
                 next_action="retry",
                 observation_summary=summary,
                 retry_allowed=True,
@@ -248,7 +223,7 @@ class RunOutcomeReducer:
                 status=ExecutionOutcomeStatus.RETRYABLE,
                 source="protocol",
                 reason="Protocol reported recoverable tool failure.",
-                error_code=error_codes[0] if error_codes else "tool_failure",
+                error_code=error_codes[0] if error_codes else ErrorCode.TOOL_FAILURE.value,
                 next_action="retry",
                 observation_summary=summary,
                 retry_allowed=True,
@@ -278,7 +253,11 @@ class RunOutcomeReducer:
         outcome: ExecutionOutcome,
         current_status: RunLifecycleStatus,
     ) -> RunLifecycleStatus:
-        if outcome.error_code in {"verification_failed", "blocked_by_verification", "semantic_failure"}:
+        if outcome.error_code in {
+            ErrorCode.VERIFICATION_FAILED.value,
+            ErrorCode.BLOCKED_BY_VERIFICATION.value,
+            ErrorCode.SEMANTIC_FAILURE.value,
+        }:
             return RunLifecycleStatus.REPAIRING
         if outcome.next_action == "replan":
             return RunLifecycleStatus.RUNNING
@@ -446,7 +425,7 @@ class RunController:
                 to_status=RunLifecycleStatus.BLOCKED,
                 reason=f"Task stopped after max_turns={max_turns}.",
                 terminal=True,
-                metadata={"error_code": "max_turns_exceeded"},
+                metadata={"error_code": ErrorCode.MAX_TURNS_EXCEEDED.value},
             )
         )
         return result

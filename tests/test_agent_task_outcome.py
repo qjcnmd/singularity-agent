@@ -631,6 +631,37 @@ def test_sandbox_backend_unavailable_blocks_without_model_repair(tmp_path: Path)
     assert any("sandbox backend unavailable" in reason for reason in planner.state.blocked_reasons)
 
 
+def test_failure_analysis_fingerprint_ignores_trigger_source(tmp_path: Path) -> None:
+    failure_sources = [
+        {
+            "kind": "verification_result",
+            "check_id": "check_quicksort",
+            "status": "failed",
+            "failure_type": "unit_test_failure",
+            "evidence": {
+                "command": "python quicksort.py",
+                "exit_code": 1,
+                "parsed_failures": [{"file": "quicksort.py", "message": "ZeroDivisionError"}],
+            },
+        }
+    ]
+    base = {
+        "request_id": "failure_analysis_1",
+        "run_id": "run_1",
+        "session_id": "session_1",
+        "task_id": "task_1",
+        "phase_id": "repairing_failures",
+        "workspace_root": str(tmp_path),
+        "failure_summary": "unit_test_failure",
+        "failure_sources": failure_sources,
+    }
+
+    tool_request = FailureAnalysisRequest(**base, failure_source="tool")
+    verification_request = FailureAnalysisRequest(**base, failure_source="verification")
+
+    assert tool_request.fingerprint == verification_request.fingerprint
+
+
 def test_repeated_completion_rejected_escalates_to_failure_analyzer(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     provider = FakeProvider(
@@ -714,7 +745,11 @@ def test_repeated_failure_fingerprint_budget_blocks_after_second_failed_verifica
     assert planner.state is not None
     assert planner.state.status == TaskStatus.BLOCKED
     assert "repeated_failure" in planner.state.blocked_reasons
-    llm_analyses = [item for item in planner.evidence.failure_analyses if item.get("request_id")]
+    llm_analyses = [
+        item
+        for item in planner.evidence.failure_analyses
+        if str(item.get("request_id") or "").startswith("failure_analysis_")
+    ]
     assert len(llm_analyses) == 1
 
 

@@ -41,7 +41,7 @@ from singularity.tools.edit import register_edit_tools
 from singularity.tools.mutation import register_mutation_tools
 from singularity.tools.verification import register_verification_tools
 from singularity.tools.workspace_state import register_workspace_state_tools
-from singularity.verification import VerificationRunner
+from singularity.verification.runner import VerificationRunner
 from singularity.workspace import WorkspaceMutationManager
 from singularity.workspace_state import WorkspaceHealthReport, WorkspaceStateManager
 

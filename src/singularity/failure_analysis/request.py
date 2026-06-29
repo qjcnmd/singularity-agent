@@ -88,7 +88,6 @@ class FailureAnalysisRequest:
     @property
     def fingerprint(self) -> str:
         payload: dict[str, Any] = {
-            "source": self.failure_source,
             "summary": self.failure_summary,
             "failures": _fingerprint_sources(self.failure_sources),
         }

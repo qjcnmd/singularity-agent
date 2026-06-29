@@ -59,7 +59,6 @@ class InstructionSourceCollector:
         user_session_instructions: list[str] | None = None,
         component_observations: list[dict[str, Any]] | None = None,
         retrieved_content: list[dict[str, Any]] | None = None,
-        tool_protocol_summary: str | None = None,
     ) -> list[InstructionSource]:
         sources = [
             self._source(
@@ -75,10 +74,7 @@ class InstructionSourceCollector:
                 origin="singularity.component",
                 priority=InstructionPriority.SINGULARITY_DEVELOPER,
                 trust_level=TrustLevel.TRUSTED_SINGULARITY,
-                content=(
-                    SINGULARITY_DEVELOPER_INSTRUCTIONS
-                    + ("\n" + tool_protocol_summary if tool_protocol_summary else "")
-                ),
+                content=SINGULARITY_DEVELOPER_INSTRUCTIONS,
                 purpose=purpose,
             ),
         ]

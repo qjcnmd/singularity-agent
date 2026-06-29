@@ -109,6 +109,38 @@ def test_model_turn_request_builder_keeps_stable_prefix_metadata_and_dynamic_tai
     assert request.messages[-1].role.value == "tool"
 
 
+def test_tool_protocol_summary_is_structured_metadata_not_prompt_text(
+    tmp_path: Path,
+) -> None:
+    context = ContextManager(system_prompt="legacy system", user_goal="Inspect project")
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    prompt_assembly = PromptAssemblyPipeline(workspace_root=tmp_path)
+
+    request = ModelTurnRequestBuilder(
+        registry=component.registry,
+        tool_renderer=component.tool_renderer,
+    ).build_request(
+        context,
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="understanding_task",
+        action_id="action_1",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        allowed_tool_names=["read_file", "search_text"],
+        prompt_assembly=prompt_assembly,
+        user_task="Inspect project",
+    )
+
+    visible_text = "\n".join(message.text for message in request.messages)
+
+    assert "Tool protocol summary:" not in visible_text
+    assert "Verification work must use VerificationRunner tools" not in visible_text
+    assert request.context_metadata["tool_protocol"]["tool_names"] == ["read_file", "search_text"]
+    assert request.context_metadata["tool_protocol"] == request.trace_metadata["tool_protocol"]
+
+
 def test_model_turn_request_builder_hashes_ignore_ephemeral_prompt_ids(
     tmp_path: Path,
 ) -> None:

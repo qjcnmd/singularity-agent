@@ -9,6 +9,7 @@ from typing import Any
 from rich.console import Console
 
 from singularity.context import ContextManager
+from singularity.error_codes import FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES, ErrorCode
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.failure_analysis.analyzer import FailureAnalyzer
 from singularity.failure_analysis.request import FailureAnalysisRequest
@@ -30,9 +31,8 @@ from singularity.tools import ToolExecutor, ToolRegistry
 
 SYSTEM_PROMPT = """You are Singularity, a local coding agent harness.
 
-Use only the tools exposed in the current request schema. The agent loop provides
-a per-turn tool protocol summary with the available tools and preferred execution
-paths.
+Use only the tools exposed in the current request schema. The agent loop records
+tool protocol metadata outside model-visible instructions.
 
 Never claim that you inspected, edited, or verified anything unless the
 corresponding tool executor returned evidence. File mutations must go through
@@ -50,7 +50,7 @@ When you have enough information, answer the user directly.
 class AgentLoopStatus(StrEnum):
     COMPLETED = "completed"
     BLOCKED = "blocked"
-    MAX_TURNS_EXCEEDED = "max_turns_exceeded"
+    MAX_TURNS_EXCEEDED = ErrorCode.MAX_TURNS_EXCEEDED.value
     FAILED = "failed"
 
 
@@ -302,7 +302,7 @@ class AgentLoop:
                 status=ExecutionOutcomeStatus.BLOCKED,
                 source="agent_loop",
                 reason=message,
-                error_code="max_turns_exceeded",
+                error_code=ErrorCode.MAX_TURNS_EXCEEDED.value,
                 next_action="blocked",
                 observation_summary=message,
                 retry_allowed=False,
@@ -316,7 +316,7 @@ class AgentLoop:
                 status=AgentLoopStatus.MAX_TURNS_EXCEEDED,
                 final_answer=message,
                 turn=max_turns,
-                error_code="max_turns_exceeded",
+                error_code=ErrorCode.MAX_TURNS_EXCEEDED.value,
             )
 
         return controller.run_loop(
@@ -341,7 +341,7 @@ class AgentLoop:
                 status=ExecutionOutcomeStatus.REPLAN_REQUIRED,
                 source="completion",
                 reason="completion_rejected",
-                error_code="completion_rejected",
+                error_code=ErrorCode.COMPLETION_REJECTED.value,
                 missing_evidence=list(assessment["unmet"]),
                 next_action="continue",
                 observation_summary=(
@@ -413,7 +413,7 @@ class AgentLoop:
                 ),
                 source="completion",
                 reason=f"Final report did not complete: {report.status.value}.",
-                error_code="final_review_rejected",
+                error_code=ErrorCode.FINAL_REVIEW_REJECTED.value,
                 missing_evidence=list(report.next_steps or ["final_report_completed"]),
                 next_action="continue" if retry_allowed else "blocked",
                 observation_summary=(
@@ -491,14 +491,14 @@ class AgentLoop:
             else ", ".join(result.validation.errors if result.validation else [])
         )
         retryable = bool(getattr(result.error, "retryable", False)) if result.error else True
-        error_code = "model_runner_failed"
+        error_code = ErrorCode.MODEL_RUNNER_FAILED.value
         lowered = message.lower()
         if "invalid_json" in lowered or "invalid json" in lowered:
-            error_code = "invalid_json"
+            error_code = ErrorCode.INVALID_JSON.value
         elif "unknown_tool" in lowered or "unknown tool" in lowered:
-            error_code = "unknown_tool"
+            error_code = ErrorCode.UNKNOWN_TOOL.value
         elif "schema" in lowered:
-            error_code = "schema_mismatch"
+            error_code = ErrorCode.SCHEMA_MISMATCH.value
         error_kind = getattr(result.error, "kind", None) if result.error else None
         blocked_external_dependency = (
             not retryable
@@ -615,7 +615,7 @@ class AgentLoop:
                         status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
                         source="failure_analysis",
                         reason="Repeated completion/final review failure without new repair evidence.",
-                        error_code="repair_budget_exceeded",
+                        error_code=ErrorCode.REPAIR_BUDGET_EXCEEDED.value,
                         next_action="ask_user",
                         observation_summary=(
                             "Completion gate is still blocked after failure analysis and no new repair evidence."
@@ -634,7 +634,7 @@ class AgentLoop:
                     status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
                     source="failure_analysis",
                     reason=decision.reason,
-                    error_code="repair_budget_exceeded",
+                    error_code=ErrorCode.REPAIR_BUDGET_EXCEEDED.value,
                     next_action="ask_user",
                     observation_summary=decision.reason,
                     retry_allowed=False,
@@ -672,7 +672,7 @@ class AgentLoop:
                 status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
                 source="failure_analysis",
                 reason=decision.reason,
-                error_code="repair_budget_exceeded",
+                error_code=ErrorCode.REPAIR_BUDGET_EXCEEDED.value,
                 next_action="ask_user",
                 observation_summary=decision.reason,
                 retry_allowed=False,
@@ -683,22 +683,9 @@ class AgentLoop:
     def _should_analyze_outcome(self, planner: Planner, outcome: ExecutionOutcome) -> bool:
         if outcome.status != ExecutionOutcomeStatus.REPLAN_REQUIRED:
             return False
-        if outcome.error_code in {
-            "approval_required",
-            "approval_denied",
-            "permission_denied",
-            "policy_blocked",
-            "policy_denied",
-            "policy_ask_user_required",
-            "action_not_allowed",
-            "risk_escalated",
-            "sandbox_required",
-            "sandbox_capability_failed",
-            "sandbox_violation",
-            "policy_escalation_required",
-        }:
+        if outcome.error_code in FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES:
             return False
-        if outcome.error_code == "completion_rejected":
+        if outcome.error_code == ErrorCode.COMPLETION_REJECTED.value:
             return self._should_escalate_completion_rejection(planner, outcome)
         return True
 
@@ -806,7 +793,11 @@ class AgentLoop:
             return True
         return bool(
             outcome is not None
-            and outcome.error_code in {"completion_rejected", "final_review_rejected"}
+            and outcome.error_code
+            in {
+                ErrorCode.COMPLETION_REJECTED.value,
+                ErrorCode.FINAL_REVIEW_REJECTED.value,
+            }
         )
 
     @staticmethod
@@ -825,7 +816,7 @@ class AgentLoop:
             status=ExecutionOutcomeStatus.BLOCKED,
             source="completion",
             reason="Repair phase completion rejected because the active repair contract is unsatisfied.",
-            error_code="repair_budget_exceeded",
+            error_code=ErrorCode.REPAIR_BUDGET_EXCEEDED.value,
             missing_evidence=unmet,
             next_action="blocked",
             observation_summary=(
@@ -859,20 +850,7 @@ class AgentLoop:
                 or (failure.get("execution_outcome") or {}).get("error_code")
                 or failure.get("status")
             )
-            if code not in {
-                "approval_required",
-                "approval_denied",
-                "permission_denied",
-                "policy_blocked",
-                "policy_denied",
-                "policy_ask_user_required",
-                "action_not_allowed",
-                "risk_escalated",
-                "sandbox_required",
-                "sandbox_capability_failed",
-                "sandbox_violation",
-                "policy_escalation_required",
-            }:
+            if code not in FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES:
                 return True
         return False
 

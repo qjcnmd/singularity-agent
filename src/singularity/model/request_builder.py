@@ -74,7 +74,6 @@ class ModelTurnRequestBuilder:
                 user_session_instructions=user_session_instructions,
                 component_observations=list(component_observations or []),
                 retrieved_content=retrieved_content,
-                tool_protocol_summary=_tool_protocol_summary(tools),
                 supports_developer_message=provider_supports_developer,
                 ids={
                     "run_id": run_id,
@@ -130,6 +129,7 @@ class ModelTurnRequestBuilder:
             "context_shape_hash": context_bundle_metadata.get("context_shape_hash"),
             "context_ordering_hash": context_bundle_metadata.get("context_ordering_hash"),
             "context_bundle_metadata": context_bundle_metadata,
+            "tool_protocol": _tool_protocol_metadata(tools),
         }
         rendered_tool_names = [tool.name for tool in tools]
         return ModelTurnRequest(
@@ -169,42 +169,30 @@ class ModelTurnRequestBuilder:
         return self.converter.from_openai_dict(message)
 
 
-def _tool_protocol_summary(tools: list[ModelToolSchema]) -> str:
+def _tool_protocol_metadata(tools: list[ModelToolSchema]) -> dict[str, Any]:
     tool_names = [tool.name for tool in tools]
-    return "\n".join(
-        _compact_lines(
-            "Tool protocol summary:",
-            "Only tools exposed in this request's tool schema may be called.",
-            f"Available this turn: {', '.join(tool_names) if tool_names else 'none'}.",
-            "Tool calls must use complete JSON arguments.",
-            "The model must not claim tool execution unless ToolExecutor returns a result.",
-            _verification_guidance(tool_names),
-            _edit_guidance(tool_names),
-        )
-    )
+    return {
+        "version": "tool_protocol_metadata/v1",
+        "tool_names": tool_names,
+        "tool_count": len(tool_names),
+        "has_verification_tools": _has_verification_tools(tool_names),
+        "has_edit_tools": _has_edit_tools(tool_names),
+    }
 
 
-def _compact_lines(*lines: str | None) -> list[str]:
-    return [line for line in lines if line]
-
-
-def _verification_guidance(tool_names: list[str]) -> str | None:
+def _has_verification_tools(tool_names: list[str]) -> bool:
     verification_tools = {
         "plan_verification",
         "run_verification",
         "get_verification_result",
         "rerun_check",
     }
-    if verification_tools.intersection(tool_names):
-        return "Verification work must use VerificationRunner tools, not run_command."
-    return None
+    return bool(verification_tools.intersection(tool_names))
 
 
-def _edit_guidance(tool_names: list[str]) -> str | None:
+def _has_edit_tools(tool_names: list[str]) -> bool:
     edit_tools = {"edit_plan", "edit_preview", "edit_apply", "apply_patch", "write_file"}
-    if edit_tools.intersection(tool_names):
-        return "File changes must use EditExecutor or apply_patch tools, not raw workspace mutation."
-    return None
+    return bool(edit_tools.intersection(tool_names))
 
 
 def _messages_hash(messages: list[ModelMessage | dict[str, Any]]) -> str:

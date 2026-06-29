@@ -664,6 +664,28 @@ def test_command_trace_records_full_audit_event(tmp_path: Path) -> None:
     assert "git_after" in audit
 
 
+def test_command_executor_does_not_silently_support_legacy_backend_execute_signature(
+    tmp_path: Path,
+) -> None:
+    class LegacyExecuteBackend:
+        name = "legacy_execute"
+
+        def execute(self, *, request, cwd, env, collector):
+            _ = request, cwd, env, collector
+            raise AssertionError("legacy execute signature should not be called")
+
+    component = unrestricted_command_executor(tmp_path, backend=LegacyExecuteBackend())
+
+    with pytest.raises(TypeError, match="cancellation_token"):
+        component.run(
+            CommandRequest(
+                argv=[sys.executable, "-c", "print('legacy')"],
+                cwd=".",
+                purpose=CommandPurpose.READ_ONLY_COMMAND,
+            )
+        )
+
+
 def test_command_trace_redacts_sensitive_argv_and_url_query(tmp_path: Path) -> None:
     trace = JsonlTraceRecorder.create(tmp_path)
     component = unrestricted_command_executor(tmp_path, trace=trace)
