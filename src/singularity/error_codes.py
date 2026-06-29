@@ -11,6 +11,7 @@ class ErrorCode(StrEnum):
     POLICY_DENIED = "policy_denied"
     POLICY_ASK_USER_REQUIRED = "policy_ask_user_required"
     POLICY_ESCALATION_REQUIRED = "policy_escalation_required"
+    PROTECTED_PATH_DENIED = "protected_path_denied"
     REVIEW_REQUIRED = "review_required"
     ACTION_NOT_ALLOWED = "action_not_allowed"
     RISK_ESCALATED = "risk_escalated"
@@ -65,6 +66,7 @@ FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES = frozenset(
         ErrorCode.POLICY_DENIED.value,
         ErrorCode.POLICY_ASK_USER_REQUIRED.value,
         ErrorCode.ACTION_NOT_ALLOWED.value,
+        ErrorCode.PROTECTED_PATH_DENIED.value,
         ErrorCode.RISK_ESCALATED.value,
         ErrorCode.SANDBOX_REQUIRED.value,
         ErrorCode.SANDBOX_CAPABILITY_FAILED.value,
@@ -75,11 +77,17 @@ FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES = frozenset(
 
 TOOL_BLOCKING_ERROR_CODES = frozenset(
     {
+        ErrorCode.POLICY_BLOCKED.value,
         ErrorCode.POLICY_DENIED.value,
+        ErrorCode.PROTECTED_PATH_DENIED.value,
+        ErrorCode.REVIEW_REQUIRED.value,
         ErrorCode.APPROVAL_DENIED.value,
         ErrorCode.ACTION_NOT_ALLOWED.value,
         ErrorCode.RISK_ESCALATED.value,
         ErrorCode.SANDBOX_REQUIRED.value,
+        ErrorCode.SANDBOX_UNAVAILABLE.value,
+        ErrorCode.SANDBOX_VIOLATION.value,
+        ErrorCode.CWD_DENIED.value,
         ErrorCode.POLICY_ESCALATION_REQUIRED.value,
     }
 )
@@ -94,6 +102,7 @@ TOOL_REPLAN_ERROR_CODES = frozenset(
         ErrorCode.VERIFICATION_FAILED.value,
         ErrorCode.BLOCKED_BY_VERIFICATION.value,
         ErrorCode.COMMAND_NOT_FOUND.value,
+        ErrorCode.PROCESS_NOT_FOUND.value,
         ErrorCode.TIMEOUT.value,
     }
 )

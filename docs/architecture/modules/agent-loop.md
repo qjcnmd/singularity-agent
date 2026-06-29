@@ -66,7 +66,7 @@ class AgentLoopStatus(str, Enum):
 
 ### ErrorCode（错误码注册表）
 
-`AgentLoop` 不再在终止分支中维护分散的错误码字面量集合。`max_turns_exceeded`、`completion_rejected`、`final_review_rejected`、`model_runner_failed`、`repair_budget_exceeded` 以及 failure-analysis 排除集合来自 `singularity.error_codes.ErrorCode` 和 `FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES`；对外仍序列化为同名字符串。
+`AgentLoop` 不再在终止分支中维护分散的错误码字面量集合。`max_turns_exceeded`、`completion_rejected`、`final_review_rejected`、`model_runner_failed`、`repair_budget_exceeded` 以及 failure-analysis 排除集合来自 `singularity.error_codes.ErrorCode` 和 `FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES`；对外仍序列化为同名字符串。工具 observation 的 `error_code` 由 `RunOutcomeReducer.protocol_result_to_outcome()` 按 `TOOL_BLOCKING_ERROR_CODES`、`TOOL_REPLAN_ERROR_CODES` 和 `TOOL_RETRYABLE_ERROR_CODES` 归类为 blocked、replan 或 retry，不在 `AgentLoop.run()` 内重复判定。
 
 ### 数据流概述
 

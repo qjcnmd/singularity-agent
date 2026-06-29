@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
+from singularity.context.models import ToolObservation
+from singularity.error_codes import ErrorCode
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.planner import Planner
 from singularity.run_controller import (
@@ -64,6 +68,52 @@ def test_protocol_next_action_maps_to_task_event() -> None:
     assert event.kind == RunControlEventKind.PROTOCOL_NEXT_ACTION
     assert event.to_status == RunLifecycleStatus.WAITING_APPROVAL
     assert event.metadata["next_action"] == "resume_pending_approval"
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_status", "expected_next_action"),
+    [
+        (ErrorCode.REVIEW_REQUIRED.value, ExecutionOutcomeStatus.BLOCKED, "blocked"),
+        (ErrorCode.POLICY_BLOCKED.value, ExecutionOutcomeStatus.BLOCKED, "blocked"),
+        (ErrorCode.PROTECTED_PATH_DENIED.value, ExecutionOutcomeStatus.BLOCKED, "blocked"),
+        (ErrorCode.SANDBOX_UNAVAILABLE.value, ExecutionOutcomeStatus.BLOCKED, "blocked"),
+        (ErrorCode.SANDBOX_VIOLATION.value, ExecutionOutcomeStatus.BLOCKED, "blocked"),
+        (ErrorCode.CWD_DENIED.value, ExecutionOutcomeStatus.BLOCKED, "blocked"),
+        (ErrorCode.PROCESS_NOT_FOUND.value, ExecutionOutcomeStatus.REPLAN_REQUIRED, "replan"),
+    ],
+)
+def test_protocol_error_codes_from_runtime_do_not_fall_back_to_retry(
+    error_code: str,
+    expected_status: ExecutionOutcomeStatus,
+    expected_next_action: str,
+) -> None:
+    outcome = RunOutcomeReducer().protocol_result_to_outcome(
+        SimpleNamespace(
+            next_action="recover",
+            failed_count=1,
+            rejected_count=1,
+            pending_approval_count=0,
+            status=SimpleNamespace(value="failed"),
+        ),
+        observations=[
+            ToolObservation(
+                id="obs_1",
+                tool_call_id="call_1",
+                tool_name="run_command",
+                ok=False,
+                raw_result={},
+                error_code=error_code,
+                preview="runtime failure",
+                truncated=False,
+            )
+        ],
+    )
+
+    assert outcome is not None
+    assert outcome.status == expected_status
+    assert outcome.error_code == error_code
+    assert outcome.next_action == expected_next_action
+    assert outcome.retry_allowed is (expected_status == ExecutionOutcomeStatus.REPLAN_REQUIRED)
 
 
 def test_task_controller_records_trace_event_for_state_transition(tmp_path) -> None:
