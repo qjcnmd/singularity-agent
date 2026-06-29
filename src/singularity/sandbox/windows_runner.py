@@ -13,7 +13,7 @@ from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NEW_CONSOLE = 0x00000010
@@ -44,7 +44,7 @@ DESKTOP_SWITCHDESKTOP = 0x0100
 DESKTOP_ACCESS = (
     DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP
 )
-LOGON_WITH_PROFILE = 0x00000001
+SANDBOX_LOGON_FLAGS = 0
 CRED_TYPE_GENERIC = 1
 # Token / identity introspection (Level-1 account process proves its own identity
 # so doctor can verify the launch was not an admin-current-user fallback).
@@ -61,8 +61,8 @@ CHILD_ERROR_MODE = (
     SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
 )
 
-DEFAULT_ACCOUNT_NAME = "SingularitySandbox"
-DEFAULT_CREDENTIAL_TARGET = "SingularitySandbox"
+DEFAULT_ACCOUNT_NAME = "SingularityOffline"
+DEFAULT_CREDENTIAL_TARGET = "SingularityOffline"
 NETWORK_PROBE_ENDPOINTS = (("1.1.1.1", 53), ("1.1.1.1", 443), ("8.8.8.8", 53))
 SECRET_KEY_RE = re.compile(
     r"(authorization|cookie|token|api[_-]?key|secret|password|private[_-]?key|database[_-]?url|dsn)",
@@ -201,7 +201,11 @@ class WindowsSandboxRunner:
             return run_spec(_spec_from_prepared(prepared))
         spec_path = Path(prepared.baseline["runner_spec"])
         result_path = Path(prepared.baseline["runner_result"])
-        username, password = _read_generic_credential(self.credential_target)
+        account_name = str(prepared.baseline.get("sandbox_account") or self.account_name)
+        credential_target = str(
+            prepared.baseline.get("credential_target") or self.credential_target
+        )
+        username, password = _read_generic_credential(credential_target)
         account_stdout = ""
         account_stderr = ""
         try:
@@ -215,7 +219,7 @@ class WindowsSandboxRunner:
                 ],
                 cwd=prepared.sandbox_root,
                 env=_launcher_env(),
-                username=username or self.account_name,
+                username=username or account_name,
                 password=password,
             )
             try:
@@ -530,7 +534,7 @@ class _WindowsChildProcess:
         desktop_handle: int | None,
         stdout_path: Path,
         stderr_path: Path,
-        streams: list[object],
+        streams: list[BinaryIO],
     ) -> None:
         self.args = command
         self.pid = process_id
@@ -561,7 +565,7 @@ class _WindowsChildProcess:
         wait_ms = INFINITE if timeout is None else max(1, int(float(timeout) * 1000))
         wait_result = _kernel32().WaitForSingleObject(self._process_handle, wait_ms)
         if wait_result == WAIT_TIMEOUT:
-            raise subprocess.TimeoutExpired(self.args, timeout)
+            raise subprocess.TimeoutExpired(self.args, float(timeout or 0))
         if wait_result != WAIT_OBJECT_0:
             raise _last_winerror("WaitForSingleObject")
         exit_code = self.poll()
@@ -621,7 +625,7 @@ def _start_windows_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildPro
             stdout_file = stream_stack.enter_context(stdout_path.open("w+b"))
             stderr_file = stream_stack.enter_context(stderr_path.open("w+b"))
             stdin_file = stream_stack.enter_context(Path(os.devnull).open("rb"))
-            streams: list[object] = [stdout_file, stderr_file, stdin_file]
+            streams: list[BinaryIO] = [stdout_file, stderr_file, stdin_file]
             for stream in streams:
                 os.set_handle_inheritable(msvcrt.get_osfhandle(stream.fileno()), True)
             desktop_handle = _create_private_desktop(desktop_name)
@@ -645,7 +649,7 @@ def _start_windows_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildPro
                 True,
                 flags,
                 env_block,
-                str(cwd),
+                _windows_extended_path(cwd),
                 ctypes.byref(startup),
                 ctypes.byref(process_info),
             )
@@ -708,8 +712,11 @@ def _create_restricted_token() -> int:
             ctypes.byref(restricted),
         ):
             raise _last_winerror("CreateRestrictedToken")
-        _set_low_integrity(restricted.value)
-        return restricted.value
+        restricted_handle = restricted.value
+        if not restricted_handle:
+            raise OSError("CreateRestrictedToken returned an empty token handle.")
+        _set_low_integrity(restricted_handle)
+        return restricted_handle
     finally:
         _close_handle(token.value)
 
@@ -751,6 +758,17 @@ def _windows_command_line(command: list[str] | str) -> str:
 def _windows_env_block(env: dict[str, str]) -> str:
     pairs = [f"{key}={value}" for key, value in sorted(env.items(), key=lambda item: item[0].upper())]
     return "\0".join(pairs) + "\0\0"
+
+
+def _windows_extended_path(path: Path) -> str:
+    value = str(path)
+    if value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    if path.is_absolute():
+        return "\\\\?\\" + value
+    return value
 
 
 def _spec_from_prepared(prepared: Any) -> WindowsRunnerSpec:
@@ -804,7 +822,7 @@ def _start_account_process(
             stdout_file = stream_stack.enter_context(stdout_path.open("w+b"))
             stderr_file = stream_stack.enter_context(stderr_path.open("w+b"))
             stdin_file = stream_stack.enter_context(Path(os.devnull).open("rb"))
-            streams: list[object] = [stdout_file, stderr_file, stdin_file]
+            streams: list[BinaryIO] = [stdout_file, stderr_file, stdin_file]
             for stream in streams:
                 os.set_handle_inheritable(msvcrt.get_osfhandle(stream.fileno()), True)
             startup = STARTUPINFO()
@@ -819,7 +837,7 @@ def _start_account_process(
                 username,
                 ".",
                 password,
-                LOGON_WITH_PROFILE,
+                SANDBOX_LOGON_FLAGS,
                 None,
                 command_line,
                 CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,

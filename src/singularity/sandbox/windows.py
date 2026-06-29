@@ -43,18 +43,29 @@ from singularity.sandbox.windows_runner import (
     WindowsSandboxRunner,
 )
 
-DOCTOR_SCHEMA_VERSION = "sandbox.windows.doctor/v1"
-SETUP_SCHEMA_VERSION = "sandbox.windows.setup/v1"
-CLEANUP_SCHEMA_VERSION = "sandbox.windows.cleanup/v1"
+DOCTOR_SCHEMA_VERSION = "sandbox.windows.doctor/v2"
+SETUP_SCHEMA_VERSION = "sandbox.windows.setup/v2"
+CLEANUP_SCHEMA_VERSION = "sandbox.windows.cleanup/v2"
 WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT = 20
-SANDBOX_ACCOUNT = "SingularitySandbox"
+OFFLINE_SANDBOX_ACCOUNT = "SingularityOffline"
+ONLINE_SANDBOX_ACCOUNT = "SingularityOnline"
+SANDBOX_ACCOUNTS = (OFFLINE_SANDBOX_ACCOUNT, ONLINE_SANDBOX_ACCOUNT)
+LEGACY_SINGLE_SANDBOX_ACCOUNT = "SingularitySandbox"
 LEGACY_SANDBOX_ACCOUNT = "SingularitySandboxRunner"
+LEGACY_SANDBOX_ACCOUNTS = (
+    LEGACY_SINGLE_SANDBOX_ACCOUNT,
+    LEGACY_SANDBOX_ACCOUNT,
+)
 FIREWALL_RULE_GROUP = "Singularity Sandbox"
 FIREWALL_RULE_NAME = "Singularity Sandbox Outbound Block"
 LEGACY_FIREWALL_RULE_NAME = "Singularity Sandbox Runner Outbound Block"
 LOGIN_UI_USERLIST_KEY = (
     r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
 )
+SECURITY_ATTESTATION_KEY = r"HKLM:\SOFTWARE\Singularity\WindowsSandbox"
+SECURITY_ATTESTATION_VALUE = "SecurityAttestation"
+SECURITY_ATTESTATION_SCHEMA_VERSION = "singularity.windows-sandbox.security/v1"
+SECURITY_ATTESTATION_POLICY = "interactive-only-with-remote-network-service-batch-denied"
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 NERR_SUCCESS = 0
@@ -97,20 +108,57 @@ SANDBOX_UNNEEDED_ALLOW_LOGON_RIGHTS = (
 NERR_MEMBER_IN_GROUP = 2118
 ERROR_MEMBER_IN_ALIAS = 1378
 ERROR_NOT_FOUND = 1168
+STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
 SETUP_STEP_ORDER = (
-    "sandbox_account",
-    "credential",
+    "sandbox_accounts",
+    "credentials",
     "login_ui_visibility",
-    "logon_right",
-    "logon_hardening",
-    "account_group",
+    "logon_rights",
+    "group_membership",
     "state_dir_acl",
     "acl_boundary",
-    "network_filter",
+    "offline_network_filter",
     "private_desktop",
-    "execution_backend",
+    "execution_backends",
     "network_probe",
+    "legacy_cleanup",
 )
+
+
+@dataclass(frozen=True)
+class _WindowsSandboxIdentity:
+    role: str
+    network_mode: SandboxNetworkMode
+    account_name: str
+    credential_target: str
+    firewall_blocked: bool
+
+
+_SANDBOX_IDENTITIES = {
+    SandboxNetworkMode.DENIED: _WindowsSandboxIdentity(
+        role="offline",
+        network_mode=SandboxNetworkMode.DENIED,
+        account_name=OFFLINE_SANDBOX_ACCOUNT,
+        credential_target=OFFLINE_SANDBOX_ACCOUNT,
+        firewall_blocked=True,
+    ),
+    SandboxNetworkMode.ALLOWED: _WindowsSandboxIdentity(
+        role="online",
+        network_mode=SandboxNetworkMode.ALLOWED,
+        account_name=ONLINE_SANDBOX_ACCOUNT,
+        credential_target=ONLINE_SANDBOX_ACCOUNT,
+        firewall_blocked=False,
+    ),
+}
+
+
+def _sandbox_identity_for_mode(mode: SandboxNetworkMode) -> _WindowsSandboxIdentity:
+    identity = _SANDBOX_IDENTITIES.get(mode)
+    if identity is None:
+        raise SandboxCapabilityError(
+            f"backend_unavailable: Windows sandbox network mode {mode.value} is unsupported."
+        )
+    return identity
 
 
 @dataclass(frozen=True)
@@ -166,65 +214,68 @@ class WindowsSandboxPrimitives:
 
 @dataclass(frozen=True)
 class WindowsSandboxSetup:
-    sandbox_account: WindowsCapabilityState
+    sandbox_accounts: WindowsCapabilityState
     login_ui_visibility: WindowsCapabilityState
     logon_rights: WindowsCapabilityState
     group_membership: WindowsCapabilityState
     state_dir_acl: WindowsCapabilityState
     acl_boundary: WindowsCapabilityState
-    network_filter: WindowsCapabilityState
+    offline_network_filter: WindowsCapabilityState
     private_desktop: WindowsCapabilityState
-    execution_backend: WindowsCapabilityState
+    execution_backends: WindowsCapabilityState
+    legacy_assets: WindowsCapabilityState
 
     def values(self) -> tuple[WindowsCapabilityState, ...]:
         return (
-            self.sandbox_account,
+            self.sandbox_accounts,
             self.login_ui_visibility,
             self.logon_rights,
             self.group_membership,
             self.state_dir_acl,
             self.acl_boundary,
-            self.network_filter,
+            self.offline_network_filter,
             self.private_desktop,
-            self.execution_backend,
+            self.execution_backends,
+            self.legacy_assets,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "sandbox_account": self.sandbox_account.to_dict(),
+            "sandbox_accounts": self.sandbox_accounts.to_dict(),
             "login_ui_visibility": self.login_ui_visibility.to_dict(),
             "logon_rights": self.logon_rights.to_dict(),
             "group_membership": self.group_membership.to_dict(),
             "state_dir_acl": self.state_dir_acl.to_dict(),
             "acl_boundary": self.acl_boundary.to_dict(),
-            "network_filter": self.network_filter.to_dict(),
+            "offline_network_filter": self.offline_network_filter.to_dict(),
             "private_desktop": self.private_desktop.to_dict(),
-            "execution_backend": self.execution_backend.to_dict(),
+            "execution_backends": self.execution_backends.to_dict(),
+            "legacy_assets": self.legacy_assets.to_dict(),
         }
 
 
 @dataclass(frozen=True)
 class WindowsSandboxExecution:
-    account_sid: WindowsCapabilityState
-    credential: WindowsCapabilityState
-    launcher: WindowsCapabilityState
+    account_sids: WindowsCapabilityState
+    credentials: WindowsCapabilityState
+    launchers: WindowsCapabilityState
     runner_smoke: WindowsCapabilityState
     network_probe: WindowsCapabilityState
 
     def values(self) -> tuple[WindowsCapabilityState, ...]:
         return (
-            self.account_sid,
-            self.credential,
-            self.launcher,
+            self.account_sids,
+            self.credentials,
+            self.launchers,
             self.runner_smoke,
             self.network_probe,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "account_sid": self.account_sid.to_dict(),
-            "credential": self.credential.to_dict(),
-            "launcher": self.launcher.to_dict(),
+            "account_sids": self.account_sids.to_dict(),
+            "credentials": self.credentials.to_dict(),
+            "launchers": self.launchers.to_dict(),
             "runner_smoke": self.runner_smoke.to_dict(),
             "network_probe": self.network_probe.to_dict(),
         }
@@ -252,7 +303,9 @@ class WindowsSandboxDoctorReport:
     def ready_for_tests(cls) -> WindowsSandboxDoctorReport:
         ready = _available("test verified", {"source": "test"})
         primitives = WindowsSandboxPrimitives(ready, ready, ready, ready, ready, ready)
-        setup = WindowsSandboxSetup(ready, ready, ready, ready, ready, ready, ready, ready, ready)
+        setup = WindowsSandboxSetup(
+            ready, ready, ready, ready, ready, ready, ready, ready, ready, ready
+        )
         execution = WindowsSandboxExecution(ready, ready, ready, ready, ready)
         return cls(
             implementation="elevated",
@@ -314,16 +367,18 @@ class WindowsSandboxSetupReport:
             requires_elevation=False,
             changed=False,
             completed_steps=(
-                "sandbox_account",
-                "credential",
-                "logon_right",
-                "account_group",
+                "sandbox_accounts",
+                "credentials",
+                "login_ui_visibility",
+                "logon_rights",
+                "group_membership",
                 "state_dir_acl",
                 "acl_boundary",
-                "network_filter",
+                "offline_network_filter",
                 "private_desktop",
-                "execution_backend",
+                "execution_backends",
                 "network_probe",
+                "legacy_cleanup",
             ),
             pending_steps=(),
             failed_steps=(),
@@ -357,6 +412,7 @@ class WindowsSandboxCleanupReport:
     completed_steps: tuple[str, ...]
     failed_steps: tuple[dict[str, Any], ...]
     diagnostics: tuple[dict[str, Any], ...] = ()
+    residual_audit: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -370,6 +426,7 @@ class WindowsSandboxCleanupReport:
             "completed_steps": list(self.completed_steps),
             "failed_steps": list(self.failed_steps),
             "diagnostics": list(self.diagnostics),
+            "residual_audit": dict(self.residual_audit),
         }
 
 
@@ -380,10 +437,11 @@ class WindowsSandboxBackend:
         runner: Any | None = None,
         filesystem: SandboxFilesystemManager | None = None,
         artifact_collector: SandboxArtifactCollector | None = None,
-        acl_applier: Callable[[Path], None] | None = None,
+        acl_applier: Callable[[Path, str], None] | None = None,
         doctor_provider: Callable[[], WindowsSandboxDoctorReport] | None = None,
         setup_provider: Callable[[], WindowsSandboxSetupReport] | None = None,
         cleanup_provider: Callable[[], WindowsSandboxCleanupReport] | None = None,
+        run_root_provider: Callable[[SandboxRequest], Path] | None = None,
     ) -> None:
         self.runner = runner or WindowsSandboxRunner()
         self.filesystem = filesystem or SandboxFilesystemManager()
@@ -392,6 +450,9 @@ class WindowsSandboxBackend:
         self._doctor_provider = doctor_provider or probe_windows_sandbox
         self._setup_provider = setup_provider or setup_windows_sandbox
         self._cleanup_provider = cleanup_provider or cleanup_windows_sandbox_assets
+        self._run_root_provider = run_root_provider or (
+            lambda request: _windows_state_dir_path() / "runs" / request.sandbox_id
+        )
 
     def name(self) -> str:
         return "windows"
@@ -443,6 +504,7 @@ class WindowsSandboxBackend:
         report = self.doctor()
         if not report.available:
             raise SandboxCapabilityError(report.reason)
+        identity = _sandbox_identity_for_mode(request.profile.network.mode)
         if _external_writable_paths(request):
             raise SandboxCapabilityError(
                 "backend_unavailable: Windows sandbox additional writable directories "
@@ -453,12 +515,18 @@ class WindowsSandboxBackend:
                 "backend_unavailable: Windows sandbox path-specific readonly leases "
                 "are not available."
             )
-        fs = self.filesystem.prepare_filesystem(
-            sandbox_id=request.sandbox_id,
-            policy=request.profile.filesystem,
-            cwd=request.cwd,
-        )
-        self._acl_applier(fs.sandbox_root)
+        filesystem_policy = request.profile.filesystem
+        original_sandbox_root = filesystem_policy.sandbox_root
+        filesystem_policy.sandbox_root = self._run_root_provider(request)
+        try:
+            fs = self.filesystem.prepare_filesystem(
+                sandbox_id=request.sandbox_id,
+                policy=filesystem_policy,
+                cwd=request.cwd,
+            )
+        finally:
+            filesystem_policy.sandbox_root = original_sandbox_root
+        self._acl_applier(fs.sandbox_root, identity.account_name)
         env = SandboxEnvironmentBuilder().build_env(request.profile.env, os.environ)
         env = self._runtime_env(env)
         trace_id = random_trace_id()
@@ -492,7 +560,9 @@ class WindowsSandboxBackend:
                 "files": baseline,
                 "runner_spec": str(spec_path),
                 "runner_result": str(result_path),
-                "account": SANDBOX_ACCOUNT,
+                "sandbox_account": identity.account_name,
+                "credential_target": identity.credential_target,
+                "sandbox_role": identity.role,
             },
         )
 
@@ -535,7 +605,7 @@ class WindowsSandboxBackend:
         process_tree_kill = bool(runner_metadata.get("job_object"))
         network_filter_verified = (
             prepared.request.profile.network.mode != SandboxNetworkMode.DENIED
-            or enforcement.setup.network_filter.ready
+            or enforcement.setup.offline_network_filter.ready
         )
         network_probe_verified = (
             prepared.request.profile.network.mode != SandboxNetworkMode.DENIED
@@ -563,7 +633,7 @@ class WindowsSandboxBackend:
             **runner_metadata,
             "error_code": None,
             "execution_backend": "account_restricted_token",
-            "sandbox_account": SANDBOX_ACCOUNT,
+            "sandbox_role": str(prepared.baseline.get("sandbox_role") or "unknown"),
             "restricted_token": restricted_token,
             "low_integrity": low_integrity,
             "private_desktop": private_desktop,
@@ -637,6 +707,11 @@ class WindowsSandboxBackend:
         )
 
     def cleanup(self, prepared: PreparedSandbox) -> None:
+        normalized = _normalize_run_root_for_cleanup(prepared.sandbox_root)
+        if not normalized.ok:
+            raise SandboxCapabilityError(
+                "backend_unavailable: sandbox run root could not be normalized for cleanup."
+            )
         self.filesystem.cleanup(prepared.sandbox_root)
 
     def _runtime_enforcement_report(self) -> WindowsSandboxDoctorReport:
@@ -673,17 +748,43 @@ class WindowsSandboxBackend:
             return SandboxStatus.FAILED
         return SandboxStatus.SUCCESS if runner_result.exit_code == 0 else SandboxStatus.FAILED
 
-    def _apply_run_acl(self, sandbox_root: Path) -> None:
+    def _apply_run_acl(self, sandbox_root: Path, account_name: str) -> None:
         if os.name != "nt":
             return
-        result = _apply_account_acl(
-            sandbox_root,
-            low_integrity_root=sandbox_root / "workspace",
-        )
-        if not result.ok:
+        host_sid = _current_process_sid()
+        icacls = shutil.which("icacls")
+        if not host_sid or icacls is None:
             raise SandboxCapabilityError(
                 "backend_unavailable: sandbox ACL boundary could not be applied."
             )
+        commands = (
+            [icacls, str(sandbox_root), "/inheritance:r", "/T", "/C", "/Q"],
+            [
+                icacls,
+                str(sandbox_root),
+                "/grant:r",
+                f"*{host_sid}:(OI)(CI)F",
+                f"{account_name}:(OI)(CI)M",
+                "/T",
+                "/C",
+                "/Q",
+            ],
+            [
+                icacls,
+                str(sandbox_root / "workspace"),
+                "/setintegritylevel",
+                "(OI)(CI)L",
+                "/T",
+                "/C",
+                "/Q",
+            ],
+        )
+        for command in commands:
+            result = _run_command(command)
+            if result.returncode != 0:
+                raise SandboxCapabilityError(
+                    "backend_unavailable: sandbox ACL boundary could not be applied."
+                )
 
     @staticmethod
     def _runtime_env(env: dict[str, str]) -> dict[str, str]:
@@ -710,7 +811,119 @@ def probe_windows_sandbox() -> WindowsSandboxDoctorReport:
     return _probe_windows_sandbox_uncached()
 
 
+def _ensure_sandbox_identity(identity: _WindowsSandboxIdentity) -> _OperationResult:
+    name_error = _validate_sandbox_account_name(identity.account_name)
+    if name_error is not None:
+        return _OperationResult(
+            False,
+            name_error["reason"],
+            dict(name_error["details"]),
+        )
+    changed = False
+    password = ""
+    try:
+        if not _account_exists(identity.account_name):
+            password = _generate_account_password()
+            created = _create_sandbox_account(identity.account_name, password)
+            if not created.ok:
+                return _OperationResult(
+                    False,
+                    created.reason,
+                    {"phase": "sandbox_accounts", **created.details},
+                )
+            changed = True
+            credential = _store_credential(identity, password)
+            if not credential.ok:
+                return _OperationResult(
+                    False,
+                    credential.reason,
+                    {"phase": "credentials", **credential.details},
+                )
+        elif not _credential_state(identity).ready:
+            password = _generate_account_password()
+            reset = _set_account_password(identity.account_name, password)
+            if not reset.ok:
+                return _OperationResult(
+                    False,
+                    reset.reason,
+                    {"phase": "credentials", **reset.details},
+                )
+            credential = _store_credential(identity, password)
+            if not credential.ok:
+                return _OperationResult(
+                    False,
+                    credential.reason,
+                    {"phase": "credentials", **credential.details},
+                )
+            changed = True
+        return _OperationResult(True, "identity_ready", {"changed": changed})
+    finally:
+        password = ""
+
+
+def _setup_identity_security(identity: _WindowsSandboxIdentity) -> _OperationResult:
+    sid = _account_sid(identity.account_name)
+    if not sid:
+        return _OperationResult(False, "sandbox account SID unavailable")
+    changed = False
+    visibility = _hide_account_from_login_ui(identity.account_name)
+    if not visibility.ok:
+        return _OperationResult(
+            False,
+            visibility.reason,
+            {"phase": "login_ui_visibility", **visibility.details},
+        )
+    changed = changed or bool(visibility.details.get("changed"))
+    rights = _enumerate_account_logon_rights(sid)
+    if not rights.get("interactive"):
+        granted = _grant_logon_right(sid)
+        if not granted.ok:
+            return _OperationResult(
+                False,
+                granted.reason,
+                {"phase": "logon_rights", **granted.details},
+            )
+        changed = True
+    if rights.get("deny_interactive"):
+        removed = _remove_deny_logon_rights(sid)
+        if not removed.ok:
+            return _OperationResult(
+                False,
+                removed.reason,
+                {"phase": "logon_rights", **removed.details},
+            )
+        changed = True
+    hardened = _harden_sandbox_logon_rights(sid)
+    if not hardened.ok:
+        return _OperationResult(
+            False,
+            hardened.reason,
+            {"phase": "logon_rights", **hardened.details},
+        )
+    changed = changed or bool(hardened.details.get("changed"))
+    post_rights = _enumerate_account_logon_rights(sid)
+    if not _logon_rights_state(post_rights).ready:
+        return _OperationResult(
+            False,
+            "sandbox account logon rights were not verified after hardening",
+            {"phase": "logon_rights", "logon_rights": post_rights},
+        )
+    group = _ensure_constrained_group_membership(identity.account_name)
+    if not group.ok:
+        return _OperationResult(
+            False,
+            group.reason,
+            {"phase": "group_membership", **group.details},
+        )
+    changed = changed or bool(group.details.get("changed")) or group.reason == "added"
+    return _OperationResult(True, "identity_security_ready", {"changed": changed})
+
+
 def setup_windows_sandbox() -> WindowsSandboxSetupReport:
+    return _setup_windows_sandbox_v2()
+
+
+def _setup_windows_sandbox_v2() -> WindowsSandboxSetupReport:
     if os.name != "nt":
         return WindowsSandboxSetupReport(
             status="not_supported",
@@ -719,15 +932,13 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
             changed=False,
             completed_steps=(),
             pending_steps=(),
-            failed_steps=({"step": "platform", "reason": "Windows sandbox setup requires Windows."},),
+            failed_steps=(
+                {"step": "platform", "reason": "Windows sandbox setup requires Windows."},
+            ),
             available_after_setup=False,
             message="Windows sandbox setup is not supported on this platform.",
             diagnostics=(),
         )
-    changed = False
-    completed: list[str] = []
-    pending: list[str] = []
-    failed: list[dict[str, Any]] = []
     if not _is_elevated():
         return WindowsSandboxSetupReport(
             status="requires_elevation",
@@ -735,243 +946,214 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
             requires_elevation=True,
             changed=False,
             completed_steps=(),
-            pending_steps=(
-                *SETUP_STEP_ORDER,
-            ),
+            pending_steps=SETUP_STEP_ORDER,
             failed_steps=(),
             available_after_setup=False,
             message="Run sandbox setup from an elevated shell to create account and firewall assets.",
             diagnostics=(),
         )
-    diagnostics = _legacy_artifact_diagnostics()
-    password = ""
-    account_name_error = _validate_sandbox_account_name(SANDBOX_ACCOUNT)
-    if account_name_error is not None:
-        failed.append(account_name_error)
-        return _setup_report(
-            status="failed",
-            changed=changed,
-            completed=completed,
-            failed=failed,
-            available_after_setup=False,
-            message=account_name_error["reason"],
-            diagnostics=diagnostics,
-        )
-    elif not _account_exists(SANDBOX_ACCOUNT):
-        password = _generate_account_password()
-        result = _create_sandbox_account(SANDBOX_ACCOUNT, password)
-        if result.ok:
-            changed = True
-            completed.append("sandbox_account")
-            credential = _store_credential(password)
-            if credential.ok:
-                completed.append("credential")
-            else:
-                failed.append({"step": "credential", "reason": credential.reason})
-        else:
-            failed.append(
-                _operation_failure_step(
-                    "sandbox_account",
-                    result,
-                    account_name=SANDBOX_ACCOUNT,
-                )
-            )
-    else:
-        completed.append("sandbox_account")
-        credential_state = _credential_state()
-        if credential_state.ready:
-            completed.append("credential")
-        else:
-            password = _generate_account_password()
-            reset = _set_account_password(SANDBOX_ACCOUNT, password)
-            if reset.ok:
-                credential = _store_credential(password)
-                if credential.ok:
-                    changed = True
-                    completed.append("credential")
-                else:
-                    failed.append({"step": "credential", "reason": credential.reason})
-            else:
-                failed.append(
-                    _operation_failure_step(
-                        "credential",
-                        reset,
-                        account_name=SANDBOX_ACCOUNT,
-                    )
-                )
-    password = ""
-    sid = _account_sid(SANDBOX_ACCOUNT)
-    visibility_result = _hide_account_from_login_ui(SANDBOX_ACCOUNT)
-    if visibility_result.ok:
-        if visibility_result.reason != "already_hidden":
-            changed = True
-        completed.append("login_ui_visibility")
-    else:
-        failed.append(
-            {
-                "step": "login_ui_visibility",
-                "reason": visibility_result.reason,
-                "details": visibility_result.details,
-            }
-        )
-    pre_rights = (
-        _enumerate_account_logon_rights(sid) if sid else _logon_rights_view([], "no_sid")
-    )
-    needs_grant = bool(sid) and not pre_rights.get("interactive")
-    needs_deny_remove = bool(sid) and (
-        pre_rights.get("deny_interactive")
-        or pre_rights.get("deny_batch")
-        or pre_rights.get("deny_service")
-    )
-    logon_grant = (
-        _grant_logon_right(sid)
-        if needs_grant
-        else _OperationResult(True, "SeInteractiveLogonRight already present")
-    )
-    logon_deny = (
-        _remove_deny_logon_rights(sid)
-        if needs_deny_remove
-        else _OperationResult(True, "no deny logon rights present")
-    )
-    if logon_grant.ok and logon_deny.ok:
-        post_rights = (
-            _enumerate_account_logon_rights(sid) if sid else _logon_rights_view([], "no_sid")
-        )
-        if post_rights.get("interactive") and not post_rights.get("deny_interactive"):
-            if needs_grant or needs_deny_remove:
-                changed = True
-            completed.append("logon_right")
-        else:
+
+    changed = False
+    completed: list[str] = []
+    failed: list[dict[str, Any]] = []
+    identities = tuple(_SANDBOX_IDENTITIES.values())
+
+    identity_results: dict[str, _OperationResult] = {}
+    for identity in identities:
+        result = _ensure_sandbox_identity(identity)
+        identity_results[identity.role] = result
+        changed = changed or bool(result.details.get("changed"))
+        if not result.ok:
             failed.append(
                 {
-                    "step": "logon_right",
-                    "reason": "SeInteractiveLogonRight not verified after grant",
+                        "step": str(result.details.get("phase") or "sandbox_accounts"),
+                    "reason": result.reason,
                     "details": {
-                        "logon_rights": post_rights,
-                        "grant_reason": logon_grant.reason,
-                        "deny_reason": logon_deny.reason,
+                        "role": identity.role,
+                        **result.details,
                     },
                 }
             )
-    else:
-        failed.append(
-            {
-                "step": "logon_right",
-                "reason": logon_grant.reason or logon_deny.reason,
-                "details": {
-                    "grant_ok": logon_grant.ok,
-                    "deny_ok": logon_deny.ok,
-                    "grant_reason": logon_grant.reason,
-                    "deny_reason": logon_deny.reason,
-                },
-            }
-        )
-    hardening = (
-        _harden_sandbox_logon_rights(sid)
-        if sid
-        else _OperationResult(False, "sandbox account SID unavailable for logon hardening")
+    if all(result.ok for result in identity_results.values()):
+        completed.extend(("sandbox_accounts", "credentials"))
+
+    security_results: dict[str, _OperationResult] = {}
+    for identity in identities:
+        if not identity_results.get(identity.role, _OperationResult(False)).ok:
+            continue
+        result = _setup_identity_security(identity)
+        security_results[identity.role] = result
+        changed = changed or bool(result.details.get("changed"))
+        if not result.ok:
+            failed.append(
+                {
+                    "step": str(result.details.get("phase") or "logon_rights"),
+                    "reason": result.reason,
+                    "details": {"role": identity.role, **result.details},
+                }
+            )
+    security_ready = len(security_results) == len(identities) and all(
+        result.ok for result in security_results.values()
     )
-    if hardening.ok:
-        if hardening.details.get("changed"):
-            changed = True
-        completed.append("logon_hardening")
-    else:
-        failed.append(
+    if security_ready:
+        completed.extend(("login_ui_visibility", "group_membership"))
+        attestation = _write_security_attestation(
             {
-                "step": "logon_hardening",
-                "reason": hardening.reason,
-                "details": hardening.details,
+                identity.role: _account_sid(identity.account_name)
+                for identity in identities
             }
         )
-    group_result = _add_account_to_users_group(SANDBOX_ACCOUNT)
-    if group_result.ok:
-        if group_result.reason == "added":
-            changed = True
-        completed.append("account_group")
-    else:
-        failed.append(
-            {
-                "step": "account_group",
-                "reason": group_result.reason,
-                "details": group_result.details,
-            }
-        )
+        changed = changed or bool(attestation.details.get("changed"))
+        if attestation.ok:
+            completed.append("logon_rights")
+        else:
+            failed.append(
+                {
+                    "step": "logon_rights",
+                    "reason": attestation.reason,
+                    "details": attestation.details,
+                }
+            )
+
     state_acl = _ensure_state_dir_acl()
     if state_acl.ok:
-        if state_acl.details.get("changed"):
-            changed = True
+        changed = changed or bool(state_acl.details.get("changed"))
         completed.append("state_dir_acl")
     else:
         failed.append(
+            {"step": "state_dir_acl", "reason": state_acl.reason, "details": state_acl.details}
+        )
+
+    offline = _SANDBOX_IDENTITIES[SandboxNetworkMode.DENIED]
+    offline_sid = _account_sid(offline.account_name)
+    if offline_sid and not _network_state(offline_sid).ready:
+        _run_powershell(
+            f"Remove-NetFirewallRule -Group {_ps_quote(FIREWALL_RULE_GROUP)} "
+            "-ErrorAction SilentlyContinue"
+        )
+        firewall = _run_powershell(
+            "New-NetFirewallRule "
+            f"-DisplayName {_ps_quote(FIREWALL_RULE_NAME)} "
+            f"-Group {_ps_quote(FIREWALL_RULE_GROUP)} "
+            "-Direction Outbound -Action Block -Enabled True "
+            f"-LocalUser {_ps_quote(_firewall_local_user_sddl(offline_sid))} | Out-Null"
+        )
+        if firewall.returncode == 0:
+            changed = True
+        else:
+            failed.append(
+                {
+                    "step": "offline_network_filter",
+                    "reason": _safe_output(firewall),
+                }
+            )
+    online = _SANDBOX_IDENTITIES[SandboxNetworkMode.ALLOWED]
+    online_sid = _account_sid(online.account_name)
+    network_filter_ready = bool(
+        offline_sid
+        and online_sid
+        and _network_state(offline_sid).ready
+        and _online_network_filter_state(online_sid).ready
+    )
+    if network_filter_ready:
+        completed.append("offline_network_filter")
+    elif not any(item["step"] == "offline_network_filter" for item in failed):
+        failed.append(
             {
-                "step": "state_dir_acl",
-                "reason": state_acl.reason,
-                "details": state_acl.details,
+                "step": "offline_network_filter",
+                "reason": "Offline firewall rule or online-account exclusion was not verified.",
             }
         )
-    probe_windows_sandbox.cache_clear()
-    if not _firewall_rule_ready():
-        sid = _account_sid(SANDBOX_ACCOUNT)
-        if sid:
-            _run_powershell(
-                f"Remove-NetFirewallRule -DisplayName {_ps_quote(FIREWALL_RULE_NAME)} "
-                "-ErrorAction SilentlyContinue"
-            )
-            firewall_result = _run_powershell(
-                "New-NetFirewallRule "
-                f"-DisplayName '{FIREWALL_RULE_NAME}' "
-                f"-Group '{FIREWALL_RULE_GROUP}' "
-                "-Direction Outbound -Action Block -Enabled True "
-                f"-LocalUser '{_firewall_local_user_sddl(sid)}' | Out-Null"
-            )
-            if firewall_result.returncode == 0:
-                changed = True
-                completed.append("network_filter")
-            else:
-                failed.append({"step": "network_filter", "reason": _safe_output(firewall_result)})
-        else:
-            failed.append({"step": "network_filter", "reason": "sandbox account SID unavailable"})
-    else:
-        completed.append("network_filter")
-    acl_state = _acl_state(True)
-    if acl_state.ready:
+
+    acl_states = {
+        identity.role: _acl_state(True, identity) for identity in identities
+    }
+    if all(state.ready for state in acl_states.values()):
         completed.append("acl_boundary")
     else:
-        failed.append({"step": "acl_boundary", "reason": acl_state.reason, "details": acl_state.evidence})
+        failed.append(
+            {
+                "step": "acl_boundary",
+                "reason": "ACL boundary probe failed for one or more sandbox accounts.",
+                "details": {
+                    role: state.to_dict() for role, state in acl_states.items() if not state.ready
+                },
+            }
+        )
+
     if _has_windows_symbols("user32", "CreateDesktopW", "CloseDesktop"):
         completed.append("private_desktop")
     else:
         failed.append({"step": "private_desktop", "reason": "CreateDesktopW is unavailable"})
-    execution_state = _runner_smoke_state()
-    if execution_state.ready:
-        completed.append("execution_backend")
+
+    runner_states = {
+        identity.role: _runner_smoke_state(identity) for identity in identities
+    }
+    if all(state.ready for state in runner_states.values()):
+        completed.append("execution_backends")
     else:
         failed.append(
             {
-                "step": "execution_backend",
-                "reason": execution_state.reason,
-                "details": execution_state.evidence,
+                "step": "execution_backends",
+                "reason": "Restricted runner smoke failed for one or more sandbox accounts.",
+                "details": {
+                    role: state.to_dict() for role, state in runner_states.items() if not state.ready
+                },
             }
         )
-    probe_windows_sandbox.cache_clear()
-    doctor = _probe_windows_sandbox_uncached()
-    if doctor.execution.network_probe.ready:
+
+    network_states = {
+        identity.role: _network_probe_state(identity, _account_sid(identity.account_name))
+        for identity in identities
+    }
+    if all(state.ready for state in network_states.values()):
         completed.append("network_probe")
     else:
         failed.append(
             {
                 "step": "network_probe",
-                "reason": doctor.execution.network_probe.reason,
-                "details": doctor.execution.network_probe.evidence,
+                "reason": "Offline denied or online allowed network probe failed.",
+                "details": {
+                    role: state.to_dict() for role, state in network_states.items() if not state.ready
+                },
             }
         )
-    status = "ready" if doctor.available else "partial"
-    if failed:
-        status = "failed" if not completed else "partial"
+
+    if not failed:
+        legacy_cleanup = _cleanup_legacy_assets()
+        if legacy_cleanup.ok:
+            changed = changed or bool(legacy_cleanup.details.get("changed"))
+            completed.append("legacy_cleanup")
+        else:
+            failed.append(
+                {
+                    "step": "legacy_cleanup",
+                    "reason": legacy_cleanup.reason,
+                    "details": legacy_cleanup.details,
+                }
+            )
+
+    if not failed:
+        visibility = _stabilize_login_ui_visibility(identities)
+        changed = changed or bool(visibility.details.get("changed"))
+        if not visibility.ok:
+            failed.append(
+                {
+                    "step": "login_ui_visibility",
+                    "reason": visibility.reason,
+                    "details": visibility.details,
+                }
+            )
+
+    probe_windows_sandbox.cache_clear()
+    doctor = _probe_windows_sandbox_uncached()
+    status = "ready" if doctor.available and not failed else ("partial" if completed else "failed")
+    if failed and not completed:
+        status = "failed"
     pending = [
-        item
-        for item in SETUP_STEP_ORDER
-        if item not in completed and not any(step.get("step") == item for step in failed)
+        step
+        for step in SETUP_STEP_ORDER
+        if step not in completed and not any(item.get("step") == step for item in failed)
     ]
     return WindowsSandboxSetupReport(
         status=status,
@@ -981,10 +1163,114 @@ def setup_windows_sandbox() -> WindowsSandboxSetupReport:
         completed_steps=tuple(dict.fromkeys(completed)),
         pending_steps=tuple(pending),
         failed_steps=tuple(failed),
-        available_after_setup=doctor.available,
-        message=_setup_message(doctor, diagnostics),
-        diagnostics=diagnostics,
+        available_after_setup=doctor.available and not failed,
+        message=_setup_message(doctor, doctor.diagnostics),
+        diagnostics=doctor.diagnostics,
     )
+
+
+def _cleanup_legacy_assets() -> _OperationResult:
+    changed = False
+    failures: list[dict[str, Any]] = []
+    for target in LEGACY_SANDBOX_ACCOUNTS:
+        for operation, result in (
+            ("credential", _delete_credential(target)),
+            ("login_ui_visibility", _remove_login_ui_visibility_entry(target)),
+        ):
+            if result.ok:
+                changed = changed or bool(result.details.get("changed"))
+            else:
+                failures.append(
+                    {"operation": operation, "reason": result.reason, "details": result.details}
+                )
+    legacy_firewall = _delete_firewall_rule(LEGACY_FIREWALL_RULE_NAME)
+    if legacy_firewall.ok:
+        changed = changed or bool(legacy_firewall.details.get("changed"))
+    else:
+        failures.append(
+            {
+                "operation": "firewall_rule",
+                "reason": legacy_firewall.reason,
+                "details": legacy_firewall.details,
+            }
+        )
+    state_dir = _windows_state_dir_path()
+    icacls = shutil.which("icacls")
+    if state_dir.exists() and icacls:
+        for target in LEGACY_SANDBOX_ACCOUNTS:
+            if not _account_exists(target):
+                continue
+            completed = _run_command(
+                [icacls, str(state_dir), "/remove:g", target, "/T", "/C", "/Q"]
+            )
+            if completed.returncode != 0:
+                failures.append(
+                    {
+                        "operation": "legacy_acl_remove",
+                        "details": _completed_process_diagnostics(
+                            "legacy_acl_remove",
+                            completed,
+                            state_dir=state_dir,
+                            path=state_dir,
+                            extra={"account": _account_name_diagnostics(target)},
+                        ),
+                    }
+                )
+            else:
+                changed = True
+    for target in reversed(LEGACY_SANDBOX_ACCOUNTS):
+        if not _account_exists(target):
+            continue
+        rights = _remove_all_account_rights(_account_sid(target))
+        if not rights.ok:
+            failures.append(
+                {
+                    "operation": "legacy_account_rights",
+                    "reason": rights.reason,
+                    "details": rights.details,
+                }
+            )
+        result = _delete_sandbox_account(target)
+        if result.ok:
+            changed = changed or bool(result.details.get("changed"))
+        else:
+            failures.append(
+                {"operation": "sandbox_account", "reason": result.reason, "details": result.details}
+            )
+    if failures:
+        return _OperationResult(
+            False,
+            "Legacy Windows sandbox assets could not be fully removed.",
+            {"changed": changed, "failures": failures},
+        )
+    residuals = _legacy_artifact_diagnostics()
+    if residuals:
+        return _OperationResult(
+            False,
+            "Legacy Windows sandbox assets remain after cleanup.",
+            {
+                "changed": changed,
+                "residual_count": len(residuals),
+                "residual_kinds": sorted(
+                    {str(item.get("kind") or "unknown") for item in residuals}
+                ),
+            },
+        )
+    return _OperationResult(True, "legacy_assets_removed", {"changed": changed})
+
+
+def _sandbox_residual_audit() -> dict[str, int]:
+    account_names = (*SANDBOX_ACCOUNTS, *LEGACY_SANDBOX_ACCOUNTS)
+    return {
+        "accounts": sum(1 for name in account_names if _account_exists(name)),
+        "credentials": sum(1 for name in account_names if _credential_exists(name)),
+        "firewall_rules": _firewall_group_rule_count(),
+        "login_ui_entries": sum(
+            1 for name in account_names if _login_ui_entry_exists(name)
+        ),
+        "security_attestations": int(_security_attestation_exists()),
+        "state_dirs": int(_windows_state_dir_path().exists()),
+    }
 
 
 def cleanup_windows_sandbox_assets() -> WindowsSandboxCleanupReport:
@@ -1020,7 +1306,8 @@ def cleanup_windows_sandbox_assets() -> WindowsSandboxCleanupReport:
     failed: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = list(_legacy_artifact_diagnostics())
 
-    for target in dict.fromkeys((SANDBOX_ACCOUNT, LEGACY_SANDBOX_ACCOUNT)):
+    asset_accounts = tuple(dict.fromkeys((*SANDBOX_ACCOUNTS, *LEGACY_SANDBOX_ACCOUNTS)))
+    for target in asset_accounts:
         if not target:
             continue
         credential = _delete_credential(target)
@@ -1030,17 +1317,29 @@ def cleanup_windows_sandbox_assets() -> WindowsSandboxCleanupReport:
         else:
             failed.append({"step": "credential", "reason": credential.reason, "details": credential.details})
 
-    for rule in dict.fromkeys((FIREWALL_RULE_NAME, LEGACY_FIREWALL_RULE_NAME)):
-        if not rule:
-            continue
-        firewall = _delete_firewall_rule(rule)
-        if firewall.ok:
-            changed = changed or bool(firewall.details.get("changed"))
-            completed.append(f"firewall_rule:{_hash_text(rule)}")
-        else:
-            failed.append({"step": "firewall_rule", "reason": firewall.reason, "details": firewall.details})
+    firewall = _delete_firewall_group()
+    if firewall.ok:
+        changed = changed or bool(firewall.details.get("changed"))
+        completed.append("firewall_group")
+    else:
+        failed.append(
+            {"step": "firewall_group", "reason": firewall.reason, "details": firewall.details}
+        )
 
-    for target in dict.fromkeys((SANDBOX_ACCOUNT, LEGACY_SANDBOX_ACCOUNT)):
+    attestation = _delete_security_attestation()
+    if attestation.ok:
+        changed = changed or bool(attestation.details.get("changed"))
+        completed.append("security_attestation")
+    else:
+        failed.append(
+            {
+                "step": "security_attestation",
+                "reason": attestation.reason,
+                "details": attestation.details,
+            }
+        )
+
+    for target in asset_accounts:
         if not target:
             continue
         visibility = _remove_login_ui_visibility_entry(target)
@@ -1057,9 +1356,15 @@ def cleanup_windows_sandbox_assets() -> WindowsSandboxCleanupReport:
     else:
         failed.append({"step": "state_dir", "reason": state_dir.reason, "details": state_dir.details})
 
-    for target in dict.fromkeys((LEGACY_SANDBOX_ACCOUNT, SANDBOX_ACCOUNT)):
+    for target in reversed(asset_accounts):
         if not target:
             continue
+        sid = _account_sid(target)
+        rights = _remove_all_account_rights(sid)
+        if not rights.ok:
+            failed.append(
+                {"step": "account_rights", "reason": rights.reason, "details": rights.details}
+            )
         account = _delete_sandbox_account(target)
         if account.ok:
             changed = changed or bool(account.details.get("changed"))
@@ -1067,6 +1372,18 @@ def cleanup_windows_sandbox_assets() -> WindowsSandboxCleanupReport:
         else:
             failed.append({"step": "sandbox_account", "reason": account.reason, "details": account.details})
 
+    residual_audit = _sandbox_residual_audit()
+    residual_count = sum(residual_audit.values())
+    if residual_count:
+        failed.append(
+            {
+                "step": "residual_audit",
+                "reason": "Singularity Windows sandbox assets remain after cleanup.",
+                "details": {"residual_audit": residual_audit},
+            }
+        )
+    else:
+        completed.append("residual_audit")
     probe_windows_sandbox.cache_clear()
     status = "failed" if failed else "completed"
     if not changed and not failed:
@@ -1079,35 +1396,7 @@ def cleanup_windows_sandbox_assets() -> WindowsSandboxCleanupReport:
         completed_steps=tuple(dict.fromkeys(completed)),
         failed_steps=tuple(failed),
         diagnostics=tuple(diagnostics),
-    )
-
-
-def _setup_report(
-    *,
-    status: str,
-    changed: bool,
-    completed: list[str],
-    failed: list[dict[str, Any]],
-    available_after_setup: bool,
-    message: str,
-    diagnostics: tuple[dict[str, Any], ...],
-) -> WindowsSandboxSetupReport:
-    pending = [
-        item
-        for item in SETUP_STEP_ORDER
-        if item not in completed and not any(step.get("step") == item for step in failed)
-    ]
-    return WindowsSandboxSetupReport(
-        status=status,
-        requested_operation="setup",
-        requires_elevation=False,
-        changed=changed,
-        completed_steps=tuple(dict.fromkeys(completed)),
-        pending_steps=tuple(pending),
-        failed_steps=tuple(failed),
-        available_after_setup=available_after_setup,
-        message=message,
-        diagnostics=diagnostics,
+        residual_audit=residual_audit,
     )
 
 
@@ -1128,50 +1417,163 @@ def _probe_windows_sandbox_uncached() -> WindowsSandboxDoctorReport:
         firewall=_powershell_state("Get-NetFirewallRule"),
         private_desktop=_primitive("user32", "CreateDesktopW", "CloseDesktop"),
     )
-    sid = _account_sid(SANDBOX_ACCOUNT) if platform_supported else ""
-    logon_rights = (
-        _enumerate_account_logon_rights(sid) if sid else _logon_rights_view([], "no_sid")
+    identities = tuple(_SANDBOX_IDENTITIES.values())
+    sids = {
+        identity.role: _account_sid(identity.account_name) if platform_supported else ""
+        for identity in identities
+    }
+    rights = {
+        identity.role: (
+            _enumerate_account_logon_rights(sids[identity.role])
+            if sids[identity.role]
+            else _logon_rights_view([], "no_sid")
+        )
+        for identity in identities
+    }
+    security_attestation = (
+        _security_attestation_state(sids) if platform_supported else _missing(
+            "Security attestation requires Windows.",
+            {},
+        )
     )
     diagnostics = _legacy_artifact_diagnostics() if platform_supported else ()
     state_dir = _state_dir_state() if platform_supported else None
     if state_dir is not None and not state_dir.ready:
         diagnostics = (*diagnostics, {"kind": "windows_sandbox_state_dir", **state_dir.to_dict()})
-    setup = WindowsSandboxSetup(
-        sandbox_account=_state_from_bool(
-            bool(sid),
+    account_states = {
+        identity.role: _state_from_bool(
+            bool(sids[identity.role]),
             "sandbox account exists",
             "sandbox account is missing",
             {
-                "account": _account_name_diagnostics(SANDBOX_ACCOUNT),
-                "sid_hash": _hash_sid(sid) if sid else None,
-                "logon_rights": logon_rights,
+                "account": _account_name_diagnostics(identity.account_name),
+                "sid_hash": _hash_sid(sids[identity.role]) if sids[identity.role] else None,
             },
+        )
+        for identity in identities
+    }
+    visibility_states = {
+        identity.role: _login_ui_visibility_state(identity.account_name)
+        for identity in identities
+    }
+    logon_states = {
+        identity.role: _logon_rights_state(
+            rights[identity.role],
+            attested=security_attestation.ready,
+        )
+        for identity in identities
+    }
+    group_states = {
+        identity.role: _group_membership_state(identity.account_name)
+        for identity in identities
+    }
+    credential_states = {
+        identity.role: _credential_state(identity) for identity in identities
+    }
+    acl_states = {
+        identity.role: _acl_state(platform_supported, identity)
+        for identity in identities
+    }
+    runner_states = {
+        identity.role: _runner_smoke_state(identity) for identity in identities
+    }
+    launcher_states = {
+        identity.role: _launcher_state(
+            identity,
+            sids[identity.role],
+            rights[identity.role],
+            acl_states[identity.role].ready,
+        )
+        for identity in identities
+    }
+    backend_states = {
+        identity.role: _execution_backend_state(
+            primitives,
+            sids[identity.role],
+            credential_states[identity.role],
+            runner_states[identity.role],
+        )
+        for identity in identities
+    }
+    network_filter_states = {
+        "offline": _network_state(sids["offline"]),
+        "online": _online_network_filter_state(sids["online"]),
+    }
+    network_probe_states = {
+        identity.role: _network_probe_state(identity, sids[identity.role])
+        for identity in identities
+    }
+    setup = WindowsSandboxSetup(
+        sandbox_accounts=_aggregate_identity_states(
+            "Both sandbox accounts exist.",
+            "One or more sandbox accounts are missing.",
+            account_states,
         ),
-        login_ui_visibility=_login_ui_visibility_state(),
-        logon_rights=_logon_rights_state(logon_rights),
-        group_membership=_group_membership_state(SANDBOX_ACCOUNT),
+        login_ui_visibility=_aggregate_identity_states(
+            "Both sandbox accounts are hidden from the standard sign-in list.",
+            "One or more sandbox accounts remain visible in the standard sign-in list.",
+            visibility_states,
+        ),
+        logon_rights=_aggregate_identity_states(
+            "Both sandbox accounts have hardened logon rights.",
+            "One or more sandbox accounts have incomplete logon-right hardening.",
+            logon_states,
+        ),
+        group_membership=_aggregate_identity_states(
+            "Both sandbox accounts have constrained local group membership.",
+            "One or more sandbox accounts have invalid local group membership.",
+            group_states,
+        ),
         state_dir_acl=_state_dir_acl_state(),
-        acl_boundary=_acl_state(platform_supported),
-        network_filter=_network_state(sid),
+        acl_boundary=_aggregate_identity_states(
+            "ACL boundary probes passed for both sandbox accounts.",
+            "One or more sandbox account ACL boundary probes failed.",
+            acl_states,
+        ),
+        offline_network_filter=_aggregate_identity_states(
+            "Offline firewall isolation and online exclusion are configured.",
+            "Offline firewall isolation or online exclusion is incomplete.",
+            network_filter_states,
+        ),
         private_desktop=_state_from_bool(
             primitives.private_desktop.ready,
             "private desktop primitive is available",
             "private desktop primitive is missing",
             {"api": "CreateDesktopW"},
         ),
-        execution_backend=_execution_backend_state(primitives, sid),
+        execution_backends=_aggregate_identity_states(
+            "Account-backed execution is available for both sandbox accounts.",
+            "Account-backed execution is incomplete for one or more sandbox accounts.",
+            backend_states,
+        ),
+        legacy_assets=_legacy_assets_state(),
     )
     execution = WindowsSandboxExecution(
-        account_sid=_state_from_bool(
-            bool(sid),
-            "sandbox account SID resolved",
-            "sandbox account SID unresolved",
-            {"sid_hash": _hash_sid(sid) if sid else None},
+        account_sids=_aggregate_identity_states(
+            "Both sandbox account SIDs resolved.",
+            "One or more sandbox account SIDs are unresolved.",
+            account_states,
         ),
-        credential=_credential_state(),
-        launcher=_launcher_state(sid, logon_rights, setup.acl_boundary.ready),
-        runner_smoke=_runner_smoke_state(),
-        network_probe=_network_probe_state(sid),
+        credentials=_aggregate_identity_states(
+            "Both sandbox credentials are present.",
+            "One or more sandbox credentials are missing.",
+            credential_states,
+        ),
+        launchers=_aggregate_identity_states(
+            "Both sandbox launchers satisfy their prerequisites.",
+            "One or more sandbox launchers are unavailable.",
+            launcher_states,
+        ),
+        runner_smoke=_aggregate_identity_states(
+            "Restricted runner smoke passed for both sandbox accounts.",
+            "Restricted runner smoke failed for one or more sandbox accounts.",
+            runner_states,
+        ),
+        network_probe=_aggregate_identity_states(
+            "Offline denied and online allowed network probes passed.",
+            "One or more sandbox network probes failed.",
+            network_probe_states,
+        ),
     )
     blocking = _blocking_requirements(platform_supported, primitives, setup, execution)
     available = platform_supported and not blocking
@@ -1261,13 +1663,16 @@ def _powershell_state(command: str) -> WindowsCapabilityState:
     )
 
 
-def _acl_state(platform_supported: bool) -> WindowsCapabilityState:
+def _acl_state(
+    platform_supported: bool,
+    identity: _WindowsSandboxIdentity,
+) -> WindowsCapabilityState:
     if not platform_supported:
         return _missing("Windows ACL boundary requires Windows.", {"tool": "icacls"})
     state_dir = _windows_state_dir_path()
     root = state_dir / "acl-probe"
-    sid = _account_sid(SANDBOX_ACCOUNT)
-    if not sid or not _credential_state().ready:
+    sid = _account_sid(identity.account_name)
+    if not sid or not _credential_state(identity).ready:
         return _missing(
             "ACL boundary probe requires sandbox account and credential.",
             {
@@ -1284,7 +1689,11 @@ def _acl_state(platform_supported: bool) -> WindowsCapabilityState:
         denied = root / "denied"
         allowed.mkdir(parents=True, exist_ok=True)
         denied.mkdir(parents=True, exist_ok=True)
-        control = _apply_account_acl(root, low_integrity_root=allowed)
+        control = _apply_account_acl(
+            root,
+            account_names=(identity.account_name,),
+            low_integrity_root=allowed,
+        )
         if not control.ok:
             return _missing(
                 "ACL probe control directory setup failed.",
@@ -1294,7 +1703,7 @@ def _acl_state(platform_supported: bool) -> WindowsCapabilityState:
                     "details": control.details,
                 },
             )
-        grant = _apply_account_acl(allowed)
+        grant = _apply_account_acl(allowed, account_names=(identity.account_name,))
         icacls = shutil.which("icacls")
         if icacls is None:
             return _missing(
@@ -1308,7 +1717,15 @@ def _acl_state(platform_supported: bool) -> WindowsCapabilityState:
                 ),
             )
         deny = _run_command(
-            [icacls, str(denied), "/inheritance:r", "/remove:g", SANDBOX_ACCOUNT, "/T", "/C"],
+            [
+                icacls,
+                str(denied),
+                "/inheritance:r",
+                "/remove:g",
+                identity.account_name,
+                "/T",
+                "/C",
+            ],
         )
         if not grant.ok or deny.returncode != 0:
             details = grant.details if not grant.ok else _completed_process_diagnostics(
@@ -1328,12 +1745,14 @@ def _acl_state(platform_supported: bool) -> WindowsCapabilityState:
                 },
             )
         allowed_result = _account_python_smoke(
+            identity=identity,
             cwd=allowed,
             code="from pathlib import Path; Path('ok.txt').write_text('ok', encoding='utf-8')",
             timeout_seconds=5,
             operation_prefix="acl_allowed",
         )
         denied_result = _account_python_smoke(
+            identity=identity,
             cwd=root,
             code=(
                 "from pathlib import Path\n"
@@ -1387,6 +1806,8 @@ def _acl_state(platform_supported: bool) -> WindowsCapabilityState:
                 path=root,
             ),
         )
+    finally:
+        _cleanup_probe_root(root)
 
 
 def _network_state(sid: str) -> WindowsCapabilityState:
@@ -1418,9 +1839,36 @@ def _network_state(sid: str) -> WindowsCapabilityState:
     )
 
 
+def _online_network_filter_state(sid: str) -> WindowsCapabilityState:
+    evidence = {
+        "group": FIREWALL_RULE_GROUP,
+        "local_user_sid_hash": _hash_sid(sid) if sid else None,
+    }
+    if os.name != "nt":
+        return _missing("Online network filter probe requires Windows.", evidence)
+    if not sid:
+        return _missing("Online sandbox account SID is unavailable.", evidence)
+    completed = _run_powershell(
+        f"$sid = {_ps_quote(sid)}; "
+        f"$rules = Get-NetFirewallRule -Group {_ps_quote(FIREWALL_RULE_GROUP)} "
+        "-ErrorAction SilentlyContinue; "
+        "$blocked = $rules | Get-NetFirewallSecurityFilter -ErrorAction SilentlyContinue "
+        "| Where-Object { $_.LocalUser -like ('*' + $sid + '*') }; "
+        "if ($blocked) { exit 1 }; exit 0"
+    )
+    return _state_from_bool(
+        completed.returncode == 0,
+        "Online sandbox account is not targeted by Singularity firewall rules.",
+        "Online sandbox account is incorrectly targeted by a Singularity firewall rule.",
+        evidence,
+    )
+
+
 def _execution_backend_state(
     primitives: WindowsSandboxPrimitives,
     sid: str,
+    credential_state: WindowsCapabilityState,
+    runner_state: WindowsCapabilityState,
 ) -> WindowsCapabilityState:
     ready = (
         primitives.restricted_token.ready
@@ -1428,8 +1876,8 @@ def _execution_backend_state(
         and primitives.low_integrity.ready
         and primitives.private_desktop.ready
         and bool(sid)
-        and _credential_state().ready
-        and _runner_smoke_state().ready
+        and credential_state.ready
+        and runner_state.ready
     )
     return _state_from_bool(
         ready,
@@ -1447,6 +1895,7 @@ def _executable_acl_summary() -> str:
 
 
 def _launcher_state(
+    identity: _WindowsSandboxIdentity,
     sid: str,
     logon_rights: dict[str, Any],
     acl_boundary_ready: bool,
@@ -1469,8 +1918,8 @@ def _launcher_state(
     rights_definitively_missing = (not interactive) and lsa_status in {"", "0xC0000034"}
     evidence = {
         "api": "CreateProcessWithLogonW",
-        "logon_flags": "LOGON_WITH_PROFILE (0x1)",
-        "domain_username_form": f".\\{_redact_account_name(SANDBOX_ACCOUNT)}",
+        "logon_flags": "0 (profile not loaded)",
+        "domain_username_form": f".\\{_redact_account_name(identity.account_name)}",
         "symbol_present": symbol_present,
         "account_logon_rights": logon_rights,
         "window_station": {
@@ -1507,17 +1956,17 @@ def _launcher_state(
     )
 
 
-def _credential_state() -> WindowsCapabilityState:
+def _credential_state(identity: _WindowsSandboxIdentity) -> WindowsCapabilityState:
     # We intentionally do not read or print credential material. Presence is
     # tested through the Windows Credential Manager target only.
     evidence = {
         "storage_scope": "windows_credential_manager",
-        "target_hash": _hash_text(_credential_target()),
-        "target_redacted": _redact_account_name(_credential_target()),
+        "target_hash": _hash_text(identity.credential_target),
+        "target_redacted": _redact_account_name(identity.credential_target),
     }
     if os.name != "nt":
         return _missing("Credential Manager probe requires Windows.", evidence)
-    ready = _credential_exists(_credential_target())
+    ready = _credential_exists(identity.credential_target)
     return _state_from_bool(
         ready,
         "Sandbox credential target is present.",
@@ -1536,14 +1985,14 @@ def _runner_state() -> WindowsCapabilityState:
     )
 
 
-def _runner_smoke_state() -> WindowsCapabilityState:
+def _runner_smoke_state(identity: _WindowsSandboxIdentity) -> WindowsCapabilityState:
     if os.name != "nt":
         return _missing("Windows runner smoke requires Windows.", {"runner": "windows_runner.py"})
     runner = _runner_state()
     if not runner.ready:
         return runner
-    sid = _account_sid(SANDBOX_ACCOUNT)
-    if not _credential_state().ready or not sid:
+    sid = _account_sid(identity.account_name)
+    if not _credential_state(identity).ready or not sid:
         state_dir = _windows_state_dir_path()
         return _missing(
             "Windows runner smoke requires sandbox account and credential.",
@@ -1560,7 +2009,7 @@ def _runner_smoke_state() -> WindowsCapabilityState:
         state_dir = _windows_state_dir()
         root = state_dir / "runner-smoke"
         root.mkdir(parents=True, exist_ok=True)
-        acl = _apply_account_acl(root)
+        acl = _apply_account_acl(root, account_names=(identity.account_name,))
         if not acl.ok:
             return _missing(
                 "Windows runner smoke ACL setup failed.",
@@ -1597,11 +2046,20 @@ def _runner_smoke_state() -> WindowsCapabilityState:
             )
         prepared = SimpleNamespace(
             sandbox_root=root,
-            baseline={"runner_spec": str(spec_path), "runner_result": str(result_path)},
+            baseline={
+                "runner_spec": str(spec_path),
+                "runner_result": str(result_path),
+                "sandbox_account": identity.account_name,
+                "credential_target": identity.credential_target,
+                "sandbox_role": identity.role,
+            },
             request=SimpleNamespace(profile=SimpleNamespace(resources=SandboxResourceLimits(timeout_seconds=5))),
         )
         try:
-            result = WindowsSandboxRunner().run(prepared)
+            result = WindowsSandboxRunner(
+                account_name=identity.account_name,
+                credential_target=identity.credential_target,
+            ).run(prepared)
         except Exception as exc:
             return _missing(
                 "Windows account-backed runner smoke failed.",
@@ -1648,10 +2106,13 @@ def _runner_smoke_state() -> WindowsCapabilityState:
                 path=root,
             ),
         )
+    finally:
+        _cleanup_probe_root(root)
 
 
 def _account_python_smoke(
     *,
+    identity: _WindowsSandboxIdentity,
     cwd: Path,
     code: str,
     timeout_seconds: int,
@@ -1686,13 +2147,22 @@ def _account_python_smoke(
         )
     prepared = SimpleNamespace(
         sandbox_root=cwd,
-        baseline={"runner_spec": str(spec_path), "runner_result": str(result_path)},
+        baseline={
+            "runner_spec": str(spec_path),
+            "runner_result": str(result_path),
+            "sandbox_account": identity.account_name,
+            "credential_target": identity.credential_target,
+            "sandbox_role": identity.role,
+        },
         request=SimpleNamespace(
             profile=SimpleNamespace(resources=SandboxResourceLimits(timeout_seconds=timeout_seconds))
         ),
     )
     try:
-        return WindowsSandboxRunner().run(prepared)
+        return WindowsSandboxRunner(
+            account_name=identity.account_name,
+            credential_target=identity.credential_target,
+        ).run(prepared)
     except Exception as exc:
         return _probe_failure_runner_result(
             _exception_diagnostics(
@@ -1705,10 +2175,13 @@ def _account_python_smoke(
         )
 
 
-def _network_probe_state(sid: str) -> WindowsCapabilityState:
+def _network_probe_state(
+    identity: _WindowsSandboxIdentity,
+    sid: str,
+) -> WindowsCapabilityState:
     if os.name != "nt":
         return _missing("Network probe requires Windows.", {"probe": "socket connect"})
-    if not sid or not _network_state(sid).ready:
+    if not sid or (identity.firewall_blocked and not _network_state(sid).ready):
         state_dir = _windows_state_dir_path()
         return _missing(
             "Network probe requires configured firewall rule.",
@@ -1728,7 +2201,7 @@ def _network_probe_state(sid: str) -> WindowsCapabilityState:
         state_dir = _windows_state_dir()
         root = state_dir / "network-smoke"
         root.mkdir(parents=True, exist_ok=True)
-        acl = _apply_account_acl(root)
+        acl = _apply_account_acl(root, account_names=(identity.account_name,))
         if not acl.ok:
             return _missing(
                 "Network denied smoke ACL setup failed for sandbox account.",
@@ -1741,13 +2214,38 @@ def _network_probe_state(sid: str) -> WindowsCapabilityState:
             )
         spec_path = root / "runner-spec.json"
         result_path = root / "runner-result.json"
+        if identity.firewall_blocked:
+            command = [sys.executable, "-c", "print('network-smoke')"]
+            network_mode = SandboxNetworkMode.DENIED.value
+        else:
+            endpoints = json.dumps(NETWORK_PROBE_ENDPOINTS)
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json, socket\n"
+                    f"endpoints=json.loads({endpoints!r})\n"
+                    "for host, port in endpoints:\n"
+                    "    s=socket.socket(); s.settimeout(1)\n"
+                    "    try:\n"
+                    "        s.connect((host, int(port)))\n"
+                    "    except OSError:\n"
+                    "        continue\n"
+                    "    finally:\n"
+                    "        s.close()\n"
+                    "    print('network-allowed')\n"
+                    "    raise SystemExit(0)\n"
+                    "raise SystemExit(7)\n"
+                ),
+            ]
+            network_mode = SandboxNetworkMode.ALLOWED.value
         spec = WindowsRunnerSpec(
-            command=[sys.executable, "-c", "print('network-smoke')"],
+            command=command,
             cwd=str(root),
             env=WindowsSandboxBackend._runtime_env({}),
             timeout_seconds=5,
             max_output_chars=2000,
-            network_mode=SandboxNetworkMode.DENIED.value,
+            network_mode=network_mode,
             result_path=str(result_path),
         )
         try:
@@ -1765,11 +2263,20 @@ def _network_probe_state(sid: str) -> WindowsCapabilityState:
             )
         prepared = SimpleNamespace(
             sandbox_root=root,
-            baseline={"runner_spec": str(spec_path), "runner_result": str(result_path)},
+            baseline={
+                "runner_spec": str(spec_path),
+                "runner_result": str(result_path),
+                "sandbox_account": identity.account_name,
+                "credential_target": identity.credential_target,
+                "sandbox_role": identity.role,
+            },
             request=SimpleNamespace(profile=SimpleNamespace(resources=SandboxResourceLimits(timeout_seconds=5))),
         )
         try:
-            result = WindowsSandboxRunner().run(prepared)
+            result = WindowsSandboxRunner(
+                account_name=identity.account_name,
+                credential_target=identity.credential_target,
+            ).run(prepared)
         except Exception as exc:
             return _missing(
                 "Network denied smoke failed for sandbox account.",
@@ -1781,17 +2288,22 @@ def _network_probe_state(sid: str) -> WindowsCapabilityState:
                     path=root,
                 ),
             )
+        ready = (
+            result.exit_code == 0 and result.network_denied_verified
+            if identity.firewall_blocked
+            else result.exit_code == 0 and "network-allowed" in result.stdout
+        )
         operation = (
-            "network_probe"
-            if result.exit_code == 0 and result.network_denied_verified
-            else "network_probe_sandbox_network_not_blocked"
+            f"network_probe_{identity.role}"
+            if ready
+            else f"network_probe_{identity.role}_unexpected_result"
             if result.exit_code == 0
-            else _runner_result_operation("network_probe", result)
+            else _runner_result_operation(f"network_probe_{identity.role}", result)
         )
         return _state_from_bool(
-            result.exit_code == 0 and result.network_denied_verified,
-            "Network denied smoke passed for sandbox account.",
-            "Network denied smoke failed for sandbox account.",
+            ready,
+            f"Network {identity.network_mode.value} smoke passed for sandbox account.",
+            f"Network {identity.network_mode.value} smoke failed for sandbox account.",
             _runner_result_summary(
                 operation,
                 result,
@@ -1813,6 +2325,8 @@ def _network_probe_state(sid: str) -> WindowsCapabilityState:
                 extra={"probe": "runtime", "local_user_sid_hash": _hash_sid(sid)},
             ),
         )
+    finally:
+        _cleanup_probe_root(root)
 
 
 def _host_network_baseline_state() -> WindowsCapabilityState:
@@ -1870,7 +2384,36 @@ def _state_from_bool(
     )
 
 
-def _login_ui_visibility_state(account_name: str = SANDBOX_ACCOUNT) -> WindowsCapabilityState:
+def _aggregate_identity_states(
+    available_reason: str,
+    missing_reason: str,
+    states: dict[str, WindowsCapabilityState],
+) -> WindowsCapabilityState:
+    ready = bool(states) and all(state.ready for state in states.values())
+    return _state_from_bool(
+        ready,
+        available_reason,
+        missing_reason,
+        {"principals": {role: state.to_dict() for role, state in states.items()}},
+    )
+
+
+def _legacy_assets_state() -> WindowsCapabilityState:
+    diagnostics = _legacy_artifact_diagnostics()
+    return _state_from_bool(
+        not diagnostics,
+        "Legacy Windows sandbox assets are absent.",
+        "Legacy Windows sandbox assets remain and must be removed.",
+        {
+            "residual_count": len(diagnostics),
+            "residual_kinds": sorted(
+                {str(item.get("kind") or "unknown") for item in diagnostics}
+            ),
+        },
+    )
+
+
+def _login_ui_visibility_state(account_name: str) -> WindowsCapabilityState:
     evidence = {
         "registry_key_hash": _hash_text(LOGIN_UI_USERLIST_KEY),
         "account": _account_name_diagnostics(account_name),
@@ -1882,9 +2425,9 @@ def _login_ui_visibility_state(account_name: str = SANDBOX_ACCOUNT) -> WindowsCa
         "$key = "
         f"{_ps_quote(LOGIN_UI_USERLIST_KEY)}; "
         f"$name = {_ps_quote(account_name)}; "
-        "$item = Get-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue; "
-        "if ($null -eq $item) { exit 2 }; "
-        "if ([int]$item.$name -eq 0) { exit 0 }; exit 1"
+        "$value = Get-ItemPropertyValue -LiteralPath $key -Name $name "
+        "-ErrorAction SilentlyContinue; if ($null -eq $value) { exit 2 }; "
+        "if ([int]$value -eq 0) { exit 0 }; exit 1"
     )
     if result.returncode == 0:
         return _available("Sandbox account is hidden from the standard Windows sign-in user list.", evidence)
@@ -1902,7 +2445,11 @@ def _login_ui_visibility_state(account_name: str = SANDBOX_ACCOUNT) -> WindowsCa
     return _missing(reason, details)
 
 
-def _logon_rights_state(logon_rights: dict[str, Any]) -> WindowsCapabilityState:
+def _logon_rights_state(
+    logon_rights: dict[str, Any],
+    *,
+    attested: bool = False,
+) -> WindowsCapabilityState:
     interactive = bool(logon_rights.get("interactive"))
     deny_interactive = bool(logon_rights.get("deny_interactive"))
     deny_ready = all(
@@ -1918,9 +2465,20 @@ def _logon_rights_state(logon_rights: dict[str, Any]) -> WindowsCapabilityState:
         bool(logon_rights.get(key))
         for key in ("remote_interactive", "network", "service", "batch")
     )
-    ready = interactive and not deny_interactive and deny_ready and allow_clear
+    directly_verified = interactive and not deny_interactive and deny_ready and allow_clear
+    attestation_verified = (
+        attested and str(logon_rights.get("lsa_status") or "").upper() == "0XC0000022"
+    )
+    ready = directly_verified or attestation_verified
     evidence = {
         "logon_rights": logon_rights,
+        "verification_source": (
+            "direct_lsa_enumeration"
+            if directly_verified
+            else "protected_setup_attestation"
+            if attestation_verified
+            else "unverified"
+        ),
         "required_allow": [SE_INTERACTIVE_LOGON_NAME],
         "required_absent": [SE_DENY_INTERACTIVE_LOGON_NAME, *SANDBOX_UNNEEDED_ALLOW_LOGON_RIGHTS],
         "required_deny": list(SANDBOX_DENY_LOGON_RIGHTS),
@@ -1938,18 +2496,18 @@ def _logon_rights_state(logon_rights: dict[str, Any]) -> WindowsCapabilityState:
 
 
 def _group_membership_state(account_name: str) -> WindowsCapabilityState:
-    evidence = {"account": _account_name_diagnostics(account_name), "group": "Users"}
+    evidence = {
+        "account": _account_name_diagnostics(account_name),
+        "required_group_sid_hash": _hash_sid("S-1-5-32-545"),
+        "allowed_direct_group_count": 1,
+    }
     if os.name != "nt":
         return _missing("Users group membership probe requires Windows.", evidence)
-    result = _run_powershell(
-        "$member = Get-LocalGroupMember -Group 'Users' -ErrorAction SilentlyContinue "
-        f"| Where-Object {{ $_.Name -like ('*\\' + {_ps_quote(account_name)}) -or $_.Name -eq {_ps_quote(account_name)} }}; "
-        "if ($member) { exit 0 }; exit 1"
-    )
+    result = _run_powershell(_group_membership_probe_command(account_name))
     return _state_from_bool(
         result.returncode == 0,
-        "Sandbox account is a member of Users for executable traversal.",
-        "Sandbox account is missing Users group membership.",
+        "Sandbox account direct group membership is limited to built-in Users.",
+        "Sandbox account has missing or overprivileged direct local group membership.",
         evidence
         if result.returncode == 0
         else _completed_process_diagnostics(
@@ -1973,7 +2531,10 @@ def _state_dir_acl_state() -> WindowsCapabilityState:
         return _missing("icacls is required for state directory ACL probe.", evidence)
     result = _run_command([icacls, str(state_dir)])
     text = f"{result.stdout}\n{result.stderr}"
-    ready = result.returncode == 0 and SANDBOX_ACCOUNT.lower() in text.lower()
+    missing_accounts = [
+        account for account in SANDBOX_ACCOUNTS if account.lower() not in text.lower()
+    ]
+    ready = result.returncode == 0 and not missing_accounts
     details = (
         evidence
         if ready
@@ -1986,9 +2547,236 @@ def _state_dir_acl_state() -> WindowsCapabilityState:
     )
     return _state_from_bool(
         ready,
-        "Windows sandbox state directory ACL includes sandbox account access.",
+        "Windows sandbox state directory ACL includes both sandbox accounts.",
         "Windows sandbox state directory ACL is missing sandbox account access.",
         details,
+    )
+
+
+def _security_attestation_state(sids: dict[str, str]) -> WindowsCapabilityState:
+    evidence = {
+        "registry_key_hash": _hash_text(SECURITY_ATTESTATION_KEY),
+        "principal_count": len(_SANDBOX_IDENTITIES),
+        "schema_version": SECURITY_ATTESTATION_SCHEMA_VERSION,
+    }
+    if os.name != "nt":
+        return _missing("Security attestation requires Windows.", evidence)
+    result = _run_powershell(
+        "$subkey = 'SOFTWARE\\Singularity\\WindowsSandbox'; "
+        f"$name = {_ps_quote(SECURITY_ATTESTATION_VALUE)}; "
+        "$read = [System.Security.AccessControl.RegistryRights]::ReadKey -bor "
+        "[System.Security.AccessControl.RegistryRights]::ReadPermissions; "
+        "$key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("
+        "$subkey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree, $read); "
+        "if ($null -eq $key) { exit 2 }; $value = $key.GetValue($name, $null); "
+        "if ($null -eq $value) { $key.Close(); exit 2 }; "
+        "$acl = $key.GetAccessControl(); $key.Close(); "
+        "$allowed = @('S-1-5-18', 'S-1-5-32-544'); "
+        "$writeMask = [int]("
+        "[System.Security.AccessControl.RegistryRights]::SetValue -bor "
+        "[System.Security.AccessControl.RegistryRights]::CreateSubKey -bor "
+        "[System.Security.AccessControl.RegistryRights]::Delete -bor "
+        "[System.Security.AccessControl.RegistryRights]::ChangePermissions -bor "
+        "[System.Security.AccessControl.RegistryRights]::TakeOwnership); "
+        "$rules = @($acl.GetAccessRules($true, $true, "
+        "[System.Security.Principal.SecurityIdentifier])); "
+        "$unsafe = @($rules | Where-Object { "
+        "$_.AccessControlType -eq 'Allow' -and "
+        "(([int]$_.RegistryRights -band $writeMask) -ne 0) -and "
+        "$allowed -notcontains $_.IdentityReference.Value }); "
+        "if (-not $acl.AreAccessRulesProtected -or $unsafe.Count -ne 0) { exit 3 }; "
+        "$payload = $value | ConvertFrom-Json; "
+        "$payload | Add-Member -NotePropertyName acl_protected -NotePropertyValue $true -Force; "
+        "$payload | ConvertTo-Json -Compress -Depth 6"
+    )
+    if result.returncode != 0:
+        return _missing(
+            "Protected sandbox security attestation is missing or has an unsafe ACL.",
+            _completed_process_diagnostics(
+                "security_attestation_probe",
+                result,
+                state_dir=_windows_state_dir_path(),
+                extra=evidence,
+            ),
+        )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return _missing("Sandbox security attestation is malformed.", evidence)
+    expected = {
+        role: _hash_sid(sids.get(role, ""))
+        for role in ("offline", "online")
+        if sids.get(role)
+    }
+    principals = payload.get("principals")
+    ready = (
+        payload.get("schema_version") == SECURITY_ATTESTATION_SCHEMA_VERSION
+        and payload.get("policy") == SECURITY_ATTESTATION_POLICY
+        and payload.get("acl_protected") is True
+        and expected.keys() == {"offline", "online"}
+        and principals == expected
+    )
+    return _state_from_bool(
+        ready,
+        "Protected setup attestation matches both current sandbox principals.",
+        "Protected setup attestation does not match the current sandbox principals.",
+        evidence,
+    )
+
+
+def _write_security_attestation(sids: dict[str, str]) -> _OperationResult:
+    expected = {
+        role: _hash_sid(sids.get(role, ""))
+        for role in ("offline", "online")
+        if sids.get(role)
+    }
+    if expected.keys() != {"offline", "online"}:
+        return _OperationResult(False, "Both sandbox SIDs are required for security attestation.")
+    before = _security_attestation_state(sids)
+    if before.ready:
+        return _OperationResult(True, "already_attested", {"changed": False})
+    payload = json.dumps(
+        {
+            "schema_version": SECURITY_ATTESTATION_SCHEMA_VERSION,
+            "policy": SECURITY_ATTESTATION_POLICY,
+            "principals": expected,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    result = _run_powershell(
+        "$subkey = 'SOFTWARE\\Singularity\\WindowsSandbox'; "
+        f"$name = {_ps_quote(SECURITY_ATTESTATION_VALUE)}; "
+        "$key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey("
+        "$subkey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree); "
+        "if ($null -eq $key) { exit 2 }; "
+        f"$key.SetValue($name, {_ps_quote(payload)}, [Microsoft.Win32.RegistryValueKind]::String); "
+        "$acl = New-Object System.Security.AccessControl.RegistrySecurity; "
+        "$system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18'); "
+        "$admins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'); "
+        "$users = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545'); "
+        "$allow = [System.Security.AccessControl.AccessControlType]::Allow; "
+        "$noneI = [System.Security.AccessControl.InheritanceFlags]::None; "
+        "$noneP = [System.Security.AccessControl.PropagationFlags]::None; "
+        "$acl.SetOwner($admins); $acl.SetAccessRuleProtection($true, $false); "
+        "$acl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new("
+        "$system, [System.Security.AccessControl.RegistryRights]::FullControl, "
+        "$noneI, $noneP, $allow)); "
+        "$acl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new("
+        "$admins, [System.Security.AccessControl.RegistryRights]::FullControl, "
+        "$noneI, $noneP, $allow)); "
+        "$acl.AddAccessRule([System.Security.AccessControl.RegistryAccessRule]::new("
+        "$users, [System.Security.AccessControl.RegistryRights]::ReadKey, "
+        "$noneI, $noneP, $allow)); $key.SetAccessControl($acl); $key.Close()"
+    )
+    if result.returncode != 0:
+        return _OperationResult(
+            False,
+            "Failed to write protected sandbox security attestation.",
+            _completed_process_diagnostics(
+                "security_attestation_write",
+                result,
+                state_dir=_windows_state_dir_path(),
+            ),
+        )
+    after = _security_attestation_state(sids)
+    return _OperationResult(
+        after.ready,
+        "security_attestation_verified" if after.ready else after.reason,
+        {"changed": True, "state": after.to_dict()},
+    )
+
+
+def _security_attestation_exists() -> bool:
+    if os.name != "nt":
+        return False
+    result = _run_powershell(
+        f"if (Test-Path -LiteralPath {_ps_quote(SECURITY_ATTESTATION_KEY)}) "
+        "{ exit 0 } else { exit 2 }"
+    )
+    return result.returncode == 0
+
+
+def _delete_security_attestation() -> _OperationResult:
+    if os.name != "nt":
+        return _OperationResult(False, "Security attestation cleanup requires Windows.")
+    existed = _security_attestation_exists()
+    if not existed:
+        return _OperationResult(True, "security_attestation_not_present", {"changed": False})
+    result = _run_powershell(
+        "$key = "
+        f"{_ps_quote(SECURITY_ATTESTATION_KEY)}; "
+        "$parent = 'HKLM:\\SOFTWARE\\Singularity'; "
+        "Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction Stop; "
+        "if (Test-Path -LiteralPath $parent) { "
+        "$item = Get-Item -LiteralPath $parent; "
+        "if (@(Get-ChildItem -LiteralPath $parent).Count -eq 0 -and "
+        "$item.Property.Count -eq 0) { Remove-Item -LiteralPath $parent -Force } }"
+    )
+    if result.returncode == 0 and not _security_attestation_exists():
+        return _OperationResult(True, "security_attestation_removed", {"changed": True})
+    return _OperationResult(
+        False,
+        "Failed to remove sandbox security attestation.",
+        _completed_process_diagnostics(
+            "security_attestation_cleanup",
+            result,
+            state_dir=_windows_state_dir_path(),
+        ),
+    )
+
+
+def _group_membership_probe_command(account_name: str) -> str:
+    return (
+        f"$user = Get-LocalUser -Name {_ps_quote(account_name)} -ErrorAction SilentlyContinue; "
+        "if (-not $user) { exit 2 }; "
+        "$groupSids = @(); "
+        "Get-LocalGroup -ErrorAction SilentlyContinue | ForEach-Object { "
+        "$group = $_; "
+        "$member = Get-LocalGroupMember -Group $group -ErrorAction SilentlyContinue "
+        "| Where-Object { $_.SID -eq $user.SID }; "
+        "if ($member) { $groupSids += $group.SID.Value } }; "
+        "if ($groupSids.Count -eq 1 -and $groupSids[0] -eq 'S-1-5-32-545') "
+        "{ exit 0 }; exit 1"
+    )
+
+
+def _ensure_constrained_group_membership(account_name: str) -> _OperationResult:
+    if os.name != "nt":
+        return _OperationResult(False, "Local group hardening requires Windows.")
+    before = _group_membership_state(account_name)
+    if before.ready:
+        return _OperationResult(True, "already_constrained", {"changed": False})
+    command = (
+        f"$user = Get-LocalUser -Name {_ps_quote(account_name)} -ErrorAction Stop; "
+        "$users = Get-LocalGroup -SID 'S-1-5-32-545' -ErrorAction Stop; "
+        "Get-LocalGroup -ErrorAction Stop | ForEach-Object { "
+        "$group = $_; "
+        "$member = Get-LocalGroupMember -Group $group -ErrorAction SilentlyContinue "
+        "| Where-Object { $_.SID -eq $user.SID }; "
+        "if ($member -and $group.SID.Value -ne 'S-1-5-32-545') { "
+        "Remove-LocalGroupMember -Group $group -Member $user -ErrorAction Stop } }; "
+        "$member = Get-LocalGroupMember -Group $users -ErrorAction SilentlyContinue "
+        "| Where-Object { $_.SID -eq $user.SID }; "
+        "if (-not $member) { Add-LocalGroupMember -Group $users -Member $user -ErrorAction Stop }"
+    )
+    result = _run_powershell(command)
+    if result.returncode != 0:
+        return _OperationResult(
+            False,
+            "Failed to constrain sandbox account local group membership.",
+            _completed_process_diagnostics(
+                "group_membership_harden",
+                result,
+                state_dir=_windows_state_dir_path(),
+                extra={"account": _account_name_diagnostics(account_name)},
+            ),
+        )
+    after = _group_membership_state(account_name)
+    return _OperationResult(
+        after.ready,
+        "group_membership_constrained" if after.ready else after.reason,
+        {"changed": True, "state": after.to_dict()},
     )
 
 
@@ -2041,18 +2829,6 @@ def _validate_sandbox_account_name(name: str) -> dict[str, Any] | None:
     }
 
 
-def _operation_failure_step(
-    step: str,
-    result: _OperationResult,
-    *,
-    account_name: str,
-) -> dict[str, Any]:
-    details = dict(result.details)
-    details.update(_account_name_diagnostics(account_name))
-    details.setdefault("account_name_limit", WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT)
-    return {"step": step, "reason": result.reason, "details": details}
-
-
 def _account_name_diagnostics(name: str) -> dict[str, Any]:
     return {
         "account_name_length": len(name),
@@ -2070,22 +2846,30 @@ def _redact_account_name(name: str) -> str:
 
 def _legacy_artifact_diagnostics() -> tuple[dict[str, Any], ...]:
     diagnostics: list[dict[str, Any]] = []
-    if LEGACY_SANDBOX_ACCOUNT and LEGACY_SANDBOX_ACCOUNT != SANDBOX_ACCOUNT:
-        if _account_exists(LEGACY_SANDBOX_ACCOUNT):
+    for account_name in LEGACY_SANDBOX_ACCOUNTS:
+        if _account_exists(account_name):
             diagnostics.append(
                 {
                     "kind": "legacy_sandbox_account",
                     "status": "present",
-                    **_account_name_diagnostics(LEGACY_SANDBOX_ACCOUNT),
+                    **_account_name_diagnostics(account_name),
                 }
             )
-        if _credential_exists(LEGACY_SANDBOX_ACCOUNT):
+        if _credential_exists(account_name):
             diagnostics.append(
                 {
                     "kind": "legacy_credential",
                     "status": "present",
-                    "target_hash": _hash_text(LEGACY_SANDBOX_ACCOUNT),
-                    "target_redacted": _redact_account_name(LEGACY_SANDBOX_ACCOUNT),
+                    "target_hash": _hash_text(account_name),
+                    "target_redacted": _redact_account_name(account_name),
+                }
+            )
+        if _login_ui_entry_exists(account_name):
+            diagnostics.append(
+                {
+                    "kind": "legacy_login_ui_visibility",
+                    "status": "present",
+                    **_account_name_diagnostics(account_name),
                 }
             )
     if (
@@ -2103,6 +2887,19 @@ def _legacy_artifact_diagnostics() -> tuple[dict[str, Any], ...]:
             }
         )
     return tuple(diagnostics)
+
+
+def _login_ui_entry_exists(account_name: str) -> bool:
+    if os.name != "nt":
+        return False
+    result = _run_powershell(
+        "$key = "
+        f"{_ps_quote(LOGIN_UI_USERLIST_KEY)}; "
+        f"$name = {_ps_quote(account_name)}; "
+        "$item = Get-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue; "
+        "if ($null -ne $item) { exit 0 }; exit 1"
+    )
+    return result.returncode == 0
 
 
 def _has_windows_symbols(library: str, *symbols: str) -> bool:
@@ -2318,9 +3115,6 @@ def _set_account_password(name: str, password: str) -> _OperationResult:
 def _delete_sandbox_account(name: str) -> _OperationResult:
     if os.name != "nt":
         return _OperationResult(False, "Windows account deletion requires Windows.")
-    name_error = _validate_sandbox_account_name(name)
-    if name_error is not None:
-        return _OperationResult(False, name_error["reason"], dict(name_error["details"]))
     if not _account_exists(name):
         return _OperationResult(True, "account_not_present", {"changed": False, **_account_name_diagnostics(name)})
     code = _netapi32().NetUserDel(None, name)
@@ -2391,15 +3185,18 @@ def _netapi_error_explanation(code: int) -> str:
     return ""
 
 
-def _store_credential(password: str) -> _OperationResult:
+def _store_credential(
+    identity: _WindowsSandboxIdentity,
+    password: str,
+) -> _OperationResult:
     if os.name != "nt":
         return _OperationResult(False, "Windows Credential Manager requires Windows.")
     blob = password.encode("utf-16-le")
     blob_buffer = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
     credential = _CREDENTIALW()
     credential.Type = CRED_TYPE_GENERIC
-    credential.TargetName = _credential_target()
-    credential.UserName = SANDBOX_ACCOUNT
+    credential.TargetName = identity.credential_target
+    credential.UserName = identity.account_name
     credential.CredentialBlobSize = len(blob)
     credential.CredentialBlob = blob_buffer
     credential.Persist = CRED_PERSIST_LOCAL_MACHINE
@@ -2600,6 +3397,37 @@ def _remove_account_rights(sid_string: str, right_names: tuple[str, ...]) -> _Op
     return _OperationResult(True, f"removed {len(right_names)} account right(s)", {"changed": True})
 
 
+def _remove_all_account_rights(sid_string: str) -> _OperationResult:
+    if os.name != "nt":
+        return _OperationResult(False, "LSA account right removal requires Windows.")
+    if not sid_string:
+        return _OperationResult(True, "account_sid_not_present", {"changed": False})
+    psid = _account_psid(sid_string)
+    if not psid:
+        return _OperationResult(False, "sandbox account PSID conversion failed")
+    try:
+        handle = _lsa_open(POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT)
+        if not handle:
+            return _OperationResult(False, "LsaOpenPolicy failed for account right removal")
+        try:
+            status = _advapi32().LsaRemoveAccountRights(handle, psid, True, None, 0)
+            normalized_status = status & 0xFFFFFFFF
+            if status != 0 and normalized_status != STATUS_OBJECT_NAME_NOT_FOUND:
+                return _OperationResult(
+                    False,
+                    f"LsaRemoveAccountRights failed: lsa_status=0x{normalized_status:08X}",
+                )
+        finally:
+            _lsa_close(handle)
+    finally:
+        _local_free(psid)
+    return _OperationResult(
+        True,
+        "all_account_rights_removed" if status == 0 else "account_rights_not_present",
+        {"changed": status == 0},
+    )
+
+
 def _grant_logon_right(sid_string: str) -> _OperationResult:
     return _add_account_rights(sid_string, (SE_INTERACTIVE_LOGON_NAME,))
 
@@ -2670,40 +3498,6 @@ def _harden_sandbox_logon_rights(sid_string: str) -> _OperationResult:
     )
 
 
-def _add_account_to_users_group(name: str) -> _OperationResult:
-    """Add the sandbox account to the local Users group for executable RX.
-
-    CreateProcessWithLogonW accesses python.exe and the runner script in the
-    target account's security context; Users membership provides the standard
-    traverse+RX on Program Files/Windows that every local user has. Sandbox
-    isolation is still enforced by the restricted token, low integrity, network
-    denial and per-run ACL boundary, not by Users-group exclusion.
-    """
-    if os.name != "nt":
-        return _OperationResult(False, "Users group membership requires Windows.")
-    sid = _account_sid(name)
-    if not sid:
-        return _OperationResult(False, "sandbox account SID unavailable for Users group membership")
-    psid = _account_psid(sid)
-    if not psid:
-        return _OperationResult(False, "sandbox account PSID conversion failed")
-    try:
-        info = (_LOCALGROUP_MEMBERS_INFO_0 * 1)()
-        info[0].lgrmi0_sid = psid
-        code = _netapi32().NetLocalGroupAddMembers(None, "Users", 0, info, 1)
-        if code == NERR_SUCCESS:
-            return _OperationResult(True, "added")
-        if code == ERROR_MEMBER_IN_ALIAS:
-            return _OperationResult(True, "already_member")
-        return _OperationResult(
-            False,
-            f"NetLocalGroupAddMembers failed: code {code}",
-            {"windows_error_code": code},
-        )
-    finally:
-        _local_free(psid)
-
-
 def _hide_account_from_login_ui(account_name: str) -> _OperationResult:
     if os.name != "nt":
         return _OperationResult(False, "Login UI visibility hardening requires Windows.")
@@ -2713,7 +3507,8 @@ def _hide_account_from_login_ui(account_name: str) -> _OperationResult:
     result = _run_powershell(
         "$key = "
         f"{_ps_quote(LOGIN_UI_USERLIST_KEY)}; "
-        "New-Item -Path $key -Force | Out-Null; "
+        "if (-not (Test-Path -LiteralPath $key)) { "
+        "New-Item -Path $key -Force | Out-Null }; "
         f"New-ItemProperty -Path $key -Name {_ps_quote(account_name)} "
         "-Value 0 -PropertyType DWord -Force | Out-Null"
     )
@@ -2736,6 +3531,46 @@ def _hide_account_from_login_ui(account_name: str) -> _OperationResult:
     )
 
 
+def _stabilize_login_ui_visibility(
+    identities: tuple[_WindowsSandboxIdentity, ...],
+    *,
+    attempts: int = 6,
+    interval_seconds: float = 1.0,
+) -> _OperationResult:
+    changed = False
+    last_states: dict[str, WindowsCapabilityState] = {}
+    for _attempt in range(max(1, attempts)):
+        for identity in identities:
+            hidden = _hide_account_from_login_ui(identity.account_name)
+            changed = changed or bool(hidden.details.get("changed"))
+            if not hidden.ok:
+                return _OperationResult(
+                    False,
+                    hidden.reason,
+                    {"changed": changed, "role": identity.role, **hidden.details},
+                )
+        if interval_seconds > 0:
+            time.sleep(interval_seconds)
+        last_states = {
+            identity.role: _login_ui_visibility_state(identity.account_name)
+            for identity in identities
+        }
+        if all(state.ready for state in last_states.values()):
+            return _OperationResult(
+                True,
+                "login_ui_visibility_stable",
+                {"changed": changed},
+            )
+    return _OperationResult(
+        False,
+        "Sandbox account login UI visibility did not remain stable after setup probes.",
+        {
+            "changed": changed,
+            "states": {role: state.to_dict() for role, state in last_states.items()},
+        },
+    )
+
+
 def _remove_login_ui_visibility_entry(account_name: str) -> _OperationResult:
     if os.name != "nt":
         return _OperationResult(False, "Login UI visibility cleanup requires Windows.")
@@ -2747,9 +3582,9 @@ def _remove_login_ui_visibility_entry(account_name: str) -> _OperationResult:
         "$key = "
         f"{_ps_quote(LOGIN_UI_USERLIST_KEY)}; "
         f"$name = {_ps_quote(account_name)}; "
-        "$item = Get-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue; "
-        "if ($null -eq $item) { exit 2 }; "
-        "Remove-ItemProperty -Path $key -Name $name -ErrorAction Stop"
+        "$value = Get-ItemPropertyValue -LiteralPath $key -Name $name "
+        "-ErrorAction SilentlyContinue; if ($null -eq $value) { exit 2 }; "
+        "Remove-ItemProperty -LiteralPath $key -Name $name -ErrorAction Stop"
     )
     if result.returncode in {0, 2}:
         return _OperationResult(
@@ -2827,6 +3662,58 @@ def _delete_windows_state_dir() -> _OperationResult:
         )
     if not path.exists():
         return _OperationResult(True, "state_dir_not_present", {"changed": False, **details})
+    tools = {name: shutil.which(name) for name in ("takeown", "icacls", "attrib")}
+    missing_tools = sorted(name for name, executable in tools.items() if executable is None)
+    if missing_tools:
+        return _OperationResult(
+            False,
+            "Windows state directory cleanup tools are unavailable.",
+            {"missing_tools": missing_tools, **details},
+        )
+    repair_commands = (
+        [str(tools["takeown"]), "/F", str(path), "/R", "/D", "Y"],
+        [
+            str(tools["icacls"]),
+            str(path),
+            "/inheritance:e",
+            "/T",
+            "/C",
+            "/Q",
+        ],
+        [
+            str(tools["icacls"]),
+            str(path),
+            "/reset",
+            "/T",
+            "/C",
+            "/Q",
+        ],
+        [
+            str(tools["icacls"]),
+            str(path),
+            "/setintegritylevel",
+            "(OI)(CI)M",
+            "/T",
+            "/C",
+            "/Q",
+        ],
+        [str(tools["attrib"]), "-R", "-S", "-H", str(path), "/S", "/D"],
+        [str(tools["attrib"]), "-R", "-S", "-H", str(path / "*"), "/S", "/D"],
+    )
+    for command in repair_commands:
+        result = _run_command(command)
+        if result.returncode != 0:
+            return _OperationResult(
+                False,
+                "Failed to normalize Windows sandbox state directory before deletion.",
+                _completed_process_diagnostics(
+                    "state_dir_cleanup_normalize",
+                    result,
+                    state_dir=path,
+                    path=path,
+                    extra=details,
+                ),
+            )
     try:
         shutil.rmtree(path)
     except OSError as exc:
@@ -2838,9 +3725,43 @@ def _delete_windows_state_dir() -> _OperationResult:
     return _OperationResult(True, "state_dir_removed", {"changed": True, **details})
 
 
-def _firewall_rule_ready() -> bool:
-    sid = _account_sid(SANDBOX_ACCOUNT)
-    return bool(sid and _network_state(sid).ready)
+def _delete_firewall_group() -> _OperationResult:
+    if os.name != "nt":
+        return _OperationResult(False, "Firewall cleanup requires Windows.")
+    count = _firewall_group_rule_count()
+    details = {"group": FIREWALL_RULE_GROUP, "rule_count": count}
+    if count == 0:
+        return _OperationResult(True, "firewall_group_not_present", {"changed": False, **details})
+    result = _run_powershell(
+        f"Remove-NetFirewallRule -Group {_ps_quote(FIREWALL_RULE_GROUP)} -ErrorAction Stop"
+    )
+    if result.returncode == 0 and _firewall_group_rule_count() == 0:
+        return _OperationResult(True, "firewall_group_removed", {"changed": True, **details})
+    return _OperationResult(
+        False,
+        "Failed to remove Singularity sandbox firewall group.",
+        _completed_process_diagnostics(
+            "firewall_group_cleanup",
+            result,
+            state_dir=_windows_state_dir_path(),
+            extra=details,
+        ),
+    )
+
+
+def _firewall_group_rule_count() -> int:
+    if os.name != "nt":
+        return 0
+    result = _run_powershell(
+        f"$rules = @(Get-NetFirewallRule -Group {_ps_quote(FIREWALL_RULE_GROUP)} "
+        "-ErrorAction SilentlyContinue); $rules.Count"
+    )
+    if result.returncode != 0:
+        return 1
+    try:
+        return int((result.stdout or "0").strip() or "0")
+    except ValueError:
+        return 1
 
 
 def _firewall_rule_exists(name: str) -> bool:
@@ -2857,10 +3778,6 @@ def _generate_account_password() -> str:
     return "Sg!" + secrets.token_urlsafe(32) + "9"
 
 
-def _credential_target() -> str:
-    return SANDBOX_ACCOUNT
-
-
 def _run_powershell(command: str) -> subprocess.CompletedProcess[str]:
     executable = shutil.which("powershell") or shutil.which("pwsh")
     if executable is None:
@@ -2875,6 +3792,74 @@ def _run_powershell(command: str) -> subprocess.CompletedProcess[str]:
             command,
         ]
     )
+
+
+@lru_cache(maxsize=1)
+def _current_process_sid() -> str:
+    if os.name != "nt":
+        return ""
+    result = _run_powershell(
+        "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"
+    )
+    value = (result.stdout or "").strip()
+    if result.returncode != 0 or re.fullmatch(r"S-\d+(?:-\d+)+", value) is None:
+        return ""
+    return value
+
+
+def _normalize_run_root_for_cleanup(path: Path) -> _OperationResult:
+    state_dir = _windows_state_dir_path().resolve(strict=False)
+    runs_dir = (state_dir / "runs").resolve(strict=False)
+    candidate = path.resolve(strict=False)
+    details = {
+        "state_dir_hash": _hash_path(state_dir),
+        "run_root_hash": _hash_path(candidate),
+    }
+    if not _is_relative_to(candidate, runs_dir) or candidate == runs_dir:
+        return _OperationResult(
+            False,
+            "Refusing to normalize a path outside the Windows sandbox run directory.",
+            details,
+        )
+    if not candidate.exists():
+        return _OperationResult(True, "run_root_not_present", {"changed": False, **details})
+    tools = {name: shutil.which(name) for name in ("icacls", "attrib")}
+    missing = sorted(name for name, executable in tools.items() if executable is None)
+    if missing:
+        return _OperationResult(
+            False,
+            "Windows run-root cleanup tools are unavailable.",
+            {"missing_tools": missing, **details},
+        )
+    commands = (
+        [
+            str(tools["icacls"]),
+            str(candidate),
+            "/setintegritylevel",
+            "(OI)(CI)M",
+            "/T",
+            "/C",
+            "/Q",
+        ],
+        [str(tools["attrib"]), "-R", "-S", "-H", str(candidate), "/S", "/D"],
+        [str(tools["attrib"]), "-R", "-S", "-H", str(candidate / "*"), "/S", "/D"],
+    )
+    for command in commands:
+        result = _run_command(command)
+        if result.returncode != 0:
+            return _OperationResult(
+                False,
+                "Failed to normalize Windows sandbox run root before deletion.",
+                _completed_process_diagnostics(
+                    "run_root_cleanup_normalize",
+                    result,
+                    state_dir=state_dir,
+                    probe_root=candidate,
+                    path=candidate,
+                    extra=details,
+                ),
+            )
+    return _OperationResult(True, "run_root_normalized", {"changed": True, **details})
 
 
 def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -2895,23 +3880,22 @@ def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
         )
 
 
-def _apply_account_acl(path: Path, *, low_integrity_root: Path | None = None) -> _OperationResult:
+def _apply_account_acl(
+    path: Path,
+    *,
+    account_names: tuple[str, ...] = SANDBOX_ACCOUNTS,
+    low_integrity_root: Path | None = None,
+) -> _OperationResult:
     if os.name != "nt":
         return _OperationResult(False, "Windows ACL setup requires Windows.")
     icacls = shutil.which("icacls")
     if icacls is None:
         return _OperationResult(False, "icacls is required for sandbox ACL setup.")
     low_integrity_target = low_integrity_root or path
-    grant = _run_command(
-        [
-            icacls,
-            str(path),
-            "/grant",
-            f"{SANDBOX_ACCOUNT}:(OI)(CI)M",
-            "/T",
-            "/C",
-        ]
-    )
+    grant_args = [icacls, str(path), "/grant"]
+    grant_args.extend(f"{account}:(OI)(CI)M" for account in account_names)
+    grant_args.extend(("/T", "/C"))
+    grant = _run_command(grant_args)
     if grant.returncode != 0:
         return _OperationResult(
             False,
@@ -2960,17 +3944,10 @@ def sandbox_exception_diagnostics(operation: str, exc: BaseException) -> dict[st
 
 def _state_dir_state() -> WindowsCapabilityState:
     path = _windows_state_dir_path()
-    try:
-        _windows_state_dir()
-    except OSError as exc:
+    if not path.exists():
         return _missing(
-            "Windows sandbox machine state directory is unavailable.",
-            _exception_diagnostics(
-                "windows_state_dir_mkdir",
-                exc,
-                state_dir=path,
-                path=path,
-            ),
+            "Windows sandbox machine state directory is missing.",
+            _probe_evidence("windows_state_dir_missing", state_dir=path, path=path),
         )
     return _available(
         "Windows sandbox machine state directory is available.",
@@ -2982,6 +3959,34 @@ def _windows_state_dir() -> Path:
     path = _windows_state_dir_path()
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _cleanup_probe_root(path: Path) -> None:
+    state_dir = _windows_state_dir_path().resolve(strict=False)
+    candidate = path.resolve(strict=False)
+    if not _is_relative_to(candidate, state_dir) or candidate == state_dir:
+        return
+    if not candidate.exists():
+        return
+    icacls = shutil.which("icacls")
+    attrib = shutil.which("attrib")
+    if icacls:
+        _run_command(
+            [
+                icacls,
+                str(candidate),
+                "/setintegritylevel",
+                "(OI)(CI)M",
+                "/T",
+                "/C",
+                "/Q",
+            ]
+        )
+        _run_command([icacls, str(candidate), "/reset", "/T", "/C", "/Q"])
+    if attrib:
+        _run_command([attrib, "-R", "-S", "-H", str(candidate / "*"), "/S", "/D"])
+    with suppress(OSError):
+        shutil.rmtree(candidate)
 
 
 def _windows_state_dir_path() -> Path:

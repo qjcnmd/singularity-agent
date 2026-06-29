@@ -121,8 +121,13 @@ def test_workspace_write_command_requires_sandbox_instead_of_local_process(
 
 
 def test_workspace_write_low_risk_verification_runs_through_windows_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(
+        "singularity.sandbox.windows._windows_state_dir_path",
+        lambda: tmp_path / "state" / "windows-sandbox",
+    )
     class FakeRunner:
         def __init__(self) -> None:
             self.calls = []
@@ -150,7 +155,7 @@ def test_workspace_write_low_risk_verification_runs_through_windows_sandbox(
     runner = FakeRunner()
     backend = sandbox.WindowsSandboxBackend(
         runner=runner,
-        acl_applier=lambda _path: None,
+        acl_applier=lambda _path, _account: None,
         doctor_provider=sandbox.WindowsSandboxDoctorReport.ready_for_tests,
     )
     profile = PermissionProfile.default_for_workspace(

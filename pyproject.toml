@@ -97,6 +97,7 @@ python_version = "3.11"
 warn_unused_configs = true
 ignore_missing_imports = true
 check_untyped_defs = true
+follow_imports = "silent"
 # Focused type gate over stable utilities plus the core agent harness path.
 # `python -m mypy src/singularity` is tracked as a separate full-source backlog
 # check until the package is type-clean.

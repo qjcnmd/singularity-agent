@@ -210,7 +210,7 @@ python -m pytest tests/test_sandbox_backend_windows.py -m "" -v
 python -m pytest tests -k sandbox -m "not evaluation and not provider_eval and not slow" -v
 ```
 
-当前 Windows 测试覆盖 doctor schema、setup states、未完成 elevated setup 时的 fail-closed、backend unavailable 不启动进程、`CommandExecutor -> SandboxManager -> WindowsSandboxBackend` 的 fake-ready 成功链路、protected path preflight、network denied violation、host outbound baseline 缺失时 network probe fail-closed、timeout/Job Object evidence、runner result 落盘前脱敏、临时 stdout/stderr 清理、output redaction/limit，以及 runner evidence 不能被 backend 硬编码伪造。
+当前 Windows 测试覆盖 v2 doctor/setup/cleanup schema、offline/online账户路由、登录UI隐藏、logon deny rights、受限组成员、独立credential、offline firewall与online排除、runner身份hash、denied/allowed network probe、legacy迁移、超长legacy账户删除、state dir ACL/完整性/只读属性恢复、幂等cleanup、cleanup residual audit、未完成elevated setup时的fail-closed、backend unavailable不启动进程、`CommandExecutor -> SandboxManager -> WindowsSandboxBackend`的fake-ready成功链路、protected path preflight、timeout/Job Object evidence、输出脱敏与runner evidence不能被硬编码伪造。
 
 真实 Windows account-backed sandbox 需要先在 elevated shell 运行：
 
@@ -219,9 +219,9 @@ python -m singularity.cli sandbox setup --json
 python -m singularity.cli sandbox doctor --json
 ```
 
-setup 必须创建/验证 `SingularitySandbox` 本地账户、Windows Credential Manager 凭据、`Singularity Sandbox` firewall rule group 的 account-scoped `LocalUser` outbound block、ACL boundary、private desktop、restricted low-integrity runner smoke、network denied smoke 和 timeout/output capture。任何缺项都必须保持 `backend_unavailable`，不能改用普通本地进程获得通过。旧失败状态中的 `SingularitySandboxRunner` account、credential 或 firewall rule 只应作为 legacy diagnostics 报告，不得进入新执行路径。
+setup 必须创建/验证`SingularityOffline`与`SingularityOnline`两个本地账户及独立Windows Credential Manager凭据；两者都必须隐藏于标准登录用户列表，保留runner所需interactive logon right，同时拒绝RDP/network/service/batch logon并限制直接本地组为内置Users。`Singularity Sandbox`firewall group的outbound block只绑定offline SID；doctor还必须证明offline网络被拒绝、online网络可用、两个runner身份与SID hash匹配。`SingularitySandbox`和`SingularitySandboxRunner`只作为迁移清理目标，不进入运行路径；任一当前能力缺失或legacy资产残留都保持`backend_unavailable`。
 
-当前 Windows backend 已支持 workspace COW projection、protected path exclude、run root ACL、workspace-only low-integrity label、private desktop、restricted token、Job Object、timeout、output limit、secret redaction、临时输出清理、artifact refs 和带 host baseline 的 network denied proof。workspace 外 additional writable directories 与 path-specific readonly leases 还没有独立 projection/ACL lease，测试要求它们 fail closed，直到 runtime 真正实现。
+当前 Windows backend 已支持 machine state下的短run root、workspace COW projection、protected path exclude、仅选中sandbox账户加宿主cleanup ACE的run root ACL、workspace-only low-integrity label、private desktop、restricted token、Job Object、timeout、output limit、secret redaction、临时输出/属性恢复清理、artifact refs和带host baseline的network denied proof。普通权限doctor遇到LSA access denied时只接受ACL受保护且匹配当前双SID hash的setup证明。workspace外additional writable directories与path-specific readonly leases仍fail closed。
 
 ## 8. Marker 自检方式
 
