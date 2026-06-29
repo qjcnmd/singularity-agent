@@ -1,91 +1,20 @@
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
+from singularity.failure_analysis.request import FailureAnalysisRequest
+from singularity.failure_analysis.result import FailureAnalysisResult
+from singularity.verification.contract import VerificationContract
 from singularity.verification.models import CheckStatus, FailureType, VerificationResult
 
 
-@dataclass(frozen=True)
 class RootCauseHypothesis:
-    description: str
-    evidence: list[str]
-    confidence: float = 0.6
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "description": self.description,
-            "evidence": self.evidence,
-            "confidence": self.confidence,
-        }
-
-
-@dataclass(frozen=True)
-class RepairStep:
-    step_id: str
-    action: str
-    target_file: str | None
-    rationale: str
-    next_verification: dict[str, Any]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "step_id": self.step_id,
-            "action": self.action,
-            "target_file": self.target_file,
-            "rationale": self.rationale,
-            "next_verification": self.next_verification,
-        }
-
-
-@dataclass(frozen=True)
-class RepairPlan:
-    plan_id: str
-    strategy: str
-    summary: str
-    steps: list[RepairStep]
-    next_verification: dict[str, Any]
-    blocked_reason: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "plan_id": self.plan_id,
-            "strategy": self.strategy,
-            "summary": self.summary,
-            "steps": [step.to_dict() for step in self.steps],
-            "next_verification": self.next_verification,
-            "blocked_reason": self.blocked_reason,
-        }
-
-
-@dataclass(frozen=True)
-class FailureAnalysis:
-    analysis_id: str
-    check_id: str
-    failure_type: str
-    root_cause: RootCauseHypothesis
-    hypotheses: list[RootCauseHypothesis]
-    suspect_files: list[str]
-    repair_plan: RepairPlan
-    next_verification: dict[str, Any]
-    no_progress_reason: str | None = None
-    retrieval_queries: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "analysis_id": self.analysis_id,
-            "check_id": self.check_id,
-            "failure_type": self.failure_type,
-            "root_cause": self.root_cause.to_dict(),
-            "hypotheses": [hypothesis.to_dict() for hypothesis in self.hypotheses],
-            "suspect_files": self.suspect_files,
-            "repair_plan": self.repair_plan.to_dict(),
-            "next_verification": self.next_verification,
-            "no_progress_reason": self.no_progress_reason,
-            "retrieval_queries": self.retrieval_queries,
-        }
+    def __init__(self, description: str, evidence: list[str], confidence: float = 0.6) -> None:
+        self.description = description
+        self.evidence = evidence
+        self.confidence = confidence
 
 
 class NoProgressGuard:
@@ -101,55 +30,16 @@ class NoProgressGuard:
         return None
 
 
-class RepairPlanner:
-    def plan(self, analysis: FailureAnalysis | list[FailureAnalysis]) -> RepairPlan:
-        analyses = analysis if isinstance(analysis, list) else [analysis]
-        if not analyses:
-            return _empty_plan()
-        first = analyses[0]
-        blocked = next((item for item in analyses if item.no_progress_reason), None)
-        if blocked is not None:
-            return RepairPlan(
-                plan_id=f"repair_{uuid4().hex[:12]}",
-                strategy="stop_and_ask",
-                summary=f"No progress guard blocked repair: {blocked.no_progress_reason}.",
-                steps=[],
-                next_verification=blocked.next_verification,
-                blocked_reason=blocked.no_progress_reason,
-            )
-        steps: list[RepairStep] = []
-        for index, item in enumerate(analyses, start=1):
-            target = item.suspect_files[0] if item.suspect_files else None
-            steps.append(
-                RepairStep(
-                    step_id=f"repair_step_{index}",
-                    action="inspect_and_patch",
-                    target_file=target,
-                    rationale=item.root_cause.description,
-                    next_verification=item.next_verification,
-                )
-            )
-        return RepairPlan(
-            plan_id=f"repair_{uuid4().hex[:12]}",
-            strategy="repair_then_rerun",
-            summary="Repair suspected files, then rerun the bound verification command.",
-            steps=steps,
-            next_verification=first.next_verification,
-        )
-
-
 class FailureAnalysisPipeline:
     def __init__(
         self,
         *,
         no_progress_guard: NoProgressGuard | None = None,
         max_same_failure_retries: int = 2,
-        repair_planner: RepairPlanner | None = None,
     ) -> None:
         self.no_progress_guard = no_progress_guard or NoProgressGuard(
             max_same_failure_retries=max_same_failure_retries
         )
-        self.repair_planner = repair_planner or RepairPlanner()
 
     def analyze_result(
         self,
@@ -159,7 +49,7 @@ class FailureAnalysisPipeline:
         diff: str | None = None,
         task_contract: dict[str, Any] | None = None,
         next_verification_command: list[str] | None = None,
-    ) -> FailureAnalysis:
+    ) -> FailureAnalysisResult:
         payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
         evidence = dict(payload.get("evidence") or {})
         parsed = [dict(item) for item in evidence.get("parsed_failures") or []]
@@ -182,29 +72,55 @@ class FailureAnalysisPipeline:
         )
         fingerprint = _fingerprint(payload, parsed)
         no_progress = self.no_progress_guard.record(fingerprint)
-        analysis = FailureAnalysis(
-            analysis_id=f"failure_{uuid4().hex[:12]}",
-            check_id=str(payload.get("check_id") or ""),
-            failure_type=failure_type,
-            root_cause=root,
-            hypotheses=[root],
-            suspect_files=suspect_files,
-            repair_plan=_empty_plan(next_verification=next_verification),
-            next_verification=next_verification,
-            no_progress_reason=no_progress,
-            retrieval_queries=_retrieval_queries(suspect_files=suspect_files, root_cause=root, task_contract=task_contract, diff=diff),
+        request = FailureAnalysisRequest(
+            request_id=f"verification_failure_{uuid4().hex[:12]}",
+            run_id="",
+            session_id="",
+            task_id="",
+            phase_id="verification",
+            workspace_root="",
+            failure_source="verification",
+            failure_summary=root.description,
+            failure_sources=[],
+            changed_files=list(changed_files),
+            evidence_refs=[str(payload.get("check_id") or "verification")],
+            metadata={
+                "check_id": payload.get("check_id"),
+                "next_verification": next_verification,
+                "retrieval_queries": _retrieval_queries(
+                    suspect_files=suspect_files,
+                    root_cause=root,
+                    task_contract=task_contract,
+                    diff=diff,
+                ),
+            },
         )
-        return FailureAnalysis(
-            analysis_id=analysis.analysis_id,
-            check_id=analysis.check_id,
-            failure_type=analysis.failure_type,
-            root_cause=analysis.root_cause,
-            hypotheses=analysis.hypotheses,
-            suspect_files=analysis.suspect_files,
-            repair_plan=self.repair_planner.plan(analysis),
-            next_verification=analysis.next_verification,
-            no_progress_reason=analysis.no_progress_reason,
-            retrieval_queries=analysis.retrieval_queries,
+        if no_progress is not None:
+            return FailureAnalysisResult.blocked(
+                request=request,
+                reason=no_progress,
+                category="verification_failed",
+                affected_files=suspect_files,
+            )
+        command_value = next_verification.get("command")
+        command = [str(item) for item in command_value] if isinstance(command_value, list) else []
+        command_text = " ".join(str(item) for item in command)
+        verification_plan = [command_text] if command_text else []
+        return FailureAnalysisResult(
+            analysis_id=f"failure_{uuid4().hex[:12]}",
+            request_id=request.request_id,
+            root_cause=root.description,
+            failure_category=failure_type,
+            affected_files=suspect_files,
+            evidence_refs=request.evidence_refs,
+            repair_strategy="repair_then_rerun",
+            next_actions=[
+                f"Inspect and patch {suspect_files[0] if suspect_files else 'the failing verification target'}."
+            ],
+            verification_plan=verification_plan,
+            confidence=root.confidence,
+            needs_user_input=False,
+            verification_contract=VerificationContract.from_plan_strings(verification_plan),
         )
 
     def analyze_results(
@@ -215,7 +131,7 @@ class FailureAnalysisPipeline:
         diff: str | None = None,
         task_contract: dict[str, Any] | None = None,
         verification_commands: dict[str, list[str]] | None = None,
-    ) -> list[FailureAnalysis]:
+    ) -> list[FailureAnalysisResult]:
         failed_statuses = {
             CheckStatus.FAILED.value,
             CheckStatus.BLOCKED.value,
@@ -337,13 +253,3 @@ def _retrieval_queries(
 def _append_unique(values: list[str], value: Any) -> None:
     if value and str(value) not in values:
         values.append(str(value))
-
-
-def _empty_plan(next_verification: dict[str, Any] | None = None) -> RepairPlan:
-    return RepairPlan(
-        plan_id=f"repair_{uuid4().hex[:12]}",
-        strategy="none",
-        summary="No repair plan is available.",
-        steps=[],
-        next_verification=next_verification or {"check_id": None, "command": []},
-    )

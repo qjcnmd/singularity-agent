@@ -10,13 +10,19 @@ from rich.console import Console
 
 from singularity.context import ContextManager
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
-from singularity.failure_analysis import FailureAnalysisRequest, FailureAnalyzer
+from singularity.failure_analysis.analyzer import FailureAnalyzer
+from singularity.failure_analysis.request import FailureAnalysisRequest
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.interaction import InteractionController, ProgressEvent
-from singularity.model import ModelErrorKind, ModelPurpose, ModelRunner, ModelTurnStatus
+from singularity.model import (
+    ChatCompletionProvider,
+    ModelErrorKind,
+    ModelPurpose,
+    ModelRunner,
+    ModelTurnStatus,
+)
 from singularity.observability.protocols import TraceStorageProtocol
 from singularity.planner import Planner, TaskStatus
-from singularity.provider import OpenAICompatibleProvider
 from singularity.repair import RepairPlanner
 from singularity.run_controller import RunController
 from singularity.tool_protocol.engine import ToolProtocolEngine
@@ -86,7 +92,7 @@ class AgentLoop:
     def __init__(
         self,
         *,
-        provider: OpenAICompatibleProvider | None = None,
+        provider: ChatCompletionProvider | None = None,
         model_runner: ModelRunner,
         tools: ToolRegistry,
         trace: TraceStorageProtocol,

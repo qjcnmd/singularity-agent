@@ -643,6 +643,17 @@ def test_replanner_maps_required_failures(tmp_path: Path) -> None:
     assert planner.state.status == TaskStatus.BLOCKED
 
 
+def test_replan_delegates_repair_contract_blockers_to_replanner(tmp_path: Path) -> None:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    planner.start_task("Repair")
+
+    decision = planner.replan({"repair_contract": {"confidence": 0.1}})
+
+    assert decision.decision == ReplanDecisionKind.ASK_USER
+    assert decision.reason == "Repair contract confidence is too low to continue automatically."
+    assert planner.state.status == TaskStatus.BLOCKED
+
+
 def test_risk_escalation_requires_review_for_high_risk_actions(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Change CI")

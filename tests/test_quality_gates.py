@@ -4,7 +4,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
-import yaml
+
+yaml = pytest.importorskip("yaml")
 
 pytestmark = pytest.mark.regression
 

@@ -1,10 +1,20 @@
+import importlib.util
 from typing import Any, ClassVar
 
 import httpx
 import pytest
 
 from singularity.config import Settings
-from singularity.provider import OpenAICompatibleProvider, ToolChoiceMode
+from singularity.model import (
+    ContentBlock,
+    ModelMessage,
+    ModelPurpose,
+    ModelRole,
+    OpenAICompatibleModelProvider,
+    ProviderRequest,
+    ToolChoiceMode,
+    ToolChoicePolicy,
+)
 
 
 class FakeResponse:
@@ -77,8 +87,8 @@ def test_provider_chat_passes_tool_choice(
     expected: str,
 ) -> None:
     FakeClient.payloads = []
-    monkeypatch.setattr("singularity.provider.httpx.Client", FakeClient)
-    provider = OpenAICompatibleProvider(
+    monkeypatch.setattr("singularity.model.providers.httpx.Client", FakeClient)
+    provider = OpenAICompatibleModelProvider(
         Settings(
             base_url="https://example.test/v1",
             api_key="test-key",
@@ -86,7 +96,19 @@ def test_provider_chat_passes_tool_choice(
         )
     )
 
-    provider.chat(messages=[{"role": "user", "content": "hi"}], tools=[], tool_choice=mode)
+    provider.complete(
+        ProviderRequest(
+            request_id="req",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION.value,
+            messages=[
+                ModelMessage(
+                    role=ModelRole.USER,
+                    content=[ContentBlock.from_text("hi")],
+                )
+            ],
+            tool_choice=ToolChoicePolicy(mode=mode),
+        )
+    )
 
     assert FakeClient.payloads[0]["tool_choice"] == expected
 
@@ -95,8 +117,8 @@ def test_provider_http_error_does_not_echo_response_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     FakeErrorClient.payloads = []
-    monkeypatch.setattr("singularity.provider.httpx.Client", FakeErrorClient)
-    provider = OpenAICompatibleProvider(
+    monkeypatch.setattr("singularity.model.providers.httpx.Client", FakeErrorClient)
+    provider = OpenAICompatibleModelProvider(
         Settings(
             base_url="https://example.test/v1",
             api_key="test-key",
@@ -104,10 +126,25 @@ def test_provider_http_error_does_not_echo_response_body(
         )
     )
 
-    with pytest.raises(RuntimeError) as exc:
-        provider.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+    with pytest.raises(Exception) as exc:
+        provider.complete(
+            ProviderRequest(
+                request_id="req",
+                purpose=ModelPurpose.PLAN_NEXT_ACTION.value,
+                messages=[
+                    ModelMessage(
+                        role=ModelRole.USER,
+                        content=[ContentBlock.from_text("hi")],
+                    )
+                ],
+            )
+        )
 
     message = str(exc.value)
     assert "HTTP 401" in message
     assert "sk-secret-provider-body" not in message
     assert "OPENAI_API_KEY" not in message
+
+
+def test_legacy_provider_module_is_removed() -> None:
+    assert importlib.util.find_spec("singularity.provider") is None

@@ -19,11 +19,16 @@
 - ModelMessage
 - ModelToolSchema
 - ModelToolCall
+- ToolChoiceMode
+- ToolChoicePolicy
 - ModelRunner
 - ProviderRequest
 - ProviderResponse
 - ProviderStreamEvent
 - StreamingAccumulator
+- ChatCompletionProvider
+- OpenAICompatibleModelProvider
+- provider_tool_call_dict
 
 字段清单:
 - ContentBlock: type, text, artifact_ref, metadata
@@ -65,11 +70,11 @@
 
 ## 真实运行时调用链
 
-`AgentLoop.run()` -> `ModelRunner.build_request_from_context()` -> `PromptAssemblyPipeline` -> provider registry -> provider chat/completion 或 streaming -> `ModelRunner.run_turn()` -> `ModelTurnResult` -> tool protocol 或 finalization。
+`AgentLoop.run()` -> `ModelRunner.build_request_from_context()` -> `PromptAssemblyPipeline` -> provider registry -> provider chat/completion 或 streaming -> `ModelRunner.run_turn()` -> `ModelTurnResult` -> tool protocol 或 finalization。provider 对外实现以 `OpenAICompatibleModelProvider` 为当前 OpenAI-compatible adapter；`ChatCompletionProvider` 只是 `AgentLoop` 和 context compaction fallback 使用的最小 Protocol，不是第二套 provider runtime。
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`ModelRunner.build_request_from_context()` -> `ModelTurnRequestBuilder.build_request()` 先把 `ContextBundle`、`PromptBundle`、`ModelToolRenderer.render()` 生成的 `ModelToolSchema`、planner context 和 allowed tool names 生成对象 `ModelTurnRequest`。`ModelRunner.run_turn()` 把 request 投影成 provider payload，只发送 messages、tool schema、tool choice、budget 与必要生成参数；非 streaming 时 provider 返回完整 response，`ProviderResponse.from_openai_response()` 解析 message、tool calls 和 usage。streaming 时 `ModelRunner._send_with_retry()` 生成 `ProviderRequest` 并调用 `ModelRunner._stream_provider_response()`，OpenAI-compatible provider 发送 `stream=true` 和 `stream_options.include_usage=true` 到 chat completions endpoint，逐行读取 SSE `data:` chunk，把 content delta、tool call delta、usage payload 和 finish reason 转成 `ProviderStreamEvent`；`StreamingAccumulator` 合并文本和工具参数，最终生成 `ProviderResponse`。随后 `ModelRunner._normalize_tool_calls()` 生成 `ModelToolCall`，`_emit_response_received()` 写 trace 事件，`_write_raw_artifact()` 在配置允许时写 redacted raw artifact。`ModelTurnResult.usage` 被 `ContextManager.record_model_usage()` 消费，`tool_calls` 进入 `ToolProtocolEngine.process_model_turn()`，完整 metadata 不写入 provider payload。
+以用户要求修复 `quicksort.py` 为例：`ModelRunner.build_request_from_context()` -> `ModelTurnRequestBuilder.build_request()` 先把 `ContextBundle`、`PromptBundle`、`ModelToolRenderer.render()` 生成的 `ModelToolSchema`、planner context 和 allowed tool names 生成对象 `ModelTurnRequest`。`ModelRunner.run_turn()` 把 request 投影成 provider payload，只发送 messages、tool schema、tool choice、budget 与必要生成参数；`ToolChoiceMode` 只在模型层定义，provider payload 由 `_serialize_tool_choice()` 转成 provider 值。非 streaming 时 provider 返回完整 response，`ProviderResponse.from_openai_response()` 解析 message、tool calls 和 usage。streaming 时 `ModelRunner._send_with_retry()` 生成 `ProviderRequest` 并调用 `ModelRunner._stream_provider_response()`，OpenAI-compatible provider 发送 `stream=true` 和 `stream_options.include_usage=true` 到 chat completions endpoint，逐行读取 SSE `data:` chunk，把 content delta、tool call delta、usage payload 和 finish reason 转成 `ProviderStreamEvent`；`StreamingAccumulator` 合并文本和工具参数，最终生成 `ProviderResponse`。随后 `ModelRunner._normalize_tool_calls()` 生成 `ModelToolCall`，`ModelToolCall.to_provider_tool_call()` 通过 `provider_tool_call_dict()` 生成 provider tool-call projection，tool protocol 中的 `ToolCallEnvelope.to_provider_tool_call()` 复用同一函数。`_emit_response_received()` 写 trace 事件，`_write_raw_artifact()` 在配置允许时写 redacted raw artifact。`ModelTurnResult.usage` 被 `ContextManager.record_model_usage()` 消费，`tool_calls` 进入 `ToolProtocolEngine.process_model_turn()`，完整 metadata 不写入 provider payload。
 
 ## 真实对象完整结构
 
@@ -246,6 +251,7 @@ class ProviderStreamEventType(StrEnum):
 
 context/prompt/message converter 生成 `ContentBlock`/`ModelMessage`；`ModelToolRenderer.render()` 从 registry 生成 `ModelToolSchema`。`ModelTurnRequestBuilder.build_request()` 生成 choice、preferences、budget 与 `ModelTurnRequest`，provider adapter 提供 capabilities。`ModelRunner._send_with_retry()` 生成 `ProviderRequest`。
 provider response parser/normalizer 生成 `ProviderResponse`、`ModelToolCall` 和 `ModelUsage`；streaming 路径由 provider adapter 生成 `ProviderStreamEvent`，`StreamingAccumulator` 合成 `ProviderResponse`。`ModelRunner._validate_response()` 生成 `ModelValidationResult`，`ModelRunner.run_turn()` 的成功/invalid/failed 分支生成 `ModelTurnResult` 与 `ModelError`。
+`provider_tool_call_dict()` 生成 provider-compatible tool call dict，供 `ModelToolCall` 和 `ToolCallEnvelope` 共同使用，避免模型层和 tool protocol 层维护两套 provider tool-call projection。历史 `src/singularity/provider.py` 不再是运行时入口；OpenAI-compatible provider 入口在 `src/singularity/model/providers.py`。
 
 ## 谁消费这些对象
 

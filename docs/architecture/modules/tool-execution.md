@@ -29,6 +29,7 @@
 - ToolProtocolRecoveryManager
 - ToolResultCache
 - IdempotencyLedger
+- ToolCallEnvelope.to_provider_tool_call
 
 字段清单:
 - ToolCallEnvelope: protocol_version, run_id, session_id, task_id, phase_id, model_request_id, model_response_id, assistant_message_id, tool_call_id, tool_name, raw_arguments, parsed_arguments, normalized_arguments, argument_digest, tool_schema_hash, allowed_tool_names, proposed_at, proposed_by_model, parse_status, validation_errors, metadata, phase
@@ -70,7 +71,7 @@
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`ToolProtocolEngine.process_model_turn()` -> `ToolProtocolValidator.validate_assistant_message()` 先把 `ModelTurnResult.tool_calls` 生成对象 `ToolCallEnvelope` 和 `ToolCallBatch`，再由 `ToolProtocolScheduler.schedule()` 生成 `ToolExecutionPlan`。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 并返回 `ToolResult`；其中 read-only 且可缓存的结果由 `ToolResultCache` 按参数、schema、workspace 与 touched paths 指纹保存，重复 `tool_call_id` 由 `IdempotencyLedger` 做冲突检测或安全 replay。`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`；`ToolProtocolStateStore.upsert_record()`、`transition()`、`append_event()` 和 `bind_result()` 把 batch、record、event、binding 写入 `tool_protocol.sqlite3`。`ContextManager.add_tool_protocol_result()` 把安全 tool message 写入 `context.sqlite3`，raw result 只通过 artifact ref/digest 进入 trace。
+以用户要求修复 `quicksort.py` 为例：`ToolProtocolEngine.process_model_turn()` -> `ToolProtocolValidator.validate_assistant_message()` 先把 `ModelTurnResult.tool_calls` 生成对象 `ToolCallEnvelope` 和 `ToolCallBatch`，再由 `ToolProtocolScheduler.schedule()` 生成 `ToolExecutionPlan`。调度语义仍由 scheduler 决定：side-effect 或不安全调用走 sequential，read-only 且并行安全调用可走 parallel_readonly，blocked call 不执行。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 并返回 `ToolResult`；其中 read-only 且可缓存的结果由 `ToolResultCache` 按参数、schema、workspace 与 touched paths 指纹保存，重复 `tool_call_id` 由 `IdempotencyLedger` 做冲突检测或安全 replay。`ToolCallEnvelope.to_provider_tool_call()` 只在需要把 envelope 投影回 provider tool-call 形状时使用，并复用模型层 `provider_tool_call_dict()`；它不参与执行调度。`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`；`ToolProtocolStateStore.upsert_record()`、`transition()`、`append_event()` 和 `bind_result()` 把 batch、record、event、binding 写入 `tool_protocol.sqlite3`。`ContextManager.add_tool_protocol_result()` 把安全 tool message 写入 `context.sqlite3`，raw result 只通过 artifact ref/digest 进入 trace。
 
 ## 真实对象完整结构
 
@@ -207,7 +208,7 @@ class ToolProtocolTurnStatus(str, Enum): # ToolProtocolTurnResult.status
 
 ### 数据流概述
 
-`ModelTurnResult.tool_calls` -> `ToolProtocolValidator.validate_assistant_message()` 生成 `ToolCallEnvelope` 和 `ToolCallBatch`。`ToolProtocolScheduler.schedule()` 根据 side_effect/并行安全性生成 `ToolExecutionPlan`（sequential/parallel_readonly/blocked）。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 返回 `ToolResult`，`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`。`ContextManager.add_tool_protocol_result()` 只把 redacted `ToolObservationView.to_model_payload()` 作为 tool message 加入下一轮模型请求。
+`ModelTurnResult.tool_calls` -> `ToolProtocolValidator.validate_assistant_message()` 生成 `ToolCallEnvelope` 和 `ToolCallBatch`。`ToolProtocolScheduler.schedule()` 根据 side_effect/并行安全性生成 `ToolExecutionPlan`（sequential/parallel_readonly/blocked）。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 返回 `ToolResult`，`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`。`ContextManager.add_tool_protocol_result()` 只把 redacted `ToolObservationView.to_model_payload()` 作为 tool message 加入下一轮模型请求。provider tool-call dict 的格式由模型层 helper 统一生成，tool protocol 不维护第二份硬编码结构。
 
 ## 谁生成这些对象
 

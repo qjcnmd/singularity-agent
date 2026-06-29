@@ -24,6 +24,8 @@ from singularity.model import (
 from singularity.policy import DecisionOutcome
 from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tool_protocol.models import (
+    ToolCallBatch,
+    ToolCallEnvelope,
     ToolCallFailureKind,
     ToolCallPhase,
     ToolExecutionMode,
@@ -363,6 +365,49 @@ def test_tool_protocol_executes_parallel_read_only_group_concurrently(tmp_path: 
         "call_read_one",
         "call_read_two",
     ]
+
+
+def test_tool_call_provider_serialization_is_shared_with_execution_context() -> None:
+    batch = ToolCallBatch(
+        batch_id="batch_1",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        model_request_id="req_1",
+        model_response_id="resp_1",
+        assistant_message={"role": "assistant", "content": None, "tool_calls": []},
+    )
+    model_call = ModelToolCall(
+        tool_call_id="call_1",
+        tool_name="read_file",
+        arguments={"path": "README.md"},
+        raw_arguments='{"path":"README.md"}',
+        parse_status=ModelToolParseStatus.VALID,
+    )
+    envelope = ToolCallEnvelope(
+        protocol_version="1.0",
+        run_id=batch.run_id,
+        session_id=batch.session_id,
+        task_id=batch.task_id,
+        phase_id=batch.phase_id,
+        model_request_id=batch.model_request_id,
+        model_response_id=batch.model_response_id,
+        assistant_message_id="assistant_1",
+        tool_call_id=model_call.tool_call_id,
+        tool_name=model_call.tool_name,
+        raw_arguments=model_call.raw_arguments,
+        parsed_arguments=model_call.arguments,
+        normalized_arguments=model_call.arguments,
+    )
+
+    assert envelope.to_provider_tool_call() == model_call.to_provider_tool_call()
+
+    request = ToolExecutionRequest.from_envelope(envelope, batch=batch)
+    assert request.batch_id == "batch_1"
+    assert request.run_id == "run_1"
+    assert request.session_id == "session_1"
+    assert request.model_request_id == "req_1"
 
 
 def test_tool_protocol_creates_synthetic_result_for_rejected_call(tmp_path: Path) -> None:

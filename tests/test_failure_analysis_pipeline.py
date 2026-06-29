@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
+import singularity.verification as verification
 from singularity.command import CommandRequest, SemanticStatus
 from singularity.planner import Planner
 from singularity.verification import FailureAnalysisPipeline, FailureType, VerificationRunner
@@ -33,16 +36,12 @@ def test_failing_pytest_generates_failure_analysis_and_repair_plan(tmp_path: Pat
 
     analysis = observation["verification"]["failure_analysis"][0]
     repair_plan = observation["verification"]["repair_plan"]
-    assert analysis["failure_type"] == FailureType.UNIT_TEST_FAILURE.value
-    assert analysis["suspect_files"] == ["tests/test_app.py"]
+    assert analysis["failure_category"] == FailureType.UNIT_TEST_FAILURE.value
+    assert analysis["affected_files"] == ["tests/test_app.py"]
     assert "AssertionError" in analysis["root_cause"]["description"]
-    assert repair_plan["steps"][0]["target_file"] == "tests/test_app.py"
-    assert repair_plan["next_verification"]["command"] == [
-        "python",
-        "-m",
-        "pytest",
-        "tests/test_app.py::test_bad",
-    ]
+    assert repair_plan["action_candidates"][0]["target_file"] == "tests/test_app.py"
+    assert repair_plan["repair_contract"]["target_files"] == ["tests/test_app.py"]
+    assert repair_plan["verification_plan"] == ["python -m pytest tests/test_app.py::test_bad"]
 
 
 def test_same_failure_repeated_routes_to_no_progress() -> None:
@@ -70,9 +69,9 @@ def test_same_failure_repeated_routes_to_no_progress() -> None:
     first = component.analyze_result(result, changed_files=["app.py"])
     second = component.analyze_result(result, changed_files=["app.py"])
 
-    assert first.no_progress_reason is None
-    assert second.no_progress_reason == "same_failure_retry_budget_exceeded"
-    assert second.repair_plan.strategy == "stop_and_ask"
+    assert first.blocked_reason is None
+    assert second.blocked_reason == "same_failure_retry_budget_exceeded"
+    assert second.needs_user_input is True
 
 
 def test_golden_failure_repair_rerun_passes(tmp_path: Path) -> None:
@@ -107,14 +106,11 @@ def test_golden_failure_repair_rerun_passes(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("FIXED = True\n", encoding="utf-8")
     passed = component.rerun_check(
         plan_id=plan.id,
-        check_id=failed["verification"]["repair_plan"]["next_verification"]["check_id"],
+        check_id=failed["verification"]["failed_checks"][0]["check_id"],
     )
 
-    assert failed["verification"]["repair_plan"]["steps"][0]["next_verification"]["command"] == [
-        "python",
-        "-m",
-        "pytest",
-        "tests/test_app.py::test_bad",
+    assert failed["verification"]["repair_plan"]["verification_plan"] == [
+        "python -m pytest tests/test_app.py::test_bad"
     ]
     assert passed["verification"]["completion_assessment"]["status"] == "ready"
     assert "failure_analysis" not in passed["verification"]
@@ -150,3 +146,24 @@ def test_verification_failure_analysis_updates_planner_context(tmp_path: Path) -
     context = planner.planner_context_message()["content"]
     assert "failure_analysis" in context
     assert "repair_plan" in context
+
+
+def test_verification_package_does_not_export_repair_planner_aliases() -> None:
+    assert not hasattr(verification, "RepairPlanner")
+    assert not hasattr(verification, "RepairPlan")
+
+
+def test_agent_loop_import_does_not_cycle_through_verification_failure_analysis() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from singularity.agent_loop import AgentLoop; "
+            "from singularity.kernel.graph import AgentGraphBuilder",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr

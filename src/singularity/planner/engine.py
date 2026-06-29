@@ -1196,38 +1196,21 @@ class Planner:
         signal_payload = _dict_like(signal)
         state = self._state()
         repair_contract = _repair_contract_payload(signal_payload)
-        blocked_reason = _repair_contract_blocked_reason(repair_contract, signal_payload)
-        if blocked_reason:
-            state.status = TaskStatus.BLOCKED
-            self._append_unique(state.blocked_reasons, blocked_reason)
-            decision = ReplanDecision(
-                decision=ReplanDecisionKind.ASK_USER,
-                reason=blocked_reason,
-                next_action=ActionKind.ASK_USER,
-            )
-            self._persist()
-            self._record_event(
-                decision="replan",
-                reason=decision.reason,
-                replan_decision=decision.to_dict(),
-                extra={
-                    "replan_signal": signal_payload,
-                    "repair_contract": repair_contract,
-                },
-            )
-            self._record_repair_signal_consumed(signal_payload, decision)
-            return decision
         fingerprint = signal_payload.get("failure_fingerprint")
         if fingerprint:
             count = BudgetController(self.budget).record_failure(str(fingerprint))
             if count >= self.budget.max_repeated_failures:
+                reason = "repeated_failure"
+                signal_payload = {**signal_payload, "blocked_reason": reason}
+                decision = self.replanner.decide(signal_payload)
+                if decision.decision == ReplanDecisionKind.CONTINUE:
+                    decision = ReplanDecision(
+                        decision=ReplanDecisionKind.ASK_USER,
+                        reason="Repeated failure budget exceeded.",
+                        next_action=ActionKind.ASK_USER,
+                    )
                 state.status = TaskStatus.BLOCKED
-                self._append_unique(state.blocked_reasons, "repeated_failure")
-                decision = ReplanDecision(
-                    decision=ReplanDecisionKind.ASK_USER,
-                    reason="Repeated failure budget exceeded.",
-                    next_action=ActionKind.ASK_USER,
-                )
+                self._append_unique(state.blocked_reasons, reason)
                 self._persist()
                 self._record_event(
                     decision="replan",
@@ -1240,6 +1223,35 @@ class Planner:
                 )
                 self._record_repair_signal_consumed(signal_payload, decision)
                 return decision
+        rule_decision = self.replanner.decide(signal_payload)
+        if rule_decision.decision != ReplanDecisionKind.CONTINUE:
+            decision = rule_decision
+            if decision.decision == ReplanDecisionKind.ASK_USER:
+                state.status = TaskStatus.BLOCKED
+                self._append_unique(state.blocked_reasons, decision.reason)
+            elif decision.decision == ReplanDecisionKind.READ_FRESH_FILE:
+                state.status = TaskStatus.INSPECTING_WORKSPACE
+                state.current_phase = "inspecting_workspace"
+                self._plan().current_phase = "inspecting_workspace"
+            elif decision.decision == ReplanDecisionKind.REPAIR_FAILURE:
+                state.status = TaskStatus.REPAIRING_FAILURES
+                state.current_phase = "repairing_failures"
+                self._plan().current_phase = "repairing_failures"
+                self._consume_repair_signal(signal_payload)
+            elif decision.decision == ReplanDecisionKind.REQUIRE_REVIEW:
+                state.status = TaskStatus.NEEDS_REVIEW
+            self._persist()
+            self._record_event(
+                decision="replan",
+                reason=decision.reason,
+                replan_decision=decision.to_dict(),
+                extra={
+                    "replan_signal": signal_payload,
+                    "repair_contract": repair_contract,
+                },
+            )
+            self._record_repair_signal_consumed(signal_payload, decision)
+            return decision
         planner_decision = self.producers.planner_decision.produce(
             signal_payload,
             context_payload=self._producer_context(),
@@ -1683,16 +1695,21 @@ class Planner:
         if not self.evidence.repair_plans:
             return {}
         # Search backwards for a repair plan that carries a repair_contract.
-        # VerificationRunner may append additional repair_plans (from its own
-        # failure analysis) that don't carry a contract — we must find the
-        # authoritative one from the FailureAnalyzer/RepairPlanner path.
+        # VerificationRunner may append additional blocked plans with empty
+        # verification contracts after a failed rerun; prefer the newest
+        # contract that still carries executable verification steps.
+        fallback: dict[str, Any] = {}
         for plan in reversed(self.evidence.repair_plans):
             if not isinstance(plan, dict):
                 continue
             contract = _repair_contract_payload(plan)
-            if contract:
+            if not contract:
+                continue
+            if not fallback:
+                fallback = contract
+            if _repair_contract_has_verification_steps(contract):
                 return contract
-        return {}
+        return fallback
 
     def _repair_contract_execution_block(self) -> tuple[str, str] | None:
         if self.state is None or self.state.current_phase != "repairing_failures":
@@ -2421,6 +2438,13 @@ def _repair_contract_blocked_reason(
     if confidence < 0.45:
         return "repair_contract_low_confidence"
     return None
+
+
+def _repair_contract_has_verification_steps(contract: dict[str, Any]) -> bool:
+    payload = contract.get("verification_contract")
+    if isinstance(payload, dict) and payload.get("steps"):
+        return True
+    return bool(contract.get("verification_plan"))
 
 
 def _normalize_planner_path(path: Any) -> str:

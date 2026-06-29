@@ -1,15 +1,6 @@
 from singularity.verification.assessor import CompletionAssessor
 from singularity.verification.discovery import CommandDiscovery, ProjectDetector
 from singularity.verification.errors import VERIFICATION_ERROR_CODES
-from singularity.verification.failure_analysis import (
-    FailureAnalysis,
-    FailureAnalysisPipeline,
-    NoProgressGuard,
-    RepairPlan,
-    RepairPlanner,
-    RepairStep,
-    RootCauseHypothesis,
-)
 from singularity.verification.impact import ImpactAnalyzer
 from singularity.verification.models import (
     CheckKind,
@@ -39,7 +30,6 @@ from singularity.verification.parsers import (
 )
 from singularity.verification.policy import VerificationPolicy, VerificationPolicyResult
 from singularity.verification.repair import RepairHintGenerator, RepairLoopController
-from singularity.verification.runner import VerificationRunner
 
 __all__ = [
     "VERIFICATION_ERROR_CODES",
@@ -50,7 +40,6 @@ __all__ = [
     "CompletionAssessor",
     "CompletionStatus",
     "DiscoveredCommand",
-    "FailureAnalysis",
     "FailureAnalysisPipeline",
     "FailureParser",
     "FailureParserRegistry",
@@ -67,10 +56,6 @@ __all__ = [
     "RepairHintGenerator",
     "RepairLoopController",
     "RepairLoopState",
-    "RepairPlan",
-    "RepairPlanner",
-    "RepairStep",
-    "RootCauseHypothesis",
     "VerificationCheck",
     "VerificationDecision",
     "VerificationEvidence",
@@ -82,3 +67,22 @@ __all__ = [
     "WorkspaceKind",
     "classify_failure",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if name in {"FailureAnalysisPipeline", "NoProgressGuard"}:
+        from singularity.verification.failure_analysis import (
+            FailureAnalysisPipeline,
+            NoProgressGuard,
+        )
+
+        exports = {
+            "FailureAnalysisPipeline": FailureAnalysisPipeline,
+            "NoProgressGuard": NoProgressGuard,
+        }
+        return exports[name]
+    if name == "VerificationRunner":
+        from singularity.verification.runner import VerificationRunner
+
+        return VerificationRunner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

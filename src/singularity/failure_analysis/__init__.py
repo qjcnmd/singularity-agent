@@ -1,5 +1,4 @@
 from singularity.failure_analysis._shared import MIN_REPAIR_CONFIDENCE
-from singularity.failure_analysis.analyzer import FailureAnalyzer
 from singularity.failure_analysis.request import FailureAnalysisRequest
 from singularity.failure_analysis.result import FailureAnalysisResult
 
@@ -9,3 +8,11 @@ __all__ = [
     "FailureAnalysisResult",
     "FailureAnalyzer",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if name == "FailureAnalyzer":
+        from singularity.failure_analysis.analyzer import FailureAnalyzer
+
+        return FailureAnalyzer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

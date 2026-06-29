@@ -113,6 +113,21 @@ class ModelProvider(Protocol):
         ...
 
 
+class ChatCompletionProvider(Protocol):
+    """Minimal chat-completion fallback used by context compaction tests."""
+
+    settings: Any
+
+    def chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_choice: ToolChoiceMode | str = ToolChoiceMode.AUTO,
+    ) -> dict[str, Any]:
+        ...
+
+
 class MockModelProvider:
     def __init__(
         self,

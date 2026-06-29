@@ -31,9 +31,10 @@ from singularity.policy import (
     ResourceRef,
 )
 from singularity.policy.audit import redact
+from singularity.repair import RepairPlanner
 from singularity.verification.assessor import CompletionAssessor
 from singularity.verification.discovery import ProjectDetector
-from singularity.verification.failure_analysis import FailureAnalysisPipeline, RepairPlanner
+from singularity.verification.failure_analysis import FailureAnalysisPipeline
 from singularity.verification.impact import ImpactAnalyzer
 from singularity.verification.models import (
     CheckKind,
@@ -228,7 +229,7 @@ class VerificationRunner:
             task_contract=self._task_contract_payload(),
             verification_commands=self._verification_commands(plan),
         )
-        repair_plan = self.repair_planner.plan(analyses) if analyses else None
+        repair_plan = self.repair_planner.plan(analyses[0]) if analyses else None
         observation = self._observation(
             plan,
             results,
@@ -267,7 +268,7 @@ class VerificationRunner:
             task_contract=self._task_contract_payload(),
             verification_commands=self._verification_commands(plan),
         )
-        repair_plan = self.repair_planner.plan(analyses) if analyses else None
+        repair_plan = self.repair_planner.plan(analyses[0]) if analyses else None
         observation = self._observation(
             plan,
             existing,

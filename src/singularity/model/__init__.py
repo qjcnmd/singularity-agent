@@ -36,6 +36,7 @@ from singularity.model.models import (
     ToolChoicePolicy,
 )
 from singularity.model.providers import (
+    ChatCompletionProvider,
     ChatProviderModelProvider,
     MockModelProvider,
     ModelProvider,
@@ -56,6 +57,7 @@ from singularity.model.tools import ModelToolRenderer, ToolCallNormalizer
 from singularity.model.validation import ModelResponseValidator
 
 __all__ = [
+    "ChatCompletionProvider",
     "ChatProviderModelProvider",
     "ContentBlock",
     "ContentBlockType",

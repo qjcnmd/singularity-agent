@@ -18,6 +18,7 @@
 - AgentAction
 - EvidenceLedger
 - ReplanDecision
+- Replanner
 - FinalReport
 - Planner
 
@@ -55,11 +56,11 @@ Planner 层维护任务状态、阶段、行动、证据、预算、重规划决
 
 ## 真实运行时调用链
 
-`AgentLoop.run()` -> `planner.step()` -> tool/model/verification outcomes 写入 `EvidenceLedger` -> `RunController` reduce outcome -> `Planner.replan()` 或 `Planner.finalize()`。
+`AgentLoop.run()` -> `planner.step()` -> tool/model/verification outcomes 写入 `EvidenceLedger` -> `RunController` reduce outcome -> `Planner.replan()` 或 `Planner.finalize()`。`Planner.replan()` 先把 signal 投给 `Replanner.decide()` 做 repair contract、blocked reason、fresh-file、review 和 verification failure 等规则判定；Planner 自身继续负责 `TaskState` 状态转换、budget、persist 和 event recording。
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`Planner.start_task()` -> `Planner.step()` -> `Planner.update_from_tool_result()` / `update_from_command()` / `update_from_verification()` 先生成对象 `TaskState`、`TaskPhase`、`TaskPlan` 和 `AgentAction`，再把工具、命令和验证结果写入 `EvidenceLedger` 并更新 `ExecutionBudget`；`Planner._persist()` 再把 state/plan/evidence/budget 写入 `.singularity/planner/<session_id>/state.json`、`plan.json`、`evidence.json`、`budget.json`。completion gate 不满足时 `Planner.replan()` 返回 `ReplanDecision`，失败分析的 `RepairReplanSignal` 通过 `Planner.record_failure_analysis()` 进入同一 evidence/report 链。
+以用户要求修复 `quicksort.py` 为例：`Planner.start_task()` -> `Planner.step()` -> `Planner.update_from_tool_result()` / `update_from_command()` / `update_from_verification()` 先生成对象 `TaskState`、`TaskPhase`、`TaskPlan` 和 `AgentAction`，再把工具、命令和验证结果写入 `EvidenceLedger` 并更新 `ExecutionBudget`；`Planner._persist()` 再把 state/plan/evidence/budget 写入 `.singularity/planner/<session_id>/state.json`、`plan.json`、`evidence.json`、`budget.json`。completion gate 不满足时 `Planner.replan()` 先调用 `Replanner.decide()` 取得 `ReplanDecision`，再在同一方法内应用状态转换、重复失败预算和 event recording；失败分析的 `RepairReplanSignal` 通过 `Planner.record_failure_analysis()` 进入同一 evidence/report 链。
 ## 真实对象完整结构
 
 ### TaskState（任务状态）
@@ -208,13 +209,13 @@ class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
 
 - `Planner.start_task()` 生成 `TaskState` 与默认 `CompletionCriteria`，并通过 `_default_plan()` 生成 `TaskPhase` 列表和 `TaskPlan`。`Planner.step()` 根据当前 phase 生成 `AgentAction`。
 - Planner 初始化 `EvidenceLedger`/`ExecutionBudget`；tool、mutation、command、verification、failure/review 的 `record_*`/`update_*` 方法持续更新 evidence，BudgetController 与 replan 路径更新 budget counters。
-- `Planner.authorize_tool_call()` 生成 `AuthorizationDecision`，`Planner.replan()` 生成 `ReplanDecision`，`RiskEscalator.evaluate_action()` 生成 `RiskEscalation`。`Planner.finalize()` 委托 `Finalizer.build()` 生成 `FinalReport`。
+- `Planner.authorize_tool_call()` 生成 `AuthorizationDecision`，`Replanner.decide()` 生成规则层面的 `ReplanDecision`，`Planner.replan()` 应用该 decision 并处理持久化/事件/预算状态，`RiskEscalator.evaluate_action()` 生成 `RiskEscalation`。`Planner.finalize()` 委托 `Finalizer.build()` 生成 `FinalReport`。
 
 ## 谁消费这些对象
 
 - `Planner.step()`、`AgentLoop.run()` 内部 `run_turn()`、`RunController.apply_protocol_result()` / `apply_outcome()` 和 `Finalizer.build()` 消费 `TaskState`/`TaskPlan`/`CompletionCriteria`；`ToolExecutor.execute_request()` 消费当前 `TaskPhase` 与 `AgentAction`。主模型只接收 `PlannerContextRenderer.render()` 投影的 goal、phase、allowed tools、rolling plan 与选择性 evidence，不接收完整 state/plan。
 - `Planner.assess_completion()` 消费 `EvidenceLedger`，`BudgetController.check_budget()` 和 `Planner.step()` 消费 `ExecutionBudget`；ledger/budget 全量对象不进模型。`AuthorizationDecision` 由 `ToolExecutor.authorize()` 消费，deny reason 可经 tool observation 进入后续模型。
-- `Planner.replan()` 消费 `ReplanDecision`/`RiskEscalation`；replan signal 会进入 planner-decision producer 的独立模型请求。`AgentKernel.run_task()`、CLI、evaluation 和 `MemoryLearningPipeline.ingest_final_report()` 消费 `FinalReport`，final report 不再发送给主模型。
+- `Planner.replan()` 消费 `Replanner.decide()` 生成的 `ReplanDecision`/`RiskEscalation` 并更新 state；replan signal 会进入 planner-decision producer 的独立模型请求。`AgentKernel.run_task()`、CLI、evaluation 和 `MemoryLearningPipeline.ingest_final_report()` 消费 `FinalReport`，final report 不再发送给主模型。
 
 ## 是否落盘
 
@@ -232,7 +233,7 @@ class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
 
 - completion criterion 不满足时 `assess_completion()` 返回 unmet 集合；`TaskState.status`/`blocked_reasons` 表达 blocked、needs-review 或 failed。`EvidenceLedger.missing_evidence`/`unresolved_failures` 保留未解决原因。
 - `TaskPlan.phase()` 找不到 phase 时失败；`TaskPhase.failure_policy` 决定该阶段后续策略。budget 对 model/tool/command/mutation/repair/repeated failure 超限时阻止继续，不通过重置 counter 绕过。
-- authorization 对 phase、repair contract、benchmark tool/path、verification command 违规返回 `allowed=False` 和具体 error code；replan 可返回 ask-user、require-review 或 repeated-failure。final reviewer 拒绝或 completion 未满足时 `FinalReport.status` 非 completed，AgentLoop 不返回成功。
+- authorization 对 phase、repair contract、benchmark tool/path、verification command 违规返回 `allowed=False` 和具体 error code；`Replanner.decide()` 可返回 ask-user、read-fresh-file、repair-failure 或 require-review，重复失败预算由 `Planner.replan()` 记录后再走同一 decision/event 边界。final reviewer 拒绝或 completion 未满足时 `FinalReport.status` 非 completed，AgentLoop 不返回成功。
 
 ## 当前结构问题
 

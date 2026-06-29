@@ -144,14 +144,11 @@ class ModelToolCall(SerializableDataclass):
     provider_metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_provider_tool_call(self) -> dict[str, Any]:
-        return {
-            "id": self.tool_call_id,
-            "type": "function",
-            "function": {
-                "name": self.tool_name,
-                "arguments": self.raw_arguments,
-            },
-        }
+        return provider_tool_call_dict(
+            tool_call_id=self.tool_call_id,
+            tool_name=self.tool_name,
+            raw_arguments=self.raw_arguments,
+        )
 
 
 @dataclass
@@ -166,6 +163,22 @@ class ModelCapabilities(SerializableDataclass):
     max_output_tokens: int = 4096
     input_modalities: list[str] = field(default_factory=lambda: ["text"])
     output_modalities: list[str] = field(default_factory=lambda: ["text"])
+
+
+def provider_tool_call_dict(
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    raw_arguments: str,
+) -> dict[str, Any]:
+    return {
+        "id": tool_call_id,
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": raw_arguments,
+        },
+    }
 
 
 @dataclass

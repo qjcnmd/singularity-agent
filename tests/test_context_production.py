@@ -14,8 +14,7 @@ from singularity.context import (
     ReferenceResolver,
     TokenCounter,
 )
-from singularity.model import ModelUsage
-from singularity.provider import ToolChoiceMode
+from singularity.model import ModelUsage, ToolChoiceMode
 
 
 def tool_call(call_id: str, name: str = "read_file") -> dict[str, Any]:

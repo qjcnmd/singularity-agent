@@ -9,6 +9,7 @@ from typing import Any
 
 from singularity.model.models import (
     ModelToolParseStatus,
+    provider_tool_call_dict,
 )
 from singularity.tools.models import ToolResult
 
@@ -148,14 +149,11 @@ class ToolCallEnvelope(SerializableDataclass):
             self.tool_schema_hash = str(self.metadata.get("tool_schema_hash") or "")
 
     def to_provider_tool_call(self) -> dict[str, Any]:
-        return {
-            "id": self.tool_call_id,
-            "type": "function",
-            "function": {
-                "name": self.tool_name,
-                "arguments": self.raw_arguments,
-            },
-        }
+        return provider_tool_call_dict(
+            tool_call_id=self.tool_call_id,
+            tool_name=self.tool_name,
+            raw_arguments=self.raw_arguments,
+        )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ToolCallEnvelope:

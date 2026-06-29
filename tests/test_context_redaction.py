@@ -6,7 +6,7 @@ from singularity.context import ContextManager
 from singularity.context.models import ContextSensitivity
 from singularity.context.redaction import ContextRedactor, SensitivityClassifier
 from singularity.context.tokens import TokenCounter
-from singularity.provider import ToolChoiceMode
+from singularity.model import ToolChoiceMode
 from singularity.tool_protocol.models import ToolProtocolResultEnvelope
 
 

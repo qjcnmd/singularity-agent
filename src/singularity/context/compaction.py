@@ -20,7 +20,6 @@ from singularity.context.models import (
     PartialCompactionRange,
     digest_value,
 )
-from singularity.provider import ToolChoiceMode
 
 COMPACTION_RECENT_TAIL_MESSAGES = 8
 COMPACTION_FRAGMENT_LIMIT = 8000
@@ -546,6 +545,8 @@ class ContextCompactionExecutor:
             )
             content = result.assistant_message.text if result.assistant_message else ""
         else:
+            from singularity.model.models import ToolChoiceMode
+
             provider = self.manager.provider
             if provider is None:
                 return {}
