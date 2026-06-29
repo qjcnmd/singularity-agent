@@ -57,7 +57,7 @@ def test_ci_workflow_enforces_cross_platform_quality_gates() -> None:
     matrix = strategy["matrix"]
     assert isinstance(matrix, dict)
     assert set(matrix["os"]) == {"ubuntu-latest", "windows-latest"}
-    assert set(matrix["python-version"]) == {"3.11", "3.14"}
+    assert set(matrix["python-version"]) == {"3.11", "3.12", "3.13", "3.14"}
 
     steps = quality["steps"]
     assert isinstance(steps, list)

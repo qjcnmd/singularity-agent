@@ -5,6 +5,7 @@
 源码证据路径:
 - src/singularity/command/models.py
 - src/singularity/command/executor.py
+- src/singularity/command/backend.py
 - src/singularity/command/policy.py
 - src/singularity/tools/command.py
 - src/singularity/error_codes.py
@@ -36,6 +37,7 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 
 - src/singularity/command/models.py
 - src/singularity/command/executor.py
+- src/singularity/command/backend.py
 - src/singularity/command/policy.py
 - src/singularity/tools/command.py
 - src/singularity/error_codes.py
@@ -47,6 +49,8 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 ## 真实运行时调用链
 
 `run_command` / verification tools -> `CommandExecutor.run()` -> `CommandRequest` -> command policy -> optional sandbox/backend -> `CommandResult` -> trace/context/planner evidence。`ExecutionBackend.execute()` 的当前签名必须接收 `cancellation_token` 关键字参数；`CommandExecutor` 不再静默回退到旧签名。
+
+`LocalProcessBackend` 通过 stdout/stderr reader thread 将管道输出送入 `OutputCollector`；reader 优先使用 `read1(8192)` 读取可用缓冲，回退到 `read(8192)`，避免大输出逐字节读取，同时保持长进程的实时输出可被 `read_process_output()` 轮询。
 
 ## 真实任务中的对象流
 

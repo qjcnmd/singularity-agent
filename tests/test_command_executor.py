@@ -21,7 +21,7 @@ from singularity.command import (
     ResourceLimits,
     SemanticStatus,
 )
-from singularity.command.backend import RunningProcess
+from singularity.command.backend import RunningProcess, _reader_thread
 from singularity.context import ContextManager
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import DecisionOutcome, PolicyConfig, PolicyEngine
@@ -64,6 +64,39 @@ def unrestricted_command_executor(tmp_path: Path, **kwargs) -> CommandExecutor:
         ),
         **kwargs,
     )
+
+
+def test_command_reader_reads_output_in_chunks() -> None:
+    class Pipe:
+        def __init__(self, data: bytes) -> None:
+            self.data = data
+            self.read_sizes: list[int] = []
+
+        def read(self, size: int) -> bytes:
+            self.read_sizes.append(size)
+            if not self.data:
+                return b""
+            chunk = self.data[:size]
+            self.data = self.data[size:]
+            return chunk
+
+        def read1(self, size: int) -> bytes:
+            return self.read(size)
+
+    pipe = Pipe(b"x" * 9000)
+    output_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
+
+    thread = _reader_thread("stdout", pipe, output_queue)
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert max(pipe.read_sizes) > 1
+    chunks: list[bytes] = []
+    while not output_queue.empty():
+        stream, chunk = output_queue.get_nowait()
+        assert stream == "stdout"
+        chunks.append(chunk)
+    assert b"".join(chunks) == b"x" * 9000
 
 
 def test_strict_mode_blocks_inline_interpreter_readonly_command(

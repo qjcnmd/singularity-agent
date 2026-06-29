@@ -14,6 +14,8 @@ from uuid import uuid4
 from singularity.command.models import CommandRequest, ResourceLimits
 from singularity.command.output import OutputCollector
 
+_PIPE_READ_CHUNK_SIZE = 8192
+
 
 @dataclass(frozen=True)
 class BackendRunResult:
@@ -402,9 +404,12 @@ def _reader_thread(
     def run() -> None:
         if pipe is None:
             return
+        read = getattr(pipe, "read1", None)
+        if not callable(read):
+            read = pipe.read  # type: ignore[attr-defined]
         while True:
             try:
-                chunk = pipe.read(1)  # type: ignore[attr-defined]
+                chunk = read(_PIPE_READ_CHUNK_SIZE)
             except ValueError:
                 return
             if not chunk:
