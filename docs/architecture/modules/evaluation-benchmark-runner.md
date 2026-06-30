@@ -247,6 +247,7 @@ benchmark scoring path 中，`BenchmarkTaskExecutor.evaluate()` 生成 `TaskExec
 - `CommandEvalResult.failure_category` 明确区分 `command_parse_error`、`command_timeout`、`command_not_found`、`command_execution_error`、`environment_dependency_missing`、`verification_failed` 和 `command_failed`。
 - `EvaluationTaskResult.status` 由 `_task_result()` 归一为 `infrastructure_blocked`、`success`、`policy_blocked`、`verification_failed`、`blocked`、`failed`、`max_turns_exceeded`、`failure` 或 `unknown`；最终通过字段是 `evaluation_passed`，不是 manifest 的 `success`。
 - `TaskExecutionEvidence.failure_reasons` 聚合 snapshot、diff 和 hook error code；golden contract 中未观察到的 evidence 只标记 `observed=false`，由 scoring/report 消费，不会绕过 verification。
+- `public`/`hidden` post-agent verification 是 evaluation 层评分证据，写入 `EvaluationTaskResult.checks`、`verification_result`、`contract_satisfaction` 和 `<evaluation_run>/result.json`。它不回灌到 AgentLoop 的 `EvidenceLedger.verification_results`，也不参与 `Planner.assess_completion()`、`Planner.finalize()` 或 `AgentLoopResult.status` 的完成判定。
 - 真实 AgentLoop 中 verification 被 sandbox backend unavailable 阻塞时，失败摘要应保留 policy/sandbox 分类和 trace/final report artifact；不能用 fake provider、scripted provider 或 `danger-full-access` 替代默认 `workspace-write` 验证。
 - targeted replay 的 `status` 原样取 `AgentLoopResult.status.value`，`agent_completed=False` 使 CLI 退出 1；该 runner 没有总异常捕获，文件或运行异常直接传播。
 

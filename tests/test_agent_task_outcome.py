@@ -164,6 +164,55 @@ def test_ready_verification_finalizes_without_extra_model_turn(tmp_path: Path) -
     assert planner.evidence.verification_results[-1]["completion_assessment"]["status"] == "ready"
 
 
+def test_ready_verification_clears_stale_completion_blockers(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("task context", encoding="utf-8")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = FakeProvider(
+        tool("call_read_1", "read_file", {"path": "README.md"}),
+        tool("call_read_2", "read_file", {"path": "README.md", "max_bytes": 20}),
+        tool(
+            "call_create",
+            "write_file",
+            {
+                "path": "quicksort.py",
+                "content": QUICK_SORT,
+                "mode": "create",
+                "reason": "create deterministic quicksort smoke target",
+            },
+        ),
+        tool(
+            "call_verify",
+            "run_verification",
+            {
+                "changed_files": ["quicksort.py"],
+                "task_intent": "verify quicksort script",
+                "smoke_commands": [["python", "quicksort.py"]],
+            },
+        ),
+    )
+    agent = make_task_agent(tmp_path, provider=provider, planner=planner, max_turns=4)
+    planner.start_task("implement quicksort.py and verify it")
+    planner.state.blocked_reasons.extend(
+        [
+            "required_verifications_passed",
+            "unresolved_failures_empty",
+            "sandbox backend unavailable: run elevated sandbox setup before verification can proceed",
+        ]
+    )
+
+    result = agent.run("implement quicksort.py and verify it")
+
+    assert result.status == AgentLoopStatus.COMPLETED
+    assert "status: completed" in result.final_answer
+    assert planner.state is not None
+    assert planner.state.status == TaskStatus.COMPLETED
+    assert planner.state.blocked_reasons == []
+    assert all(
+        item.get("error_code") != "repair_budget_exceeded"
+        for item in planner.evidence.task_outcomes
+    )
+
+
 def test_malformed_tool_args_record_retryable_outcome(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     provider = FakeProvider(

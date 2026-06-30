@@ -72,6 +72,8 @@ class AgentLoopStatus(str, Enum):
 
 `AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部创建 `RunController`，再把每一轮执行封装在局部 `run_turn()` callback 中：`planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `_attempt_finalize()` 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `_terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
 
+完成判定只消费 AgentLoop 内部 evidence：`Planner.update_from_verification()` 写入的最新 `completion_assessment.status` 必须为 `ready` 或 `ready_with_warnings`，`Planner.assess_completion()` 必须没有 unmet，`Planner.finalize()` 的 final review 必须没有 blocking finding 且 `FinalReport.status=completed`。当这些条件满足时，`Planner.finalize()` 会清理已经被最新 final report 解决的 completion blocker（例如 `required_verifications_passed`、`unresolved_failures_empty`、旧的 sandbox backend unavailable 记录），再由 `_attempt_finalize()` 返回 `AgentLoopStatus.COMPLETED`。未被最新证据解决的 policy、approval、workspace conflict、sandbox/backend unavailable 当前失败仍保持 fail-closed，不会被 reducer 或 finalizer 改写成 completed。
+
 ## 谁生成这些对象
 
 - `AgentLoop.run()` 内部的 `run_turn()` 在 completion gate 通过时调用 `_attempt_finalize()` 构造 `status=completed` 的 `AgentLoopResult`；`on_max_turns()` 构造 `status=max_turns_exceeded` 的结果。
@@ -81,6 +83,7 @@ class AgentLoopStatus(str, Enum):
 
 - `AgentKernel.run_task()` 接收 `AgentLoopResult`，更新 `AgentRun`/`AgentSession` 生命周期并返回 CLI；`EvaluationRunner.run_task()` 读取其 `status`、`turn`、`final_answer` 和 `error_code` 生成 `EvaluationTaskResult`。
 - `AgentLoopResult` 不进入模型请求。模型只在结果生成前接收 `ModelRunner.build_request_from_context()` 构造的 request；结果生成后执行已经终止。
+- `RunOutcomeReducer` 只把 `ExecutionOutcomeStatus.SUCCESS` 且 `next_action="finalize"` 的 outcome 归约为 terminal completed；`sandbox_unavailable`、policy denied、protected path、cwd denied 等 runtime error code 仍归约为 blocked。
 - CLI 将 `final_answer` 输出给用户，并依据最终状态/内核错误确定退出；targeted replay 读取同一结果生成 `TargetedFailureReplayResult`。
 
 ## 是否落盘

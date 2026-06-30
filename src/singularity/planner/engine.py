@@ -1434,6 +1434,7 @@ class Planner:
         if report.status == TaskStatus.COMPLETED:
             self._state().status = TaskStatus.COMPLETED
             self._state().completion_criteria.final_report_ready = True
+            self._clear_resolved_completion_blockers(report)
         else:
             self._state().status = report.status
         self._state().touch()
@@ -1461,6 +1462,35 @@ class Planner:
                 },
             )
         return report
+
+    def _clear_resolved_completion_blockers(self, report: FinalReport) -> None:
+        state = self._state()
+        if report.verification_summary.get("status") not in {"ready", "ready_with_warnings"}:
+            return
+        if report.review_summary.get("blocking_finding_count", 0):
+            return
+        state.blocked_reasons = [
+            reason
+            for reason in state.blocked_reasons
+            if not self._completion_blocker_resolved_by_final_report(reason)
+        ]
+
+    @staticmethod
+    def _completion_blocker_resolved_by_final_report(reason: str) -> bool:
+        normalized = str(reason).strip().lower()
+        if normalized in {
+            "required_files_inspected",
+            "required_changes_applied",
+            "required_verifications_passed",
+            "unresolved_failures_empty",
+            "workspace_health_acceptable",
+            "risks_acknowledged",
+            "completion_criteria_unmet",
+            "missing_required_evidence",
+            "verification_contract_satisfaction",
+        }:
+            return True
+        return "sandbox backend unavailable" in normalized
 
     def extract_lessons(self, final_report: Any | None = None, *, accept: bool = False) -> list[Any]:
         return self.lesson_extractor.extract(

@@ -263,6 +263,19 @@ def test_cancel_command_triggers_token_and_cancelled_report(tmp_path: Path) -> N
             },
             OutcomeStatus.UNVERIFIED,
         ),
+        (
+            {
+                "kernel_report": {
+                    "planner_summary": {
+                        "status": "completed",
+                        "files_changed": ["a.py"],
+                        "verification_summary": {"status": "ready"},
+                    }
+                },
+                "blocked_reasons": ["required_verifications_passed"],
+            },
+            OutcomeStatus.SUCCESS,
+        ),
     ],
 )
 def test_final_report_outcome_mapping(kwargs: dict, expected: OutcomeStatus) -> None:

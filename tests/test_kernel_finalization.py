@@ -147,6 +147,14 @@ def test_agent_kernel_shutdown_writes_final_report_during_shutdown_step(tmp_path
     assert kernel.workspace_lock.released is True
 
 
+def test_agent_kernel_normal_shutdown_does_not_interrupt_planner(tmp_path: Path) -> None:
+    kernel, _trace = _build_kernel(tmp_path)
+
+    kernel.shutdown(ShutdownReason.NORMAL)
+
+    assert not hasattr(kernel.graph.planner, "interrupt_reason")
+
+
 def test_agent_kernel_shutdown_rejects_late_component_actions(tmp_path: Path) -> None:
     kernel, _trace = _build_kernel(tmp_path)
 

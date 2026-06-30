@@ -205,6 +205,8 @@ class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
 
 `Planner.start_task()` 生成 `TaskState` 和 `TaskPlan`，`Planner.step()` 生成 `AgentAction`。工具/命令/验证结果写入 `EvidenceLedger`（25 个 evidence bucket），`ExecutionBudget` 跟踪计数器。`Planner._persist()` 写 `state.json`/`plan.json`/`evidence.json`/`budget.json`。`Finalizer.build()` 生成 `FinalReport`，落盘 `final_report.json`/`.md`。`PlannerContextRenderer` 只投影 goal、phase、allowed tools、rolling plan 与选择性 evidence 进入模型上下文。
 
+`FinalReport.status` 的完成边界来自三层内部证据：最新 `verification_summary.status` 必须是 `ready` 或 `ready_with_warnings`，final review `latest_decision` 必须是 `accept`，active repair `contract_satisfaction.satisfied` 不能为 false。三者满足时 `Planner.finalize()` 把 `TaskState.status` 置为 `completed`、设置 `completion_criteria.final_report_ready=True`，并清理已由本次 final report 解决的历史 completion blocker。`contract_satisfaction` 随 report 落盘和进入 kernel planner summary；它不进入主模型请求，也不由 evaluation 后验 verification 改写。
+
 ## 谁生成这些对象
 
 - `Planner.start_task()` 生成 `TaskState` 与默认 `CompletionCriteria`，并通过 `_default_plan()` 生成 `TaskPhase` 列表和 `TaskPlan`。`Planner.step()` 根据当前 phase 生成 `AgentAction`。
@@ -214,7 +216,7 @@ class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
 ## 谁消费这些对象
 
 - `Planner.step()`、`AgentLoop.run()` 内部 `run_turn()`、`RunController.apply_protocol_result()` / `apply_outcome()` 和 `Finalizer.build()` 消费 `TaskState`/`TaskPlan`/`CompletionCriteria`；`ToolExecutor.execute_request()` 消费当前 `TaskPhase` 与 `AgentAction`。主模型只接收 `PlannerContextRenderer.render()` 投影的 goal、phase、allowed tools、rolling plan 与选择性 evidence，不接收完整 state/plan。
-- `Planner.assess_completion()` 消费 `EvidenceLedger`，`BudgetController.check_budget()` 和 `Planner.step()` 消费 `ExecutionBudget`；ledger/budget 全量对象不进模型。`AuthorizationDecision` 由 `ToolExecutor.authorize()` 消费，deny reason 可经 tool observation 进入后续模型。
+- `Planner.assess_completion()` 消费 `EvidenceLedger`，`BudgetController.check_budget()` 和 `Planner.step()` 消费 `ExecutionBudget`；ledger/budget 全量对象不进模型。`AuthorizationDecision` 由 `ToolExecutor.authorize()` 消费，deny reason 可经 tool observation 进入后续模型。`InteractionController.build_final_report()` 可从 kernel final report 的 `planner_summary` 读取 planner report 投影，用于把 completed + ready verification 映射为 interaction `success`。
 - `Planner.replan()` 消费 `Replanner.decide()` 生成的 `ReplanDecision`/`RiskEscalation` 并更新 state；replan signal 会进入 planner-decision producer 的独立模型请求。`AgentKernel.run_task()`、CLI、evaluation 和 `MemoryLearningPipeline.ingest_final_report()` 消费 `FinalReport`，final report 不再发送给主模型。
 
 ## 是否落盘

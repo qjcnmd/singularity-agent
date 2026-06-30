@@ -212,6 +212,8 @@ class InteractionController:
     ) -> FinalReport:
         planner_payload = _to_dict(planner_report)
         kernel_payload = _to_dict(kernel_report)
+        if not planner_payload and isinstance(kernel_payload.get("planner_summary"), dict):
+            planner_payload = dict(kernel_payload["planner_summary"])
         workspace_payload = dict(workspace_summary or kernel_payload.get("workspace_summary") or {})
         verification_payload = dict(
             verification_summary

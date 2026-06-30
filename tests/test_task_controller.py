@@ -55,6 +55,22 @@ def test_outcome_reducer_maps_waiting_and_nonterminal_outcomes() -> None:
     assert replan.terminal is False
 
 
+def test_success_finalize_outcome_is_terminal_completed() -> None:
+    event = RunOutcomeReducer().reduce_outcome(
+        RunLifecycleStatus.FINAL_REVIEW,
+        ExecutionOutcome(
+            status=ExecutionOutcomeStatus.SUCCESS,
+            source="completion",
+            reason="completion_ready",
+            next_action="finalize",
+            retry_allowed=False,
+        ),
+    )
+
+    assert event.to_status == RunLifecycleStatus.COMPLETED
+    assert event.terminal is True
+
+
 def test_protocol_next_action_maps_to_task_event() -> None:
     event = RunOutcomeReducer().reduce_protocol_result(
         RunLifecycleStatus.RUNNING,
