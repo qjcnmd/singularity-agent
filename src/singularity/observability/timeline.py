@@ -45,8 +45,16 @@ class TraceTimelineBuilder:
             )
         # Sort by timestamp first, then by monotonic_ms for stable ordering
         # when events share the same wall-clock timestamp.
-        monotonic_by_id = {e.event_id: e.monotonic_ms for e in all_events}
-        return sorted(items, key=lambda item: (item.timestamp, monotonic_by_id.get(item.event_id, 0), item.event_id))
+        monotonic_by_id = {event.event_id: event.monotonic_ms for event in all_events}
+        order_by_id = {event.event_id: index for index, event in enumerate(all_events)}
+        return sorted(
+            items,
+            key=lambda item: (
+                item.timestamp,
+                monotonic_by_id.get(item.event_id, 0),
+                order_by_id.get(item.event_id, 0),
+            ),
+        )
 
 
 def _related_ids(event: TraceEvent) -> list[str]:

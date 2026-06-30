@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from singularity.observability.models import TraceEventType, TraceSeverity
+from datetime import UTC, datetime
+
+from singularity.observability.models import TraceEvent, TraceEventType, TraceSeverity
 from singularity.observability.recorder import TraceRecorder
 
 
@@ -64,6 +66,37 @@ def test_timeline_and_summary_correlate_interaction_events(tmp_path) -> None:
     assert summary.policy_denial_count == 1
     assert summary.approval_count == 1
     assert summary.replan_count == 1
+
+
+def test_timeline_preserves_write_order_for_same_clock_tick(tmp_path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    for event_id, event_type in [
+        ("event_z", TraceEventType.ACTION_STARTED),
+        ("event_a", TraceEventType.POLICY_BLOCKED),
+        ("event_m", TraceEventType.PLANNER_REPLAN_TRIGGERED),
+    ]:
+        trace.store.append_event(
+            TraceEvent(
+                event_id=event_id,
+                event_type=event_type,
+                run_id="run_1",
+                session_id="session_1",
+                task_id="task_1",
+                phase_id=None,
+                action_id=None,
+                parent_event_id=None,
+                timestamp=timestamp,
+                monotonic_ms=0,
+                component="test",
+                severity=TraceSeverity.INFO,
+                summary=event_type.value,
+            )
+        )
+
+    timeline = trace.timeline(task_id="task_1")
+
+    assert [item.event_id for item in timeline] == ["event_z", "event_a", "event_m"]
 
 
 def test_final_report_and_context_summary_are_redacted(tmp_path) -> None:

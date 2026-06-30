@@ -186,7 +186,11 @@ def test_workspace_write_low_risk_verification_runs_through_windows_sandbox(
             )
 
     runner = FakeRunner()
-    backend = sandbox.WindowsSandboxBackend(
+    class FakeWindowsSandboxBackend(sandbox.WindowsSandboxBackend):
+        def cleanup(self, prepared):
+            return None
+
+    backend = FakeWindowsSandboxBackend(
         runner=runner,
         acl_applier=lambda _path, _account: None,
         doctor_provider=sandbox.WindowsSandboxDoctorReport.ready_for_tests,
