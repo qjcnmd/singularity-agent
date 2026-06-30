@@ -24,6 +24,14 @@
 
 ## 模块数据流文档
 
+仓库级主调用结构图位于：
+
+```text
+docs/singularity.md
+```
+
+该文件记录当前 CLI -> KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop -> ToolProtocolEngine -> ToolExecutor -> FinalReport 的主链路和全部分支路径。任何改变主链路、状态映射、错误码路由、工具协议执行、最终化、失败分析、shutdown/finalize 或 trace/report 生成路径的变更，都必须同步更新本文件对应段落；只更新受影响段落，不重写整份结构图。结构图内容必须来自当前源码或明确指定的提交快照，不允许保留过期行号、历史评审标签、旧命名或未实现设计。
+
 核心模块文档位于：
 
 ```text
@@ -47,7 +55,7 @@ docs/architecture/modules/
 - 当前结构问题
 - 维护规则
 
-代码结构、模块边界、类、字段、函数、调用链、CLI、schema、manifest、trace event、report schema、evaluation result 变化时，必须同步更新对应模块文档。模块文档必须用中文客观描述；英文术语可以保留，但首次出现要给中文说明。
+代码结构、模块边界、类、字段、函数、调用链、CLI、schema、manifest、trace event、report schema、evaluation result 变化时，必须同步更新对应模块文档；如果变化影响主链路或分支路径，也必须同步更新 `docs/singularity.md` 的对应部分。模块文档必须用中文客观描述；英文术语可以保留，但首次出现要给中文说明。
 
 完成运行时敏感变更前运行：
 
@@ -55,7 +63,7 @@ docs/architecture/modules/
 python scripts/verify_runtime_docs.py
 ```
 
-最终回复需要说明修改了哪些源码文件、更新了哪些 `docs/architecture/modules/*.md` 文件；如果没有更新模块数据流文档，必须说明该变更为什么不影响已记录的数据流。
+最终回复需要说明修改了哪些源码文件、更新了哪些 `docs/architecture/modules/*.md` 文件，以及是否更新了 `docs/singularity.md`；如果没有更新这些运行时文档，必须说明该变更为什么不影响已记录的数据流或主调用结构图。
 
 ## 真实模型验证
 
