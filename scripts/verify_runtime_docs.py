@@ -9,6 +9,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCS_DIR = REPO_ROOT / "docs" / "architecture" / "modules"
 
+
+def _ensure_utf8_stdio() -> None:
+    """Keep Chinese verifier output printable on Windows CI consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 CORE_DOC_IDS = {
     "agent-loop",
     "kernel-agent-graph",
@@ -797,4 +806,5 @@ def _cjk_count(text: str) -> int:
 
 
 if __name__ == "__main__":
+    _ensure_utf8_stdio()
     raise SystemExit(main())

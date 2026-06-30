@@ -71,6 +71,28 @@ def test_forbidden_keyword_list_avoids_literal_old_terms() -> None:
     assert "Runtime" + " Flow" in forbidden
 
 
+def test_ensure_utf8_stdio_reconfigures_output_streams(monkeypatch) -> None:
+    module = _load_verify_module()
+
+    class RecordingStream:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def reconfigure(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    stdout = RecordingStream()
+    stderr = RecordingStream()
+    monkeypatch.setattr(module.sys, "stdout", stdout)
+    monkeypatch.setattr(module.sys, "stderr", stderr)
+
+    module._ensure_utf8_stdio()
+
+    expected = [{"encoding": "utf-8", "errors": "replace"}]
+    assert stdout.calls == expected
+    assert stderr.calls == expected
+
+
 def test_verify_doc_rejects_generic_data_flow_template(tmp_path: Path) -> None:
     module = _load_verify_module()
     path = tmp_path / "module.md"

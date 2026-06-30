@@ -36,6 +36,14 @@ class _FcntlModule(Protocol):
         ...
 
 
+class _MsvcrtModule(Protocol):
+    LK_LOCK: int
+    LK_UNLCK: int
+
+    def locking(self, file_descriptor: int, mode: int, nbytes: int) -> None:
+        ...
+
+
 class ApprovalGate:
     def __init__(
         self,
@@ -390,24 +398,42 @@ def _file_lock(path: Path):
 
 def _lock_file(handle: Any) -> None:
     if os.name == "nt":
-        import msvcrt
-
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        _lock_file_windows(handle)
         return
+    _lock_file_posix(handle)
+
+
+def _unlock_file(handle: Any) -> None:
+    if os.name == "nt":
+        _unlock_file_windows(handle)
+        return
+    _unlock_file_posix(handle)
+
+
+def _lock_file_windows(handle: Any) -> None:
+    import msvcrt
+
+    windows_lock = cast(_MsvcrtModule, msvcrt)
+    handle.seek(0)
+    windows_lock.locking(handle.fileno(), windows_lock.LK_LOCK, 1)
+
+
+def _unlock_file_windows(handle: Any) -> None:
+    import msvcrt
+
+    windows_lock = cast(_MsvcrtModule, msvcrt)
+    handle.seek(0)
+    windows_lock.locking(handle.fileno(), windows_lock.LK_UNLCK, 1)
+
+
+def _lock_file_posix(handle: Any) -> None:
     import fcntl
 
     posix_lock = cast(_FcntlModule, fcntl)
     posix_lock.flock(handle.fileno(), posix_lock.LOCK_EX)
 
 
-def _unlock_file(handle: Any) -> None:
-    if os.name == "nt":
-        import msvcrt
-
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        return
+def _unlock_file_posix(handle: Any) -> None:
     import fcntl
 
     posix_lock = cast(_FcntlModule, fcntl)
