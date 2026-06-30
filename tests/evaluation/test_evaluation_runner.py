@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -304,8 +304,9 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         error_summary="infrastructure blocked",
         workspace=str(tmp_path),
         trace=str(tmp_path / "trace3"),
-        status="infrastructure_blocked",
+        status="environment_blocker",
         turn_count=0,
+        failure_category="environment_blocker",
     )
 
     summary = summarize_evaluation_results([first, second, blocked])
@@ -333,7 +334,7 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         "repair_execution_count": 0,
         "policy_blocks": 0,
         "miscompletion_count": 1,
-        "failure_reasons": {"verification_failed": 1},
+        "failure_reasons": {"environment_blocker": 1, "verification_failed": 1},
     }
 
 
@@ -1219,13 +1220,224 @@ def test_evaluation_marks_model_transport_blocker_without_running_verification(t
 
     assert result["summary"]["infrastructure_blocked_count"] == 1
     assert result["summary"]["scored_task_count"] == 0
-    assert result["summary"]["score_status"] == "infrastructure_blocked"
+    assert result["summary"]["score_status"] == "environment_blocker"
+    assert result["summary"]["failure_reasons"] == {"environment_blocker": 1}
     assert result["summary"]["task_completion_rate"] == 0.0
     assert result["summary"]["test_pass_rate"] == 0.0
     task = result["tasks"][0]
     assert task["infrastructure_blocked"] is True
+    assert task["status"] == "environment_blocker"
+    assert task["failure_category"] == "environment_blocker"
     assert task["verification"] is None
-    assert "infrastructure blocked" in task["error_summary"]
+    assert "environment blocker" in task["error_summary"]
+
+
+def test_evaluation_classifies_observed_sandbox_unavailability_as_environment_blocker(
+    tmp_path: Path,
+) -> None:
+    py = json.dumps(sys.executable)
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.sandbox_environment_blocker",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Write done.txt with ok and verify it.",
+                    "allowed_paths": ["done.txt"],
+                    "expected_file_changes": ["done.txt"],
+                    "verification_command": f'{py} -c "raise SystemExit(99)"',
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeEvidence:
+        sandbox_observations: ClassVar[list[dict[str, Any]]] = [
+            {
+                "source": "verification",
+                "backend": "windows",
+                "status": "backend_unavailable",
+                "enforcement_status": "backend_unavailable",
+                "sandbox_id": "sandbox_1",
+            }
+        ]
+
+    class FakePlannerState:
+        blocked_reasons: ClassVar[list[str]] = [
+            "sandbox backend unavailable: run elevated sandbox setup before verification can proceed"
+        ]
+
+    class FakePlanner:
+        evidence = FakeEvidence()
+        state = FakePlannerState()
+
+    class FakeGraph:
+        trace = FakeTrace()
+        planner = FakePlanner()
+
+    class FakeResult:
+        status = RunStatus.BLOCKED
+        final_answer = "sandbox backend unavailable"
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="blocked",
+            diagnostics_count=1,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            planner_summary={
+                "failure_repair_summary": {
+                    "latest_failure_category": "sandbox_limitation",
+                    "latest_blocked_reason": (
+                        "sandbox backend unavailable: run elevated sandbox setup before verification"
+                    ),
+                }
+            },
+            trace_summary={
+                "tool_calls": 2,
+                "key_artifacts": ["artifact_sandbox"],
+                "model_usage_summary": {"input_tokens": 10, "requests": 2},
+            },
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok\n", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="sandbox_environment_blocker",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["status"] == "environment_blocker"
+    assert task["failure_category"] == "environment_blocker"
+    assert task["infrastructure_blocked"] is True
+    assert task["verification"] is None
+    assert task["checks"]["public"]["status"] == "not_run"
+    assert task["checks"]["hidden"]["status"] == "not_run"
+    assert task["tests_passed"] is False
+    assert task["files_changed"] == ["done.txt"]
+    assert task["patch"]["changed_files"] == ["done.txt"]
+    assert task["tool_calls"] == 2
+    assert task["turn_count"] == 2
+    assert task["trace"] == str(tmp_path / "trace")
+    assert task["trace_artifact_refs"] == ["artifact_sandbox"]
+    assert "sandbox backend unavailable" in task["blocked_reason"]
+    assert result["summary"]["scored_task_count"] == 0
+    assert result["summary"]["score_status"] == "environment_blocker"
+    assert result["summary"]["failure_reasons"] == {"environment_blocker": 1}
+
+
+def test_evaluation_does_not_treat_plain_agent_block_as_environment_blocker(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.agent_blocked",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Stop without changing files.",
+                    "allowed_paths": ["README.md"],
+                    "verification_command": f'{py} -c "print(\'ok\')"',
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeEvidence:
+        sandbox_observations: ClassVar[list[dict[str, Any]]] = []
+
+    class FakePlanner:
+        evidence = FakeEvidence()
+
+    class FakeGraph:
+        trace = FakeTrace()
+        planner = FakePlanner()
+
+    class FakeResult:
+        status = RunStatus.BLOCKED
+        final_answer = "agent requires clarification"
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="blocked",
+            diagnostics_count=1,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"input_tokens": 10}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def run_task(self, _goal: str) -> FakeResult:
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            _ = kwargs
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel()
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="agent_blocked",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["status"] == "blocked"
+    assert task["failure_category"] == "blocked"
+    assert task["infrastructure_blocked"] is False
+    assert task["verification"]["passed"] is True
 
 
 def test_evaluation_completion_gate_counts_false_completed_report(tmp_path: Path) -> None:

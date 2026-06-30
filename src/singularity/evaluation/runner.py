@@ -582,8 +582,13 @@ class EvaluationRunner:
             policy_blocks = _policy_blocks(final_report_payload, trace_summary)
             trace_artifact_refs = _trace_artifact_refs(final_report_payload, trace_summary)
             agent_status = _agent_status(agent_result)
+            environment_blocker_reason = ""
             if _infrastructure_blocked(agent_result, usage=usage, tool_calls=tool_calls):
-                errors.append("infrastructure blocked: model provider unavailable")
+                environment_blocker_reason = "model provider unavailable"
+            elif _sandbox_environment_blocked(kernel, agent_status=agent_status):
+                environment_blocker_reason = _sandbox_environment_blocker_reason(kernel)
+            if environment_blocker_reason:
+                errors.append(f"environment blocker: {environment_blocker_reason}")
                 files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
                 patch_payload = _patch_payload(before_text_snapshot, workspace)
                 contract_satisfaction = _contract_satisfaction(
@@ -975,10 +980,11 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
     cached_tokens = sum(result.cached_tokens for result in results)
     failures: dict[str, int] = {}
     miscompletion_count = 0
-    for result in scored_results:
+    for result in results:
         if not result.evaluation_passed:
             reason = result.failure_category if result.failure_category and result.failure_category != "none" else result.status
             failures[reason or "failure"] = failures.get(reason or "failure", 0) + 1
+    for result in scored_results:
         miscompletion_count += result.miscompletion_count or int(
             result.agent_completed and not result.evaluation_passed
         )
@@ -1176,7 +1182,7 @@ def _score_status(*, task_count: int, scored_task_count: int, infrastructure_blo
     if scored_task_count > 0:
         return "scored"
     if task_count > 0 and infrastructure_blocked_count == task_count:
-        return "infrastructure_blocked"
+        return "environment_blocker"
     return "empty"
 
 
@@ -1389,6 +1395,39 @@ def _infrastructure_blocked(agent_result: Any, *, usage: dict[str, Any], tool_ca
     return any(marker in answer for marker in ("winerror 10013", "network", "socket", "访问权限不允许"))
 
 
+def _sandbox_environment_blocked(kernel: Any, *, agent_status: str) -> bool:
+    if agent_status not in {"blocked", "failed"}:
+        return False
+    planner = getattr(getattr(kernel, "graph", None), "planner", None)
+    evidence = getattr(planner, "evidence", None)
+    observations = getattr(evidence, "sandbox_observations", None) or []
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        if observation.get("source") not in {"command", "verification"}:
+            continue
+        if not observation.get("sandbox_id"):
+            continue
+        if (
+            observation.get("status") == "backend_unavailable"
+            or observation.get("enforcement_status") == "backend_unavailable"
+        ):
+            return True
+    return False
+
+
+def _sandbox_environment_blocker_reason(kernel: Any) -> str:
+    planner = getattr(getattr(kernel, "graph", None), "planner", None)
+    state = getattr(planner, "state", None)
+    for reason in getattr(state, "blocked_reasons", None) or []:
+        normalized = str(reason).strip().lower()
+        if "sandbox" in normalized and (
+            "backend unavailable" in normalized or "backend_unavailable" in normalized
+        ):
+            return str(reason)
+    return "sandbox backend unavailable: required OS isolation could not be enforced"
+
+
 def _permission_profile_for_task(task: EvaluationTask) -> PermissionProfileName:
     value = str(task.strategy.get("permission_profile") or "").strip().lower()
     if not value:
@@ -1524,11 +1563,11 @@ def _failure_category(
 ) -> str:
     if status == "success":
         return "none"
+    if infrastructure_blocked:
+        return "environment_blocker"
     failure_repair = _failure_repair_summary(payload)
     if failure_repair.get("latest_failure_category"):
         return str(failure_repair["latest_failure_category"])
-    if infrastructure_blocked:
-        return "infrastructure_blocked"
     if policy_blocks:
         return "policy_blocked"
     if verification is not None and verification.failure_category and verification.failure_category != "none":
@@ -1612,7 +1651,7 @@ def _result_status(
     errors: list[str],
 ) -> str:
     if infrastructure_blocked:
-        return "infrastructure_blocked"
+        return "environment_blocker"
     if success:
         return "success"
     if policy_blocks and agent_status in {"blocked", "failed"}:

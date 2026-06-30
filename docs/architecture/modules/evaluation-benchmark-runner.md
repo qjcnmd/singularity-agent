@@ -61,7 +61,7 @@ benchmark scoring path: `python -m singularity.cli eval benchmark <task-set>` ->
 
 同一类任务进入 benchmark scoring path 时，`BenchmarkTaskExecutor.evaluate()` 先按 `WorkspaceSnapshot` 准备工作区，再运行 before/after/score-adjustment hooks、verification command、assertions 和 diff 检查。它把 verification、assertions、diff、heuristics、trace metrics、diff summary、hook results、snapshot、agent config overrides、golden contract 和 failure reasons 聚合成 `TaskExecutionEvidence`。`evaluate_golden_contract()` 对 `file_created`、`verification_passed`、`final_report_written`、`repair_applied`、`approval_required`、`sandbox_fail_closed` 等 expected evidence 从 verification、diff summary、hook results 和 trace metrics 中观察；未知或未接入的 evidence 仍为 `observed=false`，不伪造成成功。`_diff_summary()` 用真实前后文本 snapshot 计算 added/removed lines、简单复杂度和重复新增行标记，不再固定写 `complexity=0` 或 `redundant_code=false`。
 
-capability regression task 以 `workspace-write`、`approval_policy=never`、`network_access=denied` 进入真实 `KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop.run` 路径。AgentLoop 内的低风险验证命令由 policy 判为 `sandbox_required` 后必须进入 `CommandExecutor -> SandboxManager -> WindowsSandboxBackend`；Windows setup 或 execution backend 缺失时，task 应记录 sandbox/permission blocker，而不是把普通本地进程当作 verification 通过。
+capability regression task 以 `workspace-write`、`approval_policy=never`、`network_access=denied` 进入真实 `KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop.run` 路径。AgentLoop 内的低风险验证命令由 policy 判为 `sandbox_required` 后必须进入 `CommandExecutor -> SandboxManager -> WindowsSandboxBackend`；Windows setup 或 execution backend 缺失且 `planner.evidence.sandbox_observations` 已记录真实 `command`/`verification` 尝试及 `backend_unavailable` 时，runner 在 post-agent verification 前归约为 `environment_blocker`，保留模型、工具、patch 与 trace 证据，但不把普通本地进程或 post-agent verification 当作 AgentLoop 成功。
 
 ## 真实对象完整结构
 
@@ -183,7 +183,7 @@ class TaskExecutionEvidence:
 
 ```python
 # EvaluationTaskResult.status 由 _task_result() 归一为以下值:
-INFRASTRUCTURE_BLOCKED = "infrastructure_blocked"
+ENVIRONMENT_BLOCKER = "environment_blocker"
 SUCCESS = "success"
 POLICY_BLOCKED = "policy_blocked"
 VERIFICATION_FAILED = "verification_failed"
@@ -245,9 +245,9 @@ benchmark scoring path 中，`BenchmarkTaskExecutor.evaluate()` 生成 `TaskExec
 
 - workspace/task/task-set 输入错误在运行前抛 `ValueError`；缺 workspace 源抛 `FileNotFoundError`，git clone/checkout 失败抛 `RuntimeError`。task 执行阶段异常由 `EvaluationRunner.run_task()` 捕获、脱敏后写 `error_summary`。
 - `CommandEvalResult.failure_category` 明确区分 `command_parse_error`、`command_timeout`、`command_not_found`、`command_execution_error`、`environment_dependency_missing`、`verification_failed` 和 `command_failed`。
-- `EvaluationTaskResult.status` 由 `_task_result()` 归一为 `infrastructure_blocked`、`success`、`policy_blocked`、`verification_failed`、`blocked`、`failed`、`max_turns_exceeded`、`failure` 或 `unknown`；最终通过字段是 `evaluation_passed`，不是 manifest 的 `success`。
+- `EvaluationTaskResult.status` 由 `_task_result()` 归一为 `environment_blocker`、`success`、`policy_blocked`、`verification_failed`、`blocked`、`failed`、`max_turns_exceeded`、`failure` 或 `unknown`；`infrastructure_blocked` 布尔字段仍表示该 task 不进入评分分母。最终通过字段是 `evaluation_passed`，不是 manifest 的 `success`。
 - `TaskExecutionEvidence.failure_reasons` 聚合 snapshot、diff 和 hook error code；golden contract 中未观察到的 evidence 只标记 `observed=false`，由 scoring/report 消费，不会绕过 verification。
-- `public`/`hidden` post-agent verification 是 evaluation 层评分证据，写入 `EvaluationTaskResult.checks`、`verification_result`、`contract_satisfaction` 和 `<evaluation_run>/result.json`。它不回灌到 AgentLoop 的 `EvidenceLedger.verification_results`，也不参与 `Planner.assess_completion()`、`Planner.finalize()` 或 `AgentLoopResult.status` 的完成判定。
+- `public`/`hidden` post-agent verification 是 evaluation 层评分证据，写入 `EvaluationTaskResult.checks`、`verification_result`、`contract_satisfaction` 和 `<evaluation_run>/result.json`。它不回灌到 AgentLoop 的 `EvidenceLedger.verification_results`，也不参与 `Planner.assess_completion()`、`Planner.finalize()` 或 `AgentLoopResult.status` 的完成判定。真实 AgentLoop 已因结构化 sandbox `backend_unavailable` 证据 blocked 时，runner 不执行这组命令，两个 check 均写为 `not_run`，避免形成与环境 blocker 冲突的通过证据。
 - 真实 AgentLoop 中 verification 被 sandbox backend unavailable 阻塞时，失败摘要应保留 policy/sandbox 分类和 trace/final report artifact；不能用 fake provider、scripted provider 或 `danger-full-access` 替代默认 `workspace-write` 验证。
 - targeted replay 的 `status` 原样取 `AgentLoopResult.status.value`，`agent_completed=False` 使 CLI 退出 1；该 runner 没有总异常捕获，文件或运行异常直接传播。
 
