@@ -88,6 +88,9 @@ python scripts/test_impact.py --git --strict-index
 | `recommended_tests` | 推荐的测试文件列表 |
 | `recommended_commands` | 推荐的 pytest 命令 |
 | `confidence` | `high`/`medium`/`low` |
+| `fallback_gate` | 低置信度或无明确测试时要求升级的 gate，当前为 `stage` |
+| `skipped_reason` | 未选择受影响 pytest 时的明确原因 |
+| `capability_gate` | 是否因 AgentLoop/ToolProtocol/sandbox/context/compaction/verification/CompletionGate/FinalReport/evaluation runner 变更建议 capability gate |
 
 ### 按模块测试
 
@@ -105,12 +108,43 @@ python -m pytest tests/test_policy*.py tests/test_approval_gate.py tests/test_se
 python -m pytest tests/test_verification_runner.py tests/test_repair_contract_verification.py -v
 ```
 
-## 3. 提交前 Fast Gate
+## 3. 本地验证 Gate
+
+### Fast Gate（Codex 小改默认）
+
+日常小改默认运行：
 
 ```bash
-# 默认测试（排除 evaluation、provider_eval、slow、external）
-# 相当于: python -m pytest -m "not evaluation and not provider_eval and not slow and not external"
-python -m pytest
+python scripts/verify_fast.py --git
+```
+
+Fast gate 只跑 ruff、当前 mypy、changed-scope compileall，以及 `scripts/test_impact.py` 推荐的受影响 pytest。它不跑全量 pytest，不跑真实 provider eval。若 test impact 为 `low` 或没有明确测试，脚本输出 `fallback_required=stage` 与 `skipped_reason` 并返回非零码，要求升级 stage gate，不能把空推荐当作通过。
+
+### Stage Gate（阶段收口）
+
+阶段收口运行：
+
+```bash
+python scripts/verify_stage.py
+```
+
+Stage gate 执行 deterministic 检查：mypy、ruff、`compileall src scripts`、`scripts/verify_runtime_docs.py`、过滤后的 pytest，以及 evaluation runner / test impact / quality gate 专项测试。它不默认跑多个真实 provider eval。
+
+### Capability Gate（核心链路变更）
+
+只有影响 AgentLoop、ToolProtocol、sandbox、context、compaction、verification、CompletionGate、FinalReport 或 evaluation runner 时运行：
+
+```bash
+python scripts/verify_capability.py --force --run-id phase8-public-long-task-gate
+```
+
+该 gate 只运行 `docs/evaluation/public-representative-task.json` 这一项公共 SWE-bench Lite dev 任务，并要求 result 中有 `capability_summary`，包含 model/tool/retrieval/context/compaction/sandbox/verification/finalization 对象流和耗时摘要。没有触发 compaction 时必须写明 skipped reason，例如 context usage 未到阈值、retrieval 内容不足或任务过早完成。
+
+仍可按需运行以下传统 pytest 命令，但它们不再是 Codex 小改默认 fast gate：
+
+```bash
+# 默认 pytest（排除 evaluation、provider_eval、slow、external）
+python -m pytest -m "not evaluation and not provider_eval and not slow and not external"
 
 # 真正快速 unit（仅纯函数/类测试，排除 slow/external 中的集成测试）
 python -m pytest -m "unit and not slow and not external"
@@ -285,7 +319,7 @@ python scripts/test_impact.py --git --strict-index
 |------|------|------|
 | `high` | code index 可用且有命中 | 推荐结果基于精确的代码依赖分析 |
 | `medium` | code index 不可用但 fallback 有命中 | 推荐结果基于路径命名约定 |
-| `low` | 无命中 | 无法确定相关测试，建议运行默认套件 |
+| `low` | 无命中 | 无法确定相关测试，fast gate 必须回退 stage gate |
 
 ### 特殊路径映射
 
@@ -293,7 +327,13 @@ python scripts/test_impact.py --git --strict-index
 
 | 变更文件 | 推荐测试 | 说明 |
 |----------|----------|------|
+| `src/singularity/agent_loop.py` | `tests/test_agent.py`, `tests/test_agent_task_outcome.py` | AgentLoop 主链路 |
+| `src/singularity/tool_protocol/engine.py` | `tests/test_tool_protocol_engine.py` | ToolProtocol engine |
+| `src/singularity/evaluation/runner.py` | `tests/evaluation/test_evaluation_runner.py` | evaluation runner |
+| `src/singularity/kernel/finalization.py` | `tests/test_kernel_finalization.py` | FinalReport / kernel finalization |
+| `src/singularity/tools/verification.py` | `tests/test_verification_runner.py` | verification tool |
 | `scripts/test_impact.py` | `tests/test_test_impact.py` | 脚本自身测试 |
+| `scripts/verify_fast.py` / `scripts/verify_stage.py` / `scripts/verify_capability.py` | `tests/test_quality_gates.py` | 本地 gate 合同 |
 | `tests/conftest.py` | `tests/test_test_infra.py` | marker/精选列表配置测试 |
 | `docs/testing.md` | `tests/test_docs_consistency.py` | 文档一致性测试 |
 | `pyproject.toml` | `tests/test_test_infra.py` | pytest 配置测试（附加 `--collect-only -m smoke` 提示） |
@@ -309,15 +349,15 @@ python -m pytest tests/test_test_impact.py -v
 
 ## 10. 耗时基线
 
-| 测试层级 | 目标耗时 | 告警阈值 | 维护规则 |
-|----------|----------|----------|----------|
-| smoke | <10s | >15s | 检查是否有测试变慢 |
-| 默认 (~900 tests) | <4min | >5min | 排查慢测试 |
-| release-full (~990 tests) | <6min | >8min | 排查慢测试 |
-| fast-unit (`unit and not slow and not external`) | <2min | >3min | 重分类或优化 |
-| integration | <2min | >3min | 排查慢测试 |
-| security | <30s | >1min | 排查慢测试 |
-| evaluation | <1min | >2min | 排查慢测试 |
+| 验证层级 | 入口 | 目标耗时 | 告警阈值 | 维护规则 |
+|----------|------|----------|----------|----------|
+| fast gate | `python scripts/verify_fast.py --git` | 按变更，通常 <2min | 无法选择测试时回退 stage | ruff/mypy/changed compileall/受影响 pytest，不跑真实 provider |
+| stage gate | `python scripts/verify_stage.py` | <6min | >8min | deterministic 收口，含 runtime docs 和过滤 pytest |
+| capability gate | `python scripts/verify_capability.py --force --run-id <id>` | 依 provider 与 sandbox | 阻塞必须分类清楚 | 只跑公共代表性真实任务 |
+| smoke | `python -m pytest -m smoke` | <10s | >15s | 检查是否有测试变慢 |
+| release-full | `python -m pytest -m "not provider_eval"` | <6min | >8min | 排查慢测试 |
+| fast-unit | `python -m pytest -m "unit and not slow and not external"` | <2min | >3min | 重分类或优化 |
+| evaluation infra | `python -m pytest -m evaluation` | <1min | >2min | 只验证评估基础设施，不代表真实 provider |
 
 ### 检查方法
 

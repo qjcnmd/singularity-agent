@@ -33,6 +33,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Special path mappings for files that are not themselves tests but should
@@ -40,7 +41,16 @@ from pathlib import Path, PurePosixPath
 # general naming-convention heuristics.
 # ---------------------------------------------------------------------------
 _SPECIAL_PATH_MAP: dict[str, list[str]] = {
+    "src/singularity/agent_loop.py": ["tests/test_agent.py", "tests/test_agent_task_outcome.py"],
+    "src/singularity/context/manager.py": ["tests/test_context.py"],
+    "src/singularity/evaluation/runner.py": ["tests/evaluation/test_evaluation_runner.py"],
+    "src/singularity/kernel/finalization.py": ["tests/test_kernel_finalization.py"],
+    "src/singularity/tool_protocol/engine.py": ["tests/test_tool_protocol_engine.py"],
+    "src/singularity/tools/verification.py": ["tests/test_verification_runner.py"],
     "scripts/test_impact.py": ["tests/test_test_impact.py"],
+    "scripts/verify_capability.py": ["tests/test_quality_gates.py"],
+    "scripts/verify_fast.py": ["tests/test_quality_gates.py"],
+    "scripts/verify_stage.py": ["tests/test_quality_gates.py"],
     "tests/conftest.py": ["tests/test_test_infra.py"],
     "docs/testing.md": ["tests/test_docs_consistency.py"],
     ".github/workflows/ci.yml": ["tests/test_quality_gates.py"],
@@ -55,6 +65,25 @@ _SPECIAL_PATH_WARNINGS: dict[str, str] = {
         "'python -m pytest --collect-only -m smoke'"
     ),
 }
+
+_CAPABILITY_TRIGGER_PATHS: tuple[tuple[str, str], ...] = (
+    ("AgentLoop", "src/singularity/agent_loop.py"),
+    ("AgentLoop", "src/singularity/agent_loop/"),
+    ("ToolProtocol", "src/singularity/tool_protocol/"),
+    ("sandbox", "src/singularity/sandbox/"),
+    ("sandbox", "src/singularity/command/"),
+    ("context", "src/singularity/context/"),
+    ("compaction", "src/singularity/context/compaction"),
+    ("verification", "src/singularity/verification/"),
+    ("verification", "src/singularity/tools/verification.py"),
+    ("CompletionGate", "src/singularity/completion/"),
+    ("CompletionGate", "src/singularity/kernel/completion"),
+    ("FinalReport", "src/singularity/kernel/finalization.py"),
+    ("FinalReport", "src/singularity/reporting/"),
+    ("evaluation runner", "src/singularity/evaluation/"),
+    ("evaluation runner", "docs/evaluation/"),
+    ("evaluation runner", "scripts/verify_capability.py"),
+)
 
 
 def _is_pytest_collectable(path: str) -> bool:
@@ -273,6 +302,41 @@ def _compute_confidence(
     return "low"
 
 
+def _capability_triggers(changed_files: list[str]) -> dict[str, Any]:
+    areas: list[str] = []
+    files: list[str] = []
+    for raw_path in changed_files:
+        path = raw_path.replace("\\", "/")
+        matched = False
+        for area, prefix in _CAPABILITY_TRIGGER_PATHS:
+            if path == prefix or path.startswith(prefix):
+                areas.append(area)
+                matched = True
+        if matched:
+            files.append(raw_path)
+    return {
+        "required": bool(files),
+        "areas": sorted(dict.fromkeys(areas)),
+        "files": files,
+        "trigger": "core_agent_chain" if files else "",
+    }
+
+
+def _gate_recommendation(
+    *,
+    confidence: str,
+    recommended_tests: list[str],
+    warnings: list[str],
+) -> dict[str, str | None]:
+    if confidence == "low" or not recommended_tests:
+        detail = "; ".join(warnings[:3])
+        reason = "No impacted pytest target could be selected"
+        if detail:
+            reason = f"{reason}: {detail}"
+        return {"fallback_gate": "stage", "skipped_reason": reason}
+    return {"fallback_gate": None, "skipped_reason": ""}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Recommend tests based on changed files.",
@@ -329,6 +393,9 @@ def main() -> int:
                     "recommended_tests": [],
                     "recommended_commands": [],
                     "confidence": "low",
+                    "fallback_gate": None,
+                    "skipped_reason": "no changed files detected",
+                    "capability_gate": _capability_triggers([]),
                 }, indent=2))
             else:
                 print("No changed files detected.")
@@ -367,6 +434,9 @@ def main() -> int:
                     "recommended_tests": [],
                     "recommended_commands": [],
                     "confidence": "low",
+                    "fallback_gate": "stage",
+                    "skipped_reason": msg,
+                    "capability_gate": _capability_triggers(changed_files),
                 }, indent=2))
             else:
                 print(f"ERROR: {msg}", file=sys.stderr)
@@ -398,6 +468,12 @@ def main() -> int:
             )
 
     confidence = _compute_confidence(source, likely_tests, all_warnings)
+    gate = _gate_recommendation(
+        confidence=confidence,
+        recommended_tests=likely_tests,
+        warnings=all_warnings,
+    )
+    capability_gate = _capability_triggers(changed_files)
 
     # Output
     if args.json_output:
@@ -408,11 +484,20 @@ def main() -> int:
             "recommended_tests": likely_tests,
             "recommended_commands": commands,
             "confidence": confidence,
+            "fallback_gate": gate["fallback_gate"],
+            "skipped_reason": gate["skipped_reason"],
+            "capability_gate": capability_gate,
         }
         print(json.dumps(output, indent=2))
     else:
         print(f"Test mapping source: {source}")
         print(f"Confidence: {confidence}")
+        if gate["fallback_gate"]:
+            print(f"Fallback gate required: {gate['fallback_gate']}")
+            print(f"Skipped reason: {gate['skipped_reason']}")
+        if capability_gate["required"]:
+            print("Capability gate recommended:")
+            print(f"  areas: {', '.join(capability_gate['areas'])}")
         if all_warnings:
             print(f"\nWarnings ({len(all_warnings)}):")
             for w in all_warnings:

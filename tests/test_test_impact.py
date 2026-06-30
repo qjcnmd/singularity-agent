@@ -16,8 +16,10 @@ import pytest
 # Import the module under test
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.test_impact import (
+    _capability_triggers,
     _compute_confidence,
     _fallback_tests,
+    _gate_recommendation,
     _is_pytest_collectable,
     _validate_recommendations,
 )
@@ -227,6 +229,46 @@ class TestComputeConfidence:
         assert _compute_confidence("path_heuristics", [], []) == "low"
 
 
+class TestGateRecommendation:
+    """Fast/stage/capability gate metadata for Codex local validation."""
+
+    def test_unmapped_change_requires_stage_fallback_with_reason(self) -> None:
+        decision = _gate_recommendation(
+            confidence="low",
+            recommended_tests=[],
+            warnings=["No test mapping for non-Python file: README.md"],
+        )
+
+        assert decision["fallback_gate"] == "stage"
+        assert decision["skipped_reason"]
+        assert "No impacted pytest target" in decision["skipped_reason"]
+
+    def test_mapped_change_stays_on_fast_gate(self) -> None:
+        decision = _gate_recommendation(
+            confidence="medium",
+            recommended_tests=["tests/test_cli.py"],
+            warnings=[],
+        )
+
+        assert decision["fallback_gate"] is None
+        assert decision["skipped_reason"] == ""
+
+    def test_core_agent_change_triggers_capability_gate(self) -> None:
+        triggers = _capability_triggers([
+            "src/singularity/agent_loop.py",
+            "src/singularity/tool_protocol/engine.py",
+            "src/singularity/context/manager.py",
+        ])
+
+        assert triggers["required"] is True
+        assert set(triggers["areas"]) >= {"AgentLoop", "ToolProtocol", "context"}
+        assert triggers["files"] == [
+            "src/singularity/agent_loop.py",
+            "src/singularity/tool_protocol/engine.py",
+            "src/singularity/context/manager.py",
+        ]
+
+
 # ---------------------------------------------------------------------------
 # JSON output
 # ---------------------------------------------------------------------------
@@ -257,6 +299,9 @@ class TestJsonOutput:
             "recommended_tests",
             "recommended_commands",
             "confidence",
+            "skipped_reason",
+            "fallback_gate",
+            "capability_gate",
         }
         assert required_fields.issubset(set(data.keys())), (
             f"Missing fields: {required_fields - set(data.keys())}"
@@ -294,8 +339,27 @@ class TestJsonOutput:
         data = json.loads(result.stdout)
         assert data["recommended_tests"] == []
         assert data["confidence"] == "low"
+        assert data["fallback_gate"] == "stage"
+        assert data["skipped_reason"]
         # Should have a warning about unmapped non-Python file
         assert len(data["warnings"]) >= 1
+
+    def test_json_core_change_reports_capability_trigger(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        script = Path(__file__).resolve().parents[1] / "scripts" / "test_impact.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "src/singularity/agent_loop.py", "--json"],
+            capture_output=True,
+            text=True,
+            cwd=str(tmp_path.parent.parent),
+        )
+        if result.returncode != 0:
+            pytest.skip(f"Script failed: {result.stderr}")
+        data = json.loads(result.stdout)
+        assert data["capability_gate"]["required"] is True
+        assert "AgentLoop" in data["capability_gate"]["areas"]
 
     def test_json_output_special_paths(
         self,

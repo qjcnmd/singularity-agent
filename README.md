@@ -172,6 +172,14 @@ python -m singularity.cli eval run docs/evaluation/capability-regression-tasks.j
 
 不要把 `evaluation_passed` 写回旧的 `completed` / `success` result alias。
 
+Phase 8 后本地验证分为三层，CI Quality matrix 不降级，既有全量测试仍保留：
+
+- `fast` gate：Codex 日常小改默认运行 `python scripts/verify_fast.py --git`。它执行 ruff、当前 mypy、changed-scope compileall 和 `scripts/test_impact.py` 推荐的受影响 pytest；低置信度或无明确测试时输出 `fallback_required=stage` 与 `skipped_reason`，不静默跳过，不跑真实 provider eval。
+- `stage` gate：阶段收口运行 `python scripts/verify_stage.py`。它执行 deterministic mypy/ruff/compileall/runtime docs、过滤后的 pytest 和关键模块专项测试，不默认跑真实 provider eval。
+- `capability` gate：只有 AgentLoop、ToolProtocol、sandbox、context、compaction、verification、CompletionGate、FinalReport 或 evaluation runner 变更时运行 `python scripts/verify_capability.py --force --run-id <run-id>`，默认使用单个公共任务 `docs/evaluation/public-representative-task.json`。
+
+公共代表性任务来自 SWE-bench Lite dev split：`sqlfluff__sqlfluff-1625`，repo 为 `sqlfluff/sqlfluff`，base commit 为 `14e1a23a3166b9a645a16de96f694c77a5d4abb7`，验证目标为 `test/cli/commands_test.py::test__cli__command_directed`。manifest 只把 issue 摘要、允许范围、可见 verification 和完成标准交给模型；gold patch / test patch 只允许作为 evaluator-owned metadata 或离线验证资料，不进入 `ModelTurnRequest`。
+
 ## 运行时状态
 
 默认 trace run 目录结构：

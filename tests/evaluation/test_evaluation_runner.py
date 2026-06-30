@@ -13,13 +13,17 @@ from singularity.evaluation.models import FAILURE_CASE_RECORD_SCHEMA_VERSION
 from singularity.evaluation.runner import (
     EVALUATION_RESULT_SCHEMA_VERSION,
     EVALUATION_TASK_SET_SCHEMA_VERSION,
+    CommandEvalResult,
     EvaluationRunner,
     EvaluationTaskResult,
     EvaluationTaskSet,
     SingularityPrivateBenchmarkAdapter,
+    _apply_benchmark_constraints,
+    _build_capability_summary,
     _command_failure_category,
     _failure_category,
     _result_status,
+    _task_goal,
     load_evaluation_task_set,
     summarize_evaluation_results,
 )
@@ -121,6 +125,156 @@ def test_load_v7_focused_smoke_manifest_remains_single_task() -> None:
     assert manifest.tasks[0].task_type == "v7_smoke"
     assert manifest.tasks[0].public_verification_command == manifest.tasks[0].verification_command
     assert manifest.tasks[0].hidden_verification_command == manifest.tasks[0].verification_command
+
+
+def test_load_public_representative_task_manifest_is_public_swe_bench() -> None:
+    manifest = load_evaluation_task_set(Path("docs/evaluation/public-representative-task.json"))
+
+    assert manifest.schema_version == EVALUATION_TASK_SET_SCHEMA_VERSION
+    assert len(manifest.tasks) == 1
+    task = manifest.tasks[0]
+    assert task.task_id == "sqlfluff__sqlfluff-1625"
+    assert task.task_type == "public_representative"
+    assert task.workspace.kind == "repo"
+    assert task.workspace.path == "https://github.com/sqlfluff/sqlfluff.git"
+    assert task.workspace.start_commit == "14e1a23a3166b9a645a16de96f694c77a5d4abb7"
+    assert task.fixture_metadata["visibility"] == "public"
+    assert task.fixture_metadata["adapter"] == "swe_bench"
+    assert task.fixture_metadata["instance_id"] == "sqlfluff__sqlfluff-1625"
+    assert task.fixture_metadata["fail_to_pass"] == [
+        "test/cli/commands_test.py::test__cli__command_directed"
+    ]
+    assert task.hidden_test_patch["source"] == "swe_bench_lite.dev"
+    assert task.hidden_test_patch["fixture_owner"] == "evaluator"
+    assert task.prepare_commands
+    assert task.model_visible_verification_command == (
+        "python -m pytest test/cli/commands_test.py::test__cli__command_directed"
+    )
+    goal = _task_goal(task)
+    assert "sqlfluff/sqlfluff" in goal
+    assert "python -m pytest test/cli/commands_test.py::test__cli__command_directed" in goal
+    assert "FAIL_TO_PASS" not in goal
+    assert "hidden_test_patch" not in goal
+    assert "test_patch" not in goal
+    assert "gold" not in goal.lower()
+    assert ".eval-venv" not in goal
+    assert "pip install" not in goal
+
+
+def test_evaluation_hidden_fixture_metadata_never_enters_goal_or_constraints(tmp_path: Path) -> None:
+    sentinel = "PHASE8_SENTINEL_DO_NOT_LEAK"
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.hidden_fixture",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Update README.md.",
+                    "allowed_paths": ["README.md"],
+                    "verification_command": f"{json.dumps(sys.executable)} -c \"print('ok')\"",
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                    "fixture_metadata": {
+                        "patch": sentinel,
+                        "test_patch": sentinel,
+                        "gold_patch": sentinel,
+                    },
+                    "hidden_test_patch": {
+                        "content": sentinel,
+                        "sha256": sentinel,
+                    },
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+    task = manifest.tasks[0]
+
+    class FakePlanner:
+        def __init__(self) -> None:
+            self.constraints: dict[str, Any] = {}
+
+        def apply_benchmark_constraints(self, payload: dict[str, Any]) -> None:
+            self.constraints = payload
+
+    class FakeGraph:
+        def __init__(self) -> None:
+            self.planner = FakePlanner()
+
+    class FakeKernel:
+        def __init__(self) -> None:
+            self.graph = FakeGraph()
+
+    kernel = FakeKernel()
+    goal = _task_goal(task)
+    _apply_benchmark_constraints(kernel, task)
+    constraints = kernel.graph.planner.constraints
+
+    assert sentinel not in goal
+    assert sentinel not in json.dumps(constraints, ensure_ascii=False)
+    assert "fixture_metadata" not in constraints
+    assert "hidden_test_patch" not in constraints
+
+
+def test_capability_summary_counts_trace_events_and_explains_skipped_compaction(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    (trace_dir / "events.jsonl").write_text(
+        "\n".join(
+            json.dumps(event)
+            for event in [
+                {"event_type": "model.request.created", "payload": {}},
+                {"event_type": "model.response.received", "payload": {"latency_ms": 1200}},
+                {"event_type": "model.request.failed", "payload": {"latency_ms": 300}},
+                {"event_type": "model.tool_call.proposed", "payload": {}},
+                {"event_type": "tool_protocol.call_started", "payload": {}},
+                {"event_type": "tool_protocol.call_completed", "payload": {}},
+                {"event_type": "context.tool_observation_added", "payload": {}},
+                {"event_type": "retrieval.query.completed", "payload": {}},
+                {"event_type": "context.bundle_built", "payload": {}},
+                {"event_type": "context.rendered_for_model", "payload": {}},
+                {"event_type": "command.completed", "payload": {"duration_ms": 250, "backend": "local_process"}},
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    verification = CommandEvalResult(
+        command=f"{json.dumps(sys.executable)} -m pytest tests/test_app.py",
+        exit_code=0,
+        duration_seconds=1.25,
+    )
+    summary = _build_capability_summary(
+        trace=trace_dir,
+        trace_summary={"model_usage_summary": {"requests": 1}},
+        checks={"public": {"status": "passed"}, "hidden": {"status": "passed"}},
+        verification=verification,
+        public_verification=verification,
+        hidden_verification=verification,
+        final_report_status="completed",
+        agent_status="completed",
+        wall_time_seconds=2.5,
+    )
+
+    assert summary["model_turn_request_count"] == 1
+    assert summary["model_turn_result_count"] == 2
+    assert summary["tool_call_envelope_count"] == 2
+    assert summary["tool_result_count"] == 1
+    assert summary["tool_observation_count"] == 1
+    assert summary["retrieval_calls"] == 1
+    assert summary["context_package_rebuild_count"] == 2
+    assert summary["context_compaction"]["requested"] == 0
+    assert summary["context_compaction"]["skipped"] is True
+    assert summary["context_compaction"]["reason"]
+    assert summary["sandbox_backend"] == "local_process"
+    assert summary["local_process_fallback_count"] == 1
+    assert summary["verification_checks"] == ["public", "hidden"]
+    assert summary["final_report_status"] == "completed"
+    assert summary["agent_loop_result_status"] == "completed"
+    assert summary["timing"]["wall_time_seconds"] == 2.5
+    assert summary["timing"]["provider_time_seconds"] == 1.5
+    assert summary["timing"]["sandbox_time_seconds"] == 0.25
+    assert summary["timing"]["pytest_time_seconds"] == 1.25
 
 
 def test_evaluation_sanitized_baseline_example_is_safe_and_shape_current() -> None:

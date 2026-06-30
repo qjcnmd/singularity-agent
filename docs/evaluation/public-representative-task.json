@@ -1,0 +1,84 @@
+{
+  "schema_version": "evaluation.task_set/v1",
+  "tasks": [
+    {
+      "task_id": "sqlfluff__sqlfluff-1625",
+      "task_type": "public_representative",
+      "description": "Public SWE-bench Lite dev representative task: TSQL L031 alias rule fires when no join is present.",
+      "workspace": {
+        "type": "repo",
+        "path": "https://github.com/sqlfluff/sqlfluff.git",
+        "start_commit": "14e1a23a3166b9a645a16de96f694c77a5d4abb7"
+      },
+      "user_task": "Fix sqlfluff/sqlfluff issue sqlfluff__sqlfluff-1625. In the TSQL dialect, rule L031 incorrectly triggers the alias rule when a query has no join. Make the smallest focused change needed so the directed CLI behavior is correct.",
+      "allowed_paths": [
+        "src/sqlfluff",
+        "test"
+      ],
+      "allowed_tools": [
+        "read_file",
+        "write_file",
+        "run_verification",
+        "inspect_diff"
+      ],
+      "prepare_commands": [
+        "python -m venv ../.eval-venv",
+        "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); raise SystemExit(subprocess.call([py, '-m', 'pip', 'install', '-q', '-U', 'pip', 'wheel', 'setuptools<81']))\"",
+        "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); raise SystemExit(subprocess.call([py, '-m', 'pip', 'install', '-q', '-r', 'requirements.txt', '-e', '.', 'click<8.2', 'setuptools<81']))\""
+      ],
+      "tool_policy": "read_write",
+      "strategy": {
+        "permission_profile": "workspace-write",
+        "approval_policy": "never",
+        "network_access": "denied",
+        "context_budget_tokens": 6000
+      },
+      "expected_file_changes": [
+        "src/sqlfluff"
+      ],
+      "verification_command": "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); raise SystemExit(subprocess.call([py, '-m', 'pytest', 'test/cli/commands_test.py::test__cli__command_directed']))\"",
+      "public_verification_command": "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); raise SystemExit(subprocess.call([py, '-m', 'pytest', 'test/cli/commands_test.py::test__cli__command_directed']))\"",
+      "hidden_verification_command": "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); raise SystemExit(subprocess.call([py, '-m', 'pytest', 'test/cli/commands_test.py::test__cli__command_directed']))\"",
+      "model_visible_verification_command": "python -m pytest test/cli/commands_test.py::test__cli__command_directed",
+      "verification_timeout_seconds": 300,
+      "completion_standard": "The directed CLI pytest target passes, the fix is scoped to the SQLFluff alias-rule behavior, and the final report records verification evidence.",
+      "risk_tags": [
+        "public-swe-bench-lite",
+        "representative-long-chain",
+        "tool-protocol",
+        "verification",
+        "context-compaction",
+        "final-report"
+      ],
+      "fixture_metadata": {
+        "visibility": "public",
+        "adapter": "swe_bench",
+        "dataset": "princeton-nlp/SWE-bench_Lite",
+        "split": "dev",
+        "instance_id": "sqlfluff__sqlfluff-1625",
+        "repo": "sqlfluff/sqlfluff",
+        "base_commit": "14e1a23a3166b9a645a16de96f694c77a5d4abb7",
+        "fail_to_pass": [
+          "test/cli/commands_test.py::test__cli__command_directed"
+        ],
+        "issue_summary": "TSQL L031 incorrectly triggers alias rule when no join is present.",
+        "gold_patch": {
+          "stored": false,
+          "model_visible": false,
+          "reason": "gold patch is never included in ModelTurnRequest or prompt"
+        }
+      },
+      "hidden_test_patch": {
+        "source": "swe_bench_lite.dev",
+        "fixture_owner": "evaluator",
+        "model_visible": false,
+        "content_stored": false,
+        "metadata_only": true
+      },
+      "success": {
+        "type": "verification_exit_code",
+        "exit_code": 0
+      }
+    }
+  ]
+}

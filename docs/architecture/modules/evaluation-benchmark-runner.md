@@ -25,10 +25,10 @@
 字段清单:
 - TaskExecutionEvidence: verification, assertions, diff, heuristics, trace_metrics, diff_summary, hook_results, snapshot, agent_config_overrides, golden_contract, failure_reasons
 - EvaluationWorkspace: kind, path, files, start_commit
-- EvaluationTask: task_id, workspace, user_task, allowed_paths, verification_command, success, task_type, description, allowed_tools, tool_policy, strategy, expected_file_changes, completion_standard, risk_tags, prepare_commands, public_verification_command, hidden_verification_command, verification_prepare_commands, verification_timeout_seconds
+- EvaluationTask: task_id, workspace, user_task, allowed_paths, verification_command, success, task_type, description, allowed_tools, tool_policy, strategy, expected_file_changes, completion_standard, risk_tags, prepare_commands, public_verification_command, hidden_verification_command, verification_prepare_commands, verification_timeout_seconds, model_visible_verification_command, fixture_metadata, hidden_test_patch
 - EvaluationTaskSet: tasks, base_dir, schema_version
 - CommandEvalResult: command, exit_code, duration_seconds, timed_out, error_summary, raw_command, resolved_argv, interpreter_strategy, failure_category
-- EvaluationTaskResult: task_id, tests_passed, infrastructure_blocked, prompt_tokens, cached_tokens, request_cache_hit_rate, run_cache_hit_rate, tool_calls, files_changed, duration_seconds, error_summary, workspace, trace, verification_workspace, patch, checks, verification, agent_completed, evaluation_passed, patch_applicable, allowed_scope_passed, public_verification_passed, hidden_verification_passed, repair_attempt_count, repair_execution_count, miscompletion_count, blocked_reason, failure_category, request_cache_hit_rates, status, turn_count, verification_result, contract_satisfaction, final_report_status, policy_blocks, token_usage, cache_usage, trace_artifact_refs, reproducible_environment
+- EvaluationTaskResult: task_id, tests_passed, infrastructure_blocked, prompt_tokens, cached_tokens, request_cache_hit_rate, run_cache_hit_rate, tool_calls, files_changed, duration_seconds, error_summary, workspace, trace, verification_workspace, patch, checks, verification, agent_completed, evaluation_passed, patch_applicable, allowed_scope_passed, public_verification_passed, hidden_verification_passed, repair_attempt_count, repair_execution_count, miscompletion_count, blocked_reason, failure_category, request_cache_hit_rates, status, turn_count, verification_result, contract_satisfaction, final_report_status, policy_blocks, token_usage, cache_usage, trace_artifact_refs, reproducible_environment, capability_summary
 - TargetedFailureReplayResult: status, agent_completed, entered_agent_loop, failure_trigger, failure_analysis_request_count, failure_analysis_result_count, repair_plan_count, repair_contract_count, repair_attempt_count, repair_execution_count, repairing_failures_seen, verification_contract_satisfaction, repair_scope, final_report_status, trace_path, phase_history, planner_status_history, repair_contract_summary, repairing_failures_evidence, trace_refs, report_paths
 
 ## 这一层解决什么问题
@@ -57,7 +57,9 @@ benchmark scoring path: `python -m singularity.cli eval benchmark <task-set>` ->
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 的 evaluation task 为例：`load_evaluation_task_set()` -> `EvaluationRunner.run()` -> `EvaluationRunner.run_task()` 先从 manifest 生成对象 `EvaluationTaskSet` 和 `EvaluationTask`，再由 `_materialize_workspace()` 创建 task `workspace`、`baseline-workspace` 和 `verification-workspace`。`KernelBootstrap.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()` 执行真实 agent 后，runner 读取 trace summary、final report、changed files 和 public/hidden verification，生成 `EvaluationTaskResult`。汇总阶段把结果写入 `<run_dir>/result.json`、`report.json`、`report.md`，clean verification workspace 失败时写错误并返回失败结果。
+以用户要求修复 `quicksort.py` 的 evaluation task 为例：`load_evaluation_task_set()` -> `EvaluationRunner.run()` -> `EvaluationRunner.run_task()` 先从 manifest 生成对象 `EvaluationTaskSet` 和 `EvaluationTask`，再由 `_materialize_workspace()` 创建 task `workspace`、`baseline-workspace` 和 `verification-workspace`。fixture workspace 直接写入内联文件；本地 repo workspace 复制或按 `start_commit` checkout；远端 repo URL 只在 evaluator 准备阶段 clone/checkout，失败时在 AgentLoop 启动前归类为 setup failure 或 `environment_blocker`。`KernelBootstrap.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()` 执行真实 agent 后，runner 读取 trace summary、final report、changed files 和 public/hidden verification，生成 `EvaluationTaskResult`。`_task_result()` 同时聚合 `capability_summary`，统计 model/tool/retrieval/context/compaction/sandbox/verification/finalization 对象流与耗时；没有 compaction 事件时必须写出 skipped reason。汇总阶段把结果写入 `<run_dir>/result.json`、`report.json`、`report.md`，clean verification workspace 失败时写错误并返回失败结果。
+
+公共代表性任务 `docs/evaluation/public-representative-task.json` 是单一公开 SWE-bench Lite dev task：`sqlfluff__sqlfluff-1625`，repo 为 `sqlfluff/sqlfluff`，base commit 为 `14e1a23a3166b9a645a16de96f694c77a5d4abb7`。它的 `fixture_metadata` 和 `hidden_test_patch` 是 evaluator-owned metadata，用于记录 public dataset、FAIL_TO_PASS、离线 hidden fixture 边界和 gold/test patch 不可见策略；这些字段不进入 `_task_goal()`、`_apply_benchmark_constraints()`、ModelTurnRequest 或 planner benchmark constraints。
 
 同一类任务进入 benchmark scoring path 时，`BenchmarkTaskExecutor.evaluate()` 先按 `WorkspaceSnapshot` 准备工作区，再运行 before/after/score-adjustment hooks、verification command、assertions 和 diff 检查。它把 verification、assertions、diff、heuristics、trace metrics、diff summary、hook results、snapshot、agent config overrides、golden contract 和 failure reasons 聚合成 `TaskExecutionEvidence`。`evaluate_golden_contract()` 对 `file_created`、`verification_passed`、`final_report_written`、`repair_applied`、`approval_required`、`sandbox_fail_closed` 等 expected evidence 从 verification、diff summary、hook results 和 trace metrics 中观察；未知或未接入的 evidence 仍为 `observed=false`，不伪造成成功。`_diff_summary()` 用真实前后文本 snapshot 计算 added/removed lines、简单复杂度和重复新增行标记，不再固定写 `complexity=0` 或 `redundant_code=false`。
 
@@ -93,6 +95,9 @@ class EvaluationTask:
     hidden_verification_command: str = ""
     verification_prepare_commands: list[str] = field(default_factory=list)
     verification_timeout_seconds: int = 120
+    model_visible_verification_command: str = ""
+    fixture_metadata: dict[str, Any] = field(default_factory=dict)
+    hidden_test_patch: dict[str, Any] = field(default_factory=dict)
 ```
 
 ### EvaluationTaskResult（评估任务结果）
@@ -141,6 +146,7 @@ class EvaluationTaskResult:
     cache_usage: dict[str, Any] = field(default_factory=dict)
     trace_artifact_refs: list[str] = field(default_factory=list)
     reproducible_environment: dict[str, Any] = field(default_factory=dict)
+    capability_summary: dict[str, Any] = field(default_factory=dict)
 ```
 
 ### CommandEvalResult（命令评估结果）
@@ -222,7 +228,7 @@ benchmark scoring path 中，`BenchmarkTaskExecutor.evaluate()` 生成 `TaskExec
 ## 谁消费这些对象
 
 - `EvaluationRunner._materialize_workspace()` 和 `_workspace_environment()` 消费 `EvaluationWorkspace`；该对象不直接进入模型请求，只有物化后的文件可被 AgentLoop 工具读取。
-- `EvaluationRunner.run_task()` 消费 `EvaluationTask`。`_task_goal()` 只把 `user_task`、`allowed_paths`、`tool_policy`、`allowed_tools`、`expected_file_changes`、`completion_standard`、`risk_tags` 和可见 verification command 写入用户 goal；hidden command、verification prepare command、`success` 与 `description` 不进入模型请求。`EvaluationTaskSet` 本身不进模型，只由 `EvaluationRunner.run()` 遍历。
+- `EvaluationRunner.run_task()` 消费 `EvaluationTask`。`_task_goal()` 只把 `user_task`、`allowed_paths`、`tool_policy`、`allowed_tools`、`expected_file_changes`、`completion_standard`、`risk_tags` 和 `_model_visible_verification_command()` 选出的可见 verification command 写入用户 goal；hidden command、verification prepare command、`success`、`description`、`fixture_metadata` 与 `hidden_test_patch` 不进入模型请求。`model_visible_verification_command` 只允许承载与实际 evaluator 命令等价的简洁用户可见检查，例如公开 pytest nodeid；不得承载 evaluator setup、gold patch 或 test patch。`_apply_benchmark_constraints()` 同样只发送 task id、allowed tools、expected changes、completion standard、risk tags 和可见 verification command。`EvaluationTaskSet` 本身不进模型，只由 `EvaluationRunner.run()` 遍历。
 - public/hidden check、success criterion 和 contract satisfaction 消费 `CommandEvalResult`；它发生在 AgentLoop 结束后的独立 evaluator 中，不进入后续模型请求。
 - `summarize_evaluation_results()`、regression compare/report、`FailureCaseReplayRunner` 和 CLI JSON 输出消费 `EvaluationTaskResult`。`TargetedFailureReplayResult.to_dict()`、Markdown renderer 与 `eval targeted-replay` 的退出码逻辑消费 targeted replay result；两种 result 都不再进入模型。
 - `EvaluationHarness._evaluate_task()`、`EvaluationScoringEngine.score()` 和 `_apply_execution_failures()` 消费 `TaskExecutionEvidence`；`EvaluationReport.to_dict()`/`to_markdown()` 消费其中的 `golden_contract`。这些字段用于 evaluator/report，不进入 AgentLoop 的模型上下文。
@@ -232,7 +238,7 @@ benchmark scoring path 中，`BenchmarkTaskExecutor.evaluate()` 生成 `TaskExec
 
 - `EvaluationTaskSet` 与 `EvaluationTask` 来自输入 manifest，runner 不复制完整对象；`EvaluationTaskSet.to_dict()` 也不写运行时 `base_dir`。每个 task 的 workspace 落在 `<output_root>/<run_id>/<task_id>/workspace`，另有 `baseline-workspace` 和 `verification-workspace`。
 - `CommandEvalResult` 序列化到 `EvaluationTaskResult.verification`、`checks.public`、`checks.hidden` 和 `verification_result`。
-- `EvaluationRunner.run()` 在 `<output_root>/<run_id>/` 写 `result.json`、`report.json`、`report.md`；有 baseline 时写 `regression.json`、`regression.md`，失败样本写 `failure_cases.json`。默认 `output_root` 是 `work/evaluations`。
+- `EvaluationRunner.run()` 在 `<output_root>/<run_id>/` 写 `result.json`、`report.json`、`report.md`；有 baseline 时写 `regression.json`、`regression.md`，失败样本写 `failure_cases.json`。默认 `output_root` 是 `work/evaluations`。`capability_summary` 随每个 `EvaluationTaskResult` 落盘，包含 `model_turn_request_count`、`model_turn_result_count`、`tool_call_envelope_count`、`tool_result_count`、`tool_observation_count`、`retrieval_calls`、`context_package_rebuild_count`、`context_compaction`、`sandbox_backend`、`local_process_fallback_count`、`verification_checks`、`final_report_status`、`agent_loop_result_status` 和 timing 子对象。
 - `TaskExecutionEvidence` 序列化到 benchmark report 的 `profile_reports[].task_results[].execution_evidence`；其 `golden_contract` 同时投影到 Markdown 的 Golden Task Evidence 表。
 - targeted replay 默认写 `work/evaluations-targeted/targeted_replay_result.json`、`targeted_replay_result.md`，workspace 位于同目录的 `workspace/`；协议状态写该 workspace 下 `.singularity/runs/<run_id>/tool_protocol.sqlite3`，JSONL trace 写 `.singularity/runs/<run_id>.jsonl`。
 
@@ -245,7 +251,7 @@ benchmark scoring path 中，`BenchmarkTaskExecutor.evaluate()` 生成 `TaskExec
 
 ## 失败路径
 
-- workspace/task/task-set 输入错误在运行前抛 `ValueError`；缺 workspace 源抛 `FileNotFoundError`，git clone/checkout 失败抛 `RuntimeError`。task 执行阶段异常由 `EvaluationRunner.run_task()` 捕获、脱敏后写 `error_summary`。
+- workspace/task/task-set 输入错误在运行前抛 `ValueError`。`EvaluationRunner.run_task()` 的 workspace materialization 阶段把缺本地路径或坏本地 git ref 归为 setup/manifest failure，把远端 clone/checkout 失败归为 evaluator 准备阶段的 `environment_blocker` 并在 AgentLoop 启动前短路；task 执行阶段异常由 `EvaluationRunner.run_task()` 捕获、脱敏后写 `error_summary`。
 - `CommandEvalResult.failure_category` 明确区分 `command_parse_error`、`command_timeout`、`command_not_found`、`command_execution_error`、`environment_dependency_missing`、`verification_failed` 和 `command_failed`。
 - `EvaluationTaskResult.status` 由 `_task_result()` 归一为 `environment_blocker`、`success`、`policy_blocked`、`verification_failed`、`blocked`、`failed`、`max_turns_exceeded`、`failure` 或 `unknown`；`infrastructure_blocked` 布尔字段仍表示该 task 不进入评分分母。最终通过字段是 `evaluation_passed`，不是 manifest 的 `success`。
 - AgentLoop final report或failure repair summary中出现`latest_failure_category=environment_error`或`sandbox_limitation`时，`_failure_category()`归约为`environment_blocker`；Python `_ssl` / OpenSSL runtime blocker 是该规则的环境类输入之一。该规则只影响报告/评分分类，不把post-agent verification结果回灌给AgentLoop，也不降低CompletionGate标准。
@@ -256,7 +262,7 @@ benchmark scoring path 中，`BenchmarkTaskExecutor.evaluate()` 生成 `TaskExec
 
 ## 当前结构问题
 
-`CommandEvalResult.to_dict()` 额外输出派生字段 `passed`，`TargetedFailureReplayResult.to_dict()` 额外输出 `schema_version`，这些不是 dataclass 字段；维护字段校验时必须区分“源码字段完整性”和“序列化派生字段”。`EvaluationWorkspace.kind` 序列化为 `type`，也是明确投影而非 alias。`TaskExecutionEvidence` 仍是 dict-heavy report evidence；新增 evidence 名称时必须接入真实 verification、trace metrics、hook results 或 diff/assertion 来源，不能只在 schema 中登记。
+`CommandEvalResult.to_dict()` 额外输出派生字段 `passed`，`TargetedFailureReplayResult.to_dict()` 额外输出 `schema_version`，这些不是 dataclass 字段；维护字段校验时必须区分“源码字段完整性”和“序列化派生字段”。`EvaluationWorkspace.kind` 序列化为 `type`，也是明确投影而非 alias。`fixture_metadata` 和 `hidden_test_patch` 可以落盘到 manifest/task对象，但禁止进入模型 goal、planner constraints、trace model request payload 或 raw model artifact。`TaskExecutionEvidence` 仍是 dict-heavy report evidence；新增 evidence 名称时必须接入真实 verification、trace metrics、hook results 或 diff/assertion 来源，不能只在 schema 中登记。
 
 ## 维护规则
 

@@ -35,6 +35,12 @@ EVALUATION_RESULT_SCHEMA_VERSION = "evaluation.result/v1"
 _PATCH_REDACTOR = ContextRedactor()
 
 
+class EvaluationSetupError(RuntimeError):
+    def __init__(self, message: str, *, environment_blocker: bool) -> None:
+        super().__init__(message)
+        self.environment_blocker = environment_blocker
+
+
 @dataclass(frozen=True)
 class EvaluationWorkspace:
     kind: str
@@ -90,6 +96,9 @@ class EvaluationTask:
     hidden_verification_command: str = ""
     verification_prepare_commands: list[str] = field(default_factory=list)
     verification_timeout_seconds: int = 120
+    model_visible_verification_command: str = ""
+    fixture_metadata: dict[str, Any] = field(default_factory=dict)
+    hidden_test_patch: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> EvaluationTask:
@@ -125,6 +134,9 @@ class EvaluationTask:
             hidden_verification_command=str(payload.get("hidden_verification_command") or "").strip(),
             verification_prepare_commands=[str(item) for item in verification_prepare_commands if str(item).strip()],
             verification_timeout_seconds=int(payload.get("verification_timeout_seconds") or 120),
+            model_visible_verification_command=str(payload.get("model_visible_verification_command") or "").strip(),
+            fixture_metadata=_dict(payload.get("fixture_metadata") or {}, "fixture_metadata"),
+            hidden_test_patch=_dict(payload.get("hidden_test_patch") or {}, "hidden_test_patch"),
         )
         task._validate()
         return task
@@ -178,6 +190,12 @@ class EvaluationTask:
             payload["hidden_verification_command"] = self.hidden_verification_command
         if self.verification_prepare_commands:
             payload["verification_prepare_commands"] = list(self.verification_prepare_commands)
+        if self.model_visible_verification_command:
+            payload["model_visible_verification_command"] = self.model_visible_verification_command
+        if self.fixture_metadata:
+            payload["fixture_metadata"] = dict(self.fixture_metadata)
+        if self.hidden_test_patch:
+            payload["hidden_test_patch"] = dict(self.hidden_test_patch)
         return payload
 
 
@@ -276,6 +294,7 @@ class EvaluationTaskResult:
     cache_usage: dict[str, Any] = field(default_factory=dict)
     trace_artifact_refs: list[str] = field(default_factory=list)
     reproducible_environment: dict[str, Any] = field(default_factory=dict)
+    capability_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -318,6 +337,7 @@ class EvaluationTaskResult:
             "cache_usage": self.cache_usage,
             "trace_artifact_refs": list(self.trace_artifact_refs),
             "reproducible_environment": self.reproducible_environment,
+            "capability_summary": self.capability_summary,
         }
 
 
@@ -510,7 +530,35 @@ class EvaluationRunner:
         reproducible_environment: dict[str, Any] = {}
         try:
             _reset_dir(task_dir, root=self.run_dir)
-            self._materialize_workspace(task, workspace=workspace, manifest_base=manifest_base)
+            try:
+                self._materialize_workspace(task, workspace=workspace, manifest_base=manifest_base)
+            except EvaluationSetupError as exc:
+                errors.append(str(exc))
+                return self._task_result(
+                    task=task,
+                    workspace=workspace,
+                    trace=trace_path,
+                    started=started,
+                    verification=None,
+                    verification_workspace=verification_workspace,
+                    files_changed=[],
+                    usage={},
+                    tool_calls=0,
+                    errors=errors,
+                    patch={},
+                    checks=_checks_payload(None, None),
+                    success=False,
+                    tests_passed=False,
+                    infrastructure_blocked=exc.environment_blocker,
+                    agent_status="",
+                    final_report_payload={},
+                    trace_summary={},
+                    turn_count=0,
+                    policy_blocks=0,
+                    trace_artifact_refs=[],
+                    contract_satisfaction={},
+                    reproducible_environment=_setup_environment(task, manifest_base=manifest_base),
+                )
             config = ProductionConfig.from_cli(
                 project_root=workspace,
                 max_turns=self.max_turns or adaptive_default_max_turns(task.user_task),
@@ -713,6 +761,8 @@ class EvaluationRunner:
                         trace_artifact_refs=trace_artifact_refs,
                         contract_satisfaction=contract_satisfaction,
                         reproducible_environment=reproducible_environment,
+                        public_verification=public_verification,
+                        hidden_verification=prepared,
                     )
             hidden_verification = _run_shell(
                 hidden_command,
@@ -804,6 +854,8 @@ class EvaluationRunner:
             trace_artifact_refs=trace_artifact_refs,
             contract_satisfaction=contract_satisfaction,
             reproducible_environment=reproducible_environment,
+            public_verification=public_verification,
+            hidden_verification=hidden_verification,
         )
 
     def _materialize_workspace(self, task: EvaluationTask, *, workspace: Path, manifest_base: Path) -> None:
@@ -812,14 +864,39 @@ class EvaluationRunner:
             for relative, content in task.workspace.files.items():
                 _write_workspace_file(workspace, relative, content)
             return
+        source_value = str(task.workspace.path or "")
+        if _is_remote_git_url(source_value):
+            if not task.workspace.start_commit:
+                raise EvaluationSetupError(
+                    f"remote evaluation repo task {task.task_id} requires start_commit.",
+                    environment_blocker=False,
+                )
+            try:
+                _run_git(["clone", "--quiet", "--filter=blob:none", source_value, str(workspace)], cwd=manifest_base)
+                _run_git(["checkout", "--quiet", task.workspace.start_commit], cwd=workspace)
+            except RuntimeError as exc:
+                raise EvaluationSetupError(
+                    f"setup/environment blocker: failed to materialize remote repo {source_value}: {exc}",
+                    environment_blocker=True,
+                ) from exc
+            return
         source = Path(str(task.workspace.path or ""))
         if not source.is_absolute():
             source = (manifest_base / source).resolve(strict=False)
         if not source.exists():
-            raise FileNotFoundError(source)
+            raise EvaluationSetupError(
+                f"evaluation repo workspace path not found: {source}",
+                environment_blocker=False,
+            )
         if task.workspace.start_commit and _is_git_repo(source):
-            _run_git(["clone", "--quiet", "--shared", str(source), str(workspace)], cwd=manifest_base)
-            _run_git(["checkout", "--quiet", task.workspace.start_commit], cwd=workspace)
+            try:
+                _run_git(["clone", "--quiet", "--shared", str(source), str(workspace)], cwd=manifest_base)
+                _run_git(["checkout", "--quiet", task.workspace.start_commit], cwd=workspace)
+            except RuntimeError as exc:
+                raise EvaluationSetupError(
+                    f"evaluation repo checkout failed: {exc}",
+                    environment_blocker=False,
+                ) from exc
             return
         shutil.copytree(source, workspace, ignore=_copy_ignore)
 
@@ -849,6 +926,8 @@ class EvaluationRunner:
         trace_artifact_refs: list[str] | None = None,
         contract_satisfaction: dict[str, Any] | None = None,
         reproducible_environment: dict[str, Any] | None = None,
+        public_verification: CommandEvalResult | None = None,
+        hidden_verification: CommandEvalResult | None = None,
     ) -> EvaluationTaskResult:
         request_rates = _float_map(usage.get("request_cache_hit_rates") or {})
         final_report_payload = final_report_payload or {}
@@ -960,6 +1039,17 @@ class EvaluationRunner:
             cache_usage=cache_usage,
             trace_artifact_refs=list(trace_artifact_refs or _trace_artifact_refs(final_report_payload, trace_summary)),
             reproducible_environment=reproducible_environment or {},
+            capability_summary=_build_capability_summary(
+                trace=Path(trace) if trace else None,
+                trace_summary=trace_summary,
+                checks=checks or _checks_payload(None, verification),
+                verification=verification,
+                public_verification=public_verification or verification,
+                hidden_verification=hidden_verification or verification,
+                final_report_status=final_report_status,
+                agent_status=agent_status,
+                wall_time_seconds=round(time.perf_counter() - started, 3),
+            ),
         )
 
 
@@ -1335,6 +1425,13 @@ def _workspace_environment(task: EvaluationTask, *, manifest_base: Path) -> dict
             "source": "manifest.inline_files",
         }
     source = task.workspace.path or ""
+    if _is_remote_git_url(source):
+        return {
+            "type": "repo",
+            "source": _redacted_url(source) or source,
+            "start_commit": task.workspace.start_commit,
+            "materialization": "evaluator_remote_clone",
+        }
     source_path = Path(source).resolve(strict=False) if source else None
     try:
         source_ref = source_path.relative_to(manifest_base.resolve(strict=False)).as_posix() if source_path else ""
@@ -1344,6 +1441,30 @@ def _workspace_environment(task: EvaluationTask, *, manifest_base: Path) -> dict
         "type": "repo",
         "source": source_ref,
         "start_commit": task.workspace.start_commit,
+    }
+
+
+def _setup_environment(task: EvaluationTask, *, manifest_base: Path) -> dict[str, Any]:
+    return {
+        "schema_version": "evaluation.environment/v1",
+        "task_id": task.task_id,
+        "task_type": task.task_type,
+        "workspace": _workspace_environment(task, manifest_base=manifest_base),
+        "prepare_commands": list(task.prepare_commands),
+        "verification_command": task.verification_command,
+        "public_verification_command": _public_verification_command(task),
+        "hidden_verification_command": _hidden_verification_command(task),
+        "verification_prepare_commands": list(task.verification_prepare_commands),
+        "allowed_paths": list(task.allowed_paths),
+        "expected_file_changes": list(task.expected_file_changes),
+        "completion_standard": task.completion_standard,
+        "risk_tags": list(task.risk_tags),
+        "policy": {
+            "tool_policy": task.tool_policy,
+            "permission_profile": _permission_profile_for_task(task).value,
+            "approval_policy": _approval_policy_for_task(task).value,
+            "network_access": _network_access_for_task(task).value,
+        },
     }
 
 
@@ -1634,6 +1755,227 @@ def _trace_artifact_refs(payload: dict[str, Any], trace_summary: dict[str, Any])
     return sorted(dict.fromkeys(refs))
 
 
+def _build_capability_summary(
+    *,
+    trace: Path | None,
+    trace_summary: dict[str, Any],
+    checks: dict[str, Any],
+    verification: CommandEvalResult | None,
+    public_verification: CommandEvalResult | None,
+    hidden_verification: CommandEvalResult | None,
+    final_report_status: str,
+    agent_status: str,
+    wall_time_seconds: float,
+) -> dict[str, Any]:
+    events = _read_trace_events(trace)
+    model_requests = _count_events(events, "model.request.created")
+    model_results = _count_events(events, "model.response.received") + _count_events(events, "model.request.failed")
+    tool_call_envelopes = _count_events(events, "model.tool_call.proposed") + _count_events(events, "tool_protocol.call_started")
+    tool_results = _count_events(events, "tool_protocol.call_completed") + _count_events(events, "tool_protocol.result")
+    tool_observations = _count_events_with_contains(events, ("tool_observation", "tool.observation"))
+    retrieval_calls = _count_events_with_contains(events, ("retrieval",))
+    context_rebuilds = _count_events(events, "context.bundle_built") + _count_events(events, "context.rendered_for_model")
+    compaction_requested = _count_events(events, "context.compaction_requested")
+    compaction_completed = _count_events(events, "context.compaction_completed")
+    compaction_failed = _count_events(events, "context.compaction_failed")
+    compaction_reason = _compaction_reason(events, compaction_requested=compaction_requested)
+    sandbox_backend = _sandbox_backend(events, trace_summary)
+    local_fallback_count = _local_process_fallback_count(events, trace_summary)
+    sandbox_seconds = _sandbox_time_seconds(events)
+    provider_seconds = _provider_time_seconds(events, trace_summary)
+    pytest_seconds = _pytest_time_seconds(public_verification, hidden_verification, verification)
+    verification_seconds = _verification_time_seconds(public_verification, hidden_verification, verification)
+    verification_checks = _ordered_verification_checks(checks)
+    usage = trace_summary.get("model_usage_summary") if isinstance(trace_summary, dict) else {}
+    if isinstance(usage, dict):
+        model_requests = model_requests or _safe_int(usage.get("requests"))
+        model_results = model_results or _safe_int(usage.get("responses")) or model_requests
+    return {
+        "schema_version": "evaluation.capability_summary/v1",
+        "model_turn_request_count": model_requests,
+        "model_turn_result_count": model_results,
+        "tool_call_envelope_count": tool_call_envelopes,
+        "tool_result_count": tool_results,
+        "tool_observation_count": tool_observations,
+        "retrieval_calls": retrieval_calls,
+        "context_package_rebuild_count": context_rebuilds,
+        "context_compaction": {
+            "requested": compaction_requested,
+            "skipped": compaction_requested == 0,
+            "completed": compaction_completed,
+            "failed": compaction_failed,
+            "reason": compaction_reason,
+        },
+        "sandbox_backend": sandbox_backend,
+        "local_process_fallback_count": local_fallback_count,
+        "verification_checks": verification_checks,
+        "final_report_status": final_report_status,
+        "agent_loop_result_status": agent_status,
+        "timing": {
+            "wall_time_seconds": wall_time_seconds,
+            "provider_time_seconds": provider_seconds,
+            "sandbox_time_seconds": sandbox_seconds,
+            "pytest_time_seconds": pytest_seconds,
+            "verification_time_seconds": verification_seconds,
+        },
+    }
+
+
+def _read_trace_events(trace: Path | None) -> list[dict[str, Any]]:
+    if trace is None:
+        return []
+    events_path = trace / "events.jsonl" if trace.is_dir() else trace
+    if not events_path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    try:
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                events.append(payload)
+    except (OSError, json.JSONDecodeError):
+        return events
+    return events
+
+
+def _event_type(event: dict[str, Any]) -> str:
+    return str(event.get("event_type") or event.get("type") or "")
+
+
+def _count_events(events: list[dict[str, Any]], event_type: str) -> int:
+    return sum(1 for event in events if _event_type(event) == event_type)
+
+
+def _count_events_with_prefix(events: list[dict[str, Any]], prefixes: tuple[str, ...]) -> int:
+    return sum(1 for event in events if _event_type(event).startswith(prefixes))
+
+
+def _count_events_with_contains(events: list[dict[str, Any]], needles: tuple[str, ...]) -> int:
+    return sum(1 for event in events if any(needle in _event_type(event) for needle in needles))
+
+
+def _event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _compaction_reason(events: list[dict[str, Any]], *, compaction_requested: int) -> str:
+    for event in events:
+        if not _event_type(event).startswith("context.compaction"):
+            continue
+        payload = _event_payload(event)
+        reason = payload.get("reason") or payload.get("skipped_reason")
+        if reason:
+            return str(reason)
+    if compaction_requested:
+        return "compaction requested; no detailed reason recorded"
+    return "context usage below compaction threshold, retrieval content insufficient, or task completed before compaction was needed"
+
+
+def _sandbox_backend(events: list[dict[str, Any]], trace_summary: dict[str, Any]) -> str:
+    for event in events:
+        payload = _event_payload(event)
+        backend = payload.get("backend") or payload.get("sandbox_backend")
+        if backend:
+            return str(backend)
+    planner = trace_summary.get("sandbox_isolation_summary") if isinstance(trace_summary, dict) else {}
+    if isinstance(planner, dict):
+        backends = planner.get("selected_backends") or planner.get("available_backends") or []
+        if backends:
+            return str(backends[0])
+    return ""
+
+
+def _local_process_fallback_count(events: list[dict[str, Any]], trace_summary: dict[str, Any]) -> int:
+    count = 0
+    for event in events:
+        payload = _event_payload(event)
+        backend = str(payload.get("backend") or payload.get("sandbox_backend") or "")
+        fallback = payload.get("local_process_fallback") or payload.get("used_local_process_fallback")
+        if backend == "local_process" or fallback is True:
+            count += 1
+    planner = trace_summary.get("sandbox_isolation_summary") if isinstance(trace_summary, dict) else {}
+    if isinstance(planner, dict):
+        count = max(count, _safe_int(planner.get("local_process_backend_count")))
+    return count
+
+
+def _sandbox_time_seconds(events: list[dict[str, Any]]) -> float:
+    total = 0.0
+    for event in events:
+        payload = _event_payload(event)
+        if not (_event_type(event).startswith("command.") or "sandbox" in _event_type(event)):
+            continue
+        total += _duration_seconds_from_payload(payload)
+    return round(total, 3)
+
+
+def _provider_time_seconds(events: list[dict[str, Any]], trace_summary: dict[str, Any]) -> float:
+    total = 0.0
+    for event in events:
+        if _event_type(event) not in {"model.response.received", "model.request.failed"}:
+            continue
+        total += _duration_seconds_from_payload(_event_payload(event))
+    if total:
+        return round(total, 3)
+    usage = trace_summary.get("model_usage_summary") if isinstance(trace_summary, dict) else {}
+    if isinstance(usage, dict):
+        return round(_safe_float(usage.get("latency_ms")) / 1000.0, 3)
+    return 0.0
+
+
+def _duration_seconds_from_payload(payload: dict[str, Any]) -> float:
+    if payload.get("duration_seconds") is not None:
+        return _safe_float(payload.get("duration_seconds"))
+    if payload.get("duration_ms") is not None:
+        return _safe_float(payload.get("duration_ms")) / 1000.0
+    if payload.get("latency_ms") is not None:
+        return _safe_float(payload.get("latency_ms")) / 1000.0
+    return 0.0
+
+
+def _pytest_time_seconds(*results: CommandEvalResult | None) -> float:
+    seen: set[tuple[str, float]] = set()
+    total = 0.0
+    for result in results:
+        if result is None:
+            continue
+        command = result.raw_command or result.command
+        if "pytest" in command:
+            key = (command, result.duration_seconds)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += result.duration_seconds
+    return round(total, 3)
+
+
+def _verification_time_seconds(*results: CommandEvalResult | None) -> float:
+    seen: set[tuple[str, float]] = set()
+    total = 0.0
+    for result in results:
+        if result is None:
+            continue
+        key = (result.raw_command or result.command, result.duration_seconds)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += result.duration_seconds
+    return round(total, 3)
+
+
+def _ordered_verification_checks(checks: dict[str, Any]) -> list[str]:
+    ordered = [name for name in ("public", "hidden") if isinstance(checks.get(name), dict)]
+    ordered.extend(
+        name
+        for name, payload in sorted(checks.items())
+        if name not in {"public", "hidden"} and isinstance(payload, dict)
+    )
+    return ordered
+
+
 def _repair_phase_contract_satisfaction(payload: dict[str, Any]) -> dict[str, Any]:
     planner = payload.get("planner_summary") if isinstance(payload, dict) else {}
     satisfaction = planner.get("contract_satisfaction") if isinstance(planner, dict) else {}
@@ -1824,6 +2166,8 @@ def _hidden_verification_command(task: EvaluationTask) -> str:
 
 
 def _model_visible_verification_command(task: EvaluationTask) -> str:
+    if task.model_visible_verification_command:
+        return task.model_visible_verification_command
     if task.verification_prepare_commands:
         return task.public_verification_command
     return task.verification_command
@@ -2244,8 +2588,17 @@ def _reset_dir(path: Path, *, root: Path) -> None:
     if os.path.commonpath([str(root_resolved), str(resolved)]) != str(root_resolved):
         raise ValueError("refusing to delete outside evaluation run directory.")
     if resolved.exists():
+        _make_tree_writable(resolved)
         shutil.rmtree(resolved)
     resolved.mkdir(parents=True, exist_ok=True)
+
+
+def _make_tree_writable(root: Path) -> None:
+    for path in [root, *root.rglob("*")]:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            continue
 
 
 def _copy_ignore(_dir: str, names: list[str]) -> set[str]:
@@ -2278,6 +2631,11 @@ def _display_path(path: str) -> str:
 
 def _is_git_repo(path: Path) -> bool:
     return (path / ".git").exists()
+
+
+def _is_remote_git_url(value: str) -> bool:
+    lowered = value.lower().strip()
+    return lowered.startswith(("https://", "http://", "ssh://", "git@"))
 
 
 def _status_path(line: str) -> str:

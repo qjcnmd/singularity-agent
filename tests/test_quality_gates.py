@@ -17,6 +17,11 @@ _REQUIRED_CI_COMMANDS = (
     "python scripts/verify_runtime_docs.py",
     'python -m pytest tests --basetemp work/pytest-tmp -m "not provider_eval and not external and not slow"',
 )
+_REQUIRED_LOCAL_GATE_SCRIPTS = (
+    "scripts/verify_fast.py",
+    "scripts/verify_stage.py",
+    "scripts/verify_capability.py",
+)
 
 
 def _project_configuration() -> dict[str, object]:
@@ -66,6 +71,41 @@ def test_ci_workflow_enforces_cross_platform_quality_gates() -> None:
     for required in _REQUIRED_CI_COMMANDS:
         assert any(required in command for command in commands)
 
+
+
+def test_local_tiered_verification_gate_scripts_exist() -> None:
+    for script in _REQUIRED_LOCAL_GATE_SCRIPTS:
+        path = Path(script)
+        assert path.exists(), f"missing local verification gate: {script}"
+        text = path.read_text(encoding="utf-8")
+        assert "duration_seconds" in text
+        assert "json" in text.lower()
+
+
+def test_local_gate_pytest_commands_override_default_evaluation_exclusion() -> None:
+    fast = Path("scripts/verify_fast.py").read_text(encoding="utf-8")
+    stage = Path("scripts/verify_stage.py").read_text(encoding="utf-8")
+
+    assert "not provider_eval and not slow and not external" in fast
+    assert "evaluation and not provider_eval and not slow and not external" in stage
+
+
+def test_quality_matrix_remains_two_os_by_four_python_versions() -> None:
+    workflow = _workflow_configuration()
+    jobs = workflow["jobs"]
+    quality = jobs["quality"]
+    strategy = quality["strategy"]
+    matrix = strategy["matrix"]
+
+    combinations = [
+        (os_name, python_version)
+        for os_name in matrix["os"]
+        for python_version in matrix["python-version"]
+    ]
+
+    assert len(combinations) == 8
+    assert set(matrix["os"]) == {"ubuntu-latest", "windows-latest"}
+    assert set(matrix["python-version"]) == {"3.11", "3.12", "3.13", "3.14"}
 
 
 def test_provider_validation_is_explicitly_gated_without_fake_fallback() -> None:
