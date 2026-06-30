@@ -1,6 +1,6 @@
 # Singularity 主链路完整调用链（全部分支路径）
 
-> 基于最后一次已 push 的 `origin/main@58e2d8dd` 源码核对：`agent_loop.py`(849行)、`run_controller.py`(439行)、`execution_outcome.py`(52行)、`error_codes.py`(114行)、`kernel/agent_kernel.py`(393行)、`tool_protocol/engine.py`(986行)。
+> 基于 `origin/main@ab3080f3` + Phase 7 工作树源码核对：`agent_loop.py`(891行)、`run_controller.py`(479行)、`execution_outcome.py`(60行)、`error_codes.py`(123行)、`kernel/agent_kernel.py`(414行)、`tool_protocol/engine.py`(946行)。
 > `[成功]` / `[失败]` / `[阻断]` 为关键分叉点；缩进表示嵌套层级。
 
 ---
@@ -815,6 +815,10 @@
 │                                                              │
 │  ┌─ 最终化路径（最完整的成功路径）───────────────────────┐    │
 │  │   │  report = planner.finalize()                      │    │
+│  │   │  → Finalizer.build() 通过 EvidenceLedger typed     │    │
+│  │   │    helper 读取 verification / sandbox / policy /  │    │
+│  │   │    tool result / task outcome 关键 bucket，避免      │    │
+│  │   │    从裸 dict 随意读取缺字段或 stale blocker。        │    │
 │  │   │  → FinalReport {                                   │    │
 │  │   │      status, files_changed, verification_summary,  │    │
 │  │   │      review_summary, unresolved_issues, risks,     │    │
@@ -1177,7 +1181,18 @@
 │                                                              │
 │  trace.emit("tool_protocol.plan_built", …)                   │
 │                                                              │
-│  ⑧ 执行计划 (execute_plan / _execute_parallel_readonly_plan)    │
+│  ⑧ 执行计划 (shared lifecycle core + scheduling strategy)       │
+│                                                              │
+│  batch = _batch_for_plan(plan, context)                       │
+│  counters = _ToolExecutionCounters()                          │
+│  ★ serial 与 parallel_readonly 共用同一组 call lifecycle helper：│
+│    _prepare_call()       → validation trace / record upsert / │
+│                            synthetic result / replay check / │
+│                            scheduled+running transition       │
+│    _bind_synthetic_result() → rejected / replay-blocked 结果绑定│
+│    _complete_call()      → result builder / state transition /│
+│                            context append / trace emit        │
+│    _turn_result()        → ToolProtocolTurnResult 汇总         │
 │                                                              │
 │  ★★★ 分叉：执行模式 ★★★                                      │
 │                                                              │
@@ -1185,7 +1200,10 @@
 │  │   │  AND plan.parallel_groups is not empty              │ │
 │  │   └── _execute_parallel_readonly_plan(                   │ │
 │  │           plan, batch, context, tool_executor, turn)    │ │
-│  │       → 按 parallel_groups 分组执行只读工具调用            │ │
+│  │       → group trace 记录调度组边界                         │ │
+│  │       → 每个 call 仍先走 _prepare_call()                   │ │
+│  │       → prepared read-only calls 交给 ParallelToolExecutor│ │
+│  │       → 每个执行结果仍走 _complete_call()                  │ │
 │  │       → 返回 ToolProtocolTurnResult                      │ │
 │  └──────────────────────────────────────────────────────────┘ │
 │                                                              │
@@ -1199,11 +1217,10 @@
 │  │                                                        │   │
 │  │  for each call in ordered_calls:                       │   │
 │  │      │                                                 │   │
-│  │      ├── _throw_if_cancelled()                          │   │
-│  │      │                                                 │   │
-│  │      ├── state_store.upsert_record(                    │   │
-│  │      │       call, batch_id, phase=VALIDATED)           │   │
-│  │      ├── trace.emit("tool_protocol.call_validated")    │   │
+│  │      ├── prepared = _prepare_call(batch, context, call)│   │
+│  │      │   ├── _throw_if_cancelled()                      │   │
+│  │      │   ├── state_store.upsert_record(VALIDATED)       │   │
+│  │      │   └── trace.emit("tool_protocol.call_validated") │   │
 │  │      │                                                 │   │
 │  │      ├── [validation_errors] ──────────────────────┐   │   │
 │  │      │   │  参数验证失败                                │   │   │
@@ -1287,17 +1304,15 @@
 │  │      │       │  │   _enforce_policy()                  │   │
 │  │      │       │  │   → policy_engine.enforce(PolicyRequest)│
 │  │      │       │  │   → PolicyDecision {                 │   │
-│  │      │       │  │       allowed, escalated,             │   │
-│  │      │       │  │       require_approval,               │   │
-│  │      │       │  │       require_user_input,             │   │
-│  │      │       │  │       reason, error_code }            │   │
-│  │      │       │  │   ├── [allowed]              → 继续    │   │
-│  │      │       │  │   ├── [escalated]            → 继续    │   │
-│  │      │       │  │   ├── [require_approval]     → 审批    │   │
-│  │      │       │  │   └── [blocked/denied]       → error  │   │
+│  │      │       │  │       outcome, reason, risk_level,    │   │
+│  │      │       │  │       risk_tags, constraints,         │   │
+│  │      │       │  │       required_approval, error_code } │   │
+│  │      │       │  │   ├── [allow/sandbox_required] → 继续 │   │
+│  │      │       │  │   ├── [require_review]       → 审批    │   │
+│  │      │       │  │   └── [deny/ask_user]        → error  │   │
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ⑥ 审批门控                           │   │
-│  │      │       │  │   if require_approval:                │   │
+│  │      │       │  │   if required_approval:               │   │
 │  │      │       │  │   approval_gate.authorize(           │   │
 │  │      │       │  │       tool_name, arguments,          │   │
 │  │      │       │  │       policy_decision)               │   │
@@ -1329,8 +1344,13 @@
 │  │      │       │  │   ├── [命令工具]                       │   │
 │  │      │       │  │   │   CommandExecutor.run(           │   │
 │  │      │       │  │   │       command, cwd, env, …)      │   │
-│  │      │       │  │   │   ├── CommandPolicy.evaluate()   │   │
-│  │      │       │  │   │   │   → CommandDecision           │   │
+│  │      │       │  │   │   ├── _policy_request()          │   │
+│  │      │       │  │   │   │   + CommandPolicy.classify() │   │
+│  │      │       │  │   │   │   → command PolicyRequest     │   │
+│  │      │       │  │   │   ├── PolicyEngine.enforce()     │   │
+│  │      │       │  │   │   │   → PolicyDecision            │   │
+│  │      │       │  │   │   ├── _command_policy_result()   │   │
+│  │      │       │  │   │   │   → CommandPolicyResult 投影  │   │
 │  │      │       │  │   │   ├── SandboxManager.run()       │   │
 │  │      │       │  │   │   │   ├── prepare(workspace)     │   │
 │  │      │       │  │   │   │   ├── WindowsSandboxBackend   │   │

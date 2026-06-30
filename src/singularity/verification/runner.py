@@ -697,7 +697,13 @@ class VerificationRunner:
                 "command": command,
                 "transaction_id": plan.transaction_id,
                 "changeset_id": plan.changeset_id,
+                **(check.command.safe_metadata() if check.command else {}),
             },
+            requires_network=(
+                check.command.network_mode.value != "DISABLED"
+                if check.command
+                else False
+            ),
             touches_workspace=False,
             workspace_root=str(self.workspace_root),
         )

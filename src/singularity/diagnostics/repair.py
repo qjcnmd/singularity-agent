@@ -10,10 +10,10 @@ from uuid import uuid4
 from singularity.code_index import ProjectIndex
 from singularity.diagnostics.models import (
     DiagnosticFinding,
+    DiagnosticRepairResult,
     DiagnosticResult,
     DiagnosticSeverity,
     RepairAction,
-    RepairPlan,
     now_iso,
 )
 from singularity.memory.store import MemoryStore
@@ -31,10 +31,10 @@ class RepairEngine:
         paths: UserDataPaths,
         project_root: Path,
         apply: bool = False,
-    ) -> RepairPlan:
+    ) -> DiagnosticRepairResult:
         actions, blocked = self._actions_for(result)
         if not apply or not actions:
-            return RepairPlan(actions=actions, blocked_actions=blocked, applied=False)
+            return DiagnosticRepairResult(actions=actions, blocked_actions=blocked, applied=False)
         audit_log = self._write_audit(paths, actions)
         applied_actions: list[RepairAction] = []
         for action in actions:
@@ -49,7 +49,7 @@ class RepairEngine:
                         message=f"{type(exc).__name__}: {exc}",
                     )
                 )
-        return RepairPlan(
+        return DiagnosticRepairResult(
             actions=applied_actions,
             blocked_actions=blocked,
             applied=True,

@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from singularity.planner.models import EvidenceLedger, FinalReport, TaskState, TaskStatus
+from singularity.planner.models import (
+    EvidenceLedger,
+    FinalReport,
+    SandboxObservationRecord,
+    TaskState,
+    TaskStatus,
+)
 
 
 class Finalizer:
@@ -44,11 +50,11 @@ class Finalizer:
                     artifacts.add(str(item["relative_path"]))
 
         verification_summary: dict[str, Any] = {"status": "not_run"}
-        if evidence.verification_results:
-            latest = evidence.verification_results[-1]
-            verification_summary = dict(latest.get("completion_assessment") or {})
-            if "check_status" in latest:
-                verification_summary["check_status"] = latest["check_status"]
+        latest_verification = evidence.latest_verification_result()
+        if latest_verification is not None:
+            verification_summary = dict(latest_verification.completion_assessment)
+            if latest_verification.check_status:
+                verification_summary["check_status"] = latest_verification.check_status
 
         review_summary = self._review_summary(evidence)
         latest_review_decision = review_summary.get("latest_decision")
@@ -106,36 +112,36 @@ class Finalizer:
 
     @staticmethod
     def _policy_summary(evidence: EvidenceLedger) -> dict[str, Any]:
-        observations = evidence.policy_observations
-        allowed = [item for item in observations if item.get("outcome") == "allow"]
+        observations = evidence.policy_records()
+        allowed = [item for item in observations if item.outcome == "allow"]
         reviewed = [
             item
             for item in observations
-            if item.get("outcome") in {"require_review", "reviewed", "approved"}
+            if item.outcome in {"require_review", "reviewed", "approved"}
         ]
-        denied = [item for item in observations if item.get("outcome") == "deny"]
+        denied = [item for item in observations if item.outcome == "deny"]
         sandbox = [
-            item for item in observations if item.get("outcome") == "sandbox_required"
+            item for item in observations if item.outcome == "sandbox_required"
         ]
         approved = [
-            item
+            item.to_dict()
             for item in observations
-            if item.get("approved_by_user") or item.get("approval_grant_id")
+            if item.approved_by_user or item.approval_grant_id
         ]
         high_risk_commands = [
-            item
+            item.to_dict()
             for item in observations
-            if item.get("component") == "command"
-            and item.get("risk_level") in {"high", "critical"}
+            if item.component == "command"
+            and item.risk_level in {"high", "critical"}
         ]
         skipped = [
             item
             for item in observations
-            if item.get("outcome") in {"deny", "sandbox_required", "escalate"}
+            if item.outcome in {"deny", "sandbox_required", "escalate"}
         ]
         return {
             "allowed_low_risk_actions_count": len(
-                [item for item in allowed if item.get("risk_level") in {None, "none", "low"}]
+                [item for item in allowed if item.risk_level in {None, "none", "low"}]
             ),
             "reviewed_actions_count": len(reviewed),
             "denied_actions_count": len(denied),
@@ -147,13 +153,13 @@ class Finalizer:
 
     @staticmethod
     def _sandbox_summary(evidence: EvidenceLedger) -> dict[str, Any]:
-        observations = evidence.sandbox_observations
+        observations = evidence.sandbox_records()
         if not observations:
-            observations = []
+            fallback_observations: list[dict[str, Any]] = []
             for command in evidence.command_results:
                 sandbox = ((command.get("isolation_report") or {}).get("sandbox") or {})
                 if sandbox.get("sandbox_id"):
-                    observations.append(
+                    fallback_observations.append(
                         {
                             "source": "command",
                             "backend": sandbox.get("backend"),
@@ -175,7 +181,7 @@ class Finalizer:
                 for result in verification.get("results") or []:
                     result_evidence = result.get("evidence") or {}
                     if result_evidence.get("sandbox_id"):
-                        observations.append(
+                        fallback_observations.append(
                             {
                                 "source": "verification",
                                 "backend": result_evidence.get("sandbox_backend"),
@@ -197,38 +203,42 @@ class Finalizer:
                                 "imported_changes_count": 0,
                             }
                         )
+            observations = [
+                SandboxObservationRecord.from_dict(item)
+                for item in fallback_observations
+            ]
         return {
-            "sandboxed_commands_count": len([item for item in observations if item.get("source") == "command"]),
-            "verification_commands_run_in_sandbox_count": len([item for item in observations if item.get("source") == "verification"]),
-            "backend_unavailable_count": len([item for item in observations if item.get("status") == "backend_unavailable"]),
-            "sandbox_violation_count": sum(len(item.get("violations") or []) for item in observations),
-            "timeout_count": len([item for item in observations if item.get("status") == "timeout"]),
+            "sandboxed_commands_count": len([item for item in observations if item.source == "command"]),
+            "verification_commands_run_in_sandbox_count": len([item for item in observations if item.source == "verification"]),
+            "backend_unavailable_count": len([item for item in observations if item.status == "backend_unavailable"]),
+            "sandbox_violation_count": sum(len(item.violations) for item in observations),
+            "timeout_count": len([item for item in observations if item.status == "timeout"]),
             "selected_backends": sorted(
-                {str(item.get("backend")) for item in observations if item.get("backend")}
+                {str(item.backend) for item in observations if item.backend}
             ),
             "network_denied_verified_count": len(
-                [item for item in observations if item.get("network_denied_verified") is True]
+                [item for item in observations if item.network_denied_verified is True]
             ),
-            "job_killed_count": len([item for item in observations if item.get("job_killed") is True]),
+            "job_killed_count": len([item for item in observations if item.job_killed is True]),
             "local_process_backend_count": len(
-                [item for item in observations if item.get("backend") == "local_process"]
+                [item for item in observations if item.backend == "local_process"]
             ),
-            "artifact_count": sum(int(item.get("artifact_count") or 0) for item in observations),
+            "artifact_count": sum(int(item.artifact_count or 0) for item in observations),
             "artifact_refs": [
                 ref
                 for item in observations
-                for ref in (item.get("artifact_refs") or [])
+                for ref in item.artifact_refs
             ],
-            "changed_files_in_sandbox_count": sum(int(item.get("changed_files_count") or 0) for item in observations),
-            "imported_changes_count": sum(int(item.get("imported_changes_count") or 0) for item in observations),
+            "changed_files_in_sandbox_count": sum(int(item.changed_files_count or 0) for item in observations),
+            "imported_changes_count": sum(int(item.imported_changes_count or 0) for item in observations),
         }
 
     @staticmethod
     def _execution_trace_summary(evidence: EvidenceLedger) -> dict[str, Any]:
         failed_actions = [
-            item
-            for item in evidence.tool_results
-            if item.get("ok") is False or item.get("error_code")
+            item.to_dict()
+            for item in evidence.tool_result_records()
+            if item.ok is False or item.error_code
         ]
         failed_commands = [
             item
@@ -236,28 +246,28 @@ class Finalizer:
             if item.get("semantic_status") not in {None, "succeeded", "SUCCEEDED"}
         ]
         return {
-            "total_actions": len(evidence.tool_results),
+            "total_actions": len(evidence.tool_result_records()),
             "failed_actions": len(failed_actions),
-            "tool_calls": len(evidence.tool_results),
+            "tool_calls": len(evidence.tool_result_records()),
             "commands_executed": len(evidence.command_results),
             "sandboxed_commands": len(evidence.sandbox_observations),
             "workspace_mutations": len(evidence.applied_changes),
             "verification_checks": sum(
-                len(item.get("check_status") or [])
-                for item in evidence.verification_results
+                len(item.check_status)
+                for item in evidence.verification_records()
             ),
             "policy_denials": len(
                 [
                     item
-                    for item in evidence.policy_observations
-                    if item.get("outcome") in {"deny", "require_review", "sandbox_required", "escalate"}
+                    for item in evidence.policy_records()
+                    if item.outcome in {"deny", "require_review", "sandbox_required", "escalate"}
                 ]
             ),
             "approvals": len(
                 [
                     item
-                    for item in evidence.policy_observations
-                    if item.get("approval_grant_id") or item.get("approved_by_user")
+                    for item in evidence.policy_records()
+                    if item.approval_grant_id or item.approved_by_user
                 ]
             ),
             "replans": 0,

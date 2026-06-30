@@ -53,9 +53,11 @@ Verification 层发现、计划并执行验证命令，把命令结果转换为 
 
 `run_verification` tool -> `VerificationToolHandlers.run_verification()` -> `VerificationRunner.plan_verification()` / `run_plan()` -> `CommandExecutor.run()` -> parsers -> `CompletionAssessor.assess()` -> planner evidence -> `Planner.assess_verification_contract_satisfaction()` -> `AgentLoop._attempt_finalize()`。
 
+`VerificationRunner.plan_verification()` 内的 `VerificationPolicy.evaluate()` 只处理 required check 没有 command 这类 verification 结构 blocker，并用 `CommandPolicy.classify()` 给可执行 check 补充风险标签；它不再调用 `CommandPolicy.evaluate()`，也不产生最终 command allow/deny/review 裁决。可执行验证命令的最终策略结果来自 `VerificationRunner._run_check()` 和 `CommandExecutor.run()` 中的 `PolicyEngine.enforce()`。
+
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 后执行验证为例：`VerificationToolHandlers.run_verification()` -> `VerificationRunner.plan_verification()` 先生成对象 `VerificationCheck` 和 verification plan，`VerificationRunner.run_plan()` 调用 `CommandExecutor.run()` 执行命令并生成 `VerificationResult`。`CompletionAssessor.assess()` 消费 result 列表返回 `CompletionAssessment`，同时 tool observation 写入 `context.sqlite3`，planner evidence 写入 `.singularity/planner/<session_id>/evidence.json`。repair contract 场景中，`Planner.assess_verification_contract_satisfaction()` 读取 `VerificationContract` 和 evidence，生成 `StepEvidence` / `ContractSatisfaction`；failed、blocked、skipped 或 command 不在 contract 时返回 `satisfied=False` 并阻止 `AgentLoop._attempt_finalize()` 完成。
+以用户要求修复 `quicksort.py` 后执行验证为例：`VerificationToolHandlers.run_verification()` -> `VerificationRunner.plan_verification()` 先生成对象 `VerificationCheck` 和 verification plan，plan-time preflight 只把无 executable command 的 required check 放入 blocked_checks，并把 command 分类标签写回 `VerificationCheck.risk_tags`。`VerificationRunner.run_plan()` 对可执行 check 先调用 `_policy_request()` / `PolicyEngine.enforce()` 记录 verification-level policy，再调用 `CommandExecutor.run()` 让同一个 `PolicyEngine` 对实际 command 执行边界裁决，随后生成 `VerificationResult`。`CompletionAssessor.assess()` 消费 result 列表返回 `CompletionAssessment`，同时 tool observation 写入 `context.sqlite3`，planner evidence 写入 `.singularity/planner/<session_id>/evidence.json`。repair contract 场景中，`Planner.assess_verification_contract_satisfaction()` 读取 `VerificationContract` 和 evidence，生成 `StepEvidence` / `ContractSatisfaction`；failed、blocked、skipped 或 command 不在 contract 时返回 `satisfied=False` 并阻止 `AgentLoop._attempt_finalize()` 完成。
 
 ## 真实对象完整结构
 
@@ -181,19 +183,19 @@ class CompletionStatus(str, Enum):   # CompletionAssessment.status
 
 ### 数据流概述
 
-`VerificationRunner.plan_verification()` 生成 `VerificationCheck` 列表，`run_plan()` 调用 `CommandExecutor.run()` 执行命令生成 `VerificationResult`。`CompletionAssessor.assess()` 消费 result 列表返回 `CompletionAssessment`。`VerificationContract.from_plan_strings()` 生成 `VerificationContract`。`Planner.assess_verification_contract_satisfaction()` 读取 contract 和 evidence 生成 `StepEvidence` 和 `ContractSatisfaction`。每个 check 产生 `PolicyRequest`/`PolicyDecision` 进入 policy audit ledger。
+`VerificationRunner.plan_verification()` 生成 `VerificationCheck` 列表，`VerificationPolicy.evaluate()` 只做 plan-time 结构检查和风险标签补充。`run_plan()` 调用 `PolicyEngine.enforce()` 做 verification-level preflight，再调用 `CommandExecutor.run()` 执行命令生成 `VerificationResult`。`CompletionAssessor.assess()` 消费 result 列表返回 `CompletionAssessment`。`VerificationContract.from_plan_strings()` 生成 `VerificationContract`。`Planner.assess_verification_contract_satisfaction()` 读取 contract 和 evidence 生成 `StepEvidence` 和 `ContractSatisfaction`。可执行 check 的 `PolicyRequest`/`PolicyDecision` 在执行阶段进入 policy audit ledger。
 
 `VerificationRunner._result_from_command()` 对命令输出先走 `FailureParserRegistry.parse()`，再由 `classify_failure()` 将 sandbox backend unavailable归为`sandbox_limitation`、sandbox violation归为`sandbox_violation`、timeout归为`timeout`、missing command归为`missing_command`。Python DLL/import初始化类环境问题（例如 `ImportError: DLL load failed while importing _ssl`、`_hashlib`、`_socket`、`libssl/libcrypto`缺失、OpenSSL provider/config不可读、证书路径不可读、DLL search path失败或 DLL initialization routine failed）优先归为`environment_error`，状态为`blocked`，不会按pytest普通失败进入代码修复。`environment_error`、`sandbox_limitation`和`sandbox_violation`不生成普通`repair_hints`；调用方必须把它们作为环境/沙箱 blocker 处理，而不是让模型修改业务代码。
 
 ## 谁生成这些对象
 
-- `VerificationRunner._check()` 生成 `VerificationCheck`；执行、blocked、skipped、budget 与 policy 分支生成 `VerificationResult`。`CompletionAssessor.assess()` 从 verification plan 和 result 列表生成 `CompletionAssessment`。
+- `VerificationRunner._check()` 生成 `VerificationCheck`；plan-time 结构 blocker、执行、skipped、budget 与 policy 分支生成 `VerificationResult`。`CompletionAssessor.assess()` 从 verification plan 和 result 列表生成 `CompletionAssessment`。
 - `VerificationContract.from_plan_strings()` 或 Planner 的 benchmark/repair contract 路径生成 `VerificationStep` 与 `VerificationContract`；contract validation errors 在构造时确定。
 - `Planner.assess_verification_contract_satisfaction()` 将 contract step 与 evidence 对齐，逐步生成 `StepEvidence`，再生成 `ContractSatisfaction`；这不是 `VerificationRunner` 的输出。
 
 ## 谁消费这些对象
 
-- verification planner、policy gate、`CommandExecutor` 消费 `VerificationCheck`；assessor、failure analysis 和 Planner 消费 `VerificationResult`。`run_verification` tool 将安全 result/assessment 投影写入 context，因此下一轮模型可见该投影，而不是内部 command/policy 对象。
+- verification planner、`PolicyEngine`、`CommandExecutor` 消费 `VerificationCheck`；assessor、failure analysis 和 Planner 消费 `VerificationResult`。`run_verification` tool 将安全 result/assessment 投影写入 context，因此下一轮模型可见该投影，而不是内部 command/policy 对象。
 - `AgentLoop._attempt_finalize()` 通过 Planner completion state 消费 `CompletionAssessment` 的结论；assessment 本体也进入 verification tool result 与 planner `final_assessment`。
 - Planner tool authorization、`VerificationRunner.plan_verification()` 和 contract satisfaction 消费 `VerificationContract`/`VerificationStep`。repair planner context 可把 contract 摘要送入模型；`StepEvidence`/`ContractSatisfaction` 用于 completion/report，不直接作为 provider message。
 
@@ -206,12 +208,12 @@ class CompletionStatus(str, Enum):   # CompletionAssessment.status
 ## 是否进入 trace / audit
 
 - verification runner 记录 plan、check/result、`verification.evidence_recorded` 与 completion assessment 摘要；legacy `verification` record 的 payload 来自 result/assessment 的安全 `to_dict()` 投影，并关联 verification/command ids 与 artifact refs。
-- 每个执行检查都先产生 `PolicyRequest`/`PolicyDecision`，decision 进入 policy audit ledger；blocked/denied check 的 `policy_decision` 和 reasons 同时进入 `VerificationCheck`/`VerificationResult`。
+- 每个可执行检查在 `_run_check()` 产生 verification-level `PolicyRequest`/`PolicyDecision`，decision 进入 policy audit ledger；随后实际 command 再由 `CommandExecutor.run()` 产生 command-level `PolicyRequest`/`PolicyDecision`。blocked/denied check 的 `policy_decision` 和 reasons 同时进入 `VerificationCheck`/`VerificationResult`。
 - Planner 对 contract satisfaction 的结果进入 planner event/final report；不存在单独的 `VerificationRunner.contract_satisfaction` recorder。
 
 ## 失败路径
 
-- `VerificationResult.status` 区分 passed、failed、timeout、blocked、skipped、flaky；policy、budget、missing command 与 parser failure分别由 helper 生成对应 result，而不是抛弃该 check。
+- `VerificationResult.status` 区分 passed、failed、timeout、blocked、skipped、flaky；plan-time missing command、execution-time policy、budget 与 parser failure分别由 helper 生成对应 result，而不是抛弃该 check。
 - Python runtime DLL/import初始化失败在`classify_failure()`中归为`FailureType.ENVIRONMENT_ERROR`，`VerificationRunner._status_from_command()`把它归为`blocked`，并且`_result_from_command()`不给这类环境/沙箱失败生成普通代码 repair hints。该路径覆盖 `_ssl.pyd`、`libssl/libcrypto`、OpenSSL provider/config、证书路径、DLL search path与low-integrity初始化失败，避免 runtime blocker 被误认为 `unit_test_failure` 后进入 repair loop。
 - `CompletionAssessor` 对 required failure 返回 `failed`，required blocked 返回 `blocked`，缺结果/高风险人工复核返回 `needs_review`，warning/flaky 返回 `ready_with_warnings`，全部满足才是 `ready`。
 - contract 的 invalid/pending、missing step、command 不在 contract 或 step evidence failed/skipped 会使 `ContractSatisfaction.satisfied=False` 并给出 reason；Planner completion gate据此拒绝完成或进入 repair。

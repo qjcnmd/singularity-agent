@@ -17,6 +17,11 @@
 - TaskPlan
 - AgentAction
 - EvidenceLedger
+- VerificationEvidenceRecord
+- SandboxObservationRecord
+- PolicyObservationRecord
+- ToolResultRecord
+- TaskOutcomeRecord
 - ReplanDecision
 - Replanner
 - FinalReport
@@ -28,6 +33,11 @@
 - TaskPhase: phase_id, name, purpose, allowed_tools, allowed_actions, entry_conditions, exit_conditions, required_evidence, failure_policy, risk_notes
 - TaskPlan: plan_id, task_id, phases, current_phase, version, updated_at
 - AgentAction: kind, intent, phase_id, preconditions, allowed_tools, expected_evidence, risk_level, status, action_id, result_ref
+- VerificationEvidenceRecord: completion_assessment, check_status, results, tool_call_id, plan, extra
+- SandboxObservationRecord: source, backend, status, enforcement_status, execution_backend, network_denied_verified, process_tree_kill, job_killed, timeout_enforced, artifact_count, artifact_refs, changed_files_count, violations, imported_changes_count, extra
+- PolicyObservationRecord: outcome, component, operation, reason, risk_level, resource, approval_grant_id, approved_by_user, extra
+- ToolResultRecord: tool_call_id, tool_name, action_id, ok, status, error_code, failure, extra
+- TaskOutcomeRecord: status, error_code, summary, reason, next_action, retry_allowed, missing_evidence, extra
 - EvidenceLedger: inspected_files, relevant_symbols, search_results, applied_changes, command_results, verification_results, parsed_failures, assumptions, missing_evidence, unresolved_failures, external_changes, risks, tool_results, policy_observations, sandbox_observations, instruction_prompt_observations, project_index_observations, diff_observations, edit_plans, edit_results, review_results, failure_analyses, repair_plans, retrieval_results, task_outcomes
 - ExecutionBudget: max_model_turns, max_tool_calls, max_command_runs, max_mutation_transactions, max_repair_iterations, max_changed_files, max_wall_time_seconds, max_repeated_failures, max_context_growth, model_turns, tool_calls, command_runs, mutation_transactions, repair_iterations, changed_files, context_growth, repeated_failures
 - AuthorizationDecision: allowed, action, error_code, reason, risk_decision
@@ -60,7 +70,7 @@ Planner 层维护任务状态、阶段、行动、证据、预算、重规划决
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`Planner.start_task()` -> `Planner.step()` -> `Planner.update_from_tool_result()` / `update_from_command()` / `update_from_verification()` 先生成对象 `TaskState`、`TaskPhase`、`TaskPlan` 和 `AgentAction`，再把工具、命令和验证结果写入 `EvidenceLedger` 并更新 `ExecutionBudget`；`Planner._persist()` 再把 state/plan/evidence/budget 写入 `.singularity/planner/<session_id>/state.json`、`plan.json`、`evidence.json`、`budget.json`。completion gate 不满足时 `Planner.replan()` 先调用 `Replanner.decide()` 取得 `ReplanDecision`，再在同一方法内应用状态转换、重复失败预算和 event recording；失败分析的 `RepairReplanSignal` 通过 `Planner.record_failure_analysis()` 进入同一 evidence/report 链。
+以用户要求修复 `quicksort.py` 为例：`Planner.start_task()` -> `Planner.step()` -> `Planner.update_from_tool_result()` / `update_from_command()` / `update_from_verification()` 先生成对象 `TaskState`、`TaskPhase`、`TaskPlan` 和 `AgentAction`，再通过 `EvidenceLedger.add_tool_result()`、`add_verification_result()`、`add_sandbox_observation()`、`add_policy_observation()`、`add_task_outcome()` 把关键 evidence bucket 规范化为 typed record 的 JSON 投影，并更新 `ExecutionBudget`；`Planner._persist()` 再把 state/plan/evidence/budget 写入 `.singularity/planner/<session_id>/state.json`、`plan.json`、`evidence.json`、`budget.json`。completion gate 不满足时 `Planner.replan()` 先调用 `Replanner.decide()` 取得 `ReplanDecision`，再在同一方法内应用状态转换、重复失败预算和 event recording；失败分析的 `RepairReplanSignal` 通过 `Planner.record_failure_analysis()` 进入同一 evidence/report 链。
 ## 真实对象完整结构
 
 ### TaskState（任务状态）
@@ -116,6 +126,73 @@ class AgentAction:
     status: ActionStatus = ActionStatus.PROPOSED
     action_id: str = field(default_factory=lambda: f"action_{uuid4().hex[:12]}")
     result_ref: str | None = None
+```
+
+### Evidence typed records（关键证据记录）
+
+completion、verification、sandbox、policy、tool result 和 task outcome 相关 bucket 的 typed projection。**边界**：运行时仍以 `EvidenceLedger` 的 list-of-dict JSON shape 落盘；`add_*()` 和 `*_records()` helper 在写入与 Finalizer/CompletionGate 读取时提供字段稳定性。
+
+```python
+@dataclass(frozen=True)
+class VerificationEvidenceRecord:
+    completion_assessment: dict[str, Any] = field(default_factory=dict)
+    check_status: list[dict[str, Any]] = field(default_factory=list)
+    results: list[dict[str, Any]] = field(default_factory=list)
+    tool_call_id: str | None = None
+    plan: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class SandboxObservationRecord:
+    source: str | None = None
+    backend: str | None = None
+    status: str | None = None
+    enforcement_status: str | None = None
+    execution_backend: str | None = None
+    network_denied_verified: bool | None = None
+    process_tree_kill: bool | None = None
+    job_killed: bool | None = None
+    timeout_enforced: bool | None = None
+    artifact_count: int = 0
+    artifact_refs: list[str] = field(default_factory=list)
+    changed_files_count: int = 0
+    violations: list[dict[str, Any]] = field(default_factory=list)
+    imported_changes_count: int = 0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class PolicyObservationRecord:
+    outcome: str | None = None
+    component: str | None = None
+    operation: str | None = None
+    reason: str | None = None
+    risk_level: str | None = None
+    resource: str | None = None
+    approval_grant_id: str | None = None
+    approved_by_user: bool | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class ToolResultRecord:
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    action_id: str | None = None
+    ok: bool | None = None
+    status: str | None = None
+    error_code: str | None = None
+    failure: dict[str, Any] | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class TaskOutcomeRecord:
+    status: str
+    error_code: str | None = None
+    summary: str | None = None
+    reason: str | None = None
+    next_action: str | None = None
+    retry_allowed: bool | None = None
+    missing_evidence: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
 ```
 
 ### FinalReport（最终报告）
@@ -203,20 +280,20 @@ class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
 
 ### 数据流概述
 
-`Planner.start_task()` 生成 `TaskState` 和 `TaskPlan`，`Planner.step()` 生成 `AgentAction`。工具/命令/验证结果写入 `EvidenceLedger`（25 个 evidence bucket），`ExecutionBudget` 跟踪计数器。`Planner._persist()` 写 `state.json`/`plan.json`/`evidence.json`/`budget.json`。`Finalizer.build()` 生成 `FinalReport`，落盘 `final_report.json`/`.md`。`PlannerContextRenderer` 只投影 goal、phase、allowed tools、rolling plan 与选择性 evidence 进入模型上下文。
+`Planner.start_task()` 生成 `TaskState` 和 `TaskPlan`，`Planner.step()` 生成 `AgentAction`。工具/命令/验证结果写入 `EvidenceLedger`（25 个 evidence bucket），其中 `verification_results`、`sandbox_observations`、`policy_observations`、`tool_results`、`task_outcomes` 通过 typed helper 写入和读取；持久化仍保持 list-of-dict JSON shape。`ExecutionBudget` 跟踪计数器。`Planner._persist()` 写 `state.json`/`plan.json`/`evidence.json`/`budget.json`。`Finalizer.build()` 通过 `latest_verification_result()`、`sandbox_records()`、`policy_records()`、`tool_result_records()` 聚合关键 summary 并生成 `FinalReport`，落盘 `final_report.json`/`.md`。`PlannerContextRenderer` 只投影 goal、phase、allowed tools、rolling plan 与选择性 evidence 进入模型上下文。
 
 `FinalReport.status` 的完成边界来自三层内部证据：最新 `verification_summary.status` 必须是 `ready` 或 `ready_with_warnings`，final review `latest_decision` 必须是 `accept`，active repair `contract_satisfaction.satisfied` 不能为 false。三者满足时 `Planner.finalize()` 把 `TaskState.status` 置为 `completed`、设置 `completion_criteria.final_report_ready=True`，并清理已由本次 final report 解决的历史 completion blocker。`contract_satisfaction` 随 report 落盘和进入 kernel planner summary；它不进入主模型请求，也不由 evaluation 后验 verification 改写。
 
 ## 谁生成这些对象
 
 - `Planner.start_task()` 生成 `TaskState` 与默认 `CompletionCriteria`，并通过 `_default_plan()` 生成 `TaskPhase` 列表和 `TaskPlan`。`Planner.step()` 根据当前 phase 生成 `AgentAction`。
-- Planner 初始化 `EvidenceLedger`/`ExecutionBudget`；tool、mutation、command、verification、failure/review 的 `record_*`/`update_*` 方法持续更新 evidence，BudgetController 与 replan 路径更新 budget counters。
+- Planner 初始化 `EvidenceLedger`/`ExecutionBudget`；tool、mutation、command、verification、failure/review 的 `record_*`/`update_*` 方法持续更新 evidence。关键 bucket 由 `EvidenceLedger.add_*()` 生成 typed record 后再投影回 dict；BudgetController 与 replan 路径更新 budget counters。
 - `Planner.authorize_tool_call()` 生成 `AuthorizationDecision`，`Replanner.decide()` 生成规则层面的 `ReplanDecision`，`Planner.replan()` 应用该 decision 并处理持久化/事件/预算状态，`RiskEscalator.evaluate_action()` 生成 `RiskEscalation`。`Planner.finalize()` 委托 `Finalizer.build()` 生成 `FinalReport`。
 
 ## 谁消费这些对象
 
 - `Planner.step()`、`AgentLoop.run()` 内部 `run_turn()`、`RunController.apply_protocol_result()` / `apply_outcome()` 和 `Finalizer.build()` 消费 `TaskState`/`TaskPlan`/`CompletionCriteria`；`ToolExecutor.execute_request()` 消费当前 `TaskPhase` 与 `AgentAction`。主模型只接收 `PlannerContextRenderer.render()` 投影的 goal、phase、allowed tools、rolling plan 与选择性 evidence，不接收完整 state/plan。
-- `Planner.assess_completion()` 消费 `EvidenceLedger`，`BudgetController.check_budget()` 和 `Planner.step()` 消费 `ExecutionBudget`；ledger/budget 全量对象不进模型。`AuthorizationDecision` 由 `ToolExecutor.authorize()` 消费，deny reason 可经 tool observation 进入后续模型。`InteractionController.build_final_report()` 可从 kernel final report 的 `planner_summary` 读取 planner report 投影，用于把 completed + ready verification 映射为 interaction `success`。
+- `Planner.assess_completion()` 消费 `EvidenceLedger`，`Finalizer.build()` 通过 typed helper 消费 verification/policy/sandbox/tool result 关键 bucket，`BudgetController.check_budget()` 和 `Planner.step()` 消费 `ExecutionBudget`；ledger/budget 全量对象不进模型。`AuthorizationDecision` 由 `ToolExecutor.authorize()` 消费，deny reason 可经 tool observation 进入后续模型。`InteractionController.build_final_report()` 可从 kernel final report 的 `planner_summary` 读取 planner report 投影，用于把 completed + ready verification 映射为 interaction `success`。
 - `Planner.replan()` 消费 `Replanner.decide()` 生成的 `ReplanDecision`/`RiskEscalation` 并更新 state；replan signal 会进入 planner-decision producer 的独立模型请求。`AgentKernel.run_task()`、CLI、evaluation 和 `MemoryLearningPipeline.ingest_final_report()` 消费 `FinalReport`，final report 不再发送给主模型。
 
 ## 是否落盘
@@ -239,7 +316,7 @@ class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
 
 ## 当前结构问题
 
-Planner 同时维护 durable state、增量 events 与模型可见投影；新增 evidence bucket 或状态时必须同步 `to_dict/from_dict`、PlannerStore、PlannerContextRenderer、completion/finalizer 和 trace event，不能以“整个对象都会进入模型/trace”概括。
+Planner 同时维护 durable state、增量 events 与模型可见投影；新增 evidence bucket 或状态时必须同步 `to_dict/from_dict`、typed helper、PlannerStore、PlannerContextRenderer、completion/finalizer 和 trace event，不能以“整个对象都会进入模型/trace”概括。关键 completion/report bucket 不应绕过 `EvidenceLedger.add_*()` 直接随意写裸 dict。
 
 ## 维护规则
 

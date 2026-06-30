@@ -449,6 +449,95 @@ def test_tool_protocol_creates_synthetic_result_for_rejected_call(tmp_path: Path
     assert payload["error_code"] == "unknown_tool"
 
 
+def test_parallel_readonly_validation_uses_same_synthetic_lifecycle_trace(
+    tmp_path: Path,
+) -> None:
+    trace = _TraceCollector()
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="read_one",
+            description="read",
+            input_model=_EmptyInput,
+            handler=lambda _args: {"ok": True},
+            permission_level=PermissionLevel.READ_ONLY,
+            side_effects=ToolSideEffectKind.READ_WORKSPACE,
+            idempotent=True,
+        )
+    )
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_executor = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=trace,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    batch = ToolCallBatch(
+        batch_id="batch_parallel_validation",
+        run_id=context.run_id,
+        session_id=context.session_id,
+        task_id=context.task_id,
+        phase_id=context.phase_id,
+        model_request_id="req_parallel_validation",
+        model_response_id="resp_parallel_validation",
+        assistant_message={"role": "assistant", "content": None, "tool_calls": []},
+        tool_calls=[
+            ToolCallEnvelope(
+                protocol_version="1.0",
+                run_id=context.run_id,
+                session_id=context.session_id,
+                task_id=context.task_id,
+                phase_id=context.phase_id,
+                model_request_id="req_parallel_validation",
+                model_response_id="resp_parallel_validation",
+                assistant_message_id="assistant_parallel_validation",
+                tool_call_id="call_bad",
+                tool_name="read_one",
+                raw_arguments="{}",
+                parsed_arguments={},
+                normalized_arguments={},
+                validation_errors=["schema_mismatch"],
+            ),
+            ToolCallEnvelope(
+                protocol_version="1.0",
+                run_id=context.run_id,
+                session_id=context.session_id,
+                task_id=context.task_id,
+                phase_id=context.phase_id,
+                model_request_id="req_parallel_validation",
+                model_response_id="resp_parallel_validation",
+                assistant_message_id="assistant_parallel_validation",
+                tool_call_id="call_ok",
+                tool_name="read_one",
+                raw_arguments="{}",
+                parsed_arguments={},
+                normalized_arguments={},
+            ),
+        ],
+        supports_parallel_execution=True,
+    )
+    tool_protocol.state_store.save_batch(batch)
+    plan = tool_protocol.build_execution_plan(batch)
+
+    result = tool_protocol.execute_plan(
+        plan,
+        context=context,
+        tool_executor=tool_executor,
+        planner=None,
+    )
+
+    event_names = [event for event, _payload in trace.events]
+    assert result.rejected_count == 1
+    assert "tool_protocol.call_rejected" in event_names
+    assert "tool_protocol.synthetic_result_created" in event_names
+
+
 def test_tool_protocol_invokes_workspace_state_hook(tmp_path: Path) -> None:
     request, context = _make_request(tmp_path)
     response = ModelTurnResult(

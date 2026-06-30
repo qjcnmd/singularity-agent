@@ -553,7 +553,7 @@ class Planner:
             "error_code": payload.get("error_code"),
             "failure": failure,
         }
-        self.evidence.tool_results.append(tool_result_entry)
+        self.evidence.add_tool_result(tool_result_entry)
         if payload.get("ok") is False and payload.get("error_code"):
             self.replan(
                 {
@@ -681,7 +681,7 @@ class Planner:
         ):
             return
         verification = {**verification, "tool_call_id": tool_call_id}
-        self.evidence.verification_results.append(verification)
+        self.evidence.add_verification_result(verification)
         failure_analyses: list[dict[str, Any]] = []
         for analysis in verification.get("failure_analysis") or []:
             if isinstance(analysis, dict):
@@ -768,8 +768,7 @@ class Planner:
             "imported_changes_count": sandbox.get("imported_changes_count", 0),
             "summary": self._sandbox_summary(command, sandbox),
         }
-        if payload not in self.evidence.sandbox_observations:
-            self.evidence.sandbox_observations.append(payload)
+        self.evidence.add_sandbox_observation(payload)
 
     def _record_sandbox_from_verification(self, verification: dict[str, Any]) -> None:
         for result in verification.get("results") or []:
@@ -815,8 +814,7 @@ class Planner:
                     prefix=f"{result.get('kind') or 'verification'} ran",
                 ),
             }
-            if payload not in self.evidence.sandbox_observations:
-                self.evidence.sandbox_observations.append(payload)
+            self.evidence.add_sandbox_observation(payload)
 
     @staticmethod
     def _sandbox_summary(
@@ -854,8 +852,7 @@ class Planner:
             "risk_level": observation.get("risk_level"),
             "resource": observation.get("resource"),
         }
-        if payload not in self.evidence.policy_observations:
-            self.evidence.policy_observations.append(payload)
+        self.evidence.add_policy_observation(payload)
         if payload["outcome"] in {"deny", "require_review", "escalate"}:
             self.evidence.unresolved_failures.append({"policy": payload})
             state.status = TaskStatus.NEEDS_REVIEW
@@ -894,8 +891,7 @@ class Planner:
     def record_execution_outcome(self, outcome: ExecutionOutcome | dict[str, Any]) -> None:
         self._throw_if_cancelled()
         payload = outcome.to_dict() if hasattr(outcome, "to_dict") else dict(outcome)
-        if payload not in self.evidence.task_outcomes:
-            self.evidence.task_outcomes.append(payload)
+        self.evidence.add_task_outcome(payload)
         for item in payload.get("missing_evidence") or []:
             self._append_unique(self.evidence.missing_evidence, item)
         status = str(payload.get("status") or "")

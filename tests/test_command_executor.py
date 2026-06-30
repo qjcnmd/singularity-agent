@@ -495,48 +495,42 @@ def test_project_verification_nonzero_is_semantic_test_failure(tmp_path: Path) -
     assert result.error_code == "semantic_failure"
 
 
-def test_command_policy_classifies_pytest_and_package_manager_commands(tmp_path: Path) -> None:
+def test_command_policy_classifies_pytest_and_package_manager_commands() -> None:
     policy = CommandPolicy()
 
-    pytest_decision = policy.evaluate(
+    pytest_risks = policy.classify(
         CommandRequest(
             argv=["pytest", "tests"],
             cwd=".",
             purpose=CommandPurpose.PROJECT_VERIFICATION,
-        ),
-        workspace_root=tmp_path,
+        )
     )
-    package_decision = policy.evaluate(
+    package_risks = policy.classify(
         CommandRequest(
             argv=["npm", "install"],
             cwd=".",
             purpose=CommandPurpose.PACKAGE_MANAGER,
             network_mode=NetworkMode.ALLOW_PACKAGE_REGISTRIES,
             filesystem_mode=FilesystemMode.READ_WRITE_WORKSPACE,
-        ),
-        workspace_root=tmp_path,
+        )
     )
 
-    assert CommandRisk.EXECUTES_PROJECT_CODE in pytest_decision.risk_tags
-    assert CommandRisk.PACKAGE_MANAGER in package_decision.risk_tags
-    assert CommandRisk.NETWORK in package_decision.risk_tags
-    assert CommandRisk.WRITE_WORKSPACE in package_decision.risk_tags
-    assert package_decision.decision == CommandDecision.REQUIRE_REVIEW
+    assert CommandRisk.EXECUTES_PROJECT_CODE in pytest_risks
+    assert CommandRisk.PACKAGE_MANAGER in package_risks
+    assert CommandRisk.NETWORK in package_risks
+    assert CommandRisk.WRITE_WORKSPACE in package_risks
 
 
-def test_destructive_command_is_denied(tmp_path: Path) -> None:
-    decision = CommandPolicy().evaluate(
+def test_destructive_command_is_classified_for_policy_engine_review() -> None:
+    risks = CommandPolicy().classify(
         CommandRequest(
             argv=["rm", "-rf", "."],
             cwd=".",
             purpose=CommandPurpose.DESTRUCTIVE,
-        ),
-        workspace_root=tmp_path,
+        )
     )
 
-    assert decision.decision == CommandDecision.REQUIRE_REVIEW
-    assert CommandRisk.DESTRUCTIVE in decision.risk_tags
-    assert decision.error_code == "review_required"
+    assert CommandRisk.DESTRUCTIVE in risks
 
 
 def test_long_running_process_can_start_read_stop_and_list(tmp_path: Path) -> None:

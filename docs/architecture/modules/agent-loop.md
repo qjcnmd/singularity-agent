@@ -34,7 +34,7 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`AgentKernel.run_task()` -> `AgentLoop.run()` -> `ModelRunner.build_request_from_context()` 先生成对象 `ModelTurnRequest`，`ModelRunner.run_turn()` 返回 `ModelTurnResult` 后交给 `ToolProtocolEngine.process_model_turn()`。工具结果通过 `ContextManager.add_tool_protocol_result()` 和 `Planner.update_from_tool_result()` 写入 `context.sqlite3`、planner evidence 和 trace 事件；当 completion gate 通过时，`AgentLoop._attempt_finalize()` 调用 `Planner.finalize()` 生成 `FinalReport` 并写入 `final_answer` trace event。若模型失败，`_outcome_from_model_failure()` 归类 provider 错误，`_terminal_result_from_outcome()` 返回带 `error_code` 的 `AgentLoopResult`。
+以用户要求修复 `quicksort.py` 为例：`AgentKernel.run_task()` -> `AgentLoop.run()` -> `ModelRunner.build_request_from_context()` 先生成对象 `ModelTurnRequest`，`ModelRunner.run_turn()` 返回 `ModelTurnResult` 后交给 `ToolProtocolEngine.process_model_turn()`。工具结果通过 `ContextManager.add_tool_protocol_result()` 和 `Planner.update_from_tool_result()` 写入 `context.sqlite3`、planner evidence 和 trace 事件；关键 tool/verification/policy/sandbox/task outcome evidence 由 `EvidenceLedger.add_*()` typed helper 写入 JSON 投影。当 completion gate 通过时，`AgentLoop._attempt_finalize()` 调用 `Planner.finalize()`，`Finalizer.build()` 通过 typed evidence helper 生成 `FinalReport`，然后写入 `final_answer` trace event。若模型失败，`_outcome_from_model_failure()` 归类 provider 错误，`_terminal_result_from_outcome()` 返回带 `error_code` 的 `AgentLoopResult`。
 
 ## 真实对象完整结构
 
@@ -72,7 +72,7 @@ class AgentLoopStatus(str, Enum):
 
 `AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部创建 `RunController`，再把每一轮执行封装在局部 `run_turn()` callback 中：`planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `_attempt_finalize()` 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `_terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
 
-完成判定只消费 AgentLoop 内部 evidence：`Planner.update_from_verification()` 写入的最新 `completion_assessment.status` 必须为 `ready` 或 `ready_with_warnings`，`Planner.assess_completion()` 必须没有 unmet，`Planner.finalize()` 的 final review 必须没有 blocking finding 且 `FinalReport.status=completed`。当这些条件满足时，`Planner.finalize()` 会清理已经被最新 final report 解决的 completion blocker（例如 `required_verifications_passed`、`unresolved_failures_empty`、旧的 sandbox backend unavailable 记录），再由 `_attempt_finalize()` 返回 `AgentLoopStatus.COMPLETED`。未被最新证据解决的 policy、approval、workspace conflict、sandbox/backend unavailable 当前失败仍保持 fail-closed，不会被 reducer 或 finalizer 改写成 completed。
+完成判定只消费 AgentLoop 内部 evidence：`Planner.update_from_verification()` 通过 `EvidenceLedger.add_verification_result()` 写入的最新 `completion_assessment.status` 必须为 `ready` 或 `ready_with_warnings`，`Planner.assess_completion()` 必须没有 unmet，`Planner.finalize()` 的 final review 必须没有 blocking finding 且 `FinalReport.status=completed`。`Finalizer.build()` 通过 `latest_verification_result()`、`policy_records()`、`sandbox_records()`、`tool_result_records()` 汇总 completion/report 关键 bucket，避免从裸 dict 随意读取缺字段。 当这些条件满足时，`Planner.finalize()` 会清理已经被最新 final report 解决的 completion blocker（例如 `required_verifications_passed`、`unresolved_failures_empty`、旧的 sandbox backend unavailable 记录），再由 `_attempt_finalize()` 返回 `AgentLoopStatus.COMPLETED`。未被最新证据解决的 policy、approval、workspace conflict、sandbox/backend unavailable 当前失败仍保持 fail-closed，不会被 reducer 或 finalizer 改写成 completed。
 
 ## 谁生成这些对象
 

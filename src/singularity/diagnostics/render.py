@@ -6,7 +6,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from singularity.diagnostics.models import DiagnosticResult, RepairPlan
+from singularity.diagnostics.models import DiagnosticRepairResult, DiagnosticResult
 
 SEVERITY_STYLES = {
     "error": "red",
@@ -41,8 +41,8 @@ def render_diagnostic_result(console: Console, result: DiagnosticResult, *, verb
     console.print(Panel(f"{status} | summary={result.summary}", title="doctor summary", border_style="green" if result.ok else "red"))
 
 
-def render_repair_plan(console: Console, payload: RepairPlan | dict[str, Any]) -> None:
-    data = payload.to_dict() if isinstance(payload, RepairPlan) else payload
+def render_repair_plan(console: Console, payload: DiagnosticRepairResult | dict[str, Any]) -> None:
+    data = payload.to_dict() if isinstance(payload, DiagnosticRepairResult) else payload
     repair = data.get("repair", data)
     table = Table(title="Singularity repair")
     table.add_column("status")

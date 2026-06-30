@@ -353,6 +353,274 @@ class AgentAction:
         )
 
 
+@dataclass(frozen=True)
+class VerificationEvidenceRecord:
+    completion_assessment: dict[str, Any] = field(default_factory=dict)
+    check_status: list[dict[str, Any]] = field(default_factory=list)
+    results: list[dict[str, Any]] = field(default_factory=list)
+    tool_call_id: str | None = None
+    plan: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def completion_status(self) -> str | None:
+        status = self.completion_assessment.get("status")
+        return str(status) if status is not None else None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = dict(self.extra)
+        if self.completion_assessment:
+            payload["completion_assessment"] = dict(self.completion_assessment)
+        if self.check_status:
+            payload["check_status"] = list(self.check_status)
+        if self.results:
+            payload["results"] = list(self.results)
+        if self.tool_call_id is not None:
+            payload["tool_call_id"] = self.tool_call_id
+        if self.plan:
+            payload["plan"] = dict(self.plan)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> VerificationEvidenceRecord:
+        known = {"completion_assessment", "check_status", "results", "tool_call_id", "plan"}
+        return cls(
+            completion_assessment=dict(payload.get("completion_assessment") or {}),
+            check_status=[dict(item) for item in payload.get("check_status") or [] if isinstance(item, dict)],
+            results=[dict(item) for item in payload.get("results") or [] if isinstance(item, dict)],
+            tool_call_id=(
+                str(payload["tool_call_id"])
+                if payload.get("tool_call_id") is not None
+                else None
+            ),
+            plan=dict(payload.get("plan") or {}),
+            extra={key: value for key, value in payload.items() if key not in known},
+        )
+
+
+@dataclass(frozen=True)
+class SandboxObservationRecord:
+    source: str | None = None
+    backend: str | None = None
+    status: str | None = None
+    enforcement_status: str | None = None
+    execution_backend: str | None = None
+    network_denied_verified: bool | None = None
+    process_tree_kill: bool | None = None
+    job_killed: bool | None = None
+    timeout_enforced: bool | None = None
+    artifact_count: int = 0
+    artifact_refs: list[str] = field(default_factory=list)
+    changed_files_count: int = 0
+    violations: list[dict[str, Any]] = field(default_factory=list)
+    imported_changes_count: int = 0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = dict(self.extra)
+        payload.update(
+            {
+                "source": self.source,
+                "backend": self.backend,
+                "status": self.status,
+                "enforcement_status": self.enforcement_status,
+                "execution_backend": self.execution_backend,
+                "network_denied_verified": self.network_denied_verified,
+                "process_tree_kill": self.process_tree_kill,
+                "job_killed": self.job_killed,
+                "timeout_enforced": self.timeout_enforced,
+                "artifact_count": self.artifact_count,
+                "artifact_refs": list(self.artifact_refs),
+                "changed_files_count": self.changed_files_count,
+                "violations": list(self.violations),
+                "imported_changes_count": self.imported_changes_count,
+            }
+        )
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> SandboxObservationRecord:
+        known = {
+            "source",
+            "backend",
+            "status",
+            "enforcement_status",
+            "execution_backend",
+            "network_denied_verified",
+            "process_tree_kill",
+            "job_killed",
+            "timeout_enforced",
+            "artifact_count",
+            "artifact_refs",
+            "changed_files_count",
+            "violations",
+            "imported_changes_count",
+        }
+        return cls(
+            source=_optional_str(payload.get("source")),
+            backend=_optional_str(payload.get("backend")),
+            status=_optional_str(payload.get("status")),
+            enforcement_status=_optional_str(payload.get("enforcement_status")),
+            execution_backend=_optional_str(payload.get("execution_backend")),
+            network_denied_verified=_optional_bool(payload.get("network_denied_verified")),
+            process_tree_kill=_optional_bool(payload.get("process_tree_kill")),
+            job_killed=_optional_bool(payload.get("job_killed")),
+            timeout_enforced=_optional_bool(payload.get("timeout_enforced")),
+            artifact_count=int(payload.get("artifact_count") or 0),
+            artifact_refs=[str(item) for item in payload.get("artifact_refs") or []],
+            changed_files_count=int(payload.get("changed_files_count") or 0),
+            violations=[dict(item) for item in payload.get("violations") or [] if isinstance(item, dict)],
+            imported_changes_count=int(payload.get("imported_changes_count") or 0),
+            extra={key: value for key, value in payload.items() if key not in known},
+        )
+
+
+@dataclass(frozen=True)
+class PolicyObservationRecord:
+    outcome: str | None = None
+    component: str | None = None
+    operation: str | None = None
+    reason: str | None = None
+    risk_level: str | None = None
+    resource: str | None = None
+    approval_grant_id: str | None = None
+    approved_by_user: bool | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = dict(self.extra)
+        payload.update(
+            {
+                "outcome": self.outcome,
+                "component": self.component,
+                "operation": self.operation,
+                "reason": self.reason,
+                "risk_level": self.risk_level,
+                "resource": self.resource,
+            }
+        )
+        if self.approval_grant_id is not None:
+            payload["approval_grant_id"] = self.approval_grant_id
+        if self.approved_by_user is not None:
+            payload["approved_by_user"] = self.approved_by_user
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> PolicyObservationRecord:
+        known = {
+            "outcome",
+            "component",
+            "operation",
+            "reason",
+            "risk_level",
+            "resource",
+            "approval_grant_id",
+            "approved_by_user",
+        }
+        return cls(
+            outcome=_optional_str(payload.get("outcome")),
+            component=_optional_str(payload.get("component")),
+            operation=_optional_str(payload.get("operation")),
+            reason=_optional_str(payload.get("reason")),
+            risk_level=_optional_str(payload.get("risk_level")),
+            resource=_optional_str(payload.get("resource")),
+            approval_grant_id=_optional_str(payload.get("approval_grant_id")),
+            approved_by_user=_optional_bool(payload.get("approved_by_user")),
+            extra={key: value for key, value in payload.items() if key not in known},
+        )
+
+
+@dataclass(frozen=True)
+class ToolResultRecord:
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    action_id: str | None = None
+    ok: bool | None = None
+    status: str | None = None
+    error_code: str | None = None
+    failure: dict[str, Any] | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = dict(self.extra)
+        payload.update(
+            {
+                "tool_call_id": self.tool_call_id,
+                "tool_name": self.tool_name,
+                "action_id": self.action_id,
+                "ok": self.ok,
+                "status": self.status,
+                "error_code": self.error_code,
+                "failure": self.failure,
+            }
+        )
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ToolResultRecord:
+        known = {"tool_call_id", "tool_name", "action_id", "ok", "status", "error_code", "failure"}
+        failure = payload.get("failure")
+        return cls(
+            tool_call_id=_optional_str(payload.get("tool_call_id")),
+            tool_name=_optional_str(payload.get("tool_name")),
+            action_id=_optional_str(payload.get("action_id")),
+            ok=_optional_bool(payload.get("ok")),
+            status=_optional_str(payload.get("status")),
+            error_code=_optional_str(payload.get("error_code")),
+            failure=dict(failure) if isinstance(failure, dict) else None,
+            extra={key: value for key, value in payload.items() if key not in known},
+        )
+
+
+@dataclass(frozen=True)
+class TaskOutcomeRecord:
+    status: str
+    error_code: str | None = None
+    summary: str | None = None
+    reason: str | None = None
+    next_action: str | None = None
+    retry_allowed: bool | None = None
+    missing_evidence: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = dict(self.extra)
+        payload.update(
+            {
+                "status": self.status,
+                "error_code": self.error_code,
+                "summary": self.summary,
+                "reason": self.reason,
+                "next_action": self.next_action,
+                "retry_allowed": self.retry_allowed,
+                "missing_evidence": list(self.missing_evidence),
+            }
+        )
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> TaskOutcomeRecord:
+        known = {
+            "status",
+            "error_code",
+            "summary",
+            "reason",
+            "next_action",
+            "retry_allowed",
+            "missing_evidence",
+        }
+        return cls(
+            status=str(payload.get("status") or "unknown"),
+            error_code=_optional_str(payload.get("error_code")),
+            summary=_optional_str(payload.get("summary")),
+            reason=_optional_str(payload.get("reason")),
+            next_action=_optional_str(payload.get("next_action")),
+            retry_allowed=_optional_bool(payload.get("retry_allowed")),
+            missing_evidence=[str(item) for item in payload.get("missing_evidence") or []],
+            extra={key: value for key, value in payload.items() if key not in known},
+        )
+
+
 @dataclass
 class EvidenceLedger:
     inspected_files: list[str] = field(default_factory=list)
@@ -430,6 +698,102 @@ class EvidenceLedger:
             return value
         return [value]
 
+    def add_verification_result(
+        self, record: VerificationEvidenceRecord | dict[str, Any]
+    ) -> VerificationEvidenceRecord:
+        typed = (
+            record
+            if isinstance(record, VerificationEvidenceRecord)
+            else VerificationEvidenceRecord.from_dict(record)
+        )
+        self.verification_results.append(typed.to_dict())
+        return typed
+
+    def latest_verification_result(self) -> VerificationEvidenceRecord | None:
+        if not self.verification_results:
+            return None
+        return VerificationEvidenceRecord.from_dict(self.verification_results[-1])
+
+    def verification_records(self) -> list[VerificationEvidenceRecord]:
+        return [
+            VerificationEvidenceRecord.from_dict(item)
+            for item in self.verification_results
+        ]
+
+    def add_sandbox_observation(
+        self, record: SandboxObservationRecord | dict[str, Any]
+    ) -> SandboxObservationRecord:
+        typed = (
+            record
+            if isinstance(record, SandboxObservationRecord)
+            else SandboxObservationRecord.from_dict(record)
+        )
+        payload = typed.to_dict()
+        if payload not in self.sandbox_observations:
+            self.sandbox_observations.append(payload)
+        return typed
+
+    def sandbox_records(self) -> list[SandboxObservationRecord]:
+        return [
+            SandboxObservationRecord.from_dict(item)
+            for item in self.sandbox_observations
+        ]
+
+    def add_policy_observation(
+        self, record: PolicyObservationRecord | dict[str, Any]
+    ) -> PolicyObservationRecord:
+        typed = (
+            record
+            if isinstance(record, PolicyObservationRecord)
+            else PolicyObservationRecord.from_dict(record)
+        )
+        payload = typed.to_dict()
+        if payload not in self.policy_observations:
+            self.policy_observations.append(payload)
+        return typed
+
+    def policy_records(self) -> list[PolicyObservationRecord]:
+        return [
+            PolicyObservationRecord.from_dict(item)
+            for item in self.policy_observations
+        ]
+
+    def add_tool_result(
+        self, record: ToolResultRecord | dict[str, Any]
+    ) -> ToolResultRecord:
+        typed = (
+            record
+            if isinstance(record, ToolResultRecord)
+            else ToolResultRecord.from_dict(record)
+        )
+        self.tool_results.append(typed.to_dict())
+        return typed
+
+    def tool_result_records(self) -> list[ToolResultRecord]:
+        return [
+            ToolResultRecord.from_dict(item)
+            for item in self.tool_results
+        ]
+
+    def add_task_outcome(
+        self, record: TaskOutcomeRecord | dict[str, Any]
+    ) -> TaskOutcomeRecord:
+        typed = (
+            record
+            if isinstance(record, TaskOutcomeRecord)
+            else TaskOutcomeRecord.from_dict(record)
+        )
+        payload = typed.to_dict()
+        if payload not in self.task_outcomes:
+            self.task_outcomes.append(payload)
+        return typed
+
+    def task_outcome_records(self) -> list[TaskOutcomeRecord]:
+        return [
+            TaskOutcomeRecord.from_dict(item)
+            for item in self.task_outcomes
+        ]
+
     def evidence_for_criterion(self, criterion_id: str) -> list[dict[str, Any]]:
         """Return all evidence records tagged with ``criterion_id``.
 
@@ -506,6 +870,24 @@ class EvidenceLedger:
             retrieval_results=list(payload.get("retrieval_results") or []),
             task_outcomes=list(payload.get("task_outcomes") or []),
         )
+
+
+def _optional_str(value: Any) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    return None
 
 
 @dataclass

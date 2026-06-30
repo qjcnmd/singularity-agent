@@ -2,6 +2,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -32,6 +33,11 @@ class SimpleTokenCounter:
 
     def count_messages(self, messages: list[dict]) -> int:
         return sum(self.count_text(str(message.get("content") or "")) for message in messages)
+
+
+class GrantingApprovalGate:
+    def authorize(self, _request: Any, _decision: Any) -> object:
+        return type("Grant", (), {"grant_id": "grant_test"})()
 
 
 def tool_call(name: str, arguments: dict, *, tool_call_id: str = "call_state") -> dict:
@@ -142,6 +148,7 @@ def test_command_executor_records_side_effect_ownership_by_command_purpose(tmp_p
     component = CommandExecutor(
         tmp_path,
         workspace_state_manager=state,
+        approval_gate=GrantingApprovalGate(),
         policy_engine=PolicyEngine(
             PolicyConfig(
                 workspace_root=tmp_path,

@@ -11,7 +11,7 @@ from typing import Any
 from singularity.release.paths import UserDataPaths
 
 DIAGNOSTIC_RESULT_SCHEMA = "diagnostic-result/v1"
-REPAIR_PLAN_SCHEMA = "repair-plan/v1"
+DIAGNOSTIC_REPAIR_RESULT_SCHEMA = "repair-plan/v1"
 
 
 class DiagnosticSeverity(StrEnum):
@@ -106,13 +106,13 @@ class RepairAction:
 
 
 @dataclass(frozen=True)
-class RepairPlan:
+class DiagnosticRepairResult:
     actions: list[RepairAction]
     blocked_actions: list[dict[str, Any]] = field(default_factory=list)
     applied: bool = False
     audit_log_path: str | None = None
     generated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
-    schema_version: str = REPAIR_PLAN_SCHEMA
+    schema_version: str = DIAGNOSTIC_REPAIR_RESULT_SCHEMA
 
     def to_dict(self) -> dict[str, Any]:
         return {

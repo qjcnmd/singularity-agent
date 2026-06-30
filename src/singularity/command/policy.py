@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from singularity.command.models import (
-    CommandDecision,
-    CommandPolicyResult,
     CommandPurpose,
     CommandRequest,
     CommandRisk,
@@ -83,151 +80,6 @@ INTERPRETERS = {
 
 
 class CommandPolicy:
-    def evaluate(
-        self,
-        request: CommandRequest,
-        *,
-        workspace_root: Path | str,
-    ) -> CommandPolicyResult:
-        risk_tags = self.classify(request)
-        redaction_rules = [
-            "*_TOKEN",
-            "*_KEY",
-            "*_SECRET",
-            "PASSWORD",
-            "DATABASE_URL",
-            "DSN",
-            "*_DSN",
-            "CONN_STR",
-            "*_CONN_STR",
-            "CONN_STRING",
-            "*_CONN_STRING",
-            "CONNECTION_STRING",
-            "*_CONNECTION_STRING",
-            "AWS_*",
-            "GITHUB_TOKEN",
-            "OPENAI_API_KEY",
-        ]
-        cwd_error = self._cwd_error(Path(workspace_root), request.cwd)
-        if cwd_error is not None:
-            return CommandPolicyResult(
-                decision=CommandDecision.DENY,
-                reasons=[cwd_error],
-                risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="cwd_outside_workspace",
-            )
-
-        if not request.argv and not request.shell:
-            return CommandPolicyResult(
-                decision=CommandDecision.DENY,
-                reasons=["Command request must provide argv or shell."],
-                risk_tags=sorted_risks({*risk_tags, CommandRisk.UNKNOWN}),
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="command_parse_error",
-            )
-
-        if CommandRisk.DESTRUCTIVE in risk_tags:
-            return CommandPolicyResult(
-                decision=CommandDecision.REQUIRE_REVIEW,
-                reasons=["Destructive commands require explicit review."],
-                risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="review_required",
-            )
-        if CommandRisk.SYSTEM_MUTATION in risk_tags:
-            return CommandPolicyResult(
-                decision=CommandDecision.REQUIRE_REVIEW,
-                reasons=["System mutation commands require explicit review."],
-                risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="review_required",
-            )
-        if CommandRisk.NETWORK in risk_tags and request.network_mode == NetworkMode.DISABLED:
-            return CommandPolicyResult(
-                decision=CommandDecision.DENY,
-                reasons=["Command has network risk but network mode is disabled."],
-                risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="network_denied",
-            )
-        if request.shell is not None:
-            return CommandPolicyResult(
-                decision=CommandDecision.REQUIRE_REVIEW,
-                reasons=["Shell commands require review because parsing is delegated to the shell."],
-                risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="review_required",
-            )
-        if CommandRisk.VCS_MUTATION in risk_tags:
-            return CommandPolicyResult(
-                decision=CommandDecision.REQUIRE_REVIEW,
-                reasons=["Git mutation commands must use GitClient or explicit review."],
-                risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="review_required",
-            )
-        if CommandRisk.PACKAGE_MANAGER in risk_tags and not request.risk_acceptance_reason:
-            return CommandPolicyResult(
-                decision=CommandDecision.REQUIRE_REVIEW,
-                reasons=["Package manager commands can change dependency state and require review."],
-                risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="review_required",
-            )
-        if (
-            CommandRisk.WRITE_WORKSPACE in risk_tags
-            and request.purpose != CommandPurpose.FORMATTER
-            and not request.risk_acceptance_reason
-        ):
-            return CommandPolicyResult(
-                decision=CommandDecision.REQUIRE_REVIEW,
-                reasons=["Workspace-writing commands require an explicit risk acceptance reason."],
-                risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="review_required",
-            )
-        if (
-            CommandRisk.LONG_RUNNING in risk_tags
-            and not request.risk_acceptance_reason
-        ):
-            return CommandPolicyResult(
-                decision=CommandDecision.REQUIRE_REVIEW,
-                reasons=["Long-running process sessions require explicit ownership."],
-                risk_tags=risk_tags,
-                required_network=request.network_mode,
-                required_filesystem=request.filesystem_mode,
-                redaction_rules=redaction_rules,
-                error_code="review_required",
-            )
-
-        return CommandPolicyResult(
-            decision=CommandDecision.ALLOW,
-            reasons=["Command policy allowed execution."],
-            risk_tags=risk_tags,
-            required_network=request.network_mode,
-            required_filesystem=request.filesystem_mode,
-            redaction_rules=redaction_rules,
-        )
-
     def classify(self, request: CommandRequest) -> list[CommandRisk]:
         tags: set[CommandRisk] = set()
         if request.purpose.name in CommandRisk.__members__:
@@ -300,21 +152,6 @@ class CommandPolicy:
 
     def requires_verification_runner(self, request: CommandRequest) -> bool:
         return _is_verification_like_request(request)
-
-    @staticmethod
-    def _cwd_error(workspace_root: Path, cwd: str) -> str | None:
-        root = workspace_root.expanduser().resolve(strict=False)
-        raw = Path(cwd)
-        candidate = raw if raw.is_absolute() else root / raw
-        try:
-            resolved = candidate.resolve(strict=False)
-            root_key = os.path.normcase(os.path.normpath(str(root)))
-            candidate_key = os.path.normcase(os.path.normpath(str(resolved)))
-            if os.path.commonpath([root_key, candidate_key]) != root_key:
-                return f"cwd is outside workspace: {cwd}"
-        except (OSError, ValueError) as exc:
-            return f"cwd could not be resolved: {cwd}: {exc}"
-        return None
 
 
 def sorted_risks(tags: set[CommandRisk]) -> list[CommandRisk]:

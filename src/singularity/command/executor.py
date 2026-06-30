@@ -50,6 +50,7 @@ from singularity.policy import (
     PolicyRequest,
     PolicySubject,
     ResourceRef,
+    RiskTag,
 )
 from singularity.policy.audit import redact, redact_resource_identifier
 from singularity.policy.permissions import PermissionProfile, ProtectedPathRule
@@ -80,6 +81,25 @@ SKIP_SIDE_EFFECT_DIRS = {
     "node_modules",
     "venv",
 }
+
+_COMMAND_REDACTION_RULES = [
+    "*_TOKEN",
+    "*_KEY",
+    "*_SECRET",
+    "PASSWORD",
+    "DATABASE_URL",
+    "DSN",
+    "*_DSN",
+    "CONN_STR",
+    "*_CONN_STR",
+    "CONN_STRING",
+    "*_CONN_STRING",
+    "CONNECTION_STRING",
+    "*_CONNECTION_STRING",
+    "AWS_*",
+    "GITHUB_TOKEN",
+    "OPENAI_API_KEY",
+]
 
 
 @dataclass(frozen=True)
@@ -158,7 +178,9 @@ class CommandExecutor:
         self._sessions: dict[str, _SessionRecord] = {}
 
     def plan(self, request: CommandRequest) -> CommandPlan:
-        decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
+        policy_request = self._policy_request(request)
+        policy_decision = self.policy_engine.enforce(policy_request)
+        decision = self._command_policy_result(request, policy_decision)
         cwd = self._resolve_cwd(request.cwd)
         env_result = self.env_policy.build(request.env_request)
         return CommandPlan(
@@ -193,6 +215,7 @@ class CommandExecutor:
         policy_request = self._policy_request(request)
         policy_decision = self.policy_engine.enforce(policy_request)
         self._record_policy_trace(policy_request, policy_decision)
+        decision = self._command_policy_result(request, policy_decision)
         sandbox_required = (
             policy_decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
             or policy_decision.constraints.sandbox_required
@@ -212,14 +235,13 @@ class CommandExecutor:
             if approved_escalation:
                 pass
             else:
-                result = self._policy_blocked_result(
+                result = self._blocked_result(
                     request,
-                    decision=policy_decision,
+                    decision=decision,
                     started_at=started_at,
                     started=started,
                     git_before=git_before,
                     git_after=git_before,
-                    policy_request=policy_request,
                 )
                 self._record_trace(
                     request,
@@ -229,27 +251,6 @@ class CommandExecutor:
                 )
                 self._notify_planner_policy(request, policy_request, policy_decision)
                 return result
-        decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
-        if decision.decision == CommandDecision.DENY or (
-            decision.decision != CommandDecision.ALLOW
-            and not sandbox_required
-            and not approved_escalation
-        ):
-            result = self._blocked_result(
-                request,
-                decision=decision,
-                started_at=started_at,
-                started=started,
-                git_before=git_before,
-                git_after=git_before,
-            )
-            self._record_trace(
-                request,
-                result,
-                tool_call_id=tool_call_id,
-                transaction_id=transaction_id,
-            )
-            return result
 
         cwd = self._resolve_cwd(request.cwd)
         if cwd is None or not cwd.exists() or not cwd.is_dir():
@@ -383,7 +384,6 @@ class CommandExecutor:
                 owner_transaction=transaction_id,
                 error_code=ErrorCode.VERIFICATION_RUNNER_REQUIRED.value,
             )
-        decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
         policy_request = self._policy_request(request)
         policy_decision = self.policy_engine.enforce(policy_request)
         self._record_policy_trace(policy_request, policy_decision)
@@ -428,23 +428,6 @@ class CommandExecutor:
                 owner_transaction=transaction_id,
                 error_code=_policy_error_code(policy_decision.outcome),
             )
-        decision = self.policy.evaluate(request, workspace_root=self.workspace_root)
-        if decision.decision != CommandDecision.ALLOW and not (
-            approved_escalation and decision.decision == CommandDecision.REQUIRE_REVIEW
-        ):
-            session = ProcessSession(
-                process_id=request.command_id,
-                command_id=request.command_id,
-                pid=None,
-                status=decision.decision.value,
-                argv=request.argv,
-                shell=request.shell,
-                cwd=request.cwd,
-                started_at=started_at,
-                owner_transaction=transaction_id,
-                error_code=decision.error_code,
-            )
-            return session
 
         cwd = self._resolve_cwd(request.cwd)
         if cwd is None or not cwd.exists() or not cwd.is_dir():
@@ -1283,6 +1266,8 @@ class CommandExecutor:
 
     def _policy_request(self, request: CommandRequest) -> PolicyRequest:
         operation, capability, resource = _command_policy_shape(request)
+        risk_tags = self.policy.classify(request)
+        cwd_outside_workspace = _cwd_outside_workspace(self.workspace_root, request.cwd)
         return PolicyRequest(
             session_id=getattr(self.planner, "session_id", "command_session"),
             task_id=getattr(self.planner, "task_id", "command_task"),
@@ -1295,15 +1280,54 @@ class CommandExecutor:
             resource=resource,
             reason=request.redacted_display_command(),
             proposed_by_model=True,
+            risk_tags=_policy_risk_tags(request, risk_tags),
             metadata={
                 **request.safe_metadata(),
                 "env_policy": request.env_request,
+                "command_purpose": request.purpose.value,
+                "command_risk_tags": [tag.value for tag in risk_tags],
+                "command_missing": not bool(request.argv or request.shell),
+                "cwd_outside_workspace": cwd_outside_workspace,
             },
             requires_network=request.network_mode != NetworkMode.DISABLED,
             touches_workspace=request.filesystem_mode != FilesystemMode.READ_ONLY_WORKSPACE,
             long_running=request.purpose == CommandPurpose.LONG_RUNNING,
             destructive=request.purpose == CommandPurpose.DESTRUCTIVE,
             workspace_root=str(self.workspace_root),
+        )
+
+    def _command_policy_result(
+        self,
+        request: CommandRequest,
+        decision: Any,
+    ) -> CommandPolicyResult:
+        command_decision = (
+            CommandDecision.ALLOW
+            if decision.outcome in {DecisionOutcome.ALLOW, DecisionOutcome.SANDBOX_REQUIRED}
+            else CommandDecision.REQUIRE_REVIEW
+            if decision.outcome == DecisionOutcome.REQUIRE_REVIEW
+            else CommandDecision.DENY
+        )
+        error_code = None if command_decision == CommandDecision.ALLOW else _policy_error_code(decision.outcome)
+        if decision.outcome == DecisionOutcome.DENY and decision.rule_ids:
+            if "hard_deny_cwd_outside_workspace" in decision.rule_ids:
+                error_code = "cwd_outside_workspace"
+            elif any("protected_path" in rule_id for rule_id in decision.rule_ids):
+                error_code = ErrorCode.PROTECTED_PATH_DENIED.value
+        return CommandPolicyResult(
+            decision=command_decision,
+            reasons=[decision.reason],
+            risk_tags=self.policy.classify(request),
+            required_backend=(
+                "sandbox"
+                if decision.outcome == DecisionOutcome.SANDBOX_REQUIRED
+                or decision.constraints.sandbox_required
+                else self.backend.name
+            ),
+            required_network=request.network_mode,
+            required_filesystem=request.filesystem_mode,
+            redaction_rules=_COMMAND_REDACTION_RULES,
+            error_code=error_code,
         )
 
     def _sandbox_request(
@@ -1376,37 +1400,6 @@ class CommandExecutor:
             rule.pattern if isinstance(rule, ProtectedPathRule) else str(rule)
             for rule in permission_profile.protected_paths
         ]
-
-    def _policy_blocked_result(
-        self,
-        request: CommandRequest,
-        *,
-        decision: Any,
-        started_at: str,
-        started: float,
-        git_before: dict[str, Any],
-        git_after: dict[str, Any],
-        policy_request: PolicyRequest,
-    ) -> CommandResult:
-        cmd_decision = CommandPolicyResult(
-            decision=CommandDecision.REQUIRE_REVIEW
-            if decision.outcome == DecisionOutcome.REQUIRE_REVIEW
-            else CommandDecision.DENY,
-            reasons=[decision.reason],
-            risk_tags=[CommandRisk.UNKNOWN],
-            required_network=request.network_mode,
-            required_filesystem=request.filesystem_mode,
-            redaction_rules=[],
-            error_code=_policy_error_code(decision.outcome),
-        )
-        return self._blocked_result(
-            request,
-            decision=cmd_decision,
-            started_at=started_at,
-            started=started,
-            git_before=git_before,
-            git_after=git_after,
-        )
 
     def _notify_planner_policy(
         self,
@@ -1535,6 +1528,44 @@ def _looks_like_package_manager(request: CommandRequest) -> bool:
     if program in {"python", "python3", "py"}:
         return argv[1:3] == ["-m", "pip"] and any(part in {"install", "uninstall"} for part in argv[3:])
     return program == "uv" and any(part in {"add", "pip", "sync"} for part in argv[1:])
+
+
+def _cwd_outside_workspace(workspace_root: Path, cwd: str) -> bool:
+    root = workspace_root.expanduser().resolve(strict=False)
+    raw = Path(cwd)
+    candidate = raw if raw.is_absolute() else root / raw
+    try:
+        resolved = candidate.resolve(strict=False)
+        root_key = os.path.normcase(os.path.normpath(str(root)))
+        candidate_key = os.path.normcase(os.path.normpath(str(resolved)))
+        return os.path.commonpath([root_key, candidate_key]) != root_key
+    except (OSError, ValueError):
+        return True
+
+
+def _policy_risk_tags(
+    request: CommandRequest,
+    command_risks: list[CommandRisk],
+) -> list[RiskTag]:
+    tags: set[RiskTag] = set()
+    for risk in command_risks:
+        if risk == CommandRisk.NETWORK:
+            tags.add(RiskTag.NETWORK)
+        elif risk == CommandRisk.WRITE_WORKSPACE:
+            tags.add(RiskTag.MUTATES_FILES)
+        elif risk == CommandRisk.DESTRUCTIVE:
+            tags.update({RiskTag.DESTRUCTIVE, RiskTag.IRREVERSIBLE, RiskTag.MUTATES_FILES})
+        elif risk == CommandRisk.PACKAGE_MANAGER:
+            tags.update({RiskTag.PACKAGE_MANAGER, RiskTag.SUPPLY_CHAIN, RiskTag.MUTATES_FILES})
+        elif risk == CommandRisk.LONG_RUNNING:
+            tags.add(RiskTag.LONG_RUNNING)
+        elif risk in {CommandRisk.PROJECT_VERIFICATION, CommandRisk.EXECUTES_PROJECT_CODE}:
+            tags.add(RiskTag.EXECUTES_PROJECT_CODE)
+        elif risk == CommandRisk.CODE_GENERATION:
+            tags.add(RiskTag.EXECUTES_GENERATED_CODE)
+    if request.shell is not None:
+        tags.add(RiskTag.SHELL_EXPANSION)
+    return sorted(tags, key=lambda tag: tag.value)
 
 
 def _policy_error_code(outcome: DecisionOutcome) -> str:

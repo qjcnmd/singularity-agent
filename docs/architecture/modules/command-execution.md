@@ -18,6 +18,7 @@
 - ProcessOutput
 - ProcessStopResult
 - CommandExecutor
+- CommandPolicy
 
 字段清单:
 - ResourceLimits: timeout_seconds, idle_timeout_seconds, max_stdout_bytes, max_stderr_bytes, max_combined_output_bytes, max_memory_mb, max_processes, max_disk_write_mb
@@ -31,7 +32,7 @@
 
 ## 这一层解决什么问题
 
-Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem policy 和资源限制，再通过 policy/sandbox/backend 执行命令并生成可追踪结果。
+Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem policy 和资源限制，再通过 `PolicyEngine`、approval、sandbox/backend 执行命令并生成可追踪结果。`CommandPolicy` 只保留 command risk 分类和 verification-runner routing helper，不再生成最终 allow/deny/review 裁决。
 
 ## 当前源码位置
 
@@ -48,13 +49,13 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 
 ## 真实运行时调用链
 
-`run_command` / verification tools -> `CommandExecutor.run()` -> `CommandRequest` -> command policy -> optional sandbox/backend -> `CommandResult` -> trace/context/planner evidence。`ExecutionBackend.execute()` 的当前签名必须接收 `cancellation_token` 关键字参数；`CommandExecutor` 不再静默回退到旧签名。
+`run_command` / verification tools -> `CommandExecutor.run()` -> `CommandRequest` -> `CommandExecutor._policy_request()` -> `PolicyEngine.enforce()` -> `CommandExecutor._command_policy_result()` -> optional `ApprovalGate` / sandbox/backend -> `CommandResult` -> trace/context/planner evidence。`ExecutionBackend.execute()` 的当前签名必须接收 `cancellation_token` 关键字参数；`CommandExecutor` 不再静默回退到旧签名。
 
 `LocalProcessBackend` 通过 stdout/stderr reader thread 将管道输出送入 `OutputCollector`；reader 优先使用 `read1(8192)` 读取可用缓冲，回退到 `read(8192)`，避免大输出逐字节读取，同时保持长进程的实时输出可被 `read_process_output()` 轮询。
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`CommandToolHandlers.run_command()` -> `CommandExecutor.plan()` -> `CommandExecutor.run()` 先把 tool 参数生成对象 `CommandRequest`，再经 command policy 生成 `CommandPolicyResult` 和 `CommandPlan`。若策略要求隔离，`SandboxManager.run()` 返回的 sandbox payload 被 `CommandExecutor._result_from_sandbox()` 转成 `CommandResult`；否则 `_completed_result()` 从 backend exit/stdout/stderr 生成结果。`CommandExecutor._record_trace()` 写入 command trace 事件，长输出写 artifact，`CommandResult.to_observation()` 进入 `context.sqlite3` 并由 `Planner.update_from_command()` 消费为 evidence。
+以用户要求修复 `quicksort.py` 为例：`CommandToolHandlers.run_command()` -> `CommandExecutor.plan()` -> `CommandExecutor.run()` 先把 tool 参数生成对象 `CommandRequest`，再由 `_policy_request()` 把 command risk 分类、cwd 是否越界、network/filesystem intent 和 redacted command metadata 投影为 `PolicyRequest`。`PolicyEngine.enforce()` 是唯一最终裁决者；`CommandExecutor._command_policy_result()` 只把 `PolicyDecision` 投影成嵌入 `CommandPlan` / `CommandResult` 的 `CommandPolicyResult`。若策略要求隔离，`SandboxManager.run()` 返回的 sandbox payload 被 `CommandExecutor._result_from_sandbox()` 转成 `CommandResult`；否则 `_completed_result()` 从 backend exit/stdout/stderr 生成结果。`CommandExecutor._record_trace()` 写入 command trace 事件，长输出写 artifact，`CommandResult.to_observation()` 进入 `context.sqlite3` 并由 `Planner.update_from_command()` 消费为 evidence。
 
 在 `workspace-write` 且 `PolicyDecision.outcome=sandbox_required` 时，普通本地验证命令不得走 `local_process`。Windows backend 可用时，`CommandResult.backend` 为 `windows`，`isolation_report["sandbox"]` 和 metadata 同步记录 `enforcement_status`、`execution_backend`、`backend_is_local_process`、`network_denied_verified`、`process_tree_kill`、`job_killed`、`timeout_enforced`、`artifact_refs`、`sandbox_artifacts`、`sandbox_changed_files` 和 `sandbox_violations`。Windows backend 不可用时，结果是 `ExecutionStatus.BACKEND_ERROR` / `error_code=sandbox_unavailable`，不是普通本地执行。
 
@@ -124,9 +125,9 @@ class CommandResult:
 
 当结果来自 sandbox，`isolation_report["sandbox"]` 是 command 层对 `SandboxResult` 的安全投影，包含 `sandbox_id`、`backend`、`status`、`trace_id`、`enforcement_status`、`execution_backend`、`backend_is_local_process`、`network_denied_verified`、`process_tree_kill`、`job_killed`、`timeout_enforced`、`artifact_count`、`artifacts`、`artifact_refs`、`changed_files`、`changed_files_count`、`violations`、`cleanup_status` 和 `imported_changes_count`。同一批字段的简化版本也进入 `CommandResult.metadata`，供 VerificationRunner、Planner 和 Finalizer 聚合。
 
-### CommandPolicyResult（命令策略决策）
+### CommandPolicyResult（命令策略投影）
 
-command policy 的评估结果。**边界**：内部治理对象，嵌入 CommandPlan/CommandResult；进入 policy audit ledger。
+`PolicyDecision` 在 command 层的安全投影。**边界**：内部治理对象，嵌入 CommandPlan/CommandResult；完整 policy request/decision 由 `PolicyEngine` 进入 policy audit ledger。
 
 ```python
 @dataclass(frozen=True)
@@ -193,18 +194,18 @@ class CommandDecision(str, Enum):    # CommandPolicyResult.decision
 
 ### 数据流概述
 
-`CommandToolHandlers.run_command()` 生成 `CommandRequest`，`CommandPolicy.evaluate()` 生成 `CommandPolicyResult`，`CommandExecutor.plan()` 组合为 `CommandPlan`。若策略要求隔离，`SandboxManager.run()` 返回 sandbox payload 被 `_result_from_sandbox()` 转成 `CommandResult`；否则 `_completed_result()` 从 backend 生成结果。`CommandResult.to_observation()` 写 `context.sqlite3`，长输出写 trace artifact，`CommandExecutor._record_trace()` 写 trace event。
+`CommandToolHandlers.run_command()` 生成 `CommandRequest`，`CommandExecutor._policy_request()` 生成 `PolicyRequest`，`PolicyEngine.enforce()` 生成 `PolicyDecision`，`CommandExecutor._command_policy_result()` 生成 command-local `CommandPolicyResult`，`CommandExecutor.plan()` 组合为 `CommandPlan`。若策略要求隔离，`SandboxManager.run()` 返回 sandbox payload 被 `_result_from_sandbox()` 转成 `CommandResult`；否则 `_completed_result()` 从 backend 生成结果。`CommandResult.to_observation()` 写 `context.sqlite3`，长输出写 trace artifact，`CommandExecutor._record_trace()` 写 trace event。
 
 命令执行层的核心 `error_code` 值来自 `singularity.error_codes.ErrorCode`：policy、sandbox、timeout、idle timeout、semantic failure、exit nonzero、output limit、process not found、verification runner required 等分支仍输出原字符串值，但不再在 `CommandExecutor` 内维护独立字面量映射。
 
 ## 谁生成这些对象
 
-- command tool、VerificationRunner 与 evaluation setup 生成 `ResourceLimits`/`CommandRequest`；`CommandPolicy.evaluate()` 或 executor 的 fail-closed 分支生成 `CommandPolicyResult`，`CommandExecutor.plan()` 组合为 `CommandPlan`。
+- command tool、VerificationRunner 与 evaluation setup 生成 `ResourceLimits`/`CommandRequest`；`CommandExecutor._policy_request()` 生成 `PolicyRequest`，`PolicyEngine.enforce()` 生成最终 `PolicyDecision`，`CommandExecutor._command_policy_result()` 或 executor 的 fail-closed 分支生成 command-local `CommandPolicyResult`，`CommandExecutor.plan()` 组合为 `CommandPlan`。
 - `CommandExecutor.run()` 的 backend、sandbox、blocked 分支生成 `CommandResult`；`start_process()`、`read_process_output()`、`stop_process()` 分别生成 `ProcessSession`、`ProcessOutput`、`ProcessStopResult`。
 
 ## 谁消费这些对象
 
-`CommandExecutor` 消费 request/plan/policy；command tool、verification、planner 消费 result/process objects。`CommandResult.to_observation()` 和 process `to_dict()` 的安全投影进入 tool result/context，模型看不到 env request、raw secret argv 或完整内部 plan。
+`CommandExecutor` 消费 request、`PolicyDecision` 投影和 backend/sandbox result；command tool、verification、planner 消费 result/process objects。`CommandResult.to_observation()` 和 process `to_dict()` 的安全投影进入 tool result/context，模型看不到 env request、raw secret argv 或完整内部 plan。
 
 ## 是否落盘
 
@@ -212,11 +213,11 @@ Command plan 和 process session 只在 executor 内存；长 stdout/stderr 由 
 
 ## 是否进入 trace / audit
 
-CommandExecutor 发出 `COMMAND_*` event 与 legacy `command` record，payload 包含 status、exit、digest、artifact ref、changed files、policy/isolation 摘要；argv/env/output 在写入前脱敏。Command policy 的 request/decision 进入 policy audit ledger。
+CommandExecutor 发出 `COMMAND_*` event 与 legacy `command` record，payload 包含 status、exit、digest、artifact ref、changed files、policy/isolation 摘要；argv/env/output 在写入前脱敏。`PolicyEngine` 的 request/decision 进入 policy audit ledger。
 
 ## 失败路径
 
-policy 返回 `REVIEW_REQUIRED`/`POLICY_DENIED`、cwd denied、sandbox setup/backend error、timeout/idle timeout、kill 或非零退出时生成非成功 `CommandResult`；process API 通过 `status`、`error_code`、`killed_reason` 表达失败，不把启动失败登记为 running session。`workspace-write` 下 sandbox backend unavailable 时 `backend` 不得是 `local_process`，`sandbox_availability` 必须说明 backend 状态，输出仍按 `SecretRedactor` 和 output limit 处理。
+`PolicyEngine` 返回 `REQUIRE_REVIEW`/`DENY`、cwd denied、sandbox setup/backend error、timeout/idle timeout、kill 或非零退出时生成非成功 `CommandResult`；process API 通过 `status`、`error_code`、`killed_reason` 表达失败，不把启动失败登记为 running session。`workspace-write` 下 sandbox backend unavailable 时 `backend` 不得是 `local_process`，`sandbox_availability` 必须说明 backend 状态，输出仍按 `SecretRedactor` 和 output limit 处理。
 
 ## 当前结构问题
 

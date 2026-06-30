@@ -109,6 +109,19 @@ class DefaultLocalPolicyRules:
         tags = set(risk.tags)
         operation = request.operation
 
+        if request.metadata.get("command_missing"):
+            return RuleResult(
+                DecisionOutcome.DENY,
+                "Command request must provide argv or shell.",
+                "hard_deny_command_parse_error",
+            )
+        if request.metadata.get("cwd_outside_workspace"):
+            return RuleResult(
+                DecisionOutcome.DENY,
+                "Command cwd is outside the current workspace.",
+                "hard_deny_cwd_outside_workspace",
+            )
+
         protected = _protected_path_violation(request, profile, tags)
         if protected is not None:
             return RuleResult(
@@ -213,6 +226,9 @@ class DefaultLocalPolicyRules:
                     "Command execution requires review in read-only mode.",
                 )
             if profile.profile == PermissionProfileName.DANGER_FULL_ACCESS:
+                review_reason = _danger_full_access_review_reason(request, tags)
+                if review_reason is not None:
+                    return _review_result(request, review_reason)
                 return RuleResult(
                     DecisionOutcome.ALLOW,
                     "Local command execution is allowed by danger-full-access.",
@@ -291,9 +307,33 @@ def _always_review(
         return True
     if RiskTag.PACKAGE_MANAGER in tags or RiskTag.SUPPLY_CHAIN in tags:
         return True
+    command_risks = set(request.metadata.get("command_risk_tags") or [])
+    if command_risks.intersection({"DESTRUCTIVE", "SYSTEM_MUTATION", "VCS_MUTATION"}):
+        return True
     if "sudo" in command_text or "runas" in command_text:
         return True
     return _is_vcs_mutation(command_text)
+
+
+def _danger_full_access_review_reason(
+    request: PolicyRequest,
+    tags: set[RiskTag],
+) -> str | None:
+    command_risks = set(request.metadata.get("command_risk_tags") or [])
+    if request.metadata.get("shell"):
+        return "Shell commands require review because parsing is delegated to the shell."
+    purpose = str(request.metadata.get("command_purpose") or "")
+    if (
+        RiskTag.MUTATES_FILES in tags
+        and purpose != "FORMATTER"
+        and not request.metadata.get("risk_acceptance_reason")
+    ):
+        return "Workspace-writing commands require an explicit risk acceptance reason."
+    if "WRITE_WORKSPACE" in command_risks and purpose != "FORMATTER" and not request.metadata.get("risk_acceptance_reason"):
+        return "Workspace-writing commands require an explicit risk acceptance reason."
+    if "LONG_RUNNING" in command_risks and not request.metadata.get("risk_acceptance_reason"):
+        return "Long-running process sessions require explicit ownership."
+    return None
 
 
 def _is_vcs_mutation(command_text: str) -> bool:

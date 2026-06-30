@@ -73,6 +73,8 @@
 
 以用户要求修复 `quicksort.py` 为例：`ToolProtocolEngine.process_model_turn()` -> `ToolProtocolValidator.validate_assistant_message()` 先把 `ModelTurnResult.tool_calls` 生成对象 `ToolCallEnvelope` 和 `ToolCallBatch`，再由 `ToolProtocolScheduler.schedule()` 生成 `ToolExecutionPlan`。调度语义仍由 scheduler 决定：side-effect 或不安全调用走 sequential，read-only 且并行安全调用可走 parallel_readonly，blocked call 不执行。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 并返回 `ToolResult`；其中 read-only 且可缓存的结果由 `ToolResultCache` 按参数、schema、workspace 与 touched paths 指纹保存，重复 `tool_call_id` 由 `IdempotencyLedger` 做冲突检测或安全 replay。`ToolCallEnvelope.to_provider_tool_call()` 只在需要把 envelope 投影回 provider tool-call 形状时使用，并复用模型层 `provider_tool_call_dict()`；它不参与执行调度。`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`；`ToolProtocolStateStore.upsert_record()`、`transition()`、`append_event()` 和 `bind_result()` 把 batch、record、event、binding 写入 `tool_protocol.sqlite3`。`ContextManager.add_tool_protocol_result()` 把安全 tool message 写入 `context.sqlite3`，raw result 只通过 artifact ref/digest 进入 trace。
 
+`ToolProtocolEngine.execute_plan()` 与 `_execute_parallel_readonly_plan()` 共用同一批 call lifecycle helper：`_batch_for_plan()` 取得 batch，`_prepare_call()` 统一执行 validation trace、record upsert、synthetic result、replay/idempotency check、scheduled/running transition，`_bind_synthetic_result()` 统一绑定 rejected/replay-blocked synthetic result，`_complete_call()` 统一 result builder、state transition、context append、trace emit 和 counters，`_turn_result()` 统一 turn status/metadata。serial 与 parallel readonly 的差异只在 scheduling strategy：serial 逐个调用 `ToolExecutor.execute_request()`，parallel readonly 先按 group 调用 `_prepare_call()`，再把 prepared read-only calls 交给 `ParallelToolExecutor.execute()` 并发执行，group start/completed trace 只记录调度组边界。
+
 ## 真实对象完整结构
 
 ### ToolCallEnvelope（工具调用信封）
@@ -208,12 +210,12 @@ class ToolProtocolTurnStatus(str, Enum): # ToolProtocolTurnResult.status
 
 ### 数据流概述
 
-`ModelTurnResult.tool_calls` -> `ToolProtocolValidator.validate_assistant_message()` 生成 `ToolCallEnvelope` 和 `ToolCallBatch`。`ToolProtocolScheduler.schedule()` 根据 side_effect/并行安全性生成 `ToolExecutionPlan`（sequential/parallel_readonly/blocked）。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 返回 `ToolResult`，`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`。`ContextManager.add_tool_protocol_result()` 只把 redacted `ToolObservationView.to_model_payload()` 作为 tool message 加入下一轮模型请求。provider tool-call dict 的格式由模型层 helper 统一生成，tool protocol 不维护第二份硬编码结构。
+`ModelTurnResult.tool_calls` -> `ToolProtocolValidator.validate_assistant_message()` 生成 `ToolCallEnvelope` 和 `ToolCallBatch`。`ToolProtocolScheduler.schedule()` 根据 side_effect/并行安全性生成 `ToolExecutionPlan`（sequential/parallel_readonly/blocked）。`ToolProtocolEngine` 对 serial 和 parallel readonly 共用 `_prepare_call()` / `_complete_call()` 生命周期核心；`ToolExecutor.execute_request()` 或 `ParallelToolExecutor.execute()` 只提供调度方式和 `ToolResult` 来源。`ToolProtocolResultBuilder.build()` 生成 `ToolProtocolResultEnvelope`。`ContextManager.add_tool_protocol_result()` 只把 redacted `ToolObservationView.to_model_payload()` 作为 tool message 加入下一轮模型请求。provider tool-call dict 的格式由模型层 helper 统一生成，tool protocol 不维护第二份硬编码结构。
 
 ## 谁生成这些对象
 
 - `ToolProtocolValidator.validate_assistant_message()` 从模型响应生成 `ToolCallEnvelope`、`ToolCallBatch` 和 `ToolProtocolValidationResult`；`ToolProtocolScheduler.schedule()` 根据 tool side effect/并行安全性生成 `ToolExecutionPlan`。
-- `ToolProtocolStateStore.upsert_record()` / `transition()` 创建并更新 `ToolCallRecord`；`append_event()` 生成协议库内部的 `ToolProtocolEvent`。`ToolProtocolResultBuilder.build()` 或 engine 的 `_synthetic_result()` 生成 `ToolProtocolResultEnvelope`，`bind_result()` 生成 `ToolProtocolResultBinding`。
+- `ToolProtocolEngine._prepare_call()` 通过 `ToolProtocolStateStore.upsert_record()` / `transition()` 创建并更新 `ToolCallRecord`；`append_event()` 生成协议库内部的 `ToolProtocolEvent`。`ToolProtocolResultBuilder.build()` 或 engine 的 `_synthetic_result()` 生成 `ToolProtocolResultEnvelope`，`_bind_synthetic_result()` / `_complete_call()` 调用 `bind_result()` 生成 `ToolProtocolResultBinding`。
 - `ToolProtocolEngine.process_model_turn()` 生成正常/拒绝/待批准的 `ToolProtocolTurnResult`；`ToolProtocolRecoveryManager` 从 records、bindings 与 context message 状态生成 `ToolProtocolRecoveryReport` 和恢复用 turn result。
 
 ## 谁消费这些对象
@@ -231,18 +233,18 @@ class ToolProtocolTurnStatus(str, Enum): # ToolProtocolTurnResult.status
 ## 是否进入 trace / audit
 
 - `ToolProtocolTrace.emit()` 写 observability `events.jsonl` 的 `tool_protocol.batch_created`、`plan_built`、call state、`call_completed`、`result_bound` 等事件；payload 只保留 call id、tool name、digest、状态、计数和 artifact refs，明确删除 raw arguments/result/content。
-- `ToolProtocolEvent` 是 `tool_protocol.sqlite3` 内部恢复日志，不是 `TraceRecorder` 的 `TraceEvent`；二者不可互换。协议 event 用于 replay/recovery，observability event 用于 timeline/report。
+- `ToolProtocolEvent` 是 `tool_protocol.sqlite3` 内部恢复日志，不是 `TraceRecorder` 的 `TraceEvent`；二者不可互换。协议 event 用于 replay/recovery，observability event 用于 timeline/report。serial 与 parallel readonly 共用的 lifecycle helper 保证 validation、synthetic result、replay、state transition、result binding、context append 和 trace emit 的 event 字段一致。
 - planner/policy gate 产生的 request/decision 由 `ToolExecutor` 的 policy 链写 audit；protocol envelope、validation 与 recovery report 不直接进入 policy audit。
 
 ## 失败路径
 
-- validator 对 invalid JSON、unknown/disallowed tool、schema mismatch、duplicate/missing call id 返回 invalid `ToolProtocolValidationResult`；engine 将错误转换成 rejected/synthetic result，而不是执行 handler。
+- validator 对 invalid JSON、unknown/disallowed tool、schema mismatch、duplicate/missing call id 返回 invalid `ToolProtocolValidationResult`；engine 在 `_prepare_call()` 中将错误转换成 rejected/synthetic result，而不是执行 handler。serial 与 parallel readonly 走同一 synthetic binding 路径。
 - `ToolCallRecord.phase` 表达 waiting approval、running、succeeded、rejected、failed、cancelled；`ToolProtocolResultEnvelope` 用 `ok/status/error_code/error_kind` 保存执行失败，turn result 汇总 failed/rejected/pending approval 并给出 `next_action`。
 - recovery report 明确列 pending、running、succeeded-but-not-appended、assistant message missing tool message；missing record/binding、conflicting replay 或无法安全 append 时保持阻塞，不伪造成功 tool message。
 
 ## 当前结构问题
 
-协议状态 SQLite 与 observability trace 是两套持久化系统；修改 call phase、binding 或恢复规则时必须同时核对 state schema、`ToolExecutor.execute_request()`、`ContextManager.add_tool_protocol_result()` 的 append 原子性和 trace 安全投影。
+协议状态 SQLite 与 observability trace 是两套持久化系统；修改 call phase、binding 或恢复规则时必须同时核对 state schema、`ToolExecutor.execute_request()`、`ParallelToolExecutor.execute()`、`ContextManager.add_tool_protocol_result()` 的 append 原子性和 trace 安全投影。serial/parallel readonly 不应复制 validation、synthetic result、replay、state transition、result binding 或 trace emit 逻辑；只允许在 scheduling strategy 和 group-level trace 上分叉。
 
 ## 维护规则
 

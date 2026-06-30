@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 
-from singularity.diagnostics import DoctorEngine, RepairEngine
+import singularity.diagnostics as diagnostics
+from singularity.diagnostics import DiagnosticRepairResult, DoctorEngine, RepairEngine
 from singularity.release.init import initialize_user_data
 from singularity.release.models import atomic_write_json
 from singularity.release.paths import resolve_user_data_paths
@@ -15,10 +16,16 @@ def test_repair_dry_run_does_not_create_user_data_files(tmp_path):
     plan = RepairEngine().run(result, paths=paths, project_root=tmp_path, apply=False)
 
     assert plan.applied is False
+    assert isinstance(plan, DiagnosticRepairResult)
     assert plan.actions
     assert not paths.config_dir.exists()
     assert not paths.config_file.exists()
     assert plan.audit_log_path is None
+
+
+def test_diagnostics_repair_result_does_not_export_repair_plan_alias() -> None:
+    assert hasattr(diagnostics, "DiagnosticRepairResult")
+    assert not hasattr(diagnostics, "RepairPlan")
 
 
 def test_repair_apply_creates_missing_dirs_and_audit_log(tmp_path):

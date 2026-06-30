@@ -47,6 +47,8 @@
 
 Policy 层把会话级权限边界、动作级策略决策和人工 approval 串成同一条强制执行链。会话级边界由 `PermissionProfile` 描述；动作级结果仍使用仓库既有 `allow / deny / require_review / sandbox_required` 语义。完整内部对象只供 runtime、audit、trace 使用；模型只能看到裁剪后的权限摘要和安全错误信息。
 
+`PolicyEngine` 是唯一 policy decision authority。`CommandPolicy` 不再生成最终 command 裁决，只作为 command risk classification / request-shape helper；`VerificationPolicy` 只做 verification plan-time 结构检查和风险标签补充。`ApprovalGate` 只消费 `PolicyDecision.required_approval` 并返回/记录 grant，不重新判定 policy。
+
 ## 命名来源
 
 | 名称 | 来源 |
@@ -91,13 +93,13 @@ Policy 层把会话级权限边界、动作级策略决策和人工 approval 串
 
 `ProductionConfig.to_permission_profile()` 在 kernel 启动时生成一个不可变 `PermissionProfile`。`AgentGraphBuilder._build_policy_sandbox()` 用同一个 profile 构造 `PolicyConfig`、`PolicyEngine`、`ApprovalGate` 和 `SandboxManager`，再把同一个 `PolicyEngine` / `ApprovalGate` 注入 `CommandExecutor`、`WorkspaceMutationManager`、`VerificationRunner` 和 `ToolExecutor`。
 
-执行时，`ToolExecutor` 只做工具准入和 hard deny；对于 delegated command/mutation，它不提前消费 approval grant。`CommandExecutor._policy_request()`、`WorkspaceMutationManager._policy_request()`、`VerificationRunner._policy_request()` 在真正执行边界生成 `PolicyRequest`，调用 `PolicyEngine.enforce()` 得到 `PolicyDecision`。`REQUIRE_REVIEW` 由该执行边界调用 `ApprovalGate.authorize()` 消费单次授权；`SANDBOX_REQUIRED` 交给 `SandboxManager.run()` 执行已经构造好的 `SandboxRequest`。`approval_policy=never` 在 rules 层把 review 转为 deny。
+执行时，`ToolExecutor` 只做工具准入和 hard deny；对于 delegated command/mutation，它不提前消费 approval grant。`CommandExecutor._policy_request()`、`WorkspaceMutationManager._policy_request()`、`VerificationRunner._policy_request()` 在真正执行边界生成 `PolicyRequest`，调用 `PolicyEngine.enforce()` 得到 `PolicyDecision`。command 路径只用 `CommandPolicy.classify()` 补充 `risk_tags` 和 command metadata，再由 `CommandExecutor._command_policy_result()` 把 `PolicyDecision` 投影为 `CommandPolicyResult`。verification plan-time 的 `VerificationPolicy.evaluate()` 只阻塞缺少 command 的 required check；可执行 check 的最终 allow/deny/review/sandbox 仍由 `_run_check()` 和 `CommandExecutor.run()` 中的 `PolicyEngine` 决定。`REQUIRE_REVIEW` 由该执行边界调用 `ApprovalGate.authorize()` 消费单次授权；`SANDBOX_REQUIRED` 交给 `SandboxManager.run()` 执行已经构造好的 `SandboxRequest`。`approval_policy=never` 在 rules 层把 review 转为 deny。
 
 Windows sandbox backend 不改变 policy 语义：PolicyEngine 只决定普通本地验证命令在 `workspace-write` 下需要 sandbox，ApprovalGate 只处理 review/approval，不创建账户、不放宽到 `danger-full-access`。Sandbox 层随后验证 sandbox account、Credential Manager 凭据、ACL boundary、LocalUser firewall、private desktop、restricted low-integrity token、Job Object 和 network probe。缺任一能力时 command 结果是 sandbox/backend error，不回退到普通本地进程。
 
 ## 真实任务中的对象流
 
-以模型请求写入 `quicksort.py` 并运行验证为例：`ToolExecutor` -> `WorkspaceMutationManager.apply_operations()` -> `PolicyEngine.enforce()` -> `ApprovalGate.authorize()` 或直接执行。Mutation manager 生成 `PolicyRequest`，`PolicyEngine.enforce()` 消费 request、生成 `PolicyDecision`，并通过 `PolicyAuditWriter.append()` 落盘到 policy audit JSONL；workspace 内普通写入在 `workspace-write` 下 allow，`.env`、`.git/config` 或 `.singularity/**` 则因 `PermissionProfile.protected_paths` hard deny。随后命令验证进入 `CommandExecutor.run()` -> `CommandExecutor._sandbox_request()` -> `SandboxManager.run()`；command executor 再次生成 command `PolicyRequest`，在 `workspace-write` 下普通本地命令得到 `sandbox_required`，并生成 `SandboxRequest` 交给 sandbox 层消费。trace 记录 `policy.requested`、`policy.decided` / `policy.blocked`、`sandbox.requested`、`sandbox.completed`；audit JSONL 记录完整 request/decision 投影；模型 context 只收到裁剪后的 outcome/reason 或 `PermissionSummary`。
+以模型请求写入 `quicksort.py` 并运行验证为例：`ToolExecutor` -> `WorkspaceMutationManager.apply_operations()` -> `PolicyEngine.enforce()` -> `ApprovalGate.authorize()` 或直接执行。Mutation manager 生成 `PolicyRequest`，`PolicyEngine.enforce()` 消费 request、生成 `PolicyDecision`，并通过 `PolicyAuditWriter.append()` 落盘到 policy audit JSONL；workspace 内普通写入在 `workspace-write` 下 allow，`.env`、`.git/config` 或 `.singularity/**` 则因 `PermissionProfile.protected_paths` hard deny。随后命令验证进入 `VerificationRunner._policy_request()` -> `PolicyEngine.enforce()` 和 `CommandExecutor.run()` -> `CommandExecutor._policy_request()` -> `PolicyEngine.enforce()` -> `CommandExecutor._sandbox_request()` -> `SandboxManager.run()`；command executor 不再调用第二套 `CommandPolicy.evaluate()`，同一 command 的 network denied、protected path、sandbox required、approval required 都来自同一个 rules engine。trace 记录 `policy.requested`、`policy.decided` / `policy.blocked`、`sandbox.requested`、`sandbox.completed`；audit JSONL 记录完整 request/decision 投影；模型 context 只收到裁剪后的 outcome/reason 或 `PermissionSummary`。
 
 `WorkspaceMutationManager.apply_changeset()` 在事务开始和结束调用 `collect_git_state()` 采集 `GitState`，只用于 mutation result 与审计上下文。该函数执行固定的只读 `git rev-parse` / `git branch` / `git status --porcelain=v1`，设置 `GIT_TERMINAL_PROMPT=0`、`GIT_OPTIONAL_LOCKS=0` 和 5 秒超时，不消费模型输入、不执行任意命令，也不经过 `CommandExecutor` / `SandboxManager`。采集失败、非 git worktree、git timeout 或 git 返回非零时只生成 `GitState(available=False, error=...)`，不阻断 workspace mutation，也不改变 command/sandbox 的 fail-closed 执行边界。
 
@@ -277,7 +279,7 @@ class ApprovalGrant:
 
 ## 谁生成这些对象
 
-`ProductionConfig` 生成 `PermissionProfile`。`AgentGraphBuilder` 生成同 profile 的 `PolicyConfig`、`PolicyEngine`、`ApprovalGate` 和 `SandboxManager`。Tool、command、mutation、verification、plugin manager 生成 `PolicySubject`、`ResourceRef` 和 `PolicyRequest`。`DefaultLocalPolicyRules.decide()` 生成 `PolicyConstraints`、`ApprovalRequirement` 和 `PolicyDecision`。`ApprovalGate` 或 remote approval 生成 `ApprovalGrant`。`PolicyAuditWriter.append()` 生成 `PolicyAuditEntry`。
+`ProductionConfig` 生成 `PermissionProfile`。`AgentGraphBuilder` 生成同 profile 的 `PolicyConfig`、`PolicyEngine`、`ApprovalGate` 和 `SandboxManager`。Tool、command、mutation、verification、plugin manager 生成 `PolicySubject`、`ResourceRef` 和 `PolicyRequest`。`CommandPolicy.classify()` 只生成 command risk tags；`DefaultLocalPolicyRules.decide()` 生成 `PolicyConstraints`、`ApprovalRequirement` 和 `PolicyDecision`。`ApprovalGate` 或 remote approval 生成 `ApprovalGrant`。`PolicyAuditWriter.append()` 生成 `PolicyAuditEntry`。
 
 ## 谁消费这些对象
 

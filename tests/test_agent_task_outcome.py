@@ -10,8 +10,15 @@ from singularity.failure_analysis.analyzer import FailureAnalyzer
 from singularity.failure_analysis.request import FailureAnalysisRequest
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import ModelError, ModelErrorKind
-from singularity.planner import Planner, TaskStatus
-from singularity.planner.models import ReplanDecisionKind
+from singularity.planner import EvidenceLedger, Planner, TaskStatus
+from singularity.planner.models import (
+    PolicyObservationRecord,
+    ReplanDecisionKind,
+    SandboxObservationRecord,
+    TaskOutcomeRecord,
+    ToolResultRecord,
+    VerificationEvidenceRecord,
+)
 from singularity.policy import (
     DecisionOutcome,
     OperationKind,
@@ -76,6 +83,77 @@ class DenyMutationPolicyEngine:
 
     def register_grant(self, _grant: Any) -> None:
         return None
+
+
+def test_key_evidence_buckets_round_trip_as_typed_records() -> None:
+    evidence = EvidenceLedger()
+
+    evidence.add_verification_result(
+        {
+            "completion_assessment": {"status": "ready", "warnings": []},
+            "check_status": [{"check_id": "unit", "status": "passed"}],
+        }
+    )
+    evidence.add_sandbox_observation(
+        {
+            "source": "verification",
+            "backend": "windows",
+            "status": "backend_unavailable",
+            "enforcement_status": "backend_unavailable",
+            "execution_backend": None,
+            "network_denied_verified": "false",
+            "process_tree_kill": "false",
+            "job_killed": False,
+            "timeout_enforced": False,
+            "artifact_count": 0,
+            "artifact_refs": [],
+            "changed_files_count": 0,
+            "violations": [],
+            "imported_changes_count": 0,
+        }
+    )
+    evidence.add_policy_observation(
+        {
+            "outcome": "deny",
+            "component": "command",
+            "operation": "execute_command",
+            "reason": "blocked",
+            "risk_level": "high",
+            "resource": "python -V",
+        }
+    )
+    evidence.add_tool_result(
+        {
+            "tool_call_id": "call_1",
+            "tool_name": "read_file",
+            "ok": False,
+            "status": "failed",
+            "error_code": "policy_denied",
+            "failure": {"code": "policy_denied"},
+        }
+    )
+    evidence.add_task_outcome(
+        {
+            "status": "blocked",
+            "error_code": "completion_blocker",
+            "summary": "completion blocked",
+        }
+    )
+
+    restored = EvidenceLedger.from_dict(evidence.to_dict())
+
+    assert isinstance(restored.latest_verification_result(), VerificationEvidenceRecord)
+    assert isinstance(restored.sandbox_records()[0], SandboxObservationRecord)
+    assert isinstance(restored.policy_records()[0], PolicyObservationRecord)
+    assert isinstance(restored.tool_result_records()[0], ToolResultRecord)
+    assert isinstance(restored.task_outcome_records()[0], TaskOutcomeRecord)
+    assert restored.latest_verification_result().completion_status == "ready"
+    assert restored.sandbox_records()[0].status == "backend_unavailable"
+    assert restored.sandbox_records()[0].network_denied_verified is False
+    assert restored.sandbox_records()[0].process_tree_kill is False
+    assert restored.policy_records()[0].outcome == "deny"
+    assert restored.tool_result_records()[0].error_code == "policy_denied"
+    assert restored.task_outcome_records()[0].status == "blocked"
 
 
 def test_premature_final_then_quicksort_smoke_completes(tmp_path: Path) -> None:

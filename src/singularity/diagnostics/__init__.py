@@ -3,10 +3,10 @@ from singularity.diagnostics.models import (
     DiagnosticCheck,
     DiagnosticContext,
     DiagnosticFinding,
+    DiagnosticRepairResult,
     DiagnosticResult,
     DiagnosticSeverity,
     RepairAction,
-    RepairPlan,
 )
 from singularity.diagnostics.repair import RepairEngine
 
@@ -14,10 +14,10 @@ __all__ = [
     "DiagnosticCheck",
     "DiagnosticContext",
     "DiagnosticFinding",
+    "DiagnosticRepairResult",
     "DiagnosticResult",
     "DiagnosticSeverity",
     "DoctorEngine",
     "RepairAction",
     "RepairEngine",
-    "RepairPlan",
 ]

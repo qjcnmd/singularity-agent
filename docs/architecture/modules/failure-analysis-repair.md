@@ -37,6 +37,8 @@
 
 失败分析与修复层把失败证据转换为根因、修复计划、修复契约和 replanner signal，避免模型在同一失败上盲目循环。
 
+顶层 `repair/plan.py` / `repair/planner.py` 的 `RepairPlan` / `RepairPlanner` 只表示 AgentLoop failure repair。`diagnostics` 子系统的本地 doctor/repair 输出命名为 `DiagnosticRepairResult`，不是本层 repair plan，也不从 `singularity.diagnostics` 重新导出旧 `RepairPlan` 名称。
+
 ## 当前源码位置
 
 - src/singularity/failure_analysis/request.py
@@ -55,7 +57,7 @@
 
 ## 真实运行时调用链
 
-`AgentLoop._maybe_analyze_failure()` -> `FailureAnalysisRequest.from_planner()` -> `FailureAnalyzer.analyze()` -> `RepairPlanner.plan()` -> `RepairPlanner.to_replan_signal()` -> `Planner.record_failure_analysis()` -> `Planner.replan()`。验证执行路径中，`VerificationRunner` 调用 `FailureAnalysisPipeline.analyze_results()` 把 failed/blocked verification result 转成同一个顶层 `FailureAnalysisResult`，再交给顶层 `RepairPlanner.plan()`；verification 包不再定义自己的 `RepairPlanner` 或 `RepairPlan`。当 request 的结构化 failure source/evidence 表明 `sandbox_limitation` 且 sandbox/enforcement/backend status 为 `backend_unavailable` 时，`FailureAnalyzer.analyze()` 在模型调用前直接生成 blocked `FailureAnalysisResult`，不把测试文件作为 repair target。
+`AgentLoop._maybe_analyze_failure()` -> `FailureAnalysisRequest.from_planner()` -> `FailureAnalyzer.analyze()` -> `RepairPlanner.plan()` -> `RepairPlanner.to_replan_signal()` -> `Planner.record_failure_analysis()` -> `Planner.replan()`。验证执行路径中，`VerificationRunner` 调用 `FailureAnalysisPipeline.analyze_results()` 把 failed/blocked verification result 转成同一个顶层 `FailureAnalysisResult`，再交给顶层 `RepairPlanner.plan()`；verification 包不再定义自己的 `RepairPlanner` 或 `RepairPlan`。diagnostics doctor/repair 路径返回 `DiagnosticRepairResult`，只描述本地配置/文件系统修复动作，不进入 AgentLoop failure repair 或 replanner signal。 当 request 的结构化 failure source/evidence 表明 `sandbox_limitation` 且 sandbox/enforcement/backend status 为 `backend_unavailable` 时，`FailureAnalyzer.analyze()` 在模型调用前直接生成 blocked `FailureAnalysisResult`，不把测试文件作为 repair target。
 
 ## 真实任务中的对象流
 
@@ -168,12 +170,13 @@ READ_FILE = "read_file"
 - `FailureAnalyzer.analyze()` 将非 sandbox-backend-blocker 的 `request.to_model_payload()` 发送给失败分析模型，成功响应由 `FailureAnalysisResult.from_model_payload()` 生成；invalid JSON、schema 或不可用模型由 `FailureAnalysisResult.blocked()` 生成明确 blocked result。`sandbox_limitation/backend_unavailable` 由 analyzer 在模型调用前直接 blocked，避免模型把验证命令里的测试文件误判为 `affected_files`。
 - `FailureAnalysisPipeline.analyze_result()` 在 verification 路径中从 `VerificationResult` 生成 rule-derived `FailureAnalysisResult`；它保留 no-progress guard 和 retrieval query metadata，但不定义 repair plan 类。
 - `RepairPlanner.plan()` 先用 `_action_candidates()` 生成 `RepairActionCandidate`，再由 `RepairContract.from_analysis()` / `blocked()` 与 `RepairPlan` 构造修复边界；`RepairPlanner.to_replan_signal()` 调用 `RepairReplanSignal.from_contract()` 生成 replanner 输入。
+- `singularity.diagnostics.repair.RepairEngine.run()` 生成 `DiagnosticRepairResult`；该对象只被 diagnostics CLI/render 消费，不生成 `RepairReplanSignal`，也不写入 planner `repair_plans` bucket。
 
 ## 谁消费这些对象
 
 - `FailureAnalyzer.analyze()` 消费 `FailureAnalysisRequest`；只有 `to_model_payload()` 的有界失败证据进入 failure-analysis 模型，workspace root、raw log 和完整 metadata 不直接发送。
 - `RepairPlanner.plan()`、`Planner.record_failure_analysis()` 和 `ContextManager.add_failure_item()` 消费 `FailureAnalysisResult`；`RepairContract`/candidate 限定 target files、allowed tools 和 verification。`Planner.authorize_tool_call()` 与 `VerificationRunner.run_plan()` 是生产消费者，targeted replay 只是读取证据的评估消费者。`VerificationRunner` 从 `FailureAnalysisPipeline` 接收顶层 result 后只调用顶层 `RepairPlanner`，不消费 verification-local repair plan。
-- `Planner.replan()` 和 planner-decision producer 消费 `RepairReplanSignal`，因此 signal 进入的是独立 replanner 模型请求；`RepairPlan`/contract 的安全摘要通过 planner context 进入后续主模型 turn。
+- `Planner.replan()` 和 planner-decision producer 消费 `RepairReplanSignal`，因此 signal 进入的是独立 replanner 模型请求；`RepairPlan`/contract 的安全摘要通过 planner context 进入后续主模型 turn。diagnostics `DiagnosticRepairResult` 由 `render_repair_plan()` 渲染给 CLI，不进入主模型 turn。
 
 ## 是否落盘
 
@@ -196,7 +199,7 @@ READ_FILE = "read_file"
 
 ## 当前结构问题
 
-`FailureAnalysisResult.root_cause` 在 dataclass 中是字符串，但 `to_dict()` 将其投影成包含 description/evidence/confidence 的对象；这是序列化边界，不应通过新增 alias 字段解决。repair candidate、contract、plan、signal 均为不同授权阶段，文档与代码不得合并成一个宽松字典。
+`FailureAnalysisResult.root_cause` 在 dataclass 中是字符串，但 `to_dict()` 将其投影成包含 description/evidence/confidence 的对象；这是序列化边界，不应通过新增 alias 字段解决。repair candidate、contract、plan、signal 均为不同授权阶段，文档与代码不得合并成一个宽松字典。diagnostics 的 `DiagnosticRepairResult` 与顶层 `RepairPlan` 语义不同，不能通过别名或 re-export 合并。
 
 ## 维护规则
 

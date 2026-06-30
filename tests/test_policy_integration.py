@@ -5,7 +5,13 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from singularity.command import CommandExecutor, CommandRequest, ExecutionStatus
+from singularity.command import (
+    CommandDecision,
+    CommandExecutor,
+    CommandPolicy,
+    CommandRequest,
+    ExecutionStatus,
+)
 from singularity.planner import EvidenceLedger, Planner, TaskState, TaskStatus
 from singularity.planner.finalizer import Finalizer
 from singularity.policy import (
@@ -19,9 +25,18 @@ from singularity.policy import (
     PolicySubject,
     ResourceRef,
 )
-from singularity.policy.permissions import PermissionProfile, PermissionProfileName
+from singularity.policy.permissions import ApprovalPolicy, NetworkAccess, PermissionProfile, PermissionProfileName
 from singularity.tools import PermissionLevel, ToolExecutor, ToolPolicy, ToolRegistry, ToolSpec
 from singularity.verification import VerificationRunner
+from singularity.verification.discovery import ProjectDetector
+from singularity.verification.impact import ImpactAnalyzer
+from singularity.verification.models import (
+    CheckKind,
+    VerificationCheck,
+    VerificationDecision,
+    VerificationPlan,
+)
+from singularity.verification.policy import VerificationPolicy
 from singularity.workspace import CreateFile, WorkspaceMutationManager
 
 
@@ -50,6 +65,11 @@ class CountingPolicyEngine(PolicyEngine):
             reason="test policy allows after recording",
             required_approval=None,
         )
+
+
+class FailingCommandPolicy(CommandPolicy):
+    def evaluate(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        raise AssertionError("CommandPolicy.evaluate must not be a policy decision authority")
 
 
 def tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -110,14 +130,108 @@ def test_mutation_manager_calls_policy_before_apply(tmp_path: Path) -> None:
 
 def test_command_executor_calls_policy_before_execute(tmp_path: Path) -> None:
     policy = CountingPolicyEngine(tmp_path)
-    component = CommandExecutor(tmp_path, policy_engine=policy)
+    component = CommandExecutor(tmp_path, policy_engine=policy, policy=FailingCommandPolicy())
 
     result = component.run(
         CommandRequest(argv=[sys.executable, "-c", "print('ok')"], cwd=".")
     )
 
     assert result.execution_status == ExecutionStatus.COMPLETED
+    assert result.policy_decision.decision == CommandDecision.ALLOW
     assert any(call.startswith("command:execute_command") for call in policy.calls)
+
+
+def test_command_plan_projects_policy_engine_decision_without_command_policy_evaluate(
+    tmp_path: Path,
+) -> None:
+    policy = CountingPolicyEngine(tmp_path)
+    component = CommandExecutor(tmp_path, policy_engine=policy, policy=FailingCommandPolicy())
+
+    plan = component.plan(CommandRequest(argv=[sys.executable, "-c", "print('plan')"], cwd="."))
+
+    assert plan.policy_decision.decision == CommandDecision.ALLOW
+    assert any(call.startswith("command:execute_command") for call in policy.calls)
+
+
+def test_command_execution_uses_same_policy_authority_for_network_and_verification(
+    tmp_path: Path,
+) -> None:
+    profile = PermissionProfile.default_for_workspace(
+        tmp_path,
+        network_access=NetworkAccess.DENIED,
+        approval_policy=ApprovalPolicy.NEVER,
+    )
+    policy = PolicyEngine(PolicyConfig(workspace_root=tmp_path, permission_profile=profile))
+    component = CommandExecutor(tmp_path, policy_engine=policy, policy=FailingCommandPolicy())
+    request = CommandRequest(
+        argv=[sys.executable, "-c", "print('net')"],
+        cwd=".",
+        network_mode="ALLOW_ALL",
+    )
+
+    command_result = component.run(request)
+    runner = VerificationRunner(
+        tmp_path,
+        command_executor=component,
+        policy_engine=policy,
+    )
+    check = VerificationCheck(
+        kind=CheckKind.UNIT_TEST,
+        command=request,
+        scope="tests",
+        required=True,
+        timeout=30,
+        risk_tags=[],
+        failure_policy="fail_fast",
+    )
+    profile_for_plan = ProjectDetector(tmp_path).detect()
+    plan = VerificationPlan(
+        project_profile=profile_for_plan,
+        impact_analysis=ImpactAnalyzer().analyze(
+            changed_files=[],
+            task_intent="tests",
+            project_profile=profile_for_plan,
+        ),
+        required_checks=[check],
+        optional_checks=[],
+        skipped_checks=[],
+        blocked_checks=[],
+    )
+    verification_request = runner._policy_request(plan, check)
+    verification_decision = policy.enforce(verification_request)
+
+    assert command_result.execution_status == ExecutionStatus.POLICY_DENIED
+    assert command_result.error_code == "policy_denied"
+    assert command_result.policy_decision.decision == CommandDecision.DENY
+    assert verification_decision.outcome == DecisionOutcome.DENY
+
+
+def test_verification_policy_preflight_uses_command_classification_only(
+    tmp_path: Path,
+) -> None:
+    request = CommandRequest(
+        argv=[sys.executable, "-c", "print('ok')"],
+        cwd=".",
+        purpose="PROJECT_VERIFICATION",
+    )
+    check = VerificationCheck(
+        kind=CheckKind.UNIT_TEST,
+        command=request,
+        scope="tests",
+        required=True,
+        timeout=30,
+        risk_tags=["unit_test"],
+        failure_policy="fail_fast",
+    )
+
+    decision = VerificationPolicy(FailingCommandPolicy()).evaluate(
+        check,
+        workspace_root=tmp_path,
+    )
+
+    assert decision.decision == VerificationDecision.ALLOW
+    assert decision.command_policy is None
+    assert "EXECUTES_PROJECT_CODE" in decision.risk_tags
 
 
 def test_permission_profile_controls_local_command_sandboxing(tmp_path: Path) -> None:
