@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 import pytest
 
+import singularity.evaluation.runner as evaluation_runner
 from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
 from singularity.evaluation.models import FAILURE_CASE_RECORD_SCHEMA_VERSION
 from singularity.evaluation.runner import (
@@ -16,6 +17,9 @@ from singularity.evaluation.runner import (
     EvaluationTaskResult,
     EvaluationTaskSet,
     SingularityPrivateBenchmarkAdapter,
+    _command_failure_category,
+    _failure_category,
+    _result_status,
     load_evaluation_task_set,
     summarize_evaluation_results,
 )
@@ -1363,6 +1367,121 @@ def test_evaluation_classifies_observed_sandbox_unavailability_as_environment_bl
     assert result["summary"]["failure_reasons"] == {"environment_blocker": 1}
 
 
+def test_evaluation_short_circuits_python_ssl_environment_error_before_post_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    py = json.dumps(sys.executable)
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.python_ssl_environment_blocker",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Write done.txt with ok and verify it.",
+                    "allowed_paths": ["done.txt"],
+                    "expected_file_changes": ["done.txt"],
+                    "verification_command": f'{py} -c "raise SystemExit(99)"',
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    def fail_if_post_verification_runs(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("post-agent verification must not run after Python SSL environment blocker")
+
+    monkeypatch.setattr(evaluation_runner, "_run_shell", fail_if_post_verification_runs)
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeEvidence:
+        sandbox_observations: ClassVar[list[dict[str, Any]]] = []
+
+    class FakePlanner:
+        evidence = FakeEvidence()
+
+    class FakeGraph:
+        trace = FakeTrace()
+        planner = FakePlanner()
+
+    class FakeResult:
+        status = RunStatus.BLOCKED
+        final_answer = "python_runtime_environment_blocker"
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="blocked",
+            diagnostics_count=1,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            planner_summary={
+                "failure_repair_summary": {
+                    "latest_failure_category": "environment_error",
+                    "latest_blocked_reason": (
+                        "python_runtime_environment_blocker: "
+                        "ssl_low_integrity_runtime_initialization_failed"
+                    ),
+                },
+                "sandbox_isolation_summary": {
+                    "selected_backends": ["windows"],
+                    "local_process_backend_count": 0,
+                },
+            },
+            trace_summary={
+                "tool_calls": 2,
+                "key_artifacts": ["artifact_python_ssl"],
+                "model_usage_summary": {"input_tokens": 10, "requests": 2},
+            },
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok\n", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs: Any) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="python_ssl_environment_blocker",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["status"] == "environment_blocker"
+    assert task["failure_category"] == "environment_blocker"
+    assert task["infrastructure_blocked"] is True
+    assert task["verification"] is None
+    assert task["checks"]["public"]["status"] == "not_run"
+    assert task["checks"]["hidden"]["status"] == "not_run"
+    assert "ssl_low_integrity_runtime_initialization_failed" in task["blocked_reason"]
+    assert result["summary"]["score_status"] == "environment_blocker"
+
+
 def test_evaluation_does_not_treat_plain_agent_block_as_environment_blocker(tmp_path: Path) -> None:
     py = json.dumps(sys.executable)
     manifest = EvaluationTaskSet.from_dict(
@@ -1442,6 +1561,66 @@ def test_evaluation_does_not_treat_plain_agent_block_as_environment_blocker(tmp_
     assert task["failure_category"] == "blocked"
     assert task["infrastructure_blocked"] is False
     assert task["verification"]["passed"] is True
+
+
+def test_evaluation_reduces_python_ssl_environment_error_to_environment_blocker() -> None:
+    payload = {
+        "planner_summary": {
+            "failure_repair_summary": {
+                "latest_failure_category": "environment_error",
+                "latest_blocked_reason": (
+                    "python_runtime_environment_blocker: "
+                    "ssl_low_integrity_runtime_initialization_failed"
+                ),
+            },
+            "sandbox_isolation_summary": {
+                "selected_backends": ["windows"],
+                "local_process_backend_count": 0,
+            },
+        }
+    }
+
+    status = _result_status(
+        success=False,
+        tests_passed=False,
+        infrastructure_blocked=True,
+        agent_status="blocked",
+        verification=None,
+        policy_blocks=0,
+        errors=["environment blocker: python ssl runtime"],
+    )
+    category = _failure_category(
+        payload,
+        status=status,
+        verification=None,
+        infrastructure_blocked=True,
+        policy_blocks=0,
+        errors=["environment blocker: python ssl runtime"],
+    )
+
+    assert status == "environment_blocker"
+    assert category == "environment_blocker"
+    assert payload["planner_summary"]["sandbox_isolation_summary"]["local_process_backend_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "error_summary",
+    [
+        "ImportError: DLL load failed while importing _ssl: libssl-3-x64.dll was not found",
+        "OpenSSL provider missing: Library\\lib\\ossl-modules was not found",
+        "OpenSSL config missing: Library\\ssl\\openssl.cnf was not found",
+        "ssl_low_integrity_runtime_initialization_failed: DLL initialization routine failed",
+        "certificate path unreadable from ssl.get_default_verify_paths()",
+    ],
+)
+def test_evaluation_shell_python_ssl_runtime_failure_is_environment_error(error_summary: str) -> None:
+    category = _command_failure_category(
+        [sys.executable, "-m", "pytest", "tests/test_app.py"],
+        exit_code=1,
+        error_summary=error_summary,
+    )
+
+    assert category == "environment_error"
 
 
 def test_evaluation_completion_gate_counts_false_completed_report(tmp_path: Path) -> None:

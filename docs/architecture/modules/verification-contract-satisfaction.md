@@ -183,7 +183,7 @@ class CompletionStatus(str, Enum):   # CompletionAssessment.status
 
 `VerificationRunner.plan_verification()` 生成 `VerificationCheck` 列表，`run_plan()` 调用 `CommandExecutor.run()` 执行命令生成 `VerificationResult`。`CompletionAssessor.assess()` 消费 result 列表返回 `CompletionAssessment`。`VerificationContract.from_plan_strings()` 生成 `VerificationContract`。`Planner.assess_verification_contract_satisfaction()` 读取 contract 和 evidence 生成 `StepEvidence` 和 `ContractSatisfaction`。每个 check 产生 `PolicyRequest`/`PolicyDecision` 进入 policy audit ledger。
 
-`VerificationRunner._result_from_command()` 对命令输出先走 `FailureParserRegistry.parse()`，再由 `classify_failure()` 将 sandbox backend unavailable归为`sandbox_limitation`、sandbox violation归为`sandbox_violation`、timeout归为`timeout`、missing command归为`missing_command`。Python DLL/import初始化类环境问题（例如 `ImportError: DLL load failed while importing _ssl`、`_hashlib`、`_socket`或 DLL initialization routine failed）优先归为`environment_error`，状态为`blocked`，不会按pytest普通失败进入代码修复。`environment_error`、`sandbox_limitation`和`sandbox_violation`不生成普通`repair_hints`；调用方必须把它们作为环境/沙箱 blocker 处理，而不是让模型修改业务代码。
+`VerificationRunner._result_from_command()` 对命令输出先走 `FailureParserRegistry.parse()`，再由 `classify_failure()` 将 sandbox backend unavailable归为`sandbox_limitation`、sandbox violation归为`sandbox_violation`、timeout归为`timeout`、missing command归为`missing_command`。Python DLL/import初始化类环境问题（例如 `ImportError: DLL load failed while importing _ssl`、`_hashlib`、`_socket`、`libssl/libcrypto`缺失、OpenSSL provider/config不可读、证书路径不可读、DLL search path失败或 DLL initialization routine failed）优先归为`environment_error`，状态为`blocked`，不会按pytest普通失败进入代码修复。`environment_error`、`sandbox_limitation`和`sandbox_violation`不生成普通`repair_hints`；调用方必须把它们作为环境/沙箱 blocker 处理，而不是让模型修改业务代码。
 
 ## 谁生成这些对象
 
@@ -212,7 +212,7 @@ class CompletionStatus(str, Enum):   # CompletionAssessment.status
 ## 失败路径
 
 - `VerificationResult.status` 区分 passed、failed、timeout、blocked、skipped、flaky；policy、budget、missing command 与 parser failure分别由 helper 生成对应 result，而不是抛弃该 check。
-- Python runtime DLL/import初始化失败在`classify_failure()`中归为`FailureType.ENVIRONMENT_ERROR`，`VerificationRunner._status_from_command()`把它归为`blocked`，并且`_result_from_command()`不给这类环境/沙箱失败生成普通代码 repair hints。该路径避免 `_ssl` 等 runtime blocker 被误认为 `unit_test_failure` 后进入 repair loop。
+- Python runtime DLL/import初始化失败在`classify_failure()`中归为`FailureType.ENVIRONMENT_ERROR`，`VerificationRunner._status_from_command()`把它归为`blocked`，并且`_result_from_command()`不给这类环境/沙箱失败生成普通代码 repair hints。该路径覆盖 `_ssl.pyd`、`libssl/libcrypto`、OpenSSL provider/config、证书路径、DLL search path与low-integrity初始化失败，避免 runtime blocker 被误认为 `unit_test_failure` 后进入 repair loop。
 - `CompletionAssessor` 对 required failure 返回 `failed`，required blocked 返回 `blocked`，缺结果/高风险人工复核返回 `needs_review`，warning/flaky 返回 `ready_with_warnings`，全部满足才是 `ready`。
 - contract 的 invalid/pending、missing step、command 不在 contract 或 step evidence failed/skipped 会使 `ContractSatisfaction.satisfied=False` 并给出 reason；Planner completion gate据此拒绝完成或进入 repair。
 

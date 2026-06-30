@@ -259,16 +259,36 @@ def _command_output(command_result: CommandResult) -> str:
 
 def _looks_like_python_runtime_import_failure(output: str) -> bool:
     lowered = output.lower()
-    return (
-        ("importerror:" in lowered or "dll load failed" in lowered or "dll initialization" in lowered)
-        and (
-            "while importing _ssl" in lowered
-            or "while importing _hashlib" in lowered
-            or "while importing _socket" in lowered
-            or "python runtime" in lowered
-            or "initialization of dll" in lowered
-            or "dll initialization routine failed" in lowered
-        )
+    runtime_markers = (
+        "while importing _ssl",
+        "while importing _ssl.pyd",
+        "while importing _hashlib",
+        "while importing _socket",
+        "python runtime",
+        "initialization of dll",
+        "dll initialization routine failed",
+        "ssl_low_integrity_runtime_initialization_failed",
+        "dll search path failed",
+        "libssl",
+        "libcrypto",
+        "openssl provider",
+        "openssl config",
+        "ossl-modules",
+        "certificate path unreadable",
+        "ssl.get_default_verify_paths",
+    )
+    failure_markers = (
+        "importerror:",
+        "dll load failed",
+        "dll initialization",
+        "initialization routine failed",
+        "was not found",
+        "is not readable",
+        "unreadable",
+        "failed",
+    )
+    return any(marker in lowered for marker in runtime_markers) and any(
+        marker in lowered for marker in failure_markers
     )
 
 

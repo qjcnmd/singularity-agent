@@ -50,6 +50,9 @@ SAFE_NUMERIC_METRIC_KEYS = {
     "prompt_tokens",
     "completion_tokens",
 }
+SAFE_BOOLEAN_STATUS_KEYS = {
+    "restricted_token",
+}
 
 
 class TraceRedactor:
@@ -60,7 +63,7 @@ class TraceRedactor:
         if isinstance(value, dict):
             redacted: dict[str, Any] = {}
             for key, item in value.items():
-                if _is_safe_numeric_metric(key, item):
+                if _is_safe_numeric_metric(key, item) or _is_safe_boolean_status(key, item):
                     redacted[key] = item
                 elif SECRET_KEY_RE.search(str(key)):
                     redacted[key] = "<redacted>"
@@ -101,3 +104,7 @@ def _is_safe_numeric_metric(key: object, value: Any) -> bool:
     if str(key).lower() not in SAFE_NUMERIC_METRIC_KEYS:
         return False
     return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _is_safe_boolean_status(key: object, value: Any) -> bool:
+    return str(key).lower() in SAFE_BOOLEAN_STATUS_KEYS and isinstance(value, bool)

@@ -1650,12 +1650,19 @@
     → offline / online 双账户检查：
       1) account / credential / login UI / logon rights / group membership
       2) state dir ACL boundary / runner smoke / network probe
-      3) Python runtime smoke: import ssl, socket, hashlib, pathlib
+      3) Python runtime smoke:
+         import _ssl, ssl, socket, hashlib, pathlib
+         → _ssl.__file__, ssl.OPENSSL_VERSION,
+            ssl.get_default_verify_paths()
+         → OpenSSL DLL / config / provider / cert / TEMP access
     → Python runtime smoke 失败：
       diagnostics += {kind: "python_runtime_environment_blocker",
-                      module_status, runner evidence, redacted/hash details}
+                      failure_type, module, sandbox_role,
+                      module_status, runtime target hashes,
+                      runner evidence, redacted/hash details}
       只扩展 diagnostics，不改变 doctor schema v2，也不改变原有
-      enforcement available 计算。
+      enforcement available 计算；runtime ACL 只覆盖明确发现的
+      Python/OpenSSL target，不恢复 base 根目录 RX。
 
     python -m singularity.cli sandbox setup --json
     → setup_windows_sandbox()
@@ -1697,7 +1704,8 @@
     → CommandExecutor.run()
     → FailureParserRegistry.parse()
     → classify_failure()
-    → Python DLL/import 初始化失败（如 _ssl/_hashlib/_socket 或
+    → Python DLL/import 初始化失败（如 _ssl/_hashlib/_socket、
+      libssl/libcrypto、OpenSSL provider/config/cert、DLL search path 或
       "DLL initialization routine failed"）
       = FailureType.ENVIRONMENT_ERROR
       = VerificationResult.status BLOCKED

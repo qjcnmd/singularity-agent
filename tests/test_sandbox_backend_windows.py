@@ -1,6 +1,8 @@
+import io
 import json
 import subprocess
 import sys
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1602,8 +1604,10 @@ def test_runner_runtime_access_grants_only_read_execute_to_python_roots(
     commands: list[tuple[list[str], float]] = []
     venv_root = tmp_path / "venv"
     base_root = tmp_path / "python"
-    venv_root.mkdir()
-    base_root.mkdir()
+    scripts = venv_root / "Scripts"
+    dlls = base_root / "DLLs"
+    scripts.mkdir(parents=True)
+    dlls.mkdir(parents=True)
 
     monkeypatch.setattr(windows.os, "name", "nt", raising=False)
     monkeypatch.setattr(windows.sys, "prefix", str(venv_root))
@@ -1611,9 +1615,10 @@ def test_runner_runtime_access_grants_only_read_execute_to_python_roots(
     monkeypatch.setattr(
         windows,
         "_runner_runtime_acl_targets",
-        lambda: ((venv_root, "(OI)(CI)RX"), (base_root, "RX")),
+        lambda: ((scripts, "RX"), (dlls, "(OI)(CI)RX")),
         raising=False,
     )
+    monkeypatch.setattr(windows, "_python_runtime_roots", lambda: (scripts, venv_root, base_root), raising=False)
     monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
 
     def fake_run_command(
@@ -1629,10 +1634,28 @@ def test_runner_runtime_access_grants_only_read_execute_to_python_roots(
     result = windows._ensure_runner_runtime_access()
 
     assert result.ok is True
-    assert len(commands) == 3
+    assert len(commands) == 5
     remove_commands = [command for command, _timeout in commands if "/remove:g" in command]
     grant_commands = [command for command, _timeout in commands if "/grant:r" in command]
     assert remove_commands == [
+        [
+            "icacls.exe",
+            str(scripts),
+            "/remove:g",
+            windows.OFFLINE_SANDBOX_ACCOUNT,
+            windows.ONLINE_SANDBOX_ACCOUNT,
+            "/C",
+            "/Q",
+        ],
+        [
+            "icacls.exe",
+            str(venv_root),
+            "/remove:g",
+            windows.OFFLINE_SANDBOX_ACCOUNT,
+            windows.ONLINE_SANDBOX_ACCOUNT,
+            "/C",
+            "/Q",
+        ],
         [
             "icacls.exe",
             str(base_root),
@@ -1643,12 +1666,12 @@ def test_runner_runtime_access_grants_only_read_execute_to_python_roots(
             "/Q",
         ]
     ]
-    assert {command[1] for command in grant_commands} == {str(venv_root), str(base_root)}
+    assert {command[1] for command in grant_commands} == {str(scripts), str(dlls)}
     command_by_path = {command[1]: command for command, _timeout in commands}
-    assert f"{windows.OFFLINE_SANDBOX_ACCOUNT}:(OI)(CI)RX" in command_by_path[str(venv_root)]
-    assert f"{windows.ONLINE_SANDBOX_ACCOUNT}:(OI)(CI)RX" in command_by_path[str(venv_root)]
-    assert f"{windows.OFFLINE_SANDBOX_ACCOUNT}:RX" in command_by_path[str(base_root)]
-    assert f"{windows.ONLINE_SANDBOX_ACCOUNT}:RX" in command_by_path[str(base_root)]
+    assert f"{windows.OFFLINE_SANDBOX_ACCOUNT}:RX" in command_by_path[str(scripts)]
+    assert f"{windows.ONLINE_SANDBOX_ACCOUNT}:RX" in command_by_path[str(scripts)]
+    assert f"{windows.OFFLINE_SANDBOX_ACCOUNT}:(OI)(CI)RX" in command_by_path[str(dlls)]
+    assert f"{windows.ONLINE_SANDBOX_ACCOUNT}:(OI)(CI)RX" in command_by_path[str(dlls)]
     assert all(
         not any("M" in argument or "F" in argument for argument in command[3:5])
         for command, _timeout in commands
@@ -1667,15 +1690,19 @@ def test_runner_runtime_access_removes_stale_recursive_base_ace_before_minimal_g
     commands: list[tuple[list[str], float]] = []
     base_root = tmp_path / "python"
     dlls = base_root / "DLLs"
+    libssl = base_root / "Library" / "bin" / "libssl-3-x64.dll"
     dlls.mkdir(parents=True)
+    libssl.parent.mkdir(parents=True)
+    libssl.write_bytes(b"")
 
     monkeypatch.setattr(windows.os, "name", "nt", raising=False)
     monkeypatch.setattr(
         windows,
         "_runner_runtime_acl_targets",
-        lambda: ((base_root, "RX"), (dlls, "(OI)(CI)RX")),
+        lambda: ((libssl, "RX"), (dlls, "(OI)(CI)RX")),
         raising=False,
     )
+    monkeypatch.setattr(windows, "_python_runtime_roots", lambda: (base_root,), raising=False)
     monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
 
     def fake_run_command(
@@ -1694,7 +1721,7 @@ def test_runner_runtime_access_removes_stale_recursive_base_ace_before_minimal_g
     remove_commands = [command for command, _timeout in commands if "/remove:g" in command]
     grant_commands = [command for command, _timeout in commands if "/grant:r" in command]
     assert remove_commands == [["icacls.exe", str(base_root), "/remove:g", "SandboxA", "/C", "/Q"]]
-    assert grant_commands[0] == ["icacls.exe", str(base_root), "/grant:r", "SandboxA:RX", "/C", "/Q"]
+    assert grant_commands[0] == ["icacls.exe", str(libssl), "/grant:r", "SandboxA:RX", "/C", "/Q"]
     assert grant_commands[1] == ["icacls.exe", str(dlls), "/grant:r", "SandboxA:(OI)(CI)RX", "/C", "/Q"]
     assert all("/T" not in command for command, _timeout in commands)
 
@@ -1706,15 +1733,19 @@ def test_runner_runtime_cleanup_removes_all_explicit_runtime_aces(
     commands: list[tuple[list[str], float]] = []
     base_root = tmp_path / "python"
     dlls = base_root / "DLLs"
+    libssl = base_root / "Library" / "bin" / "libssl-3-x64.dll"
     dlls.mkdir(parents=True)
+    libssl.parent.mkdir(parents=True)
+    libssl.write_bytes(b"")
 
     monkeypatch.setattr(windows.os, "name", "nt", raising=False)
     monkeypatch.setattr(
         windows,
         "_runner_runtime_acl_targets",
-        lambda: ((base_root, "RX"), (dlls, "(OI)(CI)RX")),
+        lambda: ((libssl, "RX"), (dlls, "(OI)(CI)RX")),
         raising=False,
     )
+    monkeypatch.setattr(windows, "_python_runtime_roots", lambda: (base_root,), raising=False)
     monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
 
     def fake_run_command(
@@ -1728,12 +1759,16 @@ def test_runner_runtime_cleanup_removes_all_explicit_runtime_aces(
     monkeypatch.setattr(windows, "_run_command", fake_run_command)
 
     result = windows._remove_runner_runtime_access(("SandboxA", "SandboxB"))
+    repeated = windows._remove_runner_runtime_access(("SandboxA", "SandboxB"))
 
     assert result.ok is True
-    assert [command for command, _timeout in commands] == [
+    assert repeated.ok is True
+    expected = [
         ["icacls.exe", str(base_root), "/remove:g", "SandboxA", "SandboxB", "/C", "/Q"],
+        ["icacls.exe", str(libssl), "/remove:g", "SandboxA", "SandboxB", "/C", "/Q"],
         ["icacls.exe", str(dlls), "/remove:g", "SandboxA", "SandboxB", "/C", "/Q"],
     ]
+    assert [command for command, _timeout in commands] == expected + expected
     assert all(timeout_seconds == 120 for _command, timeout_seconds in commands)
 
 
@@ -1743,25 +1778,80 @@ def test_runner_runtime_acl_targets_exclude_unneeded_base_packages_and_config(
 ) -> None:
     venv_root = tmp_path / "venv"
     base_root = tmp_path / "python"
-    venv_root.mkdir()
+    scripts = venv_root / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "python.exe").write_bytes(b"")
     (base_root / "DLLs").mkdir(parents=True)
-    (base_root / "Lib").mkdir()
+    (base_root / "DLLs" / "_ssl.pyd").write_bytes(b"")
+    (base_root / "DLLs" / "_hashlib.pyd").write_bytes(b"")
+    (base_root / "DLLs" / "_socket.pyd").write_bytes(b"")
+    (base_root / "Library" / "bin").mkdir(parents=True)
+    (base_root / "Library" / "bin" / "libssl-3-x64.dll").write_bytes(b"")
+    (base_root / "Library" / "bin" / "libcrypto-3-x64.dll").write_bytes(b"")
+    (base_root / "Library" / "ssl").mkdir(parents=True)
+    (base_root / "Library" / "ssl" / "openssl.cnf").write_text("", encoding="utf-8")
+    (base_root / "Library" / "lib" / "ossl-modules").mkdir(parents=True)
+    (base_root / "Library" / "lib" / "ossl-modules" / "legacy.dll").write_bytes(b"")
     (base_root / "pkgs").mkdir()
     (base_root / "python313.dll").write_bytes(b"")
+    (base_root / "conda.exe").write_bytes(b"")
+    (base_root / "python313.zip").write_bytes(b"")
     (base_root / ".condarc").write_text("channels: []", encoding="utf-8")
+    user_profile = tmp_path / "Users" / "Lenovo"
+    user_profile.mkdir(parents=True)
+    (user_profile / ".condarc").write_text("channels: []", encoding="utf-8")
 
     monkeypatch.setattr(windows.sys, "prefix", str(venv_root))
     monkeypatch.setattr(windows.sys, "base_prefix", str(base_root))
+    monkeypatch.setattr(windows.sys, "exec_prefix", str(venv_root))
+    monkeypatch.setattr(windows.sys, "executable", str(scripts / "python.exe"))
 
     targets = dict(windows._runner_runtime_acl_targets())
 
-    assert targets[venv_root] == "(OI)(CI)RX"
-    assert targets[base_root] == "RX"
+    assert targets[scripts] == "RX"
     assert targets[base_root / "DLLs"] == "(OI)(CI)RX"
-    assert targets[base_root / "Lib"] == "(OI)(CI)RX"
+    assert targets[base_root / "Library" / "bin"] == "(OI)(CI)RX"
+    assert targets[base_root / "Library" / "ssl"] == "(OI)(CI)RX"
+    assert targets[base_root / "Library" / "lib" / "ossl-modules"] == "(OI)(CI)RX"
     assert targets[base_root / "python313.dll"] == "RX"
+    assert targets[base_root / "DLLs" / "_ssl.pyd"] == "RX"
+    assert targets[base_root / "Library" / "bin" / "libssl-3-x64.dll"] == "RX"
+    assert targets[base_root / "Library" / "bin" / "libcrypto-3-x64.dll"] == "RX"
+    assert venv_root not in targets
+    assert base_root not in targets
+    assert base_root / "conda.exe" not in targets
+    assert base_root / "python313.zip" not in targets
     assert base_root / "pkgs" not in targets
     assert base_root / ".condarc" not in targets
+    assert user_profile not in targets
+    assert user_profile / ".condarc" not in targets
+
+
+def test_runtime_env_prepends_discovered_python_dll_directories(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "venv" / "Scripts"
+    dlls = tmp_path / "python" / "DLLs"
+    library_bin = tmp_path / "python" / "Library" / "bin"
+    for path in (scripts, dlls, library_bin):
+        path.mkdir(parents=True)
+    monkeypatch.setattr(
+        windows,
+        "_python_runtime_path_directories",
+        lambda: (scripts, dlls, library_bin),
+    )
+    monkeypatch.setitem(windows.os.environ, "PATH", "C:\\Windows\\System32")
+    monkeypatch.setitem(windows.os.environ, "TEMP", "C:\\Temp")
+    monkeypatch.setitem(windows.os.environ, "TMP", "C:\\Temp")
+
+    env = windows.WindowsSandboxBackend._runtime_env({"PATH": "C:\\Existing"})
+
+    path_entries = env["PATH"].split(windows.os.pathsep)
+    assert path_entries[:3] == [str(scripts), str(dlls), str(library_bin)]
+    assert path_entries[-1] == "C:\\Existing"
+    assert env["TEMP"] == "C:\\Temp"
+    assert env["TMP"] == "C:\\Temp"
 
 
 def test_run_root_acl_removes_inherited_sandbox_accounts_and_preserves_host_cleanup(
@@ -2004,9 +2094,49 @@ def test_python_runtime_smoke_reports_ssl_environment_blocker_diagnostics(
     def fake_account_python_smoke(**kwargs) -> sandbox.WindowsRunnerResult:
         role = kwargs["identity"].role
         stdout = (
-            '{"ssl": "failed", "socket": "passed", "hashlib": "passed", "pathlib": "passed"}'
+            json.dumps(
+                {
+                    "modules": {
+                        "_ssl": {
+                            "status": "failed",
+                            "error_type": "ImportError",
+                            "message": (
+                                "DLL initialization routine failed at "
+                                r"C:\Users\Lenovo\private-runtime-root\Library\bin\runtime-target.bin"
+                            ),
+                        },
+                        "ssl": {"status": "failed"},
+                        "socket": {"status": "passed"},
+                        "hashlib": {"status": "passed"},
+                        "pathlib": {"status": "passed"},
+                    },
+                    "ssl": {
+                        "openssl_version": "",
+                        "default_verify_paths": {},
+                    },
+                    "runtime_access": {
+                        "openssl_config": {
+                            "status": "failed",
+                            "path_hash": "cnfhash",
+                            "message": r"C:\Users\Lenovo\private-runtime-root\Library\ssl\openssl.cnf",
+                        },
+                        "openssl_providers": {"status": "passed", "path_hash": "providerhash"},
+                    },
+                },
+                sort_keys=True,
+            )
             if role == "offline"
-            else '{"ssl": "passed", "socket": "passed", "hashlib": "passed", "pathlib": "passed"}'
+            else json.dumps(
+                {
+                    "modules": {
+                        "_ssl": {"status": "passed", "file_hash": "sslhash"},
+                        "ssl": {"status": "passed"},
+                        "socket": {"status": "passed"},
+                        "hashlib": {"status": "passed"},
+                        "pathlib": {"status": "passed"},
+                    }
+                }
+            )
         )
         stderr = (
             "ImportError: DLL load failed while importing _ssl: The specified module could not be found"
@@ -2041,9 +2171,192 @@ def test_python_runtime_smoke_reports_ssl_environment_blocker_diagnostics(
     assert diagnostics
     diagnostic_text = json.dumps(diagnostics)
     assert '"ssl": "failed"' in diagnostic_text
+    assert '"_ssl": "failed"' in diagnostic_text
     assert "_ssl" in diagnostic_text
+    assert "ssl_low_integrity_runtime_initialization_failed" in diagnostic_text
+    assert '"module": "_ssl"' in diagnostic_text
+    assert '"sandbox_role": "offline"' in diagnostic_text
+    assert '"restricted_token": true' in diagnostic_text
+    assert '"low_integrity": true' in diagnostic_text
+    assert '"private_desktop": true' in diagnostic_text
+    assert '"job_object": true' in diagnostic_text
     assert str(runtime_root) not in diagnostic_text
+    assert "private-runtime-root" not in diagnostic_text
+    assert "C:\\Users\\Lenovo" not in diagnostic_text
     assert "S-1-5-21" not in diagnostic_text
+
+
+def test_python_runtime_failure_classifies_localized_dll_initialization_error() -> None:
+    payload = {
+        "modules": {
+            "_ssl": {
+                "status": "failed",
+                "error_type": "ImportError",
+                "message": "DLL load failed while importing _ssl: 动态链接库(DLL)初始化例程失败。",
+            },
+            "ssl": {"status": "failed"},
+        },
+        "runtime_access": {
+            "temp": {"status": "passed"},
+            "tmp": {"status": "passed"},
+        },
+    }
+    result = sandbox.WindowsRunnerResult(
+        exit_code=7,
+        stdout=json.dumps(payload, ensure_ascii=False),
+        stderr="",
+        timed_out=False,
+        started_at="2026-06-30T00:00:00+00:00",
+        ended_at="2026-06-30T00:00:01+00:00",
+        duration_ms=1,
+    )
+
+    failure_type, module = windows._python_runtime_failure(payload, result)
+
+    assert failure_type == "ssl_low_integrity_runtime_initialization_failed"
+    assert module == "_ssl"
+
+
+def test_python_runtime_failure_classifies_escaped_localized_dll_initialization_error() -> None:
+    payload = {
+        "modules": {
+            "_ssl": {
+                "status": "failed",
+                "error_type": "ImportError",
+                "message": "DLL load failed while importing _ssl: 动态链接库(DLL)初始化例程失败。",
+            },
+            "ssl": {
+                "status": "failed",
+                "error_type": "ImportError",
+                "message": "DLL load failed while importing _ssl: 出现了内部错误。",
+            },
+        },
+        "runtime_access": {},
+    }
+    result = sandbox.WindowsRunnerResult(
+        exit_code=7,
+        stdout=json.dumps(payload),
+        stderr="",
+        timed_out=False,
+        started_at="2026-06-30T00:00:00+00:00",
+        ended_at="2026-06-30T00:00:01+00:00",
+        duration_ms=1,
+    )
+
+    failure_type, module = windows._python_runtime_failure(payload, result)
+
+    assert failure_type == "ssl_low_integrity_runtime_initialization_failed"
+    assert module == "_ssl"
+
+
+def test_python_runtime_failure_classifies_unstructured_ssl_import_error() -> None:
+    result = sandbox.WindowsRunnerResult(
+        exit_code=7,
+        stdout="",
+        stderr="ImportError: DLL load failed while importing _ssl: The specified module could not be found.",
+        timed_out=False,
+        started_at="2026-06-30T00:00:00+00:00",
+        ended_at="2026-06-30T00:00:01+00:00",
+        duration_ms=1,
+    )
+
+    failure_type, module = windows._python_runtime_failure({}, result)
+
+    assert failure_type == "_ssl.pyd_load_failed"
+    assert module == "_ssl"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (
+            "ImportError: DLL load failed while importing _ssl: libssl-3-x64.dll was not found.",
+            "openssl_dependency_dll_load_failed",
+        ),
+        (
+            "ImportError: DLL load failed while importing _ssl: DLL initialization routine failed.",
+            "ssl_low_integrity_runtime_initialization_failed",
+        ),
+    ],
+)
+def test_python_runtime_failure_classifies_unstructured_ssl_specific_errors(
+    stderr: str,
+    expected: str,
+) -> None:
+    result = sandbox.WindowsRunnerResult(
+        exit_code=7,
+        stdout="",
+        stderr=stderr,
+        timed_out=False,
+        started_at="2026-06-30T00:00:00+00:00",
+        ended_at="2026-06-30T00:00:01+00:00",
+        duration_ms=1,
+    )
+
+    failure_type, module = windows._python_runtime_failure({}, result)
+
+    assert failure_type == expected
+    assert module == "_ssl"
+
+
+def test_python_runtime_failure_classifies_missing_openssl_provider_or_config() -> None:
+    payload = {
+        "modules": {
+            "_ssl": {"status": "passed"},
+            "ssl": {"status": "failed", "message": "OpenSSL provider missing"},
+        },
+        "runtime_access": {
+            "openssl_config": {"status": "missing"},
+            "openssl_providers": {"status": "missing"},
+        },
+    }
+    result = sandbox.WindowsRunnerResult(
+        exit_code=7,
+        stdout=json.dumps(payload),
+        stderr="",
+        timed_out=False,
+        started_at="2026-06-30T00:00:00+00:00",
+        ended_at="2026-06-30T00:00:01+00:00",
+        duration_ms=1,
+    )
+
+    failure_type, module = windows._python_runtime_failure(payload, result)
+
+    assert failure_type == "openssl_provider_or_config_unreadable"
+    assert module == "ssl"
+
+
+def test_python_runtime_smoke_code_reports_discovered_openssl_target_access(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "python"
+    library_bin = root / "Library" / "bin"
+    openssl_config = root / "Library" / "ssl" / "openssl.cnf"
+    provider = root / "Library" / "lib" / "ossl-modules" / "legacy.dll"
+    library_bin.mkdir(parents=True)
+    openssl_config.parent.mkdir(parents=True)
+    provider.parent.mkdir(parents=True)
+    (library_bin / "libssl-3-x64.dll").write_bytes(b"")
+    (library_bin / "libcrypto-3-x64.dll").write_bytes(b"")
+    openssl_config.write_text("", encoding="utf-8")
+    provider.write_bytes(b"")
+
+    monkeypatch.setattr(sys, "prefix", str(root))
+    monkeypatch.setattr(sys, "base_prefix", str(root))
+    monkeypatch.setattr(sys, "exec_prefix", str(root))
+    stdout = io.StringIO()
+
+    with redirect_stdout(stdout), pytest.raises(SystemExit):
+        exec(windows._PYTHON_RUNTIME_SMOKE_CODE, {})
+
+    payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
+    runtime_access = payload["runtime_access"]
+    assert runtime_access["openssl_dlls"]["status"] == "passed"
+    assert runtime_access["openssl_config"]["status"] == "passed"
+    assert runtime_access["openssl_providers"]["status"] == "passed"
+    encoded = json.dumps(runtime_access)
+    assert str(root) not in encoded
 
 
 def test_network_probe_oserror_reports_structured_diagnostics(
@@ -2231,7 +2544,7 @@ def test_windows_runner_result_serialization_redacts_output() -> None:
         started_at="2026-06-27T00:00:00+00:00",
         ended_at="2026-06-27T00:00:01+00:00",
         duration_ms=1,
-        metadata={"api_key": secret},
+        metadata={"api_key": secret, "restricted_token": True},
     )
 
     payload = result.to_dict()
@@ -2239,6 +2552,7 @@ def test_windows_runner_result_serialization_redacts_output() -> None:
     encoded = json.dumps(payload, sort_keys=True)
     assert secret not in encoded
     assert "<redacted>" in encoded
+    assert payload["metadata"]["restricted_token"] is True
 
 
 def test_child_output_removes_raw_temp_files(tmp_path: Path) -> None:
@@ -2396,7 +2710,15 @@ def test_windows_doctor_launcher_reports_logon_rights_and_blocks_when_right_miss
 ) -> None:
     monkeypatch.setattr(windows.os, "name", "nt", raising=False)
     monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
-    monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "D:\\anconda3\\python.exe BUILTIN\\Users:(I)(RX)")
+    monkeypatch.setattr(
+        windows,
+        "_executable_acl_summary",
+        lambda: (
+            "D:\\anconda3\\python.exe BUILTIN\\Users:(I)(RX)\n"
+            "COUNT\\SingularityOnline:(I)(RX)\n"
+            "S-1-5-21-3872630174-1473590342-1348630071-2498001538:(I)(RX)"
+        ),
+    )
     monkeypatch.setattr(windows.sys, "executable", "D:\\anconda3\\python.exe")
 
     rights = windows._logon_rights_view([], "")
@@ -2419,7 +2741,10 @@ def test_windows_doctor_launcher_reports_logon_rights_and_blocks_when_right_miss
     assert evidence["window_station"]["lpDesktop"] is None
     assert evidence["desktop"]["inherits_parent"] is True
     assert evidence["executable"]["path_hash"]
-    assert "D:\\anconda3\\python.exe" not in evidence["executable"]["acl_summary_redacted"]
+    acl_summary = evidence["executable"]["acl_summary_redacted"]
+    assert "D:\\anconda3\\python.exe" not in acl_summary
+    assert "SingularityOnline" not in acl_summary
+    assert "S-1-5-21" not in acl_summary
     assert evidence["working_directory"]["account_has_access"] is True
     assert "S-1-5-21" not in json.dumps(state.to_dict())
 

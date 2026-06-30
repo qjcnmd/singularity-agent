@@ -771,6 +771,53 @@ def test_python_dll_import_failure_classifies_as_environment_error(tmp_path: Pat
     assert failed[0]["repair_hints"] == []
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "ImportError: DLL load failed while importing _ssl: The specified module could not be found",
+        "ImportError: DLL load failed while importing _ssl.pyd: The specified module could not be found",
+        "ImportError: DLL load failed while importing _ssl: libssl-3-x64.dll was not found",
+        "ImportError: DLL load failed while importing _ssl: libcrypto-3-x64.dll was not found",
+        "OpenSSL provider/config error: Library\\lib\\ossl-modules is not readable",
+        "OpenSSL provider missing: Library\\lib\\ossl-modules was not found",
+        "OpenSSL config missing: Library\\ssl\\openssl.cnf was not found",
+        "ssl_low_integrity_runtime_initialization_failed: DLL initialization routine failed",
+        "DLL search path failed for Python runtime while importing _ssl",
+        "certificate path unreadable from ssl.get_default_verify_paths()",
+    ],
+)
+def test_python_ssl_runtime_failures_classify_as_environment_error(
+    tmp_path: Path,
+    output: str,
+) -> None:
+    request = CommandRequest(argv=["python", "-m", "pytest", "tests/test_app.py"])
+    fake = FakeCommandExecutor(
+        [
+            command_result(
+                request,
+                command_id="cmd_ssl_runtime_failed",
+                exit_code=1,
+                semantic_status=SemanticStatus.TESTS_FAILED,
+                output=output,
+                error_code="semantic_failure",
+            )
+        ]
+    )
+    component = VerificationRunner(tmp_path, command_executor=fake)
+
+    plan = component.plan_verification(
+        changed_files=[],
+        task_intent="verify python ssl runtime failure",
+        smoke_commands=[["python", "-m", "pytest", "tests/test_app.py"]],
+    )
+    observation = component.run_plan(plan.id)
+
+    failed = observation["verification"]["failed_checks"]
+    assert failed[0]["status"] == CheckStatus.BLOCKED.value
+    assert failed[0]["failure_type"] == FailureType.ENVIRONMENT_ERROR.value
+    assert failed[0]["repair_hints"] == []
+
+
 def test_completion_assessment_statuses(tmp_path: Path) -> None:
     component = VerificationRunner(tmp_path)
     plan = component.plan_verification(changed_files=["src/app.py"], task_intent="code")

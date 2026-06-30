@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import importlib.util
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import sysconfig
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -883,6 +885,13 @@ class WindowsSandboxBackend:
             value = os.environ.get(name)
             if value is not None and name not in runtime:
                 runtime[name] = value
+        path_entries = [str(path) for path in _python_runtime_path_directories()]
+        existing_path = runtime.get("PATH", "")
+        for entry in existing_path.split(os.pathsep):
+            if entry and entry not in path_entries:
+                path_entries.append(entry)
+        if path_entries:
+            runtime["PATH"] = os.pathsep.join(path_entries)
         runtime.setdefault("PYTHONIOENCODING", "utf-8")
         return runtime
 
@@ -2389,7 +2398,9 @@ def _python_runtime_smoke_diagnostic(
     state_dir: Path,
     root: Path,
 ) -> dict[str, Any]:
-    module_status = _python_runtime_module_status(result.stdout)
+    payload = _python_runtime_smoke_payload(result.stdout)
+    module_status = _python_runtime_module_status(payload)
+    failure_type, module = _python_runtime_failure(payload, result)
     evidence = _runner_result_summary(
         _runner_result_operation("python_runtime_smoke", result),
         result,
@@ -2402,28 +2413,51 @@ def _python_runtime_smoke_diagnostic(
             "account": _account_name_diagnostics(identity.account_name),
             "account_sid_hash": _hash_sid(sid),
             "module_status": module_status,
+            "failure_type": failure_type,
+            "module": module,
+            "sandbox_role": identity.role,
+            "restricted_token": result.metadata.get("restricted_token"),
+            "low_integrity": result.metadata.get("low_integrity"),
+            "private_desktop": result.metadata.get("private_desktop"),
+            "job_object": result.metadata.get("job_object"),
+            "runtime_target_hashes": _runtime_target_hashes(),
+            "runtime_access": _diagnostic_payload(
+                payload.get("runtime_access") if isinstance(payload.get("runtime_access"), dict) else {}
+            ),
+            "ssl": _diagnostic_payload(payload.get("ssl") if isinstance(payload.get("ssl"), dict) else {}),
         },
     )
     return {
         "kind": "python_runtime_environment_blocker",
         "status": "blocked",
+        "failure_type": failure_type,
+        "module": module,
+        "sandbox_role": identity.role,
+        "restricted_token": result.metadata.get("restricted_token"),
+        "low_integrity": result.metadata.get("low_integrity"),
+        "private_desktop": result.metadata.get("private_desktop"),
+        "job_object": result.metadata.get("job_object"),
         "reason": "Sandbox account Python runtime smoke failed.",
         "evidence": evidence,
     }
 
 
-def _python_runtime_module_status(stdout: str) -> dict[str, str]:
+def _python_runtime_smoke_payload(stdout: str) -> dict[str, Any]:
     try:
         payload = json.loads(stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError):
         return {}
     if not isinstance(payload, dict):
         return {}
+    return payload
+
+
+def _python_runtime_module_status(payload: dict[str, Any]) -> dict[str, str]:
     modules = payload.get("modules") if isinstance(payload.get("modules"), dict) else payload
     if not isinstance(modules, dict):
         return {}
     result: dict[str, str] = {}
-    for name in ("ssl", "socket", "hashlib", "pathlib"):
+    for name in ("_ssl", "ssl", "socket", "hashlib", "pathlib"):
         value = modules.get(name)
         if isinstance(value, dict):
             result[name] = str(value.get("status") or "unknown")
@@ -2432,20 +2466,223 @@ def _python_runtime_module_status(stdout: str) -> dict[str, str]:
     return result
 
 
-_PYTHON_RUNTIME_SMOKE_CODE = (
-    "import importlib, json\n"
-    "modules={}\n"
-    "ok=True\n"
-    "for name in ('ssl','socket','hashlib','pathlib'):\n"
-    "    try:\n"
-    "        importlib.import_module(name)\n"
-    "        modules[name]={'status':'passed'}\n"
-    "    except BaseException as exc:\n"
-    "        ok=False\n"
-    "        modules[name]={'status':'failed','error_type':type(exc).__name__,'message':str(exc)[:200]}\n"
-    "print(json.dumps({'modules':modules}, sort_keys=True))\n"
-    "raise SystemExit(0 if ok else 7)\n"
-)
+def _python_runtime_failure(
+    payload: dict[str, Any],
+    result: WindowsRunnerResult,
+) -> tuple[str, str]:
+    modules_payload = payload.get("modules")
+    modules: dict[str, Any] = modules_payload if isinstance(modules_payload, dict) else {}
+    runtime_access_payload = payload.get("runtime_access")
+    runtime_access: dict[str, Any] = runtime_access_payload if isinstance(runtime_access_payload, dict) else {}
+    output = f"{result.stdout}\n{result.stderr}\n{_python_runtime_payload_text(payload)}".lower()
+    if _module_failed(modules, "_ssl"):
+        if "dll search path" in output:
+            return "dll_search_path_failed", "_ssl"
+        if "libssl" in output or "libcrypto" in output:
+            return "openssl_dependency_dll_load_failed", "_ssl"
+        if _looks_like_dll_initialization_failed(output):
+            return "ssl_low_integrity_runtime_initialization_failed", "_ssl"
+        return "_ssl.pyd_load_failed", "_ssl"
+    if _module_failed(modules, "ssl"):
+        if _access_failed(runtime_access, ("openssl_config", "openssl_providers")):
+            return "openssl_provider_or_config_unreadable", "ssl"
+        if _access_failed(runtime_access, ("certificate_paths",)):
+            return "certificate_path_unreadable", "ssl"
+        return "_ssl.pyd_load_failed", "ssl"
+    if _access_failed(runtime_access, ("openssl_config", "openssl_providers")):
+        return "openssl_provider_or_config_unreadable", "ssl"
+    if _access_failed(runtime_access, ("certificate_paths",)):
+        return "certificate_path_unreadable", "ssl"
+    if _access_failed(runtime_access, ("temp", "tmp", "profile")):
+        return "temp_or_profile_access_failed", "ssl"
+    if "dll search path" in output:
+        return "dll_search_path_failed", "_ssl"
+    if "libssl" in output or "libcrypto" in output:
+        return "openssl_dependency_dll_load_failed", "_ssl"
+    if _looks_like_dll_initialization_failed(output):
+        return "ssl_low_integrity_runtime_initialization_failed", "_ssl"
+    if "_ssl" in output or "_ssl.pyd" in output:
+        return "_ssl.pyd_load_failed", "_ssl"
+    return "ssl_low_integrity_runtime_initialization_failed", "ssl"
+
+
+def _module_failed(modules: dict[str, Any], name: str) -> bool:
+    value = modules.get(name)
+    if isinstance(value, dict):
+        return str(value.get("status") or "").lower() == "failed"
+    return str(value or "").lower() == "failed"
+
+
+def _access_failed(runtime_access: dict[str, Any], names: tuple[str, ...]) -> bool:
+    for name in names:
+        value = runtime_access.get(name)
+        if isinstance(value, dict):
+            status = str(value.get("status") or "").lower()
+            if status in {"failed", "missing"}:
+                return True
+    return False
+
+
+def _looks_like_dll_initialization_failed(output: str) -> bool:
+    return any(
+        marker in output
+        for marker in (
+            "dll initialization",
+            "initialization routine failed",
+            "初始化例程失败",
+            "出现了内部错误",
+        )
+    )
+
+
+def _python_runtime_payload_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return "\n".join(_python_runtime_payload_text(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return "\n".join(_python_runtime_payload_text(item) for item in value)
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _runtime_target_hashes() -> list[str]:
+    return [_hash_path(path) for path, _permission in _runner_runtime_acl_targets()]
+
+
+def _diagnostic_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _diagnostic_payload(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_diagnostic_payload(item) for item in value]
+    if isinstance(value, str):
+        return _diagnostic_text(value)
+    return value
+
+
+_PYTHON_RUNTIME_SMOKE_CODE = r"""
+import importlib
+import json
+import os
+from pathlib import Path
+
+
+def _hash_path(path):
+    import hashlib
+
+    return hashlib.sha256(str(Path(path).expanduser()).encode("utf-8")).hexdigest()[:16]
+
+
+def _check_readable(path):
+    if not path:
+        return {"status": "missing"}
+    try:
+        target = Path(path)
+        if not target.exists():
+            return {"status": "missing", "path_hash": _hash_path(target)}
+        if target.is_dir():
+            next(iter(target.iterdir()), None)
+        else:
+            with target.open("rb") as handle:
+                handle.read(1)
+        return {"status": "passed", "path_hash": _hash_path(target)}
+    except BaseException as exc:
+        return {
+            "status": "failed",
+            "path_hash": _hash_path(path),
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:200],
+        }
+
+
+def _runtime_roots():
+    import sys
+
+    roots = []
+    for value in (sys.prefix, sys.base_prefix, sys.exec_prefix):
+        if value:
+            path = Path(value)
+            if path.exists() and path not in roots:
+                roots.append(path)
+    return roots
+
+
+def _check_many(paths):
+    statuses = {}
+    for path in paths:
+        checked = _check_readable(path)
+        statuses[checked.get("path_hash", _hash_path(path))] = checked["status"]
+    return {"status": "failed" if "failed" in statuses.values() else "passed", "entries": statuses}
+
+
+modules = {}
+ok = True
+for name in ("_ssl", "ssl", "socket", "hashlib", "pathlib"):
+    try:
+        module = importlib.import_module(name)
+        state = {"status": "passed"}
+        filename = getattr(module, "__file__", "")
+        if filename:
+            state["file_hash"] = _hash_path(filename)
+        modules[name] = state
+    except BaseException as exc:
+        ok = False
+        modules[name] = {
+            "status": "failed",
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:200],
+        }
+
+ssl_info = {}
+runtime_access = {}
+try:
+    ssl = importlib.import_module("ssl")
+    ssl_info["openssl_version"] = getattr(ssl, "OPENSSL_VERSION", "")
+    paths = ssl.get_default_verify_paths()
+    ssl_info["default_verify_paths"] = {
+        name: _hash_path(value)
+        for name, value in {
+            "cafile": paths.cafile,
+            "capath": paths.capath,
+            "openssl_cafile": paths.openssl_cafile,
+            "openssl_capath": paths.openssl_capath,
+        }.items()
+        if value
+    }
+    cert_status = {}
+    for value in (paths.cafile, paths.capath, paths.openssl_cafile, paths.openssl_capath):
+        if value:
+            cert_status[str(_hash_path(value))] = _check_readable(value)["status"]
+    runtime_access["certificate_paths"] = {
+        "status": "failed" if "failed" in cert_status.values() else "passed",
+        "entries": cert_status,
+    }
+except BaseException as exc:
+    ssl_info["error_type"] = type(exc).__name__
+    ssl_info["message"] = str(exc)[:200]
+
+for env_name, key in (("OPENSSL_CONF", "openssl_config"), ("OPENSSL_MODULES", "openssl_providers")):
+    runtime_access[key] = _check_readable(os.environ.get(env_name))
+for env_name, key in (("TEMP", "temp"), ("TMP", "tmp"), ("USERPROFILE", "profile")):
+    runtime_access[key] = _check_readable(os.environ.get(env_name))
+openssl_dlls = []
+openssl_configs = []
+openssl_providers = []
+for root in _runtime_roots():
+    openssl_dlls.extend((root / "Library" / "bin").glob("libssl*.dll"))
+    openssl_dlls.extend((root / "Library" / "bin").glob("libcrypto*.dll"))
+    config = root / "Library" / "ssl" / "openssl.cnf"
+    if config.exists():
+        openssl_configs.append(config)
+    openssl_providers.extend((root / "Library" / "lib" / "ossl-modules").glob("*.dll"))
+runtime_access["openssl_dlls"] = _check_many(openssl_dlls)
+if openssl_configs:
+    runtime_access["openssl_config"] = _check_many(openssl_configs)
+if openssl_providers:
+    runtime_access["openssl_providers"] = _check_many(openssl_providers)
+
+print(json.dumps({"modules": modules, "ssl": ssl_info, "runtime_access": runtime_access}, sort_keys=True))
+raise SystemExit(0 if ok else 7)
+""".strip()
 
 
 def _network_probe_state(
@@ -3903,28 +4140,97 @@ def _ensure_state_dir_acl() -> _OperationResult:
     return _OperationResult(True, "state_dir_acl_applied", {"changed": True, "state_dir_hash": _hash_path(state_dir)})
 
 
+def _python_runtime_roots() -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    executable = Path(sys.executable).expanduser().resolve(strict=False)
+    if executable:
+        candidates.append(executable.parent)
+    for value in (
+        sys.prefix,
+        sys.base_prefix,
+        getattr(sys, "exec_prefix", ""),
+        sysconfig.get_config_var("base"),
+        sysconfig.get_config_var("installed_base"),
+        sysconfig.get_config_var("prefix"),
+        sysconfig.get_config_var("exec_prefix"),
+    ):
+        if value:
+            candidates.append(Path(str(value)).expanduser().resolve(strict=False))
+    return _unique_existing_paths(candidates)
+
+
+def _unique_existing_paths(paths: list[Path] | tuple[Path, ...]) -> tuple[Path, ...]:
+    unique: list[Path] = []
+    for path in paths:
+        resolved = path.expanduser().resolve(strict=False)
+        if resolved.exists() and all(existing != resolved for existing in unique):
+            unique.append(resolved)
+    return tuple(unique)
+
+
+def _python_runtime_path_directories() -> tuple[Path, ...]:
+    directories: list[Path] = []
+    executable = Path(sys.executable).expanduser().resolve(strict=False)
+    if executable.parent.exists():
+        directories.append(executable.parent)
+    for path, _permission in _runner_runtime_acl_targets():
+        candidate = path if path.is_dir() else path.parent
+        if candidate.exists():
+            directories.append(candidate)
+    return _unique_existing_paths(directories)
+
+
 def _runner_runtime_acl_targets() -> tuple[tuple[Path, str], ...]:
-    venv_root = Path(sys.prefix).expanduser().resolve(strict=False)
-    base_root = Path(sys.base_prefix).expanduser().resolve(strict=False)
     targets: list[tuple[Path, str]] = []
 
     def add(path: Path, permission: str) -> None:
-        if path.exists() and all(existing != path for existing, _permission in targets):
-            targets.append((path, permission))
+        resolved = path.expanduser().resolve(strict=False)
+        if resolved.exists() and all(existing != resolved for existing, _permission in targets):
+            targets.append((resolved, permission))
 
-    if venv_root == base_root:
-        add(base_root, "(OI)(CI)RX")
-        return tuple(targets)
+    executable = Path(sys.executable).expanduser().resolve(strict=False)
+    if executable.parent.exists():
+        add(executable.parent, "RX")
 
-    add(venv_root, "(OI)(CI)RX")
-    add(base_root, "RX")
-    add(base_root / "DLLs", "(OI)(CI)RX")
-    add(base_root / "Lib", "(OI)(CI)RX")
-    add(base_root / "Library" / "bin", "(OI)(CI)RX")
-    for child in sorted(base_root.iterdir(), key=lambda path: path.name.casefold()):
-        if child.is_file() and child.suffix.casefold() in {".dll", ".exe", ".zip"}:
-            add(child, "RX")
+    roots = _python_runtime_roots()
+    for root in roots:
+        add(root / "DLLs", "(OI)(CI)RX")
+        add(root / "Library" / "bin", "(OI)(CI)RX")
+        add(root / "Library" / "ssl", "(OI)(CI)RX")
+        add(root / "Library" / "lib" / "ossl-modules", "(OI)(CI)RX")
+        for pattern in ("python*.dll",):
+            for child in sorted(root.glob(pattern), key=lambda path: path.name.casefold()):
+                if child.is_file():
+                    add(child, "RX")
+        for child in sorted((root / "DLLs").glob("*.pyd"), key=lambda path: path.name.casefold()):
+            if child.name.casefold() in {"_ssl.pyd", "_hashlib.pyd", "_socket.pyd"}:
+                add(child, "RX")
+        for child in sorted((root / "Library" / "bin").glob("*.dll"), key=lambda path: path.name.casefold()):
+            lowered = child.name.casefold()
+            if lowered.startswith(("libssl", "libcrypto")):
+                add(child, "RX")
+        openssl_config = root / "Library" / "ssl" / "openssl.cnf"
+        if openssl_config.exists():
+            add(openssl_config, "RX")
+        for provider in sorted(
+            (root / "Library" / "lib" / "ossl-modules").glob("*.dll"),
+            key=lambda path: path.name.casefold(),
+        ):
+            if provider.is_file():
+                add(provider, "RX")
+
+    for module_name in ("_ssl", "_hashlib", "_socket"):
+        with suppress(Exception):
+            spec = importlib.util.find_spec(module_name)
+            origin = Path(str(spec.origin)).expanduser().resolve(strict=False) if spec and spec.origin else None
+            if origin and origin.exists():
+                add(origin.parent, "(OI)(CI)RX")
+                add(origin, "RX")
     return tuple(targets)
+
+
+def _runner_runtime_stale_acl_targets() -> tuple[Path, ...]:
+    return _python_runtime_roots()
 
 
 def _ensure_runner_runtime_access(
@@ -3978,9 +4284,8 @@ def _remove_stale_runner_runtime_base_access(
     account_names: tuple[str, ...],
     details: dict[str, Any],
 ) -> _OperationResult | None:
-    for path, permission in targets:
-        if permission != "RX":
-            continue
+    del targets
+    for path in _runner_runtime_stale_acl_targets():
         command = [icacls, str(path), "/remove:g", *account_names, "/C", "/Q"]
         result = _run_command(command, timeout_seconds=120)
         if result.returncode != 0:
@@ -4011,7 +4316,8 @@ def _remove_runner_runtime_access(account_names: tuple[str, ...]) -> _OperationR
         "runtime_target_hashes": [_hash_path(path) for path, _permission in targets],
         "account_name_hashes": [_hash_text(account) for account in account_names],
     }
-    for path, _permission in targets:
+    cleanup_targets = tuple(dict.fromkeys((*_runner_runtime_stale_acl_targets(), *(path for path, _permission in targets))))
+    for path in cleanup_targets:
         command = [icacls, str(path), "/remove:g", *account_names, "/C", "/Q"]
         result = _run_command(command, timeout_seconds=120)
         if result.returncode != 0:
@@ -4699,6 +5005,9 @@ def _diagnostic_text(
         lambda match: f"<path:{_hash_text(match.group(0))}>",
         sanitized,
     )
+    for account in (*SANDBOX_ACCOUNTS, *LEGACY_SANDBOX_ACCOUNTS):
+        sanitized = sanitized.replace(account, f"<account:{_hash_text(account)}>")
+    sanitized = re.sub(r"\bS-\d(?:-\d+){2,}\b", lambda match: f"<sid:{_hash_text(match.group(0))}>", sanitized)
     return sanitized[:500]
 
 

@@ -113,3 +113,16 @@ def test_preserves_safe_numeric_token_usage_metrics() -> None:
     assert redacted["usage"]["output_tokens"] == 7
     assert redacted["usage"]["total_tokens"] == 19
     assert redacted["usage"]["token"] == "<redacted>"
+
+
+def test_preserves_safe_boolean_token_status_flags() -> None:
+    redactor = TraceRedactor(output_limit_chars=1000)
+    payload = {
+        "restricted_token": True,
+        "token": "secret-token",
+    }
+
+    redacted = redactor.redact_payload(payload)
+
+    assert redacted["restricted_token"] is True
+    assert redacted["token"] == "<redacted>"

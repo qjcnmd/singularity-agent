@@ -587,6 +587,8 @@ class EvaluationRunner:
                 environment_blocker_reason = "model provider unavailable"
             elif _sandbox_environment_blocked(kernel, agent_status=agent_status):
                 environment_blocker_reason = _sandbox_environment_blocker_reason(kernel)
+            elif _final_report_environment_blocked(final_report_payload):
+                environment_blocker_reason = _final_report_environment_blocker_reason(final_report_payload)
             if environment_blocker_reason:
                 errors.append(f"environment blocker: {environment_blocker_reason}")
                 files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
@@ -1514,6 +1516,15 @@ def _failure_repair_summary(payload: dict[str, Any]) -> dict[str, Any]:
     return failure_repair if isinstance(failure_repair, dict) else {}
 
 
+def _final_report_environment_blocked(payload: dict[str, Any]) -> bool:
+    category = str(_failure_repair_summary(payload).get("latest_failure_category") or "")
+    return category in {"environment_error", "sandbox_limitation"}
+
+
+def _final_report_environment_blocker_reason(payload: dict[str, Any]) -> str:
+    return _blocked_reason(payload, agent_status="blocked", errors=[], verification=None) or "environment_error"
+
+
 def _repair_attempt_count(payload: dict[str, Any]) -> int:
     return _safe_int(_failure_repair_summary(payload).get("repair_attempt_count"))
 
@@ -1995,11 +2006,43 @@ def _command_failure_category(argv: list[str], *, exit_code: int, error_summary:
     if exit_code == 0:
         return "none"
     lowered = error_summary.lower()
+    if _looks_like_python_ssl_runtime_failure(lowered):
+        return "environment_error"
     if "no module named pytest" in lowered or "module named" in lowered:
         return "environment_dependency_missing"
     if len(argv) >= 3 and Path(argv[0]).resolve(strict=False) == Path(sys.executable).resolve(strict=False) and argv[1:3] == ["-m", "pytest"]:
         return "verification_failed"
     return "command_failed"
+
+
+def _looks_like_python_ssl_runtime_failure(lowered_output: str) -> bool:
+    runtime_markers = (
+        "while importing _ssl",
+        "while importing _ssl.pyd",
+        "ssl_low_integrity_runtime_initialization_failed",
+        "libssl",
+        "libcrypto",
+        "openssl provider",
+        "openssl config",
+        "ossl-modules",
+        "certificate path unreadable",
+        "ssl.get_default_verify_paths",
+        "dll search path",
+    )
+    failure_markers = (
+        "importerror:",
+        "dll load failed",
+        "dll initialization",
+        "initialization routine failed",
+        "was not found",
+        "is not readable",
+        "unreadable",
+        "missing",
+        "failed",
+    )
+    return any(marker in lowered_output for marker in runtime_markers) and any(
+        marker in lowered_output for marker in failure_markers
+    )
 
 
 def _patch_payload(before_snapshot: dict[str, str], workspace: Path) -> dict[str, Any]:

@@ -69,6 +69,7 @@ SECRET_KEY_RE = re.compile(
     r"(authorization|cookie|token|api[_-]?key|secret|password|private[_-]?key|database[_-]?url|dsn)",
     re.IGNORECASE,
 )
+SAFE_BOOLEAN_STATUS_KEYS = {"restricted_token"}
 TOKEN_VALUE_RE = re.compile(
     r"\b("
     r"sk-[A-Za-z0-9._\-]+"
@@ -565,7 +566,11 @@ def _limit_output(stdout: str, stderr: str, max_chars: int | None) -> tuple[str,
 def _redact_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: "<redacted>" if SECRET_KEY_RE.search(str(key)) else _redact_value(item)
+            key: item
+            if str(key).lower() in SAFE_BOOLEAN_STATUS_KEYS and isinstance(item, bool)
+            else "<redacted>"
+            if SECRET_KEY_RE.search(str(key))
+            else _redact_value(item)
             for key, item in value.items()
         }
     if isinstance(value, list):
