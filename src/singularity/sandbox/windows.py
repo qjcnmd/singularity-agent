@@ -1024,6 +1024,18 @@ def _setup_windows_sandbox_v2() -> WindowsSandboxSetupReport:
             {"step": "state_dir_acl", "reason": state_acl.reason, "details": state_acl.details}
         )
 
+    runtime_access = _ensure_runner_runtime_access()
+    if runtime_access.ok:
+        changed = changed or bool(runtime_access.details.get("changed"))
+    else:
+        failed.append(
+            {
+                "step": "execution_backends",
+                "reason": runtime_access.reason,
+                "details": runtime_access.details,
+            }
+        )
+
     offline = _SANDBOX_IDENTITIES[SandboxNetworkMode.DENIED]
     offline_sid = _account_sid(offline.account_name)
     if offline_sid and not _network_state(offline_sid).ready:
@@ -1348,6 +1360,20 @@ def cleanup_windows_sandbox_assets() -> WindowsSandboxCleanupReport:
             completed.append(f"login_ui_visibility:{_hash_text(target)}")
         else:
             failed.append({"step": "login_ui_visibility", "reason": visibility.reason, "details": visibility.details})
+
+    runtime_accounts = tuple(target for target in asset_accounts if target and _account_exists(target))
+    runtime_access = _remove_runner_runtime_access(runtime_accounts)
+    if runtime_access.ok:
+        changed = changed or bool(runtime_access.details.get("changed"))
+        completed.append("runner_runtime_access")
+    else:
+        failed.append(
+            {
+                "step": "runner_runtime_access",
+                "reason": runtime_access.reason,
+                "details": runtime_access.details,
+            }
+        )
 
     state_dir = _delete_windows_state_dir()
     if state_dir.ok:
@@ -3621,6 +3647,102 @@ def _ensure_state_dir_acl() -> _OperationResult:
     return _OperationResult(True, "state_dir_acl_applied", {"changed": True, "state_dir_hash": _hash_path(state_dir)})
 
 
+def _runner_runtime_acl_targets() -> tuple[tuple[Path, str], ...]:
+    venv_root = Path(sys.prefix).expanduser().resolve(strict=False)
+    base_root = Path(sys.base_prefix).expanduser().resolve(strict=False)
+    targets: list[tuple[Path, str]] = []
+
+    def add(path: Path, permission: str) -> None:
+        if path.exists() and all(existing != path for existing, _permission in targets):
+            targets.append((path, permission))
+
+    if venv_root == base_root:
+        add(base_root, "(OI)(CI)RX")
+        return tuple(targets)
+
+    add(venv_root, "(OI)(CI)RX")
+    add(base_root, "RX")
+    add(base_root / "DLLs", "(OI)(CI)RX")
+    add(base_root / "Lib", "(OI)(CI)RX")
+    add(base_root / "Library" / "bin", "(OI)(CI)RX")
+    for child in sorted(base_root.iterdir(), key=lambda path: path.name.casefold()):
+        if child.is_file() and child.suffix.casefold() in {".dll", ".exe", ".zip"}:
+            add(child, "RX")
+    return tuple(targets)
+
+
+def _ensure_runner_runtime_access(
+    account_names: tuple[str, ...] = SANDBOX_ACCOUNTS,
+) -> _OperationResult:
+    if os.name != "nt":
+        return _OperationResult(False, "Runner runtime ACL setup requires Windows.")
+    icacls = shutil.which("icacls")
+    if icacls is None:
+        return _OperationResult(False, "icacls is required for runner runtime ACL setup.")
+    targets = _runner_runtime_acl_targets()
+    details = {
+        "runtime_target_hashes": [_hash_path(path) for path, _permission in targets],
+        "account_name_hashes": [_hash_text(account) for account in account_names],
+    }
+    for path, permission in targets:
+        command = [icacls, str(path), "/grant:r"]
+        command.extend(f"{account}:{permission}" for account in account_names)
+        command.extend(("/C", "/Q"))
+        result = _run_command(command, timeout_seconds=120)
+        if result.returncode != 0:
+            return _OperationResult(
+                False,
+                "Failed to grant sandbox accounts read/execute access to the Python runtime.",
+                _completed_process_diagnostics(
+                    "runner_runtime_acl_grant",
+                    result,
+                    state_dir=_windows_state_dir_path(),
+                    path=path,
+                    extra=details,
+                ),
+            )
+    return _OperationResult(
+        True,
+        "runner_runtime_access_ready",
+        {"changed": bool(targets and account_names), **details},
+    )
+
+
+def _remove_runner_runtime_access(account_names: tuple[str, ...]) -> _OperationResult:
+    if not account_names:
+        return _OperationResult(True, "runner_runtime_access_not_present", {"changed": False})
+    if os.name != "nt":
+        return _OperationResult(False, "Runner runtime ACL cleanup requires Windows.")
+    icacls = shutil.which("icacls")
+    if icacls is None:
+        return _OperationResult(False, "icacls is required for runner runtime ACL cleanup.")
+    targets = _runner_runtime_acl_targets()
+    details = {
+        "runtime_target_hashes": [_hash_path(path) for path, _permission in targets],
+        "account_name_hashes": [_hash_text(account) for account in account_names],
+    }
+    for path, _permission in targets:
+        command = [icacls, str(path), "/remove:g", *account_names, "/C", "/Q"]
+        result = _run_command(command, timeout_seconds=120)
+        if result.returncode != 0:
+            return _OperationResult(
+                False,
+                "Failed to remove sandbox account access from the Python runtime.",
+                _completed_process_diagnostics(
+                    "runner_runtime_acl_cleanup",
+                    result,
+                    state_dir=_windows_state_dir_path(),
+                    path=path,
+                    extra=details,
+                ),
+            )
+    return _OperationResult(
+        True,
+        "runner_runtime_access_removed",
+        {"changed": bool(targets), **details},
+    )
+
+
 def _delete_firewall_rule(name: str) -> _OperationResult:
     if os.name != "nt":
         return _OperationResult(False, "Firewall cleanup requires Windows.")
@@ -3862,14 +3984,18 @@ def _normalize_run_root_for_cleanup(path: Path) -> _OperationResult:
     return _OperationResult(True, "run_root_normalized", {"changed": True, **details})
 
 
-def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_command(
+    command: list[str],
+    *,
+    timeout_seconds: float = 20,
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             command,
             text=True,
             capture_output=True,
             check=False,
-            timeout=20,
+            timeout=timeout_seconds,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(

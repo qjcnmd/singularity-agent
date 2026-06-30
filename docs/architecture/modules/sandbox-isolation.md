@@ -72,7 +72,7 @@ Windows 当前实现是双 principal 的 account-backed OS sandbox：父进程�
 
 ## 关键类、函数、字段
 
-`SandboxManager.run()`只消费由`CommandExecutor`构造完成的请求，不重新解释`PolicyDecision`。`WindowsSandboxBackend.prepare()`只接受`denied`和`allowed`：前者选择offline账户，后者选择online账户；`allowlist`和`unsupported`在准备文件系统前fail closed。`setup()`在elevated shell中幂等创建两个账户和独立credential，设置两个登录UI隐藏值，保留`SeInteractiveLogonRight`并移除`SeDenyInteractiveLogonRight`，清除batch/network/RDP/service allow right并添加对应deny right，强制直接本地组仅为通过SID解析的内置Users，授权machine state dir ACL，并只为offline SID创建outbound block。两个账户分别执行ACL boundary、restricted low-integrity runner身份smoke；network probe必须同时证明offline denied与online allowed。新结构验证完成后才删除固定legacy账户、credential、login UI、firewall和ACL资产；legacy残留使doctor fail closed。
+`SandboxManager.run()`只消费由`CommandExecutor`构造完成的请求，不重新解释`PolicyDecision`。`WindowsSandboxBackend.prepare()`只接受`denied`和`allowed`：前者选择offline账户，后者选择online账户；`allowlist`和`unsupported`在准备文件系统前fail closed。`setup()`在elevated shell中幂等创建两个账户和独立credential，设置两个登录UI隐藏值，保留`SeInteractiveLogonRight`并移除`SeDenyInteractiveLogonRight`，清除batch/network/RDP/service allow right并添加对应deny right，强制直接本地组仅为通过SID解析的内置Users，授权machine state dir ACL和当前Python runner所需runtime read/execute ACL，并只为offline SID创建outbound block。runtime授权只覆盖当前venv、base runtime根目录遍历、`DLLs`、`Lib`、`Library/bin`和base根目录顶层的`.dll`、`.exe`、`.zip`；不递归授权整个base安装、包缓存或配置文件，也不授予write/modify。两个账户分别执行ACL boundary、restricted low-integrity runner身份smoke；network probe必须同时证明offline denied与online allowed。新结构验证完成后才删除固定legacy账户、credential、login UI、firewall和ACL资产；legacy残留使doctor fail closed。
 
 Windows setup按`_SANDBOX_IDENTITIES`逐个调用`_account_exists()`、`_create_sandbox_account()`、`_set_account_password()`与`_store_credential()`；账户创建和删除使用`netapi32`，超长名称校验只约束创建/改密，不阻止精确legacy删除。Firewall由PowerShell按固定`Singularity Sandbox`group重建和核验，Credential Manager、登录UI registry、LSA rights、组成员、ACL、runner smoke与network probe均执行真实检查。
 
@@ -115,7 +115,7 @@ PolicyEngine / ApprovalGate
 -> CommandResult.isolation_report / trace / planner evidence / final report
 ```
 
-`sandbox setup --json`（elevated）配置并验证两个专用账户；`run()`按network mode选择单一sandbox账户并授权本次run root，宿主principal只保留cleanup控制权。`sandbox cleanup --json`先删除current/legacy credential、固定firewall group、登录UI值和security attestation，恢复并删除machine state dir，再移除账户LSA rights与账户，最后输出按accounts/credentials/firewall_rules/login_ui_entries/security_attestations/state_dirs分类的`residual_audit`。不存在的资产是completed/no-op；任一残留使cleanup失败。
+`sandbox setup --json`（elevated）配置并验证两个专用账户；`run()`按network mode选择单一sandbox账户并授权本次run root，宿主principal只保留cleanup控制权。`sandbox cleanup --json`先删除current/legacy credential、固定firewall group、登录UI值和security attestation，并在删除账户前移除两个current账户对Python runtime targets的显式read/execute ACE；随后恢复并删除machine state dir，再移除账户LSA rights与账户，最后输出按accounts/credentials/firewall_rules/login_ui_entries/security_attestations/state_dirs分类的`residual_audit`。不存在的资产是completed/no-op；任一残留使cleanup失败。
 
 ## 真实任务中的对象流
 
@@ -402,6 +402,7 @@ Windows凭据分别写入Credential Manager target`SingularityOffline`与`Singul
 - offline firewall缺失/错误、online SID被Singularity firewall命中、offline probe可联网或online probe无法联网：`offline_network_filter`或`network_probe`missing，不得交换账户或回退本地执行。
 - runner smoke 子进程退出 0、enforcement evidence 全部为真，但 `WindowsRunnerResult.metadata.account_sid_hash` 与 sandbox account SID hash 不匹配（疑似 admin 当前用户回退）：`runner_smoke` 报告 `missing`（`account_identity_verified=false`），fail-closed，不伪造 available。
 - `CreateProcessWithLogonW`因`SeInteractiveLogonRight`或executable RX缺失返回error 5：runner/ACL/network probe写结构化diagnostics；setup通过`logon_rights`与`group_membership`步骤修复并复查两个账户，无法验证时保持fail closed。
+- Python runtime RX授权失败：setup把`execution_backends`记入`failed_steps`，details只记录operation、target/account hash与进程退出摘要；不得用递归base-install授权或本地进程fallback绕过。runner smoke仍是runtime可执行性的最终实证。
 - sandboxed 命令无法在 restricted low-integrity token 下初始化（如普通可执行文件的 DLL init 失败）：`SetErrorMode` 抑制 Windows hard-error 对话框，`run()` 有限默认 wait 防止无限挂起；命令以 exit non-zero 失败，调用方处理失败，不弹窗、不回退本地执行。`WorkspaceMutationManager` 的 git 快照采集使用 `collect_git_state()` 执行本地有界只读 `git` 命令，不经过 `SandboxManager`，避免普通 mutation 事务被 sandbox doctor 探测拖超时；sandbox-required 命令仍由 `CommandExecutor -> SandboxManager.run()` fail-closed。
 - `sandbox setup --json` 非 elevated：返回 `requires_elevation` 和 exit code 1；不得执行 account、credential、login UI visibility、LSA rights、firewall、ACL、runner smoke 或 network probe mutation，也不得把 partial/requires_elevation 改写为 ready。
 - `sandbox cleanup --json`非elevated时不执行删除；elevated cleanup删除固定current/legacy资产，先对state dir执行take ownership、ACL reset、medium integrity恢复与只读属性清理。资产不存在时completed/changed=false；residual audit非零时status failed。
@@ -433,5 +434,5 @@ Windows凭据分别写入Credential Manager target`SingularityOffline`与`Singul
 
 - 新 backend 必须以真实 OS enforcement 和 external smoke 证明 capability；workspace copy、chmod 或普通子进程不能注册为 sandbox backend。
 - capability 或 setup 缺失必须返回 `backend_unavailable`，不得静默本地执行。
-- Windows setup、doctor、cleanup、account/ACL/firewall、restricted token、Job Object、private desktop、runner result metadata 或 network proof 变化时同步本文件；登录 UI visibility、LSA logon right（`SeInteractiveLogonRight`、RDP/network/service/batch deny rights 及对应 allow right 清理）、`Users` 组成员、state dir ACL、runner-script 物化、`SetErrorMode` 子进程弹窗抑制、有限默认 wait、`account_sid_hash` 身份证明同属本文件维护范围。
+- Windows setup、doctor、cleanup、account/ACL/firewall、restricted token、Job Object、private desktop、runner result metadata 或 network proof 变化时同步本文件；登录 UI visibility、LSA logon right（`SeInteractiveLogonRight`、RDP/network/service/batch deny rights 及对应 allow right 清理）、`Users` 组成员、state dir ACL、Python runtime read/execute ACL生命周期、runner-script 物化、`SetErrorMode` 子进程弹窗抑制、有限默认 wait、`account_sid_hash` 身份证明同属本文件维护范围。
 - 修改本模块对象字段、调用链、CLI、trace 或 report schema 后运行 `python scripts/verify_runtime_docs.py`；展示对象时必须列完整字段。

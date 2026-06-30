@@ -379,6 +379,7 @@ def test_windows_cleanup_requires_elevation_before_destructive_actions(
         "_delete_firewall_rule",
         "_delete_windows_state_dir",
         "_remove_login_ui_visibility_entry",
+        "_remove_runner_runtime_access",
     ):
         monkeypatch.setattr(
             windows,
@@ -439,6 +440,14 @@ def test_windows_cleanup_removes_current_and_legacy_assets_idempotently(
         "_delete_windows_state_dir",
         lambda: windows._OperationResult(True, "not_present", {"changed": False}),
     )
+    monkeypatch.setattr(
+        windows,
+        "_remove_runner_runtime_access",
+        lambda account_names: calls.append(("runtime_access", ",".join(account_names)))
+        or windows._OperationResult(True, "removed", {"changed": True}),
+        raising=False,
+    )
+    monkeypatch.setattr(windows, "_account_exists", lambda _target: True)
     monkeypatch.setattr(windows, "_delete_sandbox_account", lambda target: changed_result("account", target))
     monkeypatch.setattr(windows, "_account_sid", lambda _target: "")
     monkeypatch.setattr(
@@ -460,7 +469,15 @@ def test_windows_cleanup_removes_current_and_legacy_assets_idempotently(
 
     assert report.status == "completed"
     assert report.changed is True
-    assert {kind for kind, _target in calls} == {"credential", "visibility", "account"}
+    assert {kind for kind, _target in calls} == {
+        "credential",
+        "visibility",
+        "runtime_access",
+        "account",
+    }
+    runtime_index = next(index for index, call in enumerate(calls) if call[0] == "runtime_access")
+    first_account_index = next(index for index, call in enumerate(calls) if call[0] == "account")
+    assert runtime_index < first_account_index
     assert ( "account", windows.LEGACY_SANDBOX_ACCOUNT) in calls
     assert ("account", windows.OFFLINE_SANDBOX_ACCOUNT) in calls
     assert ("account", windows.ONLINE_SANDBOX_ACCOUNT) in calls
@@ -481,6 +498,8 @@ def test_windows_cleanup_fails_closed_when_residual_audit_finds_account(
     monkeypatch.setattr(windows, "_delete_firewall_group", lambda: no_change)
     monkeypatch.setattr(windows, "_delete_security_attestation", lambda: no_change)
     monkeypatch.setattr(windows, "_remove_login_ui_visibility_entry", lambda _target: no_change)
+    monkeypatch.setattr(windows, "_account_exists", lambda _target: False)
+    monkeypatch.setattr(windows, "_remove_runner_runtime_access", lambda _targets: no_change)
     monkeypatch.setattr(windows, "_delete_windows_state_dir", lambda: no_change)
     monkeypatch.setattr(windows, "_account_sid", lambda _target: "")
     monkeypatch.setattr(windows, "_delete_sandbox_account", lambda _target: no_change)
@@ -890,6 +909,13 @@ def test_windows_setup_elevated_provisions_and_verifies_both_accounts(
     )
     monkeypatch.setattr(
         windows,
+        "_ensure_runner_runtime_access",
+        lambda: calls.append(("runtime_access", "all"))
+        or windows._OperationResult(True, "ready", {"changed": True}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        windows,
         "_account_sid",
         lambda name: "offline-sid" if name == windows.OFFLINE_SANDBOX_ACCOUNT else "online-sid",
     )
@@ -928,6 +954,7 @@ def test_windows_setup_elevated_provisions_and_verifies_both_accounts(
     assert ("identity", "online") in calls
     assert ("security", "offline") in calls
     assert ("security", "online") in calls
+    assert ("runtime_access", "all") in calls
     assert ("firewall", "offline") in calls
     assert ("visibility", windows.OFFLINE_SANDBOX_ACCOUNT) in calls
     assert ("visibility", windows.ONLINE_SANDBOX_ACCOUNT) in calls
@@ -971,6 +998,11 @@ def test_windows_setup_failed_probe_steps_include_structured_details(
     monkeypatch.setattr(
         windows,
         "_ensure_state_dir_acl",
+        lambda: windows._OperationResult(True, "ready", {"changed": False}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_ensure_runner_runtime_access",
         lambda: windows._OperationResult(True, "ready", {"changed": False}),
     )
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
@@ -1338,6 +1370,86 @@ def test_apply_account_acl_scopes_low_integrity_to_workspace(
     assert result.ok
     assert commands[0][1] == str(run_root)
     assert commands[1][1] == str(workspace_root)
+
+
+def test_runner_runtime_access_grants_only_read_execute_to_python_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands: list[tuple[list[str], float]] = []
+    venv_root = tmp_path / "venv"
+    base_root = tmp_path / "python"
+    venv_root.mkdir()
+    base_root.mkdir()
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows.sys, "prefix", str(venv_root))
+    monkeypatch.setattr(windows.sys, "base_prefix", str(base_root))
+    monkeypatch.setattr(
+        windows,
+        "_runner_runtime_acl_targets",
+        lambda: ((venv_root, "(OI)(CI)RX"), (base_root, "RX")),
+        raising=False,
+    )
+    monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
+
+    def fake_run_command(
+        command: list[str],
+        *,
+        timeout_seconds: float = 20,
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append((command, timeout_seconds))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(windows, "_run_command", fake_run_command)
+
+    result = windows._ensure_runner_runtime_access()
+
+    assert result.ok is True
+    assert len(commands) == 2
+    assert {command[1] for command, _timeout in commands} == {str(venv_root), str(base_root)}
+    assert all("/grant:r" in command for command, _timeout in commands)
+    command_by_path = {command[1]: command for command, _timeout in commands}
+    assert f"{windows.OFFLINE_SANDBOX_ACCOUNT}:(OI)(CI)RX" in command_by_path[str(venv_root)]
+    assert f"{windows.ONLINE_SANDBOX_ACCOUNT}:(OI)(CI)RX" in command_by_path[str(venv_root)]
+    assert f"{windows.OFFLINE_SANDBOX_ACCOUNT}:RX" in command_by_path[str(base_root)]
+    assert f"{windows.ONLINE_SANDBOX_ACCOUNT}:RX" in command_by_path[str(base_root)]
+    assert all(
+        not any("M" in argument or "F" in argument for argument in command[3:5])
+        for command, _timeout in commands
+    )
+    assert all("/T" not in command for command, _timeout in commands)
+    assert all({"/C", "/Q"} <= set(command) for command, _timeout in commands)
+    assert all(timeout_seconds == 120 for _command, timeout_seconds in commands)
+    assert result.details["runtime_target_hashes"]
+    assert str(tmp_path) not in json.dumps(result.details)
+
+
+def test_runner_runtime_acl_targets_exclude_unneeded_base_packages_and_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    venv_root = tmp_path / "venv"
+    base_root = tmp_path / "python"
+    venv_root.mkdir()
+    (base_root / "DLLs").mkdir(parents=True)
+    (base_root / "Lib").mkdir()
+    (base_root / "pkgs").mkdir()
+    (base_root / "python313.dll").write_bytes(b"")
+    (base_root / ".condarc").write_text("channels: []", encoding="utf-8")
+
+    monkeypatch.setattr(windows.sys, "prefix", str(venv_root))
+    monkeypatch.setattr(windows.sys, "base_prefix", str(base_root))
+
+    targets = dict(windows._runner_runtime_acl_targets())
+
+    assert targets[venv_root] == "(OI)(CI)RX"
+    assert targets[base_root] == "RX"
+    assert targets[base_root / "DLLs"] == "(OI)(CI)RX"
+    assert targets[base_root / "Lib"] == "(OI)(CI)RX"
+    assert targets[base_root / "python313.dll"] == "RX"
+    assert base_root / "pkgs" not in targets
+    assert base_root / ".condarc" not in targets
 
 
 def test_run_root_acl_removes_inherited_sandbox_accounts_and_preserves_host_cleanup(

@@ -238,7 +238,7 @@ def test_trace_artifacts_cli_shows_handle_not_absolute_path(
 
 def test_sandbox_manager_emits_unified_trace_when_trace_recorder_is_used(tmp_path: Path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_sandbox", session_id="session")
-    component = SandboxManager(tmp_path, trace=trace)
+    component = SandboxManager(tmp_path, backends=[], trace=trace)
 
     result = component.run(_sandbox_request(tmp_path))
 

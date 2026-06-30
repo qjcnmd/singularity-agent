@@ -33,7 +33,7 @@ def test_default_os_sandbox_fails_closed_without_executing_process(tmp_path: Pat
         ),
     )
 
-    result = SandboxManager(tmp_path).run(request)
+    result = SandboxManager(tmp_path, backends=[]).run(request)
 
     assert result.status == SandboxStatus.BACKEND_UNAVAILABLE
     assert result.metadata["error_code"] == "backend_unavailable"
@@ -60,7 +60,7 @@ def test_unavailable_os_sandbox_does_not_create_workspace_projection(tmp_path: P
         ),
     )
 
-    result = SandboxManager(tmp_path).run(request)
+    result = SandboxManager(tmp_path, backends=[]).run(request)
 
     assert result.status == SandboxStatus.BACKEND_UNAVAILABLE
     assert not (tmp_path / "work" / "sandboxes" / request.sandbox_id).exists()
