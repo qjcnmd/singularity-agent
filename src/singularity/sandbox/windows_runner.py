@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -91,6 +92,7 @@ class WindowsRunnerSpec:
     max_output_chars: int | None = None
     network_mode: str = "denied"
     result_path: str = ""
+    operation: str = "command"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> WindowsRunnerSpec:
@@ -112,6 +114,7 @@ class WindowsRunnerSpec:
             else None,
             network_mode=str(payload.get("network_mode") or "denied"),
             result_path=str(payload.get("result_path") or ""),
+            operation=str(payload.get("operation") or "command"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -257,6 +260,8 @@ class WindowsSandboxRunner:
 
 
 def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
+    if spec.operation == "workspace_cleanup":
+        return _run_workspace_cleanup(spec)
     started = time.perf_counter()
     started_at = _now()
     output_truncated = False
@@ -319,6 +324,73 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
             network_denied_verified=False,
             metadata={"error_type": type(exc).__name__},
         )
+
+
+def _run_workspace_cleanup(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
+    started = time.perf_counter()
+    started_at = _now()
+    try:
+        if not isinstance(spec.command, list) or not spec.command:
+            raise ValueError("workspace cleanup requires a target path argument.")
+        target = Path(spec.command[0])
+        root = Path(spec.cwd)
+        target_key = os.path.normcase(os.path.abspath(str(target)))
+        root_key = os.path.normcase(os.path.abspath(str(root)))
+        if os.path.commonpath([target_key, root_key]) != root_key:
+            raise ValueError("refusing cleanup outside sandbox root")
+        if target.name.lower() != "workspace":
+            raise ValueError("refusing cleanup of non-workspace target")
+        if target.exists():
+            _clear_cleanup_attributes(target)
+            shutil.rmtree(target)
+        account_name, account_sid = _current_process_identity()
+        return WindowsRunnerResult(
+            exit_code=0,
+            stdout="workspace cleanup complete\n",
+            stderr="",
+            timed_out=False,
+            started_at=started_at,
+            ended_at=_now(),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            output_truncated=False,
+            job_killed=False,
+            network_denied_verified=True,
+            metadata={
+                "operation": "workspace_cleanup",
+                "restricted_token": False,
+                "low_integrity": False,
+                "private_desktop": False,
+                "job_object": False,
+                "account_name": account_name,
+                "account_sid_hash": _hash_text(account_sid) if account_sid else "",
+            },
+        )
+    except Exception as exc:
+        return WindowsRunnerResult(
+            exit_code=1,
+            stdout="",
+            stderr=str(exc),
+            timed_out=False,
+            started_at=started_at,
+            ended_at=_now(),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            output_truncated=False,
+            job_killed=False,
+            network_denied_verified=False,
+            metadata={
+                "operation": "workspace_cleanup",
+                "error_type": type(exc).__name__,
+            },
+        )
+
+
+def _clear_cleanup_attributes(target: Path) -> None:
+    paths = [target]
+    with suppress(OSError):
+        paths.extend(sorted(target.rglob("*"), key=lambda p: len(p.parts), reverse=True))
+    for path in paths:
+        with suppress(OSError):
+            os.chmod(path, 0o700 if path.is_dir() else 0o600)
 
 
 def _start_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildProcess | subprocess.Popen[bytes]:

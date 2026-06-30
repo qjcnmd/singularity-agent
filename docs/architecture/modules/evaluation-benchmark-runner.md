@@ -63,6 +63,8 @@ benchmark scoring path: `python -m singularity.cli eval benchmark <task-set>` ->
 
 capability regression task 以 `workspace-write`、`approval_policy=never`、`network_access=denied` 进入真实 `KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop.run` 路径。AgentLoop 内的低风险验证命令由 policy 判为 `sandbox_required` 后必须进入 `CommandExecutor -> SandboxManager -> WindowsSandboxBackend`；Windows setup 或 execution backend 缺失且 `planner.evidence.sandbox_observations` 已记录真实 `command`/`verification` 尝试及 `backend_unavailable` 时，runner 在 post-agent verification 前归约为 `environment_blocker`，保留模型、工具、patch 与 trace 证据，但不把普通本地进程或 post-agent verification 当作 AgentLoop 成功。
 
+`docs/evaluation/capability-regression-tasks.json` 中三个pytest类fixture（`simple_patch`、`multi_file_reasoning`、`failure_repair`）在fixture workspace内显式包含`pytest.ini`，内容为`addopts = -p no:anyio`。该隔离只作用于内联benchmark workspace，避免宿主pytest自动插件污染低完整性Windows sandbox内的真实pytest命令；生产项目自身pytest插件行为和`completion_gate` fixture不受影响。
+
 ## 真实对象完整结构
 
 ### EvaluationTask（评估任务）
@@ -246,6 +248,7 @@ benchmark scoring path 中，`BenchmarkTaskExecutor.evaluate()` 生成 `TaskExec
 - workspace/task/task-set 输入错误在运行前抛 `ValueError`；缺 workspace 源抛 `FileNotFoundError`，git clone/checkout 失败抛 `RuntimeError`。task 执行阶段异常由 `EvaluationRunner.run_task()` 捕获、脱敏后写 `error_summary`。
 - `CommandEvalResult.failure_category` 明确区分 `command_parse_error`、`command_timeout`、`command_not_found`、`command_execution_error`、`environment_dependency_missing`、`verification_failed` 和 `command_failed`。
 - `EvaluationTaskResult.status` 由 `_task_result()` 归一为 `environment_blocker`、`success`、`policy_blocked`、`verification_failed`、`blocked`、`failed`、`max_turns_exceeded`、`failure` 或 `unknown`；`infrastructure_blocked` 布尔字段仍表示该 task 不进入评分分母。最终通过字段是 `evaluation_passed`，不是 manifest 的 `success`。
+- AgentLoop final report或failure repair summary中出现`latest_failure_category=environment_error`或`sandbox_limitation`时，`_failure_category()`归约为`environment_blocker`。该规则只影响报告/评分分类，不把post-agent verification结果回灌给AgentLoop，也不降低CompletionGate标准。
 - `TaskExecutionEvidence.failure_reasons` 聚合 snapshot、diff 和 hook error code；golden contract 中未观察到的 evidence 只标记 `observed=false`，由 scoring/report 消费，不会绕过 verification。
 - `public`/`hidden` post-agent verification 是 evaluation 层评分证据，写入 `EvaluationTaskResult.checks`、`verification_result`、`contract_satisfaction` 和 `<evaluation_run>/result.json`。它不回灌到 AgentLoop 的 `EvidenceLedger.verification_results`，也不参与 `Planner.assess_completion()`、`Planner.finalize()` 或 `AgentLoopResult.status` 的完成判定。真实 AgentLoop 已因结构化 sandbox `backend_unavailable` 证据 blocked 时，runner 不执行这组命令，两个 check 均写为 `not_run`，避免形成与环境 blocker 冲突的通过证据。
 - 真实 AgentLoop 中 verification 被 sandbox backend unavailable 阻塞时，失败摘要应保留 policy/sandbox 分类和 trace/final report artifact；不能用 fake provider、scripted provider 或 `danger-full-access` 替代默认 `workspace-write` 验证。

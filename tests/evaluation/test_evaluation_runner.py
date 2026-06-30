@@ -76,7 +76,11 @@ def test_load_evaluation_regression_manifest_declares_required_task_classes() ->
         assert task.risk_tags
         assert "public-verification" in task.risk_tags
         assert "hidden-verification" in task.risk_tags
+    for task_type in ("simple_patch", "multi_file_reasoning", "failure_repair"):
+        files = by_type[task_type].workspace.files
+        assert files["pytest.ini"] == "[pytest]\naddopts = -p no:anyio\n"
     assert by_type["multi_file_reasoning"].expected_file_changes == ["cart.py", "policy.py"]
+    assert "pytest.ini" not in by_type["completion_gate"].workspace.files
     assert "completion-gate" in by_type["completion_gate"].risk_tags
 
 

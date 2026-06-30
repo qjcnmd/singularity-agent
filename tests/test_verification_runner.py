@@ -739,6 +739,38 @@ def test_backend_unavailable_classifies_as_sandbox_limitation(tmp_path: Path) ->
     assert failed[0]["evidence"]["sandbox_status"] == "backend_unavailable"
 
 
+def test_python_dll_import_failure_classifies_as_environment_error(tmp_path: Path) -> None:
+    request = CommandRequest(argv=["python", "-m", "pytest", "tests/test_app.py"])
+    fake = FakeCommandExecutor(
+        [
+            command_result(
+                request,
+                command_id="cmd_ssl_import_failed",
+                exit_code=1,
+                semantic_status=SemanticStatus.TESTS_FAILED,
+                output=(
+                    "ImportError: DLL load failed while importing _ssl: "
+                    "The specified module could not be found"
+                ),
+                error_code="semantic_failure",
+            )
+        ]
+    )
+    component = VerificationRunner(tmp_path, command_executor=fake)
+
+    plan = component.plan_verification(
+        changed_files=[],
+        task_intent="verify python runtime import failure",
+        smoke_commands=[["python", "-m", "pytest", "tests/test_app.py"]],
+    )
+    observation = component.run_plan(plan.id)
+
+    failed = observation["verification"]["failed_checks"]
+    assert failed[0]["status"] == CheckStatus.BLOCKED.value
+    assert failed[0]["failure_type"] == FailureType.ENVIRONMENT_ERROR.value
+    assert failed[0]["repair_hints"] == []
+
+
 def test_completion_assessment_statuses(tmp_path: Path) -> None:
     component = VerificationRunner(tmp_path)
     plan = component.plan_verification(changed_files=["src/app.py"], task_intent="code")

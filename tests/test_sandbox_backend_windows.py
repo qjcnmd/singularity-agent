@@ -321,6 +321,7 @@ def test_windows_doctor_and_setup_message_report_legacy_artifacts(
     monkeypatch.setattr(windows, "_state_dir_state", lambda: ready)
     monkeypatch.setattr(windows, "_state_dir_acl_state", lambda: ready)
     monkeypatch.setattr(windows, "_launcher_state", lambda *_args: ready)
+    monkeypatch.setattr(windows, "_python_runtime_smoke_diagnostics", lambda _identities: ())
 
     doctor = windows._probe_windows_sandbox_uncached()
 
@@ -329,6 +330,27 @@ def test_windows_doctor_and_setup_message_report_legacy_artifacts(
     assert "legacy sandbox artifacts detected" in doctor.recommended_action.lower()
 
     assert "legacy sandbox artifacts detected" in windows._setup_message(doctor, legacy).lower()
+
+
+def test_windows_doctor_recommended_action_reports_runtime_diagnostics_precisely() -> None:
+    diagnostics = (
+        {
+            "kind": "python_runtime_environment_blocker",
+            "status": "blocked",
+            "reason": "Sandbox account Python runtime smoke failed.",
+        },
+    )
+
+    action = windows._doctor_recommended_action(True, diagnostics)
+    message = windows._setup_message(
+        sandbox.WindowsSandboxDoctorReport.ready_for_tests(),
+        diagnostics,
+    )
+
+    assert "python runtime diagnostics detected" in action.lower()
+    assert "python runtime diagnostics detected" in message.lower()
+    assert "legacy sandbox artifacts" not in action.lower()
+    assert "legacy sandbox artifacts" not in message.lower()
 
 
 def test_windows_legacy_artifact_diagnostics_report_old_account_credential_and_firewall(
@@ -552,6 +574,110 @@ def test_windows_state_dir_cleanup_repairs_acl_integrity_and_attributes_before_d
     assert any("icacls" in command and "/reset" in command for command in flattened)
     assert any("icacls" in command and "/setintegritylevel" in command for command in flattened)
     assert any("attrib" in command and "-r" in command for command in flattened)
+
+
+def test_windows_run_root_cleanup_repairs_child_acl_before_delete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "Singularity" / "windows-sandbox"
+    run_root = state_dir / "runs" / "sandbox_abc123"
+    protected_child = run_root / "workspace" / ".pytest_cache"
+    protected_child.mkdir(parents=True)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
+    monkeypatch.setattr(windows.shutil, "which", lambda name: f"{name}.exe")
+    monkeypatch.setattr(windows, "_run_command", fake_run)
+
+    result = windows._normalize_run_root_for_cleanup(run_root)
+
+    flattened = [" ".join(command).lower() for command in commands]
+    assert result.ok is True
+    assert any("takeown" in command for command in flattened)
+    assert any("icacls" in command and "/reset" in command for command in flattened)
+    assert any(
+        "icacls" in command
+        and "/grant:r" in command
+        and "*s-1-5-21-host:(oi)(ci)f" in command
+        and "/t" in command
+        for command in flattened
+    )
+    assert any("icacls" in command and "/setintegritylevel" in command for command in flattened)
+    assert any("attrib" in command and "-r" in command for command in flattened)
+
+
+def test_windows_run_root_cleanup_fails_closed_without_host_sid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "Singularity" / "windows-sandbox"
+    run_root = state_dir / "runs" / "sandbox_abc123"
+    run_root.mkdir(parents=True)
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(windows, "_current_process_sid", lambda: "")
+    monkeypatch.setattr(windows.shutil, "which", lambda name: f"{name}.exe")
+
+    result = windows._normalize_run_root_for_cleanup(run_root)
+
+    assert result.ok is False
+    assert "host process SID" in result.reason
+
+
+def test_windows_run_root_cleanup_refuses_runs_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "Singularity" / "windows-sandbox"
+    runs_dir = state_dir / "runs"
+    runs_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+
+    result = windows._normalize_run_root_for_cleanup(runs_dir)
+
+    assert result.ok is False
+    assert "outside the Windows sandbox run directory" in result.reason
+
+
+def test_windows_run_root_cleanup_treats_icacls_partial_failure_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "Singularity" / "windows-sandbox"
+    run_root = state_dir / "runs" / "sandbox_abc123"
+    run_root.mkdir(parents=True)
+
+    def fake_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if "/grant:r" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "Successfully processed 0 files; Failed processing 1 files",
+                "",
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
+    monkeypatch.setattr(windows.shutil, "which", lambda name: f"{name}.exe")
+    monkeypatch.setattr(windows, "_run_command", fake_run)
+
+    result = windows._normalize_run_root_for_cleanup(run_root)
+
+    assert result.ok is False
+    assert result.details["returncode"] == 0
+    assert "failed processing" in result.details["stdout_summary"].lower()
 
 
 def test_login_ui_visibility_state_requires_hidden_userlist_entry(
@@ -1107,6 +1233,45 @@ def test_windows_backend_uses_short_machine_state_run_root(
     assert prepared.execution_cwd == prepared.sandbox_root / "workspace"
 
 
+def test_windows_backend_cleanup_uses_sandbox_account_preclean_before_host_delete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "machine-state"
+    runner = _FakeRunner(stdout="cleanup ok\n")
+    cleaned: list[Path] = []
+
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(
+        windows,
+        "_normalize_run_root_for_cleanup",
+        lambda path: windows._OperationResult(True, "normalized", {"path": str(path)}),
+    )
+    backend = sandbox.WindowsSandboxBackend(
+        runner=runner,
+        acl_applier=lambda _path, _account: None,
+        doctor_provider=sandbox.WindowsSandboxDoctorReport.ready_for_tests,
+    )
+    monkeypatch.setattr(
+        backend.filesystem,
+        "cleanup",
+        lambda sandbox_root: cleaned.append(Path(sandbox_root)),
+    )
+    prepared = backend.prepare(_request(tmp_path))
+
+    backend.cleanup(prepared)
+
+    assert len(runner.calls) == 1
+    cleanup_prepared = runner.calls[0]
+    assert cleanup_prepared.sandbox_root == prepared.sandbox_root
+    assert cleanup_prepared.workspace_copy_root == prepared.workspace_copy_root
+    assert cleanup_prepared.baseline["sandbox_account"] == prepared.baseline["sandbox_account"]
+    assert cleanup_prepared.baseline["credential_target"] == prepared.baseline["credential_target"]
+    assert cleanup_prepared.request.command == [str(prepared.workspace_copy_root)]
+    assert cleanup_prepared.request.profile.network.mode == sandbox.SandboxNetworkMode.ALLOWED
+    assert cleaned == [prepared.sandbox_root]
+
+
 def test_windows_backend_rejects_unimplemented_network_modes_before_preparing(
     tmp_path: Path,
 ) -> None:
@@ -1275,6 +1440,64 @@ def test_windows_backend_network_denied_requires_verified_firewall_probe(tmp_pat
     assert result.metadata["network_denied_verified"] is False
 
 
+def test_windows_backend_network_recheck_uses_current_account_probe_only(
+    tmp_path: Path,
+) -> None:
+    ready = sandbox.WindowsCapabilityState("available", True, "ready", {"source": "test"})
+    online_missing = sandbox.WindowsCapabilityState(
+        "missing",
+        True,
+        "online probe is temporarily unavailable",
+        {"probe": "network", "role": "online"},
+    )
+
+    class OnlineProbeFlappingBackend(_FakeReadyWindowsBackend):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.doctor_calls = 0
+
+        def doctor(self) -> sandbox.WindowsSandboxDoctorReport:
+            self.doctor_calls += 1
+            available = sandbox.WindowsSandboxDoctorReport.ready_for_tests()
+            if self.doctor_calls == 1:
+                return available
+            network_probe = windows._aggregate_identity_states(
+                "Network probes passed.",
+                "One or more network probes failed.",
+                {"offline": ready, "online": online_missing},
+            )
+            execution = sandbox.WindowsSandboxExecution(
+                account_sids=available.execution.account_sids,
+                credentials=available.execution.credentials,
+                launchers=available.execution.launchers,
+                runner_smoke=available.execution.runner_smoke,
+                network_probe=network_probe,
+            )
+            return sandbox.WindowsSandboxDoctorReport(
+                implementation=available.implementation,
+                platform_supported=available.platform_supported,
+                platform_status=available.platform_status,
+                primitives=available.primitives,
+                setup=available.setup,
+                execution=execution,
+                available=False,
+                enforcement_status="backend_unavailable",
+                blocking_requirements=("execution:network_probe",),
+                recommended_action="rerun setup",
+            )
+
+    runner = _FakeRunner(network_denied=True)
+    backend = OnlineProbeFlappingBackend(runner=runner)
+    prepared = backend.prepare(_request(tmp_path))
+
+    result = backend.run(prepared)
+
+    assert runner.calls == [prepared]
+    assert result.status == SandboxStatus.SUCCESS
+    assert result.metadata["network_probe_verified"] is True
+    assert result.metadata["network_denied_verified"] is True
+
+
 def test_windows_backend_rechecks_enforcement_before_launching_runner(tmp_path: Path) -> None:
     class FlappingBackend(_FakeReadyWindowsBackend):
         def __init__(self, **kwargs) -> None:
@@ -1406,9 +1629,21 @@ def test_runner_runtime_access_grants_only_read_execute_to_python_roots(
     result = windows._ensure_runner_runtime_access()
 
     assert result.ok is True
-    assert len(commands) == 2
-    assert {command[1] for command, _timeout in commands} == {str(venv_root), str(base_root)}
-    assert all("/grant:r" in command for command, _timeout in commands)
+    assert len(commands) == 3
+    remove_commands = [command for command, _timeout in commands if "/remove:g" in command]
+    grant_commands = [command for command, _timeout in commands if "/grant:r" in command]
+    assert remove_commands == [
+        [
+            "icacls.exe",
+            str(base_root),
+            "/remove:g",
+            windows.OFFLINE_SANDBOX_ACCOUNT,
+            windows.ONLINE_SANDBOX_ACCOUNT,
+            "/C",
+            "/Q",
+        ]
+    ]
+    assert {command[1] for command in grant_commands} == {str(venv_root), str(base_root)}
     command_by_path = {command[1]: command for command, _timeout in commands}
     assert f"{windows.OFFLINE_SANDBOX_ACCOUNT}:(OI)(CI)RX" in command_by_path[str(venv_root)]
     assert f"{windows.ONLINE_SANDBOX_ACCOUNT}:(OI)(CI)RX" in command_by_path[str(venv_root)]
@@ -1423,6 +1658,83 @@ def test_runner_runtime_access_grants_only_read_execute_to_python_roots(
     assert all(timeout_seconds == 120 for _command, timeout_seconds in commands)
     assert result.details["runtime_target_hashes"]
     assert str(tmp_path) not in json.dumps(result.details)
+
+
+def test_runner_runtime_access_removes_stale_recursive_base_ace_before_minimal_grant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands: list[tuple[list[str], float]] = []
+    base_root = tmp_path / "python"
+    dlls = base_root / "DLLs"
+    dlls.mkdir(parents=True)
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        windows,
+        "_runner_runtime_acl_targets",
+        lambda: ((base_root, "RX"), (dlls, "(OI)(CI)RX")),
+        raising=False,
+    )
+    monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
+
+    def fake_run_command(
+        command: list[str],
+        *,
+        timeout_seconds: float = 20,
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append((command, timeout_seconds))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(windows, "_run_command", fake_run_command)
+
+    result = windows._ensure_runner_runtime_access(("SandboxA",))
+
+    assert result.ok is True
+    remove_commands = [command for command, _timeout in commands if "/remove:g" in command]
+    grant_commands = [command for command, _timeout in commands if "/grant:r" in command]
+    assert remove_commands == [["icacls.exe", str(base_root), "/remove:g", "SandboxA", "/C", "/Q"]]
+    assert grant_commands[0] == ["icacls.exe", str(base_root), "/grant:r", "SandboxA:RX", "/C", "/Q"]
+    assert grant_commands[1] == ["icacls.exe", str(dlls), "/grant:r", "SandboxA:(OI)(CI)RX", "/C", "/Q"]
+    assert all("/T" not in command for command, _timeout in commands)
+
+
+def test_runner_runtime_cleanup_removes_all_explicit_runtime_aces(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands: list[tuple[list[str], float]] = []
+    base_root = tmp_path / "python"
+    dlls = base_root / "DLLs"
+    dlls.mkdir(parents=True)
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        windows,
+        "_runner_runtime_acl_targets",
+        lambda: ((base_root, "RX"), (dlls, "(OI)(CI)RX")),
+        raising=False,
+    )
+    monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
+
+    def fake_run_command(
+        command: list[str],
+        *,
+        timeout_seconds: float = 20,
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append((command, timeout_seconds))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(windows, "_run_command", fake_run_command)
+
+    result = windows._remove_runner_runtime_access(("SandboxA", "SandboxB"))
+
+    assert result.ok is True
+    assert [command for command, _timeout in commands] == [
+        ["icacls.exe", str(base_root), "/remove:g", "SandboxA", "SandboxB", "/C", "/Q"],
+        ["icacls.exe", str(dlls), "/remove:g", "SandboxA", "SandboxB", "/C", "/Q"],
+    ]
+    assert all(timeout_seconds == 120 for _command, timeout_seconds in commands)
 
 
 def test_runner_runtime_acl_targets_exclude_unneeded_base_packages_and_config(
@@ -1656,6 +1968,82 @@ def test_runner_smoke_oserror_reports_structured_diagnostics(
     assert evidence["state_dir_hash"]
     assert evidence["probe_root_hash"]
     assert "C:/ProgramData" not in json.dumps(evidence)
+
+
+def test_python_runtime_smoke_reports_ssl_environment_blocker_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ready = sandbox.WindowsCapabilityState("available", True, "ready", {})
+    runtime_root = Path("C:/ProgramData/Singularity/windows-sandbox/python-runtime-smoke")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
+    monkeypatch.setattr(windows, "_state_dir_state", lambda: ready)
+    monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(windows, "_enumerate_account_logon_rights", lambda _sid: windows._logon_rights_view([], ""))
+    monkeypatch.setattr(windows, "_security_attestation_state", lambda _sids: ready)
+    monkeypatch.setattr(windows, "_login_ui_visibility_state", lambda _name: ready)
+    monkeypatch.setattr(windows, "_logon_rights_state", lambda *_args, **_kwargs: ready)
+    monkeypatch.setattr(windows, "_group_membership_state", lambda _name: ready)
+    monkeypatch.setattr(windows, "_credential_state", lambda _identity: ready)
+    monkeypatch.setattr(windows, "_acl_state", lambda _supported, _identity: ready)
+    monkeypatch.setattr(windows, "_runner_smoke_state", lambda _identity: ready)
+    monkeypatch.setattr(windows, "_launcher_state", lambda *_args: ready)
+    monkeypatch.setattr(windows, "_execution_backend_state", lambda *_args: ready)
+    monkeypatch.setattr(windows, "_network_state", lambda _sid: ready)
+    monkeypatch.setattr(windows, "_online_network_filter_state", lambda _sid: ready)
+    monkeypatch.setattr(windows, "_network_probe_state", lambda _identity, _sid: ready)
+    monkeypatch.setattr(windows, "_state_dir_acl_state", lambda: ready)
+    monkeypatch.setattr(windows, "_legacy_assets_state", lambda: ready)
+    monkeypatch.setattr(windows, "_primitive", lambda *_args: ready)
+    monkeypatch.setattr(windows, "_command_state", lambda *_args: ready)
+    monkeypatch.setattr(windows, "_powershell_state", lambda *_args: ready)
+    monkeypatch.setattr(windows, "_windows_state_dir", lambda: tmp_path)
+
+    def fake_account_python_smoke(**kwargs) -> sandbox.WindowsRunnerResult:
+        role = kwargs["identity"].role
+        stdout = (
+            '{"ssl": "failed", "socket": "passed", "hashlib": "passed", "pathlib": "passed"}'
+            if role == "offline"
+            else '{"ssl": "passed", "socket": "passed", "hashlib": "passed", "pathlib": "passed"}'
+        )
+        stderr = (
+            "ImportError: DLL load failed while importing _ssl: The specified module could not be found"
+            if role == "offline"
+            else ""
+        )
+        return sandbox.WindowsRunnerResult(
+            exit_code=1 if role == "offline" else 0,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=False,
+            started_at="2026-06-30T00:00:00+00:00",
+            ended_at="2026-06-30T00:00:01+00:00",
+            duration_ms=1,
+            output_truncated=False,
+            job_killed=False,
+            network_denied_verified=True,
+            metadata={
+                "restricted_token": True,
+                "low_integrity": True,
+                "private_desktop": True,
+                "job_object": True,
+            },
+        )
+
+    monkeypatch.setattr(windows, "_account_python_smoke", fake_account_python_smoke)
+
+    report = windows._probe_windows_sandbox_uncached()
+
+    assert report.available is True
+    diagnostics = [item for item in report.diagnostics if item.get("kind") == "python_runtime_environment_blocker"]
+    assert diagnostics
+    diagnostic_text = json.dumps(diagnostics)
+    assert '"ssl": "failed"' in diagnostic_text
+    assert "_ssl" in diagnostic_text
+    assert str(runtime_root) not in diagnostic_text
+    assert "S-1-5-21" not in diagnostic_text
 
 
 def test_network_probe_oserror_reports_structured_diagnostics(
@@ -1949,6 +2337,36 @@ def test_windows_sandbox_runner_removes_account_runner_logs(
     assert runner_result.exit_code == 0
     assert not stdout_path.exists()
     assert not stderr_path.exists()
+
+
+def test_windows_runner_workspace_cleanup_runs_in_account_process_without_restricted_child(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import singularity.sandbox.windows_runner as runner
+
+    workspace = tmp_path / "run" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "cache.pyc").write_text("bytecode", encoding="utf-8")
+    spec = runner.WindowsRunnerSpec(
+        command=[str(workspace)],
+        cwd=str(tmp_path / "run"),
+        env={},
+        operation="workspace_cleanup",
+    )
+
+    def fail_restricted_child(_spec):
+        raise AssertionError("workspace cleanup must not spawn the restricted child")
+
+    monkeypatch.setattr(runner, "_start_restricted_child", fail_restricted_child)
+
+    result = runner.run_spec(spec)
+
+    assert result.exit_code == 0
+    assert workspace.exists() is False
+    assert result.metadata["operation"] == "workspace_cleanup"
+    assert result.metadata["restricted_token"] is False
+    assert result.metadata["low_integrity"] is False
 
 
 def test_account_logon_rights_view_classifies_rights() -> None:

@@ -1567,7 +1567,10 @@ def _failure_category(
         return "environment_blocker"
     failure_repair = _failure_repair_summary(payload)
     if failure_repair.get("latest_failure_category"):
-        return str(failure_repair["latest_failure_category"])
+        category = str(failure_repair["latest_failure_category"])
+        if category in {"environment_error", "sandbox_limitation"}:
+            return "environment_blocker"
+        return category
     if policy_blocks:
         return "policy_blocked"
     if verification is not None and verification.failure_category and verification.failure_category != "none":

@@ -9,6 +9,7 @@
         "type": "fixture",
         "files": {
           "math_utils.py": "def add(a, b):\n    return a - b\n",
+          "pytest.ini": "[pytest]\naddopts = -p no:anyio\n",
           "tests/test_math_utils.py": "from math_utils import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
         }
       },
@@ -55,6 +56,7 @@
         "files": {
           "cart.py": "from policy import FREE_SHIPPING_MINIMUM\n\n\ndef shipping_due(subtotal):\n    return 0 if subtotal > FREE_SHIPPING_MINIMUM else 7\n",
           "policy.py": "FREE_SHIPPING_MINIMUM = 75\n",
+          "pytest.ini": "[pytest]\naddopts = -p no:anyio\n",
           "tests/test_shipping.py": "from cart import shipping_due\nfrom policy import FREE_SHIPPING_MINIMUM\n\n\ndef test_policy_constant():\n    assert FREE_SHIPPING_MINIMUM == 50\n\n\ndef test_threshold_is_inclusive():\n    assert shipping_due(50) == 0\n    assert shipping_due(49.99) == 7\n"
         }
       },
@@ -103,6 +105,7 @@
         "type": "fixture",
         "files": {
           "normalizer.py": "def normalize(value):\n    return value.strip()\n",
+          "pytest.ini": "[pytest]\naddopts = -p no:anyio\n",
           "tests/test_normalizer.py": "from normalizer import normalize\n\n\ndef test_normalize_lowercases_and_trims():\n    assert normalize(' Hello  ') == 'hello'\n\n\ndef test_normalize_collapses_internal_space():\n    assert normalize('Hello   World') == 'hello world'\n"
         }
       },

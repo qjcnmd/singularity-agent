@@ -29,7 +29,13 @@ from singularity.sandbox.filesystem import SandboxFilesystemManager, random_trac
 from singularity.sandbox.models import (
     PreparedSandbox,
     SandboxCapabilities,
+    SandboxEnvPolicy,
+    SandboxFilesystemMode,
+    SandboxFilesystemPolicy,
     SandboxNetworkMode,
+    SandboxNetworkPolicy,
+    SandboxProfile,
+    SandboxProfileName,
     SandboxRequest,
     SandboxResourceLimits,
     SandboxResult,
@@ -569,7 +575,10 @@ class WindowsSandboxBackend:
     def run(self, prepared: PreparedSandbox) -> SandboxResult:
         started = time.perf_counter()
         enforcement = self._runtime_enforcement_report()
-        if not enforcement.available:
+        if not enforcement.available and not _can_ignore_unrelated_network_probe_blocker(
+            prepared,
+            enforcement,
+        ):
             now = _now()
             return SandboxResult(
                 sandbox_id=prepared.sandbox_id,
@@ -609,7 +618,7 @@ class WindowsSandboxBackend:
         )
         network_probe_verified = (
             prepared.request.profile.network.mode != SandboxNetworkMode.DENIED
-            or enforcement.execution.network_probe.ready
+            or _network_probe_state_for_role(enforcement.execution.network_probe, "offline").ready
         )
         network_denied_verified = (
             prepared.request.profile.network.mode != SandboxNetworkMode.DENIED
@@ -707,12 +716,84 @@ class WindowsSandboxBackend:
         )
 
     def cleanup(self, prepared: PreparedSandbox) -> None:
+        self._cleanup_workspace_as_sandbox_account(prepared)
         normalized = _normalize_run_root_for_cleanup(prepared.sandbox_root)
         if not normalized.ok:
             raise SandboxCapabilityError(
                 "backend_unavailable: sandbox run root could not be normalized for cleanup."
             )
         self.filesystem.cleanup(prepared.sandbox_root)
+
+    def _cleanup_workspace_as_sandbox_account(self, prepared: PreparedSandbox) -> None:
+        if os.name != "nt" or not prepared.workspace_copy_root.exists():
+            return
+        command = _workspace_cleanup_command(prepared.workspace_copy_root)
+        result_path = prepared.sandbox_root / "runner-cleanup-result.json"
+        spec_path = prepared.sandbox_root / "runner-cleanup-spec.json"
+        with suppress(OSError):
+            result_path.unlink()
+        spec = WindowsRunnerSpec(
+            command=command,
+            cwd=str(prepared.sandbox_root),
+            env=prepared.env,
+            timeout_seconds=30,
+            max_output_chars=20000,
+            network_mode=SandboxNetworkMode.ALLOWED.value,
+            result_path=str(result_path),
+            operation="workspace_cleanup",
+        )
+        spec_path.write_text(
+            json.dumps(spec.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        cleanup_request = SandboxRequest(
+            sandbox_id=prepared.sandbox_id,
+            session_id=prepared.request.session_id,
+            task_id=prepared.request.task_id,
+            action_id=f"{prepared.request.action_id}:cleanup",
+            command=command,
+            cwd=prepared.sandbox_root,
+            workspace_root=prepared.sandbox_root,
+            profile=SandboxProfile(
+                name=SandboxProfileName.ISOLATED_VERIFICATION,
+                filesystem=SandboxFilesystemPolicy(
+                    mode=SandboxFilesystemMode.EMPTY_TEMP_WORKSPACE,
+                    workspace_root=prepared.sandbox_root,
+                    detect_changes=False,
+                ),
+                network=SandboxNetworkPolicy(mode=SandboxNetworkMode.ALLOWED),
+                env=SandboxEnvPolicy(),
+                resources=SandboxResourceLimits(timeout_seconds=30, max_output_chars=20000),
+                description="Cleanup of the per-run Windows sandbox workspace.",
+            ),
+            policy_decision_id=prepared.request.policy_decision_id,
+            policy_constraints=prepared.request.policy_constraints,
+            reason="windows sandbox run-root cleanup",
+            metadata={"purpose": "windows_run_root_cleanup"},
+        )
+        cleanup_prepared = PreparedSandbox(
+            sandbox_id=prepared.sandbox_id,
+            backend_name=prepared.backend_name,
+            sandbox_root=prepared.sandbox_root,
+            workspace_copy_root=prepared.workspace_copy_root,
+            execution_cwd=prepared.sandbox_root,
+            env=prepared.env,
+            request=cleanup_request,
+            created_at=_now(),
+            trace_id=prepared.trace_id,
+            baseline={
+                "runner_spec": str(spec_path),
+                "runner_result": str(result_path),
+                "sandbox_account": prepared.baseline.get("sandbox_account"),
+                "credential_target": prepared.baseline.get("credential_target"),
+                "sandbox_role": prepared.baseline.get("sandbox_role"),
+            },
+        )
+        cleanup_result = self.runner.run(cleanup_prepared)
+        if cleanup_result.timed_out or cleanup_result.exit_code != 0:
+            raise SandboxCapabilityError(
+                "backend_unavailable: sandbox account workspace pre-cleanup failed."
+            )
 
     def _runtime_enforcement_report(self) -> WindowsSandboxDoctorReport:
         if (
@@ -804,6 +885,35 @@ class WindowsSandboxBackend:
                 runtime[name] = value
         runtime.setdefault("PYTHONIOENCODING", "utf-8")
         return runtime
+
+
+def _can_ignore_unrelated_network_probe_blocker(
+    prepared: PreparedSandbox,
+    enforcement: WindowsSandboxDoctorReport,
+) -> bool:
+    if tuple(enforcement.blocking_requirements) != ("execution:network_probe",):
+        return False
+    role = str(prepared.baseline.get("sandbox_role") or "")
+    if role not in {"offline", "online"}:
+        return False
+    return _network_probe_state_for_role(enforcement.execution.network_probe, role).ready
+
+
+def _network_probe_state_for_role(
+    state: WindowsCapabilityState,
+    role: str,
+) -> WindowsCapabilityState:
+    principals = state.evidence.get("principals")
+    if isinstance(principals, dict):
+        payload = principals.get(role)
+        if isinstance(payload, dict):
+            return WindowsCapabilityState(
+                str(payload.get("status") or "missing"),
+                bool(payload.get("checked", True)),
+                str(payload.get("reason") or ""),
+                dict(payload.get("evidence") or {}),
+            )
+    return state
 
 
 @lru_cache(maxsize=1)
@@ -1529,6 +1639,8 @@ def _probe_windows_sandbox_uncached() -> WindowsSandboxDoctorReport:
         identity.role: _network_probe_state(identity, sids[identity.role])
         for identity in identities
     }
+    runtime_diagnostics = _python_runtime_smoke_diagnostics(identities)
+    diagnostics = (*diagnostics, *runtime_diagnostics)
     setup = WindowsSandboxSetup(
         sandbox_accounts=_aggregate_identity_states(
             "Both sandbox accounts exist.",
@@ -2201,6 +2313,141 @@ def _account_python_smoke(
         )
 
 
+def _python_runtime_smoke_diagnostics(
+    identities: tuple[_WindowsSandboxIdentity, ...],
+) -> tuple[dict[str, Any], ...]:
+    if os.name != "nt":
+        return ()
+    state_dir = _windows_state_dir_path()
+    if not state_dir.exists():
+        return ()
+    root = state_dir / "python-runtime-smoke"
+    try:
+        root = _windows_state_dir() / "python-runtime-smoke"
+        root.mkdir(parents=True, exist_ok=True)
+        acl = _apply_account_acl(root, account_names=tuple(identity.account_name for identity in identities))
+        if not acl.ok:
+            return (
+                {
+                    "kind": "python_runtime_environment_blocker",
+                    "status": "blocked",
+                    "reason": "Python runtime smoke ACL setup failed.",
+                    "evidence": {
+                        **_probe_evidence("python_runtime_smoke_acl", state_dir=state_dir, probe_root=root),
+                        "details": acl.details,
+                    },
+                },
+            )
+        diagnostics: list[dict[str, Any]] = []
+        for identity in identities:
+            sid = _account_sid(identity.account_name)
+            cwd = root / identity.role
+            cwd.mkdir(parents=True, exist_ok=True)
+            result = _account_python_smoke(
+                identity=identity,
+                cwd=cwd,
+                code=_PYTHON_RUNTIME_SMOKE_CODE,
+                timeout_seconds=5,
+                operation_prefix="python_runtime_smoke",
+            )
+            if result.exit_code == 0:
+                continue
+            diagnostics.append(
+                _python_runtime_smoke_diagnostic(
+                    identity=identity,
+                    sid=sid,
+                    result=result,
+                    state_dir=state_dir,
+                    root=root,
+                )
+            )
+        return tuple(diagnostics)
+    except Exception as exc:
+        return (
+            {
+                "kind": "python_runtime_environment_blocker",
+                "status": "blocked",
+                "reason": "Python runtime smoke failed before module import checks completed.",
+                "evidence": _exception_diagnostics(
+                    "python_runtime_smoke",
+                    exc,
+                    state_dir=state_dir,
+                    probe_root=root,
+                    path=root,
+                ),
+            },
+        )
+    finally:
+        _cleanup_probe_root(root)
+
+
+def _python_runtime_smoke_diagnostic(
+    *,
+    identity: _WindowsSandboxIdentity,
+    sid: str,
+    result: WindowsRunnerResult,
+    state_dir: Path,
+    root: Path,
+) -> dict[str, Any]:
+    module_status = _python_runtime_module_status(result.stdout)
+    evidence = _runner_result_summary(
+        _runner_result_operation("python_runtime_smoke", result),
+        result,
+        state_dir=state_dir,
+        probe_root=root,
+        path=root,
+        extra={
+            "role": identity.role,
+            "network_mode": identity.network_mode.value,
+            "account": _account_name_diagnostics(identity.account_name),
+            "account_sid_hash": _hash_sid(sid),
+            "module_status": module_status,
+        },
+    )
+    return {
+        "kind": "python_runtime_environment_blocker",
+        "status": "blocked",
+        "reason": "Sandbox account Python runtime smoke failed.",
+        "evidence": evidence,
+    }
+
+
+def _python_runtime_module_status(stdout: str) -> dict[str, str]:
+    try:
+        payload = json.loads(stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    modules = payload.get("modules") if isinstance(payload.get("modules"), dict) else payload
+    if not isinstance(modules, dict):
+        return {}
+    result: dict[str, str] = {}
+    for name in ("ssl", "socket", "hashlib", "pathlib"):
+        value = modules.get(name)
+        if isinstance(value, dict):
+            result[name] = str(value.get("status") or "unknown")
+        elif isinstance(value, str):
+            result[name] = value
+    return result
+
+
+_PYTHON_RUNTIME_SMOKE_CODE = (
+    "import importlib, json\n"
+    "modules={}\n"
+    "ok=True\n"
+    "for name in ('ssl','socket','hashlib','pathlib'):\n"
+    "    try:\n"
+    "        importlib.import_module(name)\n"
+    "        modules[name]={'status':'passed'}\n"
+    "    except BaseException as exc:\n"
+    "        ok=False\n"
+    "        modules[name]={'status':'failed','error_type':type(exc).__name__,'message':str(exc)[:200]}\n"
+    "print(json.dumps({'modules':modules}, sort_keys=True))\n"
+    "raise SystemExit(0 if ok else 7)\n"
+)
+
+
 def _network_probe_state(
     identity: _WindowsSandboxIdentity,
     sid: str,
@@ -2826,7 +3073,7 @@ def _doctor_recommended_action(
         else "Run `singularity-agent sandbox setup --json` from an elevated shell and rerun doctor."
     )
     if diagnostics:
-        return f"{action} Legacy sandbox artifacts detected; review diagnostics before cleanup."
+        return f"{action} {_diagnostic_action_suffix(diagnostics)}"
     return action
 
 
@@ -2836,8 +3083,17 @@ def _setup_message(
 ) -> str:
     message = "Windows sandbox setup completed." if doctor.available else doctor.reason
     if diagnostics:
-        return f"{message} Legacy sandbox artifacts detected; review diagnostics before cleanup."
+        return f"{message} {_diagnostic_action_suffix(diagnostics)}"
     return message
+
+
+def _diagnostic_action_suffix(diagnostics: tuple[dict[str, Any], ...]) -> str:
+    kinds = {str(item.get("kind") or "") for item in diagnostics}
+    if kinds and kinds <= {"python_runtime_environment_blocker"}:
+        return "Python runtime diagnostics detected; review diagnostics before capability evaluation."
+    if "python_runtime_environment_blocker" in kinds:
+        return "Python runtime diagnostics and legacy sandbox artifacts detected; review diagnostics."
+    return "Legacy sandbox artifacts detected; review diagnostics before cleanup."
 
 
 def _validate_sandbox_account_name(name: str) -> dict[str, Any] | None:
@@ -3684,6 +3940,14 @@ def _ensure_runner_runtime_access(
         "runtime_target_hashes": [_hash_path(path) for path, _permission in targets],
         "account_name_hashes": [_hash_text(account) for account in account_names],
     }
+    stale_cleanup = _remove_stale_runner_runtime_base_access(
+        icacls,
+        targets,
+        account_names,
+        details,
+    )
+    if stale_cleanup is not None:
+        return stale_cleanup
     for path, permission in targets:
         command = [icacls, str(path), "/grant:r"]
         command.extend(f"{account}:{permission}" for account in account_names)
@@ -3706,6 +3970,32 @@ def _ensure_runner_runtime_access(
         "runner_runtime_access_ready",
         {"changed": bool(targets and account_names), **details},
     )
+
+
+def _remove_stale_runner_runtime_base_access(
+    icacls: str,
+    targets: tuple[tuple[Path, str], ...],
+    account_names: tuple[str, ...],
+    details: dict[str, Any],
+) -> _OperationResult | None:
+    for path, permission in targets:
+        if permission != "RX":
+            continue
+        command = [icacls, str(path), "/remove:g", *account_names, "/C", "/Q"]
+        result = _run_command(command, timeout_seconds=120)
+        if result.returncode != 0:
+            return _OperationResult(
+                False,
+                "Failed to remove stale sandbox account access from the Python runtime root.",
+                _completed_process_diagnostics(
+                    "runner_runtime_acl_stale_cleanup",
+                    result,
+                    state_dir=_windows_state_dir_path(),
+                    path=path,
+                    extra=details,
+                ),
+            )
+    return None
 
 
 def _remove_runner_runtime_access(account_names: tuple[str, ...]) -> _OperationResult:
@@ -3933,11 +4223,18 @@ def _normalize_run_root_for_cleanup(path: Path) -> _OperationResult:
     state_dir = _windows_state_dir_path().resolve(strict=False)
     runs_dir = (state_dir / "runs").resolve(strict=False)
     candidate = path.resolve(strict=False)
+    host_sid = _current_process_sid()
     details = {
         "state_dir_hash": _hash_path(state_dir),
         "run_root_hash": _hash_path(candidate),
+        "host_sid_hash": _hash_sid(host_sid),
     }
-    if not _is_relative_to(candidate, runs_dir) or candidate == runs_dir:
+    if (
+        not _is_relative_to(candidate, runs_dir)
+        or candidate == runs_dir
+        or candidate.parent != runs_dir
+        or not candidate.name.startswith("sandbox_")
+    ):
         return _OperationResult(
             False,
             "Refusing to normalize a path outside the Windows sandbox run directory.",
@@ -3945,7 +4242,13 @@ def _normalize_run_root_for_cleanup(path: Path) -> _OperationResult:
         )
     if not candidate.exists():
         return _OperationResult(True, "run_root_not_present", {"changed": False, **details})
-    tools = {name: shutil.which(name) for name in ("icacls", "attrib")}
+    if not host_sid:
+        return _OperationResult(
+            False,
+            "Windows sandbox run-root cleanup requires the host process SID.",
+            details,
+        )
+    tools = {name: shutil.which(name) for name in ("takeown", "icacls", "attrib")}
     missing = sorted(name for name, executable in tools.items() if executable is None)
     if missing:
         return _OperationResult(
@@ -3954,6 +4257,32 @@ def _normalize_run_root_for_cleanup(path: Path) -> _OperationResult:
             {"missing_tools": missing, **details},
         )
     commands = (
+        [str(tools["takeown"]), "/F", str(candidate), "/R", "/D", "Y"],
+        [
+            str(tools["icacls"]),
+            str(candidate),
+            "/inheritance:e",
+            "/T",
+            "/C",
+            "/Q",
+        ],
+        [
+            str(tools["icacls"]),
+            str(candidate),
+            "/reset",
+            "/T",
+            "/C",
+            "/Q",
+        ],
+        [
+            str(tools["icacls"]),
+            str(candidate),
+            "/grant:r",
+            f"*{host_sid}:(OI)(CI)F",
+            "/T",
+            "/C",
+            "/Q",
+        ],
         [
             str(tools["icacls"]),
             str(candidate),
@@ -3968,7 +4297,7 @@ def _normalize_run_root_for_cleanup(path: Path) -> _OperationResult:
     )
     for command in commands:
         result = _run_command(command)
-        if result.returncode != 0:
+        if _cleanup_command_failed(result):
             return _OperationResult(
                 False,
                 "Failed to normalize Windows sandbox run root before deletion.",
@@ -3982,6 +4311,19 @@ def _normalize_run_root_for_cleanup(path: Path) -> _OperationResult:
                 ),
             )
     return _OperationResult(True, "run_root_normalized", {"changed": True, **details})
+
+
+def _workspace_cleanup_command(workspace_copy_root: Path) -> list[str]:
+    return [str(workspace_copy_root)]
+
+
+def _cleanup_command_failed(result: subprocess.CompletedProcess[str]) -> bool:
+    if result.returncode != 0:
+        return True
+    output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    if re.search(r"failed processing\s+[1-9]\d*\s+files?", output):
+        return True
+    return "access is denied" in output
 
 
 def _run_command(

@@ -1338,14 +1338,31 @@
 │  │      │       │  │   │   │   │   → WindowsSandboxRunner │   │
 │  │      │       │  │   │   │   │   (受限令牌+私有桌面+Job  │   │
 │  │      │       │  │   │   │   │    Object+防火墙+ACL)    │   │
+│  │      │       │  │   │   │   │   recheck只采纳当前账户    │   │
+│  │      │       │  │   │   │   │   的network_probe；其他    │   │
+│  │      │       │  │   │   │   │   enforcement blocker仍阻断│   │
 │  │      │       │  │   │   │   ├── LocalProcessBackend    │   │
 │  │      │       │  │   │   │   │   .execute(command)      │   │
 │  │      │       │  │   │   │   │   → subprocess.run()     │   │
 │  │      │       │  │   │   │   └── cleanup()              │   │
+│  │      │       │  │   │   │       → 同账户Level-1删除     │   │
+│  │      │       │  │   │   │         workspace projection  │   │
+│  │      │       │  │   │   │       → 宿主run-root ACL/IL   │   │
+│  │      │       │  │   │   │         normalization后删除   │   │
 │  │      │       │  │   │   └── → CommandResult {           │   │
 │  │      │       │  │   │       stdout, stderr, returncode, │   │
 │  │      │       │  │   │       error_code, sandbox_result, │   │
 │  │      │       │  │   │       isolation_report }          │   │
+│  │      │       │  │   │                                  │   │
+│  │      │       │  │   ├── [验证工具]                         │   │
+│  │      │       │  │   │   VerificationToolHandlers       │   │
+│  │      │       │  │   │   .run_verification()            │   │
+│  │      │       │  │   │   ├── VerificationRunner.run_plan│   │
+│  │      │       │  │   │   ├── CommandExecutor.run()      │   │
+│  │      │       │  │   │   └── classify_failure()         │   │
+│  │      │       │  │   │       Python DLL/import init     │   │
+│  │      │       │  │   │       → environment_error        │   │
+│  │      │       │  │   │       → blocked, no repair_hints │   │
 │  │      │       │  │   │                                  │   │
 │  │      │       │  │   ├── [写工具]                         │   │
 │  │      │       │  │   │   WorkspaceMutationManager       │   │
@@ -1620,6 +1637,86 @@
   调用点 5: _attempt_finalize → 路径 F1 中的 _maybe_analyze_failure
     outcome=REPLAN_REQUIRED, failure_source="completion"
     → 同调用点 3
+
+
+═══════════════════════════════════════════════════════════════
+           附 E：Phase 6.2 sandbox / verification / eval 旁路
+═══════════════════════════════════════════════════════════════
+
+  E1. sandbox doctor / setup / cleanup（CLI 能力诊断，不进入 AgentLoop）
+    python -m singularity.cli sandbox doctor --json
+    → WindowsSandboxBackend.doctor()
+    → probe_windows_sandbox()
+    → offline / online 双账户检查：
+      1) account / credential / login UI / logon rights / group membership
+      2) state dir ACL boundary / runner smoke / network probe
+      3) Python runtime smoke: import ssl, socket, hashlib, pathlib
+    → Python runtime smoke 失败：
+      diagnostics += {kind: "python_runtime_environment_blocker",
+                      module_status, runner evidence, redacted/hash details}
+      只扩展 diagnostics，不改变 doctor schema v2，也不改变原有
+      enforcement available 计算。
+
+    python -m singularity.cli sandbox setup --json
+    → setup_windows_sandbox()
+    → 授权 Python runtime targets 前：
+      清理 base runtime 根目录上 sandbox 账户 stale explicit ACE
+    → 只恢复 base 根目录 RX 和精确 runtime targets RX/(OI)(CI)RX
+      不递归授权整个 Anaconda/base install、包缓存、用户目录或配置目录。
+
+    python -m singularity.cli sandbox cleanup --json
+    → cleanup_windows_sandbox_assets()
+    → 删除 credential / firewall / login UI / attestation
+    → 移除两个 current sandbox 账户在相同 runtime targets 上的全部显式 ACE
+    → residual_audit 非零则 cleanup failed。
+
+  E2. Windows sandbox command runtime recheck（AgentLoop 内命令分支）
+    CommandExecutor.run()
+    → SandboxManager.run()
+    → WindowsSandboxBackend.run(prepared)
+    → uncached enforcement probe
+    → 若 blocking_requirements == ["execution:network_probe"]：
+         读取 PreparedSandbox.baseline.sandbox_role
+         只消费当前命令账户对应 offline/online 子状态；
+         当前角色 ready 时可忽略另一账户瞬时 network_probe 失败。
+      否则任一 setup、launcher、ACL、runner smoke、network filter
+      或其他 enforcement blocker 仍 fail closed → BACKEND_UNAVAILABLE。
+    → WindowsSandboxBackend.cleanup(prepared)
+      1) 复用 PreparedSandbox.baseline.sandbox_account / credential_target
+         启动同一 sandbox 账户的 Level-1 runner；
+      2) runner spec operation="workspace_cleanup"，只删除当前
+         runs/<sandbox_id>/workspace projection，不创建 Level-2
+         low-integrity child，不扩大 runtime ACL；
+      3) 宿主进程只对当前 runs/sandbox_* run root 执行 take ownership、
+         ACL reset、host SID full-control、medium integrity 和属性恢复；
+      4) 任一步失败 → cleanup_failed，不能把命令 success 伪装为完成。
+
+  E3. verification failure 分类（AgentLoop 内 run_verification 工具）
+    run_verification tool
+    → VerificationRunner.run_plan()
+    → CommandExecutor.run()
+    → FailureParserRegistry.parse()
+    → classify_failure()
+    → Python DLL/import 初始化失败（如 _ssl/_hashlib/_socket 或
+      "DLL initialization routine failed"）
+      = FailureType.ENVIRONMENT_ERROR
+      = VerificationResult.status BLOCKED
+      = 不生成普通代码 repair_hints
+    → Planner / CompletionGate 将其作为环境 blocker 证据消费，
+      不进入普通业务代码 repair。
+
+  E4. capability regression evaluation 归约（真实 provider + AgentLoop 外层）
+    python -m singularity.cli eval run docs/evaluation/capability-regression-tasks.json
+    → EvaluationRunner.run()
+    → 每个 task 启动真实 KernelBootstrap → AgentGraphBuilder
+      → AgentKernel → AgentLoop.run
+    → post-agent verification 只作为 evaluation scoring 证据，
+      不回灌 AgentLoop completion。
+    → final report / failure repair summary 中的 latest_failure_category:
+        environment_error 或 sandbox_limitation → environment_blocker
+    → benchmark fixture 中 simple_patch / multi_file_reasoning /
+      failure_repair 的内联 pytest.ini 只禁用 anyio 自动插件；
+      completion_gate fixture 和生产项目 pytest 行为不变。
 ```
 
 ---

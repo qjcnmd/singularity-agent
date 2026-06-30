@@ -835,6 +835,12 @@ class VerificationRunner:
         repair_hints = (
             []
             if status == CheckStatus.PASSED
+            or failure_type
+            in {
+                FailureType.ENVIRONMENT_ERROR,
+                FailureType.SANDBOX_LIMITATION,
+                FailureType.SANDBOX_VIOLATION,
+            }
             else self.hints.generate(
                 parsed_failures=parsed,
                 failure_type=failure_type,

@@ -206,6 +206,9 @@ def classify_failure(
         return FailureType.ENVIRONMENT_ERROR
     if command_result.semantic_status == SemanticStatus.SUCCEEDED:
         return None
+    output = _command_output(command_result)
+    if _looks_like_python_runtime_import_failure(output):
+        return FailureType.ENVIRONMENT_ERROR
     if any(_looks_like_syntax(failure.message) for failure in parsed_failures):
         return FailureType.SYNTAX_ERROR
     if check_kind == CheckKind.TYPECHECK:
@@ -240,6 +243,33 @@ def _first_error_after(lines: list[str], index: int) -> str | None:
 def _looks_like_syntax(message: str) -> bool:
     lowered = message.lower()
     return "syntaxerror" in lowered or "parse error" in lowered or "unexpected token" in lowered
+
+
+def _command_output(command_result: CommandResult) -> str:
+    return "\n".join(
+        value
+        for value in (
+            command_result.combined_output_preview,
+            command_result.stderr_preview,
+            command_result.stdout_preview,
+        )
+        if value
+    )
+
+
+def _looks_like_python_runtime_import_failure(output: str) -> bool:
+    lowered = output.lower()
+    return (
+        ("importerror:" in lowered or "dll load failed" in lowered or "dll initialization" in lowered)
+        and (
+            "while importing _ssl" in lowered
+            or "while importing _hashlib" in lowered
+            or "while importing _socket" in lowered
+            or "python runtime" in lowered
+            or "initialization of dll" in lowered
+            or "dll initialization routine failed" in lowered
+        )
+    )
 
 
 def _dedupe_failures(failures: list[ParsedFailure]) -> list[ParsedFailure]:
