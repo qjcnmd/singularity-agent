@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -19,6 +17,23 @@ from ._shared import (
     _text,
 )
 from .request import FailureAnalysisRequest
+
+
+def _json_payload(text: str) -> dict[str, Any]:
+    """Parse a JSON object from model text via ``OutputParser``.
+
+    Legacy wrapper — prefer ``OutputParser().parse()`` directly.
+    Preserves the old return/raise contract. Uses lazy import to
+    avoid circular dependency through model → tools → repair → result.
+    """
+    from singularity.model.output import OutputParser  # lazy — avoid circular import
+
+    result = OutputParser().parse(text)
+    if not result.ok:
+        raise ValueError(
+            result.errors[0].message if result.errors else "parse failed"
+        )
+    return result.parsed  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)

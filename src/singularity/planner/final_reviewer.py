@@ -25,9 +25,10 @@ preserves the fail-closed guarantee.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Any
+
+from singularity.model.output import OutputParser
 from uuid import uuid4
 
 from singularity.model.models import (
@@ -144,17 +145,17 @@ class CompletionAssessment:
 
 
 def _json_payload(text: str) -> dict[str, Any]:
-    """Parse a JSON object from model text, with a regex fallback."""
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            raise ValueError("model response did not contain a JSON object") from None
-        value = json.loads(match.group(0))
-    if not isinstance(value, dict):
-        raise ValueError("model response JSON was not an object")
-    return value
+    """Parse a JSON object from model text via ``OutputParser``.
+
+    Legacy wrapper — prefer ``OutputParser().parse()`` directly.
+    Preserves the old return/raise contract.
+    """
+    result = OutputParser().parse(text)
+    if not result.ok:
+        raise ValueError(
+            result.errors[0].message if result.errors else "parse failed"
+        )
+    return result.parsed  # type: ignore[return-value]
 
 
 def _emit(
