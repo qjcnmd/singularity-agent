@@ -661,7 +661,7 @@ def test_readme_documents_v010_production_architecture() -> None:
     assert "PolicyEngine（策略引擎）" in readme
     assert "ApprovalGate（审批闸门）" in readme
     assert "EvaluationRunner（评估运行器）" in readme
-    assert "singularity-agent eval run docs/evaluation/capability-regression-tasks.json --json" in readme
+    assert "singularity-agent eval run docs/evaluation/public-representative-task.json --json" in readme
     assert "<trace-run-dir>/context.sqlite3" in readme
     assert "<trace-run-dir>/tool_protocol.sqlite3" in readme
     assert "--strict" in readme

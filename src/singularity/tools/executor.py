@@ -808,6 +808,8 @@ class ToolExecutor:
         return None
 
     def _execute_handler(self, spec: ToolSpec, validated_args: Any) -> tuple[ToolResult, str]:
+        if _prefer_thread_handler(spec):
+            return self._execute_handler_in_thread(spec, validated_args)
         if (
             spec.execution_backend == ToolExecutionBackendKind.IN_PROCESS
             and self._handler_can_run_in_process(spec.handler, validated_args)
@@ -1374,6 +1376,15 @@ def _redacted_resource_details(value: Any) -> list[dict[str, Any]]:
             }
         )
     return resources
+
+
+def _prefer_thread_handler(spec: ToolSpec) -> bool:
+    return (
+        spec.name in {"list_files", "read_file", "search_text"}
+        and spec.permission_level == PermissionLevel.READ_ONLY
+        and spec.side_effects == ToolSideEffectKind.READ_WORKSPACE
+        and spec.execution_backend == ToolExecutionBackendKind.IN_PROCESS
+    )
 
 
 def _default_resource(spec: ToolSpec, args: dict[str, Any]) -> ResourceRef:

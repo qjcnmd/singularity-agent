@@ -15,13 +15,18 @@ from singularity.evaluation.runner import (
     EVALUATION_TASK_SET_SCHEMA_VERSION,
     CommandEvalResult,
     EvaluationRunner,
+    EvaluationTask,
     EvaluationTaskResult,
     EvaluationTaskSet,
+    EvaluationWorkspace,
     SingularityPrivateBenchmarkAdapter,
     _apply_benchmark_constraints,
+    _apply_test_patch,
     _build_capability_summary,
     _command_failure_category,
+    _expected_file_changes_satisfied,
     _failure_category,
+    _provider_time_seconds,
     _result_status,
     _task_goal,
     load_evaluation_task_set,
@@ -63,8 +68,8 @@ def test_load_evaluation_task_set_example() -> None:
         assert "security_mode" not in task.strategy
 
 
-def test_load_evaluation_regression_manifest_declares_required_task_classes() -> None:
-    manifest = load_evaluation_task_set(Path("docs/evaluation/capability-regression-tasks.json"))
+def test_load_legacy_internal_smoke_regression_manifest_declares_required_task_classes() -> None:
+    manifest = load_evaluation_task_set(Path("docs/evaluation/legacy/internal-smoke-regression-tasks.json"))
 
     assert len(manifest.tasks) == 4
     by_type = {task.task_type: task for task in manifest.tasks}
@@ -133,32 +138,67 @@ def test_load_public_representative_task_manifest_is_public_swe_bench() -> None:
     assert manifest.schema_version == EVALUATION_TASK_SET_SCHEMA_VERSION
     assert len(manifest.tasks) == 1
     task = manifest.tasks[0]
-    assert task.task_id == "sqlfluff__sqlfluff-1625"
+    assert task.task_id == "sqlfluff__sqlfluff-2419"
     assert task.task_type == "public_representative"
     assert task.workspace.kind == "repo"
     assert task.workspace.path == "https://github.com/sqlfluff/sqlfluff.git"
-    assert task.workspace.start_commit == "14e1a23a3166b9a645a16de96f694c77a5d4abb7"
-    assert task.fixture_metadata["visibility"] == "public"
+    assert task.workspace.start_commit == "f1dba0e1dd764ae72d67c3d5e1471cf14d3db030"
     assert task.fixture_metadata["adapter"] == "swe_bench"
-    assert task.fixture_metadata["instance_id"] == "sqlfluff__sqlfluff-1625"
+    assert task.fixture_metadata["instance_id"] == "sqlfluff__sqlfluff-2419"
     assert task.fixture_metadata["fail_to_pass"] == [
-        "test/cli/commands_test.py::test__cli__command_directed"
+        "test/rules/std_L060_test.py::test__rules__std_L060_raised"
     ]
+    assert task.allowed_paths == ["src/sqlfluff/rules/L060.py"]
+    assert task.expected_file_changes == ["src/sqlfluff/rules/L060.py"]
+    assert "test__rules__std_L060_raised" in task.test_patch
+    assert "gold_patch" not in task.fixture_metadata
     assert task.hidden_test_patch["source"] == "swe_bench_lite.dev"
     assert task.hidden_test_patch["fixture_owner"] == "evaluator"
     assert task.prepare_commands
-    assert task.model_visible_verification_command == (
-        "python -m pytest test/cli/commands_test.py::test__cli__command_directed"
-    )
+    assert "PYTHONPATH" in task.public_verification_command
+    assert "os.path.abspath('.')" in task.public_verification_command
+    assert task.hidden_verification_command == task.public_verification_command
+    assert "src/sqlfluff/rules/L060.py" in task.model_visible_verification_command
+    assert "std_L060_test" not in task.model_visible_verification_command
+    assert "test_patch" not in task.model_visible_verification_command
+    assert "FAIL_TO_PASS" not in task.model_visible_verification_command
+    assert ".eval-venv" not in task.model_visible_verification_command
     goal = _task_goal(task)
-    assert "sqlfluff/sqlfluff" in goal
-    assert "python -m pytest test/cli/commands_test.py::test__cli__command_directed" in goal
+    assert "SQLFluff" in goal
+    assert "src/sqlfluff/rules/L060.py" in goal
+    assert "std_L060_test" not in goal
     assert "FAIL_TO_PASS" not in goal
     assert "hidden_test_patch" not in goal
     assert "test_patch" not in goal
+    assert "Use 'COALESCE' instead of 'IFNULL'." in goal
+    assert "std_L060_test" not in goal
     assert "gold" not in goal.lower()
     assert ".eval-venv" not in goal
     assert "pip install" not in goal
+
+    class FakePlanner:
+        def __init__(self) -> None:
+            self.constraints: dict[str, Any] = {}
+
+        def apply_benchmark_constraints(self, payload: dict[str, Any]) -> None:
+            self.constraints = payload
+
+    class FakeGraph:
+        def __init__(self) -> None:
+            self.planner = FakePlanner()
+
+    class FakeKernel:
+        def __init__(self) -> None:
+            self.graph = FakeGraph()
+
+    kernel = FakeKernel()
+    _apply_benchmark_constraints(kernel, task)
+    constraints_json = json.dumps(kernel.graph.planner.constraints, ensure_ascii=False)
+    assert "src/sqlfluff/rules/L060.py" in constraints_json
+    assert "std_L060_test" not in constraints_json
+    assert "test_patch" not in constraints_json
+    assert "FAIL_TO_PASS" not in constraints_json
+    assert ".eval-venv" not in constraints_json
 
 
 def test_evaluation_hidden_fixture_metadata_never_enters_goal_or_constraints(tmp_path: Path) -> None:
@@ -178,11 +218,14 @@ def test_evaluation_hidden_fixture_metadata_never_enters_goal_or_constraints(tmp
                         "patch": sentinel,
                         "test_patch": sentinel,
                         "gold_patch": sentinel,
+                        "FAIL_TO_PASS": sentinel,
+                        "PASS_TO_PASS": sentinel,
                     },
                     "hidden_test_patch": {
                         "content": sentinel,
                         "sha256": sentinel,
                     },
+                    "test_patch": sentinel,
                 }
             ],
         },
@@ -212,8 +255,225 @@ def test_evaluation_hidden_fixture_metadata_never_enters_goal_or_constraints(tmp
 
     assert sentinel not in goal
     assert sentinel not in json.dumps(constraints, ensure_ascii=False)
+    assert constraints["verification_command"] == ""
     assert "fixture_metadata" not in constraints
     assert "hidden_test_patch" not in constraints
+    assert "test_patch" not in constraints
+
+
+def test_public_task_baseline_already_passing_is_invalid_and_skips_agent(
+    tmp_path: Path,
+) -> None:
+    py = json.dumps(sys.executable)
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.public_already_passing",
+                    "task_type": "public_representative",
+                    "workspace": {"type": "fixture", "files": {"solution.py": "value = 1\n"}},
+                    "user_task": "Change solution.py.",
+                    "allowed_paths": ["solution.py"],
+                    "expected_file_changes": ["solution.py"],
+                    "verification_command": f"{py} -c \"from solution import value; assert value == 1\"",
+                    "test_patch": "",
+                    "fixture_metadata": {"fail_to_pass": ["fake::test"]},
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FailingBootstrap:
+        def __init__(self, **kwargs: Any) -> None:
+            _ = kwargs
+            raise AssertionError("AgentLoop must not start for invalid public baseline")
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="baseline_already_passing",
+        bootstrap_cls=FailingBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["status"] == "invalid_public_task"
+    assert task["failure_category"] == "baseline_already_passing"
+    assert task["baseline_failed"] is False
+    assert task["baseline_checks"]["public"]["passed"] is True
+    assert task["baseline_checks"]["hidden"]["passed"] is True
+    assert task["evaluation_passed"] is False
+    assert task["tests_passed"] is False
+    assert result["summary"]["failure_reasons"] == {"baseline_already_passing": 1}
+
+
+def test_public_task_baseline_verification_misconfiguration_skips_agent(
+    tmp_path: Path,
+) -> None:
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.public_misconfigured",
+                    "task_type": "public_representative",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Change README.md.",
+                    "allowed_paths": ["README.md"],
+                    "expected_file_changes": ["README.md"],
+                    "verification_command": "missing-python -m pytest fake::test",
+                    "fixture_metadata": {"fail_to_pass": ["fake::test"]},
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FailingBootstrap:
+        def __init__(self, **kwargs: Any) -> None:
+            _ = kwargs
+            raise AssertionError("AgentLoop must not start for misconfigured baseline")
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="baseline_misconfigured",
+        bootstrap_cls=FailingBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["status"] == "verification_misconfigured"
+    assert task["failure_category"] == "verification_misconfigured"
+    assert task["baseline_failed"] is False
+    assert task["verification_misconfiguration_reason"]
+    assert task["evaluation_passed"] is False
+
+
+def test_expected_file_changes_accepts_directory_targets() -> None:
+    assert _expected_file_changes_satisfied(
+        ["src/sqlfluff"],
+        files_changed=["src/sqlfluff/rules/L060.py"],
+    )
+    assert not _expected_file_changes_satisfied(
+        ["src/sqlfluff"],
+        files_changed=["test/rules/std_L060_test.py"],
+    )
+
+
+def test_evaluator_test_patch_applies_inside_non_git_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "nested" / "workspace"
+    workspace.mkdir(parents=True)
+    task = EvaluationTask(
+        task_id="fake.patch",
+        workspace=EvaluationWorkspace(kind="fixture", files={}),
+        user_task="Patch workspace.",
+        allowed_paths=["test"],
+        verification_command=f"{json.dumps(sys.executable)} -c \"print('ok')\"",
+        success={"type": "verification_exit_code", "exit_code": 0},
+        test_patch=(
+            "diff --git a/test/generated_test.py b/test/generated_test.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/test/generated_test.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+def test_generated():\n"
+            "+    assert True\n"
+        ),
+    )
+
+    result = _apply_test_patch(task, workspace=workspace, redactor=evaluation_runner.TraceRedactor())
+
+    assert result is not None
+    assert result.passed
+    assert (workspace / "test" / "generated_test.py").exists()
+
+
+def test_public_task_requires_baseline_fail_before_agent_patch_can_pass(
+    tmp_path: Path,
+) -> None:
+    py = json.dumps(sys.executable)
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.public_fail_to_pass",
+                    "task_type": "public_representative",
+                    "workspace": {"type": "fixture", "files": {"solution.py": "value = 0\n"}},
+                    "user_task": "Make value equal 1.",
+                    "allowed_paths": ["solution.py"],
+                    "expected_file_changes": ["solution.py"],
+                    "verification_command": f"{py} -c \"from solution import value; assert value == 1\"",
+                    "fixture_metadata": {"fail_to_pass": ["fake::test"]},
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1, "input_tokens": 10}},
+            planner_summary={"status": "completed"},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "solution.py").write_text("value = 1\n", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs: Any) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="baseline_fail_agent_pass",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["baseline_failed"] is True
+    assert task["baseline_checks"]["public"]["passed"] is False
+    assert task["patch_applied"] is True
+    assert task["patch_applicable"] is True
+    assert task["fail_to_pass_satisfied"] is True
+    assert task["agent_completed"] is True
+    assert task["tests_passed"] is True
+    assert task["evaluation_passed"] is True
 
 
 def test_capability_summary_counts_trace_events_and_explains_skipped_compaction(tmp_path: Path) -> None:
@@ -274,7 +534,35 @@ def test_capability_summary_counts_trace_events_and_explains_skipped_compaction(
     assert summary["timing"]["wall_time_seconds"] == 2.5
     assert summary["timing"]["provider_time_seconds"] == 1.5
     assert summary["timing"]["sandbox_time_seconds"] == 0.25
+    assert summary["timing"]["context_retrieval_compaction_time_seconds"] == 0.0
     assert summary["timing"]["pytest_time_seconds"] == 1.25
+
+
+def test_provider_time_falls_back_to_request_response_monotonic_ms() -> None:
+    events = [
+        {
+            "event_type": "model.request.created",
+            "monotonic_ms": 100,
+            "payload": {"request_id": "req_1"},
+        },
+        {
+            "event_type": "model.response.received",
+            "monotonic_ms": 2600,
+            "payload": {"request_id": "req_1"},
+        },
+        {
+            "event_type": "model.request.created",
+            "monotonic_ms": 3000,
+            "payload": {"request_id": "req_2"},
+        },
+        {
+            "event_type": "model.request.failed",
+            "monotonic_ms": 3500,
+            "payload": {"request_id": "req_2"},
+        },
+    ]
+
+    assert _provider_time_seconds(events, {}) == 3.0
 
 
 def test_evaluation_sanitized_baseline_example_is_safe_and_shape_current() -> None:
@@ -1647,6 +1935,7 @@ def test_evaluation_does_not_treat_plain_agent_block_as_environment_blocker(tmp_
                     "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
                     "user_task": "Stop without changing files.",
                     "allowed_paths": ["README.md"],
+                    "expected_file_changes": ["README.md"],
                     "verification_command": f'{py} -c "print(\'ok\')"',
                     "success": {"type": "verification_exit_code", "exit_code": 0},
                 }
@@ -1715,6 +2004,40 @@ def test_evaluation_does_not_treat_plain_agent_block_as_environment_blocker(tmp_
     assert task["failure_category"] == "blocked"
     assert task["infrastructure_blocked"] is False
     assert task["verification"]["passed"] is True
+    assert task["tests_passed"] is True
+    assert task["evaluation_passed"] is False
+    assert task["files_changed"] == []
+    assert task["patch_applicable"] is False
+    assert result["summary"]["tests_passed_count"] == 1
+    assert result["summary"]["evaluation_passed_count"] == 0
+    assert result["summary"]["failure_reasons"] == {"blocked": 1}
+
+
+def test_result_status_preserves_agent_blocked_when_verification_fails() -> None:
+    verification = CommandEvalResult(command="pytest", exit_code=1, duration_seconds=0.1)
+
+    status = _result_status(
+        success=False,
+        tests_passed=False,
+        infrastructure_blocked=False,
+        agent_status="blocked",
+        verification=verification,
+        policy_blocks=0,
+        errors=["agent status: blocked", "verification failed"],
+    )
+
+    assert status == "blocked"
+    assert (
+        _failure_category(
+            {},
+            status=status,
+            verification=verification,
+            infrastructure_blocked=False,
+            policy_blocks=0,
+            errors=["agent status: blocked", "verification failed"],
+        )
+        == "blocked"
+    )
 
 
 def test_evaluation_reduces_python_ssl_environment_error_to_environment_blocker() -> None:

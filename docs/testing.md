@@ -118,7 +118,7 @@ python -m pytest tests/test_verification_runner.py tests/test_repair_contract_ve
 python scripts/verify_fast.py --git
 ```
 
-Fast gate 只跑 ruff、当前 mypy、changed-scope compileall，以及 `scripts/test_impact.py` 推荐的受影响 pytest。它不跑全量 pytest，不跑真实 provider eval。若 test impact 为 `low` 或没有明确测试，脚本输出 `fallback_required=stage` 与 `skipped_reason` 并返回非零码，要求升级 stage gate，不能把空推荐当作通过。
+Fast gate 只跑 ruff、当前 mypy、changed-scope compileall，以及 `scripts/test_impact.py` 推荐的受影响 pytest。它不跑全量 pytest，不跑真实 provider eval。若 test impact 为 `low` 或没有明确测试，脚本输出 `fallback_required=stage`、`fallback_reason`、`stage_gate_recommended=true`、selected/skipped test 计数并返回非零码，要求升级 stage gate，不能把空推荐当作通过。
 
 ### Stage Gate（阶段收口）
 
@@ -128,7 +128,7 @@ Fast gate 只跑 ruff、当前 mypy、changed-scope compileall，以及 `scripts
 python scripts/verify_stage.py
 ```
 
-Stage gate 执行 deterministic 检查：mypy、ruff、`compileall src scripts`、`scripts/verify_runtime_docs.py`、过滤后的 pytest，以及 evaluation runner / test impact / quality gate 专项测试。它不默认跑多个真实 provider eval。
+Stage gate 执行 deterministic 检查：mypy、ruff、`compileall src scripts`、`scripts/verify_runtime_docs.py`、过滤后的 pytest，以及 evaluation runner / test impact / quality gate 专项测试。它输出 ruff/mypy/compileall/pytest/runtime docs 分项耗时，但不默认跑多个真实 provider eval。
 
 ### Capability Gate（核心链路变更）
 
@@ -138,7 +138,7 @@ Stage gate 执行 deterministic 检查：mypy、ruff、`compileall src scripts`�
 python scripts/verify_capability.py --force --run-id phase8-public-long-task-gate
 ```
 
-该 gate 只运行 `docs/evaluation/public-representative-task.json` 这一项公共 SWE-bench Lite dev 任务，并要求 result 中有 `capability_summary`，包含 model/tool/retrieval/context/compaction/sandbox/verification/finalization 对象流和耗时摘要。没有触发 compaction 时必须写明 skipped reason，例如 context usage 未到阈值、retrieval 内容不足或任务过早完成。
+该 gate 只运行 `docs/evaluation/public-representative-task.json` 这一项公共 SWE-bench Lite dev 任务，并要求 result 中有 `capability_summary`，包含 model/tool/retrieval/context/compaction/sandbox/verification/finalization 对象流和耗时摘要。公共任务必须先证明 base commit + evaluator test patch 失败，agent patch 后同一验证通过，才允许 `evaluation_passed=true`。没有触发 compaction 时必须写明 skipped reason，例如 context usage 未到阈值、retrieval 内容不足或任务过早完成。
 
 仍可按需运行以下传统 pytest 命令，但它们不再是 Codex 小改默认 fast gate：
 
@@ -171,8 +171,11 @@ python -m pytest -m evaluation -v
 # 5. 真实 provider 测试（需要配置 .env）
 SINGULARITY_RUN_PROVIDER_EVAL=1 python -m pytest -m provider_eval -v
 
-# 6. 真实 evaluation benchmark
-python -m singularity.cli eval run docs/evaluation/capability-regression-tasks.json --run-id release-smoke --json
+# 6. 真实 public capability benchmark
+python scripts/verify_capability.py --force --run-id release-smoke
+
+# legacy/manual/debug internal smoke（不作为默认真实 provider gate）
+python -m singularity.cli eval run docs/evaluation/legacy/internal-smoke-regression-tasks.json --run-id internal-smoke-debug --json
 ```
 
 ## 5. 本地 provider_eval

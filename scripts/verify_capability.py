@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from verify_gate_common import (
+    capability_timing_from_result,
     print_json_summary,
     python,
     repo_root_from_script,
     run_command,
+    timing_summary,
 )
 
 DEFAULT_MANIFEST = "docs/evaluation/public-representative-task.json"
@@ -51,6 +53,7 @@ def main() -> int:
     impact = _impact(args.files, cwd=cwd)
     capability_gate = impact.get("capability_gate") or {}
     if not args.force and not capability_gate.get("required"):
+        duration = round(time.perf_counter() - started, 3)
         print_json_summary(
             {
                 "gate": "capability",
@@ -59,7 +62,16 @@ def main() -> int:
                 "skipped_reason": "no AgentLoop/ToolProtocol/sandbox/context/compaction/verification/CompletionGate/FinalReport/evaluation runner changes detected",
                 "impact": impact,
                 "commands": [],
-                "duration_seconds": round(time.perf_counter() - started, 3),
+                "duration_seconds": duration,
+                "timing": timing_summary(
+                    [],
+                    total_wall_time=duration,
+                    extra={
+                        "selected_tests_count": 0,
+                        "skipped_tests_count": 1,
+                        "fallback_reason": "capability gate not triggered",
+                    },
+                ),
             }
         )
         return 0
@@ -76,6 +88,9 @@ def main() -> int:
         "--json",
     ]
     result = run_command("public_representative_eval", command, cwd=cwd)
+    duration = round(time.perf_counter() - started, 3)
+    result_path = cwd / "work" / "evaluations" / args.run_id / "result.json"
+    capability_timing = capability_timing_from_result(result_path)
     print_json_summary(
         {
             "gate": "capability",
@@ -85,7 +100,18 @@ def main() -> int:
             "run_id": args.run_id,
             "impact": impact,
             "commands": [result.to_dict()],
-            "duration_seconds": round(time.perf_counter() - started, 3),
+            "duration_seconds": duration,
+            "result_path": str(result_path),
+            "timing": timing_summary(
+                [result],
+                total_wall_time=duration,
+                extra={
+                    **capability_timing,
+                    "selected_tests_count": 1,
+                    "skipped_tests_count": 0,
+                    "fallback_reason": "",
+                },
+            ),
         }
     )
     return 0 if result.passed else 1

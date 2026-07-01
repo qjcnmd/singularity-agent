@@ -2,22 +2,22 @@
   "schema_version": "evaluation.task_set/v1",
   "tasks": [
     {
-      "task_id": "sqlfluff__sqlfluff-1625",
+      "task_id": "sqlfluff__sqlfluff-2419",
       "task_type": "public_representative",
-      "description": "Public SWE-bench Lite dev representative task: TSQL L031 alias rule fires when no join is present.",
+      "description": "Public SWE-bench Lite dev representative task: SQLFluff L060 should report the specific IFNULL/NVL replacement target.",
       "workspace": {
         "type": "repo",
         "path": "https://github.com/sqlfluff/sqlfluff.git",
-        "start_commit": "14e1a23a3166b9a645a16de96f694c77a5d4abb7"
+        "start_commit": "f1dba0e1dd764ae72d67c3d5e1471cf14d3db030"
       },
-      "user_task": "Fix sqlfluff/sqlfluff issue sqlfluff__sqlfluff-1625. In the TSQL dialect, rule L031 incorrectly triggers the alias rule when a query has no join. Make the smallest focused change needed so the directed CLI behavior is correct.",
+      "user_task": "Fix SQLFluff issue sqlfluff__sqlfluff-2419. Rule L060 currently emits the generic message Use 'COALESCE' instead of 'IFNULL' or 'NVL'. It should emit the specific message Use 'COALESCE' instead of 'IFNULL'. for IFNULL and Use 'COALESCE' instead of 'NVL'. for NVL. Use local search and targeted reads to locate the L060 rule implementation, then apply the smallest focused patch in src/sqlfluff/rules/L060.py so the lint description names the original function with this exact single-quoted wording. Do not rewrite the whole file. After the patch is in place, run the local smoke command once and finish with a final answer.",
       "allowed_paths": [
-        "src/sqlfluff",
-        "test"
+        "src/sqlfluff/rules/L060.py"
       ],
       "allowed_tools": [
         "read_file",
-        "write_file",
+        "search_text",
+        "apply_patch",
         "run_verification",
         "inspect_diff"
       ],
@@ -28,20 +28,21 @@
       ],
       "tool_policy": "read_write",
       "strategy": {
+        "max_turns": 24,
         "permission_profile": "workspace-write",
         "approval_policy": "never",
         "network_access": "denied",
         "context_budget_tokens": 6000
       },
       "expected_file_changes": [
-        "src/sqlfluff"
+        "src/sqlfluff/rules/L060.py"
       ],
-      "verification_command": "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); raise SystemExit(subprocess.call([py, '-m', 'pytest', 'test/cli/commands_test.py::test__cli__command_directed']))\"",
-      "public_verification_command": "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); raise SystemExit(subprocess.call([py, '-m', 'pytest', 'test/cli/commands_test.py::test__cli__command_directed']))\"",
-      "hidden_verification_command": "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); raise SystemExit(subprocess.call([py, '-m', 'pytest', 'test/cli/commands_test.py::test__cli__command_directed']))\"",
-      "model_visible_verification_command": "python -m pytest test/cli/commands_test.py::test__cli__command_directed",
+      "verification_command": "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); env=os.environ.copy(); env['PYTHONPATH']=os.path.abspath('.')+(os.pathsep+env['PYTHONPATH'] if env.get('PYTHONPATH') else ''); raise SystemExit(subprocess.call([py, '-m', 'pytest', 'test/rules/std_L060_test.py::test__rules__std_L060_raised'], env=env))\"",
+      "public_verification_command": "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); env=os.environ.copy(); env['PYTHONPATH']=os.path.abspath('.')+(os.pathsep+env['PYTHONPATH'] if env.get('PYTHONPATH') else ''); raise SystemExit(subprocess.call([py, '-m', 'pytest', 'test/rules/std_L060_test.py::test__rules__std_L060_raised'], env=env))\"",
+      "hidden_verification_command": "python -c \"import os, subprocess, sys; py=os.path.join('..', '.eval-venv', 'Scripts' if os.name == 'nt' else 'bin', 'python'); env=os.environ.copy(); env['PYTHONPATH']=os.path.abspath('.')+(os.pathsep+env['PYTHONPATH'] if env.get('PYTHONPATH') else ''); raise SystemExit(subprocess.call([py, '-m', 'pytest', 'test/rules/std_L060_test.py::test__rules__std_L060_raised'], env=env))\"",
+      "model_visible_verification_command": "python -m py_compile src/sqlfluff/rules/L060.py",
       "verification_timeout_seconds": 300,
-      "completion_standard": "The directed CLI pytest target passes, the fix is scoped to the SQLFluff alias-rule behavior, and the final report records verification evidence.",
+      "completion_standard": "The local L060 source smoke passes, the evaluator-only directed L060 pytest target passes, the fix is scoped to SQLFluff rule L060 behavior, and the final report records verification evidence.",
       "risk_tags": [
         "public-swe-bench-lite",
         "representative-long-chain",
@@ -50,34 +51,35 @@
         "context-compaction",
         "final-report"
       ],
+      "success": {
+        "type": "verification_exit_code",
+        "exit_code": 0,
+        "require_final_report": true,
+        "require_agent_completed": true,
+        "require_files_changed": true,
+        "require_expected_file_change": true,
+        "require_no_policy_blocks": true,
+        "summary_contains": "verification"
+      },
       "fixture_metadata": {
-        "visibility": "public",
         "adapter": "swe_bench",
         "dataset": "princeton-nlp/SWE-bench_Lite",
         "split": "dev",
-        "instance_id": "sqlfluff__sqlfluff-1625",
+        "instance_id": "sqlfluff__sqlfluff-2419",
         "repo": "sqlfluff/sqlfluff",
-        "base_commit": "14e1a23a3166b9a645a16de96f694c77a5d4abb7",
+        "base_commit": "f1dba0e1dd764ae72d67c3d5e1471cf14d3db030",
         "fail_to_pass": [
-          "test/cli/commands_test.py::test__cli__command_directed"
+          "test/rules/std_L060_test.py::test__rules__std_L060_raised"
         ],
-        "issue_summary": "TSQL L031 incorrectly triggers alias rule when no join is present.",
-        "gold_patch": {
-          "stored": false,
-          "model_visible": false,
-          "reason": "gold patch is never included in ModelTurnRequest or prompt"
-        }
+        "issue_summary": "Rule L060 should include the original IFNULL/NVL function name in its COALESCE recommendation."
       },
+      "test_patch": "diff --git a/test/rules/std_L060_test.py b/test/rules/std_L060_test.py\nnew file mode 100644\n--- /dev/null\n+++ b/test/rules/std_L060_test.py\n@@ -0,0 +1,12 @@\n+\"\"\"Tests the python routines within L060.\"\"\"\n+import sqlfluff\n+\n+\n+def test__rules__std_L060_raised() -> None:\n+    \"\"\"L060 is raised for use of ``IFNULL`` or ``NVL``.\"\"\"\n+    sql = \"SELECT\\n\\tIFNULL(NULL, 100),\\n\\tNVL(NULL,100);\"\n+    result = sqlfluff.lint(sql, rules=[\"L060\"])\n+\n+    assert len(result) == 2\n+    assert result[0][\"description\"] == \"Use 'COALESCE' instead of 'IFNULL'.\"\n+    assert result[1][\"description\"] == \"Use 'COALESCE' instead of 'NVL'.\"\n",
       "hidden_test_patch": {
         "source": "swe_bench_lite.dev",
         "fixture_owner": "evaluator",
         "model_visible": false,
-        "content_stored": false,
-        "metadata_only": true
-      },
-      "success": {
-        "type": "verification_exit_code",
-        "exit_code": 0
+        "applied_by": "EvaluationRunner verification workspace only",
+        "contains": "FAIL_TO_PASS tests only"
       }
     }
   ]

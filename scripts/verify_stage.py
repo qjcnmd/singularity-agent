@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 
-from verify_gate_common import print_json_summary, python, repo_root_from_script, run_command
+from verify_gate_common import print_json_summary, python, repo_root_from_script, run_command, timing_summary
 
 
 def main() -> int:
@@ -45,12 +45,22 @@ def main() -> int:
         run_command("quality_gate_tests", [python(), "-m", "pytest", "tests/test_quality_gates.py"], cwd=cwd),
     ]
     passed = all(command.passed for command in commands)
+    duration = round(time.perf_counter() - started, 3)
     print_json_summary(
         {
             "gate": "stage",
             "passed": passed,
             "commands": [command.to_dict() for command in commands],
-            "duration_seconds": round(time.perf_counter() - started, 3),
+            "duration_seconds": duration,
+            "timing": timing_summary(
+                commands,
+                total_wall_time=duration,
+                extra={
+                    "selected_tests_count": 4,
+                    "skipped_tests_count": 0,
+                    "fallback_reason": "",
+                },
+            ),
             "real_provider_eval": {
                 "run": False,
                 "skipped_reason": "stage gate is deterministic and does not run real provider evaluation by default",

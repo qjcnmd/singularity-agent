@@ -1734,7 +1734,7 @@
       不进入普通业务代码 repair。
 
   E4. capability regression evaluation 归约（真实 provider + AgentLoop 外层）
-    python -m singularity.cli eval run docs/evaluation/capability-regression-tasks.json
+    python -m singularity.cli eval run docs/evaluation/public-representative-task.json
     → EvaluationRunner.run()
     → 每个 task 启动真实 KernelBootstrap → AgentGraphBuilder
       → AgentKernel → AgentLoop.run

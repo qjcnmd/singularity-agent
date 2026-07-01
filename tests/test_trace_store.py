@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -120,6 +122,27 @@ def test_trace_store_append_query_timeline_summary_and_recovery(tmp_path: Path) 
     recovered = store.recover_incomplete_spans()
     assert recovered == ["span_1"]
     assert store.latest_spans()["span_1"].status == TraceStatus.FAILED
+
+
+def test_trace_store_concurrent_appends_keep_jsonl_lines_valid(tmp_path: Path) -> None:
+    store = TraceStore(tmp_path, run_id="run_1")
+
+    def append(index: int) -> None:
+        store.append_event(
+            _event(
+                f"event_{index}",
+                TraceEventType.ACTION_PROPOSED,
+                seconds=index,
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(append, range(200)))
+
+    lines = store.events_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 200
+    for line in lines:
+        assert json.loads(line)["event_type"] == TraceEventType.ACTION_PROPOSED.value
 
 
 def test_trace_store_rejects_path_traversal_run_id(tmp_path: Path) -> None:

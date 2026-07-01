@@ -17,6 +17,7 @@ from verify_gate_common import (
     repo_root_from_script,
     run_command,
     skipped_command,
+    timing_summary,
 )
 
 
@@ -100,15 +101,33 @@ def main() -> int:
 
     commands = [item.to_dict() for item in summaries]
     passed = all(item.passed for item in summaries) and not fallback_gate and impact_exit == 0
+    selected_tests_count = len(recommended_tests) if not fallback_gate else 0
+    skipped_tests_count = 0 if selected_tests_count else 1
+    fallback_reason = skipped_reason if fallback_gate else ""
+    total_duration = round(time.perf_counter() - gate_started, 3)
     summary = {
         "gate": "fast",
         "passed": passed,
         "fallback_required": fallback_gate,
+        "fallback_reason": fallback_reason,
+        "stage_gate_recommended": bool(fallback_gate),
         "skipped_reason": skipped_reason,
+        "selected_tests": recommended_tests if not fallback_gate else [],
+        "selected_tests_count": selected_tests_count,
+        "skipped_tests_count": skipped_tests_count,
         "impact": impact,
         "impact_duration_seconds": impact_duration,
         "commands": commands,
-        "duration_seconds": round(time.perf_counter() - gate_started, 3),
+        "duration_seconds": total_duration,
+        "timing": timing_summary(
+            summaries,
+            total_wall_time=total_duration,
+            extra={
+                "selected_tests_count": selected_tests_count,
+                "skipped_tests_count": skipped_tests_count,
+                "fallback_reason": fallback_reason,
+            },
+        ),
     }
     print_json_summary(summary)
     if any(not item.passed for item in summaries) or impact_exit != 0:

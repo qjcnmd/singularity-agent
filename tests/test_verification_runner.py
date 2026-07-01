@@ -354,6 +354,42 @@ def test_explicit_smoke_command_records_exit_stdout_and_stderr(tmp_path: Path) -
     assert observation["verification"]["completion_assessment"]["status"] == CompletionStatus.READY.value
 
 
+def test_explicit_smoke_command_suppresses_broad_project_checks(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (tmp_path / "mypy.ini").write_text("[mypy]\n", encoding="utf-8")
+    request = CommandRequest(argv=["python", "-c", "print('ok')"])
+    fake = FakeCommandExecutor(
+        [
+            command_result(
+                request,
+                command_id="cmd_targeted_smoke",
+                exit_code=0,
+                semantic_status=SemanticStatus.SUCCEEDED,
+                output="ok",
+            )
+        ]
+    )
+    component = VerificationRunner(tmp_path, command_executor=fake)
+
+    plan = component.plan_verification(
+        changed_files=["src/app.py"],
+        task_intent="verify a targeted benchmark change",
+        smoke_commands=[["python", "-c", "print('ok')"]],
+    )
+
+    assert [check.kind for check in plan.required_checks] == [
+        CheckKind.VERIFICATION_SMOKE,
+        CheckKind.SYNTAX,
+    ]
+    assert not plan.blocked_checks
+    assert all(
+        check.scope != "project" or not check.required
+        for check in [*plan.required_checks, *plan.blocked_checks]
+    )
+
+
 def test_plan_verification_uses_contract_smoke_commands_when_missing(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Create quicksort.py and run smoke verification")

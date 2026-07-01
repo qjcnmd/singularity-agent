@@ -32,6 +32,7 @@ SKIP_DIRS = {
 # Default per-file size limit for search_text scans. Files larger than this
 # are skipped (with a warning entry in the result) to bound scan cost.
 DEFAULT_SEARCH_MAX_FILE_BYTES = 10 * 1024 * 1024
+READ_ONLY_TOOL_TIMEOUT_SECONDS = 10.0
 
 
 class ListFilesInput(BaseModel):
@@ -47,6 +48,17 @@ class ReadFileInput(BaseModel):
     path: str = Field(..., description="File path, relative to project root.")
     max_bytes: int = Field(
         20000, ge=1, le=200000, description="Maximum bytes to read."
+    )
+    line_start: int | None = Field(
+        None,
+        ge=1,
+        description="Optional 1-based first line to read.",
+    )
+    line_count: int | None = Field(
+        None,
+        ge=1,
+        le=1000,
+        description="Optional number of lines to read from line_start.",
     )
 
 
@@ -123,6 +135,16 @@ class ReadOnlyToolHandlers:
             size = None
 
         max_bytes = args.max_bytes
+        if args.line_start is not None or args.line_count is not None:
+            return self._read_file_line_window(
+                path,
+                user_path=args.path,
+                max_bytes=max_bytes,
+                line_start=args.line_start or 1,
+                line_count=args.line_count or 200,
+                size=size,
+            )
+
         if size is not None and size > max_bytes:
             # Read only the prefix we need; mark the result as truncated.
             with path.open("rb") as handle:
@@ -160,6 +182,52 @@ class ReadOnlyToolHandlers:
             "truncated": truncated,
             "bytes_read": len(chunk),
             "bytes_total": size if size is not None else len(raw),
+        }
+
+    def _read_file_line_window(
+        self,
+        path: Path,
+        *,
+        user_path: str,
+        max_bytes: int,
+        line_start: int,
+        line_count: int,
+        size: int | None,
+    ) -> dict[str, Any]:
+        with path.open("rb") as handle:
+            sample = handle.read(4096)
+        if self._looks_binary(sample):
+            raise ToolExecutionFailure(f"File appears to be binary: {user_path}")
+
+        selected: list[str] = []
+        total_lines = 0
+        window_end = line_start + line_count - 1
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for current_line, line in enumerate(handle, start=1):
+                total_lines = current_line
+                if line_start <= current_line <= window_end:
+                    selected.append(line.rstrip("\r\n"))
+
+        content = "\n".join(selected)
+        encoded = content.encode("utf-8", errors="replace")
+        truncated_by_bytes = len(encoded) > max_bytes
+        if truncated_by_bytes:
+            content = encoded[:max_bytes].decode("utf-8", errors="replace")
+            encoded = content.encode("utf-8", errors="replace")
+        line_end = line_start + len(selected) - 1 if selected else line_start - 1
+        has_more_lines = window_end < total_lines
+
+        return {
+            "path": self._relative(path),
+            "content": content,
+            "truncated": truncated_by_bytes,
+            "bytes_read": len(encoded),
+            "bytes_total": size if size is not None else len(encoded),
+            "line_start": line_start,
+            "line_end": line_end,
+            "line_count": len(selected),
+            "total_lines": total_lines,
+            "has_more_lines": has_more_lines,
         }
 
     def search_text(self, args: SearchTextInput) -> dict[str, Any]:
@@ -323,7 +391,7 @@ def register_read_only_tools(registry: Any) -> None:
             side_effects=ToolSideEffectKind.READ_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
             risk_tags=("read", "filesystem"),
-            timeout_seconds=5.0,
+            timeout_seconds=READ_ONLY_TOOL_TIMEOUT_SECONDS,
             max_output_chars=20000,
             cache_policy=ToolCachePolicy(cacheable=True, max_entries=128),
             idempotency_policy=ToolIdempotencyPolicy(idempotent=True),
@@ -334,8 +402,8 @@ def register_read_only_tools(registry: Any) -> None:
     registry.register(
         ToolSpec(
             name="read_file",
-            version="0.0.4",
-            description="Read a UTF-8 text file inside the current project root.",
+            version="0.0.5",
+            description="Read a UTF-8 text file inside the current project root, optionally by line window.",
             input_model=ReadFileInput,
             handler=handlers.read_file,
             permission_level=PermissionLevel.READ_ONLY,
@@ -347,7 +415,7 @@ def register_read_only_tools(registry: Any) -> None:
             side_effects=ToolSideEffectKind.READ_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
             risk_tags=("read", "filesystem"),
-            timeout_seconds=5.0,
+            timeout_seconds=READ_ONLY_TOOL_TIMEOUT_SECONDS,
             max_output_chars=20000,
             cache_policy=ToolCachePolicy(cacheable=True, max_entries=128),
             idempotency_policy=ToolIdempotencyPolicy(idempotent=True),
@@ -371,7 +439,7 @@ def register_read_only_tools(registry: Any) -> None:
             side_effects=ToolSideEffectKind.READ_WORKSPACE,
             sensitivity=ToolSensitivityLevel.WORKSPACE,
             risk_tags=("read", "filesystem"),
-            timeout_seconds=5.0,
+            timeout_seconds=READ_ONLY_TOOL_TIMEOUT_SECONDS,
             max_output_chars=20000,
             cache_policy=ToolCachePolicy(cacheable=True, max_entries=128),
             idempotency_policy=ToolIdempotencyPolicy(idempotent=True),

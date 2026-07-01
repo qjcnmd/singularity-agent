@@ -368,7 +368,7 @@ class VerificationRunner:
                 if str(path).endswith(".py") and (self.workspace_root / str(path)).exists()
             }
         )
-        if targeted_pytests:
+        if targeted_pytests and not explicit_smoke:
             required.append(
                 self._check(
                     kind=CheckKind.UNIT_TEST,
@@ -406,7 +406,18 @@ class VerificationRunner:
                     skip_reason="Documentation correctness requires human review.",
                 )
             )
-        if not targeted_pytests or impact.requires_full_test:
+        if explicit_smoke:
+            skipped.append(
+                self._check(
+                    kind=CheckKind.UNIT_TEST,
+                    command=None,
+                    scope="project",
+                    required=False,
+                    source="input:smoke_commands",
+                    skip_reason="Explicit smoke command provided; broad project tests are not required.",
+                )
+            )
+        elif not targeted_pytests or impact.requires_full_test:
             unit_command = self._command_for(profile, CheckKind.UNIT_TEST)
             if unit_command is not None:
                 required.append(self._check_from_command(unit_command, required=True, scope="project"))
@@ -434,7 +445,18 @@ class VerificationRunner:
                 )
 
         lint_command = self._command_for(profile, CheckKind.LINT)
-        if lint_command is not None and not docs_only:
+        if explicit_smoke and not docs_only:
+            skipped.append(
+                self._check(
+                    kind=CheckKind.LINT,
+                    command=None,
+                    scope="project",
+                    required=False,
+                    source="input:smoke_commands",
+                    skip_reason="Explicit smoke command provided; broad lint is not required.",
+                )
+            )
+        elif lint_command is not None and not docs_only:
             required.append(self._check_from_command(lint_command, required=True, scope="project"))
         elif not docs_only:
             skipped.append(
@@ -449,7 +471,18 @@ class VerificationRunner:
             )
 
         typecheck_command = self._command_for(profile, CheckKind.TYPECHECK)
-        if impact.requires_typecheck:
+        if explicit_smoke and impact.requires_typecheck:
+            skipped.append(
+                self._check(
+                    kind=CheckKind.TYPECHECK,
+                    command=None,
+                    scope="project",
+                    required=False,
+                    source="input:smoke_commands",
+                    skip_reason="Explicit smoke command provided; broad typecheck is not required.",
+                )
+            )
+        elif impact.requires_typecheck:
             if typecheck_command is not None:
                 required.append(self._check_from_command(typecheck_command, required=True, scope="project"))
             elif not explicit_smoke:
@@ -478,7 +511,18 @@ class VerificationRunner:
             optional.append(self._check_from_command(typecheck_command, required=False, scope="project"))
 
         build_command = self._command_for(profile, CheckKind.BUILD)
-        if impact.requires_build:
+        if explicit_smoke and impact.requires_build:
+            skipped.append(
+                self._check(
+                    kind=CheckKind.BUILD,
+                    command=None,
+                    scope="project",
+                    required=False,
+                    source="input:smoke_commands",
+                    skip_reason="Explicit smoke command provided; broad build is not required.",
+                )
+            )
+        elif impact.requires_build:
             if build_command is not None:
                 required.append(self._check_from_command(build_command, required=True, scope="project"))
             else:

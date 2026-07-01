@@ -119,7 +119,7 @@ singularity-agent git status --json
 singularity-agent memory list
 singularity-agent approval remote export-request request.json decision.json --output approval-request.json --json
 singularity-agent plugin list --json
-singularity-agent eval run docs/evaluation/capability-regression-tasks.json --json
+singularity-agent eval run docs/evaluation/public-representative-task.json --json
 singularity-agent eval provider-smoke --json
 ```
 
@@ -153,15 +153,16 @@ CLI
 
 当前公开 manifest 位于 `docs/evaluation/`：
 
-- `capability-regression-tasks.json`
+- `public-representative-task.json`
 - `capability-minimal-tasks.json`
 - `capability-fix-math-test-only.json`
 - `evaluation-baseline-example.json`
+- `legacy/internal-smoke-regression-tasks.json`（仅 legacy/manual/debug）
 
 真实模型评估命令：
 
 ```bash
-python -m singularity.cli eval run docs/evaluation/capability-regression-tasks.json --run-id <run-id> --json
+python -m singularity.cli eval run docs/evaluation/public-representative-task.json --run-id <run-id> --json
 ```
 
 评估结果使用当前字段：
@@ -178,7 +179,7 @@ Phase 8 后本地验证分为三层，CI Quality matrix 不降级，既有全量
 - `stage` gate：阶段收口运行 `python scripts/verify_stage.py`。它执行 deterministic mypy/ruff/compileall/runtime docs、过滤后的 pytest 和关键模块专项测试，不默认跑真实 provider eval。
 - `capability` gate：只有 AgentLoop、ToolProtocol、sandbox、context、compaction、verification、CompletionGate、FinalReport 或 evaluation runner 变更时运行 `python scripts/verify_capability.py --force --run-id <run-id>`，默认使用单个公共任务 `docs/evaluation/public-representative-task.json`。
 
-公共代表性任务来自 SWE-bench Lite dev split：`sqlfluff__sqlfluff-1625`，repo 为 `sqlfluff/sqlfluff`，base commit 为 `14e1a23a3166b9a645a16de96f694c77a5d4abb7`，验证目标为 `test/cli/commands_test.py::test__cli__command_directed`。manifest 只把 issue 摘要、允许范围、可见 verification 和完成标准交给模型；gold patch / test patch 只允许作为 evaluator-owned metadata 或离线验证资料，不进入 `ModelTurnRequest`。
+公共代表性任务来自 SWE-bench Lite dev split：`sqlfluff__sqlfluff-2419`，repo 为 `sqlfluff/sqlfluff`，base commit 为 `f1dba0e1dd764ae72d67c3d5e1471cf14d3db030`，FAIL_TO_PASS 目标为 `test/rules/std_L060_test.py::test__rules__std_L060_raised`。manifest 只把 issue 摘要、允许范围、模型可见 local smoke 和完成标准交给模型；evaluator `test_patch` 只在 baseline/verification workspace 中应用，gold patch 不存储也不进入 `ModelTurnRequest`。
 
 ## 运行时状态
 

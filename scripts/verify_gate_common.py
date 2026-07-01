@@ -84,3 +84,57 @@ def repo_root_from_script(script_file: str) -> Path:
 
 def python() -> str:
     return sys.executable
+
+
+def timing_summary(commands: list[CommandSummary], *, total_wall_time: float, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    by_name = {command.name: command.duration_seconds for command in commands}
+    summary: dict[str, Any] = {
+        "total_wall_time_seconds": round(total_wall_time, 3),
+        "ruff_time_seconds": by_name.get("ruff", 0.0),
+        "mypy_time_seconds": by_name.get("mypy", 0.0),
+        "compileall_time_seconds": by_name.get("compileall", by_name.get("compileall_changed_scope", 0.0)),
+        "pytest_time_seconds": round(
+            sum(command.duration_seconds for command in commands if "pytest" in command.name or command.name.endswith("_tests")),
+            3,
+        ),
+        "runtime_docs_time_seconds": by_name.get("runtime_docs", 0.0),
+        "capability_eval_time_seconds": by_name.get("public_representative_eval", 0.0),
+        "provider_time_seconds": 0.0,
+        "sandbox_time_seconds": 0.0,
+        "verification_time_seconds": 0.0,
+        "context_retrieval_compaction_time_seconds": 0.0,
+        "selected_tests_count": 0,
+        "skipped_tests_count": 0,
+        "fallback_reason": "",
+    }
+    if extra:
+        summary.update(extra)
+    return summary
+
+
+def capability_timing_from_result(result_path: Path) -> dict[str, Any]:
+    if not result_path.exists():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    provider = sandbox = verification = context = 0.0
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        capability = task.get("capability_summary") or {}
+        if not isinstance(capability, dict):
+            continue
+        timing = task.get("timing") or capability.get("timing") or {}
+        if isinstance(timing, dict):
+            provider += float(timing.get("provider_time_seconds") or 0.0)
+            sandbox += float(timing.get("sandbox_time_seconds") or 0.0)
+            verification += float(timing.get("verification_time_seconds") or 0.0)
+            context += float(timing.get("context_retrieval_compaction_time_seconds") or 0.0)
+    return {
+        "provider_time_seconds": round(provider, 3),
+        "sandbox_time_seconds": round(sandbox, 3),
+        "verification_time_seconds": round(verification, 3),
+        "context_retrieval_compaction_time_seconds": round(context, 3),
+    }

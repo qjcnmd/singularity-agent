@@ -117,4 +117,4 @@ jobs:
           SINGULARITY_API_KEY: ${{ secrets.SINGULARITY_API_KEY }}
           SINGULARITY_MODEL: ${{ secrets.SINGULARITY_MODEL }}
           SINGULARITY_BASE_URL: ${{ secrets.SINGULARITY_BASE_URL }}
-        run: uv run --no-sync python -m singularity.cli eval run docs/evaluation/capability-regression-tasks.json --run-id nightly-${{ github.run_id }} --json
+        run: uv run --no-sync python scripts/verify_capability.py --force --run-id nightly-${{ github.run_id }}

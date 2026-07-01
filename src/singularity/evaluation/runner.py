@@ -99,6 +99,7 @@ class EvaluationTask:
     model_visible_verification_command: str = ""
     fixture_metadata: dict[str, Any] = field(default_factory=dict)
     hidden_test_patch: dict[str, Any] = field(default_factory=dict)
+    test_patch: str = ""
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> EvaluationTask:
@@ -137,6 +138,7 @@ class EvaluationTask:
             model_visible_verification_command=str(payload.get("model_visible_verification_command") or "").strip(),
             fixture_metadata=_dict(payload.get("fixture_metadata") or {}, "fixture_metadata"),
             hidden_test_patch=_dict(payload.get("hidden_test_patch") or {}, "hidden_test_patch"),
+            test_patch=str(payload.get("test_patch") or ""),
         )
         task._validate()
         return task
@@ -196,6 +198,8 @@ class EvaluationTask:
             payload["fixture_metadata"] = dict(self.fixture_metadata)
         if self.hidden_test_patch:
             payload["hidden_test_patch"] = dict(self.hidden_test_patch)
+        if self.test_patch:
+            payload["test_patch"] = self.test_patch
         return payload
 
 
@@ -295,6 +299,12 @@ class EvaluationTaskResult:
     trace_artifact_refs: list[str] = field(default_factory=list)
     reproducible_environment: dict[str, Any] = field(default_factory=dict)
     capability_summary: dict[str, Any] = field(default_factory=dict)
+    timing: dict[str, Any] = field(default_factory=dict)
+    baseline_failed: bool = False
+    baseline_checks: dict[str, Any] = field(default_factory=dict)
+    patch_applied: bool = False
+    fail_to_pass_satisfied: bool = False
+    verification_misconfiguration_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -338,6 +348,12 @@ class EvaluationTaskResult:
             "trace_artifact_refs": list(self.trace_artifact_refs),
             "reproducible_environment": self.reproducible_environment,
             "capability_summary": self.capability_summary,
+            "timing": self.timing,
+            "baseline_failed": self.baseline_failed,
+            "baseline_checks": self.baseline_checks,
+            "patch_applied": self.patch_applied,
+            "fail_to_pass_satisfied": self.fail_to_pass_satisfied,
+            "verification_misconfiguration_reason": self.verification_misconfiguration_reason,
         }
 
 
@@ -528,6 +544,12 @@ class EvaluationRunner:
         trace_artifact_refs: list[str] = []
         contract_satisfaction: dict[str, Any] = {}
         reproducible_environment: dict[str, Any] = {}
+        baseline_checks: dict[str, Any] = {}
+        baseline_failed = False
+        baseline_verification_workspace = task_dir / "baseline-verification-workspace"
+        patch_applied = False
+        fail_to_pass_satisfied = False
+        verification_misconfiguration_reason = ""
         try:
             _reset_dir(task_dir, root=self.run_dir)
             try:
@@ -558,6 +580,7 @@ class EvaluationRunner:
                     trace_artifact_refs=[],
                     contract_satisfaction={},
                     reproducible_environment=_setup_environment(task, manifest_base=manifest_base),
+                    baseline_checks={},
                 )
             config = ProductionConfig.from_cli(
                 project_root=workspace,
@@ -617,6 +640,80 @@ class EvaluationRunner:
             before_snapshot = _snapshot_files(workspace)
             before_text_snapshot = _read_text_files(workspace)
             shutil.copytree(workspace, baseline_workspace, ignore=_copy_ignore)
+            if _requires_baseline_verification(task):
+                baseline_verification = _run_baseline_verification(
+                    task,
+                    baseline_workspace=baseline_workspace,
+                    baseline_verification_workspace=baseline_verification_workspace,
+                    root=task_dir,
+                    redactor=self.redactor,
+                )
+                baseline_checks = baseline_verification["checks"]
+                baseline_failed = bool(baseline_verification["baseline_failed"])
+                verification_misconfiguration_reason = str(
+                    baseline_verification.get("verification_misconfiguration_reason") or ""
+                )
+                if baseline_verification["status"] == "baseline_already_passing":
+                    errors.append("baseline already passing before agent changes")
+                    return self._task_result(
+                        task=task,
+                        workspace=workspace,
+                        trace=trace_path,
+                        started=started,
+                        verification=None,
+                        verification_workspace=verification_workspace,
+                        files_changed=[],
+                        usage={},
+                        tool_calls=0,
+                        errors=errors,
+                        patch={},
+                        checks=_checks_payload(None, None),
+                        success=False,
+                        tests_passed=False,
+                        infrastructure_blocked=False,
+                        final_report_payload={},
+                        trace_summary={},
+                        turn_count=0,
+                        policy_blocks=0,
+                        trace_artifact_refs=[],
+                        contract_satisfaction={},
+                        reproducible_environment=reproducible_environment,
+                        baseline_failed=False,
+                        baseline_checks=baseline_checks,
+                        status_override="invalid_public_task",
+                        failure_category_override="baseline_already_passing",
+                    )
+                if baseline_verification["status"] == "verification_misconfigured":
+                    errors.append(f"verification misconfigured: {verification_misconfiguration_reason}")
+                    return self._task_result(
+                        task=task,
+                        workspace=workspace,
+                        trace=trace_path,
+                        started=started,
+                        verification=None,
+                        verification_workspace=verification_workspace,
+                        files_changed=[],
+                        usage={},
+                        tool_calls=0,
+                        errors=errors,
+                        patch={},
+                        checks=_checks_payload(None, None),
+                        success=False,
+                        tests_passed=False,
+                        infrastructure_blocked=False,
+                        final_report_payload={},
+                        trace_summary={},
+                        turn_count=0,
+                        policy_blocks=0,
+                        trace_artifact_refs=[],
+                        contract_satisfaction={},
+                        reproducible_environment=reproducible_environment,
+                        baseline_failed=False,
+                        baseline_checks=baseline_checks,
+                        verification_misconfiguration_reason=verification_misconfiguration_reason,
+                        status_override="verification_misconfigured",
+                        failure_category_override="verification_misconfigured",
+                    )
             goal = _task_goal(task)
             kernel = self.bootstrap_cls(project_root=workspace, config=config, console=self.console).boot(goal)
             _apply_benchmark_constraints(kernel, task)
@@ -677,6 +774,8 @@ class EvaluationRunner:
                     trace_artifact_refs=trace_artifact_refs,
                     contract_satisfaction=contract_satisfaction,
                     reproducible_environment=reproducible_environment,
+                    baseline_failed=baseline_failed,
+                    baseline_checks=baseline_checks,
                 )
             files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
             patch_payload = _patch_payload(before_text_snapshot, workspace)
@@ -686,8 +785,10 @@ class EvaluationRunner:
                 baseline_workspace=baseline_workspace,
                 before_snapshot=before_text_snapshot,
                 root=task_dir,
+                test_patch=task.test_patch,
             )
             patch_payload["applicable"] = applicable
+            patch_applied = applicable
             public_command = _public_verification_command(task)
             hidden_command = _hidden_verification_command(task)
             if task.verification_prepare_commands:
@@ -790,11 +891,15 @@ class EvaluationRunner:
                 errors.append(f"public verification failed: {public_verification.error_summary or public_verification.command}")
             patch_ok = _patch_applicable_for_task(task, patch=patch_payload, files_changed=files_changed)
             if not patch_ok:
-                errors.append("patch could not be applied to clean verification workspace")
+                if not files_changed and not agent_completed:
+                    errors.append("agent blocked before target file changes")
+                else:
+                    errors.append("patch could not be applied to clean verification workspace")
             if not allowed_ok:
                 errors.append("changed files outside allowed_paths")
             if not criterion_ok:
                 errors.append("success criterion failed")
+            fail_to_pass_satisfied = bool(baseline_failed and tests_passed and public_verification.passed)
             contract_satisfaction = _contract_satisfaction(
                 task,
                 files_changed=files_changed,
@@ -809,6 +914,7 @@ class EvaluationRunner:
             )
             success_ok = bool(
                 agent_completed
+                and (not _requires_baseline_verification(task) or baseline_failed)
                 and tests_passed
                 and public_verification.passed
                 and patch_ok
@@ -826,6 +932,16 @@ class EvaluationRunner:
                 )
         except Exception as exc:
             errors.append(self.redactor.redact_text(str(exc)) or type(exc).__name__)
+            if kernel is not None:
+                trace_path = trace_path or _trace_path(kernel)
+                trace_summary = trace_summary or _trace_summary_from_kernel(kernel)
+                if not agent_status:
+                    agent_status = _agent_status_from_trace(Path(trace_path) if trace_path else None)
+                usage = usage or dict(trace_summary.get("model_usage_summary") or {})
+                if not tool_calls:
+                    tool_calls = _tool_calls_from_trace(Path(trace_path) if trace_path else None, trace_summary)
+                if not turn_count:
+                    turn_count = _turn_count_from_trace(Path(trace_path) if trace_path else None, usage)
         finally:
             close_resources = getattr(kernel, "close_resources", None) if kernel is not None else None
             if callable(close_resources):
@@ -856,6 +972,11 @@ class EvaluationRunner:
             reproducible_environment=reproducible_environment,
             public_verification=public_verification,
             hidden_verification=hidden_verification,
+            baseline_failed=baseline_failed,
+            baseline_checks=baseline_checks,
+            patch_applied=patch_applied,
+            fail_to_pass_satisfied=fail_to_pass_satisfied,
+            verification_misconfiguration_reason=verification_misconfiguration_reason,
         )
 
     def _materialize_workspace(self, task: EvaluationTask, *, workspace: Path, manifest_base: Path) -> None:
@@ -928,11 +1049,18 @@ class EvaluationRunner:
         reproducible_environment: dict[str, Any] | None = None,
         public_verification: CommandEvalResult | None = None,
         hidden_verification: CommandEvalResult | None = None,
+        baseline_failed: bool = False,
+        baseline_checks: dict[str, Any] | None = None,
+        patch_applied: bool = False,
+        fail_to_pass_satisfied: bool = False,
+        verification_misconfiguration_reason: str = "",
+        status_override: str = "",
+        failure_category_override: str = "",
     ) -> EvaluationTaskResult:
         request_rates = _float_map(usage.get("request_cache_hit_rates") or {})
         final_report_payload = final_report_payload or {}
         trace_summary = trace_summary or {}
-        status = _result_status(
+        status = status_override or _result_status(
             success=success,
             tests_passed=tests_passed,
             infrastructure_blocked=infrastructure_blocked,
@@ -980,13 +1108,24 @@ class EvaluationRunner:
             errors=errors,
             verification=verification,
         )
-        failure_category = _failure_category(
+        failure_category = failure_category_override or _failure_category(
             final_report_payload,
             status=status,
             verification=verification,
             infrastructure_blocked=infrastructure_blocked,
             policy_blocks=policy_blocks,
             errors=errors,
+        )
+        capability_summary = _build_capability_summary(
+            trace=Path(trace) if trace else None,
+            trace_summary=trace_summary,
+            checks=checks or _checks_payload(None, verification),
+            verification=verification,
+            public_verification=public_verification or verification,
+            hidden_verification=hidden_verification or verification,
+            final_report_status=final_report_status,
+            agent_status=agent_status,
+            wall_time_seconds=round(time.perf_counter() - started, 3),
         )
         return EvaluationTaskResult(
             task_id=task.task_id,
@@ -1039,17 +1178,13 @@ class EvaluationRunner:
             cache_usage=cache_usage,
             trace_artifact_refs=list(trace_artifact_refs or _trace_artifact_refs(final_report_payload, trace_summary)),
             reproducible_environment=reproducible_environment or {},
-            capability_summary=_build_capability_summary(
-                trace=Path(trace) if trace else None,
-                trace_summary=trace_summary,
-                checks=checks or _checks_payload(None, verification),
-                verification=verification,
-                public_verification=public_verification or verification,
-                hidden_verification=hidden_verification or verification,
-                final_report_status=final_report_status,
-                agent_status=agent_status,
-                wall_time_seconds=round(time.perf_counter() - started, 3),
-            ),
+            capability_summary=capability_summary,
+            timing=dict(capability_summary.get("timing") or {}),
+            baseline_failed=baseline_failed,
+            baseline_checks=baseline_checks or {},
+            patch_applied=patch_applied,
+            fail_to_pass_satisfied=fail_to_pass_satisfied,
+            verification_misconfiguration_reason=verification_misconfiguration_reason,
         )
 
 
@@ -1337,7 +1472,17 @@ def _task_goal(task: EvaluationTask) -> str:
     risks = ", ".join(task.risk_tags) if task.risk_tags else "none declared"
     expected_changes = ", ".join(task.expected_file_changes) if task.expected_file_changes else "no required file changes declared"
     visible_command = _model_visible_verification_command(task)
-    if visible_command:
+    if _requires_baseline_verification(task) and not visible_command:
+        verification_instruction = (
+            "Before finishing, run the relevant local checks you can infer from the changed code. "
+            "Independent evaluator-only public and hidden verification will run after you finish."
+        )
+    elif _requires_baseline_verification(task):
+        verification_instruction = (
+            f"Before finishing, run this local smoke verification command: {visible_command}. "
+            "Independent evaluator-only public and hidden verification will run after you finish."
+        )
+    elif visible_command:
         verification_instruction = f"Before finishing, run this verification command: {visible_command}"
     elif task.verification_prepare_commands:
         verification_instruction = (
@@ -1510,6 +1655,50 @@ def _trace_summary(kernel: Any, agent_result: Any) -> dict[str, Any]:
     return {}
 
 
+def _trace_summary_from_kernel(kernel: Any) -> dict[str, Any]:
+    trace = getattr(getattr(kernel, "graph", None), "trace", None)
+    context = getattr(kernel, "context", None)
+    task_id = getattr(getattr(context, "identity", None), "task_id", None)
+    if trace is not None and hasattr(trace, "final_report_summary"):
+        try:
+            return trace.final_report_summary(task_id=task_id)
+        except Exception:
+            return {}
+    return {}
+
+
+def _agent_status_from_trace(trace: Path | None) -> str:
+    events = _read_trace_events(trace)
+    for event in reversed(events):
+        payload = _event_payload(event)
+        outcome = payload.get("execution_outcome")
+        if isinstance(outcome, dict):
+            status = str(outcome.get("status") or "")
+            error_code = str(outcome.get("error_code") or "")
+            if error_code == "max_turns_exceeded":
+                return "blocked"
+            if status:
+                return status
+        if _event_type(event) == "task.failed":
+            return "failed"
+    return ""
+
+
+def _tool_calls_from_trace(trace: Path | None, trace_summary: dict[str, Any]) -> int:
+    value = _safe_int(trace_summary.get("tool_calls")) if isinstance(trace_summary, dict) else 0
+    if value:
+        return value
+    return _count_events(_read_trace_events(trace), "tool_protocol.call_started")
+
+
+def _turn_count_from_trace(trace: Path | None, usage: dict[str, Any]) -> int:
+    value = _safe_int(usage.get("requests")) or _safe_int(usage.get("responses"))
+    if value:
+        return value
+    events = _read_trace_events(trace)
+    return _count_events(events, "model.request.created")
+
+
 def _infrastructure_blocked(agent_result: Any, *, usage: dict[str, Any], tool_calls: int) -> bool:
     status = _agent_status(agent_result)
     if status != "failed" or _safe_int(usage.get("input_tokens")) or tool_calls:
@@ -1576,6 +1765,8 @@ def _apply_benchmark_constraints(kernel: Any, task: EvaluationTask) -> None:
     if not callable(apply_constraints):
         return
     verification_command = _model_visible_verification_command(task)
+    if _requires_baseline_verification(task) and not task.model_visible_verification_command:
+        verification_command = ""
     apply_constraints(
         {
             "task_id": task.task_id,
@@ -1705,6 +1896,8 @@ def _failure_category(
         return category
     if policy_blocks:
         return "policy_blocked"
+    if status in {"blocked", "failed", "max_turns_exceeded"}:
+        return status
     if verification is not None and verification.failure_category and verification.failure_category != "none":
         return verification.failure_category
     if status in {"success", "unknown"} and not errors:
@@ -1783,6 +1976,7 @@ def _build_capability_summary(
     local_fallback_count = _local_process_fallback_count(events, trace_summary)
     sandbox_seconds = _sandbox_time_seconds(events)
     provider_seconds = _provider_time_seconds(events, trace_summary)
+    context_seconds = _context_retrieval_compaction_time_seconds(events)
     pytest_seconds = _pytest_time_seconds(public_verification, hidden_verification, verification)
     verification_seconds = _verification_time_seconds(public_verification, hidden_verification, verification)
     verification_checks = _ordered_verification_checks(checks)
@@ -1815,6 +2009,7 @@ def _build_capability_summary(
             "wall_time_seconds": wall_time_seconds,
             "provider_time_seconds": provider_seconds,
             "sandbox_time_seconds": sandbox_seconds,
+            "context_retrieval_compaction_time_seconds": context_seconds,
             "pytest_time_seconds": pytest_seconds,
             "verification_time_seconds": verification_seconds,
         },
@@ -1920,10 +2115,41 @@ def _provider_time_seconds(events: list[dict[str, Any]], trace_summary: dict[str
         total += _duration_seconds_from_payload(_event_payload(event))
     if total:
         return round(total, 3)
+    starts: dict[str, int] = {}
+    for event in events:
+        event_type = _event_type(event)
+        payload = _event_payload(event)
+        request_id = str(payload.get("request_id") or "")
+        monotonic_ms = _safe_int(event.get("monotonic_ms"))
+        if not request_id or not monotonic_ms:
+            continue
+        if event_type == "model.request.created":
+            starts[request_id] = monotonic_ms
+        elif event_type in {"model.response.received", "model.request.failed"}:
+            started = starts.get(request_id)
+            if started is not None and monotonic_ms >= started:
+                total += (monotonic_ms - started) / 1000.0
+    if total:
+        return round(total, 3)
     usage = trace_summary.get("model_usage_summary") if isinstance(trace_summary, dict) else {}
     if isinstance(usage, dict):
         return round(_safe_float(usage.get("latency_ms")) / 1000.0, 3)
     return 0.0
+
+
+def _context_retrieval_compaction_time_seconds(events: list[dict[str, Any]]) -> float:
+    total = 0.0
+    for event in events:
+        event_type = _event_type(event)
+        if not (
+            event_type.startswith("context.")
+            or event_type.startswith("retrieval.")
+            or event_type.startswith("prompt.")
+            or "compaction" in event_type
+        ):
+            continue
+        total += _duration_seconds_from_payload(_event_payload(event))
+    return round(total, 3)
 
 
 def _duration_seconds_from_payload(payload: dict[str, Any]) -> float:
@@ -2012,10 +2238,10 @@ def _result_status(
         return "success"
     if policy_blocks and agent_status in {"blocked", "failed"}:
         return "policy_blocked"
-    if verification is not None and not tests_passed:
-        return "verification_failed"
     if agent_status in {"blocked", "failed", "max_turns_exceeded"}:
         return agent_status
+    if verification is not None and not tests_passed:
+        return "verification_failed"
     if errors:
         return "failure"
     return "unknown"
@@ -2035,7 +2261,6 @@ def _contract_satisfaction(
     final_report_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     expected_changes = list(task.expected_file_changes or [])
-    changed = set(files_changed)
     patch_required = _patch_required(task, files_changed=files_changed)
     checks = [
         {"name": "allowed_scope", "passed": allowed_scope, "required": True},
@@ -2066,7 +2291,10 @@ def _contract_satisfaction(
         checks.append(
             {
                 "name": "expected_file_changes",
-                "passed": all(path in changed for path in expected_changes),
+                "passed": _expected_file_changes_satisfied(
+                    expected_changes,
+                    files_changed=files_changed,
+                ),
                 "required": True,
                 "expected": expected_changes,
                 "actual": files_changed,
@@ -2148,8 +2376,19 @@ def _patch_applicable_for_task(
     if not patch.get("applicable"):
         return False
     if task.expected_file_changes:
-        changed = set(files_changed)
-        return all(path in changed for path in task.expected_file_changes)
+        return _expected_file_changes_satisfied(
+            task.expected_file_changes,
+            files_changed=files_changed,
+        )
+    return True
+
+
+def _expected_file_changes_satisfied(expected_changes: list[str], *, files_changed: list[str]) -> bool:
+    changed = [_normalize_allowed(path) for path in files_changed]
+    for expected in expected_changes:
+        normalized = _normalize_allowed(expected)
+        if not any(path == normalized or path.startswith(normalized.rstrip("/") + "/") for path in changed):
+            return False
     return True
 
 
@@ -2420,6 +2659,175 @@ def _patch_payload(before_snapshot: dict[str, str], workspace: Path) -> dict[str
     }
 
 
+def _requires_baseline_verification(task: EvaluationTask) -> bool:
+    if task.task_type == "public_representative":
+        return True
+    metadata = task.fixture_metadata
+    return bool(metadata.get("fail_to_pass") or metadata.get("FAIL_TO_PASS") or task.test_patch)
+
+
+def _run_baseline_verification(
+    task: EvaluationTask,
+    *,
+    baseline_workspace: Path,
+    baseline_verification_workspace: Path,
+    root: Path,
+    redactor: TraceRedactor,
+) -> dict[str, Any]:
+    _reset_dir(baseline_verification_workspace, root=root)
+    if baseline_workspace.exists():
+        shutil.copytree(baseline_workspace, baseline_verification_workspace, dirs_exist_ok=True, ignore=_copy_ignore)
+    patch_result = _apply_test_patch(
+        task,
+        workspace=baseline_verification_workspace,
+        redactor=redactor,
+    )
+    public_command = _public_verification_command(task)
+    hidden_command = _hidden_verification_command(task)
+    public = _run_shell(
+        public_command,
+        cwd=baseline_verification_workspace,
+        timeout_seconds=task.verification_timeout_seconds,
+        redactor=redactor,
+    )
+    hidden = _run_shell(
+        hidden_command,
+        cwd=baseline_verification_workspace,
+        timeout_seconds=task.verification_timeout_seconds,
+        redactor=redactor,
+    )
+    checks = _checks_payload(public, hidden)
+    if patch_result is not None:
+        checks["test_patch"] = patch_result.to_dict()
+        if not patch_result.passed:
+            return {
+                "status": "verification_misconfigured",
+                "baseline_failed": False,
+                "checks": checks,
+                "verification_misconfiguration_reason": patch_result.error_summary
+                or patch_result.failure_category
+                or "test patch failed to apply",
+            }
+    if public.passed and hidden.passed:
+        return {
+            "status": "baseline_already_passing",
+            "baseline_failed": False,
+            "checks": checks,
+            "verification_misconfiguration_reason": "",
+        }
+    misconfigured = _baseline_misconfiguration_reason(public, hidden)
+    if misconfigured:
+        return {
+            "status": "verification_misconfigured",
+            "baseline_failed": False,
+            "checks": checks,
+            "verification_misconfiguration_reason": misconfigured,
+        }
+    return {
+        "status": "baseline_failed",
+        "baseline_failed": True,
+        "checks": checks,
+        "verification_misconfiguration_reason": "",
+    }
+
+
+def _apply_test_patch(
+    task: EvaluationTask,
+    *,
+    workspace: Path,
+    redactor: TraceRedactor,
+) -> CommandEvalResult | None:
+    patch = task.test_patch
+    if not patch.strip():
+        return None
+    started = time.perf_counter()
+    try:
+        env = os.environ.copy()
+        env["GIT_CEILING_DIRECTORIES"] = str(workspace.parent.resolve(strict=False))
+        completed = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn"],
+            cwd=workspace,
+            input=patch,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            env=env,
+            check=False,
+        )
+        output = (completed.stderr or completed.stdout or "").strip().splitlines()
+        error_summary = redactor.redact_text(output[0] if output else "")
+        return CommandEvalResult(
+            command="git apply <evaluator test_patch>",
+            raw_command="git apply <evaluator test_patch>",
+            resolved_argv=["git", "apply", "--whitespace=nowarn"],
+            exit_code=completed.returncode,
+            duration_seconds=round(time.perf_counter() - started, 3),
+            error_summary=error_summary[:500],
+            interpreter_strategy={
+                "schema_version": "evaluation.command_interpreter/v1",
+                "mode": "argv",
+                "shell": False,
+                "harness_executable": sys.executable,
+            },
+            failure_category="none" if completed.returncode == 0 else "test_patch_apply_failed",
+        )
+    except subprocess.TimeoutExpired:
+        return CommandEvalResult(
+            command="git apply <evaluator test_patch>",
+            raw_command="git apply <evaluator test_patch>",
+            resolved_argv=["git", "apply", "--whitespace=nowarn"],
+            exit_code=None,
+            duration_seconds=round(time.perf_counter() - started, 3),
+            timed_out=True,
+            error_summary="timed out after 60s",
+            interpreter_strategy={
+                "schema_version": "evaluation.command_interpreter/v1",
+                "mode": "argv",
+                "shell": False,
+                "harness_executable": sys.executable,
+            },
+            failure_category="command_timeout",
+        )
+    except OSError as exc:
+        return CommandEvalResult(
+            command="git apply <evaluator test_patch>",
+            raw_command="git apply <evaluator test_patch>",
+            resolved_argv=["git", "apply", "--whitespace=nowarn"],
+            exit_code=None,
+            duration_seconds=round(time.perf_counter() - started, 3),
+            error_summary=redactor.redact_text(str(exc))[:500],
+            interpreter_strategy={
+                "schema_version": "evaluation.command_interpreter/v1",
+                "mode": "argv",
+                "shell": False,
+                "harness_executable": sys.executable,
+            },
+            failure_category="command_execution_error",
+        )
+
+
+def _baseline_misconfiguration_reason(*results: CommandEvalResult) -> str:
+    for result in results:
+        if result.passed:
+            continue
+        if result.timed_out:
+            return result.error_summary or "baseline verification timed out"
+        if result.failure_category in {
+            "command_parse_error",
+            "command_timeout",
+            "command_not_found",
+            "command_execution_error",
+            "environment_dependency_missing",
+            "environment_error",
+        }:
+            return result.error_summary or result.failure_category
+        if result.exit_code is None:
+            return result.error_summary or "baseline verification did not run"
+        if result.exit_code not in {1} and result.failure_category != "verification_failed":
+            return result.error_summary or result.failure_category or "baseline verification failed unexpectedly"
+    return ""
+
+
 def _prepare_verification_workspace(
     *,
     source_workspace: Path,
@@ -2427,6 +2835,7 @@ def _prepare_verification_workspace(
     baseline_workspace: Path,
     before_snapshot: dict[str, str],
     root: Path,
+    test_patch: str = "",
 ) -> bool:
     _reset_dir(verification_workspace, root=root)
     if baseline_workspace.exists():
@@ -2439,10 +2848,24 @@ def _prepare_verification_workspace(
             target = _workspace_path(verification_workspace, relative)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_file, target)
-    if _read_text_files(verification_workspace) != before_snapshot:
+    if test_patch.strip():
+        patch_task = EvaluationTask(
+            task_id="patch",
+            workspace=EvaluationWorkspace(kind="fixture", files={"placeholder": ""}),
+            user_task="patch",
+            allowed_paths=["."],
+            verification_command="python -c pass",
+            success={"type": "verification_exit_code", "exit_code": 0},
+            test_patch=test_patch,
+        )
+        applied = _apply_test_patch(patch_task, workspace=verification_workspace, redactor=TraceRedactor())
+        if applied is not None and not applied.passed:
+            return False
+    elif _read_text_files(verification_workspace) != before_snapshot:
         return False
     after = _read_text_files(source_workspace)
-    for path in sorted(set(before_snapshot) | set(after)):
+    changed_paths = sorted(path for path in set(before_snapshot) | set(after) if before_snapshot.get(path) != after.get(path))
+    for path in changed_paths:
         target = _workspace_path(verification_workspace, path)
         if path not in after:
             if target.exists():
@@ -2450,7 +2873,9 @@ def _prepare_verification_workspace(
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(after[path], encoding="utf-8")
-    return _read_text_files(verification_workspace) == after
+    if not test_patch.strip():
+        return _read_text_files(verification_workspace) == after
+    return True
 
 
 def _checks_payload(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,7 @@ class TraceStore:
         self.spans_path = self.run_dir / "spans.jsonl"
         self.artifacts_path = self.run_dir / "artifacts.jsonl"
         self.index_path = self.run_dir / "index.json"
+        self._append_lock = threading.Lock()
         self._write_index()
 
     def append_event(self, event: TraceEvent) -> None:
@@ -191,8 +193,9 @@ class TraceStore:
     def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as file:
-                file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+            line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+            with self._append_lock, path.open("a", encoding="utf-8") as file:
+                file.write(line)
                 file.flush()
                 os.fsync(file.fileno())
         except OSError as exc:
