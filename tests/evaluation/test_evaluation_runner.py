@@ -29,6 +29,7 @@ from singularity.evaluation.runner import (
     _provider_time_seconds,
     _result_status,
     _task_goal,
+    evaluation_report_markdown,
     load_evaluation_task_set,
     summarize_evaluation_results,
 )
@@ -476,6 +477,174 @@ def test_public_task_requires_baseline_fail_before_agent_patch_can_pass(
     assert task["agent_completed"] is True
     assert task["tests_passed"] is True
     assert task["evaluation_passed"] is True
+    metrics = task["evaluation_metrics"]
+    assert metrics["schema_version"] == "evaluation.metrics/v1"
+    assert metrics["resolved"] == {
+        "value": True,
+        "resolved_rate_contribution": 1.0,
+        "reason": "",
+    }
+    assert metrics["swe_bench"]["fail_to_pass"]["satisfied"] is True
+    assert metrics["swe_bench"]["fail_to_pass"]["baseline_failed"] is True
+    baseline_metrics = metrics["swe_bench"]["fail_to_pass"]["baseline_checks"]
+    assert baseline_metrics["public"]["passed"] is False
+    assert "test_patch" not in json.dumps(metrics["swe_bench"], sort_keys=True)
+    assert metrics["swe_bench"]["pass_to_pass"]["status"] == "not_configured"
+    assert metrics["swe_bench"]["pass_to_pass"]["reason"] == "manifest has no PASS_TO_PASS checks"
+    manifest.tasks[0].fixture_metadata["PASS_TO_PASS"] = ["tests/test_existing.py::test_keeps_passing"]
+    pass_to_pass = evaluation_runner._swe_bench_metrics(
+        task=manifest.tasks[0],
+        baseline_failed=True,
+        baseline_checks={},
+        fail_to_pass_satisfied=True,
+    )["pass_to_pass"]
+    assert pass_to_pass["status"] == "not_implemented"
+    assert pass_to_pass["satisfied"] is None
+    assert pass_to_pass["checks"] == ["tests/test_existing.py::test_keeps_passing"]
+
+
+def test_evaluation_metrics_patch_tool_context_and_cost_helpers(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    events = [
+        {"event_type": "tool_protocol.call_started", "payload": {"tool_name": "read_file"}},
+        {"event_type": "tool_protocol.call_completed", "payload": {"tool_name": "read_file", "ok": True}},
+        {"event_type": "tool_protocol.call_started", "payload": {"tool_name": "edit_apply"}},
+        {"event_type": "tool_protocol.call_completed", "payload": {"tool_name": "edit_apply", "ok": False}},
+        {"event_type": "tool_protocol.call_started", "payload": {"tool_name": "search_text"}},
+        {"event_type": "model.response.received", "payload": {"usage": {"cost_estimate": 0.1234}}},
+    ]
+    (trace_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    patch = {
+        "diff": (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1,2 @@\n"
+            "-old\n"
+            "+new\n"
+            "+extra\n"
+            "diff --git a/tests/test_app.py b/tests/test_app.py\n"
+            "--- a/tests/test_app.py\n"
+            "+++ b/tests/test_app.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+def test_app(): pass\n"
+        ),
+        "applicable": True,
+    }
+
+    assert evaluation_runner._tool_metrics_from_trace_events(events) == {
+        "tool_call_count": 3,
+        "tool_result_count": 2,
+        "tool_success_count": 1,
+        "tool_failure_count": 1,
+        "tool_unknown_count": 1,
+        "tool_success_rate": None,
+        "distinct_tool_names": ["edit_apply", "read_file", "search_text"],
+    }
+    assert evaluation_runner._tool_metrics_from_trace_events(
+        [
+            {
+                "event_type": "model.tool_call.proposed",
+                "payload": {"tool_call_id": "call_1", "function": "read_file"},
+            },
+            {
+                "event_type": "tool_protocol.call_started",
+                "payload": {"tool_call_id": "call_1", "tool_name": "read_file"},
+            },
+            {
+                "event_type": "tool_protocol.call_completed",
+                "payload": {"tool_call_id": "call_1", "tool_name": "read_file", "ok": True},
+            },
+        ]
+    ) == {
+        "tool_call_count": 1,
+        "tool_result_count": 1,
+        "tool_success_count": 1,
+        "tool_failure_count": 0,
+        "tool_unknown_count": 0,
+        "tool_success_rate": 1.0,
+        "distinct_tool_names": ["read_file"],
+    }
+    assert evaluation_runner._patch_metrics(
+        patch=patch,
+        files_changed=["app.py", "tests/test_app.py"],
+        expected_file_changes=["app.py"],
+        allowed_paths=["app.py"],
+        patch_applicable=True,
+        allowed_scope_passed=False,
+        patch_applied=True,
+    ) == {
+        "patch_applied": True,
+        "patch_applicable": True,
+        "allowed_scope_passed": False,
+        "files_changed_count": 2,
+        "expected_files_changed": True,
+        "test_files_modified": True,
+        "out_of_scope_files": ["tests/test_app.py"],
+        "diff_added_lines": 3,
+        "diff_deleted_lines": 1,
+        "reason": "",
+    }
+    context = evaluation_runner._context_metrics(
+        trace_events=events,
+        capability_summary={
+            "retrieval_calls": 0,
+            "context_package_rebuild_count": 0,
+            "context_compaction": {
+                "requested": 0,
+                "completed": 0,
+                "failed": 0,
+                "skipped": True,
+                "reason": "context usage below compaction threshold",
+            },
+        },
+        expected_file_changes=["app.py"],
+        allowed_paths=["app.py"],
+        cache_usage={"request_cache_hit_rate": 0.25, "run_cache_hit_rate": 0.5},
+    )
+    assert context["target_file_retrieval_hit"] is None
+    assert context["target_file_retrieval_reason"] == "no retrieval evidence recorded"
+    assert context["request_cache_hit_rate"] == 0.25
+    assert context["run_cache_hit_rate"] == 0.5
+
+    assert evaluation_runner._cost_metrics(
+        trace_events=events,
+        token_usage={
+            "input_tokens": 1_000_000,
+            "cached_input_tokens": 100_000,
+            "output_tokens": 500_000,
+        },
+        model_profile={"model": "mimo-v2.5", "base_url": "https://token-plan-cn.xiaomimimo.com/v1"},
+    )["cost_source"] == "provider_usage"
+
+    priced = evaluation_runner._cost_metrics(
+        trace_events=[],
+        token_usage={
+            "input_tokens": 1_000_000,
+            "cached_input_tokens": 100_000,
+            "output_tokens": 500_000,
+        },
+        model_profile={"model": "mimo-v2.5", "base_url": "https://token-plan-cn.xiaomimimo.com/v1"},
+    )
+    assert priced == {
+        "cost_estimate": 0.26628,
+        "currency": "USD",
+        "cost_source": "pricing_table",
+        "pricing_status": "priced",
+        "pricing_source_url": "https://platform.xiaomimimo.com/docs/pricing",
+        "retrieved_at": "2026-07-01",
+        "pricing_unit": "1M tokens",
+        "matched_model": "mimo-v2.5",
+    }
+    assert evaluation_runner._cost_metrics(
+        trace_events=[],
+        token_usage={"input_tokens": 10, "output_tokens": 5},
+        model_profile={"model": "unknown-model", "base_url": "https://token-plan-cn.xiaomimimo.com/v1"},
+    )["pricing_status"] == "unknown_model_or_unpriced"
 
 
 def test_capability_summary_counts_trace_events_and_explains_skipped_compaction(tmp_path: Path) -> None:
@@ -721,6 +890,15 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         agent_completed=True,
         evaluation_passed=True,
         final_report_status="completed",
+        evaluation_metrics={
+            "resolved": {"value": True, "resolved_rate_contribution": 1.0, "reason": ""},
+            "swe_bench": {
+                "fail_to_pass": {"satisfied": True},
+                "pass_to_pass": {"satisfied": None, "status": "not_configured"},
+            },
+            "tools": {"tool_success_rate": 1.0},
+            "cost": {"cost_estimate": 0.4, "cost_source": "pricing_table"},
+        },
     )
     second = EvaluationTaskResult(
         task_id="two",
@@ -741,12 +919,21 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         agent_completed=True,
         evaluation_passed=False,
         final_report_status="completed",
+        evaluation_metrics={
+            "resolved": {"value": False, "resolved_rate_contribution": 0.0, "reason": "verification_failed"},
+            "swe_bench": {
+                "fail_to_pass": {"satisfied": False},
+                "pass_to_pass": {"satisfied": True, "status": "satisfied"},
+            },
+            "tools": {"tool_success_rate": 0.5},
+            "cost": {"cost_estimate": 0.6, "cost_source": "provider_usage"},
+        },
     )
     blocked = EvaluationTaskResult(
         task_id="blocked",
         tests_passed=False,
         infrastructure_blocked=True,
-        prompt_tokens=0,
+        prompt_tokens=10,
         cached_tokens=0,
         request_cache_hit_rate=0.0,
         run_cache_hit_rate=0.0,
@@ -759,6 +946,15 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         status="environment_blocker",
         turn_count=0,
         failure_category="environment_blocker",
+        evaluation_metrics={
+            "resolved": {"value": False, "resolved_rate_contribution": 0.0, "reason": "environment_blocker"},
+            "swe_bench": {
+                "fail_to_pass": {"satisfied": False},
+                "pass_to_pass": {"satisfied": None, "status": "not_configured"},
+            },
+            "tools": {"tool_success_rate": None},
+            "cost": {"cost_estimate": 9.0, "cost_source": "pricing_table"},
+        },
     )
 
     summary = summarize_evaluation_results([first, second, blocked])
@@ -771,11 +967,19 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         "task_completion_rate": 1.0,
         "tests_passed_count": 2,
         "test_pass_rate": 1.0,
-        "prompt_tokens": 200,
+        "prompt_tokens": 210,
         "cached_tokens": 100,
         "request_cache_hit_rate": 0.5,
-        "run_cache_hit_rate": 0.5,
+        "run_cache_hit_rate": 0.4762,
         "tool_calls": 5,
+        "resolved_count": 1,
+        "resolved_rate": 0.5,
+        "fail_to_pass_satisfied_count": 1,
+        "pass_to_pass_satisfied_count": 1,
+        "pass_to_pass_not_configured_count": 2,
+        "average_tool_success_rate": 0.75,
+        "total_cost_estimate": 10.0,
+        "cost_per_resolved": 1.0,
         "evaluation_passed_rate": 0.5,
         "verification_pass_rate": 1.0,
         "average_turns": 2.5,
@@ -788,6 +992,39 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         "miscompletion_count": 1,
         "failure_reasons": {"environment_blocker": 1, "verification_failed": 1},
     }
+
+
+def test_summarize_evaluation_results_preserves_unknown_tool_success_rate(tmp_path: Path) -> None:
+    result = EvaluationTaskResult(
+        task_id="unknown-tools",
+        tests_passed=False,
+        infrastructure_blocked=False,
+        prompt_tokens=10,
+        cached_tokens=0,
+        request_cache_hit_rate=0.0,
+        run_cache_hit_rate=0.0,
+        tool_calls=1,
+        files_changed=[],
+        duration_seconds=1.0,
+        error_summary="blocked",
+        workspace=str(tmp_path),
+        trace=str(tmp_path / "trace"),
+        status="blocked",
+        turn_count=1,
+        evaluation_metrics={
+            "resolved": {"value": False, "resolved_rate_contribution": 0.0, "reason": "blocked"},
+            "swe_bench": {
+                "fail_to_pass": {"satisfied": False},
+                "pass_to_pass": {"satisfied": None, "status": "not_configured"},
+            },
+            "tools": {"tool_success_rate": None},
+            "cost": {"cost_estimate": None},
+        },
+    )
+
+    summary = summarize_evaluation_results([result])
+
+    assert summary["average_tool_success_rate"] is None
 
 
 def test_summarize_evaluation_results_uses_agent_completed_only(tmp_path: Path) -> None:
@@ -833,6 +1070,56 @@ def test_summarize_evaluation_results_uses_agent_completed_only(tmp_path: Path) 
     assert summary["agent_completed_count"] == 1
     assert summary["miscompletion_count"] == 1
     assert summary["failure_reasons"] == {"blocked": 1, "verification_failed": 1}
+
+
+def test_evaluation_report_markdown_includes_metrics_scorecard(tmp_path: Path) -> None:
+    task_result = EvaluationTaskResult(
+        task_id="scorecard-task",
+        tests_passed=True,
+        infrastructure_blocked=False,
+        prompt_tokens=10,
+        cached_tokens=2,
+        request_cache_hit_rate=0.2,
+        run_cache_hit_rate=0.2,
+        tool_calls=1,
+        files_changed=["app.py"],
+        duration_seconds=1.0,
+        error_summary="",
+        workspace=str(tmp_path),
+        trace=str(tmp_path / "trace"),
+        status="success",
+        turn_count=1,
+        agent_completed=True,
+        evaluation_passed=True,
+        evaluation_metrics={
+            "schema_version": "evaluation.metrics/v1",
+            "resolved": {"value": True, "resolved_rate_contribution": 1.0, "reason": ""},
+            "swe_bench": {
+                "fail_to_pass": {"satisfied": True},
+                "pass_to_pass": {"satisfied": None, "status": "not_configured"},
+            },
+            "verification": {"tests_passed": True},
+            "patch": {"files_changed_count": 1, "out_of_scope_files": []},
+            "trajectory": {"turn_count": 1},
+            "tools": {"tool_call_count": 1, "tool_success_rate": 1.0},
+            "context": {"compaction": {"reason": "context usage below compaction threshold"}},
+            "efficiency": {"wall_time_seconds": 1.0},
+            "cost": {"cost_estimate": 0.1, "cost_source": "pricing_table"},
+            "safety": {"policy_blocks": 0},
+        },
+    )
+    payload = {
+        "run_id": "scorecard-run",
+        "summary": summarize_evaluation_results([task_result]),
+        "tasks": [task_result.to_dict()],
+    }
+
+    markdown = evaluation_report_markdown(payload)
+
+    assert "## Metrics / Scorecard" in markdown
+    assert "- resolved: 1 / 1 (1.0000)" in markdown
+    assert "`scorecard-task` | True | True | not_configured" in markdown
+    assert "0.100000 (pricing_table)" in markdown
 
 
 def test_evaluation_runner_writes_result_without_provider(tmp_path: Path) -> None:
@@ -974,6 +1261,12 @@ def test_evaluation_runner_writes_result_without_provider(tmp_path: Path) -> Non
     ]
     assert task["token_usage"]["input_tokens"] == 10
     assert task["cache_usage"]["run_cache_hit_rate"] == 0.4
+    scorecard = task["evaluation_metrics"]
+    assert scorecard["reproducibility"]["reproducible_environment"]["workspace"]["type"] == "fixture"
+    rendered_scorecard = json.dumps(scorecard, sort_keys=True)
+    assert "hidden_verification_command" not in rendered_scorecard
+    assert "verification_prepare_commands" not in rendered_scorecard
+    assert "test_patch" not in rendered_scorecard
     for removed in [
         "tool_call_count",
         "failure_repair_count",

@@ -138,7 +138,7 @@ Stage gate 执行 deterministic 检查：mypy、ruff、`compileall src scripts`�
 python scripts/verify_capability.py --force --run-id phase8-public-long-task-gate
 ```
 
-该 gate 只运行 `docs/evaluation/public-representative-task.json` 这一项公共 SWE-bench Lite dev 任务，并要求 result 中有 `capability_summary`，包含 model/tool/retrieval/context/compaction/sandbox/verification/finalization 对象流和耗时摘要。公共任务必须先证明 base commit + evaluator test patch 失败，agent patch 后同一验证通过，才允许 `evaluation_passed=true`。没有触发 compaction 时必须写明 skipped reason，例如 context usage 未到阈值、retrieval 内容不足或任务过早完成。
+该 gate 只运行 `docs/evaluation/public-representative-task.json` 这一项公共 SWE-bench Lite dev 任务，并要求 result 中有 `capability_summary`，包含 model/tool/retrieval/context/compaction/sandbox/verification/finalization 对象流和耗时摘要。公共任务必须先证明 base commit + evaluator test patch 失败，agent patch 后同一验证通过，才允许 `evaluation_passed=true`。没有触发 compaction 时必须写明 skipped reason，例如 context usage 未到阈值、retrieval 内容不足或任务过早完成。result 同时写出 `evaluation_metrics` scorecard，`verify_capability.py` 会把 resolved、tool success rate、cost 和 pricing 状态摘要放入 JSON 输出；这些字段只用于诊断/回归分析，不改变 capability gate 的 pass/fail 判断，也不会因为 cost/pricing unknown 导致失败。
 
 仍可按需运行以下传统 pytest 命令，但它们不再是 Codex 小改默认 fast gate：
 

@@ -170,14 +170,15 @@ python -m singularity.cli eval run docs/evaluation/public-representative-task.js
 - `agent_completed`：AgentLoop / FinalReport 自认为完成
 - `evaluation_passed`：独立 evaluator 判定通过
 - `miscompletion_count`：`agent_completed and not evaluation_passed`
+- `evaluation_metrics`：诊断 scorecard，包含 resolved、FAIL_TO_PASS/PASS_TO_PASS、verification、patch、trajectory、tools、context/compaction、efficiency、cost 和 safety；不改变硬通过语义
 
-不要把 `evaluation_passed` 写回旧的 `completed` / `success` result alias。
+不要把 `evaluation_passed` 写回旧的 `completed` / `success` result alias。capability gate 仍只以现有 evaluator 结果和命令退出码作为硬判断；`evaluation_metrics`、cost 和 pricing unknown 只用于诊断/回归分析，不会让 gate 通过或失败。
 
 Phase 8 后本地验证分为三层，CI Quality matrix 不降级，既有全量测试仍保留：
 
 - `fast` gate：Codex 日常小改默认运行 `python scripts/verify_fast.py --git`。它执行 ruff、当前 mypy、changed-scope compileall 和 `scripts/test_impact.py` 推荐的受影响 pytest；低置信度或无明确测试时输出 `fallback_required=stage` 与 `skipped_reason`，不静默跳过，不跑真实 provider eval。
 - `stage` gate：阶段收口运行 `python scripts/verify_stage.py`。它执行 deterministic mypy/ruff/compileall/runtime docs、过滤后的 pytest 和关键模块专项测试，不默认跑真实 provider eval。
-- `capability` gate：只有 AgentLoop、ToolProtocol、sandbox、context、compaction、verification、CompletionGate、FinalReport 或 evaluation runner 变更时运行 `python scripts/verify_capability.py --force --run-id <run-id>`，默认使用单个公共任务 `docs/evaluation/public-representative-task.json`。
+- `capability` gate：只有 AgentLoop、ToolProtocol、sandbox、context、compaction、verification、CompletionGate、FinalReport 或 evaluation runner 变更时运行 `python scripts/verify_capability.py --force --run-id <run-id>`，默认使用单个公共任务 `docs/evaluation/public-representative-task.json`，并在 JSON 输出中附带 `evaluation_metrics` 摘要。
 
 公共代表性任务来自 SWE-bench Lite dev split：`sqlfluff__sqlfluff-2419`，repo 为 `sqlfluff/sqlfluff`，base commit 为 `f1dba0e1dd764ae72d67c3d5e1471cf14d3db030`，FAIL_TO_PASS 目标为 `test/rules/std_L060_test.py::test__rules__std_L060_raised`。manifest 只把 issue 摘要、允许范围、模型可见 local smoke 和完成标准交给模型；evaluator `test_patch` 只在 baseline/verification workspace 中应用，gold patch 不存储也不进入 `ModelTurnRequest`。
 

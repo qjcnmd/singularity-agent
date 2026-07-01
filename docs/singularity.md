@@ -1740,6 +1740,15 @@
       → AgentKernel → AgentLoop.run
     → post-agent verification 只作为 evaluation scoring 证据，
       不回灌 AgentLoop completion。
+    → _task_result() 写 EvaluationTaskResult.evaluation_metrics:
+        schema_version = evaluation.metrics/v1
+      resolved.value 只投影 evaluation_passed；
+      FAIL_TO_PASS/PASS_TO_PASS、verification、patch、trajectory、
+      tools、context/compaction、efficiency、cost、safety 均为
+      诊断/回归分析 scorecard，不改变 evaluation_passed /
+      tests_passed / agent_completed / status 语义。
+      cost 优先读 provider usage 的 cost_estimate；否则只按
+      token usage 与精确模型价格表计算，unknown 不影响 gate。
     → final report / failure repair summary 中的 latest_failure_category:
         environment_error 或 sandbox_limitation → environment_blocker
     → benchmark fixture 中 simple_patch / multi_file_reasoning /

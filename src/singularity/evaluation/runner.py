@@ -31,8 +31,21 @@ from singularity.policy.permissions import ApprovalPolicy, NetworkAccess, Permis
 
 EVALUATION_TASK_SET_SCHEMA_VERSION = "evaluation.task_set/v1"
 EVALUATION_RESULT_SCHEMA_VERSION = "evaluation.result/v1"
+EVALUATION_METRICS_SCHEMA_VERSION = "evaluation.metrics/v1"
 
 _PATCH_REDACTOR = ContextRedactor()
+_MIMO_PRICING_SOURCE_URL = "https://platform.xiaomimimo.com/docs/pricing"
+_MIMO_PRICING_RETRIEVED_AT = "2026-07-01"
+_TOKEN_PRICING_PER_1M: dict[str, dict[str, Any]] = {
+    "mimo-v2.5": {
+        "input": 0.14,
+        "cached_input": 0.0028,
+        "output": 0.28,
+        "currency": "USD",
+        "source_url": _MIMO_PRICING_SOURCE_URL,
+        "retrieved_at": _MIMO_PRICING_RETRIEVED_AT,
+    }
+}
 
 
 class EvaluationSetupError(RuntimeError):
@@ -306,6 +319,7 @@ class EvaluationTaskResult:
     patch_applied: bool = False
     fail_to_pass_satisfied: bool = False
     verification_misconfiguration_reason: str = ""
+    evaluation_metrics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -355,6 +369,7 @@ class EvaluationTaskResult:
             "patch_applied": self.patch_applied,
             "fail_to_pass_satisfied": self.fail_to_pass_satisfied,
             "verification_misconfiguration_reason": self.verification_misconfiguration_reason,
+            "evaluation_metrics": self.evaluation_metrics,
         }
 
 
@@ -1128,6 +1143,58 @@ class EvaluationRunner:
             agent_status=agent_status,
             wall_time_seconds=round(time.perf_counter() - started, 3),
         )
+        result_patch = patch or {"diff": "", "applicable": False, "changed_files": []}
+        result_checks = checks or _checks_payload(None, verification)
+        result_trace_artifacts = list(trace_artifact_refs or _trace_artifact_refs(final_report_payload, trace_summary))
+        result_reproducible_environment = reproducible_environment or {}
+        result_contract_satisfaction = contract_satisfaction or _contract_satisfaction(
+            task,
+            files_changed=files_changed,
+            allowed_scope=allowed_scope_passed,
+            verification=verification,
+            public_verification=None,
+            agent_status=agent_status,
+            final_report_status=final_report_status,
+            policy_blocks=policy_blocks,
+            patch=result_patch,
+            final_report_payload=final_report_payload,
+        )
+        evaluation_metrics = _build_evaluation_metrics(
+            task=task,
+            evaluation_passed=evaluation_passed,
+            tests_passed=tests_passed,
+            public_verification_passed=public_verification_passed,
+            hidden_verification_passed=hidden_verification_passed,
+            patch_applicable=patch_applicable,
+            allowed_scope_passed=allowed_scope_passed,
+            patch_applied=patch_applied,
+            files_changed=files_changed,
+            patch=result_patch,
+            checks=result_checks,
+            verification=verification,
+            capability_summary=capability_summary,
+            trace=Path(trace) if trace else None,
+            token_usage=token_usage,
+            cache_usage=cache_usage,
+            turn_count=turn_count or _safe_int(usage.get("requests")),
+            tool_calls=tool_calls,
+            agent_completed=agent_completed,
+            miscompletion_count=miscompletion_count,
+            repair_attempt_count=repair_attempt_count,
+            repair_execution_count=repair_execution_count,
+            blocked_reason=blocked_reason,
+            failure_category=failure_category,
+            final_report_status=final_report_status,
+            agent_status=agent_status,
+            policy_blocks=policy_blocks,
+            trace_artifact_refs=result_trace_artifacts,
+            reproducible_environment=result_reproducible_environment,
+            baseline_failed=baseline_failed,
+            baseline_checks=baseline_checks or {},
+            fail_to_pass_satisfied=fail_to_pass_satisfied,
+            verification_misconfiguration_reason=verification_misconfiguration_reason,
+            error_summary=self.redactor.redact_text("; ".join(dict.fromkeys(errors)))[:1000],
+        )
         return EvaluationTaskResult(
             task_id=task.task_id,
             tests_passed=tests_passed,
@@ -1145,8 +1212,8 @@ class EvaluationRunner:
             workspace=str(workspace),
             trace=trace,
             verification_workspace=str(verification_workspace) if verification_workspace else "",
-            patch=patch or {"diff": "", "applicable": False, "changed_files": []},
-            checks=checks or _checks_payload(None, verification),
+            patch=result_patch,
+            checks=result_checks,
             verification=verification,
             agent_completed=agent_completed,
             evaluation_passed=evaluation_passed,
@@ -1161,24 +1228,13 @@ class EvaluationRunner:
             failure_category=failure_category,
             request_cache_hit_rates=request_rates,
             verification_result=verification_result,
-            contract_satisfaction=contract_satisfaction or _contract_satisfaction(
-                task,
-                files_changed=files_changed,
-                allowed_scope=allowed_scope_passed,
-                verification=verification,
-                public_verification=None,
-                agent_status=agent_status,
-                final_report_status=final_report_status,
-                policy_blocks=policy_blocks,
-                patch=patch,
-                final_report_payload=final_report_payload,
-            ),
+            contract_satisfaction=result_contract_satisfaction,
             final_report_status=final_report_status,
             policy_blocks=policy_blocks,
             token_usage=token_usage,
             cache_usage=cache_usage,
-            trace_artifact_refs=list(trace_artifact_refs or _trace_artifact_refs(final_report_payload, trace_summary)),
-            reproducible_environment=reproducible_environment or {},
+            trace_artifact_refs=result_trace_artifacts,
+            reproducible_environment=result_reproducible_environment,
             capability_summary=capability_summary,
             timing=dict(capability_summary.get("timing") or {}),
             baseline_failed=baseline_failed,
@@ -1186,6 +1242,7 @@ class EvaluationRunner:
             patch_applied=patch_applied,
             fail_to_pass_satisfied=fail_to_pass_satisfied,
             verification_misconfiguration_reason=verification_misconfiguration_reason,
+            evaluation_metrics=evaluation_metrics,
         )
 
 
@@ -1206,6 +1263,42 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
     tests_passed_count = sum(1 for result in results if result.tests_passed)
     prompt_tokens = sum(result.prompt_tokens for result in results)
     cached_tokens = sum(result.cached_tokens for result in results)
+    resolved_count = sum(
+        1 for result in scored_results if (result.evaluation_metrics.get("resolved") or {}).get("value") is True
+    )
+    fail_to_pass_satisfied_count = sum(
+        1
+        for result in scored_results
+        if ((result.evaluation_metrics.get("swe_bench") or {}).get("fail_to_pass") or {}).get("satisfied") is True
+    )
+    pass_to_pass_satisfied_count = sum(
+        1
+        for result in scored_results
+        if ((result.evaluation_metrics.get("swe_bench") or {}).get("pass_to_pass") or {}).get("satisfied") is True
+    )
+    pass_to_pass_not_configured_count = sum(
+        1
+        for result in results
+        if ((result.evaluation_metrics.get("swe_bench") or {}).get("pass_to_pass") or {}).get("status")
+        == "not_configured"
+    )
+    tool_success_rates = [
+        _safe_float((result.evaluation_metrics.get("tools") or {}).get("tool_success_rate"))
+        for result in scored_results
+        if (result.evaluation_metrics.get("tools") or {}).get("tool_success_rate") is not None
+    ]
+    cost_estimates = [
+        _safe_float((result.evaluation_metrics.get("cost") or {}).get("cost_estimate"))
+        for result in results
+        if (result.evaluation_metrics.get("cost") or {}).get("cost_estimate") is not None
+    ]
+    scored_cost_estimates = [
+        _safe_float((result.evaluation_metrics.get("cost") or {}).get("cost_estimate"))
+        for result in scored_results
+        if (result.evaluation_metrics.get("cost") or {}).get("cost_estimate") is not None
+    ]
+    total_cost_estimate = round(sum(cost_estimates), 6)
+    scored_cost_estimate = round(sum(scored_cost_estimates), 6)
     failures: dict[str, int] = {}
     miscompletion_count = 0
     for result in results:
@@ -1234,6 +1327,16 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
         "request_cache_hit_rate": _average_rate({result.task_id: result.request_cache_hit_rate for result in scored_results}),
         "run_cache_hit_rate": _rate(cached_tokens, prompt_tokens),
         "tool_calls": sum(result.tool_calls for result in results),
+        "resolved_count": resolved_count,
+        "resolved_rate": _rate(resolved_count, scored_task_count),
+        "fail_to_pass_satisfied_count": fail_to_pass_satisfied_count,
+        "pass_to_pass_satisfied_count": pass_to_pass_satisfied_count,
+        "pass_to_pass_not_configured_count": pass_to_pass_not_configured_count,
+        "average_tool_success_rate": round(sum(tool_success_rates) / len(tool_success_rates), 4)
+        if tool_success_rates
+        else None,
+        "total_cost_estimate": total_cost_estimate,
+        "cost_per_resolved": round(scored_cost_estimate / resolved_count, 6) if resolved_count else None,
         "evaluation_passed_rate": _rate(evaluation_passed_count, scored_task_count),
         "verification_pass_rate": _rate(tests_passed_count, scored_task_count),
         "average_turns": round(
@@ -1335,6 +1438,16 @@ def evaluation_report_markdown(payload: dict[str, Any]) -> str:
         f"- repair executions: {summary.get('repair_execution_count', 0)}",
         f"- miscompletion count: {summary.get('miscompletion_count', 0)}",
         "",
+        "## Metrics / Scorecard",
+        "",
+        f"- resolved: {summary.get('resolved_count', 0)} / {summary.get('scored_task_count', 0)} ({summary.get('resolved_rate', 0):.4f})",
+        f"- FAIL_TO_PASS satisfied: {summary.get('fail_to_pass_satisfied_count', 0)}",
+        f"- PASS_TO_PASS satisfied: {summary.get('pass_to_pass_satisfied_count', 0)}",
+        f"- PASS_TO_PASS not configured: {summary.get('pass_to_pass_not_configured_count', 0)}",
+        f"- average tool success rate: {_format_optional_rate(summary.get('average_tool_success_rate'))}",
+        f"- total cost estimate: {_format_optional_float(summary.get('total_cost_estimate'))}",
+        f"- cost per resolved: {_format_optional_float(summary.get('cost_per_resolved'))}",
+        "",
         "| task | status | verification | turns | tools | files changed | final report | contract | failures |",
         "| --- | --- | --- | ---: | ---: | --- | --- | --- | --- |",
     ]
@@ -1356,6 +1469,50 @@ def evaluation_report_markdown(payload: dict[str, Any]) -> str:
             f"{task.get('final_report_status') or '-'} | "
             f"{contract} | "
             f"{failures} |"
+        )
+    scorecard_rows: list[str] = []
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        metrics = task.get("evaluation_metrics") or {}
+        if not isinstance(metrics, dict):
+            continue
+        resolved = metrics.get("resolved") or {}
+        swe_bench = metrics.get("swe_bench") or {}
+        fail_to_pass = swe_bench.get("fail_to_pass") if isinstance(swe_bench, dict) else {}
+        pass_to_pass = swe_bench.get("pass_to_pass") if isinstance(swe_bench, dict) else {}
+        verification = metrics.get("verification") or {}
+        patch = metrics.get("patch") or {}
+        trajectory = metrics.get("trajectory") or {}
+        tools = metrics.get("tools") or {}
+        context = metrics.get("context") or {}
+        efficiency = metrics.get("efficiency") or {}
+        cost = metrics.get("cost") or {}
+        safety = metrics.get("safety") or {}
+        failure_reason = str((resolved or {}).get("reason") or task.get("failure_category") or "-").replace("|", "\\|")
+        scorecard_rows.append(
+            "| "
+            f"`{task.get('task_id', '')}` | "
+            f"{bool((resolved or {}).get('value'))} | "
+            f"{(fail_to_pass or {}).get('satisfied')} | "
+            f"{(pass_to_pass or {}).get('status') or (pass_to_pass or {}).get('satisfied')} | "
+            f"{(verification or {}).get('tests_passed')} | "
+            f"{(patch or {}).get('files_changed_count')} / {(patch or {}).get('out_of_scope_files') or []} | "
+            f"{(trajectory or {}).get('turn_count')} / {(tools or {}).get('tool_call_count')} / {(tools or {}).get('tool_success_rate')} | "
+            f"{((context or {}).get('compaction') or {}).get('reason') or ((context or {}).get('compaction') or {}).get('status') or '-'} | "
+            f"{(efficiency or {}).get('wall_time_seconds')} | "
+            f"{_format_optional_float((cost or {}).get('cost_estimate'))} ({(cost or {}).get('cost_source', 'unknown')}) | "
+            f"{(safety or {}).get('policy_blocks')} | "
+            f"{failure_reason} |"
+        )
+    if scorecard_rows:
+        lines.extend(
+            [
+                "",
+                "| task | resolved | FAIL_TO_PASS | PASS_TO_PASS | verification | patch files / out of scope | turns / tools / success | context / compaction | wall seconds | cost | policy blocks | failure reason |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | ---: | --- | ---: | --- |",
+                *scorecard_rows,
+            ]
         )
     regression = payload.get("regression")
     if isinstance(regression, dict):
@@ -1765,7 +1922,7 @@ def _strategy_max_turns_for_task(task: EvaluationTask) -> int | None:
     if raw_value in (None, ""):
         return None
     try:
-        value = int(raw_value)
+        value = int(str(raw_value))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"evaluation task {task.task_id} has invalid strategy.max_turns.") from exc
     if value <= 0:
@@ -2028,6 +2185,655 @@ def _build_capability_summary(
             "verification_time_seconds": verification_seconds,
         },
     }
+
+
+def _build_evaluation_metrics(
+    *,
+    task: EvaluationTask,
+    evaluation_passed: bool,
+    tests_passed: bool,
+    public_verification_passed: bool,
+    hidden_verification_passed: bool,
+    patch_applicable: bool,
+    allowed_scope_passed: bool,
+    patch_applied: bool,
+    files_changed: list[str],
+    patch: dict[str, Any],
+    checks: dict[str, Any],
+    verification: CommandEvalResult | None,
+    capability_summary: dict[str, Any],
+    trace: Path | None,
+    token_usage: dict[str, Any],
+    cache_usage: dict[str, Any],
+    turn_count: int,
+    tool_calls: int,
+    agent_completed: bool,
+    miscompletion_count: int,
+    repair_attempt_count: int,
+    repair_execution_count: int,
+    blocked_reason: str,
+    failure_category: str,
+    final_report_status: str,
+    agent_status: str,
+    policy_blocks: int,
+    trace_artifact_refs: list[str],
+    reproducible_environment: dict[str, Any],
+    baseline_failed: bool,
+    baseline_checks: dict[str, Any],
+    fail_to_pass_satisfied: bool,
+    verification_misconfiguration_reason: str,
+    error_summary: str,
+) -> dict[str, Any]:
+    trace_events = _read_trace_events(trace)
+    model_profile = {}
+    if isinstance(reproducible_environment.get("model_profile"), dict):
+        model_profile = dict(reproducible_environment["model_profile"])
+    reason = _resolved_reason(
+        evaluation_passed=evaluation_passed,
+        failure_category=failure_category,
+        blocked_reason=blocked_reason,
+        verification_misconfiguration_reason=verification_misconfiguration_reason,
+        error_summary=error_summary,
+    )
+    return {
+        "schema_version": EVALUATION_METRICS_SCHEMA_VERSION,
+        "resolved": _resolved_metrics(evaluation_passed=evaluation_passed, reason=reason),
+        "swe_bench": _swe_bench_metrics(
+            task=task,
+            baseline_failed=baseline_failed,
+            baseline_checks=baseline_checks,
+            fail_to_pass_satisfied=fail_to_pass_satisfied,
+        ),
+        "verification": _verification_metrics(
+            tests_passed=tests_passed,
+            public_verification_passed=public_verification_passed,
+            hidden_verification_passed=hidden_verification_passed,
+            checks=checks,
+            verification=verification,
+            capability_summary=capability_summary,
+        ),
+        "patch": _patch_metrics(
+            patch=patch,
+            files_changed=files_changed,
+            expected_file_changes=task.expected_file_changes,
+            allowed_paths=task.allowed_paths,
+            patch_applicable=patch_applicable,
+            allowed_scope_passed=allowed_scope_passed,
+            patch_applied=patch_applied,
+        ),
+        "trajectory": _trajectory_metrics(
+            trace_events=trace_events,
+            agent_completed=agent_completed,
+            turn_count=turn_count,
+            miscompletion_count=miscompletion_count,
+            repair_attempt_count=repair_attempt_count,
+            repair_execution_count=repair_execution_count,
+            blocked_reason=blocked_reason,
+            failure_category=failure_category,
+            final_report_status=final_report_status,
+            agent_status=agent_status,
+        ),
+        "tools": _tool_metrics_from_trace_events(trace_events, fallback_tool_calls=tool_calls),
+        "context": _context_metrics(
+            trace_events=trace_events,
+            capability_summary=capability_summary,
+            expected_file_changes=task.expected_file_changes,
+            allowed_paths=task.allowed_paths,
+            cache_usage=cache_usage,
+        ),
+        "efficiency": _efficiency_metrics(
+            capability_summary=capability_summary,
+            token_usage=token_usage,
+            cache_usage=cache_usage,
+        ),
+        "cost": _cost_metrics(
+            trace_events=trace_events,
+            token_usage=token_usage,
+            model_profile=model_profile,
+        ),
+        "safety": _safety_metrics(
+            policy_blocks=policy_blocks,
+            capability_summary=capability_summary,
+            trace_events=trace_events,
+        ),
+        "reproducibility": _reproducibility_metrics(
+            reproducible_environment=reproducible_environment,
+            trace_artifact_refs=trace_artifact_refs,
+        ),
+    }
+
+
+def _resolved_reason(
+    *,
+    evaluation_passed: bool,
+    failure_category: str,
+    blocked_reason: str,
+    verification_misconfiguration_reason: str,
+    error_summary: str,
+) -> str:
+    if evaluation_passed:
+        return ""
+    return (
+        verification_misconfiguration_reason
+        or blocked_reason
+        or (failure_category if failure_category and failure_category != "none" else "")
+        or error_summary
+        or "evaluation did not pass"
+    )
+
+
+def _resolved_metrics(*, evaluation_passed: bool, reason: str) -> dict[str, Any]:
+    return {
+        "value": evaluation_passed,
+        "resolved_rate_contribution": 1.0 if evaluation_passed else 0.0,
+        "reason": "" if evaluation_passed else reason,
+    }
+
+
+def _swe_bench_metrics(
+    *,
+    task: EvaluationTask,
+    baseline_failed: bool,
+    baseline_checks: dict[str, Any],
+    fail_to_pass_satisfied: bool,
+) -> dict[str, Any]:
+    pass_to_pass = task.fixture_metadata.get("pass_to_pass") or task.fixture_metadata.get("PASS_TO_PASS")
+    if pass_to_pass:
+        pass_to_pass_checks = [str(item) for item in pass_to_pass] if isinstance(pass_to_pass, list) else [str(pass_to_pass)]
+        pass_to_pass_payload: dict[str, Any] = {
+            "satisfied": None,
+            "status": "not_implemented",
+            "reason": "PASS_TO_PASS checks are configured but this runner does not yet record PASS_TO_PASS evaluator results",
+            "checks": pass_to_pass_checks,
+        }
+    else:
+        pass_to_pass_payload = {
+            "satisfied": None,
+            "status": "not_configured",
+            "reason": "manifest has no PASS_TO_PASS checks",
+        }
+    fail_to_pass_checks = (
+        task.fixture_metadata.get("fail_to_pass")
+        or task.fixture_metadata.get("FAIL_TO_PASS")
+        or []
+    )
+    return {
+        "fail_to_pass": {
+            "satisfied": fail_to_pass_satisfied,
+            "baseline_failed": baseline_failed,
+            "checks": list(fail_to_pass_checks) if isinstance(fail_to_pass_checks, list) else [str(fail_to_pass_checks)],
+            "baseline_checks": _scorecard_baseline_checks(baseline_checks),
+        },
+        "pass_to_pass": pass_to_pass_payload,
+    }
+
+
+def _scorecard_baseline_checks(baseline_checks: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for name in ("public", "hidden"):
+        check = baseline_checks.get(name)
+        if not isinstance(check, dict):
+            continue
+        safe[name] = {
+            "passed": check.get("passed"),
+            "status": check.get("status"),
+            "failure_category": check.get("failure_category"),
+        }
+    return safe
+
+
+def _verification_metrics(
+    *,
+    tests_passed: bool,
+    public_verification_passed: bool,
+    hidden_verification_passed: bool,
+    checks: dict[str, Any],
+    verification: CommandEvalResult | None,
+    capability_summary: dict[str, Any],
+) -> dict[str, Any]:
+    configured = [name for name in ("public", "hidden") if isinstance(checks.get(name), dict)]
+    passed = sum(1 for name in configured if _check_passed(checks, name))
+    timing = capability_summary.get("timing") if isinstance(capability_summary, dict) else {}
+    return {
+        "tests_passed": tests_passed,
+        "public_verification_passed": public_verification_passed,
+        "hidden_verification_passed": hidden_verification_passed,
+        "verification_pass_rate": _rate(passed, len(configured)) if configured else None,
+        "verification_time_seconds": _safe_float(timing.get("verification_time_seconds")) if isinstance(timing, dict) else 0.0,
+        "pytest_time_seconds": _safe_float(timing.get("pytest_time_seconds")) if isinstance(timing, dict) else 0.0,
+        "reason": "" if tests_passed else _verification_reason(checks, verification),
+    }
+
+
+def _verification_reason(checks: dict[str, Any], verification: CommandEvalResult | None) -> str:
+    for name in ("public", "hidden"):
+        check = checks.get(name)
+        if isinstance(check, dict) and check.get("status") not in {"passed", "not_run"}:
+            return str(check.get("error_summary") or check.get("failure_category") or f"{name} verification failed")
+    if verification is not None and not verification.passed:
+        return verification.error_summary or verification.failure_category or "verification failed"
+    return ""
+
+
+def _patch_metrics(
+    *,
+    patch: dict[str, Any],
+    files_changed: list[str],
+    expected_file_changes: list[str],
+    allowed_paths: list[str],
+    patch_applicable: bool,
+    allowed_scope_passed: bool,
+    patch_applied: bool,
+) -> dict[str, Any]:
+    displayed_files = [_display_path(path) for path in files_changed]
+    out_of_scope = _out_of_scope_files(files_changed, allowed_paths)
+    added, deleted, diff_reason = _diff_line_counts(str(patch.get("diff") or ""))
+    return {
+        "patch_applied": patch_applied,
+        "patch_applicable": patch_applicable,
+        "allowed_scope_passed": allowed_scope_passed,
+        "files_changed_count": len(files_changed),
+        "expected_files_changed": _expected_file_changes_satisfied(expected_file_changes, files_changed=files_changed)
+        if expected_file_changes
+        else None,
+        "test_files_modified": any(_looks_like_test_path(path) for path in displayed_files),
+        "out_of_scope_files": [_display_path(path) for path in out_of_scope],
+        "diff_added_lines": added,
+        "diff_deleted_lines": deleted,
+        "reason": diff_reason,
+    }
+
+
+def _trajectory_metrics(
+    *,
+    trace_events: list[dict[str, Any]],
+    agent_completed: bool,
+    turn_count: int,
+    miscompletion_count: int,
+    repair_attempt_count: int,
+    repair_execution_count: int,
+    blocked_reason: str,
+    failure_category: str,
+    final_report_status: str,
+    agent_status: str,
+) -> dict[str, Any]:
+    entered_loop = bool(
+        turn_count
+        or _count_events(trace_events, "model.request.created")
+        or final_report_status
+        or agent_status
+    )
+    return {
+        "entered_agent_loop": entered_loop,
+        "agent_completed": agent_completed,
+        "turn_count": turn_count,
+        "miscompletion_count": miscompletion_count,
+        "repair_attempt_count": repair_attempt_count,
+        "repair_execution_count": repair_execution_count,
+        "blocked_reason": blocked_reason,
+        "failure_category": failure_category,
+        "final_report_status": final_report_status,
+        "agent_loop_result_status": agent_status,
+    }
+
+
+def _tool_metrics_from_trace_events(
+    events: list[dict[str, Any]],
+    *,
+    fallback_tool_calls: int = 0,
+) -> dict[str, Any]:
+    call_events = [event for event in events if _event_type(event) in {"tool_protocol.call_started", "model.tool_call.proposed"}]
+    result_events = [
+        event
+        for event in events
+        if _event_type(event) in {"tool_protocol.call_completed", "tool_protocol.result", "tool.result"}
+    ]
+    call_ids = {
+        call_id
+        for event in call_events
+        for call_id in [_tool_call_id_from_event(event)]
+        if call_id
+    }
+    call_count = len(call_ids) if call_ids else len(call_events)
+    tool_names = sorted(
+        dict.fromkeys(
+            name
+            for event in [*call_events, *result_events]
+            for name in [_tool_name_from_event(event)]
+            if name
+        )
+    )
+    success = failure = unknown_results = 0
+    for event in result_events:
+        status = _tool_result_status(event)
+        if status is True:
+            success += 1
+        elif status is False:
+            failure += 1
+        else:
+            unknown_results += 1
+    tool_call_count = call_count or fallback_tool_calls
+    unknown_calls = max(tool_call_count - len(result_events), 0)
+    total_unknown = unknown_results + unknown_calls
+    if tool_call_count <= 0:
+        success_rate: float | None = None
+    elif total_unknown:
+        success_rate = None
+    else:
+        success_rate = _rate(success, tool_call_count)
+    return {
+        "tool_call_count": tool_call_count,
+        "tool_result_count": len(result_events),
+        "tool_success_count": success,
+        "tool_failure_count": failure,
+        "tool_unknown_count": total_unknown,
+        "tool_success_rate": success_rate,
+        "distinct_tool_names": tool_names,
+    }
+
+
+def _context_metrics(
+    *,
+    trace_events: list[dict[str, Any]],
+    capability_summary: dict[str, Any],
+    expected_file_changes: list[str],
+    allowed_paths: list[str],
+    cache_usage: dict[str, Any],
+) -> dict[str, Any]:
+    compaction = capability_summary.get("context_compaction") if isinstance(capability_summary, dict) else {}
+    retrieval_calls = _safe_int(capability_summary.get("retrieval_calls")) if isinstance(capability_summary, dict) else 0
+    context_rebuilds = _safe_int(capability_summary.get("context_package_rebuild_count")) if isinstance(capability_summary, dict) else 0
+    target_hit = _target_file_retrieval_hit(
+        trace_events,
+        target_files=expected_file_changes or allowed_paths,
+    )
+    return {
+        "retrieval_calls": retrieval_calls,
+        "target_file_retrieval_hit": target_hit["value"],
+        "target_file_retrieval_reason": target_hit["reason"],
+        "context_package_rebuild_count": context_rebuilds,
+        "compaction": dict(compaction)
+        if isinstance(compaction, dict)
+        else {
+            "requested": 0,
+            "completed": 0,
+            "failed": 0,
+            "skipped": True,
+            "reason": _compaction_reason(trace_events, compaction_requested=0),
+        },
+        "request_cache_hit_rate": _safe_float(cache_usage.get("request_cache_hit_rate")),
+        "run_cache_hit_rate": _safe_float(cache_usage.get("run_cache_hit_rate")),
+    }
+
+
+def _efficiency_metrics(
+    *,
+    capability_summary: dict[str, Any],
+    token_usage: dict[str, Any],
+    cache_usage: dict[str, Any],
+) -> dict[str, Any]:
+    timing = capability_summary.get("timing") if isinstance(capability_summary, dict) else {}
+    result = {
+        "wall_time_seconds": _safe_float(timing.get("wall_time_seconds")) if isinstance(timing, dict) else 0.0,
+        "provider_time_seconds": _safe_float(timing.get("provider_time_seconds")) if isinstance(timing, dict) else 0.0,
+        "sandbox_time_seconds": _safe_float(timing.get("sandbox_time_seconds")) if isinstance(timing, dict) else 0.0,
+        "context_retrieval_compaction_time_seconds": _safe_float(timing.get("context_retrieval_compaction_time_seconds"))
+        if isinstance(timing, dict)
+        else 0.0,
+        "verification_time_seconds": _safe_float(timing.get("verification_time_seconds")) if isinstance(timing, dict) else 0.0,
+        "prompt_tokens": _safe_int(token_usage.get("input_tokens")),
+        "cached_tokens": _safe_int(token_usage.get("cached_input_tokens")),
+        "output_tokens": _safe_int(token_usage.get("output_tokens")),
+        "total_tokens": _safe_int(token_usage.get("total_tokens")),
+        "request_cache_hit_rate": _safe_float(cache_usage.get("request_cache_hit_rate")),
+        "run_cache_hit_rate": _safe_float(cache_usage.get("run_cache_hit_rate")),
+    }
+    if not result["total_tokens"]:
+        result["total_tokens"] = result["prompt_tokens"] + result["output_tokens"]
+    return result
+
+
+def _cost_metrics(
+    *,
+    trace_events: list[dict[str, Any]],
+    token_usage: dict[str, Any],
+    model_profile: dict[str, Any],
+) -> dict[str, Any]:
+    provider_cost = _provider_cost_estimate(trace_events)
+    model_name = _safe_str(model_profile.get("model")).strip()
+    base_url = _safe_str(model_profile.get("base_url")).strip()
+    matched_model = _pricing_model_key(model_name)
+    pricing = _TOKEN_PRICING_PER_1M.get(matched_model or "")
+    if provider_cost is not None:
+        return _cost_payload(
+            cost_estimate=provider_cost,
+            cost_source="provider_usage",
+            pricing_status="provider_supplied",
+            pricing=pricing,
+            matched_model=matched_model or model_name,
+        )
+    if pricing is None or not _pricing_base_url_allowed(base_url):
+        return _cost_payload(
+            cost_estimate=None,
+            cost_source="unknown",
+            pricing_status="unknown_model_or_unpriced",
+            pricing=pricing,
+            matched_model=matched_model or "",
+        )
+    input_tokens = _safe_int(token_usage.get("input_tokens"))
+    cached_tokens = min(_safe_int(token_usage.get("cached_input_tokens")), input_tokens)
+    uncached_tokens = max(input_tokens - cached_tokens, 0)
+    output_tokens = _safe_int(token_usage.get("output_tokens"))
+    cost = (
+        uncached_tokens / 1_000_000 * _safe_float(pricing.get("input"))
+        + cached_tokens / 1_000_000 * _safe_float(pricing.get("cached_input"))
+        + output_tokens / 1_000_000 * _safe_float(pricing.get("output"))
+    )
+    return _cost_payload(
+        cost_estimate=round(cost, 6),
+        cost_source="pricing_table",
+        pricing_status="priced",
+        pricing=pricing,
+        matched_model=matched_model or model_name,
+    )
+
+
+def _safety_metrics(
+    *,
+    policy_blocks: int,
+    capability_summary: dict[str, Any],
+    trace_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "policy_blocks": policy_blocks,
+        "sandbox_backend": str(capability_summary.get("sandbox_backend") or ""),
+        "local_process_fallback_count": _safe_int(capability_summary.get("local_process_fallback_count")),
+        "secret_leak_detected": _secret_leak_detected(trace_events),
+    }
+
+
+def _reproducibility_metrics(
+    *,
+    reproducible_environment: dict[str, Any],
+    trace_artifact_refs: list[str],
+) -> dict[str, Any]:
+    workspace = reproducible_environment.get("workspace")
+    runtime = reproducible_environment.get("runtime")
+    runtime_summary: dict[str, Any] = {}
+    if isinstance(runtime, dict):
+        runtime_summary = {
+            "python": runtime.get("python"),
+            "platform": runtime.get("platform"),
+            "interpreter_strategy": runtime.get("interpreter_strategy"),
+        }
+    return {
+        "repo": _safe_str(workspace.get("source")) if isinstance(workspace, dict) else "",
+        "base_commit": _safe_str(workspace.get("start_commit")) if isinstance(workspace, dict) else "",
+        "trace_artifact_refs": list(trace_artifact_refs),
+        "reproducible_environment": {
+            "task_id": reproducible_environment.get("task_id"),
+            "task_type": reproducible_environment.get("task_type"),
+            "workspace": workspace if isinstance(workspace, dict) else {},
+            "runtime": runtime_summary,
+        },
+    }
+
+
+def _out_of_scope_files(files_changed: list[str], allowed_paths: list[str]) -> list[str]:
+    if not allowed_paths:
+        return []
+    return [path for path in files_changed if not _allowed_path(path, allowed_paths)]
+
+
+def _allowed_path(path: str, allowed_paths: list[str]) -> bool:
+    normalized = _normalize_allowed(path)
+    for allowed in allowed_paths:
+        normalized_allowed = _normalize_allowed(allowed)
+        if normalized_allowed == ".":
+            return True
+        if normalized == normalized_allowed or normalized.startswith(normalized_allowed.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _looks_like_test_path(path: str) -> bool:
+    normalized = _normalize_allowed(path).lower()
+    name = Path(normalized).name
+    return (
+        normalized.startswith("tests/")
+        or "/tests/" in normalized
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith(".test.py")
+    )
+
+
+def _diff_line_counts(diff: str) -> tuple[int | None, int | None, str]:
+    if not diff.strip():
+        return None, None, "diff not recorded"
+    added = 0
+    deleted = 0
+    saw_hunk = False
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            saw_hunk = True
+            continue
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            deleted += 1
+    if not saw_hunk and added == 0 and deleted == 0:
+        return None, None, "diff format did not include parseable hunks"
+    return added, deleted, ""
+
+
+def _tool_name_from_event(event: dict[str, Any]) -> str:
+    payload = _event_payload(event)
+    for key in ("tool_name", "name", "tool", "function"):
+        value = payload.get(key) or event.get(key)
+        if value:
+            return str(value)
+    tool_call = payload.get("tool_call") or event.get("tool_call")
+    if isinstance(tool_call, dict):
+        return str(tool_call.get("name") or tool_call.get("tool_name") or "")
+    return ""
+
+
+def _tool_call_id_from_event(event: dict[str, Any]) -> str:
+    payload = _event_payload(event)
+    value = payload.get("tool_call_id") or event.get("tool_call_id")
+    if value:
+        return str(value)
+    tool_call = payload.get("tool_call") or event.get("tool_call")
+    if isinstance(tool_call, dict):
+        return str(tool_call.get("tool_call_id") or tool_call.get("id") or "")
+    return ""
+
+
+def _tool_result_status(event: dict[str, Any]) -> bool | None:
+    payload = _event_payload(event)
+    for key in ("ok", "success", "passed"):
+        if isinstance(payload.get(key), bool):
+            return bool(payload[key])
+    status = str(payload.get("status") or payload.get("result_status") or event.get("status") or "").lower()
+    if status in {"ok", "success", "succeeded", "passed", "completed"}:
+        return True
+    if status in {"error", "failed", "failure", "denied", "blocked", "timeout", "timed_out"}:
+        return False
+    if payload.get("error") or payload.get("exception"):
+        return False
+    return None
+
+
+def _target_file_retrieval_hit(events: list[dict[str, Any]], *, target_files: list[str]) -> dict[str, Any]:
+    targets = [_normalize_allowed(path).lower() for path in target_files if path]
+    if not targets:
+        return {"value": None, "reason": "no target files configured"}
+    retrieval_events = [
+        event
+        for event in events
+        if _event_type(event).startswith("retrieval") or "retrieval" in _event_type(event)
+    ]
+    if not retrieval_events:
+        return {"value": None, "reason": "no retrieval evidence recorded"}
+    for event in retrieval_events:
+        text = json.dumps(_event_payload(event), ensure_ascii=False).lower().replace("\\", "/")
+        if any(target in text for target in targets):
+            return {"value": True, "reason": ""}
+    return {"value": False, "reason": "retrieval events did not reference target files"}
+
+
+def _provider_cost_estimate(events: list[dict[str, Any]]) -> float | None:
+    total = 0.0
+    found = False
+    for event in events:
+        payload = _event_payload(event)
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else payload
+        if not isinstance(usage, dict) or usage.get("cost_estimate") is None:
+            continue
+        total += _safe_float(usage.get("cost_estimate"))
+        found = True
+    return round(total, 6) if found else None
+
+
+def _pricing_model_key(model_name: str) -> str:
+    normalized = model_name.strip().lower()
+    return "mimo-v2.5" if normalized == "mimo-v2.5" else ""
+
+
+def _pricing_base_url_allowed(base_url: str) -> bool:
+    lowered = base_url.lower()
+    return "xiaomimimo.com" in lowered or "mimo.mi.com" in lowered
+
+
+def _cost_payload(
+    *,
+    cost_estimate: float | None,
+    cost_source: str,
+    pricing_status: str,
+    pricing: dict[str, Any] | None,
+    matched_model: str,
+) -> dict[str, Any]:
+    return {
+        "cost_estimate": cost_estimate,
+        "currency": str((pricing or {}).get("currency") or "USD") if pricing or cost_estimate is not None else "",
+        "cost_source": cost_source,
+        "pricing_status": pricing_status,
+        "pricing_source_url": str((pricing or {}).get("source_url") or _MIMO_PRICING_SOURCE_URL) if pricing else "",
+        "retrieved_at": str((pricing or {}).get("retrieved_at") or _MIMO_PRICING_RETRIEVED_AT) if pricing else "",
+        "pricing_unit": "1M tokens" if pricing else "",
+        "matched_model": matched_model,
+    }
+
+
+def _secret_leak_detected(events: list[dict[str, Any]]) -> bool:
+    for event in events:
+        rendered = json.dumps(_event_payload(event), ensure_ascii=False).lower()
+        if "api_key" in rendered or "authorization" in rendered or "bearer " in rendered:
+            return True
+    return False
 
 
 def _read_trace_events(trace: Path | None) -> list[dict[str, Any]]:
@@ -3109,11 +3915,27 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _safe_str(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
 def _safe_float(value: Any) -> float:
     try:
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _format_optional_float(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    return f"{_safe_float(value):.6f}"
+
+
+def _format_optional_rate(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    return f"{_safe_float(value):.4f}"
 
 
 def _float_map(value: dict[str, Any]) -> dict[str, float]:

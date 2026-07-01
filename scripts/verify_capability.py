@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from verify_gate_common import (
+    capability_metrics_from_result,
     capability_timing_from_result,
     print_json_summary,
     python,
@@ -91,6 +92,7 @@ def main() -> int:
     duration = round(time.perf_counter() - started, 3)
     result_path = cwd / "work" / "evaluations" / args.run_id / "result.json"
     capability_timing = capability_timing_from_result(result_path)
+    capability_metrics = capability_metrics_from_result(result_path)
     print_json_summary(
         {
             "gate": "capability",
@@ -102,6 +104,7 @@ def main() -> int:
             "commands": [result.to_dict()],
             "duration_seconds": duration,
             "result_path": str(result_path),
+            "evaluation_metrics": capability_metrics,
             "timing": timing_summary(
                 [result],
                 total_wall_time=duration,

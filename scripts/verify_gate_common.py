@@ -138,3 +138,42 @@ def capability_timing_from_result(result_path: Path) -> dict[str, Any]:
         "verification_time_seconds": round(verification, 3),
         "context_retrieval_compaction_time_seconds": round(context, 3),
     }
+
+
+def capability_metrics_from_result(result_path: Path) -> dict[str, Any]:
+    if not result_path.exists():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    summary = payload.get("summary") or {}
+    if not isinstance(summary, dict):
+        summary = {}
+    cost_sources: dict[str, int] = {}
+    pricing_statuses: dict[str, int] = {}
+    task_metrics_count = 0
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        metrics = task.get("evaluation_metrics") or {}
+        if not isinstance(metrics, dict):
+            continue
+        task_metrics_count += 1
+        cost = metrics.get("cost") or {}
+        if not isinstance(cost, dict):
+            continue
+        source = str(cost.get("cost_source") or "unknown")
+        pricing_status = str(cost.get("pricing_status") or "unknown")
+        cost_sources[source] = cost_sources.get(source, 0) + 1
+        pricing_statuses[pricing_status] = pricing_statuses.get(pricing_status, 0) + 1
+    return {
+        "resolved_count": int(summary.get("resolved_count") or 0),
+        "resolved_rate": float(summary.get("resolved_rate") or 0.0),
+        "total_cost_estimate": summary.get("total_cost_estimate"),
+        "cost_per_resolved": summary.get("cost_per_resolved"),
+        "average_tool_success_rate": summary.get("average_tool_success_rate"),
+        "cost_sources": dict(sorted(cost_sources.items())),
+        "pricing_statuses": dict(sorted(pricing_statuses.items())),
+        "task_metrics_count": task_metrics_count,
+    }

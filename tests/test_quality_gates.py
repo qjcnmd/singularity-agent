@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.verify_gate_common import capability_timing_from_result
+from scripts.verify_gate_common import capability_metrics_from_result, capability_timing_from_result
 
 yaml = pytest.importorskip("yaml")
 
@@ -151,6 +151,57 @@ def test_capability_timing_reads_task_result_timing(tmp_path: Path) -> None:
         "verification_time_seconds": 2.0,
         "context_retrieval_compaction_time_seconds": 0.75,
     }
+
+
+def test_capability_metrics_reads_task_scorecard(tmp_path: Path) -> None:
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "resolved_count": 1,
+                    "resolved_rate": 1.0,
+                    "total_cost_estimate": 0.42,
+                    "cost_per_resolved": 0.42,
+                    "average_tool_success_rate": 0.75,
+                },
+                "tasks": [
+                    {
+                        "evaluation_metrics": {
+                            "schema_version": "evaluation.metrics/v1",
+                            "cost": {
+                                "cost_estimate": 0.42,
+                                "cost_source": "pricing_table",
+                                "pricing_status": "priced",
+                            },
+                            "efficiency": {
+                                "wall_time_seconds": 3.0,
+                                "provider_time_seconds": 1.0,
+                                "verification_time_seconds": 2.0,
+                            },
+                        }
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert capability_metrics_from_result(result_path) == {
+        "resolved_count": 1,
+        "resolved_rate": 1.0,
+        "total_cost_estimate": 0.42,
+        "cost_per_resolved": 0.42,
+        "average_tool_success_rate": 0.75,
+        "cost_sources": {"pricing_table": 1},
+        "pricing_statuses": {"priced": 1},
+        "task_metrics_count": 1,
+    }
+
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["summary"]["average_tool_success_rate"] = None
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert capability_metrics_from_result(result_path)["average_tool_success_rate"] is None
 
 
 def test_local_gate_pytest_commands_override_default_evaluation_exclusion() -> None:
