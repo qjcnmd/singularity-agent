@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -175,6 +176,10 @@ class InstructionSourceCollector:
 
     def _redact_source(self, source: InstructionSource) -> InstructionSource:
         redacted_content = self.redactor.redact_text(source.content)
+        redacted_content = _escape_placeholder_env_examples(
+            redacted_content,
+            source_type=source.source_type,
+        )
         if redacted_content == source.content:
             return source
         return InstructionSource(
@@ -207,3 +212,30 @@ def _content(payload: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content if content is not None else payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+PLACEHOLDER_ENV_ASSIGNMENT_RE = re.compile(
+    r"(?im)(^|\n)(?P<prefix>\s*(?:\$env:|export\s+|set\s+)?)"
+    r"(?P<key>[A-Z_][A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Z0-9_]*)"
+    r"\s*=\s*(?P<value>\"?\.{3}\"?|'?\.{3}'?|<redacted>|\[redacted\]|present\(redacted\)|present_redacted)"
+)
+
+
+def _escape_placeholder_env_examples(
+    text: str,
+    *,
+    source_type: InstructionSourceType,
+) -> str:
+    if source_type not in {
+        InstructionSourceType.PROJECT_FILE,
+        InstructionSourceType.README,
+    }:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        indentation = re.match(r"\s*", match.group("prefix") or "").group(0)
+        key = match.group("key")
+        return f"{prefix}{indentation}{key} present_redacted"
+
+    return PLACEHOLDER_ENV_ASSIGNMENT_RE.sub(replace, text)

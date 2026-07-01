@@ -38,6 +38,8 @@
 │  │                                          启动恢复时不静默清理              │
 │  ├── SessionHistoryReader.build_resume_context()                             │
 │  │      → 过滤聚合 planner/context/tool/workspace/trace/verification 摘要      │
+│  ├── RecoveryManager.recover(previous context.sqlite3)                        │
+│  │      → pending tool / approval / process / mutation / verification 摘要     │
 │  ├── SessionRecoveryGate.evaluate()                                           │
 │  │      → ready_to_continue / ready_to_resume / needs_review / blocked        │
 │  └── AgentGraphBuilder.build()  (kernel/graph.py)                          │
@@ -1807,11 +1809,12 @@
       → KernelBootstrap.prepare_launch(mode=resume)
       → CrashRecoveryManager.inspect(session_id=session_id)
       → ToolProtocolRecoveryManager.inspect(previous run tool_protocol.sqlite3)
+      → RecoveryManager.recover(previous run context.sqlite3)
       → WorkspaceStateManager.recover_session(session_id)
       → SessionRecoveryGate.evaluate()
       → external user change / rollback conflict / stale lock /
         unfinished mutation journal / leftover sandbox / pending approval /
-        running or pending tool 均写入 trace、session timeline、checkpoint
+        context recovery failed / running or pending tool 均写入 trace、session timeline、checkpoint
         或 final report；默认 fail closed，不盲目覆盖用户外部改动。
 ```
 

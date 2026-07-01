@@ -23,6 +23,14 @@ from singularity.session.models import (
     session_state_for_status,
 )
 
+SESSION_STORE_SCHEMA_VERSION = 1
+
+
+class SessionStoreError(RuntimeError):
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class SessionStore:
     def __init__(self, workspace_root: Path | str) -> None:
@@ -30,10 +38,26 @@ class SessionStore:
         self.state_root = self.workspace_root / ".singularity"
         self.db_path = self.state_root / "session_index.sqlite3"
         self.state_root.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        self._lock = RLock()
-        self._init_schema()
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._connection = connection
+            self._connection.execute("pragma busy_timeout = 5000")
+            self._connection.row_factory = sqlite3.Row
+            self._lock = RLock()
+            self._verify_integrity()
+            self._init_schema()
+        except SessionStoreError:
+            if connection is not None:
+                connection.close()
+            raise
+        except sqlite3.DatabaseError as exc:
+            if connection is not None:
+                connection.close()
+            raise SessionStoreError(
+                f"Session store is corrupt or unreadable: {self.db_path}",
+                code="session_store_corrupt",
+            ) from exc
 
     def close(self) -> None:
         with self._lock:
@@ -402,6 +426,18 @@ class SessionStore:
 
     def _init_schema(self) -> None:
         with self._lock:
+            current_version = int(
+                self._connection.execute("pragma user_version").fetchone()[0]
+            )
+            if current_version > SESSION_STORE_SCHEMA_VERSION:
+                raise SessionStoreError(
+                    (
+                        f"Session store schema {current_version} is newer than "
+                        f"supported version {SESSION_STORE_SCHEMA_VERSION}."
+                    ),
+                    code="session_store_schema_unsupported",
+                )
+            self._connection.execute("pragma journal_mode = wal")
             self._connection.executescript(
                 """
                 create table if not exists sessions(
@@ -450,7 +486,16 @@ class SessionStore:
                 );
                 """
             )
+            if current_version < SESSION_STORE_SCHEMA_VERSION:
+                self._connection.execute(
+                    f"pragma user_version = {SESSION_STORE_SCHEMA_VERSION}"
+                )
             self._connection.commit()
+
+    def _verify_integrity(self) -> None:
+        row = self._connection.execute("pragma quick_check").fetchone()
+        if row is None or row[0] != "ok":
+            raise sqlite3.DatabaseError("session store quick_check failed")
 
 
 def _run_from_row(row: sqlite3.Row) -> SessionRun:

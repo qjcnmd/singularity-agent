@@ -163,6 +163,85 @@ def test_model_runner_allows_env_filename_safety_instruction(tmp_path: Path) -> 
     assert provider.complete_calls == 1
 
 
+def test_model_runner_allows_structured_redacted_env_status(tmp_path: Path) -> None:
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRunnerConfig(allow_remote_provider=True),
+    )
+
+    result = component.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="understanding_task",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[
+                {
+                    "role": "user",
+                    "content": {
+                        "env_status": {
+                            "SINGULARITY_API_KEY": "present_redacted",
+                            "SINGULARITY_MODEL": "present",
+                        }
+                    },
+                }
+            ],
+        )
+    )
+
+    assert result.status == ModelTurnStatus.SUCCESS
+    assert provider.complete_calls == 1
+
+
+def test_model_runner_reports_redacted_export_policy_diagnostics(tmp_path: Path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRunnerConfig(allow_remote_provider=True),
+        trace=trace,
+    )
+
+    result = component.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="understanding_task",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "OPENAI_API_KEY=sk-secret-value should not leave",
+                }
+            ],
+        )
+    )
+
+    failed = next(
+        event
+        for event in trace.store.query_events()
+        if event.event_type.value == "model.request.failed"
+    )
+    diagnostics = failed.payload["error"]["metadata"]["context_export_diagnostics"]
+
+    assert result.status == ModelTurnStatus.INVALID
+    assert provider.complete_calls == 0
+    assert diagnostics["rule"] == "secret_like_content"
+    assert diagnostics["message_index"] == 0
+    assert diagnostics["role"] == "user"
+    assert "text_hash" in diagnostics
+    assert "sk-secret-value" not in str(failed.to_dict())
+
+
 def test_model_runner_build_request_from_context_uses_context_manager(tmp_path: Path) -> None:
     context = ContextManager(system_prompt="system", user_goal="inspect project")
     component = ModelRunner.with_mock_provider(

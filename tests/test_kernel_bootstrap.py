@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from singularity.config import ProductionConfig
+from singularity.context import ContextManager
+from singularity.context.tokens import TokenCounter
 from singularity.kernel.bootstrap import KernelBootstrap
 from singularity.kernel.exceptions import KernelBootstrapError
 from singularity.kernel.graph import AgentGraphBuilder
 from singularity.kernel.models import KernelStatus
+from singularity.planner import Planner
 from singularity.session import SessionRunMode, SessionStatus, SessionStore
 from singularity.tool_protocol.models import ToolCallBatch, ToolCallEnvelope, ToolCallPhase
 from singularity.tool_protocol.state import ToolProtocolStateStore
@@ -204,6 +207,87 @@ def test_kernel_bootstrap_resume_inspects_default_trace_tool_protocol_state(
     assert kernel.recovery_gate_decision is not None
     assert kernel.recovery_gate_decision.can_call_model is False
     assert "pending_tool_call" in kernel.recovery_gate_decision.blockers
+    kernel.shutdown()
+
+
+def test_kernel_bootstrap_resume_inspects_previous_context_recovery_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SINGULARITY_API_KEY", "test")
+    monkeypatch.setenv("SINGULARITY_BASE_URL", "http://localhost/v1")
+    monkeypatch.setenv("SINGULARITY_MODEL", "test-model")
+    previous_trace_dir = tmp_path / "work" / "traces" / "runs" / "run_previous_context"
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="Recover context state",
+        db_path=previous_trace_dir / "context.sqlite3",
+        run_id="run_previous_context",
+        session_id="session_context",
+        task_id="task_context",
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+    context.add_assistant_message(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_pending_context",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        }
+    )
+    context.add_command_observation(
+        {
+            "command_id": "cmd_running",
+            "process_id": "proc_running",
+            "command_preview": "python -m http.server",
+            "exit_code": None,
+            "status": "running",
+            "stdout_preview": "",
+            "stderr_preview": "",
+            "output_ref": None,
+            "resource_limits": {},
+            "policy_decision_id": None,
+        }
+    )
+    context.close()
+    planner = Planner(tmp_path, session_id="session_context", task_id="task_context")
+    planner.start_task("Recover context state")
+    store = SessionStore(tmp_path)
+    store.create_session(
+        session_id="session_context",
+        project_root=tmp_path,
+        user_goal="Recover context state",
+        task_id="task_context",
+    )
+    store.start_run(
+        session_id="session_context",
+        run_id="run_previous_context",
+        task_id="task_context",
+        mode=SessionRunMode.NEW,
+        user_goal="Recover context state",
+        trace_run_dir=previous_trace_dir,
+    )
+    store.finish_run(run_id="run_previous_context", status=SessionStatus.INTERRUPTED)
+    store.close()
+    config = ProductionConfig.from_cli(
+        project_root=tmp_path,
+        dry_run=True,
+        resume_session="session_context",
+        session_run_mode="resume",
+        cli_overrides={"resume_session", "session_run_mode", "dry_run"},
+    )
+
+    kernel = KernelBootstrap(project_root=tmp_path, config=config).boot("Recover context state")
+
+    assert kernel.recovery_gate_decision is not None
+    assert kernel.recovery_gate_decision.can_call_model is False
+    assert "pending_tool_call" in kernel.recovery_gate_decision.blockers
+    assert "running_tool_call" in kernel.recovery_gate_decision.blockers
     kernel.shutdown()
 
 

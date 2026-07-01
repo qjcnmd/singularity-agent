@@ -147,6 +147,46 @@ def test_recovery_gate_blocks_pending_approval_and_pending_tool() -> None:
     assert pending_tool.blockers == ["pending_tool_call"]
 
 
+def test_recovery_gate_blocks_pending_context_tool_and_active_process() -> None:
+    decision = SessionRecoveryGate().evaluate(
+        session_id="session_1",
+        mode="resume",
+        workspace_health=WorkspaceHealthReport(status=WorkspaceHealthStatus.CLEAN),
+        crash_recovery=RecoveryReport(recovered=False),
+        tool_protocol_report={"next_action": "request_model"},
+        context_recovery={
+            "recommended_next_action": "resume_process_observation",
+            "pending_tool_calls": [{"id": "call_pending", "function": {"name": "read_file"}}],
+            "active_process_sessions": ["proc_1"],
+        },
+        planner_state={"status": "interrupted"},
+    )
+
+    assert decision.can_call_model is False
+    assert decision.status == RecoveryGateStatus.BLOCKED
+    assert decision.blockers == ["pending_tool_call", "running_tool_call"]
+
+
+def test_recovery_gate_needs_review_when_context_recovery_inspection_failed() -> None:
+    decision = SessionRecoveryGate().evaluate(
+        session_id="session_1",
+        mode="resume",
+        workspace_health=WorkspaceHealthReport(status=WorkspaceHealthStatus.CLEAN),
+        crash_recovery=RecoveryReport(recovered=False),
+        tool_protocol_report={"next_action": "request_model"},
+        context_recovery={
+            "recommended_next_action": "needs_review",
+            "context_recovery_failed": True,
+            "recovery_warnings": ["context recovery inspect failed: DatabaseError"],
+        },
+        planner_state={"status": "interrupted"},
+    )
+
+    assert decision.can_call_model is False
+    assert decision.status == RecoveryGateStatus.NEEDS_REVIEW
+    assert decision.blockers == ["context_recovery_failed"]
+
+
 def test_resume_context_filters_sensitive_execution_payloads() -> None:
     context = SessionResumeContext.from_sources(
         session_id="session_1",
@@ -170,9 +210,47 @@ def test_resume_context_filters_sensitive_execution_payloads() -> None:
         {"role": "user", "content": "previous instruction"},
         {"role": "assistant", "content": "I changed app.py"},
     ]
-    assert "stdout" not in payload["verification"]
-    assert "raw_args" not in payload["tool_protocol"]
+    assert "planner" not in payload
+    assert "workspace" not in payload
+    assert "verification" not in payload
+    assert "tool_protocol" not in payload
+    assert "failures" not in payload
+    assert "stdout" not in payload["verification_summary"]
+    assert "raw_args" not in payload["tool_protocol_summary"]
     assert "raw secret output" not in str(payload)
+
+
+def test_resume_context_removes_env_assignment_shapes_from_safe_projection() -> None:
+    context = SessionResumeContext.from_sources(
+        session_id="session_1",
+        user_goal="Recover after OPENAI_API_KEY=sk-secret-value",
+        current_instruction="provider status SINGULARITY_API_KEY=present(redacted)",
+        dialogue=[
+            {
+                "role": "assistant",
+                "content": "provider status SINGULARITY_API_KEY=present(redacted)",
+            }
+        ],
+        verification={
+            "provider_env_status": "SINGULARITY_API_KEY=present(redacted); SINGULARITY_MODEL=present",
+            "checks": [{"name": "smoke", "stdout": "OPENAI_API_KEY=sk-secret-value"}],
+        },
+        failures={
+            "summary": "Model turn failed after OPENAI_API_KEY=sk-secret-value appeared in raw diagnostics."
+        },
+    )
+
+    payload = context.to_model_context()
+    dumped = str(payload)
+
+    assert "SINGULARITY_API_KEY=" not in dumped
+    assert "OPENAI_API_KEY=" not in dumped
+    assert "sk-secret-value" not in dumped
+    assert "stdout" not in dumped
+    assert payload["verification_summary"]["provider_env_status"]["SINGULARITY_API_KEY"] == "present_redacted"
+    assert payload["verification_summary"]["provider_env_status"]["SINGULARITY_MODEL"] == "present"
+    assert payload["user_goal"] == "Recover after OPENAI_API_KEY <redacted>"
+    assert payload["current_instruction"] == "provider status SINGULARITY_API_KEY <redacted>"
 
 
 def test_recovery_gate_decision_round_trips_for_trace_and_report() -> None:

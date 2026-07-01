@@ -147,8 +147,11 @@ def test_context_manager_seeds_filtered_session_resume_context(tmp_path: Path) -
     item = context.seed_session_resume_context(
         {
             "session_id": "session_1",
-            "verification": {"last_status": "failed", "stdout": "raw output"},
-            "tool_protocol": {"next_action": "request_model", "raw_args": {"secret": "x"}},
+            "verification_summary": {"last_status": "failed", "stdout": "raw output"},
+            "tool_protocol_summary": {
+                "next_action": "request_model",
+                "raw_args": {"secret": "x"},
+            },
         }
     )
     bundle = context.build_bundle()
@@ -157,3 +160,61 @@ def test_context_manager_seeds_filtered_session_resume_context(tmp_path: Path) -
     assert "stdout" not in str(item.content)
     assert "raw_args" not in str(item.content)
     assert "session_1" in str(bundle.messages)
+
+
+def test_context_manager_session_resume_context_is_safe_for_model_export(
+    tmp_path: Path,
+) -> None:
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="continue",
+        db_path=tmp_path / "context.sqlite3",
+        run_id="run_2",
+        session_id="session_1",
+        task_id="task_1",
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+
+    item = context.seed_session_resume_context(
+        {
+            "session_id": "session_1",
+            "verification_summary": {
+                "provider_env_status": "SINGULARITY_API_KEY=present(redacted); SINGULARITY_MODEL=present",
+                "stdout": "OPENAI_API_KEY=sk-secret-value",
+            },
+            "failure_summary": {
+                "summary": "Previous request failed after OPENAI_API_KEY=sk-secret-value appeared in raw diagnostics."
+            },
+        }
+    )
+    messages = context.build_bundle().messages
+    rendered = "\n".join(str(message.get("content") or "") for message in messages)
+
+    assert "SINGULARITY_API_KEY=" not in rendered
+    assert "OPENAI_API_KEY=" not in rendered
+    assert "sk-secret-value" not in rendered
+    assert "verification" not in item.content
+    assert item.content["verification_summary"]["provider_env_status"]["SINGULARITY_API_KEY"] == "present_redacted"
+    context.close()
+
+
+def test_context_manager_ignores_non_projection_resume_fields(tmp_path: Path) -> None:
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="continue",
+        db_path=tmp_path / "context.sqlite3",
+        run_id="run_2",
+        session_id="session_1",
+        task_id="task_1",
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+
+    item = context.seed_session_resume_context(
+        {
+            "session_id": "session_1",
+            "verification": {"last_status": "failed", "stdout": "raw output"},
+        }
+    )
+
+    assert item.content["verification_summary"] == {}
+    context.close()

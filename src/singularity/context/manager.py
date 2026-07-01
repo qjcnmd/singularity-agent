@@ -336,12 +336,12 @@ class ContextManager:
             session_id=str(payload.get("session_id") or self.session_id),
             user_goal=str(payload.get("user_goal") or self.user_goal),
             current_instruction=str(payload.get("current_instruction") or ""),
-            dialogue=list(payload.get("dialogue_summary") or payload.get("dialogue") or []),
-            planner=dict(payload.get("planner") or {}),
-            workspace=dict(payload.get("workspace") or {}),
-            verification=dict(payload.get("verification") or {}),
-            tool_protocol=dict(payload.get("tool_protocol") or {}),
-            failures=dict(payload.get("failures") or {}),
+            dialogue=list(payload.get("dialogue_summary") or []),
+            planner=dict(payload.get("planner_summary") or {}),
+            workspace=dict(payload.get("workspace_summary") or {}),
+            verification=dict(payload.get("verification_summary") or {}),
+            tool_protocol=dict(payload.get("tool_protocol_summary") or {}),
+            failures=dict(payload.get("failure_summary") or {}),
         )
         item = self._make_item(
             layer=ContextLayer.COMPRESSED_HISTORY,
