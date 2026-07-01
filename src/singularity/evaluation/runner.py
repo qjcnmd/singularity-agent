@@ -163,6 +163,7 @@ class EvaluationTask:
         _permission_profile_for_task(self)
         _approval_policy_for_task(self)
         _network_access_for_task(self)
+        _strategy_max_turns_for_task(self)
         if self.workspace.kind == "repo" and not self.workspace.start_commit and not self.prepare_commands:
             raise ValueError(f"evaluation repo task {self.task_id} requires start_commit or prepare_command.")
 
@@ -584,7 +585,7 @@ class EvaluationRunner:
                 )
             config = ProductionConfig.from_cli(
                 project_root=workspace,
-                max_turns=self.max_turns or adaptive_default_max_turns(task.user_task),
+                max_turns=self.max_turns or _strategy_max_turns_for_task(task) or adaptive_default_max_turns(task.user_task),
                 model=self.model,
                 base_url=self.base_url,
                 env_root=self.env_root,
@@ -1757,6 +1758,19 @@ def _approval_policy_for_task(task: EvaluationTask) -> ApprovalPolicy:
 def _network_access_for_task(task: EvaluationTask) -> NetworkAccess:
     value = str(task.strategy.get("network_access") or "denied").strip().lower()
     return NetworkAccess(value)
+
+
+def _strategy_max_turns_for_task(task: EvaluationTask) -> int | None:
+    raw_value = task.strategy.get("max_turns")
+    if raw_value in (None, ""):
+        return None
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"evaluation task {task.task_id} has invalid strategy.max_turns.") from exc
+    if value <= 0:
+        raise ValueError(f"evaluation task {task.task_id} has invalid strategy.max_turns.")
+    return value
 
 
 def _apply_benchmark_constraints(kernel: Any, task: EvaluationTask) -> None:

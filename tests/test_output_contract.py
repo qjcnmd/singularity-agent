@@ -419,6 +419,37 @@ class TestOutputGuardrailVerificationMissing:
         assert len(errors) >= 1
         assert any(e.code == ERROR_UNSAFE_AUTO_REPAIR for e in errors)
 
+    def test_empty_verification_plan_allowed_for_user_input_blocker(self):
+        guardrail = OutputGuardrail()
+        contract = OutputContract(
+            fields=[
+                FieldSchema("verification_plan", type_=list, required=False, dangerous=True, allow_repair=False),
+            ]
+        )
+        errors = guardrail.check(
+            {
+                "verification_plan": [],
+                "needs_user_input": True,
+                "blocked_reason": "missing required completion evidence",
+            },
+            contract=contract,
+        )
+        assert errors == []
+
+    def test_empty_verification_plan_still_blocked_without_blocked_reason(self):
+        guardrail = OutputGuardrail()
+        contract = OutputContract(
+            fields=[
+                FieldSchema("verification_plan", type_=list, required=False, dangerous=True, allow_repair=False),
+            ]
+        )
+        errors = guardrail.check(
+            {"verification_plan": [], "needs_user_input": True},
+            contract=contract,
+        )
+        assert len(errors) >= 1
+        assert any(e.code == ERROR_UNSAFE_AUTO_REPAIR for e in errors)
+
     def test_non_empty_verification_plan_passes(self):
         guardrail = OutputGuardrail()
         contract = OutputContract(

@@ -3,6 +3,7 @@ from pathlib import Path
 
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
+from singularity.tools.edit import EDIT_APPLY_TIMEOUT_SECONDS, register_edit_tools
 from tests.tool_executor_helpers import make_test_policy_engine
 
 
@@ -46,6 +47,19 @@ def test_read_only_tools_have_stable_runtime_timeout(tmp_path: Path) -> None:
 
     for name in ("list_files", "read_file", "search_text"):
         assert registry.get(name).timeout_seconds >= 10.0
+
+
+def test_edit_apply_budget_covers_review_pipeline(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+    register_edit_tools(registry)
+
+    edit_apply = registry.get("edit_apply")
+
+    assert edit_apply is not None
+    assert edit_apply.timeout_seconds == EDIT_APPLY_TIMEOUT_SECONDS
+    assert edit_apply.timeout_seconds >= 60.0
+    assert edit_apply.uses_edit_executor is True
+    assert edit_apply.uses_mutation_manager is True
 
 
 def test_builtin_read_file_uses_thread_handler_not_process_spawn(tmp_path: Path) -> None:

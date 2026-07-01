@@ -679,6 +679,13 @@ class OutputGuardrail:
             # --- verification_plan / command guardrail ---
             elif schema_field.name in ("verification_plan", "verification_requirements"):
                 if isinstance(value, list) and len(value) == 0:
+                    if (
+                        schema_field.name == "verification_plan"
+                        and payload.get("needs_user_input") is True
+                        and isinstance(payload.get("blocked_reason"), str)
+                        and payload["blocked_reason"].strip()
+                    ):
+                        continue
                     errors.append(
                         OutputParseError(
                             code=ERROR_UNSAFE_AUTO_REPAIR,

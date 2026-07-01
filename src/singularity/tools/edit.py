@@ -17,6 +17,8 @@ from singularity.tools.models import (
 )
 from singularity.workspace import MutationError, MutationResult
 
+EDIT_APPLY_TIMEOUT_SECONDS = 90.0
+
 
 class EditScopeInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -271,7 +273,7 @@ def register_edit_tools(registry: Any, edit_executor: EditExecutor | None = None
             sensitivity=ToolSensitivityLevel.WORKSPACE,
             execution_backend=ToolExecutionBackendKind.DELEGATED_EDIT_EXECUTOR,
             risk_tags=("write", "filesystem", "mutation", "edit_executor"),
-            timeout_seconds=20.0,
+            timeout_seconds=EDIT_APPLY_TIMEOUT_SECONDS,
             max_output_chars=20000,
             cacheable=False,
             idempotent=False,

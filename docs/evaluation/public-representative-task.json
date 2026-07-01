@@ -10,14 +10,14 @@
         "path": "https://github.com/sqlfluff/sqlfluff.git",
         "start_commit": "f1dba0e1dd764ae72d67c3d5e1471cf14d3db030"
       },
-      "user_task": "Fix SQLFluff issue sqlfluff__sqlfluff-2419. Rule L060 currently emits the generic message Use 'COALESCE' instead of 'IFNULL' or 'NVL'. It should emit the specific message Use 'COALESCE' instead of 'IFNULL'. for IFNULL and Use 'COALESCE' instead of 'NVL'. for NVL. Use local search and targeted reads to locate the L060 rule implementation, then apply the smallest focused patch in src/sqlfluff/rules/L060.py so the lint description names the original function with this exact single-quoted wording. Do not rewrite the whole file. After the patch is in place, run the local smoke command once and finish with a final answer.",
+      "user_task": "Fix SQLFluff issue sqlfluff__sqlfluff-2419. Rule L060 currently emits the generic message Use 'COALESCE' instead of 'IFNULL' or 'NVL'. It should emit the specific message Use 'COALESCE' instead of 'IFNULL'. for IFNULL and Use 'COALESCE' instead of 'NVL'. for NVL. Use local search and targeted reads to locate the L060 rule implementation, then apply the smallest focused edit in src/sqlfluff/rules/L060.py so the LintResult description names context.segment.raw_upper with this exact single-quoted wording. Prefer edit_apply with a replace_text operation for the existing return LintResult(context.segment, [fix]) line instead of generating a fragile line-number patch. Do not rewrite the whole file. After the patch is in place, run the local smoke command once and finish with a final answer.",
       "allowed_paths": [
         "src/sqlfluff/rules/L060.py"
       ],
       "allowed_tools": [
         "read_file",
         "search_text",
-        "apply_patch",
+        "edit_apply",
         "run_verification",
         "inspect_diff"
       ],

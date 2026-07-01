@@ -150,6 +150,8 @@ def test_load_public_representative_task_manifest_is_public_swe_bench() -> None:
     ]
     assert task.allowed_paths == ["src/sqlfluff/rules/L060.py"]
     assert task.expected_file_changes == ["src/sqlfluff/rules/L060.py"]
+    assert "edit_apply" in task.allowed_tools
+    assert "workspace_replace_text" not in task.allowed_tools
     assert "test__rules__std_L060_raised" in task.test_patch
     assert "gold_patch" not in task.fixture_metadata
     assert task.hidden_test_patch["source"] == "swe_bench_lite.dev"
@@ -1397,6 +1399,161 @@ def test_evaluation_uses_env_root_for_fixture_workspace_config(
     assert env["sources"]["base_url"] == "env:SINGULARITY_BASE_URL"
     assert env["sources"]["env_file"].replace("\\", "/").endswith("/repo/.env")
     assert "sk-local-test-secret" not in json.dumps(result)
+
+
+def test_evaluation_uses_task_strategy_max_turns(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.strategy_max_turns",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Write done.txt.",
+                    "allowed_paths": ["done.txt"],
+                    "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').exists()\"",
+                    "strategy": {"max_turns": 24},
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+            self.config = kwargs["config"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            assert self.config.max_turns == 24
+            return FakeKernel(self.project_root)
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="strategy_max_turns",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    assert task["reproducible_environment"]["model_profile"]["max_turns"] == 24
+    assert task["evaluation_passed"] is True
+
+
+def test_evaluation_runner_max_turns_overrides_task_strategy(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest = EvaluationTaskSet.from_dict(
+        {
+            "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+            "tasks": [
+                {
+                    "task_id": "fake.runner_max_turns",
+                    "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                    "user_task": "Write done.txt.",
+                    "allowed_paths": ["done.txt"],
+                    "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').exists()\"",
+                    "strategy": {"max_turns": 24},
+                    "success": {"type": "verification_exit_code", "exit_code": 0},
+                }
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+            self.config = kwargs["config"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            assert self.config.max_turns == 7
+            return FakeKernel(self.project_root)
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="runner_max_turns",
+        max_turns=7,
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    assert result["tasks"][0]["reproducible_environment"]["model_profile"]["max_turns"] == 7
 
 
 def test_evaluation_runner_can_drive_real_agent_loop(tmp_path: Path) -> None:
