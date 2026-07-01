@@ -30,6 +30,7 @@ from singularity.kernel.models import (
 )
 from singularity.kernel.recovery import CrashRecoveryManager, RecoveryReport
 from singularity.kernel.shutdown import ShutdownManager, ShutdownSummary
+from singularity.session.models import RecoveryGateDecision, RecoveryGateStatus
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,11 @@ class AgentKernel:
         self.console = console or Console()
         self.recovery_report = recovery_report
         self.health_report = health_report
+        self.recovery_gate_decision: RecoveryGateDecision | None = getattr(
+            graph,
+            "recovery_gate_decision",
+            None,
+        )
         self.shutdown_summary: ShutdownSummary | None = None
         self._final_report: FinalReport | None = None
         self._interaction_report: InteractionFinalReport | None = None
@@ -97,6 +103,11 @@ class AgentKernel:
         self.lifecycle.start_task(user_goal)
         try:
             self.cancellation.throw_if_cancelled()
+            if (
+                self.recovery_gate_decision is not None
+                and not self.recovery_gate_decision.can_call_model
+            ):
+                return self._blocked_by_recovery_gate()
             agent = AgentLoop(
                 model_runner=self.graph.model_runner,
                 tools=self.graph.tools,
@@ -203,6 +214,45 @@ class AgentKernel:
                 raise
             raise
 
+    def _blocked_by_recovery_gate(self) -> RunResult:
+        decision = self.recovery_gate_decision
+        assert decision is not None
+        message = (
+            "Session recovery requires review before the model can continue: "
+            + ", ".join(decision.blockers)
+        )
+        self.lifecycle.mark_blocked(message)
+        self.context.diagnostics.append(
+            {
+                "type": "SessionRecoveryGate",
+                "status": decision.status.value,
+                "blockers": list(decision.blockers),
+                "next_action": decision.next_action,
+            }
+        )
+        if self.graph.planner.state is not None:
+            if decision.status == RecoveryGateStatus.BLOCKED:
+                self.graph.planner.abort("session recovery blocked")
+            else:
+                self.graph.planner.interrupt("session recovery needs review")
+        self.graph.trace.record(
+            "session.recovery_blocked",
+            {
+                "run_id": self.context.identity.run_id,
+                "session_id": self.context.identity.session_id,
+                "task_id": self.context.identity.task_id,
+                **decision.to_dict(),
+            },
+        )
+        self.shutdown(ShutdownReason.BLOCKED)
+        report = self.final_report()
+        return RunResult(
+            final_answer=message,
+            final_report=report,
+            status=RunStatus.BLOCKED,
+            interaction_report=self.interaction_final_report(),
+        )
+
     def cancel(
         self,
         reason: CancellationReason = CancellationReason.SHUTDOWN_REQUESTED,
@@ -308,6 +358,25 @@ class AgentKernel:
             config_summary=self.graph.config.final_report_config_summary(),
             workspace_summary=workspace_health.to_dict(),
             trace_summary=trace_summary,
+            session_summary={
+                "session_id": self.context.identity.session_id,
+                "task_id": self.context.identity.task_id,
+                "run_id": self.context.identity.run_id,
+                "run_mode": self.context.session_run_mode,
+            },
+            checkpoint_summary={
+                "workspace_health": workspace_health.to_dict(),
+                "last_safe_checkpoint": (
+                    self.recovery_gate_decision.resume_context.workspace
+                    if self.recovery_gate_decision is not None
+                    else {}
+                ),
+            },
+            recovery_gate_summary=(
+                self.recovery_gate_decision.to_dict()
+                if self.recovery_gate_decision is not None
+                else {}
+            ),
         )
         self.context.status = KernelStatus.FINALIZED
         self.graph.trace.record("finalization.completed", self._final_report.to_dict())

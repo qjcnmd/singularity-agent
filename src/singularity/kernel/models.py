@@ -170,6 +170,8 @@ class KernelContext:
     workspace_lock_status: str = "not_acquired"
     recovered_previous_run: bool = False
     uncertain_transactions: list[str] = field(default_factory=list)
+    session_run_mode: str = "new"
+    recovery_gate_decision: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -183,6 +185,8 @@ class KernelContext:
             "workspace_lock_status": self.workspace_lock_status,
             "recovered_previous_run": self.recovered_previous_run,
             "uncertain_transactions": self.uncertain_transactions,
+            "session_run_mode": self.session_run_mode,
+            "recovery_gate_decision": self.recovery_gate_decision,
         }
 
 

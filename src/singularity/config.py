@@ -126,6 +126,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "base_url": None,
     "raw_artifacts": False,
     "resume_session": None,
+    "session_run_mode": "new",
     "project_index_enabled": True,
     "project_index_db": None,
     "project_index_build_on_boot": True,
@@ -155,6 +156,7 @@ class ProductionConfig:
     base_url: str | None = None
     raw_artifacts: bool = False
     resume_session: str | None = None
+    session_run_mode: str = "new"
     project_index_enabled: bool = True
     project_index_db: Path | None = None
     project_index_build_on_boot: bool = True
@@ -186,6 +188,7 @@ class ProductionConfig:
         base_url: str | None = None,
         raw_artifacts: bool | None = None,
         resume_session: str | None = None,
+        session_run_mode: str | None = None,
         project_index_enabled: bool | None = None,
         project_index_db: Path | str | None = None,
         project_index_build_on_boot: bool | None = None,
@@ -225,6 +228,7 @@ class ProductionConfig:
             "base_url": base_url,
             "raw_artifacts": raw_artifacts,
             "resume_session": resume_session,
+            "session_run_mode": session_run_mode,
             "project_index_enabled": project_index_enabled,
             "project_index_db": project_index_db,
             "project_index_build_on_boot": project_index_build_on_boot,
@@ -252,6 +256,7 @@ class ProductionConfig:
             "base_url": _optional_str,
             "raw_artifacts": _bool_value,
             "resume_session": _optional_str,
+            "session_run_mode": _session_run_mode,
             "project_index_enabled": _bool_value,
             "project_index_db": _optional_path,
             "project_index_build_on_boot": _bool_value,
@@ -277,6 +282,7 @@ class ProductionConfig:
             "base_url": "SINGULARITY_BASE_URL",
             "raw_artifacts": "SINGULARITY_RAW_ARTIFACTS",
             "resume_session": "SINGULARITY_RESUME_SESSION",
+            "session_run_mode": "SINGULARITY_SESSION_RUN_MODE",
             "project_index_enabled": "SINGULARITY_PROJECT_INDEX_ENABLED",
             "project_index_db": "SINGULARITY_PROJECT_INDEX_DB",
             "project_index_build_on_boot": "SINGULARITY_PROJECT_INDEX_BUILD_ON_BOOT",
@@ -325,6 +331,7 @@ class ProductionConfig:
             base_url=values["base_url"],
             raw_artifacts=values["raw_artifacts"],
             resume_session=values["resume_session"],
+            session_run_mode=values["session_run_mode"],
             project_index_enabled=values["project_index_enabled"],
             project_index_db=values["project_index_db"],
             project_index_build_on_boot=values["project_index_build_on_boot"],
@@ -405,6 +412,7 @@ class ProductionConfig:
             "base_url": self.base_url,
             "raw_artifacts": self.raw_artifacts,
             "resume_session": self.resume_session,
+            "session_run_mode": self.session_run_mode,
             "project_index_enabled": self.project_index_enabled,
             "project_index_db": str(self.project_index_db_path()),
             "project_index_build_on_boot": self.project_index_build_on_boot,
@@ -564,6 +572,13 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _session_run_mode(value: Any) -> str:
+    text = str(value or "new").strip().lower()
+    if text not in {"new", "continue", "resume"}:
+        raise ValueError(f"Invalid session run mode: {value!r}")
+    return text
 
 
 def _optional_path(value: Any) -> Path | None:

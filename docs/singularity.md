@@ -7,8 +7,9 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        CLI 入口 (cli.py:run_goal)                           │
-│         singularity-agent run "task description"                            │
+│                        CLI 入口 (cli.py)                                     │
+│         sg run "task" / sg continue <session_id> "..." / sg resume <id>      │
+│         sg session list / sg session show <session_id> --timeline            │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
                                    ▼
@@ -20,13 +21,25 @@
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│              KernelBootstrap.boot(goal)  (kernel/bootstrap.py:53-167)        │
+│              KernelBootstrap.boot(goal)  (kernel/bootstrap.py)               │
 │                                                                             │
+│  ├── SessionStore.prepare_launch()       → new/continue/resume 解析          │
+│  │   ├── new      → 新 session_id/task_id/run_id                             │
+│  │   ├── continue → 复用 session_id/task_id，新 run_id，追加用户指令           │
+│  │   └── resume   → 复用 session_id/task_id，新 run_id，要求可恢复状态          │
 │  ├── TraceRecorder.create()              → trace run 初始化                  │
 │  ├── RunIdentity.new()                   → run / session / task id          │
+│  ├── SessionStore.start_run()            → session_index.sqlite3 run 行       │
 │  ├── RunLifecycleManager.create_run()    → 生命周期记录                     │
 │  ├── WorkspaceLockManager.acquire_lock() → 工作区文件锁                      │
-│  ├── CrashRecoveryManager.recover()      → 检查并恢复上次崩溃                │
+│  ├── WorkspaceStateManager.begin/recover_session()                           │
+│  ├── CrashRecoveryManager.inspect()      → 只检查 stale lock / unfinished     │
+│  │                                          mutation / leftover sandbox，     │
+│  │                                          启动恢复时不静默清理              │
+│  ├── SessionHistoryReader.build_resume_context()                             │
+│  │      → 过滤聚合 planner/context/tool/workspace/trace/verification 摘要      │
+│  ├── SessionRecoveryGate.evaluate()                                           │
+│  │      → ready_to_continue / ready_to_resume / needs_review / blocked        │
 │  └── AgentGraphBuilder.build()  (kernel/graph.py)                          │
 │      ├── _build_infra()          → InteractionController + WorkspaceState    │
 │      │                             + ProjectIndex + MemoryPipeline           │
@@ -40,7 +53,9 @@
 │      ├── _build_verification()   → VerificationRunner + ReviewPipeline      │
 │      ├── _build_model_context()  → PromptAssemblyPipeline + ModelRunner     │
 │      │                             + ContextManager                         │
+│      │                             + SessionResumeContext(仅 continue/resume)│
 │      ├── _create_planner()       → create_or_resume_planner()               │
+│      │                             + Planner.continue_with_instruction()     │
 │      └── _wire_planner()         → 注入依赖 + attach_producers              │
 │                                                                             │
 │  输出：AgentGraph（22+ 组件完整 wiring）                                     │
@@ -58,7 +73,14 @@
 │  2. lifecycle.start_task(goal)                                              │
 │  3. cancellation.throw_if_cancelled()                                       │
 │                                                                             │
-│  4. 组装 AgentLoop（注入 14 个依赖）                                          │
+│  4. if recovery_gate_decision.can_call_model == False:                      │
+│     ├── trace.record("session.recovery_blocked", decision)                  │
+│     ├── planner.interrupt()/abort()                                         │
+│     ├── shutdown(BLOCKED)                                                   │
+│     └── return RunResult(BLOCKED)                                           │
+│     该分支不创建 AgentLoop、不调用模型、不继续写 workspace。                 │
+│                                                                             │
+│  5. 组装 AgentLoop（注入 14 个依赖）                                          │
 │     agent = AgentLoop(                                                      │
 │         model_runner    = graph.model_runner,                               │
 │         tools           = graph.tools,         # ToolRegistry               │
@@ -75,7 +97,7 @@
 │         strict          = graph.config.strict,                               │
 │     )                                                                       │
 │                                                                             │
-│  5. agent_result = agent.run(user_goal)    ← 进入 AgentLoop（下详）          │
+│  6. agent_result = agent.run(user_goal)    ← 进入 AgentLoop（下详）          │
 │     │                                                                       │
 │     ▼  ★★★ AgentLoopStatus → RunStatus 映射 ★★★                            │
 │     │                                                                       │
@@ -107,7 +129,7 @@
 │        │ result_status     = RunStatus.FAILED                          │    │
 │        └──────────────────────────────────────────────────────────────┘    │
 │                                                                             │
-│  6. shutdown(shutdown_reason) → ShutdownManager.shutdown()                  │
+│  7. shutdown(shutdown_reason) → ShutdownManager.shutdown()                  │
 │     ├── planner.checkpoint()                                                │
 │     ├── model_runner.close()                                                │
 │     ├── command_executor.cleanup()                                          │
@@ -117,18 +139,19 @@
 │     ├── trace.close()                                                       │
 │     └── workspace_lock.release()                                            │
 │                                                                             │
-│  7. final_report() → KernelFinalizer.finalize()                             │
+│  8. final_report() → KernelFinalizer.finalize()                             │
 │     ├── planner.finalize() → FinalReport                                    │
 │     │     ├── VerificationRunner.assess() → VerificationSummary             │
 │     │     ├── ReviewPipeline.assess()     → ReviewSummary                   │
 │     │     └── Finalizer.build()           → FinalReport                     │
 │     ├── workspace_state.get_workspace_health()                              │
 │     ├── trace.final_report_summary(task_id)                                 │
+│     ├── session_summary / checkpoint_summary / recovery_gate_summary         │
 │     ├── lifecycle.summary()                                                 │
 │     ├── memory_pipeline.ingest_session_end(final_reports, trace_summary)    │
 │     └── trace.record("finalization.completed", final_report.to_dict())      │
 │                                                                             │
-│  8. return RunResult(final_answer, final_report, status, interaction_report)│
+│  9. return RunResult(final_answer, final_report, status, interaction_report)│
 │                                                                             │
 │  =======================================================================   │
 │  异常路径（Kernel.run_task 的 try/except 块）                                  │
@@ -184,7 +207,10 @@
 │  ├── context = ContextManager( … )  (如未注入)                               │
 │  │   ├── system_prompt = SYSTEM_PROMPT (类常量，见 agent_loop.py:32-47)       │
 │  │   ├── provider → ContextUsageReporter (仅诊断，不影响执行)                  │
-│  │   └── db_path → context.sqlite3 (ObservationStore, 9 张表)                │
+│  │   ├── db_path → context.sqlite3 (ObservationStore, 9 张表)                │
+│  │   └── continue/resume 时包含 ContextItemType.SESSION_RESUME_CONTEXT       │
+│  │       只含历史摘要、planner 阶段、workspace 分类、工具/验证摘要和失败摘要，  │
+│  │       不回灌 raw trace、raw tool args/result、完整 stdout/stderr。          │
 │  │                                                                          │
 │  ├── tool_schemas = tools.openai_tools(strict=self.strict)                  │
 │  │   → [{"type":"function","function":{name,description,parameters}}, …]    │
@@ -1754,6 +1780,39 @@
     → benchmark fixture 中 simple_patch / multi_file_reasoning /
       failure_repair 的内联 pytest.ini 只禁用 anyio 自动插件；
       completion_gate fixture 和生产项目 pytest 行为不变。
+
+  E5. session 历史打开、继续与中断恢复（统一 session recovery path）
+    sg session list
+      → SessionStore.list_sessions()
+      → 展示 status / updated_at / project_root / last_task_status /
+        sg session show、sg continue、sg resume 可复制命令。
+
+    sg session show <session_id> --timeline
+      → SessionStore.show_session()
+      → SessionHistoryReader.build_show_summary()
+      → 展示 conversation 摘要、planner 状态、workspace checkpoint、
+        tool protocol recovery 摘要、trace/verification 摘要、失败摘要和 timeline。
+
+    sg continue <session_id> "<instruction>"
+      → ProductionConfig(session_run_mode="continue", resume_session=session_id)
+      → KernelBootstrap.prepare_launch(mode=continue)
+      → Planner.resume(session_id)
+      → Planner.continue_with_instruction(instruction)
+      → ContextManager.seed_session_resume_context(filtered summary)
+      → SessionRecoveryGate.evaluate()
+      → gate 放行才进入 AgentLoop.run。
+
+    sg resume <session_id>
+      → ProductionConfig(session_run_mode="resume", resume_session=session_id)
+      → KernelBootstrap.prepare_launch(mode=resume)
+      → CrashRecoveryManager.inspect(session_id=session_id)
+      → ToolProtocolRecoveryManager.inspect(previous run tool_protocol.sqlite3)
+      → WorkspaceStateManager.recover_session(session_id)
+      → SessionRecoveryGate.evaluate()
+      → external user change / rollback conflict / stale lock /
+        unfinished mutation journal / leftover sandbox / pending approval /
+        running or pending tool 均写入 trace、session timeline、checkpoint
+        或 final report；默认 fail closed，不盲目覆盖用户外部改动。
 ```
 
 ---

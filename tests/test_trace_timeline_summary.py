@@ -68,6 +68,25 @@ def test_timeline_and_summary_correlate_interaction_events(tmp_path) -> None:
     assert summary.replan_count == 1
 
 
+def test_session_recovery_events_are_typed_trace_events(tmp_path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
+
+    trace.record(
+        "session.recovery_gate_completed",
+        {
+            "run_id": "run_1",
+            "session_id": "session_1",
+            "task_id": "task_1",
+            "status": "needs_review",
+        },
+    )
+
+    events = trace.store.query_events()
+
+    assert events[-1].event_type == TraceEventType.SESSION_RECOVERY_GATE_COMPLETED
+    assert events[-1].component == "session"
+
+
 def test_timeline_preserves_write_order_for_same_clock_tick(tmp_path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
     timestamp = datetime(2026, 1, 1, tzinfo=UTC)

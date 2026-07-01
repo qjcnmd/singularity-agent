@@ -131,3 +131,29 @@ def test_recovery_returns_process_ids_for_active_process_sessions(tmp_path: Path
 
     assert recovered.active_process_sessions == ["proc_1"]
     assert recovered.recommended_next_action == "resume_process_observation"
+
+
+def test_context_manager_seeds_filtered_session_resume_context(tmp_path: Path) -> None:
+    context = ContextManager(
+        system_prompt="system",
+        user_goal="continue",
+        db_path=tmp_path / "context.sqlite3",
+        run_id="run_2",
+        session_id="session_1",
+        task_id="task_1",
+        token_counter=TokenCounter(model="gpt-4o-mini"),
+    )
+
+    item = context.seed_session_resume_context(
+        {
+            "session_id": "session_1",
+            "verification": {"last_status": "failed", "stdout": "raw output"},
+            "tool_protocol": {"next_action": "request_model", "raw_args": {"secret": "x"}},
+        }
+    )
+    bundle = context.build_bundle()
+
+    assert item.item_type.value == "session_resume_context"
+    assert "stdout" not in str(item.content)
+    assert "raw_args" not in str(item.content)
+    assert "session_1" in str(bundle.messages)

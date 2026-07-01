@@ -332,6 +332,14 @@ class TraceRecorder:
             "recovery.detected",
             "recovery.completed",
             "finalization.completed",
+            "session.created",
+            "session.continue_requested",
+            "session.resume_requested",
+            "session.recovery_gate_started",
+            "session.recovery_gate_completed",
+            "workspace.checkpoint_created",
+            "workspace.conflict_detected",
+            "session.recovery_blocked",
         }:
             event_map = {
                 "kernel.boot.started": TraceEventType.KERNEL_BOOT_STARTED,
@@ -345,9 +353,18 @@ class TraceRecorder:
                 "recovery.detected": TraceEventType.RECOVERY_DETECTED,
                 "recovery.completed": TraceEventType.RECOVERY_COMPLETED,
                 "finalization.completed": TraceEventType.FINALIZATION_COMPLETED,
+                "session.created": TraceEventType.SESSION_CREATED,
+                "session.continue_requested": TraceEventType.SESSION_CONTINUE_REQUESTED,
+                "session.resume_requested": TraceEventType.SESSION_RESUME_REQUESTED,
+                "session.recovery_gate_started": TraceEventType.SESSION_RECOVERY_GATE_STARTED,
+                "session.recovery_gate_completed": TraceEventType.SESSION_RECOVERY_GATE_COMPLETED,
+                "workspace.checkpoint_created": TraceEventType.WORKSPACE_CHECKPOINT_CREATED,
+                "workspace.conflict_detected": TraceEventType.WORKSPACE_CONFLICT_DETECTED,
+                "session.recovery_blocked": TraceEventType.SESSION_RECOVERY_BLOCKED,
             }
             severity = TraceSeverity.ERROR if event.endswith(".failed") else TraceSeverity.INFO
-            return event_map[event], "kernel", event, severity, ids
+            component = "workspace" if event.startswith("workspace.") else "session" if event.startswith("session.") else "kernel"
+            return event_map[event], component, event, severity, ids
         if event == "lifecycle":
             lifecycle_type = str(data.get("event_type") or "")
             event_map = {

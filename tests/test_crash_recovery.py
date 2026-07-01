@@ -88,3 +88,50 @@ def test_crash_recovery_collects_and_cleans_mutation_sandbox_and_process_records
     assert command.stopped == ["proc_1"]
     assert not sandbox_root.exists()
     assert (journal.parent / "recovered.json").exists()
+
+
+def test_crash_recovery_inspect_does_not_cleanup_or_mark_recovered(tmp_path: Path) -> None:
+    journal = tmp_path / ".singularity" / "journals" / "tx_journal" / "journal.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text('{"transaction_id":"tx_journal"}\n', encoding="utf-8")
+    sandbox_root = tmp_path / "work" / "sandboxes" / "sandbox_leftover"
+    sandbox_root.mkdir(parents=True)
+    command = Command()
+
+    report = CrashRecoveryManager(
+        workspace_state=WorkspaceState(tmp_path),
+        sandbox=Sandbox(tmp_path),
+        command=command,
+    ).inspect()
+
+    assert report.recovered is True
+    assert sorted(report.unfinished_mutations) == ["tx_journal", "tx_workspace"]
+    assert report.leftover_sandboxes == [str(sandbox_root)]
+    assert report.process_records == ["proc_1"]
+    assert command.stopped == []
+    assert sandbox_root.exists()
+    assert not (journal.parent / "recovered.json").exists()
+
+
+def test_crash_recovery_inspects_requested_workspace_session() -> None:
+    class WorkspaceStateWithSessions:
+        def __init__(self) -> None:
+            self.requested: list[str | None] = []
+
+        def recover_session(self, session_id: str | None = None):
+            self.requested.append(session_id)
+            return {
+                "status": "recoverable",
+                "session_id": session_id,
+                "incomplete_transactions": [f"tx_{session_id}"],
+            }
+
+    workspace = WorkspaceStateWithSessions()
+
+    report = CrashRecoveryManager(workspace_state=workspace).inspect(
+        session_id="session_target"
+    )
+
+    assert workspace.requested == ["session_target"]
+    assert report.workspace_recovery["session_id"] == "session_target"
+    assert report.unfinished_mutations == ["tx_session_target"]

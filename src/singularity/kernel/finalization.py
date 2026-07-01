@@ -30,6 +30,9 @@ class FinalReport:
     component_health_summary: dict[str, Any] = field(default_factory=dict)
     shutdown_summary: dict[str, Any] = field(default_factory=dict)
     recovery_summary: dict[str, Any] = field(default_factory=dict)
+    session_summary: dict[str, Any] = field(default_factory=dict)
+    checkpoint_summary: dict[str, Any] = field(default_factory=dict)
+    recovery_gate_summary: dict[str, Any] = field(default_factory=dict)
     lifecycle_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -55,6 +58,9 @@ class FinalReport:
             "component_health_summary": self.component_health_summary,
             "shutdown_summary": self.shutdown_summary,
             "recovery_summary": self.recovery_summary,
+            "session_summary": self.session_summary,
+            "checkpoint_summary": self.checkpoint_summary,
+            "recovery_gate_summary": self.recovery_gate_summary,
             "lifecycle_summary": self.lifecycle_summary,
         }
 
@@ -78,6 +84,9 @@ class KernelFinalizer:
         config_summary: dict[str, Any] | None = None,
         workspace_summary: dict[str, Any] | None = None,
         trace_summary: dict[str, Any] | None = None,
+        session_summary: dict[str, Any] | None = None,
+        checkpoint_summary: dict[str, Any] | None = None,
+        recovery_gate_summary: dict[str, Any] | None = None,
     ) -> FinalReport:
         context.status = type(context.status).FINALIZED
         planner_payload = _to_dict(planner_report)
@@ -104,6 +113,9 @@ class KernelFinalizer:
             component_health_summary=component_health_summary or {},
             shutdown_summary=shutdown_payload,
             recovery_summary=recovery_summary or {},
+            session_summary=session_summary or {},
+            checkpoint_summary=checkpoint_summary or {},
+            recovery_gate_summary=recovery_gate_summary or {},
             lifecycle_summary=lifecycle_summary or {},
         )
         redacted = self.redactor.redact_payload(report.to_dict())

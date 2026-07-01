@@ -37,6 +37,7 @@ CORE_DOC_IDS = {
     "sandbox-isolation",
     "memory-index-context",
     "artifact-long-result-handling",
+    "session-recovery",
 }
 
 REQUIRED_HEADINGS = {
@@ -259,6 +260,16 @@ COMPLETE_FIELD_CHECKS = {
     },
     "artifact-long-result-handling": {
         "TraceArtifact",
+    },
+    "session-recovery": {
+        "RecoveryGateDecision",
+        "SessionCheckpoint",
+        "SessionDetail",
+        "SessionLaunch",
+        "SessionResumeContext",
+        "SessionRun",
+        "SessionSummary",
+        "SessionTimelineEvent",
     },
 }
 

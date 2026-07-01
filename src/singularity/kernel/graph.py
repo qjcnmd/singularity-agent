@@ -32,6 +32,7 @@ from singularity.plugins import PluginManager
 from singularity.policy import ApprovalGate, PolicyConfig, PolicyEngine
 from singularity.review import ReviewPipeline
 from singularity.sandbox import SandboxManager
+from singularity.session.models import RecoveryGateDecision
 from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tool_protocol.state import ToolProtocolStateStore
 from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
@@ -151,6 +152,7 @@ class AgentGraph:
     tool_executor: ToolExecutor
     tool_protocol: ToolProtocolEngine
     planner: Planner
+    recovery_gate_decision: RecoveryGateDecision | None = None
     initialization_order: list[ComponentName] = field(
         default_factory=lambda: list(AGENT_COMPONENT_INITIALIZATION_ORDER)
     )
@@ -263,6 +265,7 @@ class AgentGraphBuilder:
         identity: RunIdentity,
         user_goal: str,
         workspace_health: WorkspaceHealthReport | None = None,
+        recovery_gate_decision: RecoveryGateDecision | None = None,
         interaction_controller: InteractionController | None = None,
     ) -> AgentGraph:
         components = {
@@ -326,6 +329,7 @@ class AgentGraphBuilder:
                 tool_protocol=tool_protocol,
                 verification_review=verification_review,
                 marker=marker,
+                recovery_gate_decision=recovery_gate_decision,
             )
             planner = self._create_planner(
                 project_root=project_root,
@@ -349,6 +353,7 @@ class AgentGraphBuilder:
             self._prime_planner_context(
                 user_goal=user_goal,
                 planner=planner,
+                recovery_gate_decision=recovery_gate_decision,
                 project_index=infra.project_index,
                 memory_pipeline=infra.memory_pipeline,
                 context_manager=model_context.context_manager,
@@ -377,6 +382,7 @@ class AgentGraphBuilder:
                 tool_executor=tool_protocol.tool_executor,
                 tool_protocol=tool_protocol.tool_protocol,
                 planner=planner,
+                recovery_gate_decision=recovery_gate_decision,
                 components=components,
                 _evaluation_harness_factory=self._evaluation_harness_factory(
                     project_root=project_root,
@@ -636,6 +642,7 @@ class AgentGraphBuilder:
         tool_protocol: _ToolProtocolEngines,
         verification_review: _VerificationReviewPipelines,
         marker: _ComponentMarker,
+        recovery_gate_decision: RecoveryGateDecision | None = None,
     ) -> _ModelContextComponents:
         prompt_assembly = PromptAssemblyPipeline(workspace_root=project_root, trace=trace)
         marker.mark(ComponentName.INSTRUCTIONS)
@@ -670,6 +677,10 @@ class AgentGraphBuilder:
             db_path=config.context_db_path(trace.store.run_dir),
             trace=trace,
         )
+        if recovery_gate_decision is not None and recovery_gate_decision.mode != "new":
+            context_manager.seed_session_resume_context(
+                recovery_gate_decision.resume_context.to_model_context()
+            )
         execution_core.edit_executor.context_manager = context_manager
         marker.mark(ComponentName.CONTEXT)
 
@@ -698,6 +709,7 @@ class AgentGraphBuilder:
             trace=trace,
             workspace_health=workspace_health or workspace_state_manager.get_workspace_health(),
             fallback_session_id=identity.session_id,
+            session_run_mode=config.session_run_mode,
         )
 
     @staticmethod
@@ -758,6 +770,7 @@ class AgentGraphBuilder:
         *,
         user_goal: str,
         planner: Planner,
+        recovery_gate_decision: RecoveryGateDecision | None,
         project_index: ProjectIndex,
         memory_pipeline: MemoryLearningPipeline,
         context_manager: ContextManager,

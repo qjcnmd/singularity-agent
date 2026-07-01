@@ -28,6 +28,7 @@ from singularity.planner.models import (
     TaskPlan,
     TaskState,
     TaskStatus,
+    _now,
 )
 from singularity.planner.policy import (
     DIFF_TOOLS,
@@ -1586,6 +1587,32 @@ class Planner:
         self._record_event(decision="resume", reason="Planner state resumed.")
         return self
 
+    def continue_with_instruction(self, instruction: str) -> TaskState:
+        self._throw_if_cancelled()
+        state = self._state()
+        normalized = " ".join(instruction.split())
+        revision = {
+            "source": "session_continue",
+            "instruction": instruction,
+            "revised_goal": (
+                f"{state.effective_goal or state.normalized_goal}\n"
+                f"Additional instruction: {normalized}"
+            ),
+            "timestamp": _now(),
+        }
+        state.goal_revisions.append(revision)
+        state.effective_goal = str(revision["revised_goal"])
+        if state.status in {TaskStatus.COMPLETED, TaskStatus.INTERRUPTED}:
+            state.status = TaskStatus.RECOVERING
+        state.touch()
+        self._persist()
+        self._record_event(
+            decision="session_continue",
+            reason="User appended an instruction to this session.",
+            extra={"goal_revision": revision},
+        )
+        return state
+
     def abort(self, reason: str = "aborted") -> TaskState:
         self._throw_if_cancelled()
         state = self._state()
@@ -2489,6 +2516,7 @@ def create_or_resume_planner(
     trace: TraceRecorderProtocol | None,
     workspace_health: Any,
     fallback_session_id: str | None = None,
+    session_run_mode: str = "new",
 ) -> Planner:
     planner = Planner(
         workspace_root,
@@ -2497,7 +2525,33 @@ def create_or_resume_planner(
         trace=trace,
     )
     if session_id:
-        return planner.resume(session_id, workspace_health=workspace_health.to_dict())
+        try:
+            planner.resume(session_id, workspace_health=workspace_health.to_dict())
+        except FileNotFoundError:
+            planner.session_id = session_id
+            planner.task_id = task_id
+            normalized_goal = " ".join(user_goal.split())
+            planner.state = TaskState(
+                task_id=task_id,
+                session_id=session_id,
+                user_goal=user_goal,
+                normalized_goal=normalized_goal,
+                effective_goal=normalized_goal,
+                status=TaskStatus.NEEDS_REVIEW,
+                current_phase="inspecting_workspace",
+                blocked_reasons=["planner state missing during session recovery"],
+            )
+            planner.plan = planner._default_plan(task_id)
+            planner.evidence = EvidenceLedger()
+            planner.budget = ExecutionBudget()
+            planner._persist()
+            planner._record_event(
+                decision="resume_failed",
+                reason="Planner state missing during session recovery.",
+            )
+        if session_run_mode == "continue":
+            planner.continue_with_instruction(user_goal)
+        return planner
     planner.start_task(user_goal)
     return planner
 

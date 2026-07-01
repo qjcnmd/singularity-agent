@@ -21,6 +21,7 @@ MODULE_DOCS = {
     "plugin-tools-registry.md",
     "policy-approval-gates.md",
     "sandbox-isolation.md",
+    "session-recovery.md",
     "tool-execution.md",
     "tool-registry-exposure.md",
     "trace-observation-audit-events.md",

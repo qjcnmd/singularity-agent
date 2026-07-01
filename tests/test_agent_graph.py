@@ -18,6 +18,11 @@ from singularity.model import ModelMessage, ModelTurnResult, ModelTurnStatus
 from singularity.observability import TraceRecorder
 from singularity.planner.models import TaskState
 from singularity.policy.permissions import ApprovalPolicy
+from singularity.session import (
+    RecoveryGateDecision,
+    RecoveryGateStatus,
+    SessionResumeContext,
+)
 
 
 def test_agent_graph_initializes_components_in_declared_order(tmp_path: Path, monkeypatch) -> None:
@@ -299,6 +304,63 @@ def test_graph_kernel_agentloop_model_request_chain_uses_built_components(
     assert request_ids[0].startswith("model_req_")
     events = graph.trace.store.query_events()
     assert any(event.event_type.value == "final_report.completed" for event in events)
+
+
+def test_agent_kernel_blocks_before_model_when_recovery_gate_requires_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    decision = RecoveryGateDecision(
+        session_id="session_gate",
+        mode="resume",
+        status=RecoveryGateStatus.NEEDS_REVIEW,
+        can_call_model=False,
+        blockers=["external_user_change"],
+        warnings=[],
+        next_action="run sg session show session_gate --timeline",
+        resume_context=SessionResumeContext(
+            session_id="session_gate",
+            workspace={"external_changes": ["README.md"]},
+        ),
+    )
+    graph = _build_graph(tmp_path, monkeypatch, user_goal="Recover session")
+    graph.recovery_gate_decision = decision
+    identity = RunIdentity.new(
+        run_id=graph.trace.run_id,
+        session_id="session_gate",
+        task_id="task_gate",
+    )
+    lifecycle = RunLifecycleManager(identity=identity, trace=graph.trace)
+    context = KernelContext(
+        project_root=tmp_path,
+        identity=identity,
+        run=lifecycle.create_run("Recover session"),
+        session=lifecycle.start_session(),
+        status=KernelStatus.READY,
+        workspace_lock_status="acquired",
+        recovery_gate_decision=decision.to_dict(),
+    )
+
+    class Lock:
+        def release_lock(self) -> None:
+            pass
+
+    result = AgentKernel(
+        context=context,
+        graph=graph,
+        lifecycle=lifecycle,
+        workspace_lock=Lock(),
+    ).run_task("Recover session")
+
+    assert result.status.value == "blocked"
+    assert result.final_report.recovery_gate_summary["status"] == "needs_review"
+    assert result.final_report.recovery_gate_summary["can_call_model"] is False
+    assert "external_user_change" in result.final_answer
+    assert not [
+        event
+        for event in graph.trace.store.query_events()
+        if event.event_type.value == "model_request.created"
+    ]
 
 
 def test_component_health_reports_missing_evaluation_as_critical() -> None:

@@ -54,9 +54,13 @@ from singularity.release.repair import (
 )
 from singularity.sandbox import SandboxManager, WindowsSandboxBackend
 from singularity.sandbox.windows import sandbox_exception_diagnostics
+from singularity.session.history import SessionHistoryReader
+from singularity.session.models import SessionCheckpointKind, SessionRunMode, SessionStatus
+from singularity.session.store import SessionStore
 from singularity.verification import VerificationRunner
 from singularity.workspace_state import (
     WorkspaceHealthReport,
+    WorkspaceHealthStatus,
 )
 
 
@@ -82,6 +86,7 @@ app = typer.Typer(
     help="production-oriented local CLI coding agent harness",
 )
 trace_app = typer.Typer(add_completion=False, no_args_is_help=True)
+session_app = typer.Typer(add_completion=False, no_args_is_help=True)
 index_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_app = typer.Typer(add_completion=False, no_args_is_help=True)
 eval_task_app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -93,6 +98,7 @@ eval_report_app = typer.Typer(add_completion=False, no_args_is_help=True)
 system_app = typer.Typer(add_completion=False, no_args_is_help=True)
 sandbox_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(trace_app, name="trace")
+app.add_typer(session_app, name="session")
 app.add_typer(index_app, name="index")
 app.add_typer(git_app, name="git")
 app.add_typer(approval_app, name="approval")
@@ -378,6 +384,7 @@ def run_goal(
         base_url=base_url,
         raw_artifacts=raw_artifacts,
         resume_session=resume_session,
+        session_run_mode="resume" if resume_session else "new",
         project_index_enabled=project_index_enabled,
         project_index_db=project_index_db,
         project_index_build_on_boot=project_index_build_on_boot,
@@ -387,6 +394,7 @@ def run_goal(
                 "max_turns",
                 "profile",
                 "resume_session",
+                "session_run_mode",
                 "project_index_enabled",
                 "project_index_db",
                 "project_index_build_on_boot",
@@ -405,15 +413,54 @@ def run_goal(
             ]
         ),
     )
+    _run_with_config(goal=goal, project_root=project_root, production_config=production_config)
+
+
+def _run_with_config(
+    *,
+    goal: str,
+    project_root: Path,
+    production_config: ProductionConfig,
+) -> None:
     kernel = None
     renderer = RichCliRenderer(console)
+    session_store = SessionStore(project_root)
     try:
         kernel = KernelBootstrap(
             project_root=project_root,
             config=production_config,
             console=console,
         ).boot(goal)
-        kernel.graph.trace.record(
+        identity = getattr(getattr(kernel, "context", None), "identity", None)
+        run_id = str(getattr(identity, "run_id", "run_unknown"))
+        session_id = str(getattr(identity, "session_id", run_id))
+        task_id = str(getattr(identity, "task_id", session_id))
+        trace_run_dir = _trace_run_dir(kernel)
+        if session_store.load_run(run_id) is None:
+            session_store.create_session(
+                session_id=session_id,
+                project_root=project_root,
+                user_goal=goal,
+                task_id=task_id,
+            )
+            session_store.start_run(
+                session_id=session_id,
+                run_id=run_id,
+                task_id=task_id,
+                mode=SessionRunMode(production_config.session_run_mode),
+                user_goal=goal,
+                trace_run_dir=trace_run_dir,
+            )
+            session_store.append_timeline_event(
+                session_id=session_id,
+                run_id=run_id,
+                task_id=task_id,
+                event_type="session.run_started",
+                summary=f"Session run started in {production_config.session_run_mode} mode.",
+                payload={"trace_run_dir": str(trace_run_dir)},
+            )
+        _trace_record(
+            kernel,
             "user_goal",
             {
                 "goal": goal,
@@ -434,24 +481,141 @@ def run_goal(
                 "project_index_enabled": production_config.project_index_enabled,
             },
         )
-        console.print(f"[bold]run_id[/bold] {kernel.context.identity.run_id}")
-        console.print(f"[bold]trace[/bold] {kernel.graph.trace.store.run_dir}")
-        if kernel.recovery_report and kernel.recovery_report.recovered:
+        console.print(f"[bold]run_id[/bold] {run_id}")
+        console.print(f"[bold]session_id[/bold] {session_id}")
+        console.print(f"[bold]trace[/bold] {trace_run_dir}")
+        _print_session_commands(session_id)
+        recovery_gate_decision = getattr(kernel, "recovery_gate_decision", None)
+        if recovery_gate_decision is not None:
+            decision_payload = recovery_gate_decision.to_dict()
+            session_store.record_checkpoint(
+                session_id=session_id,
+                run_id=run_id,
+                task_id=task_id,
+                kind=SessionCheckpointKind.RECOVERY_GATE,
+                summary=f"Recovery gate {decision_payload['status']}.",
+                payload=decision_payload,
+            )
+            session_store.append_timeline_event(
+                session_id=session_id,
+                run_id=run_id,
+                task_id=task_id,
+                event_type="session.recovery_gate_completed",
+                summary=f"Recovery gate {decision_payload['status']}.",
+                payload=decision_payload,
+            )
+        if getattr(kernel, "recovery_report", None) and kernel.recovery_report.recovered:
             console.print(
                 "[yellow]workspace recovery[/yellow] "
                 + json_dumps(kernel.recovery_report.to_dict())
             )
-        if kernel.graph.workspace_state.baseline is not None:
-            baseline = kernel.graph.workspace_state.baseline
+        workspace_state = getattr(getattr(kernel, "graph", None), "workspace_state", None)
+        if workspace_state is not None and getattr(workspace_state, "baseline", None) is not None:
+            baseline = workspace_state.baseline
             console.print(
                 f"[bold]workspace baseline[/bold] {baseline.baseline_id} "
                 f"files={len(baseline.snapshots)}"
             )
+            session_store.record_checkpoint(
+                session_id=session_id,
+                run_id=run_id,
+                task_id=task_id,
+                kind=SessionCheckpointKind.WORKSPACE,
+                summary="Workspace baseline captured.",
+                payload={
+                    "baseline_id": baseline.baseline_id,
+                    "snapshot_count": len(baseline.snapshots),
+                },
+            )
+            _trace_record(
+                kernel,
+                "workspace.checkpoint_created",
+                {
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "baseline_id": baseline.baseline_id,
+                    "snapshot_count": len(baseline.snapshots),
+                },
+            )
         result = kernel.run_task(goal)
         final_answer = result.final_answer
         final_report = result.final_report
-        final_health = kernel.graph.workspace_state.get_workspace_health()
+        final_health = (
+            workspace_state.get_workspace_health()
+            if workspace_state is not None and hasattr(workspace_state, "get_workspace_health")
+            else WorkspaceHealthReport(status=WorkspaceHealthStatus.UNKNOWN)
+        )
+        if final_health.external_changes or final_health.rollback_conflicts:
+            conflict_payload = final_health.to_dict()
+            session_store.append_timeline_event(
+                session_id=session_id,
+                run_id=run_id,
+                task_id=task_id,
+                event_type="workspace.conflict_detected",
+                summary="Workspace conflict detected after run.",
+                payload=conflict_payload,
+            )
+            _trace_record(
+                kernel,
+                "workspace.conflict_detected",
+                {
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    **conflict_payload,
+                },
+            )
+        session_store.finish_run(
+            run_id=run_id,
+            status=_session_status_from_run_status(
+                result.status,
+                recovery_gate_decision=recovery_gate_decision,
+            ),
+            final_report_ref=str(trace_run_dir / "final_report.json"),
+            summary={"final_answer": final_answer[:1000]},
+        )
+        session_store.append_timeline_event(
+            session_id=session_id,
+            run_id=run_id,
+            task_id=task_id,
+            event_type="session.run_finished",
+            summary=(
+                "Session run finished with "
+                f"{_session_status_from_run_status(result.status, recovery_gate_decision=recovery_gate_decision).value}."
+            ),
+            payload={
+                "final_report": final_report.to_dict() if hasattr(final_report, "to_dict") else {},
+                "workspace_health": final_health.to_dict(),
+            },
+        )
     except Exception as exc:
+        session_id_from_error: str | None = None
+        details = getattr(exc, "details", None)
+        if isinstance(details, dict):
+            session_id_from_error = details.get("session_id")
+        if kernel is not None:
+            identity = getattr(getattr(kernel, "context", None), "identity", None)
+            if identity is not None:
+                run_id = str(getattr(identity, "run_id", "run_unknown"))
+                session_id = str(getattr(identity, "session_id", run_id))
+                task_id = str(getattr(identity, "task_id", session_id))
+                session_store.finish_run(
+                    run_id=run_id,
+                    status=SessionStatus.CANCELLED if isinstance(exc, CancellationError) else SessionStatus.FAILED,
+                    summary={"error_type": type(exc).__name__, "message": _REDACTOR.redact_text(str(exc))},
+                )
+                session_store.append_timeline_event(
+                    session_id=session_id,
+                    run_id=run_id,
+                    task_id=task_id,
+                    event_type="session.run_failed",
+                    summary=f"Session run failed with {type(exc).__name__}.",
+                    payload={"message": _REDACTOR.redact_text(str(exc))},
+                )
+                _print_session_commands(session_id)
+        elif session_id_from_error:
+            _print_session_commands(str(session_id_from_error))
         if isinstance(exc, CancellationError):
             console.print(f"[yellow]cancelled[/yellow] {_REDACTOR.redact_text(str(exc))}")
         else:
@@ -478,6 +642,7 @@ def run_goal(
         close_resources = getattr(kernel, "close_resources", None) if kernel is not None else None
         if callable(close_resources):
             close_resources()
+        session_store.close()
         raise typer.Exit(1) from exc
 
     try:
@@ -491,6 +656,7 @@ def run_goal(
         close_resources = getattr(kernel, "close_resources", None) if kernel is not None else None
         if callable(close_resources):
             close_resources()
+        session_store.close()
 
 
 @app.command("version")
@@ -753,6 +919,151 @@ def workspace_health_summary(health: WorkspaceHealthReport) -> str:
         f"recommended_next_action: {payload['recommended_next_action']}",
     ]
     return "\n".join(lines)
+
+
+def _print_session_commands(session_id: str) -> None:
+    console.print(f"[bold]session show[/bold] sg session show {session_id}")
+    console.print(f"[bold]continue[/bold] sg continue {session_id} \"<new instruction>\"")
+    console.print(f"[bold]resume[/bold] sg resume {session_id}")
+
+
+def _trace_run_dir(kernel: Any) -> Path:
+    run_dir = getattr(getattr(getattr(getattr(kernel, "graph", None), "trace", None), "store", None), "run_dir", None)
+    return Path(run_dir) if run_dir is not None else Path("work") / "traces" / "runs" / "unknown"
+
+
+def _trace_record(kernel: Any, event: str, payload: dict[str, Any]) -> None:
+    trace = getattr(getattr(kernel, "graph", None), "trace", None)
+    record = getattr(trace, "record", None)
+    if callable(record):
+        record(event, payload)
+
+
+def _session_status_from_run_status(
+    status: Any,
+    *,
+    recovery_gate_decision: Any | None = None,
+) -> SessionStatus:
+    value = str(getattr(status, "value", status))
+    if value == "blocked" and recovery_gate_decision is not None:
+        can_call_model = bool(getattr(recovery_gate_decision, "can_call_model", True))
+        gate_status = getattr(recovery_gate_decision, "status", "")
+        gate_status_value = str(getattr(gate_status, "value", gate_status))
+        if not can_call_model or gate_status_value == "needs_review":
+            return SessionStatus.NEEDS_REVIEW
+    mapping = {
+        "completed": SessionStatus.COMPLETED,
+        "blocked": SessionStatus.BLOCKED,
+        "failed": SessionStatus.FAILED,
+        "cancelled": SessionStatus.INTERRUPTED,
+    }
+    return mapping.get(value, SessionStatus.FAILED)
+
+
+@session_app.command("list")
+def session_list(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
+) -> None:
+    """List resumable Singularity sessions."""
+
+    root = resolve_project_root(project_root)
+    store = SessionStore(root)
+    try:
+        sessions = store.list_sessions()
+    finally:
+        store.close()
+    payload = [session.to_dict() for session in sessions]
+    if json_output:
+        _write_stdout(json_dumps(payload))
+        return
+    if not sessions:
+        console.print("No sessions found.")
+        return
+    for session in sessions:
+        console.print(
+            f"{session.session_id} {session.status.value} updated={session.updated_at} "
+            f"project={session.project_root}"
+        )
+        console.print(f"  {session.show_command}")
+        console.print(f"  {session.continue_command}")
+        console.print(f"  {session.resume_command}")
+
+
+@session_app.command("show")
+def session_show(
+    session_id: str,
+    timeline: Annotated[bool, typer.Option("--timeline", help="Include timeline events.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON.")] = False,
+    project_root: ProjectRootOption = None,
+) -> None:
+    """Show one Singularity session."""
+
+    root = resolve_project_root(project_root)
+    store = SessionStore(root)
+    try:
+        detail = store.show_session(session_id)
+    finally:
+        store.close()
+    payload = detail.to_dict()
+    payload["history_summary"] = SessionHistoryReader(root).build_show_summary(session_id)
+    if not timeline:
+        payload["timeline"] = []
+    if json_output:
+        _write_stdout(json_dumps(payload))
+        return
+    console.print(Panel(json_dumps(payload), title=f"session {session_id}"))
+
+
+@app.command("continue")
+def continue_session(
+    session_id: str,
+    instruction: str,
+    project_root: ProjectRootOption = None,
+) -> None:
+    """Append a new instruction to a previous session."""
+
+    root = resolve_project_root(project_root)
+    store = SessionStore(root)
+    try:
+        summary = store.load_session(session_id)
+    finally:
+        store.close()
+    if summary is None:
+        raise typer.BadParameter(f"Unknown session: {session_id}")
+    config = ProductionConfig.from_cli(
+        project_root=root,
+        resume_session=session_id,
+        session_run_mode="continue",
+        default_max_turns=adaptive_default_max_turns(instruction),
+        cli_overrides={"resume_session", "session_run_mode"},
+    )
+    _run_with_config(goal=instruction, project_root=root, production_config=config)
+
+
+@app.command("resume")
+def resume_session_command(
+    session_id: str,
+    project_root: ProjectRootOption = None,
+) -> None:
+    """Resume an interrupted Singularity session."""
+
+    root = resolve_project_root(project_root)
+    store = SessionStore(root)
+    try:
+        summary = store.load_session(session_id)
+    finally:
+        store.close()
+    if summary is None:
+        raise typer.BadParameter(f"Unknown session: {session_id}")
+    config = ProductionConfig.from_cli(
+        project_root=root,
+        resume_session=session_id,
+        session_run_mode="resume",
+        default_max_turns=adaptive_default_max_turns(summary.user_goal),
+        cli_overrides={"resume_session", "session_run_mode"},
+    )
+    _run_with_config(goal=summary.user_goal, project_root=root, production_config=config)
 
 
 def _workspace_health_panel(health: WorkspaceHealthReport) -> Panel:

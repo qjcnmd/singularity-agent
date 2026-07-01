@@ -196,6 +196,9 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
     assert bootstrap_config.config_sources["max_turns"] == "config:.singularity/config.toml"
     assert bootstrap_config.config_sources["dry_run"] == "cli"
     assert "final report" in result.output
+    assert "sg session show" in result.output
+    assert "sg continue" in result.output
+    assert "sg resume" in result.output
 
 
 def test_cli_run_accepts_project_root(monkeypatch, tmp_path: Path) -> None:

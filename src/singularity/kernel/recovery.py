@@ -28,6 +28,19 @@ class RecoveryReport:
             "process_records": self.process_records,
         }
 
+    def with_stale_lock(self, stale_lock_detected: bool) -> RecoveryReport:
+        if stale_lock_detected == self.stale_lock_detected:
+            return self
+        return RecoveryReport(
+            recovered=self.recovered or stale_lock_detected,
+            stale_lock_detected=stale_lock_detected,
+            incomplete_trace_spans=list(self.incomplete_trace_spans),
+            workspace_recovery=dict(self.workspace_recovery),
+            unfinished_mutations=list(self.unfinished_mutations),
+            leftover_sandboxes=list(self.leftover_sandboxes),
+            process_records=list(self.process_records),
+        )
+
 
 class CrashRecoveryManager:
     def __init__(
@@ -45,7 +58,15 @@ class CrashRecoveryManager:
         self.sandbox = sandbox
         self.command = command
 
-    def recover(self) -> RecoveryReport:
+    def recover(self, *, session_id: str | None = None) -> RecoveryReport:
+        report = self.inspect(session_id=session_id)
+        self._mark_mutations_recovered(report.unfinished_mutations)
+        self._cleanup_sandboxes(report.leftover_sandboxes)
+        self._stop_processes(report.process_records)
+        self._record("recovery.completed", report.to_dict())
+        return report
+
+    def inspect(self, *, session_id: str | None = None) -> RecoveryReport:
         stale_lock = bool(
             self.workspace_lock is not None
             and (
@@ -63,7 +84,10 @@ class CrashRecoveryManager:
             incomplete_spans = list(store.recover_incomplete_spans())
         workspace_recovery: dict[str, Any] = {}
         if self.workspace_state is not None and hasattr(self.workspace_state, "recover_session"):
-            result = self.workspace_state.recover_session()
+            try:
+                result = self.workspace_state.recover_session(session_id)
+            except TypeError:
+                result = self.workspace_state.recover_session()
             workspace_recovery = result.to_dict() if hasattr(result, "to_dict") else dict(result)
         unfinished_mutations = sorted(
             set(
@@ -75,9 +99,6 @@ class CrashRecoveryManager:
         )
         leftover_sandboxes = self._leftover_sandboxes()
         process_records = self._process_records()
-        self._mark_mutations_recovered(unfinished_mutations)
-        self._cleanup_sandboxes(leftover_sandboxes)
-        self._stop_processes(process_records)
         report = RecoveryReport(
             recovered=(
                 stale_lock
@@ -94,7 +115,6 @@ class CrashRecoveryManager:
             leftover_sandboxes=leftover_sandboxes,
             process_records=process_records,
         )
-        self._record("recovery.completed", report.to_dict())
         return report
 
     def _record(self, event: str, payload: dict[str, Any]) -> None:

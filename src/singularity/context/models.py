@@ -45,6 +45,7 @@ class ContextItemType(StrEnum):
     FAILURE = "failure"
     SUMMARY = "summary"
     REFERENCE = "reference"
+    SESSION_RESUME_CONTEXT = "session_resume_context"
 
 
 class ContextLayer(StrEnum):

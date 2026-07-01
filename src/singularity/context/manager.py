@@ -46,6 +46,7 @@ from singularity.context.redaction import ContextRedactor, SensitivityClassifier
 from singularity.context.store import ObservationStore
 from singularity.context.tokens import TokenCounter
 from singularity.context.usage import ContextUsageReporter
+from singularity.session.models import SessionResumeContext
 
 if TYPE_CHECKING:
     from singularity.tool_protocol.models import ToolProtocolResultEnvelope
@@ -329,6 +330,30 @@ class ContextManager:
             )
         stored = self.store.append_item(item)
         return stored
+
+    def seed_session_resume_context(self, payload: dict[str, Any]) -> ContextItem:
+        resume_context = SessionResumeContext.from_sources(
+            session_id=str(payload.get("session_id") or self.session_id),
+            user_goal=str(payload.get("user_goal") or self.user_goal),
+            current_instruction=str(payload.get("current_instruction") or ""),
+            dialogue=list(payload.get("dialogue_summary") or payload.get("dialogue") or []),
+            planner=dict(payload.get("planner") or {}),
+            workspace=dict(payload.get("workspace") or {}),
+            verification=dict(payload.get("verification") or {}),
+            tool_protocol=dict(payload.get("tool_protocol") or {}),
+            failures=dict(payload.get("failures") or {}),
+        )
+        item = self._make_item(
+            layer=ContextLayer.COMPRESSED_HISTORY,
+            source_component=ContextSource.SUMMARY,
+            item_type=ContextItemType.SESSION_RESUME_CONTEXT,
+            content=resume_context.to_model_context(),
+            authority=ContextAuthority.SUMMARY,
+            importance=0.9,
+            pinned=True,
+            metadata={"session_resume_context": True},
+        )
+        return self.add_context_item(item)
 
     def add_assistant_message(self, message: dict[str, Any]) -> None:
         copied = dict(message)
