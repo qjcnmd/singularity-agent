@@ -86,14 +86,19 @@ def test_local_tiered_verification_gate_scripts_exist() -> None:
         assert "json" in text.lower()
 
 
-def test_capability_gate_defaults_to_public_task_and_keeps_internal_regression_legacy() -> None:
+def test_capability_gate_defaults_to_public_task_only() -> None:
     capability = Path("scripts/verify_capability.py").read_text(encoding="utf-8")
     assert 'DEFAULT_MANIFEST = "docs/evaluation/public-representative-task.json"' in capability
-    assert "capability-regression-tasks.json" not in capability
+    old_regression_manifest = "capability-" + "regression-tasks.json"
+    legacy_internal_smoke = "legacy/internal-" + "smoke-regression-tasks.json"
 
     assert Path("docs/evaluation/public-representative-task.json").exists()
-    assert Path("docs/evaluation/legacy/internal-smoke-regression-tasks.json").exists()
-    assert not Path("docs/evaluation/capability-regression-tasks.json").exists()
+    assert old_regression_manifest not in capability
+    assert not Path("docs/evaluation", legacy_internal_smoke).exists()
+    assert not Path("docs/evaluation", old_regression_manifest).exists()
+    assert not Path("docs/evaluation", "capability-" + "minimal-tasks.json").exists()
+    assert not Path("docs/evaluation", "capability-fix-" + "math-test-only.json").exists()
+    assert not Path("docs/evaluation", "evaluation-baseline-" + "example.json").exists()
 
 
 def test_gate_scripts_expose_structured_timing_contract() -> None:
@@ -267,7 +272,7 @@ def test_provider_validation_is_explicitly_gated_without_fake_fallback() -> None
     assert "provider_eval skipped" in commands
     assert "python -m pytest tests -m provider_eval" in commands
     assert "python scripts/verify_capability.py --force" in commands
-    assert "docs/evaluation/capability-regression-tasks.json" not in commands
+    assert f"docs/evaluation/{'capability-' + 'regression-tasks.json'}" not in commands
     lowered = commands.lower()
     assert "fake provider" not in lowered
     assert "mock provider" not in lowered

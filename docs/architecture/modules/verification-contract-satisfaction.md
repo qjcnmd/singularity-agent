@@ -187,6 +187,8 @@ class CompletionStatus(str, Enum):   # CompletionAssessment.status
 
 `VerificationRunner._result_from_command()` 对命令输出先走 `FailureParserRegistry.parse()`，再由 `classify_failure()` 将 sandbox backend unavailable归为`sandbox_limitation`、sandbox violation归为`sandbox_violation`、timeout归为`timeout`、missing command归为`missing_command`。Python DLL/import初始化类环境问题（例如 `ImportError: DLL load failed while importing _ssl`、`_hashlib`、`_socket`、`libssl/libcrypto`缺失、OpenSSL provider/config不可读、证书路径不可读、DLL search path失败或 DLL initialization routine failed）优先归为`environment_error`，状态为`blocked`，不会按pytest普通失败进入代码修复。`environment_error`、`sandbox_limitation`和`sandbox_violation`不生成普通`repair_hints`；调用方必须把它们作为环境/沙箱 blocker 处理，而不是让模型修改业务代码。
 
+benchmark/public task 的 AgentLoop 内 smoke command 来自 Planner `contract_smoke_commands()`；Planner 已把 manifest 可见的 `verification_command` 收敛为唯一 required requirement，因此 `VerificationRunner.plan_verification()` 不会再把 goal 文本或项目探测推断出的 broad pytest checks 加入 required checks。语法检查仍可作为独立 syntax check 生成，但不替代 manifest smoke，也不把 evaluator-owned public/hidden verification 注入 AgentLoop。
+
 ## 谁生成这些对象
 
 - `VerificationRunner._check()` 生成 `VerificationCheck`；plan-time 结构 blocker、执行、skipped、budget 与 policy 分支生成 `VerificationResult`。`CompletionAssessor.assess()` 从 verification plan 和 result 列表生成 `CompletionAssessment`。

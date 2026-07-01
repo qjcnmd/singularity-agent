@@ -1777,9 +1777,6 @@
       token usage 与精确模型价格表计算，unknown 不影响 gate。
     → final report / failure repair summary 中的 latest_failure_category:
         environment_error 或 sandbox_limitation → environment_blocker
-    → benchmark fixture 中 simple_patch / multi_file_reasoning /
-      failure_repair 的内联 pytest.ini 只禁用 anyio 自动插件；
-      completion_gate fixture 和生产项目 pytest 行为不变。
 
   E5. session 历史打开、继续与中断恢复（统一 session recovery path）
     sg session list

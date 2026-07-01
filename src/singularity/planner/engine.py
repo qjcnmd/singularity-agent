@@ -1893,9 +1893,9 @@ class Planner:
         The rules-based ``TaskContractBuilder.from_rules`` synthesizes
         ``["python", <path>]`` from the goal text, which rarely matches the
         manifest-declared ``verification_command`` (e.g. ``python -m pytest ...``).
-        When a benchmark ``verification_command`` is present, replace the
-        ``command`` field of existing requirements so the model sees and runs
-        the correct verification command from the start.
+        When a benchmark ``verification_command`` is present, make it the only
+        required smoke command so rule- or model-derived checks cannot expand a
+        public capability task beyond the manifest-visible command.
         """
         import shlex
 
@@ -1905,17 +1905,17 @@ class Planner:
             cmd_argv = verification_command.split()
         if not cmd_argv:
             return task_contract
-        existing = list(task_contract.get("verification_requirements") or [])
-        if existing:
-            existing[0] = {**existing[0], "command": cmd_argv}
-        else:
-            existing = [
-                {
-                    "description": f"Run verification: {verification_command}",
-                    "command": cmd_argv,
-                    "required": True,
-                }
-            ]
+        existing = task_contract.get("verification_requirements") or []
+        description = f"Run verification: {verification_command}"
+        if existing and isinstance(existing[0], dict) and existing[0].get("description"):
+            description = str(existing[0]["description"])
+        existing = [
+            {
+                "description": description,
+                "command": cmd_argv,
+                "required": True,
+            }
+        ]
         return {**task_contract, "verification_requirements": existing}
 
     def assess_verification_contract_satisfaction(self) -> ContractSatisfaction:

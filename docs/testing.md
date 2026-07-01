@@ -173,9 +173,6 @@ SINGULARITY_RUN_PROVIDER_EVAL=1 python -m pytest -m provider_eval -v
 
 # 6. 真实 public capability benchmark
 python scripts/verify_capability.py --force --run-id release-smoke
-
-# legacy/manual/debug internal smoke（不作为默认真实 provider gate）
-python -m singularity.cli eval run docs/evaluation/legacy/internal-smoke-regression-tasks.json --run-id internal-smoke-debug --json
 ```
 
 ## 5. 本地 provider_eval

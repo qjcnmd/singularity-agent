@@ -312,6 +312,7 @@ class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
 
 - completion criterion 不满足时 `assess_completion()` 返回 unmet 集合；`TaskState.status`/`blocked_reasons` 表达 blocked、needs-review 或 failed。`EvidenceLedger.missing_evidence`/`unresolved_failures` 保留未解决原因。
 - `TaskPlan.phase()` 找不到 phase 时失败；`TaskPhase.failure_policy` 决定该阶段后续策略。budget 对 model/tool/command/mutation/repair/repeated failure 超限时阻止继续，不通过重置 counter 绕过。
+- benchmark constraints 中的 `verification_command` 会替换 task contract 里的推断 verification requirements，成为唯一 required smoke command；公共 capability task 不会把 goal 文本或 rules builder 推断出的 pytest 命令扩展进 AgentLoop 内验证。
 - authorization 对 phase、repair contract、benchmark tool/path、verification command 违规返回 `allowed=False` 和具体 error code；`Replanner.decide()` 可返回 ask-user、read-fresh-file、repair-failure 或 require-review，重复失败预算由 `Planner.replan()` 记录后再走同一 decision/event 边界。final reviewer 拒绝或 completion 未满足时 `FinalReport.status` 非 completed，AgentLoop 不返回成功。
 
 ## 当前结构问题

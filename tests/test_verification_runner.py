@@ -422,6 +422,61 @@ def test_plan_verification_uses_contract_smoke_commands_when_missing(tmp_path: P
     assert smoke["evidence"]["exit_code"] == 0
 
 
+def test_benchmark_contract_smoke_does_not_expand_to_project_tests(tmp_path: Path) -> None:
+    (tmp_path / "src" / "sqlfluff" / "rules").mkdir(parents=True)
+    target = tmp_path / "src" / "sqlfluff" / "rules" / "L060.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "test" / "sqlfluff" / "rules").mkdir(parents=True)
+    (tmp_path / "test" / "sqlfluff" / "rules" / "L060_test.py").write_text(
+        "def test_rule():\n    assert False\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    planner.apply_benchmark_constraints(
+        {
+            "task_id": "bench.public",
+            "allowed_tools": ["read_file", "edit_apply", "run_verification"],
+            "expected_file_changes": ["src/sqlfluff/rules/L060.py"],
+            "verification_command": "python -m py_compile src/sqlfluff/rules/L060.py",
+        }
+    )
+    planner.start_task("Fix src/sqlfluff/rules/L060.py and run benchmark verification.")
+    request = CommandRequest(argv=["python", "-m", "py_compile", "src/sqlfluff/rules/L060.py"])
+    fake = FakeCommandExecutor(
+        [
+            command_result(
+                request,
+                command_id="cmd_manifest_smoke",
+                exit_code=0,
+                semantic_status=SemanticStatus.SUCCEEDED,
+                output="ok",
+            ),
+            command_result(
+                CommandRequest(argv=[sys.executable, "-m", "py_compile", "src/sqlfluff/rules/L060.py"]),
+                command_id="cmd_syntax",
+                exit_code=0,
+                semantic_status=SemanticStatus.SUCCEEDED,
+                output="ok",
+            ),
+        ]
+    )
+    component = VerificationRunner(tmp_path, command_executor=fake, planner=planner)
+
+    plan = component.plan_verification(
+        changed_files=["src/sqlfluff/rules/L060.py"],
+        task_intent="benchmark verification",
+    )
+
+    commands = [
+        check.command.argv
+        for check in plan.required_checks
+        if check.command is not None
+    ]
+    assert ["python", "-m", "py_compile", "src/sqlfluff/rules/L060.py"] in commands
+    assert not any("pytest" in command for command in commands for command in command)
+
+
 def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path) -> None:
     request = CommandRequest(argv=[sys.executable, "-c", "print('ok')"])
     result = command_result(

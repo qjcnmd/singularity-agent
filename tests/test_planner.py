@@ -156,6 +156,34 @@ def test_benchmark_expected_file_changes_delay_verification_phase(tmp_path: Path
     assert planner.state.current_phase == "running_verification"
 
 
+def test_benchmark_verification_command_replaces_inferred_smoke_commands(tmp_path: Path) -> None:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    planner.apply_benchmark_constraints(
+        {
+            "task_id": "bench.public",
+            "allowed_tools": ["read_file", "edit_apply", "run_verification"],
+            "expected_file_changes": ["src/sqlfluff/rules/L060.py"],
+            "verification_command": "python -m py_compile src/sqlfluff/rules/L060.py",
+        }
+    )
+
+    planner.start_task(
+        "Fix src/sqlfluff/rules/L060.py and then run python -m pytest test/sqlfluff/rules/L060_test.py."
+    )
+
+    assert planner.contract_smoke_commands() == [
+        ["python", "-m", "py_compile", "src/sqlfluff/rules/L060.py"]
+    ]
+    requirements = planner.state.task_contract["verification_requirements"]
+    assert len(requirements) == 1
+    assert requirements[0]["command"] == [
+        "python",
+        "-m",
+        "py_compile",
+        "src/sqlfluff/rules/L060.py",
+    ]
+
+
 def test_sandbox_required_policy_observation_is_not_unresolved_failure(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.start_task("Run verification")

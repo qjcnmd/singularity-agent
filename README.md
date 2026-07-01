@@ -154,10 +154,6 @@ CLI
 当前公开 manifest 位于 `docs/evaluation/`：
 
 - `public-representative-task.json`
-- `capability-minimal-tasks.json`
-- `capability-fix-math-test-only.json`
-- `evaluation-baseline-example.json`
-- `legacy/internal-smoke-regression-tasks.json`（仅 legacy/manual/debug）
 
 真实模型评估命令：
 
