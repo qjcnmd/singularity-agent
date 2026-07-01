@@ -25,7 +25,6 @@ producer-internal model calls do not pollute the main task model's context.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -42,6 +41,7 @@ from singularity.model.models import (
     ToolChoiceMode,
     ToolChoicePolicy,
 )
+from singularity.model.output import OutputParser
 from singularity.planner.contract import TaskContract, TaskContractBuilder
 from singularity.planner.models import ReplanDecision
 from singularity.planner.replanner import Replanner
@@ -56,17 +56,17 @@ from singularity.planner.semantic_objects import (
 
 
 def _json_payload(text: str) -> dict[str, Any]:
-    """Parse a JSON object from model text, with a regex fallback."""
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            raise ValueError("model response did not contain a JSON object") from None
-        value = json.loads(match.group(0))
-    if not isinstance(value, dict):
-        raise ValueError("model response JSON was not an object")
-    return value
+    """Parse a JSON object from model text via ``OutputParser``.
+
+    Legacy wrapper — prefer ``OutputParser().parse()`` directly.
+    Preserves the old return/raise contract.
+    """
+    result = OutputParser().parse(text)
+    if not result.ok:
+        raise ValueError(
+            result.errors[0].message if result.errors else "parse failed"
+        )
+    return result.parsed  # type: ignore[return-value]
 
 
 def _emit(
@@ -118,6 +118,7 @@ class TaskContractProducer:
         self.model_runner = model_runner
         self.rule_builder = rule_builder
         self.trace = trace
+        self._output_parser = OutputParser()
 
     def produce(self, user_goal: str, *, context_payload: dict[str, Any]) -> TaskContract:
         if self.model_runner is None:
@@ -166,7 +167,12 @@ class TaskContractProducer:
         result = runner.run_turn(request)
         if result.status != ModelTurnStatus.SUCCESS or result.assistant_message is None:
             raise RuntimeError(f"model turn failed: {result.status}")
-        return _json_payload(result.assistant_message.text)
+        parse_result = self._output_parser.parse(result.assistant_message.text)
+        if not parse_result.ok:
+            raise ValueError(
+                parse_result.errors[0].message if parse_result.errors else "parse failed"
+            )
+        return parse_result.parsed  # type: ignore[return-value]
 
     def _fallback(self, user_goal: str, *, reason: str) -> TaskContract:
         contract = self.rule_builder.from_rules(user_goal)
@@ -232,6 +238,7 @@ class SemanticPlanProducer:
         self.model_runner = model_runner
         self.rule_planner = rule_planner
         self.trace = trace
+        self._output_parser = OutputParser()
 
     def produce_initial(
         self,
@@ -377,7 +384,12 @@ class SemanticPlanProducer:
         result = runner.run_turn(request)
         if result.status != ModelTurnStatus.SUCCESS or result.assistant_message is None:
             raise RuntimeError(f"model turn failed: {result.status}")
-        return _json_payload(result.assistant_message.text)
+        parse_result = self._output_parser.parse(result.assistant_message.text)
+        if not parse_result.ok:
+            raise ValueError(
+                parse_result.errors[0].message if parse_result.errors else "parse failed"
+            )
+        return parse_result.parsed  # type: ignore[return-value]
 
     def _fallback_initial(
         self, task_contract: TaskContract, *, reason: str
@@ -437,6 +449,7 @@ class PlannerDecisionProducer:
         self.model_runner = model_runner
         self.rule_replanner = rule_replanner
         self.trace = trace
+        self._output_parser = OutputParser()
 
     def produce(
         self,
@@ -538,7 +551,12 @@ class PlannerDecisionProducer:
         result = runner.run_turn(request)
         if result.status != ModelTurnStatus.SUCCESS or result.assistant_message is None:
             raise RuntimeError(f"model turn failed: {result.status}")
-        return _json_payload(result.assistant_message.text)
+        parse_result = self._output_parser.parse(result.assistant_message.text)
+        if not parse_result.ok:
+            raise ValueError(
+                parse_result.errors[0].message if parse_result.errors else "parse failed"
+            )
+        return parse_result.parsed  # type: ignore[return-value]
 
     def _fallback(self, signal: dict[str, Any], *, reason: str) -> PlannerDecision:
         rule_decision: ReplanDecision = self.rule_replanner.decide(signal)

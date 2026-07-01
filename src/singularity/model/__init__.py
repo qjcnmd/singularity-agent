@@ -54,6 +54,15 @@ from singularity.model.streaming import (
     StreamingAccumulator,
 )
 from singularity.model.tools import ModelToolRenderer, ToolCallNormalizer
+from singularity.model.output import (
+    FieldSchema,
+    OutputContract,
+    OutputGuardrail,
+    OutputParseError,
+    OutputParseResult,
+    OutputParser,
+    OutputRepairer,
+)
 from singularity.model.validation import ModelResponseValidator
 
 __all__ = [
@@ -62,6 +71,7 @@ __all__ = [
     "ContentBlock",
     "ContentBlockType",
     "ContextExportPolicy",
+    "FieldSchema",
     "MessageConverter",
     "MockModelProvider",
     "ModelBudget",
@@ -100,6 +110,12 @@ __all__ = [
     "ModelUsage",
     "ModelValidationResult",
     "OpenAICompatibleModelProvider",
+    "OutputContract",
+    "OutputGuardrail",
+    "OutputParseError",
+    "OutputParseResult",
+    "OutputParser",
+    "OutputRepairer",
     "ProviderRequest",
     "ProviderResponse",
     "ProviderStreamEvent",
