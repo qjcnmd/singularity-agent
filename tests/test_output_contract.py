@@ -13,15 +13,15 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from uuid import uuid4
 
-import pytest
-
+from singularity.model.models import (
+    ModelMessage,
+    ModelPurpose,
+    ModelTurnRequest,
+    ModelTurnResult,
+    ModelTurnStatus,
+)
 from singularity.model.output import (
-    FAILURE_ANALYSIS_OUTPUT_CONTRACT,
-    PLANNER_DECISION_OUTPUT_CONTRACT,
-    SEMANTIC_PLAN_OUTPUT_CONTRACT,
-    TASK_CONTRACT_OUTPUT_CONTRACT,
     ERROR_ENUM_VIOLATION,
     ERROR_INVALID_JSON,
     ERROR_MISSING_REQUIRED_FIELD,
@@ -29,20 +29,16 @@ from singularity.model.output import (
     ERROR_UNAUTHORIZED_REFERENCE,
     ERROR_UNSAFE_AUTO_REPAIR,
     ERROR_WRONG_TYPE,
+    FAILURE_ANALYSIS_OUTPUT_CONTRACT,
+    PLANNER_DECISION_OUTPUT_CONTRACT,
+    SEMANTIC_PLAN_OUTPUT_CONTRACT,
+    TASK_CONTRACT_OUTPUT_CONTRACT,
     FieldSchema,
     OutputContract,
     OutputGuardrail,
     OutputParseError,
-    OutputParseResult,
     OutputParser,
     OutputRepairer,
-)
-from singularity.model.models import (
-    ModelMessage,
-    ModelPurpose,
-    ModelTurnRequest,
-    ModelTurnResult,
-    ModelTurnStatus,
 )
 from singularity.planner.contract import TaskContractBuilder
 from singularity.planner.replanner import Replanner
@@ -310,7 +306,6 @@ class TestOutputRepairerSafe:
                 FieldSchema("confidence", type_=(int, float), required=True),
             ]
         )
-        repairer = OutputRepairer()
         payload = {"confidence": 1}  # int → float OK
         errors = contract.validate(payload)
         # int is accepted by type check (float tolerates int), so no errors

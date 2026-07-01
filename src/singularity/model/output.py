@@ -37,8 +37,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Error codes
@@ -301,28 +302,28 @@ class OutputContract:
         errors: list[OutputParseError] = []
 
         # 1. Check required fields present
-        for field in self._fields.values():
-            if field.required and field.name not in payload:
+        for schema_field in self._fields.values():
+            if schema_field.required and schema_field.name not in payload:
                 errors.append(
                     OutputParseError(
                         code=ERROR_MISSING_REQUIRED_FIELD,
-                        message=f"required field '{field.name}' is missing",
-                        field=field.name,
+                        message=f"required field '{schema_field.name}' is missing",
+                        field=schema_field.name,
                     )
                 )
 
         # 2. Check types for present fields
         for key, value in payload.items():
-            field = self._fields.get(key)
-            if field is None:
+            schema_field = self._fields.get(key)
+            if schema_field is None:
                 continue  # unknown fields are allowed (pass through)
-            if not self._type_matches(value, field.type_):
+            if not self._type_matches(value, schema_field.type_):
                 errors.append(
                     OutputParseError(
                         code=ERROR_WRONG_TYPE,
                         message=(
                             f"field '{key}' has wrong type: "
-                            f"expected {self._type_label(field.type_)}, "
+                            f"expected {self._type_label(schema_field.type_)}, "
                             f"got {type(value).__name__}"
                         ),
                         field=key,
@@ -331,23 +332,23 @@ class OutputContract:
                 )
 
         # 3. Check enum values
-        for field in self._fields.values():
-            if field.enum_values is None:
+        for schema_field in self._fields.values():
+            if schema_field.enum_values is None:
                 continue
-            raw = payload.get(field.name)
+            raw = payload.get(schema_field.name)
             if raw is None:
                 continue
             if isinstance(raw, str):
                 normalized = raw.strip().lower().replace("/", "_").replace("-", "_")
-                if normalized not in field.enum_values:
+                if normalized not in schema_field.enum_values:
                     errors.append(
                         OutputParseError(
                             code=ERROR_ENUM_VIOLATION,
                             message=(
-                                f"field '{field.name}' has invalid enum value "
-                                f"'{raw}'; allowed: {field.enum_values}"
+                                f"field '{schema_field.name}' has invalid enum value "
+                                f"'{raw}'; allowed: {schema_field.enum_values}"
                             ),
-                            field=field.name,
+                            field=schema_field.name,
                             raw_value_repr=repr(raw),
                         )
                     )
@@ -547,10 +548,7 @@ class OutputRepairer:
                 return True
             return isinstance(v, t)
 
-        if isinstance(expected, tuple):
-            targets = expected
-        else:
-            targets = (expected,)
+        targets = expected if isinstance(expected, tuple) else (expected,)
 
         # Already matches one of the targets
         for t in targets:
@@ -630,15 +628,15 @@ class OutputGuardrail:
         errors: list[OutputParseError] = []
         ctx = context or {}
 
-        for field in contract._fields.values():
-            if not field.dangerous:
+        for schema_field in contract._fields.values():
+            if not schema_field.dangerous:
                 continue
-            value = payload.get(field.name)
+            value = payload.get(schema_field.name)
             if value is None:
                 continue
 
             # --- affected_files guardrail ---
-            if field.name == "affected_files" and isinstance(value, list):
+            if schema_field.name == "affected_files" and isinstance(value, list):
                 workspace_root = ctx.get("workspace_root", "")
                 allowed = set(ctx.get("allowed_target_files") or [])
                 for raw_path in value:
@@ -648,9 +646,9 @@ class OutputGuardrail:
                                 code=ERROR_UNAUTHORIZED_REFERENCE,
                                 message=(
                                     f"affected_files contains non-string entry: "
-                                    f"{repr(raw_path)}"
+                                    f"{raw_path!r}"
                                 ),
-                                field=field.name,
+                                field=schema_field.name,
                             )
                         )
                         continue
@@ -663,7 +661,7 @@ class OutputGuardrail:
                                     f"affected_files path escapes workspace: "
                                     f"'{raw_path}'"
                                 ),
-                                field=field.name,
+                                field=schema_field.name,
                             )
                         )
                     elif allowed and normalized not in allowed:
@@ -674,21 +672,21 @@ class OutputGuardrail:
                                     f"affected_files path not in allowed targets: "
                                     f"'{raw_path}'"
                                 ),
-                                field=field.name,
+                                field=schema_field.name,
                             )
                         )
 
             # --- verification_plan / command guardrail ---
-            elif field.name in ("verification_plan", "verification_requirements"):
+            elif schema_field.name in ("verification_plan", "verification_requirements"):
                 if isinstance(value, list) and len(value) == 0:
                     errors.append(
                         OutputParseError(
                             code=ERROR_UNSAFE_AUTO_REPAIR,
                             message=(
-                                f"'{field.name}' is empty; verification commands "
+                                f"'{schema_field.name}' is empty; verification commands "
                                 f"must not be guessed"
                             ),
-                            field=field.name,
+                            field=schema_field.name,
                         )
                     )
 

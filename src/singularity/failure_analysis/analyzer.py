@@ -17,7 +17,6 @@ from singularity.model import (
 )
 from singularity.model.output import (
     FAILURE_ANALYSIS_OUTPUT_CONTRACT,
-    OutputContract,
     OutputGuardrail,
     OutputParser,
     OutputRepairer,

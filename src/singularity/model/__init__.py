@@ -35,6 +35,15 @@ from singularity.model.models import (
     ToolChoiceMode,
     ToolChoicePolicy,
 )
+from singularity.model.output import (
+    FieldSchema,
+    OutputContract,
+    OutputGuardrail,
+    OutputParseError,
+    OutputParser,
+    OutputParseResult,
+    OutputRepairer,
+)
 from singularity.model.providers import (
     ChatCompletionProvider,
     ChatProviderModelProvider,
@@ -54,15 +63,6 @@ from singularity.model.streaming import (
     StreamingAccumulator,
 )
 from singularity.model.tools import ModelToolRenderer, ToolCallNormalizer
-from singularity.model.output import (
-    FieldSchema,
-    OutputContract,
-    OutputGuardrail,
-    OutputParseError,
-    OutputParseResult,
-    OutputParser,
-    OutputRepairer,
-)
 from singularity.model.validation import ModelResponseValidator
 
 __all__ = [

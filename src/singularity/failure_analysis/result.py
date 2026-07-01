@@ -153,20 +153,6 @@ class FailureAnalysisResult:
             "blocked_reason": self.blocked_reason,
             "raw_response_ref": self.raw_response_ref,
         }
-
-def _json_payload(text: str) -> dict[str, Any]:
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            raise ValueError("model response did not contain a JSON object") from None
-        value = json.loads(match.group(0))
-    if not isinstance(value, dict):
-        raise ValueError("model response JSON was not an object")
-    return value
-
-
 def _required_text(payload: dict[str, Any], field_name: str) -> str:
     value = payload.get(field_name)
     if not isinstance(value, str) or not value.strip():

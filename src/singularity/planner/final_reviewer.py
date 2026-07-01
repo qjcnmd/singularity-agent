@@ -27,8 +27,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from typing import Any
-
-from singularity.model.output import OutputParser
 from uuid import uuid4
 
 from singularity.model.models import (
@@ -43,6 +41,7 @@ from singularity.model.models import (
     ToolChoiceMode,
     ToolChoicePolicy,
 )
+from singularity.model.output import OutputParser
 from singularity.planner.contract import TaskContract
 from singularity.planner.models import EvidenceLedger, TaskState
 from singularity.planner.semantic_objects import (
