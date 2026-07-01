@@ -28,3 +28,4 @@ nul
 *.db-wal
 *.db-shm
 *.db-journal
+.worktrees/
