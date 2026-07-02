@@ -6,6 +6,8 @@ from typing import Any
 from rich.console import Console
 
 from singularity.config import ProductionConfig
+from singularity.context import RecoveryManager
+from singularity.context.models import RecoveredContext
 from singularity.interaction import (
     InteractionController,
     InteractionMode,
@@ -153,6 +155,11 @@ class KernelBootstrap:
                     launch.previous_trace_run_dir,
                     config.trace_dir,
                 )
+                context_recovery = self._previous_context_recovery(
+                    launch.previous_run_id,
+                    launch.previous_trace_run_dir,
+                    config.trace_dir,
+                )
                 tool_protocol_report = history_reader.tool_protocol_report(
                     run_id=launch.previous_run_id or identity.run_id,
                     session_id=identity.session_id,
@@ -185,7 +192,7 @@ class KernelBootstrap:
                     workspace_health=workspace_health,
                     crash_recovery=recovery,
                     tool_protocol_report=tool_protocol_report,
-                    context_recovery=None,
+                    context_recovery=context_recovery,
                     planner_state=planner_state,
                     resume_context=resume_context,
                 )
@@ -283,6 +290,52 @@ class KernelBootstrap:
             return Path(trace_dir) / previous_run_id / "tool_protocol.sqlite3"
         return self.project_root / "work" / "traces" / "runs" / previous_run_id / "tool_protocol.sqlite3"
 
+    def _previous_context_recovery(
+        self,
+        previous_run_id: str | None,
+        previous_trace_run_dir: str | None,
+        trace_dir: Path | None,
+    ) -> dict[str, Any] | None:
+        context_db_path = self._previous_context_db_path(
+            previous_run_id,
+            previous_trace_run_dir,
+            trace_dir,
+        )
+        if previous_run_id is None or context_db_path is None or not context_db_path.exists():
+            return None
+        trace_path = context_db_path.parent / "events.jsonl"
+        manager = None
+        try:
+            manager = RecoveryManager(
+                context_db_path,
+                trace_path=trace_path if trace_path.exists() else None,
+            )
+            recovered = manager.recover(previous_run_id)
+        except Exception as exc:
+            return {
+                "recommended_next_action": "needs_review",
+                "context_recovery_failed": True,
+                "recovery_warnings": [f"context recovery inspect failed: {type(exc).__name__}"],
+            }
+        finally:
+            if manager is not None:
+                manager.store.close()
+        return _context_recovery_summary(recovered)
+
+    def _previous_context_db_path(
+        self,
+        previous_run_id: str | None,
+        previous_trace_run_dir: str | None,
+        trace_dir: Path | None,
+    ) -> Path | None:
+        if not previous_run_id:
+            return None
+        if previous_trace_run_dir:
+            return Path(previous_trace_run_dir) / "context.sqlite3"
+        if trace_dir is not None:
+            return Path(trace_dir) / previous_run_id / "context.sqlite3"
+        return self.project_root / "work" / "traces" / "runs" / previous_run_id / "context.sqlite3"
+
     def _persist_launch(
         self,
         *,
@@ -347,3 +400,21 @@ class KernelBootstrap:
             )
         finally:
             store.close()
+
+
+def _context_recovery_summary(recovered: RecoveredContext) -> dict[str, Any]:
+    return {
+        "run_id": recovered.run_id,
+        "pending_tool_calls": [
+            {"id": call.get("id"), "name": (call.get("function") or {}).get("name")}
+            for call in recovered.pending_tool_calls
+        ],
+        "pending_policy_approval": recovered.pending_policy_approval,
+        "active_process_sessions": recovered.active_process_sessions,
+        "open_mutation_transactions": recovered.open_mutation_transactions,
+        "last_verification_status": recovered.last_verification_status,
+        "last_safe_checkpoint": recovered.last_safe_checkpoint,
+        "recommended_next_action": recovered.recommended_next_action,
+        "recovery_warnings": recovered.recovery_warnings,
+        "trace_last_event": recovered.trace_last_event,
+    }

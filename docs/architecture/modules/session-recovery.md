@@ -69,11 +69,13 @@ Session Recovery 层把一次用户可打开的历史会话和每次执行尝试
 
 中断恢复：`resume_session_command()` -> `_run_with_config()` -> `KernelBootstrap.boot()` -> `SessionStore.prepare_launch(mode="resume")` -> `CrashRecoveryManager.inspect(session_id=identity.session_id)` -> `SessionHistoryReader.tool_protocol_report()` -> `SessionRecoveryGate.evaluate()` -> gate 放行后进入 `AgentLoop.run()`，不放行则 `AgentKernel._blocked_by_recovery_gate()` 返回 final report。
 
+恢复门禁在 `KernelBootstrap.boot()` 内同时读取上一 run 的 `tool_protocol.sqlite3` 和 `context.sqlite3`：tool protocol 由 `ToolProtocolRecoveryManager.inspect()` 生成 pending/running/approval 摘要，context 由 `RecoveryManager.recover()` 生成 pending tool call、pending policy approval、active process、open mutation、last verification 和 trace 尾事件摘要。读取失败会投影为 `context_recovery_failed` blocker，不会继续调用模型。
+
 历史查看：`session_show()` -> `SessionStore.show_session()` -> `SessionHistoryReader.build_show_summary()` -> 聚合 planner、上一轮 context.sqlite3 对话摘要、tool_protocol.sqlite3 recovery report、trace summary、workspace checkpoint 和失败摘要。
 
 ## 真实任务中的对象流
 
-以用户在修复 `quicksort.py` 时电脑重启为例，第一次启动调用链是 `run_goal()` -> `KernelBootstrap.boot()` -> `SessionStore.prepare_launch(mode="new")` -> `TraceRecorder.create()` -> `SessionStore.start_run()` -> `AgentGraphBuilder.build()` -> `AgentKernel.run_task()`。若进程被杀，run 行保持 active；下次执行 `sg resume <session_id>` 时，调用链是 `resume_session_command()` -> `KernelBootstrap.boot()` -> `SessionStore.prepare_launch(mode="resume")` -> `WorkspaceStateManager.recover_session(session_id)` -> `CrashRecoveryManager.inspect(session_id=session_id)` -> `ToolProtocolRecoveryManager.inspect()` -> `PlannerStore.load()` -> `SessionHistoryReader.build_resume_context()` -> `SessionRecoveryGate.evaluate()` -> `AgentKernel.run_task()`。`SessionHistoryReader.build_resume_context()` 读取上一轮 context.sqlite3 安全对话摘要和 trace summary，生成过滤后的 `SessionResumeContext`。`SessionRecoveryGate.evaluate()` 发现 external change、rollback conflict、unfinished mutation、leftover sandbox、stale lock、pending approval 或 running/pending tool 时返回 `can_call_model=False`，`AgentKernel.run_task()` 写 `session.recovery_blocked` 并停止在 review 状态；没有 blocker 时才把 `SessionResumeContext` 作为 summary context 写入 `context.sqlite3` 并调用模型。
+以用户在修复 `quicksort.py` 时电脑重启为例，第一次启动调用链是 `run_goal()` -> `KernelBootstrap.boot()` -> `SessionStore.prepare_launch(mode="new")` -> `TraceRecorder.create()` -> `SessionStore.start_run()` -> `AgentGraphBuilder.build()` -> `AgentKernel.run_task()`。若进程被杀，run 行保持 active；下次执行 `sg resume <session_id>` 时，调用链是 `resume_session_command()` -> `KernelBootstrap.boot()` -> `SessionStore.prepare_launch(mode="resume")` -> `WorkspaceStateManager.recover_session(session_id)` -> `CrashRecoveryManager.inspect(session_id=session_id)` -> `ToolProtocolRecoveryManager.inspect()` -> `RecoveryManager.recover(previous context.sqlite3)` -> `PlannerStore.load()` -> `SessionHistoryReader.build_resume_context()` -> `SessionRecoveryGate.evaluate()` -> `AgentKernel.run_task()`。`SessionHistoryReader.build_resume_context()` 读取上一轮 context.sqlite3 安全对话摘要和 trace summary，生成过滤后的 `SessionResumeContext`。`SessionRecoveryGate.evaluate()` 发现 external change、rollback conflict、unfinished mutation、leftover sandbox、stale lock、pending approval、running/pending tool、context recovery 失败或缺 planner state 时返回 `can_call_model=False`，`AgentKernel.run_task()` 写 `session.recovery_blocked` 并停止在 review 状态；没有 blocker 时才把 `SessionResumeContext` 作为 summary context 写入 `context.sqlite3` 并调用模型。
 
 ## 真实对象完整结构
 
@@ -168,7 +170,7 @@ class SessionDetail:
 
 ### SessionResumeContext（模型可见恢复摘要）
 
-恢复时注入 context 的过滤摘要。**边界**：只在 `continue/resume` 且 gate 放行时由 `ContextManager.seed_session_resume_context()` 写入 `context.sqlite3`；不包含 raw trace、raw tool args/result、完整 stdout/stderr、policy audit 原文或 model payload。
+恢复时注入 context 的过滤摘要。**边界**：只在 `continue/resume` 且 gate 放行时由 `ContextManager.seed_session_resume_context()` 写入 `context.sqlite3`；不包含 raw trace、raw tool args/result、完整 stdout/stderr、policy audit 原文或 model payload。dataclass 内部字段保持组件名，`to_model_context()` 输出固定安全投影键：`dialogue_summary`、`planner_summary`、`workspace_summary`、`verification_summary`、`tool_protocol_summary`、`failure_summary`。
 
 ```python
 @dataclass(frozen=True)
@@ -266,11 +268,11 @@ class RecoveryGateStatus(str, Enum):
 
 ## 谁消费这些对象
 
-`KernelBootstrap.boot()` 消费 `SessionLaunch` 创建 trace/run identity 并启动恢复检查；`AgentGraphBuilder._build_model_context()` 只在 `continue/resume` 消费 `RecoveryGateDecision.resume_context`；`AgentKernel.run_task()` 消费 `RecoveryGateDecision.can_call_model` 决定是否进入 AgentLoop；CLI `session list/show/continue/resume` 消费 `SessionSummary`、`SessionDetail`、`SessionHistoryReader.build_show_summary()` 和 timeline/checkpoint 摘要。
+`KernelBootstrap.boot()` 消费 `SessionLaunch` 创建 trace/run identity 并启动恢复检查；它从上一 run trace 目录读取 `tool_protocol.sqlite3` 与 `context.sqlite3` 的恢复摘要后交给 `SessionRecoveryGate.evaluate()`。`AgentGraphBuilder._build_model_context()` 只在 `continue/resume` 消费 `RecoveryGateDecision.resume_context`；`AgentKernel.run_task()` 消费 `RecoveryGateDecision.can_call_model` 决定是否进入 AgentLoop；CLI `session list/show/continue/resume` 消费 `SessionSummary`、`SessionDetail`、`SessionHistoryReader.build_show_summary()` 和 timeline/checkpoint 摘要。
 
 ## 是否落盘
 
-`SessionStore` 写 `.singularity/session_index.sqlite3`，包含 `sessions`、`runs`、`checkpoints`、`timeline` 四张表。`SessionResumeContext` 不写 session index；它作为 `ContextItemType.SESSION_RESUME_CONTEXT` 写当前 run 的 `context.sqlite3`。完整 trace 仍在 `work/traces/runs/<run_id>/events.jsonl`，tool protocol 状态仍在同目录 `tool_protocol.sqlite3`，planner 状态仍在 `.singularity/planner/<session_id>/`。`build_show_summary()` 仅读取这些既有 store，不创建新的持久化旁路。
+`SessionStore` 写 `.singularity/session_index.sqlite3`，包含 `sessions`、`runs`、`checkpoints`、`timeline` 四张表，并通过 SQLite `user_version=1` 标记当前 schema。无版本数据库按 0→1 初始化迁移；高于当前版本的数据库抛 `SessionStoreError(code="session_store_schema_unsupported")`，不降级覆盖。文件库连接设置 `busy_timeout=5000` 和 WAL journal mode，打开时执行 `quick_check`；损坏或不可读时抛 `SessionStoreError(code="session_store_corrupt")`，不创建静默空索引。`SessionResumeContext` 不写 session index；它作为 `ContextItemType.SESSION_RESUME_CONTEXT` 写当前 run 的 `context.sqlite3`，内容使用 `*_summary` 安全投影键。完整 trace 仍在 `work/traces/runs/<run_id>/events.jsonl`，tool protocol 状态仍在同目录 `tool_protocol.sqlite3`，planner 状态仍在 `.singularity/planner/<session_id>/`。`build_show_summary()` 仅读取这些既有 store，不创建新的持久化旁路。
 
 ## 是否进入 trace / audit
 
@@ -278,7 +280,7 @@ class RecoveryGateStatus(str, Enum):
 
 ## 失败路径
 
-`prepare_launch(mode="resume")` 对 closed session 抛 `ValueError`，但允许 active、recoverable、needs_review 和 blocked session 进入恢复门禁。`SessionRecoveryGate.evaluate()` 发现 external change、rollback conflict、corrupted workspace state、unfinished mutation、leftover sandbox、stale lock、pending approval、running tool、pending tool 或缺失 planner state 时设置 `can_call_model=False`；unfinished mutation、leftover sandbox 和 running tool 为 blocked，其余进入 needs_review。bootstrap 失败会把 run 标记为 failed 并写 `session.run_failed`，CLI 打印可复制恢复命令。
+`prepare_launch(mode="resume")` 对 closed session 抛 `ValueError`，但允许 active、recoverable、needs_review 和 blocked session 进入恢复门禁。`SessionRecoveryGate.evaluate()` 发现 external change、rollback conflict、corrupted workspace state、unfinished mutation、leftover sandbox、stale lock、pending approval、running tool、pending tool、context recovery failed 或缺失 planner state 时设置 `can_call_model=False`；unfinished mutation、leftover sandbox 和 running tool 为 blocked，其余进入 needs_review。bootstrap 失败会把 run 标记为 failed 并写 `session.run_failed`，CLI 打印可复制恢复命令。
 
 ## 当前结构问题
 

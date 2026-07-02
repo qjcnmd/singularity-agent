@@ -45,10 +45,17 @@ class SessionRecoveryGate:
         if tool_report.get("pending_call_ids") or str(tool_report.get("next_action")) == "execute_pending_tool":
             blockers.append("pending_tool_call")
         context_report = context_recovery or {}
+        if context_report.get("context_recovery_failed"):
+            blockers.append("context_recovery_failed")
         if context_report.get("open_mutation_transactions"):
             blockers.append("unfinished_mutation")
         if context_report.get("pending_policy_approval"):
             blockers.append("pending_approval")
+        if context_report.get("pending_tool_calls"):
+            blockers.append("pending_tool_call")
+        if context_report.get("active_process_sessions"):
+            blockers.append("running_tool_call")
+        warnings.extend(str(item) for item in context_report.get("recovery_warnings") or [])
         planner_report = planner_state or {}
         if mode != "new" and (
             planner_report.get("status") == "missing"

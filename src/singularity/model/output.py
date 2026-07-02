@@ -540,7 +540,7 @@ class OutputRepairer:
             return None
 
         def matches_single(v: Any, t: type) -> bool:
-            if t is float and isinstance(v, (int, float)):
+            if t is float and isinstance(v, int | float):
                 return True
             if t is int and isinstance(v, int) and not isinstance(v, bool):
                 return True
@@ -582,7 +582,7 @@ class OutputRepairer:
             return value
 
         # list coercion from tuple
-        if list in targets and isinstance(value, (tuple, list)):
+        if list in targets and isinstance(value, tuple | list):
             return list(value)
 
         return None

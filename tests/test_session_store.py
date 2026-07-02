@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from singularity.session import (
@@ -9,6 +10,63 @@ from singularity.session import (
     SessionStatus,
     SessionStore,
 )
+from singularity.session.store import SessionStoreError
+
+
+def test_session_store_initializes_sqlite_recovery_pragmas(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    try:
+        user_version = store._connection.execute("pragma user_version").fetchone()[0]
+        busy_timeout = store._connection.execute("pragma busy_timeout").fetchone()[0]
+        journal_mode = store._connection.execute("pragma journal_mode").fetchone()[0]
+    finally:
+        store.close()
+
+    assert user_version == 1
+    assert busy_timeout >= 5000
+    assert journal_mode == "wal"
+
+
+def test_session_store_fails_closed_on_corrupt_index(tmp_path: Path) -> None:
+    state_root = tmp_path / ".singularity"
+    state_root.mkdir()
+    (state_root / "session_index.sqlite3").write_bytes(b"not a sqlite database")
+
+    try:
+        SessionStore(tmp_path)
+    except SessionStoreError as exc:
+        assert exc.code == "session_store_corrupt"
+    else:
+        raise AssertionError("corrupt session index should fail closed")
+
+
+def test_session_store_rejects_newer_schema_version(tmp_path: Path) -> None:
+    state_root = tmp_path / ".singularity"
+    state_root.mkdir()
+    connection = sqlite3.connect(state_root / "session_index.sqlite3")
+    connection.execute("pragma user_version = 2")
+    connection.close()
+
+    try:
+        SessionStore(tmp_path)
+    except SessionStoreError as exc:
+        assert exc.code == "session_store_schema_unsupported"
+    else:
+        raise AssertionError("newer session schema should fail closed")
+
+
+def test_session_store_wraps_connection_failure(tmp_path: Path, monkeypatch) -> None:
+    def fail_connect(*args, **kwargs):
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(sqlite3, "connect", fail_connect)
+
+    try:
+        SessionStore(tmp_path)
+    except SessionStoreError as exc:
+        assert exc.code == "session_store_corrupt"
+    else:
+        raise AssertionError("connection failure should use the session store error")
 
 
 def test_session_store_indexes_sessions_runs_checkpoints_and_timeline(tmp_path: Path) -> None:

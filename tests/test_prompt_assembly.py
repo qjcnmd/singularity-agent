@@ -8,6 +8,7 @@ from singularity.instructions import (
     PromptBudgetExceeded,
 )
 from singularity.model import ModelPurpose, ModelRole
+from singularity.model.runner import ENV_ASSIGNMENT_PATTERN, SECRET_PATTERNS
 from singularity.observability import TraceRecorder
 
 
@@ -65,3 +66,30 @@ def test_trace_records_manifest_without_full_prompt_or_secret(tmp_path: Path) ->
     assert "Inspect only" not in trace_text
     assert "ignore previous instructions" not in trace_text
     assert "prompt_hash" in trace_text
+
+
+def test_prompt_assembly_escapes_placeholder_env_examples_for_remote_export(tmp_path: Path) -> None:
+    component = PromptAssemblyPipeline(workspace_root=tmp_path)
+
+    bundle = component.build_for_model_turn(
+        user_task="Inspect README.",
+        purpose=ModelPurpose.PLAN_NEXT_ACTION,
+        retrieved_content=[
+            {
+                "source_type": "readme",
+                "origin": "README.md",
+                "content": (
+                    "Example setup:\n"
+                    "$env:SINGULARITY_API_KEY = \"...\"\n"
+                    "set SINGULARITY_API_KEY=...\n"
+                    "export SINGULARITY_API_KEY=...\n"
+                ),
+            }
+        ],
+    )
+
+    text = "\n".join(message.text for message in bundle.messages)
+
+    assert not any(pattern.search(text) for pattern in SECRET_PATTERNS)
+    assert ENV_ASSIGNMENT_PATTERN.search(text) is None
+    assert "SINGULARITY_API_KEY" in text

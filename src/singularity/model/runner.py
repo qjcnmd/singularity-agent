@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -174,8 +175,9 @@ class ModelRunner:
             if export_error:
                 error = ModelError(
                     kind=ModelErrorKind.INVALID_REQUEST,
-                    message=export_error,
+                    message=export_error["code"],
                     retryable=False,
+                    metadata={"context_export_diagnostics": export_error["diagnostics"]},
                 )
                 event_ids.extend(self._emit_request_failed(request, error))
                 validation = self.validator.validate(
@@ -184,7 +186,7 @@ class ModelRunner:
                     tool_choice=request.tool_choice,
                     allowed_tool_names=self._allowed_tool_names(request),
                 )
-                validation.errors.append(export_error)
+                validation.errors.append(export_error["code"])
                 return self._invalid_result(
                     request,
                     validation_errors=validation.errors,
@@ -580,17 +582,34 @@ class ModelRunner:
             return [tool.name for tool in request.tools]
         return [spec.name for spec in self.tool_registry.list_model_visible()]
 
-    def _context_export_error(self, request: ModelTurnRequest) -> str | None:
+    def _context_export_error(self, request: ModelTurnRequest) -> dict[str, Any] | None:
         if not self.config.allow_remote_provider:
             return None
         policy = self.config.context_export_policy
-        text = "\n".join(message.text for message in request.messages)
-        if policy.deny_secret_like_content and any(
-            pattern.search(text) for pattern in SECRET_PATTERNS
-        ):
-            return "context_export_policy_secret_like_content"
-        if policy.deny_env_content and ENV_ASSIGNMENT_PATTERN.search(text):
-            return "context_export_policy_env_content"
+        for index, message in enumerate(request.messages):
+            text = message.text
+            if policy.deny_secret_like_content:
+                for pattern in SECRET_PATTERNS:
+                    if pattern.search(text):
+                        return {
+                            "code": "context_export_policy_secret_like_content",
+                            "diagnostics": _export_diagnostics(
+                                message,
+                                message_index=index,
+                                rule="secret_like_content",
+                                pattern=pattern,
+                            ),
+                        }
+            if policy.deny_env_content and ENV_ASSIGNMENT_PATTERN.search(text):
+                return {
+                    "code": "context_export_policy_env_content",
+                    "diagnostics": _export_diagnostics(
+                        message,
+                        message_index=index,
+                        rule="env_content",
+                        pattern=ENV_ASSIGNMENT_PATTERN,
+                    ),
+                }
         return None
 
     def _invalid_result(
@@ -893,9 +912,28 @@ def _latency_ms(started: float) -> int:
 
 
 def _hash_text(text: str) -> str:
-    import hashlib
-
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _export_diagnostics(
+    message: ModelMessage,
+    *,
+    message_index: int,
+    rule: str,
+    pattern: re.Pattern[str],
+) -> dict[str, Any]:
+    metadata = dict(message.metadata or {})
+    return {
+        "rule": rule,
+        "message_index": message_index,
+        "role": message.role.value,
+        "message_name": message.name,
+        "section": metadata.get("section"),
+        "source_type": metadata.get("source_type"),
+        "prompt_manifest_id": metadata.get("prompt_manifest_id"),
+        "pattern_hash": _hash_text(pattern.pattern)[:12],
+        "text_hash": _hash_text(message.text)[:12],
+    }
 
 
 def _cache_ratio(cached_tokens: int, input_tokens: int) -> float:
