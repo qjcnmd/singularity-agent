@@ -865,24 +865,21 @@ class WindowsSandboxBackend:
     def _apply_run_acl(self, sandbox_root: Path, account_name: str) -> None:
         if os.name != "nt":
             return
-        host_sid = _current_process_sid()
+        run_acl = _apply_sandbox_control_dir_acl(
+            sandbox_root,
+            account_names=(account_name,),
+            operation="run_root_acl",
+        )
+        if not run_acl.ok:
+            raise SandboxCapabilityError(
+                "backend_unavailable: sandbox ACL boundary could not be applied."
+            )
         icacls = shutil.which("icacls")
-        if not host_sid or icacls is None:
+        if icacls is None:
             raise SandboxCapabilityError(
                 "backend_unavailable: sandbox ACL boundary could not be applied."
             )
         commands = (
-            [icacls, str(sandbox_root), "/inheritance:r", "/T", "/C", "/Q"],
-            [
-                icacls,
-                str(sandbox_root),
-                "/grant:r",
-                f"*{host_sid}:(OI)(CI)F",
-                f"{account_name}:(OI)(CI)M",
-                "/T",
-                "/C",
-                "/Q",
-            ],
             [
                 icacls,
                 str(sandbox_root / "workspace"),
@@ -1867,9 +1864,10 @@ def _acl_state(
         denied = root / "denied"
         allowed.mkdir(parents=True, exist_ok=True)
         denied.mkdir(parents=True, exist_ok=True)
-        control = _apply_account_acl(
+        control = _apply_probe_root_acl(
             root,
             account_names=(identity.account_name,),
+            operation="acl_probe_control_acl",
             low_integrity_root=allowed,
         )
         if not control.ok:
@@ -1881,7 +1879,11 @@ def _acl_state(
                     "details": control.details,
                 },
             )
-        grant = _apply_account_acl(allowed, account_names=(identity.account_name,))
+        grant = _apply_probe_root_acl(
+            allowed,
+            account_names=(identity.account_name,),
+            operation="acl_probe_allowed_acl",
+        )
         icacls = shutil.which("icacls")
         if icacls is None:
             return _missing(
@@ -2119,17 +2121,24 @@ def _launcher_state(
         "working_directory": {
             "representative_hash": _hash_path(_windows_state_dir_path()),
             "account_has_access": acl_boundary_ready,
+            "failure_target": None if acl_boundary_ready else "working_directory_access",
         },
     }
     ready = (
         symbol_present
         and not rights_definitively_missing
         and not deny_interactive
+        and acl_boundary_ready
+    )
+    missing_reason = (
+        "CreateProcessWithLogonW preconditions missing (working directory account access is missing)."
+        if not acl_boundary_ready
+        else "CreateProcessWithLogonW preconditions missing (account definitively lacks SeInteractiveLogonRight, has a deny right, or symbols missing)."
     )
     return _state_from_bool(
         ready,
         "CreateProcessWithLogonW preconditions satisfied (SeInteractiveLogonRight present or unverifiable non-elevated, no deny right, symbols available).",
-        "CreateProcessWithLogonW preconditions missing (account definitively lacks SeInteractiveLogonRight, has a deny right, or symbols missing).",
+        missing_reason,
         evidence,
     )
 
@@ -2187,7 +2196,11 @@ def _runner_smoke_state(identity: _WindowsSandboxIdentity) -> WindowsCapabilityS
         state_dir = _windows_state_dir()
         root = state_dir / "runner-smoke"
         root.mkdir(parents=True, exist_ok=True)
-        acl = _apply_account_acl(root, account_names=(identity.account_name,))
+        acl = _apply_probe_root_acl(
+            root,
+            account_names=(identity.account_name,),
+            operation="runner_smoke_acl",
+        )
         if not acl.ok:
             return _missing(
                 "Windows runner smoke ACL setup failed.",
@@ -2241,8 +2254,8 @@ def _runner_smoke_state(identity: _WindowsSandboxIdentity) -> WindowsCapabilityS
         except Exception as exc:
             return _missing(
                 "Windows account-backed runner smoke failed.",
-                _exception_diagnostics(
-                    _runner_exception_operation("runner_smoke", exc),
+                _account_runner_launch_exception_diagnostics(
+                    "runner_smoke",
                     exc,
                     state_dir=state_dir,
                     probe_root=root,
@@ -2276,8 +2289,8 @@ def _runner_smoke_state(identity: _WindowsSandboxIdentity) -> WindowsCapabilityS
     except Exception as exc:
         return _missing(
             "Windows account-backed runner smoke failed.",
-            _exception_diagnostics(
-                _runner_exception_operation("runner_smoke", exc),
+            _account_runner_launch_exception_diagnostics(
+                "runner_smoke",
                 exc,
                 state_dir=state_dir,
                 probe_root=root,
@@ -2343,8 +2356,8 @@ def _account_python_smoke(
         ).run(prepared)
     except Exception as exc:
         return _probe_failure_runner_result(
-            _exception_diagnostics(
-                _runner_exception_operation(operation_prefix, exc),
+            _account_runner_launch_exception_diagnostics(
+                operation_prefix,
                 exc,
                 state_dir=state_dir,
                 probe_root=cwd,
@@ -2365,7 +2378,11 @@ def _python_runtime_smoke_diagnostics(
     try:
         root = _windows_state_dir() / "python-runtime-smoke"
         root.mkdir(parents=True, exist_ok=True)
-        acl = _apply_account_acl(root, account_names=tuple(identity.account_name for identity in identities))
+        acl = _apply_probe_root_acl(
+            root,
+            account_names=tuple(identity.account_name for identity in identities),
+            operation="python_runtime_smoke_acl",
+        )
         if not acl.ok:
             return (
                 {
@@ -2383,6 +2400,34 @@ def _python_runtime_smoke_diagnostics(
             sid = _account_sid(identity.account_name)
             cwd = root / identity.role
             cwd.mkdir(parents=True, exist_ok=True)
+            role_acl = _apply_probe_root_acl(
+                cwd,
+                account_names=(identity.account_name,),
+                operation=f"python_runtime_smoke_{identity.role}_acl",
+            )
+            if not role_acl.ok:
+                diagnostics.append(
+                    {
+                        "kind": "python_runtime_environment_blocker",
+                        "status": "blocked",
+                        "reason": "Python runtime smoke role directory ACL setup failed.",
+                        "evidence": {
+                            **_probe_evidence(
+                                f"python_runtime_smoke_{identity.role}_acl",
+                                state_dir=state_dir,
+                                probe_root=root,
+                                path=cwd,
+                                extra={
+                                    "sandbox_role": identity.role,
+                                    "network_mode": identity.network_mode.value,
+                                    "target": "probe_root_acl",
+                                },
+                            ),
+                            "details": role_acl.details,
+                        },
+                    }
+                )
+                continue
             result = _account_python_smoke(
                 identity=identity,
                 cwd=cwd,
@@ -2742,7 +2787,11 @@ def _network_probe_state(
         state_dir = _windows_state_dir()
         root = state_dir / "network-smoke"
         root.mkdir(parents=True, exist_ok=True)
-        acl = _apply_account_acl(root, account_names=(identity.account_name,))
+        acl = _apply_probe_root_acl(
+            root,
+            account_names=(identity.account_name,),
+            operation="network_probe_acl",
+        )
         if not acl.ok:
             return _missing(
                 "Network denied smoke ACL setup failed for sandbox account.",
@@ -2821,8 +2870,8 @@ def _network_probe_state(
         except Exception as exc:
             return _missing(
                 "Network denied smoke failed for sandbox account.",
-                _exception_diagnostics(
-                    "network_probe_runner_launch",
+                _account_runner_launch_exception_diagnostics(
+                    "network_probe",
                     exc,
                     state_dir=state_dir,
                     probe_root=root,
@@ -2857,8 +2906,8 @@ def _network_probe_state(
     except Exception as exc:
         return _missing(
             "Network denied smoke failed for sandbox account.",
-            _exception_diagnostics(
-                "network_probe_runner_launch",
+            _account_runner_launch_exception_diagnostics(
+                "network_probe",
                 exc,
                 state_dir=state_dir,
                 probe_root=root,
@@ -4165,7 +4214,10 @@ def _ensure_state_dir_acl() -> _OperationResult:
             "Windows sandbox state directory could not be created.",
             _exception_diagnostics("state_dir_acl_mkdir", exc, state_dir=_windows_state_dir_path()),
         )
-    acl = _apply_account_acl(state_dir)
+    acl = _apply_sandbox_control_dir_acl(
+        state_dir,
+        operation="state_dir_acl",
+    )
     if not acl.ok:
         return acl
     return _OperationResult(True, "state_dir_acl_applied", {"changed": True, "state_dir_hash": _hash_path(state_dir)})
@@ -4738,6 +4790,134 @@ def _apply_account_acl(
     return _OperationResult(True)
 
 
+def _apply_sandbox_control_dir_acl(
+    path: Path,
+    *,
+    account_names: tuple[str, ...] = SANDBOX_ACCOUNTS,
+    operation: str = "sandbox_control_dir_acl",
+    low_integrity_root: Path | None = None,
+) -> _OperationResult:
+    if os.name != "nt":
+        return _OperationResult(False, "Windows sandbox control directory ACL setup requires Windows.")
+    state_dir = _windows_state_dir_path().resolve(strict=False)
+    target = path.resolve(strict=False)
+    if not (_is_relative_to(target, state_dir) or target == state_dir):
+        return _OperationResult(
+            False,
+            "Refusing to grant sandbox account access outside the Windows sandbox state directory.",
+            _probe_evidence(
+                f"{operation}_unsafe_target",
+                state_dir=state_dir,
+                probe_root=path,
+                path=path,
+                extra={"target": "sandbox_control_dir"},
+            ),
+        )
+    host_sid = _current_process_sid()
+    icacls = shutil.which("icacls")
+    if not host_sid or icacls is None:
+        return _OperationResult(
+            False,
+            "icacls and the current process SID are required for sandbox control directory ACL setup.",
+            _probe_evidence(
+                f"{operation}_prerequisites",
+                state_dir=state_dir,
+                probe_root=path,
+                path=path,
+                extra={
+                    "target": "sandbox_control_dir",
+                    "host_sid_available": bool(host_sid),
+                    "icacls_available": bool(icacls),
+                },
+            ),
+        )
+    commands: list[tuple[str, list[str], Path]] = [
+        (
+            f"{operation}_protect",
+            [icacls, str(path), "/inheritance:r", "/T", "/C", "/Q"],
+            path,
+        ),
+        (
+            f"{operation}_grant",
+            [
+                icacls,
+                str(path),
+                "/grant:r",
+                f"*{host_sid}:(OI)(CI)F",
+                *(f"{account}:(OI)(CI)M" for account in account_names),
+                "/T",
+                "/C",
+                "/Q",
+            ],
+            path,
+        ),
+    ]
+    if low_integrity_root is not None:
+        commands.append(
+            (
+                f"{operation}_low_integrity",
+                [
+                    icacls,
+                    str(low_integrity_root),
+                    "/setintegritylevel",
+                    "(OI)(CI)L",
+                    "/T",
+                    "/C",
+                    "/Q",
+                ],
+                low_integrity_root,
+            )
+        )
+    details = {
+        "target": "sandbox_control_dir",
+        "account_name_hashes": [_hash_text(account) for account in account_names],
+    }
+    for command_operation, command, command_path in commands:
+        result = _run_command(command)
+        if result.returncode != 0:
+            return _OperationResult(
+                False,
+                _safe_output(result),
+                _completed_process_diagnostics(
+                    command_operation,
+                    result,
+                    state_dir=state_dir,
+                    probe_root=path,
+                    path=command_path,
+                    extra=details,
+                ),
+            )
+    return _OperationResult(
+        True,
+        f"{operation}_ready",
+        {
+            **_probe_evidence(
+                operation,
+                state_dir=state_dir,
+                probe_root=path,
+                path=path,
+                extra=details,
+            ),
+            "changed": True,
+        },
+    )
+
+
+def _apply_probe_root_acl(
+    path: Path,
+    *,
+    account_names: tuple[str, ...] = SANDBOX_ACCOUNTS,
+    operation: str = "probe_root_acl",
+    low_integrity_root: Path | None = None,
+) -> _OperationResult:
+    return _apply_sandbox_control_dir_acl(
+        path,
+        account_names=account_names,
+        operation=operation,
+        low_integrity_root=low_integrity_root,
+    )
+
+
 def _safe_output(result: subprocess.CompletedProcess[str]) -> str:
     text = (result.stderr or result.stdout or "").strip()
     return TraceRedactor().redact_text(text)[:500] or f"exit {result.returncode}"
@@ -4955,6 +5135,47 @@ def _runner_result_operation(prefix: str, result: WindowsRunnerResult) -> str:
     if error_type:
         return f"{prefix}_runner_error"
     return prefix
+
+
+def _is_create_process_with_logon_access_denied(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "createprocesswithlogonw" in text and (
+        getattr(exc, "winerror", None) == 5
+        or getattr(exc, "errno", None) in {5, 13}
+        or "access is denied" in text
+        or "拒绝访问" in text
+    )
+
+
+def _account_runner_launch_exception_diagnostics(
+    prefix: str,
+    exc: BaseException,
+    *,
+    state_dir: Path,
+    probe_root: Path,
+    path: Path,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if _is_create_process_with_logon_access_denied(exc):
+        evidence_extra = {"target": "working_directory"}
+        if extra:
+            evidence_extra.update(extra)
+        return _exception_diagnostics(
+            f"{prefix}_working_directory_access",
+            exc,
+            state_dir=state_dir,
+            probe_root=probe_root,
+            path=path,
+            extra=evidence_extra,
+        )
+    return _exception_diagnostics(
+        _runner_exception_operation(prefix, exc),
+        exc,
+        state_dir=state_dir,
+        probe_root=probe_root,
+        path=path,
+        extra=extra,
+    )
 
 
 def _runner_exception_operation(prefix: str, exc: BaseException) -> str:
