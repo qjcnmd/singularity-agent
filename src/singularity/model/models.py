@@ -157,6 +157,7 @@ class ModelCapabilities(SerializableDataclass):
     supports_parallel_tool_calls: bool = False
     supports_streaming: bool = False
     supports_json_mode: bool = False
+    supports_structured_outputs: bool = False
     supports_system_message: bool = True
     supports_developer_message: bool = False
     max_context_tokens: int = 128000
@@ -189,6 +190,7 @@ class ModelPreferences(SerializableDataclass):
     top_p: float | None = None
     max_output_tokens: int | None = None
     json_mode: bool = False
+    structured_output_schema: dict[str, Any] | None = None
     stream: bool = False
     fallback_models: list[str] = field(default_factory=list)
 

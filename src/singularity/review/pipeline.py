@@ -247,6 +247,7 @@ class ReviewPipeline:
             critic_skipped_reason = str(cached_outcome.get("reason") or "cached_critic_outcome")
             report.model_critic_status = str(cached_outcome.get("status") or "reused")
             report.model_critic_error = cached_outcome.get("error")
+            report.metadata.update(_review_output_metadata(cached_outcome))
             report.metadata["critic_reused"] = True
             report.metadata["critic_skipped_reason"] = critic_skipped_reason
             report.metadata["critic_source_review_id"] = cached_outcome.get("review_id")
@@ -279,18 +280,19 @@ class ReviewPipeline:
             self._throw_if_cancelled()
             report.model_critic_status = outcome.status
             report.model_critic_error = outcome.error
+            report.metadata.update(_review_output_metadata(outcome.metadata))
             if outcome.status != "ok":
+                evidence_payload = {
+                    "status": outcome.status,
+                    "error": outcome.error,
+                    **_review_output_metadata(outcome.metadata),
+                }
                 report.evidence.append(
                     ReviewEvidence(
                         source=outcome.status,
                         summary=f"Model critic status: {outcome.status}.",
-                        payload={
-                            "status": outcome.status,
-                            "error": outcome.error,
-                        },
-                        payload_hash=_stable_review_hash(
-                            {"status": outcome.status, "error": outcome.error}
-                        ),
+                        payload=evidence_payload,
+                        payload_hash=_stable_review_hash(evidence_payload),
                         trust_level="model_derived",
                     )
                 )
@@ -320,6 +322,7 @@ class ReviewPipeline:
                 critic_skipped_reason=critic_skipped_reason,
                 critic_reuse_skip_reason=critic_reuse_skip_reason,
                 critic_source_status=str(report.metadata.get("critic_source_status") or ""),
+                review_output_metadata=_review_output_metadata(report.metadata),
             )
         )
         self._record_planner(report)
@@ -429,6 +432,7 @@ class ReviewPipeline:
         critic_skipped_reason: str,
         critic_reuse_skip_reason: str,
         critic_source_status: str,
+        review_output_metadata: dict[str, Any],
     ) -> list[str]:
         return self._emit(
             TraceEventType.REVIEW_COMPLETED,
@@ -446,6 +450,7 @@ class ReviewPipeline:
                 "critic_skipped_reason": critic_skipped_reason,
                 "critic_reuse_skip_reason": critic_reuse_skip_reason,
                 "critic_source_status": critic_source_status,
+                **review_output_metadata,
             },
             severity=TraceSeverity.INFO,
             target=report.target,
@@ -571,6 +576,7 @@ class ReviewPipeline:
             "status": report.model_critic_status,
             "source_status": report.model_critic_status,
             "error": report.model_critic_error,
+            **_review_output_metadata(report.metadata),
             "findings": [
                 finding.model_dump(mode="json")
                 for finding in report.findings
@@ -599,6 +605,7 @@ class ReviewPipeline:
             "error": report.model_critic_error,
             "evidence_hashes": [item.payload_hash for item in evidence],
             "changed_files": list(context.get("changed_files") or _changed_files_from_context(context)),
+            **_review_output_metadata(report.metadata),
             "findings": [
                 finding.model_dump(mode="json")
                 for finding in report.findings
@@ -793,6 +800,15 @@ def _risk_level(context: dict[str, Any]) -> str:
 def _critic_status_reusable(outcome: dict[str, Any]) -> bool:
     status = str(outcome.get("source_status") or outcome.get("original_status") or outcome.get("status") or "")
     return status == "ok"
+
+
+def _review_output_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "output_mode": str(payload.get("output_mode") or ""),
+        "schema_validation_passed": bool(payload.get("schema_validation_passed")),
+        "retry_count": int(payload.get("retry_count") or 0),
+        "fallback_reason": str(payload.get("fallback_reason") or ""),
+    }
 
 
 def _stable_review_hash(payload: dict[str, Any]) -> str:

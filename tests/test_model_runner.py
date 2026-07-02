@@ -418,6 +418,42 @@ def test_model_runner_downgrades_json_stream_and_parallel_tool_preferences(
     ]
 
 
+def test_model_runner_downgrades_structured_outputs_when_provider_does_not_support_it(
+    tmp_path: Path,
+) -> None:
+    provider = MockModelProvider(
+        text='{"findings":[]}',
+        capabilities=ModelCapabilities(
+            supports_tools=True,
+            supports_json_mode=True,
+            supports_structured_outputs=False,
+        ),
+    )
+    component = ModelRunner.with_mock_provider(provider, tool_registry=ToolRegistry(tmp_path))
+    request = ModelTurnRequest(
+        request_id="req_structured",
+        run_id="run_1",
+        session_id="session_1",
+        task_id="task_1",
+        phase_id="phase_1",
+        action_id="action_1",
+        purpose=ModelPurpose.FINAL_REVIEW,
+        messages=[],
+        tool_choice=ToolChoicePolicy(mode=ToolChoiceMode.NONE, max_tool_calls=1),
+    )
+    request.model_preferences.structured_output_schema = {
+        "name": "review_findings",
+        "strict": True,
+        "schema": {"type": "object", "additionalProperties": False},
+    }
+
+    result = component.run_turn(request)
+
+    assert result.status == ModelTurnStatus.SUCCESS
+    assert provider.requests[0].preferences.structured_output_schema is None
+    assert result.metadata["capability_adjustments"]["downgraded"] == ["structured_outputs"]
+
+
 def test_model_runner_returns_structured_capability_error_when_tools_required(
     tmp_path: Path,
 ) -> None:

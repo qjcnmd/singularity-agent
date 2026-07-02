@@ -366,7 +366,12 @@ class OpenAICompatibleModelProvider:
             payload["top_p"] = request.preferences.top_p
         if request.preferences.max_output_tokens is not None:
             payload["max_tokens"] = request.preferences.max_output_tokens
-        if request.preferences.json_mode:
+        if request.preferences.structured_output_schema:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": request.preferences.structured_output_schema,
+            }
+        elif request.preferences.json_mode:
             payload["response_format"] = {"type": "json_object"}
         return payload
 

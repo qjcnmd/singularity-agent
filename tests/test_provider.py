@@ -7,7 +7,9 @@ import pytest
 from singularity.config import Settings
 from singularity.model import (
     ContentBlock,
+    ModelCapabilities,
     ModelMessage,
+    ModelPreferences,
     ModelPurpose,
     ModelRole,
     OpenAICompatibleModelProvider,
@@ -111,6 +113,58 @@ def test_provider_chat_passes_tool_choice(
     )
 
     assert FakeClient.payloads[0]["tool_choice"] == expected
+
+
+def test_provider_chat_passes_structured_outputs_response_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeClient.payloads = []
+    monkeypatch.setattr("singularity.model.providers.httpx.Client", FakeClient)
+    provider = OpenAICompatibleModelProvider(
+        Settings(
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        capabilities=ModelCapabilities(supports_structured_outputs=True),
+    )
+
+    provider.complete(
+        ProviderRequest(
+            request_id="req",
+            purpose=ModelPurpose.FINAL_REVIEW.value,
+            messages=[
+                ModelMessage(
+                    role=ModelRole.USER,
+                    content=[ContentBlock.from_text("hi")],
+                )
+            ],
+            preferences=ModelPreferences(
+                structured_output_schema={
+                    "name": "review_findings",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"findings": {"type": "array"}},
+                        "additionalProperties": False,
+                    },
+                }
+            ),
+        )
+    )
+
+    assert FakeClient.payloads[0]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "review_findings",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"findings": {"type": "array"}},
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 def test_provider_http_error_does_not_echo_response_body(

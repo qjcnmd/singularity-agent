@@ -20,6 +20,8 @@ from typing import Any
 from singularity.model.models import (
     ModelMessage,
     ModelPurpose,
+    ModelToolCall,
+    ModelToolParseStatus,
     ModelTurnRequest,
     ModelTurnResult,
     ModelTurnStatus,
@@ -68,6 +70,10 @@ class FakeModelRunner:
             status=ModelTurnStatus.SUCCESS,
             assistant_message=ModelMessage.assistant_text(value),
         )
+
+    def supports_review_output_mode(self, mode: str) -> bool:
+        modes = self.responses.get("supported_output_modes")
+        return modes is None or mode in modes
 
 
 class FakeTrace:
@@ -288,6 +294,7 @@ def test_final_reviewer_model_can_confirm_with_evidence_refs() -> None:
     # c1 should have been confirmed by the model (missing → satisfied with refs)
     assert assessment.overall_satisfied
     assert any(c.producer_source == "model" for c in assessment.criteria)
+    assert runner.requests[0].model_preferences.structured_output_schema is not None
 
 
 def test_final_reviewer_skips_model_when_rules_already_satisfy_all_criteria() -> None:
@@ -342,6 +349,89 @@ def test_final_reviewer_model_cannot_override_evidence_gate() -> None:
     assert not c2.satisfied
     assert "verification_results" in c2.failed_evidence
     assert not assessment.overall_satisfied
+
+
+def test_final_reviewer_uses_forced_tool_calling_fallback() -> None:
+    class ToolRunner(FakeModelRunner):
+        def run_turn(self, request: ModelTurnRequest) -> ModelTurnResult:
+            self.requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id="resp_tool",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text(""),
+                tool_calls=[
+                    ModelToolCall(
+                        tool_call_id="call_1",
+                        tool_name="submit_final_review",
+                        arguments={
+                            "criteria": [
+                                {
+                                    "criterion_id": "c1",
+                                    "satisfied": True,
+                                    "evidence_refs": ["custom_evidence:1"],
+                                }
+                            ]
+                        },
+                        raw_arguments='{"criteria":[{"criterion_id":"c1","satisfied":true,"evidence_refs":["custom_evidence:1"]}]}',
+                        parse_status=ModelToolParseStatus.VALID,
+                    )
+                ],
+            )
+
+    contract = _make_contract(
+        criteria=[
+            AcceptanceCriterion(
+                criterion_id="c1",
+                description="Custom evidence",
+                evidence=["custom_evidence"],
+                required=True,
+            ),
+        ]
+    )
+    runner = ToolRunner({ModelPurpose.FINAL_REVIEW: "{}", "supported_output_modes": {"forced_tool_call"}})
+    reviewer = FinalReviewer(model_runner=runner)
+
+    assessment = reviewer.assess(contract=contract, plan=None, evidence=EvidenceLedger(), state=_make_state())
+
+    assert assessment.overall_satisfied is True
+    assert runner.requests[0].tool_choice.tool_name == "submit_final_review"
+    assert runner.requests[0].tools[0].metadata["strict"] is True
+
+
+def test_final_reviewer_business_rule_failure_falls_back_to_rules() -> None:
+    contract = _make_contract()
+    evidence = EvidenceLedger()
+    evidence.applied_changes.append({"file": "a.py"})
+    evidence.verification_results.append({"check_id": "v1", "status": "failed"})
+    state = _make_state(verification_status="failed")
+    model_response = json.dumps(
+        {
+            "criteria": [
+                {
+                    "criterion_id": "c2",
+                    "satisfied": True,
+                    "evidence_refs": ["verification_results:1"],
+                }
+            ]
+        }
+    )
+    runner = FakeModelRunner(
+        {
+            ModelPurpose.FINAL_REVIEW: model_response,
+            "supported_output_modes": {"structured_output"},
+        }
+    )
+    trace = FakeTrace()
+    reviewer = FinalReviewer(model_runner=runner, trace=trace)
+
+    assessment = reviewer.assess(contract=contract, plan=None, evidence=evidence, state=state)
+
+    assert assessment.overall_satisfied is False
+    assert assessment.producer_source == "rules"
+    fallback_events = [payload for event, payload in trace.events if event == "final_reviewer.assess.fallback"]
+    assert fallback_events
+    assert fallback_events[-1]["payload"]["fallback_reason"] == "business_rule_validation_failed"
 
 
 def test_completion_assessment_round_trip() -> None:

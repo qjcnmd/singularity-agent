@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from singularity.model.models import ModelError, ModelErrorKind
 class RetryPolicy:
     max_attempts: int = 3
     backoff_seconds: float = 0.25
+    jitter_ratio: float = 0.2
     fallback_models: list[str] = field(default_factory=list)
 
 
@@ -54,7 +56,9 @@ class ModelRetryController:
                     fallback_index += 1
                     self.fallback_count += 1
                 if self.policy.backoff_seconds:
-                    time.sleep(self.policy.backoff_seconds * attempt)
+                    delay = self.policy.backoff_seconds * (2 ** (attempt - 1))
+                    jitter = random.uniform(0.0, delay * self.policy.jitter_ratio) if self.policy.jitter_ratio else 0.0
+                    time.sleep(delay + jitter)
                 attempt += 1
         raise ModelRetryExhausted(str(last_error.message if last_error else "Retry exhausted."))
 

@@ -24,6 +24,7 @@ from singularity.model.models import (
     ModelPurpose,
     ModelRole,
     ModelToolCall,
+    ModelToolParseStatus,
     ModelTurnRequest,
     ModelTurnResult,
     ModelTurnStatus,
@@ -162,6 +163,20 @@ class ModelRunner:
             supports_developer_message=supports_developer_message,
             strict_tools=strict_tools,
         )
+
+    def supports_review_output_mode(self, mode: str) -> bool:
+        try:
+            provider = self.registry.select_provider(ModelPreferences(), purpose=None)
+        except Exception:
+            return False
+        capabilities = provider.capabilities()
+        if mode == "structured_output":
+            return bool(capabilities.supports_structured_outputs)
+        if mode == "forced_tool_call":
+            return bool(capabilities.supports_tools)
+        if mode == "json_mode":
+            return bool(capabilities.supports_json_mode)
+        return mode == "rule_only"
 
     def run_turn(self, request: ModelTurnRequest) -> ModelTurnResult:
         _throw_if_cancelled(self)
@@ -404,6 +419,11 @@ class ModelRunner:
                 {**preferences.to_dict(), "json_mode": False}
             )
             downgraded.append("json_mode")
+        if preferences.structured_output_schema and not capabilities.supports_structured_outputs:
+            preferences = ModelPreferences.from_dict(
+                {**preferences.to_dict(), "structured_output_schema": None}
+            )
+            downgraded.append("structured_outputs")
         if preferences.stream and not capabilities.supports_streaming:
             preferences = ModelPreferences.from_dict(
                 {**preferences.to_dict(), "stream": False}
@@ -553,7 +573,11 @@ class ModelRunner:
         normalized: list[ModelToolCall] = []
         seen: set[str] = set()
         allowed = self._allowed_tool_names(request)
+        request_tool_names = {tool.name for tool in request.tools}
         for call in response.tool_calls:
+            if call.tool_name in request_tool_names:
+                normalized.append(self._normalize_request_local_tool_call(call, seen_ids=seen))
+                continue
             raw = call.provider_metadata.get("raw_tool_call")
             if isinstance(raw, dict):
                 normalized.append(
@@ -572,6 +596,56 @@ class ModelRunner:
                     )
                 )
         return normalized
+
+    @staticmethod
+    def _normalize_request_local_tool_call(
+        call: ModelToolCall,
+        *,
+        seen_ids: set[str],
+    ) -> ModelToolCall:
+        errors = list(call.validation_errors)
+        tool_call_id = call.tool_call_id or "<missing>"
+        if not call.tool_call_id:
+            errors.append("missing_tool_call_id")
+        if tool_call_id in seen_ids:
+            errors.append("duplicate_tool_call_id")
+        seen_ids.add(tool_call_id)
+        raw_arguments = call.raw_arguments or "{}"
+        try:
+            parsed = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            return ModelToolCall(
+                tool_call_id=tool_call_id,
+                tool_name=call.tool_name,
+                arguments={},
+                raw_arguments=raw_arguments,
+                parse_status=ModelToolParseStatus.INVALID_JSON,
+                validation_errors=[*errors, str(exc)],
+                provider_metadata=call.provider_metadata,
+            )
+        if not isinstance(parsed, dict):
+            return ModelToolCall(
+                tool_call_id=tool_call_id,
+                tool_name=call.tool_name,
+                arguments={},
+                raw_arguments=raw_arguments,
+                parse_status=ModelToolParseStatus.SCHEMA_MISMATCH,
+                validation_errors=[*errors, "arguments_not_object"],
+                provider_metadata=call.provider_metadata,
+            )
+        return ModelToolCall(
+            tool_call_id=tool_call_id,
+            tool_name=call.tool_name,
+            arguments=parsed,
+            raw_arguments=raw_arguments,
+            parse_status=(
+                ModelToolParseStatus.VALID
+                if not errors and call.parse_status == ModelToolParseStatus.VALID
+                else call.parse_status
+            ),
+            validation_errors=errors,
+            provider_metadata=call.provider_metadata,
+        )
 
     def _allowed_tool_names(self, request: ModelTurnRequest) -> list[str]:
         if request.tool_choice.mode == ToolChoiceMode.ALLOWED_TOOLS:

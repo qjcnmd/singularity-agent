@@ -822,6 +822,10 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
                 "duration_ms": 800,
                 "critic_duration_ms": 600,
                 "model_critic_status": "ok",
+                "output_mode": "structured_output",
+                "schema_validation_passed": True,
+                "retry_count": 0,
+                "fallback_reason": "",
             },
         },
         {
@@ -885,12 +889,16 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
                     "decision": "accept",
                     "duration_seconds": 0.8,
                     "critic_duration_seconds": 0.6,
-                "model_critic_status": "ok",
-                "critic_reused": False,
-                "critic_skipped_reason": "",
-                "critic_reuse_skip_reason": "",
-                "critic_source_status": "ok",
-            }
+                    "model_critic_status": "ok",
+                    "output_mode": "structured_output",
+                    "schema_validation_passed": True,
+                    "retry_count": 0,
+                    "fallback_reason": "",
+                    "critic_reused": False,
+                    "critic_skipped_reason": "",
+                    "critic_reuse_skip_reason": "",
+                    "critic_source_status": "ok",
+                }
             ],
             "verification_events": [
                 {

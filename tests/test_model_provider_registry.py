@@ -32,6 +32,7 @@ def test_registry_selects_default_provider_and_checks_capabilities() -> None:
             supports_tools=True,
             supports_streaming=False,
             supports_json_mode=False,
+            supports_structured_outputs=False,
         ),
     )
     registry = ModelProviderRegistry(default_provider_name="mock")
@@ -55,6 +56,7 @@ def test_registry_summarizes_provider_capabilities_without_private_payload() -> 
             supports_tools=False,
             supports_streaming=False,
             supports_json_mode=False,
+            supports_structured_outputs=False,
             supports_parallel_tool_calls=False,
             supports_developer_message=False,
         ),
@@ -68,6 +70,7 @@ def test_registry_summarizes_provider_capabilities_without_private_payload() -> 
         "supports_parallel_tool_calls": False,
         "supports_streaming": False,
         "supports_json_mode": False,
+        "supports_structured_outputs": False,
         "supports_system_message": True,
         "supports_developer_message": False,
         "max_context_tokens": 128000,

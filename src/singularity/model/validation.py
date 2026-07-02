@@ -29,6 +29,9 @@ class ModelResponseValidator:
         errors: list[str] = []
         warnings: list[str] = []
         allowed = set(allowed_tool_names)
+        request_tool_names = set(allowed_tool_names) - {
+            spec.name for spec in self.registry.list_model_visible()
+        }
         if assistant_message is None:
             errors.append("missing_assistant_message")
         elif assistant_message.role != ModelRole.ASSISTANT:
@@ -53,7 +56,7 @@ class ModelResponseValidator:
             seen.add(call.tool_call_id)
             if call.tool_name not in allowed:
                 errors.append("unknown_tool")
-            if self.registry.get(call.tool_name) is None:
+            if self.registry.get(call.tool_name) is None and call.tool_name not in request_tool_names:
                 errors.append("unknown_tool")
             if call.parse_status == ModelToolParseStatus.INVALID_JSON:
                 errors.append("invalid_json")

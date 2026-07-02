@@ -29,25 +29,20 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from singularity.model.models import (
-    ContentBlock,
-    ModelBudget,
-    ModelMessage,
-    ModelPreferences,
-    ModelPurpose,
-    ModelRole,
-    ModelTurnRequest,
-    ModelTurnStatus,
-    ToolChoiceMode,
-    ToolChoicePolicy,
-)
-from singularity.model.output import OutputParser
+from pydantic import BaseModel, ConfigDict, Field
+
+from singularity.model.models import ModelPurpose
 from singularity.planner.contract import TaskContract
 from singularity.planner.models import EvidenceLedger, TaskState
 from singularity.planner.semantic_objects import (
     RiskPoint,
     SemanticPlan,
     VerificationStrategy,
+)
+from singularity.review.structured_output import (
+    BusinessRuleViolation,
+    ReviewOutputResult,
+    call_review_output,
 )
 
 
@@ -143,29 +138,22 @@ class CompletionAssessment:
         return None
 
 
-def _json_payload(text: str) -> dict[str, Any]:
-    """Parse a JSON object from model text via ``OutputParser``.
+class FinalReviewCriterionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-    Legacy wrapper — prefer ``OutputParser().parse()`` directly.
-    Preserves the old return/raise contract.
-    """
-    result = OutputParser().parse(text)
-    if not result.ok:
-        raise ValueError(
-            result.errors[0].message if result.errors else "parse failed"
-        )
-    return result.parsed  # type: ignore[return-value]
+    criterion_id: str
+    satisfied: bool = False
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class FinalReviewCriteria(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    criteria: list[FinalReviewCriterionOutput] = Field(default_factory=list)
 
 
 def _needs_model_confirmation(criteria: list[CriterionAssessment]) -> bool:
-    for criterion in criteria:
-        if criterion.satisfied:
-            continue
-        if criterion.failed_evidence or criterion.risk_remaining:
-            continue
-        if criterion.missing_evidence:
-            return True
-    return False
+    return any(criterion.required and not criterion.satisfied for criterion in criteria)
 
 
 def _emit(
@@ -204,9 +192,12 @@ class FinalReviewer:
     3. Bind ``RiskPoint``s via ``acceptance_criterion_id`` and flag
        ``risk_remaining`` when the risk's mitigation has no corresponding
        applied change or command result.
-    4. Optionally call the model (``ModelPurpose.FINAL_REVIEW``, json_mode) to
-       *confirm* criteria — the model can flip ``satisfied`` True only when
-       it attaches ``evidence_refs``; it cannot downgrade a True to False.
+    4. Optionally call the model-assisted review path
+       (``ModelPurpose.FINAL_REVIEW``) through the shared ordered output
+       boundary: Structured Outputs / JSON Schema, strict tool calling with
+       pinned tool choice, then json_mode. The model can flip ``satisfied``
+       True only when it attaches ``evidence_refs``; it cannot downgrade a
+       True to False or override failed evidence.
     5. Fail-closed fallback: if no ``SemanticPlan`` is available, fall back to
        the coarse bucket-non-empty check (same as the legacy
        ``Planner._contract_evidence_satisfied``).
@@ -370,18 +361,19 @@ class FinalReviewer:
         context_payload: dict[str, Any],
     ) -> list[CriterionAssessment]:
         """Ask the model to confirm criteria; model can only confirm (not override)."""
-        try:
-            payload = self._call_model(criteria, evidence, context_payload)
-        except Exception as exc:
+        result = self._call_model(criteria, evidence, context_payload)
+        output_metadata = _safe_output_metadata(result.metadata)
+        if result.status != "ok":
             _emit(
                 self.trace,
                 "final_reviewer.assess.fallback",
-                summary=f"final_reviewer model confirm failed: {type(exc).__name__}: {exc}",
+                summary="final_reviewer model-assisted review used the rule-only fallback path",
+                payload=output_metadata,
                 severity="warning",
             )
             return criteria
         confirmed: dict[str, dict[str, Any]] = {}
-        for item in payload.get("criteria") or []:
+        for item in result.payload.get("criteria") or []:
             cid = item.get("criterion_id")
             if cid:
                 confirmed[str(cid)] = item
@@ -416,6 +408,7 @@ class FinalReviewer:
                     self.trace,
                     "final_reviewer.assess.model_ok",
                     summary=f"criterion {original.criterion_id} confirmed by model",
+                    payload=output_metadata,
                 )
             else:
                 updated.append(original)
@@ -423,6 +416,7 @@ class FinalReviewer:
             self.trace,
             "final_reviewer.assess.model_ok",
             summary="final_reviewer model confirm completed",
+            payload=output_metadata,
         )
         return updated
 
@@ -431,7 +425,7 @@ class FinalReviewer:
         criteria: list[CriterionAssessment],
         evidence: EvidenceLedger,
         context_payload: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> ReviewOutputResult:
         criteria_json = json.dumps(
             [c.to_dict() for c in criteria], ensure_ascii=False, sort_keys=True, default=str
         )
@@ -444,39 +438,81 @@ class FinalReviewer:
             "unresolved_failures_count": len(evidence.unresolved_failures),
         }
         prompt = (
-            "You are a Final Reviewer. For each acceptance criterion, decide if it is "
-            "satisfied based on the evidence summary. You can ONLY mark a criterion "
-            "satisfied=True if you attach at least one evidence_ref (e.g. "
-            "'applied_changes:2'). You CANNOT mark satisfied=True for a criterion that "
-            "has failed_evidence. Return JSON only: "
-            '{"criteria": [{"criterion_id", "satisfied", "evidence_refs"}]}.\n\n'
+            "You are the Singularity FinalReviewer, a project-internal hard gate. "
+            "Use the caller-selected output boundary: Structured Outputs / JSON Schema, "
+            "strict tool calling with pinned tool choice, or json_mode fallback. "
+            "For each acceptance criterion, decide if it is satisfied based on the evidence summary. "
+            "You can ONLY mark a criterion satisfied=True if you attach at least one evidence_ref "
+            "(for example 'applied_changes:2'). You CANNOT mark satisfied=True for a criterion that "
+            "has failed_evidence or risk_remaining; the local fail-closed deterministic gate is authoritative. "
+            "Return a FinalReviewCriteria JSON object with a criteria array.\n\n"
             "Criteria:\n" + criteria_json + "\n\nEvidence summary:\n"
             + json.dumps(evidence_summary, ensure_ascii=False, sort_keys=True)
         )
-        request = ModelTurnRequest(
-            request_id=f"req_{uuid4().hex[:12]}",
-            run_id=str(context_payload.get("run_id") or "final_reviewer"),
-            session_id=str(context_payload.get("session_id") or "final_reviewer"),
-            task_id=str(context_payload.get("task_id") or "final_reviewer"),
-            phase_id=str(context_payload.get("phase_id") or "final_reviewer"),
-            action_id=str(context_payload.get("action_id") or uuid4().hex[:12]),
-            purpose=ModelPurpose.FINAL_REVIEW,
-            messages=[
-                ModelMessage(
-                    role=ModelRole.USER,
-                    content=[ContentBlock.from_text(prompt)],
-                )
-            ],
-            tools=[],
-            tool_choice=ToolChoicePolicy(mode=ToolChoiceMode.NONE, max_tool_calls=0),
-            model_preferences=ModelPreferences(json_mode=True, max_output_tokens=1200),
-            budget=ModelBudget(max_retries=1, max_output_tokens=1200),
-            context_metadata={"producer": "final_reviewer"},
-        )
         runner = self.model_runner
         if runner is None:
-            raise RuntimeError("model_runner unavailable")
-        result = runner.run_turn(request)
-        if result.status != ModelTurnStatus.SUCCESS or result.assistant_message is None:
-            raise RuntimeError(f"model turn failed: {result.status}")
-        return _json_payload(result.assistant_message.text)
+            return ReviewOutputResult(
+                status="fallback",
+                error="model_runner_missing",
+                metadata={
+                    "output_mode": "rule_only",
+                    "schema_validation_passed": False,
+                    "retry_count": 0,
+                    "fallback_reason": "model_runner_missing",
+                },
+            )
+        return call_review_output(
+            model_runner=runner,
+            request_base={
+                "request_id": f"req_{uuid4().hex[:12]}",
+                "run_id": str(context_payload.get("run_id") or "final_reviewer"),
+                "session_id": str(context_payload.get("session_id") or "final_reviewer"),
+                "task_id": str(context_payload.get("task_id") or "final_reviewer"),
+                "phase_id": str(context_payload.get("phase_id") or "final_reviewer"),
+                "action_id": str(context_payload.get("action_id") or uuid4().hex[:12]),
+                "purpose": ModelPurpose.FINAL_REVIEW,
+                "context_metadata": {"producer": "final_reviewer"},
+                "max_output_tokens": 1200,
+            },
+            prompt=prompt,
+            output_model=FinalReviewCriteria,
+            schema_name="final_review_criteria",
+            tool_name="submit_final_review",
+            tool_description="Submit FinalReviewer criterion confirmations that conform to the FinalReviewCriteria JSON Schema.",
+            business_validator=_final_review_business_validator(criteria),
+        )
+
+
+def _final_review_business_validator(criteria: list[CriterionAssessment]) -> Any:
+    by_id = {criterion.criterion_id: criterion for criterion in criteria}
+
+    def validate(payload: dict[str, Any]) -> None:
+        for entry in payload.get("criteria") or []:
+            if not isinstance(entry, dict):
+                continue
+            criterion_id = str(entry.get("criterion_id") or "")
+            original = by_id.get(criterion_id)
+            if original is None:
+                raise BusinessRuleViolation("model-assisted review referenced an unknown criterion")
+            if not bool(entry.get("satisfied", False)):
+                continue
+            refs = [str(ref) for ref in entry.get("evidence_refs") or []]
+            if not refs:
+                raise BusinessRuleViolation("model-assisted review confirmation missing evidence_refs")
+            if any("evaluator-only" in ref.lower() for ref in refs):
+                raise BusinessRuleViolation("model-assisted review referenced evaluator-only evidence")
+            if original.failed_evidence or original.risk_remaining:
+                raise BusinessRuleViolation(
+                    "model-assisted review attempted to override fail-closed gate evidence"
+                )
+
+    return validate
+
+
+def _safe_output_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "output_mode": str(metadata.get("output_mode") or ""),
+        "schema_validation_passed": bool(metadata.get("schema_validation_passed")),
+        "retry_count": int(metadata.get("retry_count") or 0),
+        "fallback_reason": str(metadata.get("fallback_reason") or ""),
+    }

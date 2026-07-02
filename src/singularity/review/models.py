@@ -142,6 +142,12 @@ class ReviewFinding(BaseModel):
         return ReviewLocation(**value)
 
 
+class ReviewFindings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    findings: list[ReviewFinding]
+
+
 class ReviewDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

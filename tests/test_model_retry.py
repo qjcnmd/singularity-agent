@@ -34,3 +34,28 @@ def test_retry_controller_retries_retryable_errors_and_uses_fallback() -> None:
         attempt=1,
     )
 
+
+def test_retry_controller_uses_exponential_backoff_with_jitter(monkeypatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("singularity.model.retry.time.sleep", sleeps.append)
+    monkeypatch.setattr("singularity.model.retry.random.uniform", lambda _low, _high: 0.05)
+    controller = ModelRetryController(
+        RetryPolicy(max_attempts=3, backoff_seconds=0.5, jitter_ratio=0.2)
+    )
+    calls = {"count": 0}
+
+    def operation(model_name: str | None) -> str:
+        del model_name
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise ModelError(
+                kind=ModelErrorKind.TIMEOUT,
+                message="timeout",
+                retryable=True,
+            )
+        return "ok"
+
+    assert controller.run(operation) == "ok"
+    assert sleeps == [0.55, 1.05]
+    assert controller.retry_count == 2
+

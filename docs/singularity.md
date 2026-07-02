@@ -1794,6 +1794,15 @@
       turn_diagnostics 只保存安全 ID、phase/purpose、provider latency、
       token/cache 计数、tool call、review/verification/finalization 事件状态
       和耗时，不保存 prompt、response、文件内容或 evaluator-only metadata。
+      review 事件只保存 model-assisted review 的 output_mode、
+      schema_validation_passed、retry_count、fallback_reason、
+      model_critic_status 和耗时/复用状态；模型输出边界按
+      Structured Outputs / JSON Schema、strict tool calling with pinned
+      tool choice、json_mode、rule-only fallback path 的顺序降级，
+      本地 schema validation / Pydantic validation 仍是最终边界。
+      FinalReviewer / CompletionGate 继续 fail-closed，模型结果不能
+      覆盖 failed evidence、sandbox enforcement、visibility audit、
+      public/hidden verification 或 FAIL_TO_PASS。
       没有可靠 span 的指标为 null + unavailable/not_applicable，
       不伪造 0。sandbox command terminal event 按 command_id 去重，
       不把同一 lifecycle 的 sandbox terminal duration 重复累计。
