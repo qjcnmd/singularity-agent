@@ -223,7 +223,7 @@ class SessionLaunch:
 ### 关键枚举值域
 
 ```python
-class SessionStatus(str, Enum):
+class SessionStatus(StrEnum):
     ACTIVE = "active"
     COMPLETED = "completed"
     BLOCKED = "blocked"
@@ -232,26 +232,26 @@ class SessionStatus(str, Enum):
     INTERRUPTED = "interrupted"
     NEEDS_REVIEW = "needs_review"
 
-class SessionState(str, Enum):
+class SessionState(StrEnum):
     ACTIVE = "active"
     RECOVERABLE = "recoverable"
     NEEDS_REVIEW = "needs_review"
     BLOCKED = "blocked"
     CLOSED = "closed"
 
-class SessionRunMode(str, Enum):
+class SessionRunMode(StrEnum):
     NEW = "new"
     CONTINUE = "continue"
     RESUME = "resume"
 
-class SessionCheckpointKind(str, Enum):
+class SessionCheckpointKind(StrEnum):
     WORKSPACE = "workspace"
     CONTEXT = "context"
     TOOL_PROTOCOL = "tool_protocol"
     VERIFICATION = "verification"
     RECOVERY_GATE = "recovery_gate"
 
-class RecoveryGateStatus(str, Enum):
+class RecoveryGateStatus(StrEnum):
     READY_TO_CONTINUE = "ready_to_continue"
     READY_TO_RESUME = "ready_to_resume"
     NEEDS_REVIEW = "needs_review"

@@ -6,38 +6,50 @@
   "required": [
     "event_id",
     "event_type",
-    "schema_version",
     "run_id",
+    "session_id",
+    "task_id",
+    "phase_id",
+    "action_id",
+    "parent_event_id",
+    "timestamp",
+    "monotonic_ms",
     "component",
     "severity",
-    "timestamp",
-    "sequence",
-    "summary",
-    "redaction_applied"
+    "summary"
   ],
   "properties": {
     "event_id": { "type": "string", "minLength": 1 },
     "event_type": { "type": "string", "minLength": 1 },
-    "schema_version": { "type": "string", "const": "1.0" },
     "run_id": { "type": "string", "minLength": 1 },
-    "session_id": { "type": ["string", "null"] },
+    "session_id": { "type": "string", "minLength": 1 },
     "task_id": { "type": ["string", "null"] },
     "phase_id": { "type": ["string", "null"] },
     "action_id": { "type": ["string", "null"] },
+    "parent_event_id": { "type": ["string", "null"] },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "monotonic_ms": { "type": "integer", "minimum": 0 },
     "component": { "type": "string", "minLength": 1 },
     "severity": {
       "type": "string",
       "enum": ["debug", "info", "warning", "error", "critical"]
     },
-    "timestamp": { "type": "string", "format": "date-time" },
-    "sequence": { "type": "integer", "minimum": 0 },
     "summary": { "type": "string" },
-    "payload": { "type": "object" },
+    "payload": { "type": "object", "default": {} },
     "artifact_refs": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": { "type": "string" },
+      "default": []
     },
-    "redaction_applied": { "type": "boolean" }
+    "policy_decision_id": { "type": ["string", "null"], "default": null },
+    "approval_grant_id": { "type": ["string", "null"], "default": null },
+    "sandbox_id": { "type": ["string", "null"], "default": null },
+    "command_id": { "type": ["string", "null"], "default": null },
+    "transaction_id": { "type": ["string", "null"], "default": null },
+    "verification_id": { "type": ["string", "null"], "default": null },
+    "span_id": { "type": ["string", "null"], "default": null },
+    "redaction_applied": { "type": "boolean", "default": true },
+    "payload_hash": { "type": "string", "default": "" }
   },
   "additionalProperties": true
 }

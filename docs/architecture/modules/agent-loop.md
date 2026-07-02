@@ -57,7 +57,7 @@ class AgentLoopResult:
 `AgentLoopResult.status` 的枚举类型，由 `AgentLoop` 内部各终止分支选择。
 
 ```python
-class AgentLoopStatus(str, Enum):
+class AgentLoopStatus(StrEnum):
     COMPLETED = "completed"
     BLOCKED = "blocked"
     MAX_TURNS_EXCEEDED = "max_turns_exceeded"

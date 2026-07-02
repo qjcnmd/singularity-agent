@@ -2,27 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://singularity.local/schemas/tool-call.schema.json",
   "title": "Singularity Tool Call",
-  "type": "object",
-  "required": [
-    "schema_version",
-    "tool_call_id",
-    "tool_name",
-    "run_id",
-    "session_id",
-    "task_id",
-    "phase",
-    "argument_digest",
-    "redaction_applied"
-  ],
-  "properties": {
-    "schema_version": { "type": "string", "const": "1.0" },
-    "tool_call_id": { "type": "string", "minLength": 1 },
-    "tool_name": { "type": "string", "minLength": 1 },
-    "run_id": { "type": "string", "minLength": 1 },
-    "session_id": { "type": "string", "minLength": 1 },
-    "task_id": { "type": "string", "minLength": 1 },
-    "phase_id": { "type": ["string", "null"] },
-    "phase": {
+  "description": "Schema for ToolCallEnvelope and ToolCallRecord dataclasses from singularity.tool_protocol.models.",
+  "$defs": {
+    "ToolCallPhase": {
       "type": "string",
       "enum": [
         "proposed",
@@ -39,18 +21,249 @@
         "result_appended"
       ]
     },
-    "normalized_arguments": { "type": "object" },
-    "argument_digest": { "type": "string", "minLength": 1 },
-    "tool_schema_hash": { "type": ["string", "null"] },
-    "policy_decision_id": { "type": ["string", "null"] },
-    "approval_grant_id": { "type": ["string", "null"] },
-    "result": { "type": ["object", "null"] },
-    "artifact_refs": {
-      "type": "array",
-      "items": { "type": "string" }
+    "ModelToolParseStatus": {
+      "type": "string",
+      "enum": [
+        "valid",
+        "invalid_json",
+        "schema_mismatch",
+        "unknown_tool"
+      ]
     },
-    "error_kind": { "type": ["string", "null"] },
-    "redaction_applied": { "type": "boolean" }
+    "ToolCallFailureKind": {
+      "type": "string",
+      "enum": [
+        "missing_tool_call_id",
+        "duplicate_tool_call_id",
+        "unknown_tool",
+        "disallowed_tool",
+        "invalid_json",
+        "arguments_not_object",
+        "schema_mismatch",
+        "protocol_violation",
+        "policy_denied",
+        "approval_required",
+        "approval_denied",
+        "sandbox_required",
+        "tool_executor_failed",
+        "result_binding_failed",
+        "replay_detected",
+        "conflicting_replay",
+        "context_append_failed"
+      ]
+    },
+    "ToolCallEnvelope": {
+      "type": "object",
+      "required": [
+        "protocol_version",
+        "run_id",
+        "session_id",
+        "task_id",
+        "phase_id",
+        "model_request_id",
+        "model_response_id",
+        "assistant_message_id",
+        "tool_call_id",
+        "tool_name",
+        "raw_arguments",
+        "parsed_arguments",
+        "normalized_arguments"
+      ],
+      "properties": {
+        "protocol_version": {
+          "type": "string",
+          "description": "Tool protocol version string."
+        },
+        "run_id": {
+          "type": "string",
+          "description": "Unique identifier for the run."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Unique identifier for the session."
+        },
+        "task_id": {
+          "type": "string",
+          "description": "Unique identifier for the task."
+        },
+        "phase_id": {
+          "type": "string",
+          "description": "Unique identifier for the phase."
+        },
+        "model_request_id": {
+          "type": "string",
+          "description": "Identifier of the model request that produced this call."
+        },
+        "model_response_id": {
+          "type": "string",
+          "description": "Identifier of the model response containing this call."
+        },
+        "assistant_message_id": {
+          "type": "string",
+          "description": "Identifier of the assistant message containing this call."
+        },
+        "tool_call_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique identifier for the tool call."
+        },
+        "tool_name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of the tool being called."
+        },
+        "raw_arguments": {
+          "type": "string",
+          "description": "Raw JSON string of the tool arguments as received from the model."
+        },
+        "parsed_arguments": {
+          "type": "object",
+          "description": "Parsed JSON object of the tool arguments."
+        },
+        "normalized_arguments": {
+          "type": "object",
+          "description": "Normalized form of the parsed arguments."
+        },
+        "argument_digest": {
+          "type": "string",
+          "default": "",
+          "description": "SHA-256 digest of the normalized (or parsed/raw) arguments."
+        },
+        "tool_schema_hash": {
+          "type": "string",
+          "default": "",
+          "description": "Hash of the tool's JSON schema."
+        },
+        "allowed_tool_names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "List of tool names allowed in this context."
+        },
+        "proposed_at": {
+          "type": "string",
+          "description": "ISO-8601 timestamp when the tool call was proposed."
+        },
+        "proposed_by_model": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether the call was proposed by the model (vs. injected)."
+        },
+        "parse_status": {
+          "$ref": "#/$defs/ModelToolParseStatus",
+          "default": "valid",
+          "description": "Status of argument parsing."
+        },
+        "validation_errors": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "List of validation error messages."
+        },
+        "metadata": {
+          "type": "object",
+          "default": {},
+          "description": "Arbitrary metadata attached to the envelope."
+        },
+        "phase": {
+          "$ref": "#/$defs/ToolCallPhase",
+          "default": "proposed",
+          "description": "Current phase of the tool call lifecycle."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ToolCallRecord": {
+      "type": "object",
+      "required": [
+        "record_id",
+        "envelope",
+        "phase"
+      ],
+      "properties": {
+        "record_id": {
+          "type": "string",
+          "description": "Unique identifier for the record."
+        },
+        "envelope": {
+          "$ref": "#/$defs/ToolCallEnvelope",
+          "description": "The original ToolCallEnvelope associated with this record."
+        },
+        "phase": {
+          "$ref": "#/$defs/ToolCallPhase",
+          "description": "Current phase of the tool call."
+        },
+        "previous_phase": {
+          "oneOf": [
+            { "$ref": "#/$defs/ToolCallPhase" },
+            { "type": "null" }
+          ],
+          "default": null,
+          "description": "The phase before the current one, if any."
+        },
+        "policy_decision_id": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Identifier of the policy decision, if any."
+        },
+        "approval_grant_id": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Identifier of the approval grant, if any."
+        },
+        "execution_started_at": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "ISO-8601 timestamp when execution started."
+        },
+        "execution_finished_at": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "ISO-8601 timestamp when execution finished."
+        },
+        "tool_result_digest": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Digest of the tool result, if available."
+        },
+        "context_message_id": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Identifier of the context message appended for this call."
+        },
+        "error_kind": {
+          "oneOf": [
+            { "$ref": "#/$defs/ToolCallFailureKind" },
+            { "type": "null" }
+          ],
+          "default": null,
+          "description": "Category of failure, if the call failed."
+        },
+        "error_message": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Human-readable error message, if any."
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Number of execution attempts."
+        },
+        "created_at": {
+          "type": "string",
+          "description": "ISO-8601 timestamp when the record was created."
+        },
+        "updated_at": {
+          "type": "string",
+          "description": "ISO-8601 timestamp when the record was last updated."
+        }
+      },
+      "additionalProperties": false
+    }
   },
-  "additionalProperties": true
+  "oneOf": [
+    { "$ref": "#/$defs/ToolCallEnvelope" },
+    { "$ref": "#/$defs/ToolCallRecord" }
+  ]
 }

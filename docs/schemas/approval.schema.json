@@ -1,58 +1,26 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://singularity.local/schemas/approval.schema.json",
-  "title": "Singularity Approval",
+  "title": "Singularity ApprovalGrant",
   "type": "object",
   "required": [
-    "schema_version",
-    "request_id",
     "decision_id",
-    "session_id",
-    "status",
+    "request_id",
+    "approved_by",
     "scope"
   ],
   "properties": {
-    "schema_version": { "type": "string", "const": "1.0" },
-    "request_id": { "type": "string", "minLength": 1 },
     "decision_id": { "type": "string", "minLength": 1 },
-    "grant_id": { "type": ["string", "null"] },
-    "session_id": { "type": "string", "minLength": 1 },
-    "status": {
-      "type": "string",
-      "enum": ["requested", "granted", "denied", "consumed", "expired", "unavailable"]
-    },
-    "message": { "type": "string" },
-    "approved_by": { "type": ["string", "null"] },
-    "approved_at": { "type": ["string", "null"], "format": "date-time" },
-    "expires_at": { "type": ["string", "null"], "format": "date-time" },
-    "scope": {
-      "type": "object",
-      "required": ["capabilities", "session_only", "single_use"],
-      "properties": {
-        "capabilities": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "path_globs": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "command_patterns": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "network_hosts": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "max_duration_seconds": { "type": ["integer", "null"], "minimum": 1 },
-        "max_files": { "type": ["integer", "null"], "minimum": 1 },
-        "session_only": { "type": "boolean" },
-        "single_use": { "type": "boolean" }
-      },
-      "additionalProperties": true
-    },
-    "reason": { "type": "string" }
+    "request_id": { "type": "string", "minLength": 1 },
+    "approved_by": { "type": "string", "minLength": 1 },
+    "scope": { "type": "string" },
+    "session_id": { "type": ["string", "null"], "default": null },
+    "approved_at": { "type": "string", "format": "date-time" },
+    "grant_id": { "type": "string" },
+    "expires_at": { "type": ["string", "null"], "format": "date-time", "default": null },
+    "single_use": { "type": "boolean", "default": true },
+    "reason": { "type": "string", "default": "" },
+    "operator_signature": { "type": ["string", "null"], "default": null }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }

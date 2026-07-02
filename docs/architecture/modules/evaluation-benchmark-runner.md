@@ -96,6 +96,7 @@ class EvaluationTask:
     model_visible_verification_command: str = ""
     fixture_metadata: dict[str, Any] = field(default_factory=dict)
     hidden_test_patch: dict[str, Any] = field(default_factory=dict)
+    test_patch: str = ""
 ```
 
 ### EvaluationTaskResult（评估任务结果）

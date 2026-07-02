@@ -1,6 +1,6 @@
 # Singularity 主链路完整调用链（全部分支路径）
 
-> 基于 `origin/main@ab3080f3` + Phase 7 工作树源码核对：`agent_loop.py`(891行)、`run_controller.py`(479行)、`execution_outcome.py`(60行)、`error_codes.py`(123行)、`kernel/agent_kernel.py`(414行)、`tool_protocol/engine.py`(946行)。
+> 基于 `origin/main@05e11471` 源码核对：`agent_loop.py`(891行)、`run_controller.py`(479行)、`execution_outcome.py`(60行)、`error_codes.py`(123行)、`kernel/agent_kernel.py`(483行)、`tool_protocol/engine.py`(946行)。
 > `[成功]` / `[失败]` / `[阻断]` 为关键分叉点；缩进表示嵌套层级。
 
 ---
@@ -52,20 +52,24 @@
 │      │                             + EditExecutor                           │
 │      ├── _build_tools_protocol() → ToolRegistry + PluginManager             │
 │      │                             + ToolExecutor + ToolProtocolEngine      │
-│      ├── _build_verification()   → VerificationRunner + ReviewPipeline      │
+│      ├── _build_verification_review() → VerificationRunner + ReviewPipeline  │
 │      ├── _build_model_context()  → PromptAssemblyPipeline + ModelRunner     │
 │      │                             + ContextManager                         │
 │      │                             + SessionResumeContext(仅 continue/resume)│
 │      ├── _create_planner()       → create_or_resume_planner()               │
 │      │                             + Planner.continue_with_instruction()     │
-│      └── _wire_planner()         → 注入依赖 + attach_producers              │
+│      ├── _wire_planner()         → 注入依赖 + attach_producers              │
+│      └── _prime_planner_context() → 注入 planner 上下文                      │
+│                                      (user_goal, recovery_gate_decision,     │
+│                                       project_index, memory_pipeline,        │
+│                                       context_manager)                       │
 │                                                                             │
 │  输出：AgentGraph（22+ 组件完整 wiring）                                     │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
                                    ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║           AgentKernel.run_task(goal)  (kernel/agent_kernel.py:95-177)       ║
+║           AgentKernel.run_task(goal)  (kernel/agent_kernel.py:101-215)      ║
 ║                        ★ 内核生命周期入口 ★                                   ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
                                    │
@@ -82,7 +86,7 @@
 │     └── return RunResult(BLOCKED)                                           │
 │     该分支不创建 AgentLoop、不调用模型、不继续写 workspace。                 │
 │                                                                             │
-│  5. 组装 AgentLoop（注入 14 个依赖）                                          │
+│  5. 组装 AgentLoop（注入 13 个依赖）                                          │
 │     agent = AgentLoop(                                                      │
 │         model_runner    = graph.model_runner,                               │
 │         tools           = graph.tools,         # ToolRegistry               │
@@ -1146,7 +1150,7 @@
                                    ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│  ⑥ 验证与批次创建 (handle_model_turn_result:80-170)            │
+│  ⑥ 验证与批次创建 (handle_model_turn_result:97-188)            │
 │                                                              │
 │  _throw_if_cancelled()    ← cancellation token 检查            │
 │                                                              │

@@ -4,34 +4,28 @@
   "title": "Singularity Artifact",
   "type": "object",
   "required": [
-    "schema_version",
     "artifact_id",
+    "kind",
     "run_id",
     "session_id",
-    "kind",
-    "size_bytes",
-    "sha256",
-    "content_type",
-    "redacted",
-    "sensitive",
-    "summary"
+    "path"
   ],
   "properties": {
-    "schema_version": { "type": "string", "const": "1.0" },
     "artifact_id": { "type": "string", "minLength": 1 },
-    "artifact_ref": { "type": ["string", "null"] },
+    "kind": {
+      "type": "string",
+      "enum": ["stdout", "stderr", "diff", "report", "snapshot", "sandbox", "verification", "edit_plan", "model_message", "prompt_manifest", "command_log", "policy_audit_ref", "generic"]
+    },
     "run_id": { "type": "string", "minLength": 1 },
     "session_id": { "type": "string", "minLength": 1 },
-    "task_id": { "type": ["string", "null"] },
-    "kind": { "type": "string", "minLength": 1 },
-    "relative_handle": { "type": ["string", "null"] },
-    "size_bytes": { "type": "integer", "minimum": 0 },
-    "sha256": { "type": "string", "minLength": 1 },
-    "content_type": { "type": "string", "minLength": 1 },
-    "redacted": { "type": "boolean" },
-    "sensitive": { "type": "boolean" },
-    "summary": { "type": "string" },
-    "metadata": { "type": "object" }
+    "span_id": { "type": ["string", "null"], "default": null },
+    "event_id": { "type": ["string", "null"], "default": null },
+    "path": { "type": "string", "minLength": 1 },
+    "mime_type": { "type": "string", "default": "text/plain" },
+    "size_bytes": { "type": "integer", "minimum": 0, "default": 0 },
+    "content_hash": { "type": "string", "default": "" },
+    "metadata": { "type": "object", "default": {} },
+    "redaction_applied": { "type": "boolean", "default": true }
   },
   "additionalProperties": true
 }

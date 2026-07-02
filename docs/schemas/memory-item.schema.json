@@ -4,82 +4,87 @@
   "title": "Singularity Memory Item",
   "type": "object",
   "required": [
-    "schema_version",
     "id",
     "scope",
     "type",
     "source",
     "title",
-    "body",
-    "confidence",
-    "status",
-    "provenance",
-    "created_at",
-    "updated_at"
+    "body"
   ],
   "properties": {
-    "schema_version": { "type": "integer", "const": 1 },
     "id": { "type": "string", "minLength": 1 },
-    "scope": {
-      "type": "string",
-      "enum": ["session", "workspace", "project", "user_preference", "tool_executor"]
-    },
+    "scope": { "type": "string" },
     "type": { "type": "string", "minLength": 1 },
     "source": { "type": "string", "minLength": 1 },
     "title": { "type": "string" },
     "body": { "type": "string" },
     "confidence": {
       "type": "string",
-      "enum": ["low", "medium", "high", "verified"]
-    },
-    "status": {
-      "type": "string",
-      "enum": ["candidate", "active", "quarantined", "rejected", "tombstoned", "expired"]
-    },
-    "conflict_status": {
-      "type": "string",
-      "enum": ["none", "conflicted", "manual_review_required", "superseded"]
+      "default": "medium"
     },
     "provenance": {
       "type": "object",
-      "required": ["evidence", "created_by"],
       "properties": {
-        "evidence": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["source", "ref_id", "summary"],
-            "properties": {
-              "source": { "type": "string" },
-              "ref_id": { "type": "string" },
-              "summary": { "type": "string" },
-              "event_id": { "type": ["string", "null"] },
-              "artifact_ref": { "type": ["string", "null"] },
-              "path": { "type": ["string", "null"] }
-            },
-            "additionalProperties": true
-          }
-        },
-        "created_by": { "type": "string" },
         "source_run_id": { "type": ["string", "null"] },
         "source_session_id": { "type": ["string", "null"] },
-        "source_task_id": { "type": ["string", "null"] }
+        "source_tool": { "type": ["string", "null"] },
+        "source_file": { "type": ["string", "null"] }
       },
       "additionalProperties": true
     },
-    "ttl": { "type": "object" },
+    "ttl": {
+      "type": "object",
+      "properties": {
+        "created_at": { "type": ["string", "null"] },
+        "expires_at": { "type": ["string", "null"] },
+        "max_age_seconds": { "type": ["number", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "conflict_status": {
+      "type": "string",
+      "default": "none"
+    },
+    "status": {
+      "type": "string",
+      "default": "active"
+    },
+    "author_type": {
+      "type": "string",
+      "default": "agent"
+    },
     "created_at": { "type": "string", "format": "date-time" },
     "updated_at": { "type": "string", "format": "date-time" },
     "last_verified_at": { "type": ["string", "null"], "format": "date-time" },
     "tags": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": { "type": "string" },
+      "default": []
     },
     "paths": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": { "type": "string" },
+      "default": []
     },
-    "metadata": { "type": "object" }
+    "tools": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "error_types": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "modules": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "metadata": { "type": "object", "default": {} },
+    "tombstone_reason": { "type": ["string", "null"] },
+    "rejection_reason": { "type": ["string", "null"] },
+    "schema_version": { "type": "integer" }
   },
   "additionalProperties": true
 }

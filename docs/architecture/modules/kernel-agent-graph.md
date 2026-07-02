@@ -51,7 +51,7 @@ Kernel 层负责启动配置、trace、workspace lock、组件图、健康检查
 
 ## 真实运行时调用链
 
-`KernelBootstrap.boot()` -> `SessionStore.prepare_launch()` -> `TraceRecorder.create()` -> `CrashRecoveryManager.inspect()` -> `SessionHistoryReader.tool_protocol_report()` / `RecoveryManager.recover(previous context.sqlite3)` -> `SessionHistoryReader.build_resume_context()` -> `SessionRecoveryGate.evaluate()` -> `AgentGraphBuilder.build()` -> `AgentKernel.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()`。失败时 `KernelBootstrapError` 或 `KernelError` 携带 final report / diagnostics。
+`KernelBootstrap.boot()` -> `SessionStore.prepare_launch()` -> `TraceRecorder.create()` -> `CrashRecoveryManager.inspect()` -> `SessionHistoryReader.tool_protocol_report()` / `RecoveryManager.recover(previous context.sqlite3)` -> `SessionHistoryReader.build_resume_context()` -> `SessionRecoveryGate.evaluate()` -> `AgentGraphBuilder.build()`（内部：`_build_infra` -> `_build_policy_sandbox` -> `_build_execution_core` -> `_build_tools_protocol` -> `_build_verification_review` -> `_build_model_context` -> `_create_planner` -> `_wire_planner` -> `_prime_planner_context`）-> `AgentKernel.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()`。失败时 `KernelBootstrapError` 或 `KernelError` 携带 final report / diagnostics。
 
 ## 真实任务中的对象流
 
@@ -149,7 +149,7 @@ class RecoveryGateDecision:
 ### 关键枚举值域
 
 ```python
-class KernelStatus(str, Enum):   # KernelContext.status
+class KernelStatus(StrEnum):   # KernelContext.status
     NEW = "new"
     BOOTING = "booting"
     READY = "ready"
@@ -159,7 +159,7 @@ class KernelStatus(str, Enum):   # KernelContext.status
     FINALIZED = "finalized"
     FAILED = "failed"
 
-class RunStatus(str, Enum):      # AgentRun.status
+class RunStatus(StrEnum):      # AgentRun.status
     CREATED = "created"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -167,7 +167,7 @@ class RunStatus(str, Enum):      # AgentRun.status
     FAILED = "failed"
     CANCELLED = "cancelled"
 
-class SessionStatus(str, Enum):  # AgentSession.status
+class SessionStatus(StrEnum):  # AgentSession.status
     CREATED = "created"
     ACTIVE = "active"
     CLOSING = "closing"
@@ -176,14 +176,14 @@ class SessionStatus(str, Enum):  # AgentSession.status
     CANCELLED = "cancelled"
     RECOVERED = "recovered"
 
-class ComponentState(str, Enum): # AgentGraph.components values
+class ComponentState(StrEnum): # AgentGraph.components values
     PENDING = "pending"
     INITIALIZED = "initialized"
     READY = "ready"
     FAILED = "failed"
     STOPPED = "stopped"
 
-class RecoveryGateStatus(str, Enum): # RecoveryGateDecision.status
+class RecoveryGateStatus(StrEnum): # RecoveryGateDecision.status
     READY_TO_CONTINUE = "ready_to_continue"
     READY_TO_RESUME = "ready_to_resume"
     NEEDS_REVIEW = "needs_review"

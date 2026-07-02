@@ -4,8 +4,30 @@ Singularity 当前作为本地 Python CLI 运行。
 
 ## 安装
 
+使用 uv（推荐，项目提供 `uv.lock`）：
+
+```bash
+uv sync
+```
+
+或使用 pip：
+
 ```bash
 pip install -e .
+```
+
+可选依赖组：
+
+```bash
+uv sync --extra eval       # evaluation 依赖 (PyYAML)
+uv sync --extra devtools   # 开发工具 (tiktoken)
+```
+
+Dependency groups（开发/测试/构建）：
+
+```bash
+uv sync --group dev        # dev 依赖 (mypy, pytest, ruff, pytest-cov, PyYAML)
+uv sync --group test       # test 依赖 (pytest, pytest-cov, PyYAML)
 ```
 
 安装后可用入口：

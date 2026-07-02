@@ -56,7 +56,7 @@ Trace 层记录运行事件、span、artifact、timeline 和 summary；audit 相
 @dataclass(frozen=True)
 class TraceEvent:
     event_id: str
-    event_type: TraceEventType       # 174 个成员的枚举
+    event_type: TraceEventType       # 169 个成员的枚举
     run_id: str
     session_id: str
     task_id: str | None
@@ -133,14 +133,14 @@ class TraceArtifact:
 ### 关键枚举值域
 
 ```python
-class TraceSeverity(str, Enum):    # TraceEvent.severity
+class TraceSeverity(StrEnum):    # TraceEvent.severity
     DEBUG = "debug"
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
     CRITICAL = "critical"
 
-class TraceStatus(str, Enum):      # TraceSpan.status
+class TraceStatus(StrEnum):      # TraceSpan.status
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
@@ -149,7 +149,7 @@ class TraceStatus(str, Enum):      # TraceSpan.status
     SKIPPED = "skipped"
     BLOCKED = "blocked"
 
-class TraceArtifactKind(str, Enum): # TraceArtifact.kind
+class TraceArtifactKind(StrEnum): # TraceArtifact.kind
     STDOUT = "stdout"
     STDERR = "stderr"
     DIFF = "diff"
@@ -165,10 +165,10 @@ class TraceArtifactKind(str, Enum): # TraceArtifact.kind
     GENERIC = "generic"
 ```
 
-`TraceEventType` 有 154 个成员，按 dotted-prefix 分组：
+`TraceEventType` 有 169 个成员，按 dotted-prefix 分组：
 
 ```python
-class TraceEventType(str, Enum):
+class TraceEventType(StrEnum):
     # task (3)
     TASK_STARTED = "task.started"
     TASK_COMPLETED = "task.completed"
@@ -201,6 +201,15 @@ class TraceEventType(str, Enum):
     MODEL_REQUEST_FAILED = "model.request.failed"
     MODEL_TOOL_CALL_PROPOSED = "model.tool_call.proposed"
     MODEL_OUTPUT_REJECTED = "model.output.rejected"
+    # output (8)
+    OUTPUT_PARSE_STARTED = "output.parse.started"
+    OUTPUT_PARSE_SUCCEEDED = "output.parse.succeeded"
+    OUTPUT_PARSE_FAILED = "output.parse.failed"
+    OUTPUT_NORMALIZED = "output.normalized"
+    OUTPUT_REPAIR_REQUESTED = "output.repair.requested"
+    OUTPUT_REPAIR_SUCCEEDED = "output.repair.succeeded"
+    OUTPUT_REPAIR_FAILED = "output.repair.failed"
+    OUTPUT_FALLBACK_USED = "output.fallback.used"
     # tool_protocol (14)
     TOOL_PROTOCOL_BATCH_CREATED = "tool_protocol.batch_created"
     TOOL_PROTOCOL_CALL_VALIDATED = "tool_protocol.call_validated"
@@ -264,14 +273,15 @@ class TraceEventType(str, Enum):
     SANDBOX_COMPLETED = "sandbox.completed"
     SANDBOX_VIOLATION = "sandbox.violation"
     SANDBOX_CLEANED = "sandbox.cleaned"
-    # mutation (7)
+    # mutation (6)
     MUTATION_PROPOSED = "mutation.proposed"
-    PATCH_PROPOSED = "patch.proposed"
     MUTATION_TRANSACTION_STARTED = "mutation.transaction_started"
     MUTATION_APPLIED = "mutation.applied"
     MUTATION_FAILED = "mutation.failed"
     MUTATION_ROLLBACK_STARTED = "mutation.rollback_started"
     MUTATION_ROLLBACK_COMPLETED = "mutation.rollback_completed"
+    # patch (1)
+    PATCH_PROPOSED = "patch.proposed"
     # edit (5)
     EDIT_PLAN_CREATED = "edit.plan_created"
     EDIT_PATCH_VALIDATED = "edit.patch_validated"
@@ -332,6 +342,16 @@ class TraceEventType(str, Enum):
     PROJECT_INDEX_BUILD_FAILED = "project_index.build_failed"
     PROJECT_INDEX_REFRESHED = "project_index.refreshed"
     PROJECT_INDEX_UPDATED = "project_index.updated"
+    # session (6)
+    SESSION_CREATED = "session.created"
+    SESSION_CONTINUE_REQUESTED = "session.continue_requested"
+    SESSION_RESUME_REQUESTED = "session.resume_requested"
+    SESSION_RECOVERY_GATE_STARTED = "session.recovery_gate_started"
+    SESSION_RECOVERY_GATE_COMPLETED = "session.recovery_gate_completed"
+    SESSION_RECOVERY_BLOCKED = "session.recovery_blocked"
+    # workspace (2)
+    WORKSPACE_CHECKPOINT_CREATED = "workspace.checkpoint_created"
+    WORKSPACE_CONFLICT_DETECTED = "workspace.conflict_detected"
     # kernel (3)
     KERNEL_BOOT_STARTED = "kernel.boot.started"
     KERNEL_BOOT_COMPLETED = "kernel.boot.completed"
