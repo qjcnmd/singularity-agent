@@ -40,6 +40,7 @@ class _Backend:
     root: Path
     available: bool = True
     network: bool = True
+    capability_calls: int = 0
     prepare_calls: int = 0
     run_calls: int = 0
 
@@ -47,6 +48,7 @@ class _Backend:
         return "test_native"
 
     def capabilities(self) -> SandboxCapabilities:
+        self.capability_calls += 1
         return _capabilities(network=self.network)
 
     def is_available(self) -> bool:
@@ -167,6 +169,18 @@ def test_manager_consumes_request_without_reinterpreting_policy_constraints(
 
     assert result.status == SandboxStatus.SUCCESS
     assert request.profile.to_dict() == before
+    assert backend.prepare_calls == 1
+    assert backend.run_calls == 1
+
+
+def test_manager_reuses_selected_backend_capabilities_for_run_trace(tmp_path: Path) -> None:
+    backend = _Backend(tmp_path)
+    component = SandboxManager(tmp_path, backends=[backend])
+
+    result = component.run(_request(tmp_path))
+
+    assert result.status == SandboxStatus.SUCCESS
+    assert backend.capability_calls == 1
     assert backend.prepare_calls == 1
     assert backend.run_calls == 1
 

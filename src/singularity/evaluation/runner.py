@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import os
 import shlex
@@ -315,6 +316,7 @@ class EvaluationTaskResult:
     trace_artifact_refs: list[str] = field(default_factory=list)
     reproducible_environment: dict[str, Any] = field(default_factory=dict)
     capability_summary: dict[str, Any] = field(default_factory=dict)
+    capability_sla: dict[str, Any] = field(default_factory=dict)
     timing: dict[str, Any] = field(default_factory=dict)
     baseline_failed: bool = False
     baseline_checks: dict[str, Any] = field(default_factory=dict)
@@ -367,6 +369,7 @@ class EvaluationTaskResult:
             "trace_artifact_refs": list(self.trace_artifact_refs),
             "reproducible_environment": self.reproducible_environment,
             "capability_summary": self.capability_summary,
+            "capability_sla": self.capability_sla,
             "timing": self.timing,
             "baseline_failed": self.baseline_failed,
             "baseline_checks": self.baseline_checks,
@@ -651,9 +654,21 @@ class EvaluationRunner:
                 config=config,
                 max_turns=config.max_turns,
             )
+            dependency_cache_env, dependency_cache = _dependency_setup_cache(
+                task,
+                workspace=workspace,
+                output_root=self.output_root,
+            )
+            reproducible_environment["dependency_setup_cache"] = dependency_cache
             dependency_setup_started = time.perf_counter()
             for command in task.prepare_commands:
-                prepared = _run_shell(command, cwd=workspace, timeout_seconds=120, redactor=self.redactor)
+                prepared = _run_shell(
+                    command,
+                    cwd=workspace,
+                    timeout_seconds=120,
+                    redactor=self.redactor,
+                    env_overrides=dependency_cache_env,
+                )
                 if not prepared.passed:
                     errors.append(f"prepare failed: {prepared.error_summary or command}")
                     return self._task_result(
@@ -1242,6 +1257,7 @@ class EvaluationRunner:
         )
         capability_summary["sandbox_enforcement"] = sandbox_audit
         capability_summary["evaluator_visibility_audit"] = visibility_audit
+        capability_sla = _build_capability_sla(capability_summary)
         result_patch = patch or {"diff": "", "applicable": False, "changed_files": []}
         result_checks = checks or _checks_payload(None, verification)
         result_trace_artifacts = list(trace_artifact_refs or _trace_artifact_refs(final_report_payload, trace_summary))
@@ -1337,6 +1353,7 @@ class EvaluationRunner:
             trace_artifact_refs=result_trace_artifacts,
             reproducible_environment=result_reproducible_environment,
             capability_summary=capability_summary,
+            capability_sla=capability_sla,
             timing=dict(capability_summary.get("timing") or {}),
             baseline_failed=baseline_failed,
             baseline_checks=baseline_checks or {},
@@ -1411,6 +1428,7 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
             result.agent_completed and not result.evaluation_passed
         )
     agent_completed_count = sum(1 for result in scored_results if result.agent_completed)
+    capability_sla = _summarize_capability_sla(results)
     return {
         "task_count": task_count,
         "scored_task_count": scored_task_count,
@@ -1459,6 +1477,7 @@ def summarize_evaluation_results(results: list[EvaluationTaskResult]) -> dict[st
         "policy_blocks": sum(result.policy_blocks for result in results),
         "miscompletion_count": miscompletion_count,
         "failure_reasons": dict(sorted(failures.items())),
+        "capability_sla": capability_sla,
     }
 
 
@@ -1642,6 +1661,44 @@ def evaluation_report_markdown(payload: dict[str, Any]) -> str:
                 "| task | metric | seconds | status | reason |",
                 "| --- | --- | ---: | --- | --- |",
                 *timing_rows,
+            ]
+        )
+    sla_rows: list[str] = []
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        sla = task.get("capability_sla") or {}
+        if not isinstance(sla, dict):
+            continue
+        for name, item in sorted((sla.get("items") or {}).items()):
+            if not isinstance(item, dict):
+                continue
+            actual = item.get("actual_seconds")
+            target = item.get("target_seconds")
+            if actual is None and "actual_count" in item:
+                actual = item.get("actual_count")
+                target = item.get("target_count")
+            if actual is None and "passed" in item:
+                actual = item.get("passed")
+                target = True
+            sla_rows.append(
+                "| "
+                f"`{task.get('task_id', '')}` | "
+                f"`{name}` | "
+                f"{actual} | "
+                f"{target} | "
+                f"{item.get('status') or 'unknown'} | "
+                f"{item.get('blocking') is True} |"
+            )
+    if sla_rows:
+        lines.extend(
+            [
+                "",
+                "## Capability SLA",
+                "",
+                "| task | item | actual | target | status | blocking |",
+                "| --- | --- | ---: | ---: | --- | --- |",
+                *sla_rows,
             ]
         )
     regression = payload.get("regression")
@@ -1899,6 +1956,80 @@ def _setup_environment(task: EvaluationTask, *, manifest_base: Path) -> dict[str
             "network_access": _network_access_for_task(task).value,
         },
     }
+
+
+def _dependency_setup_cache(
+    task: EvaluationTask,
+    *,
+    workspace: Path,
+    output_root: Path,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    if not task.prepare_commands:
+        return {}, {
+            "schema_version": "evaluation.dependency_setup_cache/v1",
+            "enabled": False,
+            "strategy": "pip_cache_dir",
+            "scope": "evaluator_prepare_commands_only",
+            "model_visible": False,
+            "changes_acl": False,
+            "bypasses_windows_sandbox": False,
+            "uses_local_process_fallback": False,
+        }
+    cache_root = output_root.parent / f"{output_root.name}-dependency-cache"
+    dependency_files = _dependency_file_digests(workspace)
+    key_payload = {
+        "schema_version": "evaluation.dependency_setup_cache_key/v1",
+        "python": sys.version.split()[0],
+        "platform": sys.platform,
+        "task_id": task.task_id,
+        "workspace": {
+            "kind": task.workspace.kind,
+            "path": task.workspace.path,
+            "start_commit": task.workspace.start_commit,
+        },
+        "prepare_commands": list(task.prepare_commands),
+        "dependency_files": dependency_files,
+    }
+    cache_key = hashlib.sha256(
+        json.dumps(key_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cache_dir = cache_root / cache_key[:16]
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    audit = {
+        "schema_version": "evaluation.dependency_setup_cache/v1",
+        "enabled": bool(task.prepare_commands),
+        "strategy": "pip_cache_dir",
+        "scope": "evaluator_prepare_commands_only",
+        "cache_key": cache_key,
+        "cache_root": str(cache_root),
+        "cache_dir": str(cache_dir),
+        "invalidation": {
+            "python": sys.version.split()[0],
+            "platform": sys.platform,
+            "workspace_start_commit": task.workspace.start_commit,
+            "prepare_commands_digest": hashlib.sha256(
+                json.dumps(list(task.prepare_commands), ensure_ascii=False).encode("utf-8")
+            ).hexdigest(),
+            "dependency_files": dependency_files,
+        },
+        "model_visible": False,
+        "changes_acl": False,
+        "bypasses_windows_sandbox": False,
+        "uses_local_process_fallback": False,
+    }
+    return {"PIP_CACHE_DIR": str(cache_dir)}, audit
+
+
+def _dependency_file_digests(workspace: Path) -> dict[str, str | None]:
+    candidates = ("requirements.txt", "pyproject.toml", "setup.cfg", "setup.py")
+    digests: dict[str, str | None] = {}
+    for relative in candidates:
+        path = workspace / relative
+        if not path.is_file():
+            digests[relative] = None
+            continue
+        digests[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests
 
 
 def _redacted_url(value: str) -> str | None:
@@ -2390,6 +2521,188 @@ def _build_capability_summary(
         },
         "timing_diagnostics": timing_diagnostics,
     }
+
+
+_CAPABILITY_SLA_THRESHOLDS_SECONDS = {
+    "wall": 300.0,
+    "agent_loop": 210.0,
+    "provider": 55.0,
+    "sandbox": 50.0,
+    "dependency_setup": 35.0,
+}
+_CAPABILITY_SLA_OPTIONAL_THRESHOLDS_SECONDS = {
+    "verification": 10.0,
+    "unattributed_time": 15.0,
+}
+
+
+def _build_capability_sla(capability_summary: dict[str, Any]) -> dict[str, Any]:
+    timing = capability_summary.get("timing") if isinstance(capability_summary, dict) else {}
+    timing = timing if isinstance(timing, dict) else {}
+    wall_phases = capability_summary.get("wall_phases") if isinstance(capability_summary, dict) else {}
+    wall_phases = wall_phases if isinstance(wall_phases, dict) else {}
+    items: dict[str, dict[str, Any]] = {
+        "wall": _duration_sla_item(
+            timing.get("wall_time_seconds"),
+            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["wall"],
+            source="capability_summary.timing.wall_time_seconds",
+        ),
+        "agent_loop": _duration_sla_item(
+            wall_phases.get("agent_loop_time_seconds"),
+            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["agent_loop"],
+            source="capability_summary.wall_phases.agent_loop_time_seconds",
+        ),
+        "provider": _duration_sla_item(
+            timing.get("provider_time_seconds"),
+            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["provider"],
+            source="capability_summary.timing.provider_time_seconds",
+        ),
+        "sandbox": _duration_sla_item(
+            timing.get("sandbox_time_seconds"),
+            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["sandbox"],
+            source="capability_summary.timing.sandbox_time_seconds",
+        ),
+        "dependency_setup": _duration_sla_item(
+            timing.get("dependency_setup_time_seconds"),
+            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["dependency_setup"],
+            source="capability_summary.timing.dependency_setup_time_seconds",
+        ),
+        "verification": _duration_sla_item(
+            timing.get("verification_time_seconds"),
+            target_seconds=_CAPABILITY_SLA_OPTIONAL_THRESHOLDS_SECONDS["verification"],
+            source="capability_summary.timing.verification_time_seconds",
+        ),
+        "unattributed_time": _duration_sla_item(
+            capability_summary.get("unattributed_time_seconds"),
+            target_seconds=_CAPABILITY_SLA_OPTIONAL_THRESHOLDS_SECONDS["unattributed_time"],
+            source="capability_summary.unattributed_time_seconds",
+        ),
+        "local_fallback": _count_sla_item(
+            capability_summary.get("local_process_fallback_count"),
+            target_count=0,
+            source="capability_summary.local_process_fallback_count",
+        ),
+        "visibility_audit": _boolean_sla_item(
+            ((capability_summary.get("evaluator_visibility_audit") or {}).get("passed"))
+            if isinstance(capability_summary.get("evaluator_visibility_audit"), dict)
+            else None,
+            source="capability_summary.evaluator_visibility_audit.passed",
+        ),
+    }
+    violations = [name for name, item in items.items() if item.get("status") == "over_sla"]
+    unavailable = [name for name, item in items.items() if item.get("status") == "unavailable"]
+    return {
+        "schema_version": "evaluation.capability_sla/v1",
+        "status": "over_sla" if violations else "unavailable" if unavailable else "within_sla",
+        "blocking": False,
+        "violations": violations,
+        "items": items,
+    }
+
+
+def _duration_sla_item(value: Any, *, target_seconds: float, source: str) -> dict[str, Any]:
+    if not isinstance(value, int | float):
+        return {
+            "actual_seconds": None,
+            "target_seconds": target_seconds,
+            "status": "unavailable",
+            "delta_seconds": None,
+            "blocking": False,
+            "source": source,
+        }
+    actual = round(float(value), 3)
+    delta = round(actual - target_seconds, 3)
+    return {
+        "actual_seconds": actual,
+        "target_seconds": target_seconds,
+        "status": "over_sla" if delta > 0 else "within_sla",
+        "delta_seconds": delta,
+        "blocking": False,
+        "source": source,
+    }
+
+
+def _count_sla_item(value: Any, *, target_count: int, source: str) -> dict[str, Any]:
+    if not isinstance(value, int):
+        return {
+            "actual_count": None,
+            "target_count": target_count,
+            "status": "unavailable",
+            "delta_count": None,
+            "blocking": False,
+            "source": source,
+        }
+    delta = value - target_count
+    return {
+        "actual_count": value,
+        "target_count": target_count,
+        "status": "over_sla" if delta > 0 else "within_sla",
+        "delta_count": delta,
+        "blocking": False,
+        "source": source,
+    }
+
+
+def _boolean_sla_item(value: Any, *, source: str) -> dict[str, Any]:
+    if not isinstance(value, bool):
+        return {
+            "passed": None,
+            "status": "unavailable",
+            "blocking": False,
+            "source": source,
+        }
+    return {
+        "passed": value,
+        "status": "passed" if value else "over_sla",
+        "blocking": False,
+        "source": source,
+    }
+
+
+def _summarize_capability_sla(results: list[EvaluationTaskResult]) -> dict[str, Any]:
+    items: dict[str, dict[str, Any]] = {}
+    violations: dict[str, int] = {}
+    unavailable: dict[str, int] = {}
+    for result in results:
+        sla = result.capability_sla or {}
+        if not isinstance(sla, dict):
+            continue
+        for name, item in (sla.get("items") or {}).items():
+            if not isinstance(item, dict):
+                continue
+            items[str(name)] = _merge_sla_item(items.get(str(name)), item)
+            status = str(item.get("status") or "")
+            if status == "over_sla":
+                violations[str(name)] = violations.get(str(name), 0) + 1
+            elif status == "unavailable":
+                unavailable[str(name)] = unavailable.get(str(name), 0) + 1
+    return {
+        "schema_version": "evaluation.capability_sla_summary/v1",
+        "status": "over_sla" if violations else "unavailable" if unavailable else "within_sla",
+        "blocking": False,
+        "task_count": len(results),
+        "violations": dict(sorted(violations.items())),
+        "unavailable": dict(sorted(unavailable.items())),
+        "items": items,
+    }
+
+
+def _merge_sla_item(previous: dict[str, Any] | None, current: dict[str, Any]) -> dict[str, Any]:
+    if previous is None:
+        return dict(current)
+    if previous.get("status") != "over_sla" and current.get("status") == "over_sla":
+        return dict(current)
+    if previous.get("status") == "unavailable" and current.get("status") != "unavailable":
+        return dict(current)
+    previous_delta = _safe_float(previous.get("delta_seconds"))
+    current_delta = _safe_float(current.get("delta_seconds"))
+    if current_delta > previous_delta:
+        return dict(current)
+    previous_count_delta = _safe_int(previous.get("delta_count"))
+    current_count_delta = _safe_int(current.get("delta_count"))
+    if current_count_delta > previous_count_delta:
+        return dict(current)
+    return previous
 
 
 def _build_evaluation_metrics(
@@ -3756,7 +4069,14 @@ def _success_criterion_ok(
     raise ValueError(f"Unsupported evaluation success criterion: {kind}")
 
 
-def _run_shell(command: str, *, cwd: Path, timeout_seconds: int, redactor: TraceRedactor) -> CommandEvalResult:
+def _run_shell(
+    command: str,
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+    redactor: TraceRedactor,
+    env_overrides: dict[str, str] | None = None,
+) -> CommandEvalResult:
     started = time.perf_counter()
     try:
         argv, strategy = _resolve_command_argv(command)
@@ -3777,6 +4097,10 @@ def _run_shell(command: str, *, cwd: Path, timeout_seconds: int, redactor: Trace
             failure_category="command_parse_error",
         )
     try:
+        env = None
+        if env_overrides:
+            env = os.environ.copy()
+            env.update({key: str(value) for key, value in env_overrides.items()})
         completed = subprocess.run(
             argv,
             cwd=cwd,
@@ -3785,6 +4109,7 @@ def _run_shell(command: str, *, cwd: Path, timeout_seconds: int, redactor: Trace
             capture_output=True,
             timeout=timeout_seconds,
             check=False,
+            env=env,
         )
         output = (completed.stderr or completed.stdout or "").strip().splitlines()
         error_summary = redactor.redact_text(output[0] if output else "")

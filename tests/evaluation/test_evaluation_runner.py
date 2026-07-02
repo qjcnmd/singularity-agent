@@ -22,6 +22,7 @@ from singularity.evaluation.runner import (
     SingularityPrivateBenchmarkAdapter,
     _apply_benchmark_constraints,
     _apply_test_patch,
+    _build_capability_sla,
     _build_capability_summary,
     _command_failure_category,
     _expected_file_changes_satisfied,
@@ -879,6 +880,48 @@ def test_capability_summary_v2_aggregates_component_spans_without_payload_conten
     assert summary["unattributed_time_seconds"] == 0.9
 
 
+def test_capability_sla_reports_non_blocking_violations_without_changing_gate() -> None:
+    sla = _build_capability_sla(
+        {
+            "timing": {
+                "wall_time_seconds": 305.543,
+                "provider_time_seconds": 55.086,
+                "sandbox_time_seconds": 55.558,
+                "dependency_setup_time_seconds": 38.734,
+                "verification_time_seconds": 2.566,
+            },
+            "wall_phases": {"agent_loop_time_seconds": 215.967},
+            "unattributed_time_seconds": 10.501,
+            "local_process_fallback_count": 0,
+            "evaluator_visibility_audit": {"passed": True},
+        }
+    )
+
+    assert sla["schema_version"] == "evaluation.capability_sla/v1"
+    assert sla["blocking"] is False
+    assert sla["status"] == "over_sla"
+    assert sla["violations"] == [
+        "wall",
+        "agent_loop",
+        "provider",
+        "sandbox",
+        "dependency_setup",
+    ]
+    assert sla["items"]["wall"] == {
+        "actual_seconds": 305.543,
+        "target_seconds": 300.0,
+        "status": "over_sla",
+        "delta_seconds": 5.543,
+        "blocking": False,
+        "source": "capability_summary.timing.wall_time_seconds",
+    }
+    assert sla["items"]["verification"]["status"] == "within_sla"
+    assert sla["items"]["unattributed_time"]["status"] == "within_sla"
+    assert sla["items"]["local_fallback"]["actual_count"] == 0
+    assert sla["items"]["local_fallback"]["target_count"] == 0
+    assert sla["items"]["visibility_audit"]["passed"] is True
+
+
 def test_public_task_sandbox_enforcement_audit_fails_on_local_fallback() -> None:
     task = load_evaluation_task_set("docs/evaluation/public-representative-task.json").tasks[0]
     events = [
@@ -1207,6 +1250,15 @@ def test_summarize_evaluation_results_reports_cache_and_rates(tmp_path: Path) ->
         "policy_blocks": 0,
         "miscompletion_count": 1,
         "failure_reasons": {"environment_blocker": 1, "verification_failed": 1},
+        "capability_sla": {
+            "schema_version": "evaluation.capability_sla_summary/v1",
+            "status": "within_sla",
+            "blocking": False,
+            "task_count": 3,
+            "violations": {},
+            "unavailable": {},
+            "items": {},
+        },
     }
 
 
@@ -2011,6 +2063,89 @@ def test_evaluation_uses_task_strategy_max_turns(tmp_path: Path) -> None:
     assert task["timing"]["verification_workspace_copy_time_seconds"] is not None
     assert task["timing"]["public_verification_time_seconds"] is not None
     assert task["timing"]["hidden_verification_time_seconds"] is not None
+
+
+def test_evaluation_prepare_commands_use_auditable_dependency_cache(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    manifest_payload = {
+        "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+        "tasks": [
+            {
+                "task_id": "fake.prepare_cache",
+                "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                "prepare_commands": [
+                    f"{py} -c \"import os; from pathlib import Path; cache=os.environ.get('PIP_CACHE_DIR'); assert cache; Path('cache.txt').write_text(cache, encoding='utf-8')\""
+                ],
+                "user_task": "Write done.txt with ok.",
+                "allowed_paths": ["done.txt"],
+                "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').read_text(encoding='utf-8') == 'ok'\"",
+                "success": {"type": "verification_exit_code", "exit_code": 0},
+            }
+        ],
+    }
+    manifest = EvaluationTaskSet.from_dict(manifest_payload, base_dir=tmp_path)
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="prepare_cache",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)
+
+    task = result["tasks"][0]
+    cache = task["reproducible_environment"]["dependency_setup_cache"]
+    assert task["evaluation_passed"] is True
+    assert cache["schema_version"] == "evaluation.dependency_setup_cache/v1"
+    assert cache["enabled"] is True
+    assert cache["strategy"] == "pip_cache_dir"
+    assert cache["cache_key"]
+    assert Path(cache["cache_dir"]).is_dir()
+    assert Path(cache["cache_dir"]).is_relative_to(tmp_path / "out-dependency-cache")
+    assert Path(task["workspace"], "cache.txt").read_text(encoding="utf-8") == cache["cache_dir"]
 
 
 def test_evaluation_runner_max_turns_overrides_task_strategy(tmp_path: Path) -> None:

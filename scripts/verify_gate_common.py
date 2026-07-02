@@ -179,3 +179,36 @@ def capability_metrics_from_result(result_path: Path) -> dict[str, Any]:
         "pricing_statuses": dict(sorted(pricing_statuses.items())),
         "task_metrics_count": task_metrics_count,
     }
+
+
+def capability_sla_from_result(result_path: Path) -> dict[str, Any]:
+    if not result_path.exists():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    summary = payload.get("summary") or {}
+    if isinstance(summary, dict) and isinstance(summary.get("capability_sla"), dict):
+        result = dict(summary["capability_sla"])
+    else:
+        result = {
+            "schema_version": "evaluation.capability_sla_summary/v1",
+            "status": "unknown",
+            "blocking": False,
+            "violations": {},
+            "task_count": 0,
+        }
+    items: dict[str, dict[str, Any]] = {}
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        sla = task.get("capability_sla") or {}
+        if not isinstance(sla, dict):
+            continue
+        for name, item in (sla.get("items") or {}).items():
+            if isinstance(item, dict):
+                items[str(name)] = dict(item)
+    if items:
+        result["items"] = dict(sorted(items.items()))
+    return result

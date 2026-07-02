@@ -54,6 +54,7 @@ class SandboxManager:
         self._throw_if_cancelled()
         started = time.perf_counter()
         backend: SandboxBackend | None = None
+        backend_capabilities = None
         prepared = None
         self._emit_trace(
             TraceEventType.SANDBOX_REQUESTED,
@@ -71,7 +72,9 @@ class SandboxManager:
             )
             return result
         try:
-            backend = self._select_backend(request)
+            selected = self._select_backend(request)
+            backend = selected[0] if selected is not None else None
+            backend_capabilities = selected[1] if selected is not None else None
             if backend is None:
                 result = self._unavailable(
                     request,
@@ -86,7 +89,7 @@ class SandboxManager:
                     request=request,
                 )
                 return result
-            self.ensure_capabilities(request, backend)
+            self.ensure_capabilities(request, backend, capabilities=backend_capabilities)
             self._throw_if_cancelled()
             prepared = backend.prepare(request)
             self._throw_if_cancelled()
@@ -131,7 +134,7 @@ class SandboxManager:
             self._record_trace(
                 prepared=prepared,
                 result=result,
-                capabilities=backend.capabilities(),
+                capabilities=backend_capabilities,
             )
             return result
         except SandboxCapabilityError as exc:
@@ -151,7 +154,7 @@ class SandboxManager:
             self._record_trace(
                 prepared=prepared,
                 result=result,
-                capabilities=backend.capabilities() if backend is not None else None,
+                capabilities=self._capabilities_for_trace(backend, backend_capabilities),
                 request=request,
             )
             return result
@@ -177,13 +180,19 @@ class SandboxManager:
             self._record_trace(
                 prepared=prepared,
                 result=result,
-                capabilities=backend.capabilities() if backend is not None else None,
+                capabilities=self._capabilities_for_trace(backend, backend_capabilities),
                 request=request,
             )
             return result
 
-    def ensure_capabilities(self, request: SandboxRequest, backend: SandboxBackend) -> None:
-        capabilities = backend.capabilities()
+    def ensure_capabilities(
+        self,
+        request: SandboxRequest,
+        backend: SandboxBackend,
+        *,
+        capabilities: Any | None = None,
+    ) -> None:
+        capabilities = capabilities if capabilities is not None else backend.capabilities()
         if request.profile.network.require_hard_isolation and not capabilities.network_isolation:
             raise SandboxCapabilityError("Backend cannot enforce required network isolation.")
         if (
@@ -219,17 +228,20 @@ class SandboxManager:
             "capabilities": backends,
         }
 
-    def _select_backend(self, request: SandboxRequest) -> SandboxBackend | None:
+    def _select_backend(
+        self, request: SandboxRequest
+    ) -> tuple[SandboxBackend, Any] | None:
         first_capability_error: SandboxCapabilityError | None = None
         for backend in self.backends:
             if not self._backend_available(backend):
                 continue
+            capabilities = backend.capabilities()
             try:
-                self.ensure_capabilities(request, backend)
+                self.ensure_capabilities(request, backend, capabilities=capabilities)
             except SandboxCapabilityError as exc:
                 first_capability_error = first_capability_error or exc
                 continue
-            return backend
+            return backend, capabilities
         if first_capability_error is not None:
             raise first_capability_error
         return None
@@ -259,6 +271,17 @@ class SandboxManager:
         if reasons:
             return "; ".join(reasons)
         return "backend_unavailable: no available OS sandbox backend is registered."
+
+    @staticmethod
+    def _capabilities_for_trace(
+        backend: SandboxBackend | None,
+        capabilities: Any | None,
+    ) -> Any | None:
+        if capabilities is not None:
+            return capabilities
+        if backend is None:
+            return None
+        return backend.capabilities()
 
     def shutdown(self) -> None:
         return None

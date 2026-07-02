@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from scripts.verify_gate_common import capability_metrics_from_result, capability_timing_from_result
+from scripts.verify_gate_common import (
+    capability_metrics_from_result,
+    capability_sla_from_result,
+    capability_timing_from_result,
+)
 
 yaml = pytest.importorskip("yaml")
 
@@ -227,6 +231,84 @@ def test_capability_metrics_reads_task_scorecard(tmp_path: Path) -> None:
     payload["summary"]["average_tool_success_rate"] = None
     result_path.write_text(json.dumps(payload), encoding="utf-8")
     assert capability_metrics_from_result(result_path)["average_tool_success_rate"] is None
+
+
+def test_capability_sla_reads_task_result_diagnostics(tmp_path: Path) -> None:
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "capability_sla": {
+                        "schema_version": "evaluation.capability_sla_summary/v1",
+                        "status": "over_sla",
+                        "blocking": False,
+                        "violations": {"wall": 1},
+                        "task_count": 1,
+                    }
+                },
+                "tasks": [
+                    {
+                        "capability_sla": {
+                            "schema_version": "evaluation.capability_sla/v1",
+                            "status": "over_sla",
+                            "blocking": False,
+                            "violations": ["wall"],
+                            "items": {
+                                "wall": {
+                                    "actual_seconds": 305.543,
+                                    "target_seconds": 300.0,
+                                    "status": "over_sla",
+                                    "delta_seconds": 5.543,
+                                    "blocking": False,
+                                },
+                                "local_fallback": {
+                                    "actual_count": 0,
+                                    "target_count": 0,
+                                    "status": "within_sla",
+                                    "blocking": False,
+                                },
+                                "visibility_audit": {
+                                    "passed": True,
+                                    "status": "passed",
+                                    "blocking": False,
+                                },
+                            },
+                        }
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert capability_sla_from_result(result_path) == {
+        "schema_version": "evaluation.capability_sla_summary/v1",
+        "status": "over_sla",
+        "blocking": False,
+        "violations": {"wall": 1},
+        "task_count": 1,
+        "items": {
+            "wall": {
+                "actual_seconds": 305.543,
+                "target_seconds": 300.0,
+                "status": "over_sla",
+                "delta_seconds": 5.543,
+                "blocking": False,
+            },
+            "local_fallback": {
+                "actual_count": 0,
+                "target_count": 0,
+                "status": "within_sla",
+                "blocking": False,
+            },
+            "visibility_audit": {
+                "passed": True,
+                "status": "passed",
+                "blocking": False,
+            },
+        },
+    }
 
 
 def test_local_gate_pytest_commands_override_default_evaluation_exclusion() -> None:

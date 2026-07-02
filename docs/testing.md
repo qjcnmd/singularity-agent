@@ -142,6 +142,8 @@ python scripts/verify_capability.py --force --run-id <run-id>
 
 公共任务必须先证明 base commit + evaluator test patch 失败，agent patch 后同一验证通过，且 agent completed、目标文件变化、public/hidden verification、FAIL_TO_PASS、CompletionGate、sandbox enforcement、evaluator visibility audit 全部通过，才允许 `evaluation_passed=true`。sandbox-required 任务要求 `local_process_fallback_count=0`；evaluator-only metadata 不得进入模型可见 task projection 或 AgentLoop trace。没有触发 compaction 时必须写明 skipped reason，例如 context usage 未到阈值、retrieval 内容不足或任务过早完成。result 同时写出 `evaluation_metrics` scorecard，`verify_capability.py` 会把 resolved、tool success rate、cost 和 pricing 状态摘要放入 JSON 输出；这些字段只用于诊断/回归分析，不改变 capability gate 的 pass/fail 判断，也不会因为 cost/pricing unknown 导致失败。
 
+`capability_sla` 是 Phase 8.5 起的非阻断诊断层，写入 task result、summary、report 和 `verify_capability.py` JSON 输出，但不改变 `evaluation_passed`、`tests_passed` 或脚本退出码。当前目标为 wall <= 300s、AgentLoop <= 210s、provider <= 55s、sandbox <= 50s、dependency setup <= 35s；verification、unattributed time、local fallback 和 visibility audit 也会显示在 SLA 表中。SLA 超限必须报告 `over_sla` 和 delta，但不得通过减少 public/hidden verification、放宽 CompletionGate、扩大 ACL、绕过 Windows sandbox 或引入 local process fallback 来压时间。dependency setup 和 sandbox readiness 的优化只允许使用安全、可审计、可失效的缓存或现有 provider/native cache 诊断；当前 runner 只对 evaluator-only prepare commands 注入 `PIP_CACHE_DIR`，并在 `reproducible_environment.dependency_setup_cache` 记录 key、cache dir、失效输入和安全边界。
+
 仍可按需运行以下传统 pytest 命令，但它们不再是 Codex 小改默认 fast gate：
 
 ```bash
