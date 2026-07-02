@@ -11,7 +11,7 @@ import sys
 import time
 from contextlib import ExitStack, suppress
 from ctypes import wintypes
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar
@@ -212,8 +212,10 @@ class WindowsSandboxRunner:
         username, password = _read_generic_credential(credential_target)
         account_stdout = ""
         account_stderr = ""
+        account_process_spawn_time = 0.0
         try:
             runner_script = self._materialize_runner_script(Path(prepared.sandbox_root))
+            phase_started = time.perf_counter()
             process = _start_account_process(
                 [
                     self.python_executable,
@@ -226,6 +228,7 @@ class WindowsSandboxRunner:
                 username=username or account_name,
                 password=password,
             )
+            account_process_spawn_time = time.perf_counter() - phase_started
             try:
                 timeout = prepared.request.profile.resources.timeout_seconds
                 # Enforce a finite default wait so a sandboxed command that fails
@@ -257,7 +260,17 @@ class WindowsSandboxRunner:
                 duration_ms=0,
                 metadata={"error_code": "runner_result_missing"},
             )
-        return WindowsRunnerResult.from_dict(json.loads(result_path.read_text(encoding="utf-8")))
+        phase_started = time.perf_counter()
+        result = WindowsRunnerResult.from_dict(json.loads(result_path.read_text(encoding="utf-8")))
+        result_import_time = time.perf_counter() - phase_started
+        timing = dict(result.metadata.get("timing") or {})
+        timing["account_process_spawn_time_seconds"] = account_process_spawn_time
+        timing["process_spawn_time_seconds"] = (
+            float(timing.get("process_spawn_time_seconds") or 0.0)
+            + account_process_spawn_time
+        )
+        timing["result_import_time_seconds"] = result_import_time
+        return replace(result, metadata={**result.metadata, "timing": timing})
 
 
 def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
@@ -269,8 +282,12 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
     process: _WindowsChildProcess | subprocess.Popen[bytes] | None = None
     timed_out = False
     job_killed = False
+    timing: dict[str, float] = {}
     try:
+        phase_started = time.perf_counter()
         process = _start_restricted_child(spec)
+        timing["process_spawn_time_seconds"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         while True:
             if process.poll() is not None:
                 break
@@ -283,7 +300,10 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             job_killed = _terminate_child(process) or job_killed
+        timing["command_runtime_time_seconds"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         stdout, stderr, output_truncated = _child_output(process, spec.max_output_chars)
+        timing["output_collection_time_seconds"] = time.perf_counter() - phase_started
         network_denied_verified = _verify_network_denied(spec)
         account_name, account_sid = _current_process_identity()
         return WindowsRunnerResult(
@@ -306,12 +326,15 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
                 "pid": getattr(process, "pid", None),
                 "account_name": account_name,
                 "account_sid_hash": _hash_text(account_sid) if account_sid else "",
+                "timing": timing,
             },
         )
     except Exception as exc:
         if process is not None and process.poll() is None:
             _terminate_child(process)
+        phase_started = time.perf_counter()
         stdout, stderr, output_truncated = _child_output(process, spec.max_output_chars)
+        timing["output_collection_time_seconds"] = time.perf_counter() - phase_started
         return WindowsRunnerResult(
             exit_code=None,
             stdout=stdout,
@@ -323,7 +346,7 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
             output_truncated=output_truncated,
             job_killed=job_killed,
             network_denied_verified=False,
-            metadata={"error_type": type(exc).__name__},
+            metadata={"error_type": type(exc).__name__, "timing": timing},
         )
 
 

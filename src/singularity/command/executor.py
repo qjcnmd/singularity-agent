@@ -735,6 +735,7 @@ class CommandExecutor:
             "violations": [violation.to_dict() for violation in sandbox_result.violations],
             "cleanup_status": sandbox_result.cleanup_status,
             "imported_changes_count": 0,
+            "timing": dict(sandbox_result.metadata.get("timing") or {}),
         }
         isolation_report = self._isolation_report(request.resource_limits)
         isolation_report["backend"] = sandbox_result.backend_name
@@ -787,6 +788,7 @@ class CommandExecutor:
                 "sandbox_artifacts": [artifact.to_dict() for artifact in sandbox_result.artifacts],
                 "sandbox_changed_files": sandbox_result.filesystem_changes.to_dict(),
                 "sandbox_violations": [violation.to_dict() for violation in sandbox_result.violations],
+                "sandbox_timing": dict(sandbox_result.metadata.get("timing") or {}),
                 "enforcement_status": sandbox_report["enforcement_status"],
                 "execution_backend": sandbox_report["execution_backend"],
                 "network_denied_verified": sandbox_report["network_denied_verified"],

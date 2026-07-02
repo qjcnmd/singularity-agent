@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +221,8 @@ class ReviewPipeline:
         context: dict[str, Any],
     ) -> ReviewReport:
         self._throw_if_cancelled()
+        started = time.perf_counter()
+        critic_duration_ms = 0
         started_ids = self._emit_started(target=target, evidence=evidence)
         self._throw_if_cancelled()
         findings = self.finding_collector.collect(target=target, evidence=evidence, context=context)
@@ -236,11 +239,13 @@ class ReviewPipeline:
         if self.enable_model_critic:
             self._throw_if_cancelled()
             critic = ModelCritic(self.model_runner)
+            critic_started = time.perf_counter()
             outcome = critic.review(
                 report,
                 bundle={"target": target.model_dump(mode="json"), "context": context},
                 request_context=self._critic_request_context(target),
             )
+            critic_duration_ms = int((time.perf_counter() - critic_started) * 1000)
             self._throw_if_cancelled()
             report.model_critic_status = outcome.status
             report.model_critic_error = outcome.error
@@ -268,7 +273,13 @@ class ReviewPipeline:
 
         report.trace_event_ids.extend(self._emit_findings(report))
         report.trace_event_ids.extend(self._emit_decision(report))
-        report.trace_event_ids.extend(self._emit_completed(report))
+        report.trace_event_ids.extend(
+            self._emit_completed(
+                report,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                critic_duration_ms=critic_duration_ms,
+            )
+        )
         self._record_planner(report)
         self._record_memory(report)
         return report
@@ -362,7 +373,13 @@ class ReviewPipeline:
             target=report.target,
         )
 
-    def _emit_completed(self, report: ReviewReport) -> list[str]:
+    def _emit_completed(
+        self,
+        report: ReviewReport,
+        *,
+        duration_ms: int,
+        critic_duration_ms: int,
+    ) -> list[str]:
         return self._emit(
             TraceEventType.REVIEW_COMPLETED,
             summary=f"Review completed for {report.target.stage.value}.",
@@ -372,6 +389,9 @@ class ReviewPipeline:
                 "finding_count": len(report.findings),
                 "blocking_count": len(report.blocking_findings),
                 "model_critic_status": report.model_critic_status,
+                "review_stage": report.target.stage.value,
+                "duration_ms": duration_ms,
+                "critic_duration_ms": critic_duration_ms,
             },
             severity=TraceSeverity.INFO,
             target=report.target,

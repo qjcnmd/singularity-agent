@@ -55,6 +55,7 @@ class SandboxJsonlTraceRecorder:
             "changed_files_count": result.filesystem_changes.total_changed_files,
             "violations": [violation.to_dict() for violation in result.violations],
             "cleanup_status": result.cleanup_status,
+            "timing": dict(result.metadata.get("timing") or {}),
             "policy_decision_id": request.policy_decision_id if request else None,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)

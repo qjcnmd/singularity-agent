@@ -108,7 +108,11 @@ class VerificationRunner:
         verification_contract: Any | None = None,
     ) -> VerificationPlan:
         self._throw_if_cancelled()
-        resolved_smoke_commands = smoke_commands or self._contract_smoke_commands()
+        resolved_smoke_commands = (
+            self._benchmark_smoke_commands()
+            or smoke_commands
+            or self._contract_smoke_commands()
+        )
         # Auto-load verification contract from planner when not provided
         if verification_contract is None:
             verification_contract = self._active_verification_contract()
@@ -152,6 +156,13 @@ class VerificationRunner:
             return [list(command) for command in self.planner.contract_smoke_commands()]
         except Exception:
             return []
+
+    def _benchmark_smoke_commands(self) -> list[list[str]]:
+        task_contract = self._task_contract_payload() or {}
+        constraints = task_contract.get("benchmark_constraints")
+        if not isinstance(constraints, dict) or not constraints.get("verification_command"):
+            return []
+        return self._contract_smoke_commands()
 
     def _active_verification_contract(self) -> Any | None:
         """Retrieve the active VerificationContract from the planner, if any.
@@ -340,7 +351,10 @@ class VerificationRunner:
         python_sources = [
             path for path in impact.changed_files if path.endswith(".py")
         ]
-        if python_sources:
+        if python_sources and not _has_equivalent_python_compile(
+            smoke_commands,
+            python_sources,
+        ):
             required.append(
                 self._check(
                     kind=CheckKind.SYNTAX,
@@ -1347,6 +1361,31 @@ def _resolve_contract_step_id(
         if isinstance(step, dict) and step.get("command") == argv_str:
             return step.get("step_id")
     return None
+
+
+def _has_equivalent_python_compile(
+    smoke_commands: list[list[str]],
+    python_sources: list[str],
+) -> bool:
+    expected = tuple(_normalized_command_path(path) for path in python_sources)
+    if not expected:
+        return False
+    for command in smoke_commands:
+        if len(command) != len(expected) + 3:
+            continue
+        executable = Path(str(command[0])).name.casefold()
+        if executable not in {"python", "python.exe", Path(sys.executable).name.casefold()}:
+            continue
+        if [str(item) for item in command[1:3]] != ["-m", "py_compile"]:
+            continue
+        actual = tuple(_normalized_command_path(str(path)) for path in command[3:])
+        if actual == expected:
+            return True
+    return False
+
+
+def _normalized_command_path(value: str) -> str:
+    return value.replace("\\", "/")
 
 
 def _build_step_evidence(

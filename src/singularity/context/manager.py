@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from contextlib import suppress
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
@@ -167,10 +168,12 @@ class ContextManager:
         allow_compression: bool | None = None,
     ) -> list[dict[str, Any]]:
         should_compress = persist if allow_compression is None else allow_compression
+        decision_started = time.perf_counter()
         compaction_attempted = should_compress and self.assembler.needs_compression(
             messages=self._messages,
             tools=tools,
         )
+        compaction_decision_duration_ms = int((time.perf_counter() - decision_started) * 1000)
         if compaction_attempted:
             self._compress_if_possible()
         try:
@@ -179,8 +182,13 @@ class ContextManager:
                 planner_context=planner_context,
                 phase_id=phase_id or self.phase_id,
                 render_policy=render_policy,
-                persist=persist,
+                persist=False,
             )
+            bundle.metadata.setdefault("timing", {})["compaction_decision_duration_ms"] = (
+                compaction_decision_duration_ms
+            )
+            if persist:
+                self.persist_bundle(bundle)
             return bundle.messages
         except Exception as exc:
             if not compaction_attempted:
@@ -207,6 +215,7 @@ class ContextManager:
         render_policy: ContextRenderPolicy | None = None,
         persist: bool = True,
     ) -> Any:
+        started = time.perf_counter()
         items = self.store.query_items(run_id=self.run_id)
         active_summary_item_id = self.compaction_planner.active_summary_item_id(items)
         if active_summary_item_id is not None:
@@ -285,6 +294,10 @@ class ContextManager:
         )
         self.last_budget = bundle.budget
         self.last_bundle = bundle
+        bundle.metadata.setdefault("timing", {})["context_assembly_duration_ms"] = int(
+            (time.perf_counter() - started) * 1000
+        )
+        bundle.metadata.setdefault("timing", {})["compaction_decision_duration_ms"] = 0
         if not persist:
             return bundle
         self.persist_bundle(bundle)
@@ -292,6 +305,7 @@ class ContextManager:
 
     def persist_bundle(self, bundle: Any) -> None:
         self.store.save_bundle(bundle)
+        timing = dict(bundle.metadata.get("timing") or {})
         self._emit_context_event(
             "context.bundle_built",
             {
@@ -302,6 +316,10 @@ class ContextManager:
                 "tool_schema_tokens": bundle.budget.tool_schema_tokens,
                 "cached_input_tokens": (bundle.metadata.get("cache") or {}).get("cached_input_tokens", 0),
                 "cache_hit_ratio": (bundle.metadata.get("cache") or {}).get("cache_hit_ratio", 0.0),
+                "duration_ms": int(timing.get("context_assembly_duration_ms") or 0),
+                "compaction_decision_duration_ms": int(
+                    timing.get("compaction_decision_duration_ms") or 0
+                ),
             },
         )
         self._emit_context_event(

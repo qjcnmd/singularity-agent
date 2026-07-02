@@ -100,6 +100,24 @@ def test_memory_pipeline_does_not_inject_pristine_human_templates(tmp_path: Path
     assert block.items == []
 
 
+def test_memory_retrieval_records_duration_without_query_content(tmp_path: Path) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class Trace:
+        def record(self, event: str, payload: dict[str, object]) -> None:
+            events.append((event, payload))
+
+    component = MemoryLearningPipeline(tmp_path, trace=Trace())
+    component.start_session(session_id="session_timing", user_goal="timing")
+
+    component.retrieve(goal="secret query text")
+
+    event, payload = next(item for item in events if item[0] == "retrieval.query.completed")
+    assert event == "retrieval.query.completed"
+    assert payload["duration_ms"] >= 0
+    assert "secret query text" not in json.dumps(payload)
+
+
 def test_cli_memory_commands_cover_candidate_lifecycle(monkeypatch, tmp_path: Path) -> None:
     component = MemoryLearningPipeline(tmp_path)
     component.start_session(session_id="session_cli", user_goal="cli")

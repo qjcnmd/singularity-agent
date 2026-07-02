@@ -377,6 +377,8 @@ TraceStore消费event/span/artifact；CLI、final report、evaluation/replay消�
 
 ## 是否进入 trace / audit
 
+性能 span 只进入现有安全事件的数值 payload：sandbox lifecycle 的 `timing`、`review.completed` 的 `review_stage`/`duration_ms`/`critic_duration_ms`、`context.bundle_built` 的 `duration_ms`/`compaction_decision_duration_ms`，以及 `retrieval.query.completed` 的 `duration_ms`/`result_count`。这些字段不包含 prompt、response、memory query、credential、环境值或 evaluator-only metadata；evaluation 只按安全 ID、状态和耗时聚合。
+
 TraceEvent在append前执行payload redaction并计算payload_hash；span/artifact通过refs关联。Policy audit是独立JSONL，由PolicyAuditWriter保存request/decision摘要，不能用events.jsonl替代审计账本，也不能把audit entry称为TraceEvent。
 
 ## 失败路径

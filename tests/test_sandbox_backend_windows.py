@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 import sys
 from contextlib import redirect_stdout
@@ -20,6 +21,7 @@ from singularity.sandbox import (
     SandboxRequest,
     SandboxStatus,
 )
+from singularity.sandbox.windows_runner import run_spec
 
 
 def _request(tmp_path: Path) -> SandboxRequest:
@@ -1327,6 +1329,54 @@ class _FakeRunner:
             network_denied_verified=self.network_denied,
             metadata=self.metadata,
         )
+
+
+@pytest.mark.security
+def test_windows_backend_records_safe_lifecycle_timing(tmp_path: Path) -> None:
+    backend = _FakeReadyWindowsBackend(
+        runner=_FakeRunner(
+            metadata={
+                "runner": "fake",
+                "backend": "windows",
+                "restricted_token": True,
+                "low_integrity": True,
+                "private_desktop": True,
+                "job_object": True,
+                "timing": {"output_collection_time_seconds": 0.5},
+            }
+        )
+    )
+    prepared = backend.prepare(_request(tmp_path))
+
+    result = backend.run(prepared)
+
+    prepare_timing = prepared.baseline["timing"]
+    assert prepare_timing["sandbox_account_selection_time_seconds"] >= 0
+    assert prepare_timing["acl_grant_time_seconds"] >= 0
+    assert prepare_timing["workspace_materialization_time_seconds"] >= 0
+    run_timing = result.metadata["timing"]
+    assert run_timing["sandbox_doctor_readiness_time_seconds"] >= 0
+    assert run_timing["command_runtime_time_seconds"] >= 0
+    assert run_timing["output_collection_time_seconds"] >= 0.5
+    assert run_timing["artifact_collection_time_seconds"] >= 0
+
+
+@pytest.mark.security
+def test_windows_runner_records_spawn_runtime_and_output_timing(tmp_path: Path) -> None:
+    spec = sandbox.WindowsRunnerSpec(
+        command=[sys.executable, "-c", "print('ok')"],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        timeout_seconds=10,
+        max_output_chars=1000,
+    )
+
+    result = run_spec(spec)
+
+    assert result.exit_code == 0
+    assert result.metadata["timing"]["process_spawn_time_seconds"] >= 0
+    assert result.metadata["timing"]["command_runtime_time_seconds"] >= 0
+    assert result.metadata["timing"]["output_collection_time_seconds"] >= 0
 
 
 def test_windows_backend_runs_low_risk_verification_with_ready_runner(tmp_path: Path) -> None:

@@ -123,7 +123,7 @@ class CommandResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 ```
 
-当结果来自 sandbox，`isolation_report["sandbox"]` 是 command 层对 `SandboxResult` 的安全投影，包含 `sandbox_id`、`backend`、`status`、`trace_id`、`enforcement_status`、`execution_backend`、`backend_is_local_process`、`network_denied_verified`、`process_tree_kill`、`job_killed`、`timeout_enforced`、`artifact_count`、`artifacts`、`artifact_refs`、`changed_files`、`changed_files_count`、`violations`、`cleanup_status` 和 `imported_changes_count`。同一批字段的简化版本也进入 `CommandResult.metadata`，供 VerificationRunner、Planner 和 Finalizer 聚合。
+当结果来自 sandbox，`isolation_report["sandbox"]` 是 command 层对 `SandboxResult` 的安全投影，包含 `sandbox_id`、`backend`、`status`、`trace_id`、`enforcement_status`、`execution_backend`、`backend_is_local_process`、`network_denied_verified`、`process_tree_kill`、`job_killed`、`timeout_enforced`、`artifact_count`、`artifacts`、`artifact_refs`、`changed_files`、`changed_files_count`、`violations`、`cleanup_status`、`imported_changes_count` 和数值 `timing`。同一批字段的简化版本与 `sandbox_timing` 也进入 `CommandResult.metadata`，供 VerificationRunner、Planner、Finalizer 和 evaluation timing 聚合；timing 不包含命令正文或环境值。
 
 ### CommandPolicyResult（命令策略投影）
 

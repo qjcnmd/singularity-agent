@@ -29,6 +29,9 @@ def test_pre_edit_review_emits_trace_and_blocks_validation_review(tmp_path: Path
     event_types = {event["event_type"] for event in events}
     assert {"review.started", "review.finding", "review.decision", "review.completed"} <= event_types
     assert all(event["component"] == "review" for event in events)
+    completed = next(event for event in events if event["event_type"] == "review.completed")
+    assert completed["payload"]["duration_ms"] >= 0
+    assert completed["payload"]["critic_duration_ms"] == 0
 
 
 def test_post_verification_review_repairs_failed_checks(tmp_path: Path) -> None:

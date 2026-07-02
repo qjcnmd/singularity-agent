@@ -304,7 +304,7 @@ class PreparedSandbox:
     baseline: dict[str, Any] = field(default_factory=dict)
 ```
 
-`PreparedSandbox.baseline`在Windows backend中包含workspace file baseline、`runner_spec`、`runner_result`、`sandbox_account`、`credential_target`和`sandbox_role`。只有doctor/setup全部通过后才生成；role只能来自network mode的固定映射。
+`PreparedSandbox.baseline`在Windows backend中包含workspace file baseline、`runner_spec`、`runner_result`、`sandbox_account`、`credential_target`、`sandbox_role`和安全 timing。timing 记录 doctor/readiness、account selection、workspace materialization 与当前 run-root ACL grant；只有doctor/setup全部通过后才生成，role只能来自network mode的固定映射。
 
 ### SandboxResult（沙箱结果）
 
@@ -391,7 +391,7 @@ Windows凭据分别写入Credential Manager target`SingularityOffline`与`Singul
 
 ## 是否进入 trace / audit
 
-`SandboxManager` 可发出 `sandbox.requested`、`sandbox.prepared`、`sandbox.started`、`sandbox.cleaned`、`sandbox.capability_failed`、`sandbox.violation` 和 `sandbox.completed`。`SandboxJsonlTraceRecorder.append()` 写 result、capability、request 安全投影。sandbox result 不直接写 policy audit；关联的 policy decision 由 Policy 层记录。
+`SandboxManager` 可发出 `sandbox.requested`、`sandbox.prepared`、`sandbox.started`、`sandbox.cleaned`、`sandbox.capability_failed`、`sandbox.violation` 和 `sandbox.completed`。`sandbox.prepared` 与 terminal payload 只增加数值 timing，不写 argv、credential 或路径正文；分段包括 doctor/readiness、account selection、ACL grant、process spawn、command runtime、output collection、artifact collection 和当前 run-root cleanup。`SandboxJsonlTraceRecorder.append()` 写相同的 result timing 安全投影。sandbox result 不直接写 policy audit；关联的 policy decision 由 Policy 层记录。
 
 `CommandExecutor._result_from_sandbox()` 会把 selected backend、enforcement status、execution backend、network denied proof、Job Object/timeout 状态、artifact refs、changed files 和 violations 放入 `CommandResult.isolation_report["sandbox"]`。Planner 和 final report 从这里聚合 `sandbox_isolation_summary`。
 

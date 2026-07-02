@@ -140,6 +140,13 @@ def test_build_bundle_is_read_only_until_explicitly_persisted(tmp_path: Path) ->
         event["event_type"] == "context.bundle_built"
         for event in context.store.events_for_run(context.run_id)
     )
+    built = next(
+        event
+        for event in context.store.events_for_run(context.run_id)
+        if event["event_type"] == "context.bundle_built"
+    )
+    assert built["payload"]["duration_ms"] >= 0
+    assert built["payload"]["compaction_decision_duration_ms"] >= 0
 
 
 def test_window_trimming_keeps_tool_call_pairs_or_removes_them_together(

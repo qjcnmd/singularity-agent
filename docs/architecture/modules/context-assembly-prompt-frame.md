@@ -346,7 +346,7 @@ class ContextSensitivity(str, Enum): # ContextItem.sensitivity
 
 ## 是否进入 trace / audit
 
-- context 增量写 `context.item_added` 等摘要事件；bundle 构造写 `context.bundle_built`、`context.rendered_for_model`，payload 只含 bundle id、included/excluded ids 与 token 统计，不写完整敏感正文。实际 cache usage 写 `context.cache_usage_recorded`。
+- context 增量写 `context.item_added` 等摘要事件；bundle 构造写 `context.bundle_built`、`context.rendered_for_model`，payload 只含 bundle id、included/excluded ids、token 统计、`duration_ms` 和 `compaction_decision_duration_ms`，不写完整敏感正文。`messages()` 单独测量是否需要 compaction 的决策时间，再将其附到同一次 bundle persist，避免重复构建或重复持久化。实际 cache usage 写 `context.cache_usage_recorded`。
 - prompt assembly 写 `instruction_sources_collected`、`instruction_conflict_detected`、`instruction_injection_detected`、`prompt_compiled` 与 `prompt_manifest_created`。injection excerpt 在事件前替换成 hash/`<redacted>`；manifest artifact 仅在配置开启时产生。
 - 本层不写 policy audit；若 context 来源是 policy observation，保存的是已经由 PolicyEngine/audit 产生并经 ContextManager 投影的摘要。
 

@@ -667,6 +667,257 @@ def test_provider_time_falls_back_to_request_response_monotonic_ms() -> None:
     assert _provider_time_seconds(events, {}) == 3.0
 
 
+def test_sandbox_backend_prefers_sandbox_lifecycle_over_in_process_tools() -> None:
+    events = [
+        {"event_type": "tool.dispatch.completed", "payload": {"backend": "in_process"}},
+        {"event_type": "sandbox.prepared", "payload": {"backend": "windows"}},
+    ]
+
+    assert evaluation_runner._sandbox_backend(events, {}) == "windows"
+
+
+def test_sandbox_time_deduplicates_terminal_events_by_command_id() -> None:
+    events = [
+        {
+            "event_type": "command.completed",
+            "command_id": "cmd_1",
+            "payload": {"command_id": "cmd_1", "duration_ms": 71000},
+        },
+        {
+            "event_type": "command.completed",
+            "command_id": "cmd_1",
+            "payload": {"command_id": "cmd_1", "duration_ms": 71000, "backend": "windows"},
+        },
+        {
+            "event_type": "sandbox.completed",
+            "command_id": "cmd_1",
+            "sandbox_id": "sandbox_1",
+            "payload": {"duration_ms": 400, "backend": "windows"},
+        },
+        {
+            "event_type": "command.completed",
+            "command_id": "cmd_2",
+            "payload": {"command_id": "cmd_2", "duration_ms": 69000},
+        },
+    ]
+
+    assert evaluation_runner._sandbox_time_seconds(events) == 140.0
+
+
+def test_sandbox_time_keeps_distinct_command_ids_with_same_duration() -> None:
+    events = [
+        {
+            "event_type": "command.completed",
+            "command_id": command_id,
+            "payload": {"command_id": command_id, "duration_ms": 5000},
+        }
+        for command_id in ("cmd_1", "cmd_2")
+    ]
+
+    assert evaluation_runner._sandbox_time_seconds(events) == 10.0
+
+
+def test_provider_time_by_turn_pairs_safe_request_metadata() -> None:
+    events = [
+        {
+            "event_type": "model.request.created",
+            "monotonic_ms": 100,
+            "action_id": "action_1",
+            "payload": {"request_id": "req_1", "purpose": "execute_task"},
+        },
+        {
+            "event_type": "model.response.received",
+            "monotonic_ms": 2600,
+            "action_id": "action_1",
+            "payload": {"request_id": "req_1"},
+        },
+    ]
+
+    assert evaluation_runner._provider_time_by_turn(events) == [
+        {
+            "turn": 1,
+            "request_id": "req_1",
+            "purpose": "execute_task",
+            "action_id": "action_1",
+            "status": "completed",
+            "duration_seconds": 2.5,
+        }
+    ]
+
+
+def test_capability_summary_v2_marks_unavailable_timing_without_zero() -> None:
+    summary = _build_capability_summary(
+        trace=None,
+        trace_summary={},
+        checks={},
+        verification=None,
+        public_verification=None,
+        hidden_verification=None,
+        final_report_status="",
+        agent_status="",
+        wall_time_seconds=4.0,
+        evaluation_timing={
+            "workspace_materialization_time_seconds": 1.25,
+            "repo_fetch_time_seconds": None,
+        },
+    )
+
+    assert summary["schema_version"] == "evaluation.capability_summary/v2"
+    assert summary["timing"]["workspace_materialization_time_seconds"] == 1.25
+    assert summary["timing"]["repo_fetch_time_seconds"] is None
+    assert summary["timing_diagnostics"]["workspace_materialization_time_seconds"]["status"] == "measured"
+    assert summary["timing_diagnostics"]["repo_fetch_time_seconds"] == {
+        "status": "not_applicable",
+        "source": "evaluation_runner",
+        "reason": "remote materialization used clone without a standalone fetch",
+    }
+
+
+def test_capability_summary_v2_aggregates_component_spans_without_payload_content(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    events = [
+        {"event_type": "command.requested", "command_id": "cmd_1", "monotonic_ms": 1000, "payload": {}},
+        {"event_type": "sandbox.requested", "command_id": "cmd_1", "monotonic_ms": 1200, "payload": {}},
+        {
+            "event_type": "sandbox.prepared",
+            "command_id": "cmd_1",
+            "payload": {
+                "timing": {
+                    "sandbox_doctor_readiness_time_seconds": 1.0,
+                    "sandbox_account_selection_time_seconds": 0.1,
+                    "acl_grant_time_seconds": 0.2,
+                }
+            },
+        },
+        {
+            "event_type": "command.completed",
+            "command_id": "cmd_1",
+            "payload": {
+                "command_id": "cmd_1",
+                "duration_ms": 4000,
+                "timing": {
+                    "process_spawn_time_seconds": 0.3,
+                    "command_runtime_time_seconds": 0.4,
+                    "output_collection_time_seconds": 0.05,
+                    "artifact_collection_time_seconds": 0.02,
+                    "run_root_cleanup_time_seconds": 0.1,
+                },
+            },
+        },
+        {
+            "event_type": "tool.dispatch.completed",
+            "payload": {"tool_name": "edit_apply", "duration_ms": 2000},
+        },
+        {
+            "event_type": "mutation.applied",
+            "transaction_id": "tx_1",
+            "payload": {"duration_ms": 100},
+        },
+        {
+            "event_type": "mutation.applied",
+            "transaction_id": "tx_1",
+            "payload": {"duration_ms": 200},
+        },
+        {
+            "event_type": "review.completed",
+            "payload": {
+                "review_stage": "pre_edit",
+                "duration_ms": 1000,
+                "critic_duration_ms": 800,
+            },
+        },
+        {
+            "event_type": "context.bundle_built",
+            "payload": {"duration_ms": 50, "compaction_decision_duration_ms": 10},
+        },
+        {"event_type": "retrieval.query.completed", "payload": {"duration_ms": 20}},
+    ]
+    (trace_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = _build_capability_summary(
+        trace=trace_dir,
+        trace_summary={},
+        checks={},
+        verification=None,
+        public_verification=None,
+        hidden_verification=None,
+        final_report_status="completed",
+        agent_status="completed",
+        wall_time_seconds=6.0,
+        evaluation_timing={
+            "run_root_reset_time_seconds": 0.1,
+            "workspace_materialization_time_seconds": 1.0,
+            "dependency_setup_time_seconds": 0.5,
+            "agent_loop_time_seconds": 3.0,
+            "verification_workspace_copy_time_seconds": 0.2,
+            "public_verification_time_seconds": 0.1,
+            "hidden_verification_time_seconds": 0.1,
+            "resource_cleanup_time_seconds": 0.1,
+        },
+    )
+
+    timing = summary["timing"]
+    assert timing["command_dispatch_time_seconds"] == 0.2
+    assert timing["sandbox_doctor_readiness_time_seconds"] == 1.0
+    assert timing["process_spawn_time_seconds"] == 0.3
+    assert timing["command_runtime_time_seconds"] == 0.4
+    assert timing["edit_apply_total_time_seconds"] == 2.0
+    assert timing["edit_apply_mutation_time_seconds"] == 0.2
+    assert timing["edit_apply_review_time_seconds"] == 1.0
+    assert timing["edit_apply_critic_time_seconds"] == 0.8
+    assert timing["context_assembly_time_seconds"] == 0.05
+    assert timing["retrieval_time_seconds"] == 0.02
+    assert timing["compaction_decision_time_seconds"] == 0.01
+    assert summary["timing_diagnostics"]["command_runtime_time_seconds"]["source"] == "sandbox_trace"
+    assert summary["timing_diagnostics"]["edit_apply_review_time_seconds"]["source"] == "review_trace"
+    assert summary["timing_diagnostics"]["context_assembly_time_seconds"]["source"] == "context_trace"
+    assert summary["wall_phases"]["agent_loop_time_seconds"] == 3.0
+    assert summary["unattributed_time_seconds"] == 0.9
+
+
+def test_public_task_sandbox_enforcement_audit_fails_on_local_fallback() -> None:
+    task = load_evaluation_task_set("docs/evaluation/public-representative-task.json").tasks[0]
+    events = [
+        {
+            "event_type": "command.completed",
+            "payload": {"backend": "local_process", "used_local_process_fallback": True},
+        }
+    ]
+
+    assert evaluation_runner._sandbox_enforcement_audit(task, events, {}) == {
+        "passed": False,
+        "required": True,
+        "local_process_fallback_count": 1,
+        "reason": "sandbox-required evaluation used a local process fallback",
+    }
+
+
+def test_evaluator_visibility_audit_detects_hidden_payload_in_trace(tmp_path: Path) -> None:
+    task = load_evaluation_task_set("docs/evaluation/public-representative-task.json").tasks[0]
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    (trace_dir / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "event_type": "context.bundle_built",
+                "payload": {"hidden_test_patch": task.hidden_test_patch},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    audit = evaluation_runner._evaluator_visibility_audit(task, trace_dir)
+
+    assert audit["passed"] is False
+    assert audit["status"] == "leak_detected"
+    assert audit["reason"] == "evaluator-only metadata appeared in model-visible projection or trace"
+
+
 def test_evaluation_sanitized_result_shape_is_safe_and_current() -> None:
     payload: dict[str, Any] = {
         "schema_version": EVALUATION_RESULT_SCHEMA_VERSION,
@@ -1056,6 +1307,20 @@ def test_evaluation_report_markdown_includes_metrics_scorecard(tmp_path: Path) -
         turn_count=1,
         agent_completed=True,
         evaluation_passed=True,
+        timing={
+            "wall_time_seconds": 1.0,
+            "workspace_materialization_time_seconds": 0.2,
+            "repo_fetch_time_seconds": None,
+        },
+        capability_summary={
+            "timing_diagnostics": {
+                "repo_fetch_time_seconds": {
+                    "status": "not_applicable",
+                    "source": "evaluation_runner",
+                    "reason": "clone path",
+                }
+            }
+        },
         evaluation_metrics={
             "schema_version": "evaluation.metrics/v1",
             "resolved": {"value": True, "resolved_rate_contribution": 1.0, "reason": ""},
@@ -1085,6 +1350,9 @@ def test_evaluation_report_markdown_includes_metrics_scorecard(tmp_path: Path) -
     assert "- resolved: 1 / 1 (1.0000)" in markdown
     assert "`scorecard-task` | True | True | not_configured" in markdown
     assert "0.100000 (pricing_table)" in markdown
+    assert "## Timing Breakdown" in markdown
+    assert "workspace_materialization_time_seconds" in markdown
+    assert "clone path" in markdown
 
 
 def test_evaluation_runner_writes_result_without_provider(tmp_path: Path) -> None:
@@ -1735,6 +2003,14 @@ def test_evaluation_uses_task_strategy_max_turns(tmp_path: Path) -> None:
     task = result["tasks"][0]
     assert task["reproducible_environment"]["model_profile"]["max_turns"] == 24
     assert task["evaluation_passed"] is True
+    assert task["sandbox_enforcement_passed"] is True
+    assert task["evaluator_visibility_audit_passed"] is True
+    assert task["capability_summary"]["schema_version"] == "evaluation.capability_summary/v2"
+    assert task["timing"]["workspace_materialization_time_seconds"] is not None
+    assert task["timing"]["dependency_setup_time_seconds"] is not None
+    assert task["timing"]["verification_workspace_copy_time_seconds"] is not None
+    assert task["timing"]["public_verification_time_seconds"] is not None
+    assert task["timing"]["hidden_verification_time_seconds"] is not None
 
 
 def test_evaluation_runner_max_turns_overrides_task_strategy(tmp_path: Path) -> None:

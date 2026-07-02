@@ -119,7 +119,8 @@ def capability_timing_from_result(result_path: Path) -> dict[str, Any]:
         payload = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    provider = sandbox = verification = context = 0.0
+    aggregated: dict[str, float | None] = {}
+    diagnostics: dict[str, Any] = {}
     for task in payload.get("tasks") or []:
         if not isinstance(task, dict):
             continue
@@ -128,16 +129,17 @@ def capability_timing_from_result(result_path: Path) -> dict[str, Any]:
             continue
         timing = task.get("timing") or capability.get("timing") or {}
         if isinstance(timing, dict):
-            provider += float(timing.get("provider_time_seconds") or 0.0)
-            sandbox += float(timing.get("sandbox_time_seconds") or 0.0)
-            verification += float(timing.get("verification_time_seconds") or 0.0)
-            context += float(timing.get("context_retrieval_compaction_time_seconds") or 0.0)
-    return {
-        "provider_time_seconds": round(provider, 3),
-        "sandbox_time_seconds": round(sandbox, 3),
-        "verification_time_seconds": round(verification, 3),
-        "context_retrieval_compaction_time_seconds": round(context, 3),
-    }
+            for name, value in timing.items():
+                if isinstance(value, int | float):
+                    aggregated[name] = round(float(aggregated.get(name) or 0.0) + float(value), 3)
+                elif value is None and name not in aggregated:
+                    aggregated[name] = None
+        task_diagnostics = capability.get("timing_diagnostics") or {}
+        if isinstance(task_diagnostics, dict):
+            diagnostics.update(task_diagnostics)
+    if diagnostics:
+        aggregated["timing_diagnostics"] = diagnostics
+    return aggregated
 
 
 def capability_metrics_from_result(result_path: Path) -> dict[str, Any]:

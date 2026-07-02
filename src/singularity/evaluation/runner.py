@@ -296,6 +296,8 @@ class EvaluationTaskResult:
     allowed_scope_passed: bool = False
     public_verification_passed: bool = False
     hidden_verification_passed: bool = False
+    sandbox_enforcement_passed: bool = True
+    evaluator_visibility_audit_passed: bool = True
     repair_attempt_count: int = 0
     repair_execution_count: int = 0
     miscompletion_count: int = 0
@@ -348,6 +350,8 @@ class EvaluationTaskResult:
             "allowed_scope_passed": self.allowed_scope_passed,
             "public_verification_passed": self.public_verification_passed,
             "hidden_verification_passed": self.hidden_verification_passed,
+            "sandbox_enforcement_passed": self.sandbox_enforcement_passed,
+            "evaluator_visibility_audit_passed": self.evaluator_visibility_audit_passed,
             "repair_attempt_count": self.repair_attempt_count,
             "repair_execution_count": self.repair_execution_count,
             "miscompletion_count": self.miscompletion_count,
@@ -533,6 +537,7 @@ class EvaluationRunner:
 
     def run_task(self, task: EvaluationTask, *, manifest_base: Path) -> EvaluationTaskResult:
         started = time.perf_counter()
+        evaluation_timing: dict[str, Any] = {}
         task_dir = self.run_dir / _safe_name(task.task_id)
         workspace = task_dir / "workspace"
         trace_path = ""
@@ -567,10 +572,24 @@ class EvaluationRunner:
         fail_to_pass_satisfied = False
         verification_misconfiguration_reason = ""
         try:
+            phase_started = time.perf_counter()
             _reset_dir(task_dir, root=self.run_dir)
+            evaluation_timing["run_root_reset_time_seconds"] = time.perf_counter() - phase_started
             try:
-                self._materialize_workspace(task, workspace=workspace, manifest_base=manifest_base)
+                phase_started = time.perf_counter()
+                self._materialize_workspace(
+                    task,
+                    workspace=workspace,
+                    manifest_base=manifest_base,
+                    timing=evaluation_timing,
+                )
+                evaluation_timing["workspace_materialization_time_seconds"] = (
+                    time.perf_counter() - phase_started
+                )
             except EvaluationSetupError as exc:
+                evaluation_timing["workspace_materialization_time_seconds"] = (
+                    time.perf_counter() - phase_started
+                )
                 errors.append(str(exc))
                 return self._task_result(
                     task=task,
@@ -597,6 +616,7 @@ class EvaluationRunner:
                     contract_satisfaction={},
                     reproducible_environment=_setup_environment(task, manifest_base=manifest_base),
                     baseline_checks={},
+                    evaluation_timing=evaluation_timing,
                 )
             config = ProductionConfig.from_cli(
                 project_root=workspace,
@@ -631,6 +651,7 @@ class EvaluationRunner:
                 config=config,
                 max_turns=config.max_turns,
             )
+            dependency_setup_started = time.perf_counter()
             for command in task.prepare_commands:
                 prepared = _run_shell(command, cwd=workspace, timeout_seconds=120, redactor=self.redactor)
                 if not prepared.passed:
@@ -652,17 +673,33 @@ class EvaluationRunner:
                         tests_passed=False,
                         infrastructure_blocked=False,
                         reproducible_environment=reproducible_environment,
+                        evaluation_timing={
+                            **evaluation_timing,
+                            "dependency_setup_time_seconds": time.perf_counter()
+                            - dependency_setup_started,
+                        },
                     )
+            evaluation_timing["dependency_setup_time_seconds"] = (
+                time.perf_counter() - dependency_setup_started
+            )
             before_snapshot = _snapshot_files(workspace)
             before_text_snapshot = _read_text_files(workspace)
+            phase_started = time.perf_counter()
             shutil.copytree(workspace, baseline_workspace, ignore=_copy_ignore)
+            evaluation_timing["baseline_workspace_copy_time_seconds"] = (
+                time.perf_counter() - phase_started
+            )
             if _requires_baseline_verification(task):
+                phase_started = time.perf_counter()
                 baseline_verification = _run_baseline_verification(
                     task,
                     baseline_workspace=baseline_workspace,
                     baseline_verification_workspace=baseline_verification_workspace,
                     root=task_dir,
                     redactor=self.redactor,
+                )
+                evaluation_timing["baseline_verification_time_seconds"] = (
+                    time.perf_counter() - phase_started
                 )
                 baseline_checks = baseline_verification["checks"]
                 baseline_failed = bool(baseline_verification["baseline_failed"])
@@ -698,6 +735,7 @@ class EvaluationRunner:
                         baseline_checks=baseline_checks,
                         status_override="invalid_public_task",
                         failure_category_override="baseline_already_passing",
+                        evaluation_timing=evaluation_timing,
                     )
                 if baseline_verification["status"] == "verification_misconfigured":
                     errors.append(f"verification misconfigured: {verification_misconfiguration_reason}")
@@ -729,11 +767,14 @@ class EvaluationRunner:
                         verification_misconfiguration_reason=verification_misconfiguration_reason,
                         status_override="verification_misconfigured",
                         failure_category_override="verification_misconfigured",
+                        evaluation_timing=evaluation_timing,
                     )
             goal = _task_goal(task)
+            phase_started = time.perf_counter()
             kernel = self.bootstrap_cls(project_root=workspace, config=config, console=self.console).boot(goal)
             _apply_benchmark_constraints(kernel, task)
             agent_result = kernel.run_task(goal)
+            evaluation_timing["agent_loop_time_seconds"] = time.perf_counter() - phase_started
             trace_path = _trace_path(kernel)
             trace_summary = _trace_summary(kernel, agent_result)
             final_report_payload = _final_report_payload(agent_result)
@@ -792,9 +833,11 @@ class EvaluationRunner:
                     reproducible_environment=reproducible_environment,
                     baseline_failed=baseline_failed,
                     baseline_checks=baseline_checks,
+                    evaluation_timing=evaluation_timing,
                 )
             files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
             patch_payload = _patch_payload(before_text_snapshot, workspace)
+            phase_started = time.perf_counter()
             applicable = _prepare_verification_workspace(
                 source_workspace=workspace,
                 verification_workspace=verification_workspace,
@@ -803,17 +846,24 @@ class EvaluationRunner:
                 root=task_dir,
                 test_patch=task.test_patch,
             )
+            evaluation_timing["verification_workspace_copy_time_seconds"] = (
+                time.perf_counter() - phase_started
+            )
             patch_payload["applicable"] = applicable
             patch_applied = applicable
             public_command = _public_verification_command(task)
             hidden_command = _hidden_verification_command(task)
             if task.verification_prepare_commands:
                 if public_command:
+                    phase_started = time.perf_counter()
                     public_verification = _run_shell(
                         public_command,
                         cwd=verification_workspace,
                         timeout_seconds=task.verification_timeout_seconds,
                         redactor=self.redactor,
+                    )
+                    evaluation_timing["public_verification_time_seconds"] = (
+                        time.perf_counter() - phase_started
                     )
                 else:
                     public_verification = CommandEvalResult(
@@ -830,12 +880,17 @@ class EvaluationRunner:
                         },
                     )
             else:
+                phase_started = time.perf_counter()
                 public_verification = _run_shell(
                     public_command,
                     cwd=verification_workspace,
                     timeout_seconds=task.verification_timeout_seconds,
                     redactor=self.redactor,
                 )
+                evaluation_timing["public_verification_time_seconds"] = (
+                    time.perf_counter() - phase_started
+                )
+            verification_prepare_started = time.perf_counter()
             for command in task.verification_prepare_commands:
                 prepared = _run_shell(command, cwd=verification_workspace, timeout_seconds=120, redactor=self.redactor)
                 if not prepared.passed:
@@ -880,12 +935,20 @@ class EvaluationRunner:
                         reproducible_environment=reproducible_environment,
                         public_verification=public_verification,
                         hidden_verification=prepared,
+                        evaluation_timing=evaluation_timing,
                     )
+            evaluation_timing["verification_prepare_time_seconds"] = (
+                time.perf_counter() - verification_prepare_started
+            )
+            phase_started = time.perf_counter()
             hidden_verification = _run_shell(
                 hidden_command,
                 cwd=verification_workspace,
                 timeout_seconds=task.verification_timeout_seconds,
                 redactor=self.redactor,
+            )
+            evaluation_timing["hidden_verification_time_seconds"] = (
+                time.perf_counter() - phase_started
             )
             verification = hidden_verification
             checks = _checks_payload(public_verification, hidden_verification)
@@ -961,7 +1024,11 @@ class EvaluationRunner:
         finally:
             close_resources = getattr(kernel, "close_resources", None) if kernel is not None else None
             if callable(close_resources):
+                phase_started = time.perf_counter()
                 close_resources()
+                evaluation_timing["resource_cleanup_time_seconds"] = (
+                    time.perf_counter() - phase_started
+                )
         return self._task_result(
             task=task,
             workspace=workspace,
@@ -993,9 +1060,18 @@ class EvaluationRunner:
             patch_applied=patch_applied,
             fail_to_pass_satisfied=fail_to_pass_satisfied,
             verification_misconfiguration_reason=verification_misconfiguration_reason,
+            evaluation_timing=evaluation_timing,
         )
 
-    def _materialize_workspace(self, task: EvaluationTask, *, workspace: Path, manifest_base: Path) -> None:
+    def _materialize_workspace(
+        self,
+        task: EvaluationTask,
+        *,
+        workspace: Path,
+        manifest_base: Path,
+        timing: dict[str, Any] | None = None,
+    ) -> None:
+        timing = timing if timing is not None else {}
         if task.workspace.kind == "fixture":
             workspace.mkdir(parents=True, exist_ok=True)
             for relative, content in task.workspace.files.items():
@@ -1009,8 +1085,13 @@ class EvaluationRunner:
                     environment_blocker=False,
                 )
             try:
+                operation_started = time.perf_counter()
                 _run_git(["clone", "--quiet", "--filter=blob:none", source_value, str(workspace)], cwd=manifest_base)
+                timing["repo_clone_time_seconds"] = time.perf_counter() - operation_started
+                timing["repo_fetch_time_seconds"] = None
+                operation_started = time.perf_counter()
                 _run_git(["checkout", "--quiet", task.workspace.start_commit], cwd=workspace)
+                timing["repo_checkout_time_seconds"] = time.perf_counter() - operation_started
             except RuntimeError as exc:
                 raise EvaluationSetupError(
                     f"setup/environment blocker: failed to materialize remote repo {source_value}: {exc}",
@@ -1027,8 +1108,13 @@ class EvaluationRunner:
             )
         if task.workspace.start_commit and _is_git_repo(source):
             try:
+                operation_started = time.perf_counter()
                 _run_git(["clone", "--quiet", "--shared", str(source), str(workspace)], cwd=manifest_base)
+                timing["repo_clone_time_seconds"] = time.perf_counter() - operation_started
+                timing["repo_fetch_time_seconds"] = None
+                operation_started = time.perf_counter()
                 _run_git(["checkout", "--quiet", task.workspace.start_commit], cwd=workspace)
+                timing["repo_checkout_time_seconds"] = time.perf_counter() - operation_started
             except RuntimeError as exc:
                 raise EvaluationSetupError(
                     f"evaluation repo checkout failed: {exc}",
@@ -1072,10 +1158,20 @@ class EvaluationRunner:
         verification_misconfiguration_reason: str = "",
         status_override: str = "",
         failure_category_override: str = "",
+        evaluation_timing: dict[str, Any] | None = None,
     ) -> EvaluationTaskResult:
         request_rates = _float_map(usage.get("request_cache_hit_rates") or {})
         final_report_payload = final_report_payload or {}
         trace_summary = trace_summary or {}
+        trace_path = Path(trace) if trace else None
+        trace_events = _read_trace_events(trace_path)
+        sandbox_audit = _sandbox_enforcement_audit(task, trace_events, trace_summary)
+        visibility_audit = _evaluator_visibility_audit(task, trace_path)
+        if success and not sandbox_audit["passed"]:
+            errors.append(str(sandbox_audit["reason"]))
+        if success and not visibility_audit["passed"]:
+            errors.append(str(visibility_audit["reason"]))
+        success = bool(success and sandbox_audit["passed"] and visibility_audit["passed"])
         status = status_override or _result_status(
             success=success,
             tests_passed=tests_passed,
@@ -1110,7 +1206,7 @@ class EvaluationRunner:
         }
         report_status = final_report_status or agent_status
         agent_completed = _agent_completed(report_status, agent_status=agent_status)
-        evaluation_passed = bool(success)
+        evaluation_passed = success
         patch_applicable = _patch_applicable_for_task(task, patch=patch, files_changed=files_changed)
         allowed_scope_passed = _allowed_scope_ok(files_changed, task.allowed_paths)
         public_verification_passed = _check_passed(checks, "public")
@@ -1133,7 +1229,7 @@ class EvaluationRunner:
             errors=errors,
         )
         capability_summary = _build_capability_summary(
-            trace=Path(trace) if trace else None,
+            trace=trace_path,
             trace_summary=trace_summary,
             checks=checks or _checks_payload(None, verification),
             verification=verification,
@@ -1142,7 +1238,10 @@ class EvaluationRunner:
             final_report_status=final_report_status,
             agent_status=agent_status,
             wall_time_seconds=round(time.perf_counter() - started, 3),
+            evaluation_timing=evaluation_timing,
         )
+        capability_summary["sandbox_enforcement"] = sandbox_audit
+        capability_summary["evaluator_visibility_audit"] = visibility_audit
         result_patch = patch or {"diff": "", "applicable": False, "changed_files": []}
         result_checks = checks or _checks_payload(None, verification)
         result_trace_artifacts = list(trace_artifact_refs or _trace_artifact_refs(final_report_payload, trace_summary))
@@ -1173,7 +1272,7 @@ class EvaluationRunner:
             checks=result_checks,
             verification=verification,
             capability_summary=capability_summary,
-            trace=Path(trace) if trace else None,
+            trace=trace_path,
             token_usage=token_usage,
             cache_usage=cache_usage,
             turn_count=turn_count or _safe_int(usage.get("requests")),
@@ -1221,6 +1320,8 @@ class EvaluationRunner:
             allowed_scope_passed=allowed_scope_passed,
             public_verification_passed=public_verification_passed,
             hidden_verification_passed=hidden_verification_passed,
+            sandbox_enforcement_passed=bool(sandbox_audit["passed"]),
+            evaluator_visibility_audit_passed=bool(visibility_audit["passed"]),
             repair_attempt_count=repair_attempt_count,
             repair_execution_count=repair_execution_count,
             miscompletion_count=miscompletion_count,
@@ -1512,6 +1613,35 @@ def evaluation_report_markdown(payload: dict[str, Any]) -> str:
                 "| task | resolved | FAIL_TO_PASS | PASS_TO_PASS | verification | patch files / out of scope | turns / tools / success | context / compaction | wall seconds | cost | policy blocks | failure reason |",
                 "| --- | --- | --- | --- | --- | --- | --- | --- | ---: | --- | ---: | --- |",
                 *scorecard_rows,
+            ]
+        )
+    timing_rows: list[str] = []
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        timing = task.get("timing") or {}
+        capability = task.get("capability_summary") or {}
+        diagnostics = capability.get("timing_diagnostics") if isinstance(capability, dict) else {}
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        if not isinstance(timing, dict):
+            continue
+        for name, value in sorted(timing.items()):
+            diagnostic = diagnostics.get(name) if isinstance(diagnostics.get(name), dict) else {}
+            status = str(diagnostic.get("status") or ("measured" if value is not None else "unavailable"))
+            reason = str(diagnostic.get("reason") or "-").replace("|", "\\|")
+            rendered_value = "-" if value is None else str(value)
+            timing_rows.append(
+                f"| `{task.get('task_id', '')}` | `{name}` | {rendered_value} | {status} | {reason} |"
+            )
+    if timing_rows:
+        lines.extend(
+            [
+                "",
+                "## Timing Breakdown",
+                "",
+                "| task | metric | seconds | status | reason |",
+                "| --- | --- | ---: | --- | --- |",
+                *timing_rows,
             ]
         )
     regression = payload.get("regression")
@@ -1935,19 +2065,79 @@ def _apply_benchmark_constraints(kernel: Any, task: EvaluationTask) -> None:
     apply_constraints = getattr(planner, "apply_benchmark_constraints", None)
     if not callable(apply_constraints):
         return
+    apply_constraints(_model_visible_benchmark_constraints(task))
+
+
+def _model_visible_benchmark_constraints(task: EvaluationTask) -> dict[str, Any]:
     verification_command = _model_visible_verification_command(task)
     if _requires_baseline_verification(task) and not task.model_visible_verification_command:
         verification_command = ""
-    apply_constraints(
-        {
-            "task_id": task.task_id,
-            "allowed_tools": task.allowed_tools,
-            "expected_file_changes": task.expected_file_changes,
-            "completion_standard": task.completion_standard,
-            "risk_tags": task.risk_tags,
-            "verification_command": verification_command,
+    return {
+        "task_id": task.task_id,
+        "allowed_tools": task.allowed_tools,
+        "expected_file_changes": task.expected_file_changes,
+        "completion_standard": task.completion_standard,
+        "risk_tags": task.risk_tags,
+        "verification_command": verification_command,
+    }
+
+
+def _sandbox_enforcement_audit(
+    task: EvaluationTask,
+    events: list[dict[str, Any]],
+    trace_summary: dict[str, Any],
+) -> dict[str, Any]:
+    required = task.task_type == "public_representative"
+    fallback_count = _local_process_fallback_count(events, trace_summary)
+    passed = not required or fallback_count == 0
+    return {
+        "passed": passed,
+        "required": required,
+        "local_process_fallback_count": fallback_count,
+        "reason": "" if passed else "sandbox-required evaluation used a local process fallback",
+    }
+
+
+def _evaluator_visibility_audit(
+    task: EvaluationTask,
+    trace: Path | None,
+) -> dict[str, Any]:
+    required = task.task_type == "public_representative"
+    if not required:
+        return {"passed": True, "status": "not_applicable", "reason": ""}
+    if trace is None:
+        return {
+            "passed": False,
+            "status": "unavailable",
+            "reason": "model-visible trace was unavailable for evaluator visibility audit",
         }
+    projection = {
+        "goal": _task_goal(task),
+        "constraints": _model_visible_benchmark_constraints(task),
+    }
+    serialized_projection = json.dumps(projection, ensure_ascii=False, sort_keys=True, default=str)
+    serialized_trace = json.dumps(_read_trace_events(trace), ensure_ascii=False, sort_keys=True, default=str)
+    combined = f"{serialized_projection}\n{serialized_trace}"
+    forbidden_keys = ("fixture_metadata", "hidden_test_patch", "test_patch")
+    forbidden_payloads = [
+        task.test_patch,
+        json.dumps(task.fixture_metadata, ensure_ascii=False, sort_keys=True, default=str)
+        if task.fixture_metadata
+        else "",
+        json.dumps(task.hidden_test_patch, ensure_ascii=False, sort_keys=True, default=str)
+        if task.hidden_test_patch
+        else "",
+    ]
+    leaked = any(key in combined for key in forbidden_keys) or any(
+        payload and payload in combined for payload in forbidden_payloads
     )
+    return {
+        "passed": not leaked,
+        "status": "passed" if not leaked else "leak_detected",
+        "reason": ""
+        if not leaked
+        else "evaluator-only metadata appeared in model-visible projection or trace",
+    }
 
 
 def _agent_status(agent_result: Any) -> str:
@@ -2130,6 +2320,7 @@ def _build_capability_summary(
     final_report_status: str,
     agent_status: str,
     wall_time_seconds: float,
+    evaluation_timing: dict[str, float | None] | None = None,
 ) -> dict[str, Any]:
     events = _read_trace_events(trace)
     model_requests = _count_events(events, "model.request.created")
@@ -2155,8 +2346,16 @@ def _build_capability_summary(
     if isinstance(usage, dict):
         model_requests = model_requests or _safe_int(usage.get("requests"))
         model_results = model_results or _safe_int(usage.get("responses")) or model_requests
+    trace_timing = _trace_timing_details(events)
+    measured_timing = {**trace_timing, **(evaluation_timing or {})}
+    detailed_timing, timing_diagnostics = _capability_timing_details(measured_timing)
+    wall_phases = _wall_phase_timings(evaluation_timing or {})
+    unattributed_time = round(
+        max(0.0, wall_time_seconds - sum(wall_phases.values())),
+        3,
+    )
     return {
-        "schema_version": "evaluation.capability_summary/v1",
+        "schema_version": "evaluation.capability_summary/v2",
         "model_turn_request_count": model_requests,
         "model_turn_result_count": model_results,
         "tool_call_envelope_count": tool_call_envelopes,
@@ -2176,6 +2375,10 @@ def _build_capability_summary(
         "verification_checks": verification_checks,
         "final_report_status": final_report_status,
         "agent_loop_result_status": agent_status,
+        "provider_time_by_turn": _provider_time_by_turn(events),
+        "sandbox_commands": _sandbox_command_timings(events),
+        "wall_phases": wall_phases,
+        "unattributed_time_seconds": unattributed_time,
         "timing": {
             "wall_time_seconds": wall_time_seconds,
             "provider_time_seconds": provider_seconds,
@@ -2183,7 +2386,9 @@ def _build_capability_summary(
             "context_retrieval_compaction_time_seconds": context_seconds,
             "pytest_time_seconds": pytest_seconds,
             "verification_time_seconds": verification_seconds,
+            **detailed_timing,
         },
+        "timing_diagnostics": timing_diagnostics,
     }
 
 
@@ -2891,6 +3096,8 @@ def _compaction_reason(events: list[dict[str, Any]], *, compaction_requested: in
 
 def _sandbox_backend(events: list[dict[str, Any]], trace_summary: dict[str, Any]) -> str:
     for event in events:
+        if not _event_type(event).startswith("sandbox."):
+            continue
         payload = _event_payload(event)
         backend = payload.get("backend") or payload.get("sandbox_backend")
         if backend:
@@ -2900,6 +3107,11 @@ def _sandbox_backend(events: list[dict[str, Any]], trace_summary: dict[str, Any]
         backends = planner.get("selected_backends") or planner.get("available_backends") or []
         if backends:
             return str(backends[0])
+    for event in events:
+        payload = _event_payload(event)
+        backend = payload.get("backend") or payload.get("sandbox_backend")
+        if backend:
+            return str(backend)
     return ""
 
 
@@ -2918,13 +3130,273 @@ def _local_process_fallback_count(events: list[dict[str, Any]], trace_summary: d
 
 
 def _sandbox_time_seconds(events: list[dict[str, Any]]) -> float:
-    total = 0.0
+    command_durations: dict[str, float] = {}
+    unidentified_command_durations: list[float] = []
+    command_sandbox_ids: set[str] = set()
+    orphan_sandbox_durations: dict[str, float] = {}
     for event in events:
+        event_type = _event_type(event)
         payload = _event_payload(event)
-        if not (_event_type(event).startswith("command.") or "sandbox" in _event_type(event)):
+        if event_type in {"command.completed", "command.failed", "command.timeout", "command.killed"}:
+            duration = _duration_seconds_from_payload(payload)
+            command_id = str(payload.get("command_id") or event.get("command_id") or "")
+            sandbox_id = str(event.get("sandbox_id") or payload.get("sandbox_id") or "")
+            if sandbox_id:
+                command_sandbox_ids.add(sandbox_id)
+            if command_id:
+                command_durations[command_id] = max(command_durations.get(command_id, 0.0), duration)
+            else:
+                unidentified_command_durations.append(duration)
             continue
-        total += _duration_seconds_from_payload(payload)
+        if event_type not in {"sandbox.completed", "sandbox.cleaned"}:
+            continue
+        command_id = str(event.get("command_id") or payload.get("command_id") or "")
+        sandbox_id = str(event.get("sandbox_id") or payload.get("sandbox_id") or "")
+        if command_id and command_id in command_durations:
+            continue
+        if sandbox_id and sandbox_id in command_sandbox_ids:
+            continue
+        key = sandbox_id or str(event.get("event_id") or len(orphan_sandbox_durations))
+        orphan_sandbox_durations[key] = max(
+            orphan_sandbox_durations.get(key, 0.0),
+            _duration_seconds_from_payload(payload),
+        )
+    total = (
+        sum(command_durations.values())
+        + sum(unidentified_command_durations)
+        + sum(orphan_sandbox_durations.values())
+    )
     return round(total, 3)
+
+
+def _provider_time_by_turn(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    starts: dict[str, dict[str, Any]] = {}
+    turns: list[dict[str, Any]] = []
+    for event in events:
+        event_type = _event_type(event)
+        payload = _event_payload(event)
+        request_id = str(payload.get("request_id") or "")
+        if not request_id:
+            continue
+        if event_type == "model.request.created":
+            starts[request_id] = {
+                "monotonic_ms": _safe_int(event.get("monotonic_ms")),
+                "purpose": str(payload.get("purpose") or ""),
+                "action_id": str(event.get("action_id") or ""),
+            }
+            continue
+        if event_type not in {"model.response.received", "model.request.failed"}:
+            continue
+        started = starts.get(request_id)
+        ended_ms = _safe_int(event.get("monotonic_ms"))
+        if started is None or not started["monotonic_ms"] or ended_ms < started["monotonic_ms"]:
+            continue
+        turns.append(
+            {
+                "turn": len(turns) + 1,
+                "request_id": request_id,
+                "purpose": started["purpose"],
+                "action_id": started["action_id"],
+                "status": "completed" if event_type == "model.response.received" else "failed",
+                "duration_seconds": round((ended_ms - started["monotonic_ms"]) / 1000.0, 3),
+            }
+        )
+    return turns
+
+
+def _sandbox_command_timings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    command_requested: dict[str, int] = {}
+    for event in events:
+        event_type = _event_type(event)
+        payload = _event_payload(event)
+        command_id = str(payload.get("command_id") or event.get("command_id") or "")
+        if not command_id:
+            continue
+        if event_type == "command.requested":
+            command_requested[command_id] = _safe_int(event.get("monotonic_ms"))
+            continue
+        row = rows.setdefault(
+            command_id,
+            {
+                "command_id": command_id,
+                "sandbox_id": str(event.get("sandbox_id") or ""),
+                "duration_seconds": 0.0,
+            },
+        )
+        if event_type == "sandbox.requested":
+            requested_ms = command_requested.get(command_id, 0)
+            sandbox_ms = _safe_int(event.get("monotonic_ms"))
+            if requested_ms and sandbox_ms >= requested_ms:
+                row["command_dispatch_time_seconds"] = round(
+                    (sandbox_ms - requested_ms) / 1000.0,
+                    3,
+                )
+        if event_type in {"command.completed", "command.failed", "command.timeout", "command.killed"}:
+            row["duration_seconds"] = max(
+                float(row["duration_seconds"]),
+                _duration_seconds_from_payload(payload),
+            )
+        phase_timing = payload.get("timing")
+        if not isinstance(phase_timing, dict):
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            phase_timing = metadata.get("sandbox_timing") if isinstance(metadata, dict) else {}
+        if isinstance(phase_timing, dict):
+            for name, value in phase_timing.items():
+                if isinstance(value, int | float):
+                    row[str(name)] = max(float(row.get(str(name), 0.0)), float(value))
+    return list(rows.values())
+
+
+def _trace_timing_details(events: list[dict[str, Any]]) -> dict[str, float]:
+    values: dict[str, float] = {}
+    mutation_durations: dict[str, float] = {}
+    sandbox_fields = {
+        "command_dispatch_time_seconds",
+        "sandbox_doctor_readiness_time_seconds",
+        "sandbox_account_selection_time_seconds",
+        "acl_grant_time_seconds",
+        "process_spawn_time_seconds",
+        "command_runtime_time_seconds",
+        "output_collection_time_seconds",
+        "run_root_cleanup_time_seconds",
+    }
+    for row in _sandbox_command_timings(events):
+        for name in sandbox_fields:
+            value = row.get(name)
+            if isinstance(value, int | float):
+                values[name] = values.get(name, 0.0) + float(value)
+    for event in events:
+        event_type = _event_type(event)
+        payload = _event_payload(event)
+        duration = _duration_seconds_from_payload(payload)
+        if event_type == "tool.dispatch.completed" and payload.get("tool_name") == "edit_apply":
+            values["edit_apply_total_time_seconds"] = values.get("edit_apply_total_time_seconds", 0.0) + duration
+        elif event_type == "mutation.applied":
+            transaction_id = str(event.get("transaction_id") or event.get("event_id") or len(mutation_durations))
+            mutation_durations[transaction_id] = max(mutation_durations.get(transaction_id, 0.0), duration)
+        elif event_type == "review.completed" and str(payload.get("review_stage") or "") in {"pre_edit", "post_patch"}:
+            values["edit_apply_review_time_seconds"] = values.get("edit_apply_review_time_seconds", 0.0) + duration
+            values["edit_apply_critic_time_seconds"] = values.get("edit_apply_critic_time_seconds", 0.0) + (
+                _safe_float(payload.get("critic_duration_ms")) / 1000.0
+            )
+        elif event_type == "context.bundle_built":
+            values["context_assembly_time_seconds"] = values.get("context_assembly_time_seconds", 0.0) + duration
+            values["compaction_decision_time_seconds"] = values.get("compaction_decision_time_seconds", 0.0) + (
+                _safe_float(payload.get("compaction_decision_duration_ms")) / 1000.0
+            )
+        elif event_type.startswith("retrieval.") and duration:
+            values["retrieval_time_seconds"] = values.get("retrieval_time_seconds", 0.0) + duration
+    if mutation_durations:
+        values["edit_apply_mutation_time_seconds"] = sum(mutation_durations.values())
+    return {name: round(value, 3) for name, value in values.items()}
+
+
+def _wall_phase_timings(values: dict[str, Any]) -> dict[str, float]:
+    names = (
+        "run_root_reset_time_seconds",
+        "workspace_materialization_time_seconds",
+        "dependency_setup_time_seconds",
+        "baseline_workspace_copy_time_seconds",
+        "baseline_verification_time_seconds",
+        "agent_loop_time_seconds",
+        "verification_workspace_copy_time_seconds",
+        "public_verification_time_seconds",
+        "verification_prepare_time_seconds",
+        "hidden_verification_time_seconds",
+        "resource_cleanup_time_seconds",
+    )
+    return {
+        name: round(float(values[name]), 3)
+        for name in names
+        if isinstance(values.get(name), int | float)
+    }
+
+
+_DETAILED_TIMING_FIELDS = (
+    "workspace_materialization_time_seconds",
+    "repo_clone_time_seconds",
+    "repo_fetch_time_seconds",
+    "repo_checkout_time_seconds",
+    "dependency_setup_time_seconds",
+    "sandbox_doctor_readiness_time_seconds",
+    "command_dispatch_time_seconds",
+    "sandbox_account_selection_time_seconds",
+    "acl_grant_time_seconds",
+    "process_spawn_time_seconds",
+    "command_runtime_time_seconds",
+    "output_collection_time_seconds",
+    "artifact_import_time_seconds",
+    "run_root_cleanup_time_seconds",
+    "verification_workspace_copy_time_seconds",
+    "public_verification_time_seconds",
+    "hidden_verification_time_seconds",
+    "edit_apply_total_time_seconds",
+    "edit_apply_mutation_time_seconds",
+    "edit_apply_review_time_seconds",
+    "edit_apply_critic_time_seconds",
+    "context_assembly_time_seconds",
+    "retrieval_time_seconds",
+    "compaction_decision_time_seconds",
+)
+
+
+def _capability_timing_details(
+    values: dict[str, float | None],
+) -> tuple[dict[str, float | None], dict[str, dict[str, str]]]:
+    timings: dict[str, float | None] = {}
+    diagnostics: dict[str, dict[str, str]] = {}
+    for name in _DETAILED_TIMING_FIELDS:
+        value = values.get(name)
+        timings[name] = round(float(value), 3) if value is not None else None
+        if value is not None:
+            diagnostics[name] = {
+                "status": "measured",
+                "source": _timing_source(name),
+                "reason": "",
+            }
+        elif name == "repo_fetch_time_seconds":
+            diagnostics[name] = {
+                "status": "not_applicable",
+                "source": "evaluation_runner",
+                "reason": "remote materialization used clone without a standalone fetch",
+            }
+        elif name == "artifact_import_time_seconds":
+            diagnostics[name] = {
+                "status": "not_applicable",
+                "source": "sandbox_result",
+                "reason": "sandbox artifacts are collected but workspace changes are not imported",
+            }
+        else:
+            diagnostics[name] = {
+                "status": "unavailable",
+                "source": "trace",
+                "reason": "no reliable timing span was recorded",
+            }
+    return timings, diagnostics
+
+
+def _timing_source(name: str) -> str:
+    if name in {
+        "sandbox_doctor_readiness_time_seconds",
+        "command_dispatch_time_seconds",
+        "sandbox_account_selection_time_seconds",
+        "acl_grant_time_seconds",
+        "process_spawn_time_seconds",
+        "command_runtime_time_seconds",
+        "output_collection_time_seconds",
+        "run_root_cleanup_time_seconds",
+    }:
+        return "sandbox_trace"
+    if name.startswith("edit_apply_"):
+        return "review_trace" if name.endswith(("review_time_seconds", "critic_time_seconds")) else "tool_trace"
+    if name in {
+        "context_assembly_time_seconds",
+        "retrieval_time_seconds",
+        "compaction_decision_time_seconds",
+    }:
+        return "context_trace"
+    return "evaluation_runner"
 
 
 def _provider_time_seconds(events: list[dict[str, Any]], trace_summary: dict[str, Any]) -> float:

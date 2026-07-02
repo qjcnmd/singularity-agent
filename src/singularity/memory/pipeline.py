@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +140,7 @@ class MemoryLearningPipeline:
         modules: list[str] | None = None,
         limit: int = 8,
     ) -> list[MemorySearchResult]:
+        started = time.perf_counter()
         query = MemoryQuery(
             goal=goal,
             paths=paths or [],
@@ -152,7 +154,15 @@ class MemoryLearningPipeline:
             *self._matching_rule_entries(paths or []),
             *self.store.load_entries(rebuild_index=self._rebuild_index_on_read),
         ]
-        return MemoryRetriever(entries).search(query)
+        results = MemoryRetriever(entries).search(query)
+        self._record(
+            "retrieval.query.completed",
+            {
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "result_count": len(results),
+            },
+        )
+        return results
 
     def context_block(
         self,

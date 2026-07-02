@@ -509,10 +509,15 @@ class WindowsSandboxBackend:
         )
 
     def prepare(self, request: SandboxRequest) -> PreparedSandbox:
+        timing: dict[str, float] = {}
+        phase_started = time.perf_counter()
         report = self.doctor()
+        timing["sandbox_doctor_readiness_time_seconds"] = time.perf_counter() - phase_started
         if not report.available:
             raise SandboxCapabilityError(report.reason)
+        phase_started = time.perf_counter()
         identity = _sandbox_identity_for_mode(request.profile.network.mode)
+        timing["sandbox_account_selection_time_seconds"] = time.perf_counter() - phase_started
         if _external_writable_paths(request):
             raise SandboxCapabilityError(
                 "backend_unavailable: Windows sandbox additional writable directories "
@@ -527,14 +532,18 @@ class WindowsSandboxBackend:
         original_sandbox_root = filesystem_policy.sandbox_root
         filesystem_policy.sandbox_root = self._run_root_provider(request)
         try:
+            phase_started = time.perf_counter()
             fs = self.filesystem.prepare_filesystem(
                 sandbox_id=request.sandbox_id,
                 policy=filesystem_policy,
                 cwd=request.cwd,
             )
+            timing["workspace_materialization_time_seconds"] = time.perf_counter() - phase_started
         finally:
             filesystem_policy.sandbox_root = original_sandbox_root
+        phase_started = time.perf_counter()
         self._acl_applier(fs.sandbox_root, identity.account_name)
+        timing["acl_grant_time_seconds"] = time.perf_counter() - phase_started
         env = SandboxEnvironmentBuilder().build_env(request.profile.env, os.environ)
         env = self._runtime_env(env)
         trace_id = random_trace_id()
@@ -571,12 +580,20 @@ class WindowsSandboxBackend:
                 "sandbox_account": identity.account_name,
                 "credential_target": identity.credential_target,
                 "sandbox_role": identity.role,
+                "timing": timing,
             },
         )
 
     def run(self, prepared: PreparedSandbox) -> SandboxResult:
         started = time.perf_counter()
+        timing = dict(prepared.baseline.get("timing") or {})
+        phase_started = time.perf_counter()
         enforcement = self._runtime_enforcement_report()
+        timing["sandbox_doctor_readiness_time_seconds"] = (
+            timing.get("sandbox_doctor_readiness_time_seconds", 0.0)
+            + time.perf_counter()
+            - phase_started
+        )
         if not enforcement.available and not _can_ignore_unrelated_network_probe_blocker(
             prepared,
             enforcement,
@@ -601,13 +618,22 @@ class WindowsSandboxBackend:
                     "blocking_requirements": list(enforcement.blocking_requirements),
                 },
             )
+        phase_started = time.perf_counter()
         runner_result = self.runner.run(prepared)
+        timing["command_runtime_time_seconds"] = time.perf_counter() - phase_started
+        timing.update(dict(runner_result.metadata.get("timing") or {}))
+        phase_started = time.perf_counter()
         stdout = TraceRedactor().redact_text(runner_result.stdout)
         stderr = TraceRedactor().redact_text(runner_result.stderr)
         stdout, stderr, backend_output_truncated = _limit_output(
             stdout,
             stderr,
             prepared.request.profile.resources.max_output_chars,
+        )
+        timing["output_collection_time_seconds"] = (
+            timing.get("output_collection_time_seconds", 0.0)
+            + time.perf_counter()
+            - phase_started
         )
         runner_metadata = dict(runner_result.metadata)
         restricted_token = bool(runner_metadata.get("restricted_token"))
@@ -685,10 +711,13 @@ class WindowsSandboxBackend:
                     },
                 )
             )
+        phase_started = time.perf_counter()
         changes = self.filesystem.detect_changes(
             prepared.workspace_copy_root,
             dict(prepared.baseline.get("files") or {}),
         )
+        timing["change_detection_time_seconds"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         artifacts = self.artifact_collector.collect(
             sandbox_id=prepared.sandbox_id,
             workspace_root=prepared.workspace_copy_root,
@@ -698,6 +727,8 @@ class WindowsSandboxBackend:
             stdout=stdout,
             stderr=stderr,
         )
+        timing["artifact_collection_time_seconds"] = time.perf_counter() - phase_started
+        metadata["timing"] = timing
         metadata["artifact_refs"] = [artifact.artifact_id for artifact in artifacts]
         return SandboxResult(
             sandbox_id=prepared.sandbox_id,

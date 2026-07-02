@@ -99,6 +99,8 @@ def test_capability_gate_defaults_to_public_task_only() -> None:
     assert not Path("docs/evaluation", "capability-" + "minimal-tasks.json").exists()
     assert not Path("docs/evaluation", "capability-fix-" + "math-test-only.json").exists()
     assert not Path("docs/evaluation", "evaluation-baseline-" + "example.json").exists()
+    manifest = json.loads(Path("docs/evaluation/public-representative-task.json").read_text(encoding="utf-8"))
+    assert [task["task_id"] for task in manifest["tasks"]] == ["sqlfluff__sqlfluff-2419"]
 
 
 def test_gate_scripts_expose_structured_timing_contract() -> None:
@@ -138,10 +140,19 @@ def test_capability_timing_reads_task_result_timing(tmp_path: Path) -> None:
                             "sandbox_time_seconds": 0.5,
                             "verification_time_seconds": 2.0,
                             "context_retrieval_compaction_time_seconds": 0.75,
+                            "workspace_materialization_time_seconds": 4.0,
+                            "repo_fetch_time_seconds": None,
                         },
                         "capability_summary": {
                             "context_package_rebuild_count": 3,
                             "context_compaction": {"requested": 1},
+                            "timing_diagnostics": {
+                                "repo_fetch_time_seconds": {
+                                    "status": "not_applicable",
+                                    "source": "evaluation_runner",
+                                    "reason": "clone path",
+                                }
+                            },
                         },
                     }
                 ]
@@ -155,6 +166,15 @@ def test_capability_timing_reads_task_result_timing(tmp_path: Path) -> None:
         "sandbox_time_seconds": 0.5,
         "verification_time_seconds": 2.0,
         "context_retrieval_compaction_time_seconds": 0.75,
+        "workspace_materialization_time_seconds": 4.0,
+        "repo_fetch_time_seconds": None,
+        "timing_diagnostics": {
+            "repo_fetch_time_seconds": {
+                "status": "not_applicable",
+                "source": "evaluation_runner",
+                "reason": "clone path",
+            }
+        },
     }
 
 

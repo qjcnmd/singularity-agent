@@ -474,7 +474,48 @@ def test_benchmark_contract_smoke_does_not_expand_to_project_tests(tmp_path: Pat
         if check.command is not None
     ]
     assert ["python", "-m", "py_compile", "src/sqlfluff/rules/L060.py"] in commands
+    assert len(commands) == 1
     assert not any("pytest" in command for command in commands for command in command)
+
+
+def test_benchmark_contract_smoke_ignores_model_supplied_additional_commands(tmp_path: Path) -> None:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    planner.apply_benchmark_constraints(
+        {
+            "task_id": "bench.public",
+            "verification_command": "python -m py_compile src/sqlfluff/rules/L060.py",
+        }
+    )
+    planner.start_task("Fix src/sqlfluff/rules/L060.py and run benchmark verification.")
+    component = VerificationRunner(tmp_path, command_executor=FakeCommandExecutor([]), planner=planner)
+
+    plan = component.plan_verification(
+        changed_files=["src/sqlfluff/rules/L060.py"],
+        task_intent="benchmark verification",
+        smoke_commands=[
+            ["python", "-m", "py_compile", "src/sqlfluff/rules/L060.py"],
+            ["python", "-m", "pytest", "-k", "L060"],
+        ],
+    )
+
+    commands = [check.command.argv for check in plan.required_checks if check.command is not None]
+    assert commands == [["python", "-m", "py_compile", "src/sqlfluff/rules/L060.py"]]
+
+
+def test_non_equivalent_explicit_smoke_keeps_automatic_python_syntax_check(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    component = VerificationRunner(tmp_path, command_executor=FakeCommandExecutor([]))
+
+    plan = component.plan_verification(
+        changed_files=["src/app.py"],
+        task_intent="verify changed python",
+        smoke_commands=[["python", "-m", "py_compile", "src/other.py"]],
+    )
+
+    commands = [check.command.argv for check in plan.required_checks if check.command is not None]
+    assert ["python", "-m", "py_compile", "src/other.py"] in commands
+    assert [sys.executable, "-m", "py_compile", "src/app.py"] in commands
 
 
 def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path) -> None:

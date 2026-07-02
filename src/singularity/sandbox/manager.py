@@ -99,6 +99,7 @@ class SandboxManager:
                     "sandbox_id": prepared.sandbox_id,
                     "backend": prepared.backend_name,
                     "sandbox_handle": _relative_handle(prepared.sandbox_root, self.workspace_root),
+                    "timing": dict(prepared.baseline.get("timing") or {}),
                 },
             )
             self._emit_trace(
@@ -110,7 +111,11 @@ class SandboxManager:
             result = backend.run(prepared)
             self._throw_if_cancelled()
             try:
+                cleanup_started = time.perf_counter()
                 backend.cleanup(prepared)
+                result.metadata.setdefault("timing", {})["run_root_cleanup_time_seconds"] = (
+                    time.perf_counter() - cleanup_started
+                )
                 result.cleanup_status = "cleaned"
                 self._emit_trace(
                     TraceEventType.SANDBOX_CLEANED,
@@ -393,6 +398,7 @@ class SandboxManager:
                 "artifact_count": len(result.artifacts) if result else 0,
                 "changed_files": result.filesystem_changes.to_dict() if result else {},
                 "violations": [item.to_dict() for item in result.violations] if result else [],
+                "timing": dict(result.metadata.get("timing") or {}) if result else {},
             },
             ids={
                 "session_id": request.session_id if request else None,

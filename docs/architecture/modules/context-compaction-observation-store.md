@@ -150,7 +150,7 @@ compaction commit 成功后生成 `ContextSnapshot`；`ContextManager.add_tool_r
 
 ## 是否进入 trace / audit
 
-ContextManager 记录 observation/snapshot/compaction 的 id、digest、token 与范围摘要；raw tool result 留在 artifact/store，不进入 trace payload。恢复警告写 recovery event/diagnostics；本层不写 policy audit。
+ContextManager 记录 observation/snapshot/compaction 的 id、digest、token 与范围摘要；`ObservationStore.save_bundle()` 的 `context.bundle_built` 事件还记录 `duration_ms` 和 `compaction_decision_duration_ms` 数值，不记录 bundle 正文。raw tool result 留在 artifact/store，不进入 trace payload。恢复警告写 recovery event/diagnostics；本层不写 policy audit。
 
 ## 失败路径
 

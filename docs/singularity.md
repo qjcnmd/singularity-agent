@@ -1777,6 +1777,17 @@
       tests_passed / agent_completed / status 语义。
       cost 优先读 provider usage 的 cost_estimate；否则只按
       token usage 与精确模型价格表计算，unknown 不影响 gate。
+    → 同时写 capability_summary.schema_version =
+      evaluation.capability_summary/v2：
+      provider_time_by_turn、sandbox_commands、wall_phases、
+      unattributed_time_seconds 与细分 timing/timing_diagnostics；
+      没有可靠 span 的指标为 null + unavailable/not_applicable，
+      不伪造 0。sandbox command terminal event 按 command_id 去重，
+      不把同一 lifecycle 的 sandbox terminal duration 重复累计。
+    → 公共 task 额外 fail-closed 检查：sandbox-required 路径的
+      local_process_fallback_count 必须为 0；模型可见 task projection
+      和 AgentLoop trace 必须通过 evaluator-only metadata visibility audit。
+      两项任一不可审计或失败时 evaluation_passed=false。
     → final report / failure repair summary 中的 latest_failure_category:
         environment_error 或 sandbox_limitation → environment_blocker
 

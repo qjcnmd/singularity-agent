@@ -623,6 +623,14 @@ class ObservationStore:
                     "excluded": len(bundle.excluded_item_ids),
                     "budget": bundle.budget.__dict__,
                     "bundle_digest": bundle.bundle_digest,
+                    "duration_ms": int(
+                        ((bundle.metadata.get("timing") or {}).get("context_assembly_duration_ms"))
+                        or 0
+                    ),
+                    "compaction_decision_duration_ms": int(
+                        ((bundle.metadata.get("timing") or {}).get("compaction_decision_duration_ms"))
+                        or 0
+                    ),
                 },
             )
             self._connection.commit()

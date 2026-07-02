@@ -161,7 +161,7 @@ MemoryStore/maintenance 消费 candidate/entry 及嵌套 provenance/TTL；retrie
 
 ## 是否进入 trace / audit
 
-MemoryLearningPipeline 只记录 ingest、accept/reject/quarantine、maintenance 与 retrieval 计数/ids，不把完整 memory body 写 trace。memory policy decision 属 memory 内部状态，不写 capability policy audit。
+MemoryLearningPipeline 只记录 ingest、accept/reject/quarantine、maintenance 与 retrieval 计数/ids；`retrieve()` 额外写 `retrieval.query.completed {duration_ms, result_count}`，不写 query、完整 memory body 或匹配正文。memory policy decision 属 memory 内部状态，不写 capability policy audit。
 
 ## 失败路径
 
