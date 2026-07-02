@@ -91,7 +91,15 @@ class FakeTrace:
         severity: str = "info",
     ) -> None:
         self.events.append(
-            (event, {"summary": summary, "payload": payload or {}, "severity": severity})
+            (
+                event,
+                {
+                    "summary": summary,
+                    "payload": payload or {},
+                    "ids": ids or {},
+                    "severity": severity,
+                },
+            )
         )
 
     def record(self, event: str, payload: dict[str, Any] | None = None) -> None:
@@ -314,6 +322,11 @@ def test_final_reviewer_skips_model_when_rules_already_satisfy_all_criteria() ->
     assert runner.requests == []
     assert trace.has_event("final_reviewer.assess.done")
     assert trace.has_event("final_reviewer.assess.model_skipped")
+    skipped_events = [payload for event, payload in trace.events if event == "final_reviewer.assess.model_skipped"]
+    assert skipped_events[-1]["payload"] == {
+        "reason": "deterministic_gate_decisive",
+        "criteria_count": 2,
+    }
 
 
 def test_final_reviewer_model_cannot_override_evidence_gate() -> None:
@@ -432,6 +445,9 @@ def test_final_reviewer_business_rule_failure_falls_back_to_rules() -> None:
     fallback_events = [payload for event, payload in trace.events if event == "final_reviewer.assess.fallback"]
     assert fallback_events
     assert fallback_events[-1]["payload"]["fallback_reason"] == "business_rule_validation_failed"
+    assert fallback_events[-1]["payload"]["retry_reason"] == "business_rule_validation_failed"
+    assert fallback_events[-1]["ids"]["action_id"] == runner.requests[0].action_id
+    assert len(runner.requests) == 1
 
 
 def test_completion_assessment_round_trip() -> None:

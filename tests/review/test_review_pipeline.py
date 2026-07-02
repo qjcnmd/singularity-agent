@@ -149,6 +149,56 @@ def test_review_pipeline_model_critic_request_inherits_run_identifiers(tmp_path:
     assert request.action_id == "verify_1"
 
 
+def test_final_review_completed_trace_uses_safe_action_id(tmp_path: Path) -> None:
+    trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "traces")
+    component = ReviewPipeline(tmp_path, trace=trace, enable_model_critic=False)
+
+    report = component.final_review(
+        task_state={"task_id": "task_final"},
+        task_plan={"plan_id": "plan_final"},
+    )
+
+    assert report.target.stage.value == "final"
+    events = [json.loads(line) for line in trace.path.read_text(encoding="utf-8").splitlines()]
+    completed = [
+        event
+        for event in events
+        if event["event_type"] == "review.completed" and event["payload"]["review_stage"] == "final"
+    ]
+    assert completed[-1]["action_id"] == "plan_final"
+
+
+def test_final_review_model_critic_request_uses_safe_action_id(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id="resp_final_critic",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "traces")
+    component = ReviewPipeline(
+        tmp_path,
+        trace=trace,
+        model_runner=FakeModelRunner(),
+        enable_model_critic=True,
+    )
+
+    report = component.final_review(
+        task_state={"task_id": "task_final"},
+        task_plan={"plan_id": "plan_final"},
+    )
+
+    assert report.model_critic_status == "ok"
+    assert requests
+    assert requests[0].action_id == "plan_final"
+
+
 def test_review_pipeline_model_critic_bad_json_is_non_blocking(tmp_path: Path) -> None:
     class BadJsonModelRunner:
         def run_turn(self, request):

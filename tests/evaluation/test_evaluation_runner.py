@@ -825,6 +825,7 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
                 "output_mode": "structured_output",
                 "schema_validation_passed": True,
                 "retry_count": 0,
+                "retry_reason": "none",
                 "fallback_reason": "",
             },
         },
@@ -893,6 +894,7 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
                     "output_mode": "structured_output",
                     "schema_validation_passed": True,
                     "retry_count": 0,
+                    "retry_reason": "none",
                     "fallback_reason": "",
                     "critic_reused": False,
                     "critic_skipped_reason": "",
@@ -916,6 +918,122 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
             ],
         }
     ]
+
+
+def test_capability_summary_groups_review_provider_latency_by_stage(tmp_path: Path) -> None:
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    events = [
+        {
+            "event_type": "model.request.created",
+            "monotonic_ms": 100,
+            "phase_id": "pre_edit",
+            "action_id": "patch_1",
+            "payload": {
+                "request_id": "critic_1",
+                "purpose": "classify_error",
+                "message_count": 1,
+                "tool_count": 1,
+            },
+        },
+        {
+            "event_type": "model.response.received",
+            "monotonic_ms": 7100,
+            "phase_id": "pre_edit",
+            "action_id": "patch_1",
+            "payload": {
+                "request_id": "critic_1",
+                "tool_call_count": 1,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        },
+        {
+            "event_type": "review.completed",
+            "monotonic_ms": 7200,
+            "phase_id": "pre_edit",
+            "action_id": "patch_1",
+            "payload": {
+                "review_stage": "pre_edit",
+                "decision": "accept",
+                "duration_ms": 7200,
+                "critic_duration_ms": 7000,
+                "model_critic_status": "ok",
+                "output_mode": "forced_tool_call",
+                "schema_validation_passed": True,
+                "retry_count": 1,
+                "retry_reason": "tool_call_parse_error",
+                "fallback_reason": "",
+            },
+        },
+        {
+            "event_type": "final_reviewer.assess.fallback",
+            "monotonic_ms": 7300,
+            "phase_id": "final",
+            "action_id": "final_1",
+            "payload": {
+                "output_mode": "rule_only",
+                "schema_validation_passed": False,
+                "retry_count": 0,
+                "retry_reason": "business_rule_validation_failed",
+                "fallback_reason": "business_rule_validation_failed",
+            },
+        },
+        {
+            "event_type": "model.request.created",
+            "monotonic_ms": 7400,
+            "phase_id": "final",
+            "action_id": "final_1",
+            "payload": {
+                "request_id": "final_review_1",
+                "purpose": "final_review",
+                "message_count": 1,
+                "tool_count": 1,
+            },
+        },
+        {
+            "event_type": "model.response.received",
+            "monotonic_ms": 9400,
+            "phase_id": "final",
+            "action_id": "final_1",
+            "payload": {
+                "request_id": "final_review_1",
+                "tool_call_count": 1,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        },
+    ]
+    (trace_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    verification = CommandEvalResult(command="pytest", exit_code=0, duration_seconds=0.1)
+
+    summary = _build_capability_summary(
+        trace=trace_dir,
+        trace_summary={},
+        checks={"public": {"status": "passed"}},
+        verification=verification,
+        public_verification=verification,
+        hidden_verification=verification,
+        final_report_status="completed",
+        agent_status="completed",
+        wall_time_seconds=8.0,
+    )
+
+    assert summary["provider_latency_by_review_stage"] == {
+        "final": {
+            "call_count": 1,
+            "failed_call_count": 0,
+            "total_seconds": 2.0,
+            "max_seconds": 2.0,
+        },
+        "pre_edit": {
+            "call_count": 1,
+            "failed_call_count": 0,
+            "total_seconds": 7.0,
+            "max_seconds": 7.0,
+        }
+    }
 
 
 def test_capability_summary_v2_marks_unavailable_timing_without_zero() -> None:

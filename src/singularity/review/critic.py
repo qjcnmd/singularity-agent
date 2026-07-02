@@ -208,11 +208,13 @@ def _metadata(
     fallback_reason: str,
     schema_validation_passed: bool = False,
     retry_count: int = 0,
+    retry_reason: str = "none",
 ) -> dict[str, Any]:
     return {
         "output_mode": output_mode,
         "schema_validation_passed": schema_validation_passed,
         "retry_count": retry_count,
+        "retry_reason": retry_reason,
         "fallback_reason": fallback_reason,
     }
 

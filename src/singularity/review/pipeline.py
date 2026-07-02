@@ -471,7 +471,7 @@ class ReviewPipeline:
             "session_id": _planner_attr(self.planner, "session_id"),
             "task_id": target.task_id or _planner_attr(self.planner, "task_id"),
             "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
-            "action_id": target.edit_result_id or target.patch_id or target.verification_id,
+            "action_id": _review_action_id(target),
             "transaction_id": target.transaction_id,
             "verification_id": target.verification_id,
             "policy_decision_id": target.policy_decision_id,
@@ -670,8 +670,18 @@ class ReviewPipeline:
             "session_id": _planner_attr(self.planner, "session_id"),
             "task_id": target.task_id or _planner_attr(self.planner, "task_id"),
             "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None) or target.stage.value,
-            "action_id": target.edit_result_id or target.patch_id or target.verification_id,
+            "action_id": _review_action_id(target),
         }
+
+
+def _review_action_id(target: ReviewTarget) -> str | None:
+    return (
+        target.edit_result_id
+        or target.patch_id
+        or target.verification_id
+        or (target.plan_id if target.stage == ReviewStage.FINAL else None)
+        or (target.task_id if target.stage == ReviewStage.FINAL else None)
+    )
 
 
 def _severity(finding: ReviewFinding) -> TraceSeverity:
@@ -807,6 +817,7 @@ def _review_output_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         "output_mode": str(payload.get("output_mode") or ""),
         "schema_validation_passed": bool(payload.get("schema_validation_passed")),
         "retry_count": int(payload.get("retry_count") or 0),
+        "retry_reason": str(payload.get("retry_reason") or "none"),
         "fallback_reason": str(payload.get("fallback_reason") or ""),
     }
 

@@ -339,6 +339,7 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                                             "output_mode": "structured_output",
                                             "schema_validation_passed": True,
                                             "retry_count": 0,
+                                            "retry_reason": "none",
                                             "fallback_reason": "",
                                             "critic_source_status": "ok",
                                             "critic_reuse_skip_reason": "stage_not_reusable",
@@ -346,6 +347,14 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                                     ],
                                 }
                             ],
+                            "provider_latency_by_review_stage": {
+                                "pre_edit": {
+                                    "call_count": 1,
+                                    "failed_call_count": 0,
+                                    "total_seconds": 0.6,
+                                    "max_seconds": 0.6,
+                                }
+                            },
                             "timing": {
                                 "edit_apply_review_time_seconds": 0.8,
                                 "edit_apply_critic_time_seconds": 0.6,
@@ -391,6 +400,7 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                 "output_mode": "structured_output",
                 "schema_validation_passed": True,
                 "retry_count": 0,
+                "retry_reason": "none",
                 "fallback_reason": "",
                 "critic_reused": False,
                 "critic_skipped_reason": "",
@@ -398,6 +408,14 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                 "critic_source_status": "ok",
             }
         ],
+        "provider_latency_by_review_stage": {
+            "pre_edit": {
+                "call_count": 1,
+                "failed_call_count": 0,
+                "total_seconds": 0.6,
+                "max_seconds": 0.6,
+            }
+        },
     }
 
 

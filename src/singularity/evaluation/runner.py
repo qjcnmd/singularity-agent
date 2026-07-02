@@ -2769,6 +2769,7 @@ def _build_capability_summary(
         "final_report_status": final_report_status,
         "agent_loop_result_status": agent_status,
         "provider_time_by_turn": _provider_time_by_turn(events),
+        "provider_latency_by_review_stage": _provider_latency_by_review_stage(events),
         "turn_diagnostics": _turn_diagnostics(events),
         "sandbox_commands": _sandbox_command_timings(events),
         "sandbox_breakdown": _sandbox_breakdown(events),
@@ -3912,6 +3913,7 @@ def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "output_mode": str(payload.get("output_mode") or ""),
                     "schema_validation_passed": bool(payload.get("schema_validation_passed")),
                     "retry_count": _safe_int(payload.get("retry_count")),
+                    "retry_reason": str(payload.get("retry_reason") or "none"),
                     "fallback_reason": str(payload.get("fallback_reason") or ""),
                     "critic_reused": critic_reused,
                     "critic_skipped_reason": str(payload.get("critic_skipped_reason") or ""),
@@ -3953,6 +3955,82 @@ def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
 
     return rows
+
+
+def _provider_latency_by_review_stage(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    starts: dict[str, dict[str, Any]] = {}
+    durations_by_action: dict[str, list[dict[str, Any]]] = {}
+    review_stage_by_action: dict[str, str] = {}
+    for event in events:
+        event_type = _event_type(event)
+        payload = _event_payload(event)
+        action_id = str(event.get("action_id") or "")
+        request_id = str(payload.get("request_id") or "")
+        monotonic_ms = _safe_int(event.get("monotonic_ms"))
+        if event_type == "review.completed" and action_id:
+            review_stage_by_action[action_id] = str(payload.get("review_stage") or "")
+            continue
+        if event_type.startswith("final_reviewer.assess.") and action_id:
+            review_stage_by_action[action_id] = "final"
+            continue
+        if event_type == "model.request.created" and request_id:
+            purpose = str(payload.get("purpose") or "")
+            if purpose not in {"classify_error", "final_review"}:
+                continue
+            starts[request_id] = {
+                "monotonic_ms": monotonic_ms,
+                "action_id": action_id,
+                "purpose": purpose,
+            }
+            continue
+        if event_type not in {"model.response.received", "model.request.failed"} or not request_id:
+            continue
+        started = starts.get(request_id)
+        if started is None:
+            continue
+        started_ms = _safe_int(started.get("monotonic_ms"))
+        if not started_ms or monotonic_ms < started_ms:
+            continue
+        duration = round((monotonic_ms - started_ms) / 1000.0, 3)
+        started_action_id = str(started.get("action_id") or action_id)
+        if not started_action_id:
+            continue
+        durations_by_action.setdefault(started_action_id, []).append(
+            {
+                "duration_seconds": duration,
+                "failed": event_type == "model.request.failed",
+            }
+        )
+    by_stage: dict[str, dict[str, float | int]] = {}
+    for action_id, calls in durations_by_action.items():
+        stage = review_stage_by_action.get(action_id) or "unknown"
+        if stage == "unknown":
+            continue
+        entry = by_stage.setdefault(
+            stage,
+            {
+                "call_count": 0,
+                "failed_call_count": 0,
+                "total_seconds": 0.0,
+                "max_seconds": 0.0,
+            },
+        )
+        for call in calls:
+            duration = float(call.get("duration_seconds") or 0.0)
+            entry["call_count"] = int(entry["call_count"]) + 1
+            if call.get("failed"):
+                entry["failed_call_count"] = int(entry["failed_call_count"]) + 1
+            entry["total_seconds"] = round(float(entry["total_seconds"]) + duration, 3)
+            entry["max_seconds"] = max(float(entry["max_seconds"]), duration)
+    return {
+        stage: {
+            "call_count": int(values["call_count"]),
+            "failed_call_count": int(values["failed_call_count"]),
+            "total_seconds": round(float(values["total_seconds"]), 3),
+            "max_seconds": round(float(values["max_seconds"]), 3),
+        }
+        for stage, values in sorted(by_stage.items())
+    }
 
 
 def _sandbox_command_timings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

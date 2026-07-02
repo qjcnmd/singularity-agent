@@ -370,6 +370,7 @@ def capability_review_from_result(result_path: Path) -> dict[str, Any]:
     review_events: list[dict[str, Any]] = []
     review_time = 0.0
     critic_time = 0.0
+    provider_latency_by_stage: dict[str, dict[str, Any]] = {}
     for task in payload.get("tasks") or []:
         if not isinstance(task, dict):
             continue
@@ -377,6 +378,10 @@ def capability_review_from_result(result_path: Path) -> dict[str, Any]:
         capability = task.get("capability_summary") or {}
         if not isinstance(capability, dict):
             continue
+        _merge_review_stage_latency(
+            provider_latency_by_stage,
+            _safe_review_stage_latency(capability.get("provider_latency_by_review_stage")),
+        )
         timing = capability.get("timing") or {}
         if isinstance(timing, dict):
             review_time += float(timing.get("edit_apply_review_time_seconds") or 0.0)
@@ -398,6 +403,7 @@ def capability_review_from_result(result_path: Path) -> dict[str, Any]:
                         "output_mode": str(event.get("output_mode") or ""),
                         "schema_validation_passed": bool(event.get("schema_validation_passed")),
                         "retry_count": int(event.get("retry_count") or 0),
+                        "retry_reason": str(event.get("retry_reason") or "none"),
                         "fallback_reason": str(event.get("fallback_reason") or ""),
                         "critic_reused": bool(event.get("critic_reused")),
                         "critic_skipped_reason": str(event.get("critic_skipped_reason") or ""),
@@ -412,4 +418,49 @@ def capability_review_from_result(result_path: Path) -> dict[str, Any]:
         "critic_reused_count": sum(1 for event in review_events if event.get("critic_reused")),
         "critic_skipped_count": sum(1 for event in review_events if event.get("critic_skipped_reason")),
         "review_events": review_events,
+        "provider_latency_by_review_stage": _safe_review_stage_latency(provider_latency_by_stage),
     }
+
+
+def _safe_review_stage_latency(payload: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for stage, item in payload.items():
+        if not isinstance(item, dict):
+            continue
+        result[str(stage)] = {
+            "call_count": int(item.get("call_count") or 0),
+            "failed_call_count": int(item.get("failed_call_count") or 0),
+            "total_seconds": round(float(item.get("total_seconds") or 0.0), 3),
+            "max_seconds": round(float(item.get("max_seconds") or 0.0), 3),
+        }
+    return dict(sorted(result.items()))
+
+
+def _merge_review_stage_latency(
+    target: dict[str, dict[str, Any]],
+    source: dict[str, dict[str, Any]],
+) -> None:
+    for stage, item in source.items():
+        current = target.setdefault(
+            stage,
+            {
+                "call_count": 0,
+                "failed_call_count": 0,
+                "total_seconds": 0.0,
+                "max_seconds": 0.0,
+            },
+        )
+        current["call_count"] = int(current.get("call_count") or 0) + int(item.get("call_count") or 0)
+        current["failed_call_count"] = int(current.get("failed_call_count") or 0) + int(
+            item.get("failed_call_count") or 0
+        )
+        current["total_seconds"] = round(
+            float(current.get("total_seconds") or 0.0) + float(item.get("total_seconds") or 0.0),
+            3,
+        )
+        current["max_seconds"] = max(
+            float(current.get("max_seconds") or 0.0),
+            float(item.get("max_seconds") or 0.0),
+        )

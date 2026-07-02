@@ -162,6 +162,7 @@ def _emit(
     *,
     summary: str,
     payload: dict[str, Any] | None = None,
+    ids: dict[str, Any] | None = None,
     severity: str = "info",
 ) -> None:
     """Emit a trace event, tolerating recorders without ``emit``."""
@@ -173,11 +174,11 @@ def _emit(
             component="final_reviewer",
             summary=summary,
             payload=payload or {},
-            ids={},
+            ids=ids or {},
             severity=severity,
         )
     elif hasattr(trace, "record"):
-        trace.record(event, {**(payload or {}), "summary": summary})
+        trace.record(event, {**(payload or {}), "summary": summary, **(ids or {})})
 
 
 class FinalReviewer:
@@ -361,14 +362,17 @@ class FinalReviewer:
         context_payload: dict[str, Any],
     ) -> list[CriterionAssessment]:
         """Ask the model to confirm criteria; model can only confirm (not override)."""
-        result = self._call_model(criteria, evidence, context_payload)
+        request_ids = _final_review_request_ids(context_payload)
+        result = self._call_model(criteria, evidence, request_ids)
         output_metadata = _safe_output_metadata(result.metadata)
+        trace_ids = dict(request_ids)
         if result.status != "ok":
             _emit(
                 self.trace,
                 "final_reviewer.assess.fallback",
                 summary="final_reviewer model-assisted review used the rule-only fallback path",
                 payload=output_metadata,
+                ids=trace_ids,
                 severity="warning",
             )
             return criteria
@@ -409,6 +413,7 @@ class FinalReviewer:
                     "final_reviewer.assess.model_ok",
                     summary=f"criterion {original.criterion_id} confirmed by model",
                     payload=output_metadata,
+                    ids=trace_ids,
                 )
             else:
                 updated.append(original)
@@ -417,6 +422,7 @@ class FinalReviewer:
             "final_reviewer.assess.model_ok",
             summary="final_reviewer model confirm completed",
             payload=output_metadata,
+            ids=trace_ids,
         )
         return updated
 
@@ -424,7 +430,7 @@ class FinalReviewer:
         self,
         criteria: list[CriterionAssessment],
         evidence: EvidenceLedger,
-        context_payload: dict[str, Any],
+        request_ids: dict[str, str],
     ) -> ReviewOutputResult:
         criteria_json = json.dumps(
             [c.to_dict() for c in criteria], ensure_ascii=False, sort_keys=True, default=str
@@ -458,6 +464,7 @@ class FinalReviewer:
                     "output_mode": "rule_only",
                     "schema_validation_passed": False,
                     "retry_count": 0,
+                    "retry_reason": "none",
                     "fallback_reason": "model_runner_missing",
                 },
             )
@@ -465,11 +472,11 @@ class FinalReviewer:
             model_runner=runner,
             request_base={
                 "request_id": f"req_{uuid4().hex[:12]}",
-                "run_id": str(context_payload.get("run_id") or "final_reviewer"),
-                "session_id": str(context_payload.get("session_id") or "final_reviewer"),
-                "task_id": str(context_payload.get("task_id") or "final_reviewer"),
-                "phase_id": str(context_payload.get("phase_id") or "final_reviewer"),
-                "action_id": str(context_payload.get("action_id") or uuid4().hex[:12]),
+                "run_id": request_ids["run_id"],
+                "session_id": request_ids["session_id"],
+                "task_id": request_ids["task_id"],
+                "phase_id": request_ids["phase_id"],
+                "action_id": request_ids["action_id"],
                 "purpose": ModelPurpose.FINAL_REVIEW,
                 "context_metadata": {"producer": "final_reviewer"},
                 "max_output_tokens": 1200,
@@ -514,5 +521,16 @@ def _safe_output_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "output_mode": str(metadata.get("output_mode") or ""),
         "schema_validation_passed": bool(metadata.get("schema_validation_passed")),
         "retry_count": int(metadata.get("retry_count") or 0),
+        "retry_reason": str(metadata.get("retry_reason") or "none"),
         "fallback_reason": str(metadata.get("fallback_reason") or ""),
+    }
+
+
+def _final_review_request_ids(context_payload: dict[str, Any]) -> dict[str, str]:
+    return {
+        "run_id": str(context_payload.get("run_id") or "final_reviewer"),
+        "session_id": str(context_payload.get("session_id") or "final_reviewer"),
+        "task_id": str(context_payload.get("task_id") or "final_reviewer"),
+        "phase_id": str(context_payload.get("phase_id") or "final_reviewer"),
+        "action_id": str(context_payload.get("action_id") or uuid4().hex[:12]),
     }

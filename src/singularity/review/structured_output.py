@@ -36,6 +36,13 @@ OUTPUT_MODE_TOOL = "forced_tool_call"
 OUTPUT_MODE_JSON = "json_mode"
 OUTPUT_MODE_RULE_ONLY = "rule_only"
 
+RETRY_REASON_NONE = "none"
+RETRY_REASON_JSON_PARSE_ERROR = "json_parse_error"
+RETRY_REASON_SCHEMA_VALIDATION_ERROR = "schema_validation_error"
+RETRY_REASON_TOOL_CALL_PARSE_ERROR = "tool_call_parse_error"
+RETRY_REASON_PROVIDER_ERROR = "provider_error"
+RETRY_REASON_BUSINESS_RULE_VALIDATION_FAILED = "business_rule_validation_failed"
+
 
 @dataclass(frozen=True)
 class ReviewOutputResult:
@@ -51,6 +58,14 @@ class BusinessRuleViolation(ValueError):
 
     def __str__(self) -> str:
         return self.message
+
+
+class JsonParseError(ValueError):
+    pass
+
+
+class ToolCallParseError(ValueError):
+    pass
 
 
 def call_review_output(
@@ -79,6 +94,7 @@ def call_review_output(
             unsupported.append(mode)
             continue
         retry_count = 0
+        retry_reason = RETRY_REASON_NONE
         while retry_count <= max_validation_retries:
             try:
                 request = _build_request(
@@ -98,6 +114,7 @@ def call_review_output(
                     output_mode=OUTPUT_MODE_RULE_ONLY,
                     retry_count=retry_count,
                     fallback_reason="provider_error",
+                    retry_reason=RETRY_REASON_PROVIDER_ERROR,
                 )
             if getattr(result, "status", None) != ModelTurnStatus.SUCCESS:
                 return _fallback_result(
@@ -105,6 +122,7 @@ def call_review_output(
                     output_mode=OUTPUT_MODE_RULE_ONLY,
                     retry_count=retry_count,
                     fallback_reason="provider_error",
+                    retry_reason=RETRY_REASON_PROVIDER_ERROR,
                 )
             try:
                 payload = _payload_from_result(result, mode=mode, tool_name=tool_name)
@@ -119,6 +137,7 @@ def call_review_output(
                         "output_mode": mode,
                         "schema_validation_passed": True,
                         "retry_count": retry_count,
+                        "retry_reason": retry_reason,
                         "fallback_reason": "",
                         "schema_hash": _schema_hash(output_model),
                     },
@@ -129,15 +148,62 @@ def call_review_output(
                     output_mode=OUTPUT_MODE_RULE_ONLY,
                     retry_count=retry_count,
                     fallback_reason="business_rule_validation_failed",
+                    retry_reason=RETRY_REASON_BUSINESS_RULE_VALIDATION_FAILED,
                 )
-            except (ValueError, ValidationError) as exc:
+            except ToolCallParseError as exc:
                 last_error = str(exc)
+                retry_reason = RETRY_REASON_TOOL_CALL_PARSE_ERROR
                 if retry_count >= max_validation_retries:
                     return _fallback_result(
                         last_error,
                         output_mode=mode,
                         retry_count=retry_count,
                         fallback_reason="schema_validation_failed",
+                        retry_reason=retry_reason,
+                    )
+                retry_count += 1
+            except JsonParseError as exc:
+                last_error = str(exc)
+                retry_reason = RETRY_REASON_JSON_PARSE_ERROR
+                if retry_count >= max_validation_retries:
+                    return _fallback_result(
+                        last_error,
+                        output_mode=mode,
+                        retry_count=retry_count,
+                        fallback_reason="schema_validation_failed",
+                        retry_reason=retry_reason,
+                    )
+                retry_count += 1
+            except ValidationError as exc:
+                last_error = str(exc)
+                retry_reason = (
+                    RETRY_REASON_TOOL_CALL_PARSE_ERROR
+                    if mode == OUTPUT_MODE_TOOL
+                    else RETRY_REASON_SCHEMA_VALIDATION_ERROR
+                )
+                if retry_count >= max_validation_retries:
+                    return _fallback_result(
+                        last_error,
+                        output_mode=mode,
+                        retry_count=retry_count,
+                        fallback_reason="schema_validation_failed",
+                        retry_reason=retry_reason,
+                    )
+                retry_count += 1
+            except ValueError as exc:
+                last_error = str(exc)
+                retry_reason = (
+                    RETRY_REASON_TOOL_CALL_PARSE_ERROR
+                    if mode == OUTPUT_MODE_TOOL
+                    else RETRY_REASON_JSON_PARSE_ERROR
+                )
+                if retry_count >= max_validation_retries:
+                    return _fallback_result(
+                        last_error,
+                        output_mode=mode,
+                        retry_count=retry_count,
+                        fallback_reason="schema_validation_failed",
+                        retry_reason=retry_reason,
                     )
                 retry_count += 1
     reason = "unsupported_output_modes:" + ",".join(unsupported) if unsupported else last_error
@@ -176,6 +242,11 @@ def _build_request(
             "schema": schema,
         }
     elif mode == OUTPUT_MODE_TOOL:
+        content = (
+            f"Call the {tool_name} tool with JSON arguments that conform to the JSON Schema. "
+            "Do not answer in natural language.\n\n"
+            f"{content}"
+        )
         tools = [
             ModelToolSchema(
                 name=tool_name,
@@ -223,10 +294,10 @@ def _payload_from_result(result: Any, *, mode: str, tool_name: str) -> dict[str,
             if isinstance(call, ModelToolCall) and call.tool_name == tool_name
         ]
         if not calls:
-            raise ValueError("forced tool calling response did not include the required tool")
+            raise ToolCallParseError("forced tool calling response did not include the required tool")
         call = calls[0]
         if call.parse_status != ModelToolParseStatus.VALID:
-            raise ValueError("forced tool calling arguments failed JSON/schema parsing")
+            raise ToolCallParseError("forced tool calling arguments failed JSON/schema parsing")
         return dict(call.arguments)
     text = getattr(getattr(result, "assistant_message", None), "text", "") or ""
     return _load_json_object(text)
@@ -235,7 +306,7 @@ def _payload_from_result(result: Any, *, mode: str, tool_name: str) -> dict[str,
 def _load_json_object(text: str) -> dict[str, Any]:
     stripped = text.strip()
     if not stripped:
-        raise ValueError("empty review model response")
+        raise JsonParseError("empty review model response")
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError:
@@ -249,7 +320,7 @@ def _load_json_object(text: str) -> dict[str, Any]:
             except json.JSONDecodeError:
                 continue
         else:
-            raise ValueError("review model response did not contain JSON") from None
+            raise JsonParseError("review model response did not contain JSON") from None
     if isinstance(payload, list):
         return {"findings": payload}
     if isinstance(payload, dict) and isinstance(payload.get("report"), dict):
@@ -257,7 +328,7 @@ def _load_json_object(text: str) -> dict[str, Any]:
         if isinstance(report.get("findings"), list):
             return {"findings": report["findings"]}
     if not isinstance(payload, dict):
-        raise ValueError("review model response was not a JSON object")
+        raise JsonParseError("review model response was not a JSON object")
     return payload
 
 
@@ -289,6 +360,7 @@ def _fallback_result(
     output_mode: str = OUTPUT_MODE_RULE_ONLY,
     retry_count: int = 0,
     fallback_reason: str = "rule_only_fallback",
+    retry_reason: str = RETRY_REASON_NONE,
 ) -> ReviewOutputResult:
     return ReviewOutputResult(
         status="fallback",
@@ -297,6 +369,7 @@ def _fallback_result(
             "output_mode": output_mode,
             "schema_validation_passed": False,
             "retry_count": retry_count,
+            "retry_reason": retry_reason,
             "fallback_reason": fallback_reason,
         },
     )

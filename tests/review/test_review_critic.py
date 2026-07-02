@@ -139,6 +139,8 @@ def test_model_critic_uses_forced_tool_calling_when_structured_outputs_are_unsup
     assert outcome.metadata["output_mode"] == "forced_tool_call"
     assert runner.requests[0].tool_choice.tool_name == "submit_review_findings"
     assert runner.requests[0].tools[0].metadata["strict"] is True
+    assert "Call the submit_review_findings tool" in runner.requests[0].messages[0].text
+    assert "Do not answer in natural language" in runner.requests[0].messages[0].text
 
 
 def test_model_critic_falls_back_to_json_mode_when_structured_and_tools_are_unsupported() -> None:
@@ -200,6 +202,47 @@ def test_model_critic_validation_retry_is_bounded() -> None:
 
     assert outcome.status == "ok"
     assert outcome.metadata["retry_count"] == 1
+    assert outcome.metadata["retry_reason"] == "schema_validation_error"
+    assert len(runner.requests) == 2
+
+
+def test_model_critic_forced_tool_call_parse_retry_records_reason() -> None:
+    class ToolRetryRunner(FakeModelRunner):
+        def __init__(self) -> None:
+            super().__init__("", supported_output_modes={"forced_tool_call"})
+
+        def run_turn(self, request):
+            self.requests.append(request)
+            parse_status = (
+                ModelToolParseStatus.SCHEMA_MISMATCH
+                if len(self.requests) == 1
+                else ModelToolParseStatus.VALID
+            )
+            arguments = {} if len(self.requests) == 1 else {"findings": []}
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_tool_{len(self.requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text(""),
+                tool_calls=[
+                    ModelToolCall(
+                        tool_call_id=f"call_{len(self.requests)}",
+                        tool_name="submit_review_findings",
+                        arguments=arguments,
+                        raw_arguments=json.dumps(arguments),
+                        parse_status=parse_status,
+                    )
+                ],
+            )
+
+    runner = ToolRetryRunner()
+
+    outcome = ModelCritic(runner).review(base_report(), bundle={})
+
+    assert outcome.status == "ok"
+    assert outcome.metadata["output_mode"] == "forced_tool_call"
+    assert outcome.metadata["retry_count"] == 1
+    assert outcome.metadata["retry_reason"] == "tool_call_parse_error"
     assert len(runner.requests) == 2
 
 
@@ -225,3 +268,5 @@ def test_model_critic_business_rule_failure_uses_rule_only_fallback() -> None:
     assert outcome.status == "model_critic_invalid"
     assert outcome.metadata["output_mode"] == "rule_only"
     assert outcome.metadata["fallback_reason"] == "business_rule_validation_failed"
+    assert outcome.metadata["retry_reason"] == "business_rule_validation_failed"
+    assert len(runner.requests) == 1

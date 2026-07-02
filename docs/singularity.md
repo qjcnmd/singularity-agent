@@ -1784,7 +1784,8 @@
     → 同时写 capability_summary.schema_version =
       evaluation.capability_summary/v2：
       provider_time_by_turn、sandbox_commands、sandbox_breakdown、wall_phases、
-      turn_diagnostics、unattributed_time_seconds 与细分
+      provider_latency_by_review_stage、turn_diagnostics、
+      unattributed_time_seconds 与细分
       timing/timing_diagnostics；
       sandbox_breakdown 把 run_verification sandbox path 拆成
       doctor readiness、ACL grant、workspace materialization、
@@ -1795,8 +1796,10 @@
       token/cache 计数、tool call、review/verification/finalization 事件状态
       和耗时，不保存 prompt、response、文件内容或 evaluator-only metadata。
       review 事件只保存 model-assisted review 的 output_mode、
-      schema_validation_passed、retry_count、fallback_reason、
-      model_critic_status 和耗时/复用状态；模型输出边界按
+      schema_validation_passed、retry_count、retry_reason、
+      fallback_reason、model_critic_status 和耗时/复用状态；
+      provider_latency_by_review_stage 只按 review stage 聚合
+      provider call count、failed count、total/max seconds；模型输出边界按
       Structured Outputs / JSON Schema、strict tool calling with pinned
       tool choice、json_mode、rule-only fallback path 的顺序降级，
       本地 schema validation / Pydantic validation 仍是最终边界。
