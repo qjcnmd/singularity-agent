@@ -1037,6 +1037,32 @@ def test_capability_summary_v2_aggregates_component_spans_without_payload_conten
     assert timing["context_assembly_time_seconds"] == 0.05
     assert timing["retrieval_time_seconds"] == 0.02
     assert timing["compaction_decision_time_seconds"] == 0.01
+    breakdown = summary["sandbox_breakdown"]
+    assert breakdown["schema_version"] == "evaluation.sandbox_breakdown/v1"
+    assert breakdown["command_count"] == 1
+    assert breakdown["total_seconds"] == 4.0
+    assert breakdown["items"]["doctor_readiness"] == {
+        "actual_seconds": 1.0,
+        "source": "sandbox_trace",
+        "kind": "diagnostic_observation",
+    }
+    assert breakdown["items"]["acl_grant"]["actual_seconds"] == 0.2
+    assert breakdown["items"]["workspace_materialization"]["actual_seconds"] == 0.0
+    assert breakdown["items"]["process_spawn"] == {
+        "actual_seconds": 0.3,
+        "source": "sandbox_trace",
+        "kind": "actual_execution",
+    }
+    assert breakdown["items"]["command_runtime"] == {
+        "actual_seconds": 0.4,
+        "source": "sandbox_trace",
+        "kind": "actual_execution",
+    }
+    assert breakdown["items"]["diagnostics_overhead"] == {
+        "actual_seconds": 1.93,
+        "source": "capability_summary.sandbox_commands",
+        "kind": "diagnostic_observation",
+    }
     assert summary["timing_diagnostics"]["command_runtime_time_seconds"]["source"] == "sandbox_trace"
     assert summary["timing_diagnostics"]["edit_apply_review_time_seconds"]["source"] == "review_trace"
     assert summary["timing_diagnostics"]["context_assembly_time_seconds"]["source"] == "context_trace"
@@ -2221,6 +2247,7 @@ def test_evaluation_uses_task_strategy_max_turns(tmp_path: Path) -> None:
     assert task["evaluation_passed"] is True
     assert task["sandbox_enforcement_passed"] is True
     assert task["evaluator_visibility_audit_passed"] is True
+    assert task["local_process_fallback_count"] == 0
     assert task["capability_summary"]["schema_version"] == "evaluation.capability_summary/v2"
     assert task["timing"]["workspace_materialization_time_seconds"] is not None
     assert task["timing"]["dependency_setup_time_seconds"] is not None
@@ -2303,13 +2330,236 @@ def test_evaluation_prepare_commands_use_auditable_dependency_cache(tmp_path: Pa
     task = result["tasks"][0]
     cache = task["reproducible_environment"]["dependency_setup_cache"]
     assert task["evaluation_passed"] is True
-    assert cache["schema_version"] == "evaluation.dependency_setup_cache/v1"
+    assert cache["schema_version"] == "evaluation.dependency_setup_cache/v2"
     assert cache["enabled"] is True
     assert cache["strategy"] == "pip_cache_dir"
+    assert cache["hit"] is False
+    assert cache["miss_reason"] == "cache_not_ready"
     assert cache["cache_key"]
     assert Path(cache["cache_dir"]).is_dir()
     assert Path(cache["cache_dir"]).is_relative_to(tmp_path / "out-dependency-cache")
-    assert Path(task["workspace"], "cache.txt").read_text(encoding="utf-8") == cache["cache_dir"]
+    assert Path(task["workspace"], "cache.txt").read_text(encoding="utf-8") == cache["pip_cache_dir"]
+
+
+def test_evaluation_prepare_commands_reuse_prepared_evaluator_venv_cache(tmp_path: Path) -> None:
+    py = json.dumps(sys.executable)
+    marker_code = (
+        "import pathlib, sys; "
+        "p=pathlib.Path('../.eval-venv/cache-marker.txt'); "
+        "p.parent.mkdir(parents=True, exist_ok=True); "
+        "p.write_text(p.read_text(encoding='utf-8') + 'x' if p.exists() else 'x', encoding='utf-8'); "
+        "sp=pathlib.Path('../.eval-venv/Lib/site-packages'); "
+        "sp.mkdir(parents=True, exist_ok=True); "
+        "(sp/'editable.pth').write_text(str(pathlib.Path.cwd()), encoding='utf-8'); "
+        "dist=sp/'fake-0.1.dist-info'; dist.mkdir(exist_ok=True); "
+        "(dist/'direct_url.json').write_text(str(pathlib.Path('../.eval-venv').resolve()), encoding='utf-8')"
+    )
+    manifest_payload = {
+        "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+        "tasks": [
+            {
+                "task_id": "fake.prepared_venv_cache",
+                "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                "prepare_commands": [
+                    f"{py} -c {json.dumps(marker_code)}",
+                ],
+                "user_task": "Write done.txt with ok.",
+                "allowed_paths": ["done.txt"],
+                "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').read_text(encoding='utf-8') == 'ok'\"",
+                "success": {"type": "verification_exit_code", "exit_code": 0},
+            }
+        ],
+    }
+    manifest = EvaluationTaskSet.from_dict(manifest_payload, base_dir=tmp_path)
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    runner = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="prepared_cache_miss",
+        bootstrap_cls=FakeBootstrap,
+    )
+    first = runner.run(manifest)["tasks"][0]
+    first_cache = first["reproducible_environment"]["dependency_setup_cache"]
+    first_venv = Path(first["workspace"]).parent / ".eval-venv"
+    assert first_cache["strategy"] == "prepared_venv"
+    assert first_cache["hit"] is False
+    assert first_cache["miss_reason"] == "cache_not_ready"
+    assert first_cache["model_visible"] is False
+    assert first_cache["changes_acl"] is False
+    assert first_cache["bypasses_windows_sandbox"] is False
+    assert first_cache["uses_local_process_fallback"] is False
+    assert (first_venv / "cache-marker.txt").read_text(encoding="utf-8") == "x"
+
+    second = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="prepared_cache_hit",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)["tasks"][0]
+    second_cache = second["reproducible_environment"]["dependency_setup_cache"]
+    second_venv = Path(second["workspace"]).parent / ".eval-venv"
+    assert second_cache["schema_version"] == "evaluation.dependency_setup_cache/v2"
+    assert second_cache["strategy"] == "prepared_venv"
+    assert second_cache["hit"] is True
+    assert second_cache["miss_reason"] == ""
+    assert second_cache["source_cache_dir"] == first_cache["prepared_env_dir"]
+    assert second_cache["workspace_link_or_copy"] == str(second_venv)
+    assert second_cache["workspace_rebind"] == {"status": "completed", "files_rewritten": 2}
+    assert second_cache["restore_time_seconds"] >= 0
+    assert second_cache["workspace_rebind_time_seconds"] >= 0
+    assert second["timing"]["dependency_setup_time_seconds"] >= second_cache["restore_time_seconds"]
+    assert (second_venv / "cache-marker.txt").read_text(encoding="utf-8") == "x"
+    assert (second_venv / "Lib" / "site-packages" / "editable.pth").read_text(
+        encoding="utf-8"
+    ) == str(Path(second["workspace"]))
+    assert (second_venv / "Lib" / "site-packages" / "fake-0.1.dist-info" / "direct_url.json").read_text(
+        encoding="utf-8"
+    ) == str(second_venv)
+    assert str(Path(first["workspace"])) not in (
+        second_venv / "Lib" / "site-packages" / "editable.pth"
+    ).read_text(encoding="utf-8")
+    assert not (Path(second["workspace"]) / ".eval-venv").exists()
+
+
+def test_evaluation_prepared_venv_cache_finalize_failure_is_audit_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    py = json.dumps(sys.executable)
+    marker_code = (
+        "import pathlib; "
+        "p=pathlib.Path('../.eval-venv/cache-marker.txt'); "
+        "p.parent.mkdir(parents=True, exist_ok=True); "
+        "p.write_text('x', encoding='utf-8')"
+    )
+    manifest_payload = {
+        "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
+        "tasks": [
+            {
+                "task_id": "fake.prepared_venv_cache_finalize_failure",
+                "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+                "prepare_commands": [f"{py} -c {json.dumps(marker_code)}"],
+                "user_task": "Write done.txt with ok.",
+                "allowed_paths": ["done.txt"],
+                "verification_command": f"{py} -c \"from pathlib import Path; assert Path('done.txt').read_text(encoding='utf-8') == 'ok'\"",
+                "success": {"type": "verification_exit_code", "exit_code": 0},
+            }
+        ],
+    }
+    manifest = EvaluationTaskSet.from_dict(manifest_payload, base_dir=tmp_path)
+
+    class FakeTraceStore:
+        run_dir = tmp_path / "trace"
+
+    class FakeTrace:
+        store = FakeTraceStore()
+
+    class FakeGraph:
+        trace = FakeTrace()
+
+    class FakeResult:
+        status = RunStatus.COMPLETED
+        final_report = FinalReport(
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            kernel_status="finalized",
+            shutdown_reason="normal",
+            diagnostics_count=0,
+            cleanup_status="completed",
+            recovered_previous_run=False,
+            uncertain_transactions=[],
+            workspace_lock_status="released",
+            trace_summary={"tool_calls": 1, "model_usage_summary": {"requests": 1}},
+        )
+
+    class FakeKernel:
+        graph = FakeGraph()
+
+        def __init__(self, project_root: Path) -> None:
+            self.project_root = project_root
+
+        def run_task(self, _goal: str) -> FakeResult:
+            (self.project_root / "done.txt").write_text("ok", encoding="utf-8")
+            return FakeResult()
+
+        def close_resources(self) -> None:
+            return None
+
+    class FakeBootstrap:
+        def __init__(self, **kwargs) -> None:
+            self.project_root = kwargs["project_root"]
+
+        def boot(self, _goal: str) -> FakeKernel:
+            return FakeKernel(self.project_root)
+
+    original_copytree = evaluation_runner.shutil.copytree
+
+    def fail_cache_copytree(source: Path | str, destination: Path | str, *args: Any, **kwargs: Any) -> Any:
+        if "prepared-venv.tmp-" in str(destination):
+            raise OSError("cache publish denied")
+        return original_copytree(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(evaluation_runner.shutil, "copytree", fail_cache_copytree)
+    result = EvaluationRunner(
+        output_root=tmp_path / "out",
+        run_id="prepared_cache_finalize_failure",
+        bootstrap_cls=FakeBootstrap,
+    ).run(manifest)["tasks"][0]
+
+    cache = result["reproducible_environment"]["dependency_setup_cache"]
+    assert result["evaluation_passed"] is True
+    assert cache["strategy"] == "prepared_venv"
+    assert cache["hit"] is False
+    assert cache["miss_reason"] == "cache_finalize_failed"
+    assert cache["finalize_status"] == "failed"
+    assert cache["finalize_error"]["type"] == "OSError"
+    assert cache["model_visible"] is False
+    assert cache["uses_local_process_fallback"] is False
+    assert not (Path(result["workspace"]) / ".eval-venv").exists()
 
 
 def test_evaluation_runner_max_turns_overrides_task_strategy(tmp_path: Path) -> None:

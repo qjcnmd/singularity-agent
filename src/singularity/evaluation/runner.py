@@ -299,6 +299,7 @@ class EvaluationTaskResult:
     hidden_verification_passed: bool = False
     sandbox_enforcement_passed: bool = True
     evaluator_visibility_audit_passed: bool = True
+    local_process_fallback_count: int = 0
     repair_attempt_count: int = 0
     repair_execution_count: int = 0
     miscompletion_count: int = 0
@@ -354,6 +355,7 @@ class EvaluationTaskResult:
             "hidden_verification_passed": self.hidden_verification_passed,
             "sandbox_enforcement_passed": self.sandbox_enforcement_passed,
             "evaluator_visibility_audit_passed": self.evaluator_visibility_audit_passed,
+            "local_process_fallback_count": self.local_process_fallback_count,
             "repair_attempt_count": self.repair_attempt_count,
             "repair_execution_count": self.repair_execution_count,
             "miscompletion_count": self.miscompletion_count,
@@ -654,46 +656,51 @@ class EvaluationRunner:
                 config=config,
                 max_turns=config.max_turns,
             )
+            dependency_setup_started = time.perf_counter()
             dependency_cache_env, dependency_cache = _dependency_setup_cache(
                 task,
                 workspace=workspace,
                 output_root=self.output_root,
             )
             reproducible_environment["dependency_setup_cache"] = dependency_cache
-            dependency_setup_started = time.perf_counter()
-            for command in task.prepare_commands:
-                prepared = _run_shell(
-                    command,
-                    cwd=workspace,
-                    timeout_seconds=120,
-                    redactor=self.redactor,
-                    env_overrides=dependency_cache_env,
-                )
-                if not prepared.passed:
-                    errors.append(f"prepare failed: {prepared.error_summary or command}")
-                    return self._task_result(
-                        task=task,
-                        workspace=workspace,
-                        trace=trace_path,
-                        started=started,
-                        verification=prepared,
-                        verification_workspace=verification_workspace,
-                        files_changed=[],
-                        usage={},
-                        tool_calls=0,
-                        errors=errors,
-                        patch={},
-                        checks=_checks_payload(None, prepared),
-                        success=False,
-                        tests_passed=False,
-                        infrastructure_blocked=False,
-                        reproducible_environment=reproducible_environment,
-                        evaluation_timing={
-                            **evaluation_timing,
-                            "dependency_setup_time_seconds": time.perf_counter()
-                            - dependency_setup_started,
-                        },
+            if dependency_cache.get("hit") is not True:
+                for command in task.prepare_commands:
+                    prepared = _run_shell(
+                        command,
+                        cwd=workspace,
+                        timeout_seconds=120,
+                        redactor=self.redactor,
+                        env_overrides=dependency_cache_env,
                     )
+                    if not prepared.passed:
+                        errors.append(f"prepare failed: {prepared.error_summary or command}")
+                        return self._task_result(
+                            task=task,
+                            workspace=workspace,
+                            trace=trace_path,
+                            started=started,
+                            verification=prepared,
+                            verification_workspace=verification_workspace,
+                            files_changed=[],
+                            usage={},
+                            tool_calls=0,
+                            errors=errors,
+                            patch={},
+                            checks=_checks_payload(None, prepared),
+                            success=False,
+                            tests_passed=False,
+                            infrastructure_blocked=False,
+                            reproducible_environment=reproducible_environment,
+                            evaluation_timing={
+                                **evaluation_timing,
+                                "dependency_setup_time_seconds": time.perf_counter()
+                                - dependency_setup_started,
+                            },
+                        )
+                _finalize_dependency_setup_cache(
+                    dependency_cache,
+                    workspace=workspace,
+                )
             evaluation_timing["dependency_setup_time_seconds"] = (
                 time.perf_counter() - dependency_setup_started
             )
@@ -1338,6 +1345,7 @@ class EvaluationRunner:
             hidden_verification_passed=hidden_verification_passed,
             sandbox_enforcement_passed=bool(sandbox_audit["passed"]),
             evaluator_visibility_audit_passed=bool(visibility_audit["passed"]),
+            local_process_fallback_count=_safe_int(capability_summary.get("local_process_fallback_count")),
             repair_attempt_count=repair_attempt_count,
             repair_execution_count=repair_execution_count,
             miscompletion_count=miscompletion_count,
@@ -1966,10 +1974,15 @@ def _dependency_setup_cache(
 ) -> tuple[dict[str, str], dict[str, Any]]:
     if not task.prepare_commands:
         return {}, {
-            "schema_version": "evaluation.dependency_setup_cache/v1",
+            "schema_version": "evaluation.dependency_setup_cache/v2",
             "enabled": False,
             "strategy": "pip_cache_dir",
             "scope": "evaluator_prepare_commands_only",
+            "hit": False,
+            "miss_reason": "no_prepare_commands",
+            "created_at": "",
+            "source_cache_dir": "",
+            "workspace_link_or_copy": "",
             "model_visible": False,
             "changes_acl": False,
             "bypasses_windows_sandbox": False,
@@ -1994,18 +2007,69 @@ def _dependency_setup_cache(
         json.dumps(key_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
     cache_dir = cache_root / cache_key[:16]
+    pip_cache_dir = cache_dir / "pip"
+    wheelhouse_dir = cache_dir / "wheelhouse"
+    prepared_env_dir = cache_dir / "prepared-venv"
+    ready_marker = cache_dir / "prepared-venv.ready.json"
+    strategy = "prepared_venv" if _prepare_commands_target_eval_venv(task.prepare_commands) else "pip_cache_dir"
+    hit = False
+    miss_reason = "cache_not_ready"
+    workspace_link_or_copy = ""
+    workspace_rebind: dict[str, Any] = {"status": "not_applicable", "files_rewritten": 0}
+    restore_time_seconds: float | None = None
+    workspace_rebind_time_seconds: float | None = None
+    if strategy == "prepared_venv" and prepared_env_dir.is_dir() and ready_marker.is_file():
+        marker = _read_dependency_cache_marker(ready_marker, cache_key=cache_key)
+        if marker:
+            workspace_venv = _prepared_eval_venv_path(workspace)
+            restore_started = time.perf_counter()
+            _replace_tree(prepared_env_dir, workspace_venv)
+            restore_time_seconds = round(time.perf_counter() - restore_started, 3)
+            rebind_started = time.perf_counter()
+            workspace_rebind = _rebind_prepared_venv_workspace(
+                workspace_venv,
+                workspace=workspace,
+                source_workspace=Path(str(marker.get("source_workspace") or "")),
+                source_venv=Path(str(marker.get("source_venv") or "")),
+            )
+            workspace_rebind_time_seconds = round(time.perf_counter() - rebind_started, 3)
+            hit = True
+            miss_reason = ""
+            workspace_link_or_copy = str(workspace_venv)
+        else:
+            miss_reason = "cache_marker_invalid"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    pip_cache_dir.mkdir(parents=True, exist_ok=True)
+    wheelhouse_dir.mkdir(parents=True, exist_ok=True)
     audit = {
-        "schema_version": "evaluation.dependency_setup_cache/v1",
+        "schema_version": "evaluation.dependency_setup_cache/v2",
         "enabled": bool(task.prepare_commands),
-        "strategy": "pip_cache_dir",
+        "strategy": strategy,
+        "available_strategies": ["pip_cache_dir", "wheelhouse", "prepared_venv"],
         "scope": "evaluator_prepare_commands_only",
         "cache_key": cache_key,
         "cache_root": str(cache_root),
         "cache_dir": str(cache_dir),
+        "pip_cache_dir": str(pip_cache_dir),
+        "wheelhouse_dir": str(wheelhouse_dir),
+        "prepared_env_dir": str(prepared_env_dir),
+        "ready_marker": str(ready_marker),
+        "hit": hit,
+        "miss_reason": miss_reason,
+        "created_at": _utc_timestamp(),
+        "source_cache_dir": str(prepared_env_dir) if hit else "",
+        "workspace_link_or_copy": workspace_link_or_copy,
+        "workspace_rebind": workspace_rebind,
+        "restore_time_seconds": restore_time_seconds,
+        "workspace_rebind_time_seconds": workspace_rebind_time_seconds,
         "invalidation": {
             "python": sys.version.split()[0],
             "platform": sys.platform,
+            "workspace": {
+                "kind": task.workspace.kind,
+                "path_digest": hashlib.sha256(str(task.workspace.path or "").encode("utf-8")).hexdigest(),
+                "start_commit": task.workspace.start_commit,
+            },
             "workspace_start_commit": task.workspace.start_commit,
             "prepare_commands_digest": hashlib.sha256(
                 json.dumps(list(task.prepare_commands), ensure_ascii=False).encode("utf-8")
@@ -2017,7 +2081,205 @@ def _dependency_setup_cache(
         "bypasses_windows_sandbox": False,
         "uses_local_process_fallback": False,
     }
-    return {"PIP_CACHE_DIR": str(cache_dir)}, audit
+    return {"PIP_CACHE_DIR": str(pip_cache_dir)}, audit
+
+
+def _prepare_commands_target_eval_venv(commands: list[str]) -> bool:
+    if not commands:
+        return False
+    normalized = " ".join(commands).replace("\\", "/")
+    return "../.eval-venv" in normalized
+
+
+def _prepared_eval_venv_path(workspace: Path) -> Path:
+    return workspace.parent / ".eval-venv"
+
+
+def _replace_tree(source: Path, target: Path) -> None:
+    if target.exists():
+        _make_tree_writable(target)
+        shutil.rmtree(target)
+    shutil.copytree(source, target)
+
+
+def _read_dependency_cache_marker(marker_path: Path, *, cache_key: str) -> dict[str, Any]:
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(marker, dict):
+        return {}
+    if marker.get("cache_key") != cache_key:
+        return {}
+    if marker.get("strategy") != "prepared_venv":
+        return {}
+    if not marker.get("source_workspace") or not marker.get("source_venv"):
+        return {}
+    return marker
+
+
+def _rebind_prepared_venv_workspace(
+    venv: Path,
+    *,
+    workspace: Path,
+    source_workspace: Path,
+    source_venv: Path,
+) -> dict[str, Any]:
+    if not source_workspace or not source_venv:
+        return {"status": "skipped_missing_marker_paths", "files_rewritten": 0}
+    replacements = _path_replacement_pairs(
+        {
+            source_workspace: workspace,
+            source_venv: venv,
+        }
+    )
+    files_rewritten = 0
+    for site_packages in _prepared_venv_site_package_dirs(venv):
+        for path in _prepared_venv_rebind_files(site_packages):
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if len(data) > 2_000_000:
+                continue
+            updated = data
+            for old, new in replacements:
+                updated = updated.replace(old, new)
+            if updated != data:
+                path.write_bytes(updated)
+                files_rewritten += 1
+    return {"status": "completed", "files_rewritten": files_rewritten}
+
+
+def _prepared_venv_site_package_dirs(venv: Path) -> list[Path]:
+    candidates = [
+        venv / "Lib" / "site-packages",
+    ]
+    if (venv / "lib").exists():
+        candidates.extend(sorted((venv / "lib").glob("python*/site-packages")))
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in candidates:
+        resolved = path.resolve(strict=False)
+        if path.is_dir() and resolved not in seen and resolved.is_relative_to(venv.resolve(strict=False)):
+            seen.add(resolved)
+            result.append(path)
+    return result
+
+
+def _prepared_venv_rebind_files(site_packages: Path) -> list[Path]:
+    candidates: list[Path] = []
+    candidates.extend(site_packages.glob("*.pth"))
+    candidates.extend(site_packages.glob("*.egg-link"))
+    candidates.extend(site_packages.glob("__editable__*.py"))
+    candidates.extend(site_packages.glob("__editable__*.pth"))
+    candidates.extend(site_packages.glob("*.dist-info/direct_url.json"))
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in candidates:
+        resolved = path.resolve(strict=False)
+        if path.is_file() and resolved not in seen and resolved.is_relative_to(site_packages.resolve(strict=False)):
+            seen.add(resolved)
+            result.append(path)
+    return result
+
+
+def _path_replacement_pairs(paths: dict[Path, Path]) -> list[tuple[bytes, bytes]]:
+    pairs: list[tuple[bytes, bytes]] = []
+    seen: set[bytes] = set()
+    for old, new in paths.items():
+        variants: list[tuple[str, str]] = [
+            (str(old), str(new)),
+            (old.as_posix(), new.as_posix()),
+            (str(old).replace("\\", "\\\\"), str(new).replace("\\", "\\\\")),
+        ]
+        if old.is_absolute() and new.is_absolute():
+            variants.append((old.as_uri(), new.as_uri()))
+        for old_text, new_text in variants:
+            old_bytes = old_text.encode("utf-8")
+            if old_bytes and old_bytes not in seen:
+                seen.add(old_bytes)
+                pairs.append((old_bytes, new_text.encode("utf-8")))
+    return pairs
+
+
+def _finalize_dependency_setup_cache(audit: dict[str, Any], *, workspace: Path) -> None:
+    if audit.get("strategy") != "prepared_venv":
+        audit["finalize_status"] = "not_applicable"
+        return
+    if audit.get("hit") is True:
+        audit["finalize_status"] = "skipped_hit"
+        return
+    workspace_venv = _prepared_eval_venv_path(workspace)
+    if not workspace_venv.is_dir():
+        audit["miss_reason"] = "prepared_env_not_created"
+        audit["finalize_status"] = "skipped_missing_prepared_env"
+        return
+    prepared_env_dir = Path(str(audit.get("prepared_env_dir") or ""))
+    ready_marker = Path(str(audit.get("ready_marker") or ""))
+    temp_dir = prepared_env_dir.parent / f"{prepared_env_dir.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    marker_payload = {
+        "schema_version": "evaluation.dependency_setup_cache_marker/v1",
+        "cache_key": audit.get("cache_key"),
+        "created_at": _utc_timestamp(),
+        "strategy": "prepared_venv",
+        "source_workspace": str(workspace),
+        "source_workspace_hash": hashlib.sha256(str(workspace).encode("utf-8")).hexdigest(),
+        "source_venv": str(workspace_venv),
+        "source_venv_hash": hashlib.sha256(str(workspace_venv).encode("utf-8")).hexdigest(),
+    }
+    marker_tmp = ready_marker.with_name(f"{ready_marker.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        prepared_env_dir.parent.mkdir(parents=True, exist_ok=True)
+        if temp_dir.exists():
+            _make_tree_writable(temp_dir)
+            shutil.rmtree(temp_dir)
+        shutil.copytree(workspace_venv, temp_dir)
+        if prepared_env_dir.exists():
+            _make_tree_writable(prepared_env_dir)
+            shutil.rmtree(prepared_env_dir)
+        try:
+            temp_dir.rename(prepared_env_dir)
+        except OSError:
+            shutil.move(str(temp_dir), str(prepared_env_dir))
+        marker_tmp.write_text(
+            json.dumps(marker_payload, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        marker_tmp.replace(ready_marker)
+    except (OSError, shutil.Error) as exc:
+        audit["miss_reason"] = "cache_finalize_failed"
+        audit["finalize_status"] = "failed"
+        audit["finalize_error"] = _dependency_cache_error(exc)
+        _cleanup_dependency_cache_temp(temp_dir)
+        _cleanup_dependency_cache_temp(marker_tmp)
+        return
+    audit["source_cache_dir"] = str(prepared_env_dir)
+    audit["workspace_link_or_copy"] = str(workspace_venv)
+    audit["finalize_status"] = "ready"
+
+
+def _cleanup_dependency_cache_temp(path: Path) -> None:
+    try:
+        if path.is_dir():
+            _make_tree_writable(path)
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        return
+
+
+def _dependency_cache_error(exc: BaseException) -> dict[str, Any]:
+    text = f"{type(exc).__name__}:{exc}"
+    return {
+        "type": type(exc).__name__,
+        "message_hash": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16],
+    }
+
+
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _dependency_file_digests(workspace: Path) -> dict[str, str | None]:
@@ -2509,6 +2771,7 @@ def _build_capability_summary(
         "provider_time_by_turn": _provider_time_by_turn(events),
         "turn_diagnostics": _turn_diagnostics(events),
         "sandbox_commands": _sandbox_command_timings(events),
+        "sandbox_breakdown": _sandbox_breakdown(events),
         "wall_phases": wall_phases,
         "unattributed_time_seconds": unattributed_time,
         "timing": {
@@ -3730,6 +3993,54 @@ def _sandbox_command_timings(events: list[dict[str, Any]]) -> list[dict[str, Any
                 if isinstance(value, int | float):
                     row[str(name)] = max(float(row.get(str(name), 0.0)), float(value))
     return list(rows.values())
+
+
+_SANDBOX_BREAKDOWN_FIELDS: dict[str, tuple[str, str]] = {
+    "doctor_readiness": ("sandbox_doctor_readiness_time_seconds", "diagnostic_observation"),
+    "acl_grant": ("acl_grant_time_seconds", "diagnostic_observation"),
+    "workspace_materialization": ("workspace_materialization_time_seconds", "diagnostic_observation"),
+    "process_spawn": ("process_spawn_time_seconds", "actual_execution"),
+    "command_runtime": ("command_runtime_time_seconds", "actual_execution"),
+    "output_collection": ("output_collection_time_seconds", "actual_execution"),
+    "change_detection": ("change_detection_time_seconds", "diagnostic_observation"),
+    "artifact_collection": ("artifact_collection_time_seconds", "diagnostic_observation"),
+    "cleanup": ("run_root_cleanup_time_seconds", "diagnostic_observation"),
+}
+
+
+def _sandbox_breakdown(events: list[dict[str, Any]]) -> dict[str, Any]:
+    commands = _sandbox_command_timings(events)
+    totals = {name: 0.0 for name in _SANDBOX_BREAKDOWN_FIELDS}
+    total_seconds = 0.0
+    for command in commands:
+        duration = command.get("duration_seconds")
+        if isinstance(duration, int | float):
+            total_seconds += float(duration)
+        for name, (field_name, _kind) in _SANDBOX_BREAKDOWN_FIELDS.items():
+            value = command.get(field_name)
+            if isinstance(value, int | float):
+                totals[name] += float(value)
+    explained = sum(totals.values())
+    diagnostics_overhead = max(0.0, total_seconds - explained)
+    items = {
+        name: {
+            "actual_seconds": round(value, 3),
+            "source": "sandbox_trace",
+            "kind": _SANDBOX_BREAKDOWN_FIELDS[name][1],
+        }
+        for name, value in totals.items()
+    }
+    items["diagnostics_overhead"] = {
+        "actual_seconds": round(diagnostics_overhead, 3),
+        "source": "capability_summary.sandbox_commands",
+        "kind": "diagnostic_observation",
+    }
+    return {
+        "schema_version": "evaluation.sandbox_breakdown/v1",
+        "command_count": len(commands),
+        "total_seconds": round(total_seconds, 3),
+        "items": items,
+    }
 
 
 def _trace_timing_details(events: list[dict[str, Any]]) -> dict[str, float]:

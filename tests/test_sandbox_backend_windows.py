@@ -1962,6 +1962,44 @@ def test_sandbox_control_dir_acl_refuses_targets_outside_state_dir(
     assert calls == []
 
 
+def test_sandbox_control_dir_acl_success_uses_compact_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands: list[list[str]] = []
+    state_dir = tmp_path / "state"
+    target = state_dir / "runs" / "sandbox_123"
+    target.mkdir(parents=True)
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
+    monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
+    monkeypatch.setattr(
+        windows,
+        "_run_command",
+        lambda command: commands.append(command) or subprocess.CompletedProcess(command, 0, "verbose acl output", ""),
+    )
+
+    result = windows._apply_sandbox_control_dir_acl(
+        target,
+        account_names=(windows.OFFLINE_SANDBOX_ACCOUNT,),
+        operation="run_root_acl",
+    )
+
+    assert result.ok is True
+    assert result.reason == "run_root_acl_ready"
+    assert result.details["operation"] == "run_root_acl"
+    assert result.details["target"] == "sandbox_control_dir"
+    assert result.details["account_name_hashes"]
+    assert result.details["changed"] is True
+    assert "stdout_summary" not in result.details
+    assert "stderr_summary" not in result.details
+    assert str(target) not in json.dumps(result.details)
+    assert "SingularityOffline" not in json.dumps(result.details)
+    assert len(commands) == 2
+
+
 def test_network_probe_requires_host_connectivity_baseline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

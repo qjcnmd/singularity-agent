@@ -8,6 +8,7 @@ import pytest
 
 from scripts.verify_gate_common import (
     capability_metrics_from_result,
+    capability_repeated_timing_compare,
     capability_review_from_result,
     capability_sla_from_result,
     capability_timing_from_result,
@@ -389,6 +390,121 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                 "critic_source_status": "ok",
             }
         ],
+    }
+
+
+def test_capability_repeated_timing_compare_reports_min_median_current(tmp_path: Path) -> None:
+    output_root = tmp_path / "work" / "evaluations"
+    timings = [
+        ("run_a", 300.0, 200.0, 40.0, 50.0, 20.0, 5.0, 10.0),
+        ("run_b", 330.0, 220.0, 30.0, 70.0, 22.0, 6.0, 12.0),
+        ("run_c", 360.0, 240.0, 35.0, 60.0, 24.0, 7.0, 14.0),
+    ]
+    for run_id, wall, agent_loop, dependency, sandbox, provider, verification, unattributed in timings:
+        run_dir = output_root / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "result.json").write_text(
+            json.dumps(
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task.public",
+                            "reproducible_environment": {
+                                "workspace": {
+                                    "type": "repo",
+                                    "start_commit": "abc123",
+                                }
+                            },
+                            "timing": {
+                                "wall_time_seconds": wall,
+                                "dependency_setup_time_seconds": dependency,
+                                "sandbox_time_seconds": sandbox,
+                                "provider_time_seconds": provider,
+                                "verification_time_seconds": verification,
+                            },
+                            "capability_summary": {
+                                "wall_phases": {
+                                    "agent_loop_time_seconds": agent_loop,
+                                },
+                                "unattributed_time_seconds": unattributed,
+                                "sandbox_breakdown": {
+                                    "items": {
+                                        "doctor_readiness": {
+                                            "actual_seconds": sandbox / 2,
+                                            "source": "sandbox_trace",
+                                            "kind": "diagnostic_observation",
+                                        },
+                                        "command_runtime": {
+                                            "actual_seconds": 1.0,
+                                            "source": "sandbox_trace",
+                                            "kind": "actual_execution",
+                                        },
+                                    }
+                                },
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    current = output_root / "run_c" / "result.json"
+    compare = capability_repeated_timing_compare(current)
+
+    assert compare["schema_version"] == "evaluation.capability_timing_compare/v1"
+    assert compare["task_id"] == "task.public"
+    assert compare["start_commit"] == "abc123"
+    assert compare["run_count"] == 3
+    assert compare["metrics"]["wall_time_seconds"] == {
+        "current": 360.0,
+        "min": 300.0,
+        "median": 330.0,
+    }
+    assert compare["metrics"]["agent_loop_time_seconds"] == {
+        "current": 240.0,
+        "min": 200.0,
+        "median": 220.0,
+    }
+    assert compare["metrics"]["dependency_setup_time_seconds"]["min"] == 30.0
+    assert compare["metrics"]["sandbox_breakdown.doctor_readiness.actual_seconds"] == {
+        "current": 30.0,
+        "min": 25.0,
+        "median": 30.0,
+    }
+    assert compare["metrics"]["sandbox_breakdown.command_runtime.actual_seconds"]["current"] == 1.0
+
+
+def test_capability_repeated_timing_compare_is_null_aware(tmp_path: Path) -> None:
+    output_root = tmp_path / "work" / "evaluations"
+    for run_id, provider in (("run_a", None), ("run_b", 2.0)):
+        run_dir = output_root / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "result.json").write_text(
+            json.dumps(
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task.public",
+                            "reproducible_environment": {"workspace": {"start_commit": "abc123"}},
+                            "timing": {
+                                "wall_time_seconds": 10.0,
+                                "provider_time_seconds": provider,
+                            },
+                            "capability_summary": {"wall_phases": {}},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    compare = capability_repeated_timing_compare(output_root / "run_b" / "result.json")
+
+    assert compare["metrics"]["provider_time_seconds"] == {
+        "current": 2.0,
+        "min": 2.0,
+        "median": 2.0,
     }
 
 

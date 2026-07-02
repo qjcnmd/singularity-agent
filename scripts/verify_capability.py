@@ -12,6 +12,7 @@ from typing import Any
 
 from verify_gate_common import (
     capability_metrics_from_result,
+    capability_repeated_timing_compare,
     capability_review_from_result,
     capability_sla_from_result,
     capability_timing_from_result,
@@ -97,6 +98,7 @@ def main() -> int:
     capability_timing = capability_timing_from_result(result_path)
     capability_metrics = capability_metrics_from_result(result_path)
     capability_sla = capability_sla_from_result(result_path)
+    timing_compare = capability_repeated_timing_compare(result_path)
     turn_diagnostics = capability_turns_from_result(result_path)
     review_diagnostics = capability_review_from_result(result_path)
     print_json_summary(
@@ -112,6 +114,7 @@ def main() -> int:
             "result_path": str(result_path),
             "evaluation_metrics": capability_metrics,
             "capability_sla": capability_sla,
+            "timing_compare": timing_compare,
             "turn_diagnostics": turn_diagnostics,
             "review_diagnostics": review_diagnostics,
             "remaining_bottlenecks": _remaining_bottlenecks(capability_sla),

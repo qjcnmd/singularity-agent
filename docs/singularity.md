@@ -1783,9 +1783,14 @@
       token usage 与精确模型价格表计算，unknown 不影响 gate。
     → 同时写 capability_summary.schema_version =
       evaluation.capability_summary/v2：
-      provider_time_by_turn、sandbox_commands、wall_phases、
+      provider_time_by_turn、sandbox_commands、sandbox_breakdown、wall_phases、
       turn_diagnostics、unattributed_time_seconds 与细分
       timing/timing_diagnostics；
+      sandbox_breakdown 把 run_verification sandbox path 拆成
+      doctor readiness、ACL grant、workspace materialization、
+      process spawn、command runtime、output collection、cleanup
+      与 diagnostics overhead，并标记 actual_execution /
+      diagnostic_observation；
       turn_diagnostics 只保存安全 ID、phase/purpose、provider latency、
       token/cache 计数、tool call、review/verification/finalization 事件状态
       和耗时，不保存 prompt、response、文件内容或 evaluator-only metadata。

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 import subprocess
 import sys
 import time
@@ -212,6 +213,107 @@ def capability_sla_from_result(result_path: Path) -> dict[str, Any]:
     if items:
         result["items"] = dict(sorted(items.items()))
     return result
+
+
+def capability_repeated_timing_compare(result_path: Path) -> dict[str, Any]:
+    current = _capability_timing_record(result_path)
+    if not current:
+        return {
+            "schema_version": "evaluation.capability_timing_compare/v1",
+            "status": "unavailable",
+            "reason": "current result is unavailable or contains no task timing",
+            "run_count": 0,
+            "metrics": {},
+        }
+    output_root = result_path.parent.parent
+    records: list[dict[str, Any]] = []
+    for candidate in sorted(output_root.glob("*/result.json")):
+        record = _capability_timing_record(candidate)
+        if not record:
+            continue
+        if record.get("task_id") != current.get("task_id"):
+            continue
+        if record.get("start_commit") != current.get("start_commit"):
+            continue
+        records.append(record)
+    metrics: dict[str, dict[str, float | None]] = {}
+    metric_names = sorted({name for record in records for name in record.get("metrics", {})})
+    for name in metric_names:
+        current_value = current.get("metrics", {}).get(name)
+        values = [
+            float(value)
+            for record in records
+            for value in [record.get("metrics", {}).get(name)]
+            if isinstance(value, int | float)
+        ]
+        if not values:
+            continue
+        metrics[name] = {
+            "current": round(float(current_value), 3) if isinstance(current_value, int | float) else None,
+            "min": round(min(values), 3),
+            "median": round(float(statistics.median(values)), 3),
+        }
+    return {
+        "schema_version": "evaluation.capability_timing_compare/v1",
+        "status": "available" if records else "unavailable",
+        "task_id": current.get("task_id"),
+        "start_commit": current.get("start_commit"),
+        "current_run_id": result_path.parent.name,
+        "run_count": len(records),
+        "metrics": metrics,
+    }
+
+
+def _capability_timing_record(result_path: Path) -> dict[str, Any]:
+    if not result_path.exists():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    tasks = payload.get("tasks") or []
+    task = next((item for item in tasks if isinstance(item, dict)), None)
+    if task is None:
+        return {}
+    timing = task.get("timing") if isinstance(task.get("timing"), dict) else {}
+    capability = task.get("capability_summary") if isinstance(task.get("capability_summary"), dict) else {}
+    wall_phases = capability.get("wall_phases") if isinstance(capability.get("wall_phases"), dict) else {}
+    workspace = {}
+    environment = task.get("reproducible_environment")
+    if isinstance(environment, dict) and isinstance(environment.get("workspace"), dict):
+        workspace = environment["workspace"]
+    metrics: dict[str, float] = {}
+    for name in (
+        "wall_time_seconds",
+        "dependency_setup_time_seconds",
+        "sandbox_time_seconds",
+        "provider_time_seconds",
+        "verification_time_seconds",
+    ):
+        value = timing.get(name)
+        if isinstance(value, int | float):
+            metrics[name] = round(float(value), 3)
+    agent_loop = wall_phases.get("agent_loop_time_seconds")
+    if isinstance(agent_loop, int | float):
+        metrics["agent_loop_time_seconds"] = round(float(agent_loop), 3)
+    unattributed = capability.get("unattributed_time_seconds")
+    if isinstance(unattributed, int | float):
+        metrics["unattributed_time_seconds"] = round(float(unattributed), 3)
+    breakdown = capability.get("sandbox_breakdown") if isinstance(capability, dict) else {}
+    if isinstance(breakdown, dict):
+        items = breakdown.get("items") if isinstance(breakdown.get("items"), dict) else {}
+        for name, item in items.items():
+            if not isinstance(item, dict):
+                continue
+            value = item.get("actual_seconds")
+            if isinstance(value, int | float):
+                metrics[f"sandbox_breakdown.{name}.actual_seconds"] = round(float(value), 3)
+    return {
+        "task_id": str(task.get("task_id") or ""),
+        "start_commit": str(workspace.get("start_commit") or ""),
+        "run_id": result_path.parent.name,
+        "metrics": metrics,
+    }
 
 
 def capability_turns_from_result(result_path: Path) -> dict[str, Any]:
