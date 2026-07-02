@@ -746,6 +746,170 @@ def test_provider_time_by_turn_pairs_safe_request_metadata() -> None:
     ]
 
 
+def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None:
+    events = [
+        {
+            "event_type": "context.rendered_for_model",
+            "monotonic_ms": 90,
+            "payload": {
+                "bundle_id": "bundle_1",
+                "message_count": 4,
+                "included": 4,
+                "excluded": 0,
+                "cache_miss_reasons": ["first_request"],
+            },
+        },
+        {
+            "event_type": "model.request.created",
+            "monotonic_ms": 100,
+            "phase_id": "applying_changes",
+            "action_id": "turn_1",
+            "payload": {
+                "request_id": "req_1",
+                "purpose": "plan_next_action",
+                "message_count": 4,
+                "tool_count": 2,
+                "estimated_usage": {"input_tokens": 100},
+            },
+        },
+        {
+            "event_type": "model.response.received",
+            "monotonic_ms": 2600,
+            "phase_id": "applying_changes",
+            "action_id": "turn_1",
+            "payload": {
+                "request_id": "req_1",
+                "finish_reason": "tool_calls",
+                "tool_call_count": 1,
+                "usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 12,
+                    "cached_input_tokens": 20,
+                },
+                "cache": {"cache_hit_ratio": 0.25},
+            },
+        },
+        {
+            "event_type": "model.tool_call.proposed",
+            "monotonic_ms": 2601,
+            "action_id": "call_1",
+            "payload": {
+                "request_id": "req_1",
+                "tool_call_id": "call_1",
+                "function": "edit_apply",
+            },
+        },
+        {
+            "event_type": "tool_protocol.call_completed",
+            "monotonic_ms": 3100,
+            "action_id": "call_1",
+            "payload": {
+                "tool_call_id": "call_1",
+                "tool_name": "edit_apply",
+                "status": "ok",
+                "ok": True,
+                "error_code": None,
+            },
+        },
+        {
+            "event_type": "review.completed",
+            "monotonic_ms": 3200,
+            "phase_id": "applying_changes",
+            "action_id": "patch_1",
+            "payload": {
+                "review_stage": "pre_edit",
+                "decision": "accept",
+                "duration_ms": 800,
+                "critic_duration_ms": 600,
+                "model_critic_status": "ok",
+            },
+        },
+        {
+            "event_type": "verification.check_completed",
+            "monotonic_ms": 3300,
+            "phase_id": "running_verification",
+            "payload": {"check_id": "check_1", "status": "passed", "duration_ms": 30},
+        },
+        {
+            "event_type": "final_reviewer.assess.model_skipped",
+            "monotonic_ms": 3350,
+            "phase_id": "finalizing",
+            "payload": {"reason": "deterministic_gate_decisive"},
+        },
+        {
+            "event_type": "final_reviewer.assess.done",
+            "monotonic_ms": 3400,
+            "phase_id": "finalizing",
+            "payload": {"status": "ready"},
+        },
+    ]
+
+    assert evaluation_runner._turn_diagnostics(events) == [
+        {
+            "turn": 1,
+            "request_id": "req_1",
+            "action_id": "turn_1",
+            "phase_id": "applying_changes",
+            "purpose": "plan_next_action",
+            "provider_duration_seconds": 2.5,
+            "status": "completed",
+            "message_count": 4,
+            "tool_count": 2,
+            "tool_call_count": 1,
+            "finish_reason": "tool_calls",
+            "input_tokens": 120,
+            "output_tokens": 12,
+            "cached_input_tokens": 20,
+            "cache_hit_rate": 0.25,
+            "context": {
+                "bundle_id": "bundle_1",
+                "message_count": 4,
+                "included": 4,
+                "excluded": 0,
+                "cache_miss_reasons": ["first_request"],
+            },
+            "tool_calls": [
+                {
+                    "tool_call_id": "call_1",
+                    "tool_name": "edit_apply",
+                    "status": "ok",
+                    "ok": True,
+                    "error_code": None,
+                    "duration_seconds": 0.499,
+                }
+            ],
+            "review_events": [
+                {
+                    "stage": "pre_edit",
+                    "action_id": "patch_1",
+                    "decision": "accept",
+                    "duration_seconds": 0.8,
+                    "critic_duration_seconds": 0.6,
+                "model_critic_status": "ok",
+                "critic_reused": False,
+                "critic_skipped_reason": "",
+                "critic_reuse_skip_reason": "",
+                "critic_source_status": "ok",
+            }
+            ],
+            "verification_events": [
+                {
+                    "check_id": "check_1",
+                    "status": "passed",
+                    "duration_seconds": 0.03,
+                }
+            ],
+            "finalization_events": [
+                {
+                    "event_type": "final_reviewer.assess.model_skipped",
+                    "status": "",
+                },
+                {"event_type": "final_reviewer.assess.done", "status": "ready"},
+            ],
+        }
+    ]
+
+
 def test_capability_summary_v2_marks_unavailable_timing_without_zero() -> None:
     summary = _build_capability_summary(
         trace=None,

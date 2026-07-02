@@ -2507,6 +2507,7 @@ def _build_capability_summary(
         "final_report_status": final_report_status,
         "agent_loop_result_status": agent_status,
         "provider_time_by_turn": _provider_time_by_turn(events),
+        "turn_diagnostics": _turn_diagnostics(events),
         "sandbox_commands": _sandbox_command_timings(events),
         "wall_phases": wall_phases,
         "unattributed_time_seconds": unattributed_time,
@@ -3515,6 +3516,176 @@ def _provider_time_by_turn(events: list[dict[str, Any]]) -> list[dict[str, Any]]
             }
         )
     return turns
+
+
+def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    starts: dict[str, dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
+    request_to_row: dict[str, dict[str, Any]] = {}
+    tool_to_request: dict[str, str] = {}
+    tool_starts: dict[str, int] = {}
+    latest_context: dict[str, Any] | None = None
+    latest_model_row: dict[str, Any] | None = None
+
+    for event in events:
+        event_type = _event_type(event)
+        payload = _event_payload(event)
+        monotonic_ms = _safe_int(event.get("monotonic_ms"))
+        if event_type == "context.rendered_for_model":
+            latest_context = {
+                "bundle_id": str(payload.get("bundle_id") or ""),
+                "message_count": _safe_int(payload.get("message_count")),
+                "included": _safe_int(payload.get("included")),
+                "excluded": _safe_int(payload.get("excluded")),
+                "cache_miss_reasons": [str(item) for item in payload.get("cache_miss_reasons") or []],
+            }
+            continue
+
+        request_id = str(payload.get("request_id") or "")
+        if event_type == "model.request.created" and request_id:
+            action_id = str(event.get("action_id") or "")
+            if not action_id.startswith("turn_"):
+                continue
+            estimated_usage = payload.get("estimated_usage")
+            starts[request_id] = {
+                "monotonic_ms": monotonic_ms,
+                "phase_id": str(event.get("phase_id") or ""),
+                "action_id": action_id,
+                "purpose": str(payload.get("purpose") or ""),
+                "message_count": _safe_int(payload.get("message_count")),
+                "tool_count": _safe_int(payload.get("tool_count")),
+                "estimated_input_tokens": _safe_int(
+                    estimated_usage.get("input_tokens") if isinstance(estimated_usage, dict) else 0
+                ),
+                "context": dict(latest_context or {}),
+            }
+            continue
+
+        if event_type in {"model.response.received", "model.request.failed"} and request_id:
+            started = starts.get(request_id)
+            if started is None or not started["monotonic_ms"] or monotonic_ms < started["monotonic_ms"]:
+                continue
+            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+            cache = payload.get("cache") if isinstance(payload.get("cache"), dict) else {}
+            row = {
+                "turn": len(rows) + 1,
+                "request_id": request_id,
+                "action_id": started["action_id"],
+                "phase_id": started["phase_id"],
+                "purpose": started["purpose"],
+                "provider_duration_seconds": round((monotonic_ms - started["monotonic_ms"]) / 1000.0, 3),
+                "status": "completed" if event_type == "model.response.received" else "failed",
+                "message_count": started["message_count"],
+                "tool_count": started["tool_count"],
+                "tool_call_count": _safe_int(payload.get("tool_call_count")),
+                "finish_reason": str(payload.get("finish_reason") or ""),
+                "input_tokens": _safe_int(usage.get("input_tokens")) or started["estimated_input_tokens"],
+                "output_tokens": _safe_int(usage.get("output_tokens")),
+                "cached_input_tokens": _safe_int(usage.get("cached_input_tokens")),
+                "cache_hit_rate": round(_safe_float(cache.get("cache_hit_ratio")), 4),
+                "context": started["context"],
+                "tool_calls": [],
+                "review_events": [],
+                "verification_events": [],
+                "finalization_events": [],
+            }
+            rows.append(row)
+            request_to_row[request_id] = row
+            latest_model_row = row
+            continue
+
+        if event_type == "model.tool_call.proposed":
+            tool_call_id = str(payload.get("tool_call_id") or event.get("action_id") or "")
+            if tool_call_id and request_id:
+                tool_to_request[tool_call_id] = request_id
+                tool_starts.setdefault(tool_call_id, monotonic_ms)
+            continue
+
+        if event_type == "tool_protocol.call_started":
+            tool_call_id = str(payload.get("tool_call_id") or event.get("action_id") or "")
+            if tool_call_id:
+                tool_starts[tool_call_id] = monotonic_ms
+            continue
+
+        if event_type == "tool_protocol.call_completed":
+            tool_call_id = str(payload.get("tool_call_id") or event.get("action_id") or "")
+            row = request_to_row.get(tool_to_request.get(tool_call_id, ""))
+            if row is None:
+                continue
+            started_ms = tool_starts.get(tool_call_id)
+            duration = (
+                round((monotonic_ms - started_ms) / 1000.0, 3)
+                if started_ms is not None and monotonic_ms >= started_ms
+                else 0.0
+            )
+            row["tool_calls"].append(
+                {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": str(payload.get("tool_name") or ""),
+                    "status": str(payload.get("status") or ""),
+                    "ok": bool(payload.get("ok")),
+                    "error_code": payload.get("error_code"),
+                    "duration_seconds": duration,
+                }
+            )
+            continue
+
+        if event_type == "review.completed":
+            row = latest_model_row
+            if row is None:
+                continue
+            critic_reused = bool(payload.get("critic_reused"))
+            critic_source_status = str(payload.get("critic_source_status") or "")
+            if not critic_source_status and not critic_reused:
+                critic_source_status = str(payload.get("model_critic_status") or "")
+            row["review_events"].append(
+                {
+                    "stage": str(payload.get("review_stage") or ""),
+                    "action_id": str(event.get("action_id") or ""),
+                    "decision": str(payload.get("decision") or ""),
+                    "duration_seconds": round(_safe_float(payload.get("duration_ms")) / 1000.0, 3),
+                    "critic_duration_seconds": round(_safe_float(payload.get("critic_duration_ms")) / 1000.0, 3),
+                    "model_critic_status": str(payload.get("model_critic_status") or ""),
+                    "critic_reused": critic_reused,
+                    "critic_skipped_reason": str(payload.get("critic_skipped_reason") or ""),
+                    "critic_reuse_skip_reason": str(payload.get("critic_reuse_skip_reason") or ""),
+                    "critic_source_status": critic_source_status,
+                }
+            )
+            continue
+
+        if event_type == "verification.check_completed":
+            row = latest_model_row
+            if row is None:
+                continue
+            row["verification_events"].append(
+                {
+                    "check_id": str(payload.get("check_id") or ""),
+                    "status": str(payload.get("status") or ""),
+                    "duration_seconds": round(_duration_seconds_from_payload(payload), 3),
+                }
+            )
+            continue
+
+        if event_type in {
+            "finalization.completed",
+            "final_report.completed",
+            "final_reviewer.assess.done",
+            "final_reviewer.assess.model_ok",
+            "final_reviewer.assess.model_skipped",
+            "final_reviewer.assess.fallback",
+        }:
+            row = latest_model_row
+            if row is None:
+                continue
+            row["finalization_events"].append(
+                {
+                    "event_type": event_type,
+                    "status": str(payload.get("status") or payload.get("overall_status") or ""),
+                }
+            )
+
+    return rows
 
 
 def _sandbox_command_timings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

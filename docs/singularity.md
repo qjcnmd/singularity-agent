@@ -1784,7 +1784,11 @@
     → 同时写 capability_summary.schema_version =
       evaluation.capability_summary/v2：
       provider_time_by_turn、sandbox_commands、wall_phases、
-      unattributed_time_seconds 与细分 timing/timing_diagnostics；
+      turn_diagnostics、unattributed_time_seconds 与细分
+      timing/timing_diagnostics；
+      turn_diagnostics 只保存安全 ID、phase/purpose、provider latency、
+      token/cache 计数、tool call、review/verification/finalization 事件状态
+      和耗时，不保存 prompt、response、文件内容或 evaluator-only metadata。
       没有可靠 span 的指标为 null + unavailable/not_applicable，
       不伪造 0。sandbox command terminal event 按 command_id 去重，
       不把同一 lifecycle 的 sandbox terminal duration 重复累计。

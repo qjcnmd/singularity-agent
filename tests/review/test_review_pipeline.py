@@ -182,3 +182,262 @@ def test_review_pipeline_model_critic_exception_is_non_blocking(tmp_path: Path) 
 
     assert report.model_critic_status == "model_critic_unavailable"
     assert report.model_critic_error == "critic down"
+
+
+def test_post_patch_reuses_pre_edit_critic_when_evidence_is_unchanged(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_{len(requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "traces")
+    component = ReviewPipeline(
+        tmp_path,
+        trace=trace,
+        model_runner=FakeModelRunner(),
+        enable_model_critic=True,
+    )
+    validation = {
+        "ok": True,
+        "requires_review": False,
+        "changed_files": ["app.py"],
+        "issues": [],
+        "diff_summary": {"files_changed": 1},
+    }
+    patch = {"id": "patch_1", "digest": "digest_1", "touched_paths": ["app.py"]}
+
+    pre = component.pre_edit_review(
+        intent={"id": "intent_1", "summary": "rename"},
+        plan={"id": "plan_1"},
+        patch=patch,
+        validation=validation,
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+    post = component.post_patch_review(
+        edit_result={
+            "ok": True,
+            "status": "applied",
+            "intent_id": "intent_1",
+            "patch_candidate_id": "patch_1",
+            "patch_digest": "digest_1",
+            "changed_files": ["app.py"],
+            "changeset_id": "changeset_1",
+            "transaction_id": "tx_1",
+        },
+        mutation_result={
+            "ok": True,
+            "status": "applied",
+            "affected_files": ["app.py"],
+            "changeset_id": "changeset_1",
+            "transaction_id": "tx_1",
+        },
+        verification_plan={"verification_plan_id": "verify_1", "changed_files": ["app.py"]},
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+
+    assert pre.model_critic_status == "ok"
+    assert post.model_critic_status == "reused"
+    assert post.metadata["critic_reused"] is True
+    assert post.metadata["critic_source_status"] == "ok"
+    assert post.metadata["critic_skipped_reason"] == "pre_edit_evidence_unchanged"
+    assert len(requests) == 1
+    events = [json.loads(line) for line in trace.path.read_text(encoding="utf-8").splitlines()]
+    completed = [event for event in events if event["event_type"] == "review.completed"]
+    assert completed[-1]["payload"]["critic_reused"] is True
+    assert completed[-1]["payload"]["critic_source_status"] == "ok"
+    assert completed[-1]["payload"]["critic_skipped_reason"] == "pre_edit_evidence_unchanged"
+    assert completed[-1]["payload"]["critic_reuse_skip_reason"] == ""
+
+
+def test_post_patch_reuse_matches_pre_edit_patch_touched_paths(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_{len(requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    component = ReviewPipeline(tmp_path, model_runner=FakeModelRunner(), enable_model_critic=True)
+    patch = {"id": "patch_1", "digest": "digest_1", "touched_paths": ["app.py"]}
+
+    component.pre_edit_review(
+        intent={"id": "intent_1", "summary": "rename"},
+        plan={"id": "plan_1"},
+        patch=patch,
+        validation={"ok": True, "requires_review": False, "issues": []},
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+    post = component.post_patch_review(
+        edit_result={
+            "ok": True,
+            "status": "applied",
+            "intent_id": "intent_1",
+            "patch_candidate_id": "patch_1",
+            "patch_digest": "digest_1",
+            "changed_files": ["app.py"],
+        },
+        mutation_result={"ok": True, "status": "applied", "affected_files": ["app.py"]},
+        verification_plan={"verification_plan_id": "verify_1", "changed_files": ["app.py"]},
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+
+    assert post.model_critic_status == "reused"
+    assert post.metadata["critic_reused"] is True
+    assert len(requests) == 1
+
+
+def test_disabled_model_critic_is_not_reported_as_reused(tmp_path: Path) -> None:
+    component = ReviewPipeline(tmp_path, enable_model_critic=False)
+    validation = {
+        "ok": True,
+        "requires_review": False,
+        "changed_files": ["app.py"],
+        "issues": [],
+    }
+    patch = {"id": "patch_1", "digest": "digest_1", "touched_paths": ["app.py"]}
+
+    pre = component.pre_edit_review(
+        intent={"id": "intent_1", "summary": "rename"},
+        plan={"id": "plan_1"},
+        patch=patch,
+        validation=validation,
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+    post = component.post_patch_review(
+        edit_result={
+            "ok": True,
+            "status": "applied",
+            "intent_id": "intent_1",
+            "patch_candidate_id": "patch_1",
+            "patch_digest": "digest_1",
+            "changed_files": ["app.py"],
+        },
+        mutation_result={"ok": True, "status": "applied", "affected_files": ["app.py"]},
+        verification_plan={"verification_plan_id": "verify_1", "changed_files": ["app.py"]},
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+
+    assert pre.model_critic_status == "disabled"
+    assert post.model_critic_status == "disabled"
+    assert post.metadata["critic_reused"] is False
+    assert post.metadata["critic_skipped_reason"] == ""
+
+
+def test_post_patch_does_not_reuse_pre_edit_critic_when_mutation_failed(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_{len(requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    component = ReviewPipeline(tmp_path, model_runner=FakeModelRunner(), enable_model_critic=True)
+    validation = {
+        "ok": True,
+        "requires_review": False,
+        "changed_files": ["app.py"],
+        "issues": [],
+    }
+    patch = {"id": "patch_1", "digest": "digest_1", "touched_paths": ["app.py"]}
+
+    component.pre_edit_review(
+        intent={"id": "intent_1", "summary": "rename"},
+        plan={"id": "plan_1"},
+        patch=patch,
+        validation=validation,
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+    post = component.post_patch_review(
+        edit_result={
+            "ok": False,
+            "status": "failed",
+            "intent_id": "intent_1",
+            "patch_candidate_id": "patch_1",
+            "patch_digest": "digest_1",
+            "changed_files": ["app.py"],
+        },
+        mutation_result={"ok": False, "status": "failed", "affected_files": ["app.py"]},
+        verification_plan={"verification_plan_id": "verify_1", "changed_files": ["app.py"]},
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+
+    assert post.model_critic_status == "ok"
+    assert post.metadata["critic_reused"] is False
+    assert post.metadata["critic_reuse_skip_reason"] == "risk_or_result_requires_review"
+    assert len(requests) == 2
+
+
+def test_unavailable_model_critic_is_not_cached_or_reused(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_{len(requests)}",
+                status=ModelTurnStatus.FAILED,
+                error="provider timeout",
+            )
+
+    component = ReviewPipeline(tmp_path, model_runner=FakeModelRunner(), enable_model_critic=True)
+    validation = {
+        "ok": True,
+        "requires_review": False,
+        "changed_files": ["app.py"],
+        "issues": [],
+    }
+    patch = {"id": "patch_1", "digest": "digest_1", "touched_paths": ["app.py"]}
+
+    pre = component.pre_edit_review(
+        intent={"id": "intent_1", "summary": "rename"},
+        plan={"id": "plan_1"},
+        patch=patch,
+        validation=validation,
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+    post = component.post_patch_review(
+        edit_result={
+            "ok": True,
+            "status": "applied",
+            "intent_id": "intent_1",
+            "patch_candidate_id": "patch_1",
+            "patch_digest": "digest_1",
+            "changed_files": ["app.py"],
+        },
+        mutation_result={"ok": True, "status": "applied", "affected_files": ["app.py"]},
+        verification_plan={"verification_plan_id": "verify_1", "changed_files": ["app.py"]},
+        code_impact={"risk_level": "low"},
+        test_impact={"likely_tests": ["tests/test_app.py"]},
+    )
+
+    assert pre.model_critic_status == "model_critic_unavailable"
+    assert post.model_critic_status == "model_critic_unavailable"
+    assert post.metadata["critic_reused"] is False
+    assert len(requests) == 2

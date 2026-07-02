@@ -38,6 +38,7 @@ class ModelCritic:
             from singularity.model.models import (
                 ContentBlock,
                 ModelMessage,
+                ModelPreferences,
                 ModelPurpose,
                 ModelRole,
                 ModelTurnRequest,
@@ -60,6 +61,7 @@ class ModelCritic:
                         content=[ContentBlock.from_text(_critic_prompt(report, bundle))],
                     )
                 ],
+                model_preferences=ModelPreferences(json_mode=True),
                 context_metadata={
                     "review_id": report.review_id,
                     "review_stage": report.target.stage.value,
@@ -90,7 +92,7 @@ class ModelCritic:
 
     def _parse_findings(self, text: str) -> list[ReviewFinding]:
         try:
-            payload = json.loads(text)
+            payload = _load_json_payload(text)
         except json.JSONDecodeError as exc:
             raise InvalidCriticOutput(str(exc)) from exc
         if isinstance(payload, list):
@@ -119,7 +121,8 @@ def _critic_prompt(report: ReviewReport, bundle: dict[str, Any]) -> str:
         "instruction": (
             "Review this local Singularity change bundle. Return only JSON with a "
             "'findings' list using title, severity, category, location, evidence, "
-            "recommendation, blocking, confidence. Do not return prose."
+            "recommendation, blocking, confidence. Return {\"findings\": []} when "
+            "there are no findings. Do not return prose or markdown fences."
         ),
         "allowed_severities": ["info", "warning", "error", "critical"],
         "allowed_categories": [
@@ -138,6 +141,25 @@ def _critic_prompt(report: ReviewReport, bundle: dict[str, Any]) -> str:
         "bundle": to_bounded_plain(bundle, max_chars=2400),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _load_json_payload(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped:
+        raise json.JSONDecodeError("empty critic response", text, 0)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as original:
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(stripped):
+            if char not in "[{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(stripped[index:])
+                return payload
+            except json.JSONDecodeError:
+                continue
+        raise original
 
 
 def _degraded_finding(title: str, detail: str) -> ReviewFinding:

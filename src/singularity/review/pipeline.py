@@ -44,6 +44,8 @@ class ReviewPipeline:
         self.finding_collector = RuleFindingCollector()
         self.decision_engine = ReviewDecisionEngine()
         self.cancellation_token: Any | None = None
+        self._critic_cache: dict[str, dict[str, Any]] = {}
+        self._pre_edit_by_patch_digest: dict[str, dict[str, Any]] = {}
 
     def pre_edit_review(
         self,
@@ -236,7 +238,35 @@ class ReviewPipeline:
             next_actions=list(rule_decision.next_actions),
             trace_event_ids=started_ids,
         )
-        if self.enable_model_critic:
+        critic_reused = False
+        critic_skipped_reason = ""
+        critic_reuse_skip_reason = ""
+        cached_outcome = self._cached_critic_outcome(target=target, evidence=evidence, context=context)
+        if cached_outcome is not None:
+            critic_reused = True
+            critic_skipped_reason = str(cached_outcome.get("reason") or "cached_critic_outcome")
+            report.model_critic_status = str(cached_outcome.get("status") or "reused")
+            report.model_critic_error = cached_outcome.get("error")
+            report.metadata["critic_reused"] = True
+            report.metadata["critic_skipped_reason"] = critic_skipped_reason
+            report.metadata["critic_source_review_id"] = cached_outcome.get("review_id")
+            report.metadata["critic_source_status"] = str(
+                cached_outcome.get("source_status")
+                or cached_outcome.get("original_status")
+                or cached_outcome.get("status")
+                or ""
+            )
+            cached_findings = cached_outcome.get("findings") or []
+            if isinstance(cached_findings, list):
+                report.findings.extend(
+                    finding if isinstance(finding, ReviewFinding) else ReviewFinding.model_validate(finding)
+                    for finding in cached_findings
+                    if isinstance(finding, ReviewFinding | dict)
+                )
+                report.decision = self.decision_engine.decide(target=target, findings=report.findings, context=context)
+                report.next_actions = list(report.decision.next_actions)
+        elif self.enable_model_critic:
+            critic_reuse_skip_reason = self._critic_reuse_skip_reason(target=target, context=context)
             self._throw_if_cancelled()
             critic = ModelCritic(self.model_runner)
             critic_started = time.perf_counter()
@@ -268,9 +298,17 @@ class ReviewPipeline:
                 report.findings.extend(outcome.findings)
                 report.decision = self.decision_engine.decide(target=target, findings=report.findings, context=context)
                 report.next_actions = list(report.decision.next_actions)
+            self._store_critic_outcome(report, evidence=evidence, context=context)
         else:
             report.model_critic_status = "disabled"
 
+        if not critic_reused:
+            report.metadata.setdefault("critic_reused", False)
+            report.metadata.setdefault("critic_skipped_reason", "")
+            report.metadata.setdefault("critic_reuse_skip_reason", critic_reuse_skip_reason)
+            report.metadata.setdefault("critic_source_status", report.model_critic_status)
+        if target.stage == ReviewStage.PRE_EDIT and report.decision.action == ReviewDecisionAction.ACCEPT:
+            self._store_pre_edit_reference(report, evidence=evidence, context=context)
         report.trace_event_ids.extend(self._emit_findings(report))
         report.trace_event_ids.extend(self._emit_decision(report))
         report.trace_event_ids.extend(
@@ -278,6 +316,10 @@ class ReviewPipeline:
                 report,
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 critic_duration_ms=critic_duration_ms,
+                critic_reused=critic_reused,
+                critic_skipped_reason=critic_skipped_reason,
+                critic_reuse_skip_reason=critic_reuse_skip_reason,
+                critic_source_status=str(report.metadata.get("critic_source_status") or ""),
             )
         )
         self._record_planner(report)
@@ -297,11 +339,15 @@ class ReviewPipeline:
                         "code_impact": plain.get("code_impact"),
                         "test_impact": plain.get("test_impact"),
                         "transaction_id": plain.get("transaction_id"),
+                        "edit_ok": plain.get("ok"),
+                        "edit_status": plain.get("status"),
                     }
                 )
             elif key == "mutation_result" and isinstance(plain, dict):
                 context.setdefault("changed_files", plain.get("affected_files") or plain.get("changed_files") or [])
                 context.setdefault("transaction_id", plain.get("transaction_id"))
+                context["mutation_ok"] = plain.get("ok")
+                context["mutation_status"] = plain.get("status")
             elif key == "verification" and isinstance(plain, dict):
                 context["verification"] = plain
                 assessment = plain.get("completion_assessment") if isinstance(plain.get("completion_assessment"), dict) else {}
@@ -379,6 +425,10 @@ class ReviewPipeline:
         *,
         duration_ms: int,
         critic_duration_ms: int,
+        critic_reused: bool,
+        critic_skipped_reason: str,
+        critic_reuse_skip_reason: str,
+        critic_source_status: str,
     ) -> list[str]:
         return self._emit(
             TraceEventType.REVIEW_COMPLETED,
@@ -392,6 +442,10 @@ class ReviewPipeline:
                 "review_stage": report.target.stage.value,
                 "duration_ms": duration_ms,
                 "critic_duration_ms": critic_duration_ms,
+                "critic_reused": critic_reused,
+                "critic_skipped_reason": critic_skipped_reason,
+                "critic_reuse_skip_reason": critic_reuse_skip_reason,
+                "critic_source_status": critic_source_status,
             },
             severity=TraceSeverity.INFO,
             target=report.target,
@@ -461,6 +515,142 @@ class ReviewPipeline:
                 severity=TraceSeverity.WARNING,
                 target=report.target,
             )
+
+    def _cached_critic_outcome(
+        self,
+        *,
+        target: ReviewTarget,
+        evidence: list[ReviewEvidence],
+        context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self.enable_model_critic:
+            return None
+        cache_key = self._critic_cache_key(target=target, evidence=evidence, context=context)
+        cached = self._critic_cache.get(cache_key)
+        if cached is not None and _critic_status_reusable(cached):
+            return {**cached, "reason": "identical_review_evidence"}
+        if target.stage != ReviewStage.POST_PATCH or not target.patch_digest:
+            return None
+        if not self._post_patch_can_reuse_pre_edit_critic(context):
+            return None
+        pre_edit = self._pre_edit_by_patch_digest.get(target.patch_digest)
+        if pre_edit is None or not _critic_status_reusable(pre_edit):
+            return None
+        if sorted(str(path) for path in pre_edit.get("changed_files") or []) != _changed_files_from_context(context):
+            return None
+        return {**pre_edit, "reason": "pre_edit_evidence_unchanged"}
+
+    def _critic_reuse_skip_reason(self, *, target: ReviewTarget, context: dict[str, Any]) -> str:
+        if target.stage != ReviewStage.POST_PATCH:
+            return "stage_not_reusable"
+        if not target.patch_digest:
+            return "missing_patch_digest"
+        if not self._post_patch_can_reuse_pre_edit_critic(context):
+            return "risk_or_result_requires_review"
+        pre_edit = self._pre_edit_by_patch_digest.get(target.patch_digest)
+        if pre_edit is None:
+            return "pre_edit_reference_missing"
+        if not _critic_status_reusable(pre_edit):
+            return "pre_edit_status_not_reusable"
+        if sorted(str(path) for path in pre_edit.get("changed_files") or []) != _changed_files_from_context(context):
+            return "changed_files_changed"
+        return "cache_key_miss"
+
+    def _store_critic_outcome(
+        self,
+        report: ReviewReport,
+        *,
+        evidence: list[ReviewEvidence],
+        context: dict[str, Any],
+    ) -> None:
+        if report.model_critic_status != "ok":
+            return
+        cache_key = self._critic_cache_key(target=report.target, evidence=evidence, context=context)
+        self._critic_cache[cache_key] = {
+            "review_id": report.review_id,
+            "status": report.model_critic_status,
+            "source_status": report.model_critic_status,
+            "error": report.model_critic_error,
+            "findings": [
+                finding.model_dump(mode="json")
+                for finding in report.findings
+                if finding.source == "model_critic"
+            ],
+        }
+
+    def _store_pre_edit_reference(
+        self,
+        report: ReviewReport,
+        *,
+        evidence: list[ReviewEvidence],
+        context: dict[str, Any],
+    ) -> None:
+        if not report.target.patch_digest:
+            return
+        if not self.enable_model_critic or report.model_critic_status != "ok":
+            return
+        if not self._pre_edit_can_seed_post_patch_critic(context):
+            return
+        self._pre_edit_by_patch_digest[report.target.patch_digest] = {
+            "review_id": report.review_id,
+            "status": "reused",
+            "original_status": report.model_critic_status,
+            "source_status": report.model_critic_status,
+            "error": report.model_critic_error,
+            "evidence_hashes": [item.payload_hash for item in evidence],
+            "changed_files": list(context.get("changed_files") or _changed_files_from_context(context)),
+            "findings": [
+                finding.model_dump(mode="json")
+                for finding in report.findings
+                if finding.source == "model_critic"
+            ],
+        }
+
+    def _critic_cache_key(
+        self,
+        *,
+        target: ReviewTarget,
+        evidence: list[ReviewEvidence],
+        context: dict[str, Any],
+    ) -> str:
+        return _stable_review_hash(
+            {
+                "stage": target.stage.value,
+                "target": target.model_dump(mode="json"),
+                "evidence_hashes": [item.payload_hash for item in evidence],
+                "review_context": _review_reuse_context(context),
+            }
+        )
+
+    def _pre_edit_can_seed_post_patch_critic(self, context: dict[str, Any]) -> bool:
+        validation = context.get("validation") if isinstance(context.get("validation"), dict) else {}
+        if validation.get("ok") is False or validation.get("requires_review") is True:
+            return False
+        if validation.get("issues"):
+            return False
+        return _risk_level(context) in {"", "low", "none"}
+
+    def _post_patch_can_reuse_pre_edit_critic(self, context: dict[str, Any]) -> bool:
+        mutation_ok = context.get("mutation_ok")
+        if mutation_ok is False:
+            return False
+        edit_ok = context.get("edit_ok")
+        if edit_ok is False:
+            return False
+        mutation_status = str(context.get("mutation_status") or "").lower()
+        if mutation_status and mutation_status not in {"applied", "ok", "success", "succeeded"}:
+            return False
+        edit_status = str(context.get("edit_status") or "").lower()
+        if edit_status and edit_status not in {"applied", "ok", "success", "succeeded"}:
+            return False
+        policy_outcome = str(context.get("policy_outcome") or "").lower()
+        if policy_outcome in {"require_review", "ask_user", "escalate", "deny"}:
+            return False
+        verification = context.get("verification") if isinstance(context.get("verification"), dict) else {}
+        status = str(context.get("verification_status") or verification.get("status") or "").lower()
+        if status in {"failed", "blocked", "needs_review"}:
+            return False
+        return _risk_level(context) in {"", "low", "none"}
 
     def _throw_if_cancelled(self) -> None:
         token = getattr(self, "cancellation_token", None)
@@ -561,6 +751,48 @@ def _verification_check_groups(verification: dict[str, Any]) -> dict[str, list[s
         elif status in {"failed", "timeout"}:
             groups["failed_required_checks"].add(check_id)
     return {key: sorted(value) for key, value in groups.items()}
+
+
+def _review_reuse_context(context: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "changed_files": _changed_files_from_context(context),
+        "risk_level": _risk_level(context),
+        "policy_outcome": context.get("policy_outcome"),
+        "verification_status": context.get("verification_status"),
+        "edit_ok": context.get("edit_ok"),
+        "edit_status": context.get("edit_status"),
+        "mutation_ok": context.get("mutation_ok"),
+        "mutation_status": context.get("mutation_status"),
+    }
+
+
+def _changed_files_from_context(context: dict[str, Any]) -> list[str]:
+    changed = context.get("changed_files") or []
+    if not changed and isinstance(context.get("validation"), dict):
+        changed = (
+            context["validation"].get("changed_files")
+            or context["validation"].get("affected_files")
+            or context["validation"].get("touched_paths")
+            or []
+        )
+    if not changed and isinstance(context.get("edit_result"), dict):
+        changed = context["edit_result"].get("changed_files") or []
+    if not changed and isinstance(context.get("patch"), dict):
+        changed = context["patch"].get("changed_files") or context["patch"].get("touched_paths") or []
+    return sorted(str(path) for path in changed)
+
+
+def _risk_level(context: dict[str, Any]) -> str:
+    for key in ("code_impact", "test_impact"):
+        payload = context.get(key)
+        if isinstance(payload, dict) and payload.get("risk_level"):
+            return str(payload["risk_level"]).lower()
+    return ""
+
+
+def _critic_status_reusable(outcome: dict[str, Any]) -> bool:
+    status = str(outcome.get("source_status") or outcome.get("original_status") or outcome.get("status") or "")
+    return status == "ok"
 
 
 def _stable_review_hash(payload: dict[str, Any]) -> str:

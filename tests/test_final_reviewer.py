@@ -290,6 +290,25 @@ def test_final_reviewer_model_can_confirm_with_evidence_refs() -> None:
     assert any(c.producer_source == "model" for c in assessment.criteria)
 
 
+def test_final_reviewer_skips_model_when_rules_already_satisfy_all_criteria() -> None:
+    contract = _make_contract()
+    evidence = EvidenceLedger()
+    evidence.applied_changes.append({"file": "a.py"})
+    evidence.verification_results.append({"check_id": "v1", "status": "passed"})
+    state = _make_state(verification_status="ready")
+    runner = FakeModelRunner({ModelPurpose.FINAL_REVIEW: json.dumps({"criteria": []})})
+    trace = FakeTrace()
+    reviewer = FinalReviewer(model_runner=runner, trace=trace)
+
+    assessment = reviewer.assess(contract=contract, plan=None, evidence=evidence, state=state)
+
+    assert assessment.overall_satisfied is True
+    assert assessment.producer_source == "rules"
+    assert runner.requests == []
+    assert trace.has_event("final_reviewer.assess.done")
+    assert trace.has_event("final_reviewer.assess.model_skipped")
+
+
 def test_final_reviewer_model_cannot_override_evidence_gate() -> None:
     """Model says satisfied=True but criterion has failed_evidence → stays False."""
     contract = _make_contract()

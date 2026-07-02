@@ -3,6 +3,7 @@
   "$id": "https://singularity.local/schemas/tool-call.schema.json",
   "title": "Singularity Tool Call",
   "description": "Schema for ToolCallEnvelope and ToolCallRecord dataclasses from singularity.tool_protocol.models.",
+  "type": "object",
   "$defs": {
     "ToolCallPhase": {
       "type": "string",

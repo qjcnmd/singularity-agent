@@ -52,6 +52,20 @@ def test_model_critic_parses_machine_readable_findings() -> None:
 
     assert outcome.status == "ok"
     assert outcome.findings[0].category == ReviewCategory.TEST_GAP
+    assert outcome.findings[0].source == "model_critic"
+
+
+def test_model_critic_accepts_wrapped_json_without_lowering_schema() -> None:
+    text = """Here is the JSON:
+```json
+{"findings": []}
+```
+"""
+
+    outcome = ModelCritic(FakeModelRunner(text)).review(base_report(), bundle={"summary": "x"})
+
+    assert outcome.status == "ok"
+    assert outcome.findings == []
 
 
 def test_model_critic_unavailable_and_invalid_do_not_block_rules() -> None:
@@ -69,3 +83,12 @@ def test_model_critic_model_runner_failure_degrades_to_non_blocking_finding() ->
 
     assert outcome.status == "model_critic_unavailable"
     assert outcome.findings[0].category == ReviewCategory.VERIFICATION_GAP
+
+
+def test_model_critic_requests_json_mode() -> None:
+    runner = FakeModelRunner('{"findings": []}')
+
+    outcome = ModelCritic(runner).review(base_report(), bundle={})
+
+    assert outcome.status == "ok"
+    assert runner.requests[0].model_preferences.json_mode is True

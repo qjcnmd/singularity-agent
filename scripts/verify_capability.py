@@ -12,8 +12,10 @@ from typing import Any
 
 from verify_gate_common import (
     capability_metrics_from_result,
+    capability_review_from_result,
     capability_sla_from_result,
     capability_timing_from_result,
+    capability_turns_from_result,
     print_json_summary,
     python,
     repo_root_from_script,
@@ -95,6 +97,8 @@ def main() -> int:
     capability_timing = capability_timing_from_result(result_path)
     capability_metrics = capability_metrics_from_result(result_path)
     capability_sla = capability_sla_from_result(result_path)
+    turn_diagnostics = capability_turns_from_result(result_path)
+    review_diagnostics = capability_review_from_result(result_path)
     print_json_summary(
         {
             "gate": "capability",
@@ -108,6 +112,9 @@ def main() -> int:
             "result_path": str(result_path),
             "evaluation_metrics": capability_metrics,
             "capability_sla": capability_sla,
+            "turn_diagnostics": turn_diagnostics,
+            "review_diagnostics": review_diagnostics,
+            "remaining_bottlenecks": _remaining_bottlenecks(capability_sla),
             "timing": timing_summary(
                 [result],
                 total_wall_time=duration,
@@ -121,6 +128,29 @@ def main() -> int:
         }
     )
     return 0 if result.passed else 1
+
+
+def _remaining_bottlenecks(capability_sla: dict[str, Any]) -> list[dict[str, Any]]:
+    items = capability_sla.get("items") if isinstance(capability_sla, dict) else {}
+    if not isinstance(items, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for name, item in items.items():
+        if not isinstance(item, dict):
+            continue
+        delta = item.get("delta_seconds")
+        if not isinstance(delta, int | float) or float(delta) <= 0:
+            continue
+        rows.append(
+            {
+                "name": str(name),
+                "status": item.get("status"),
+                "actual_seconds": item.get("actual_seconds"),
+                "target_seconds": item.get("target_seconds"),
+                "delta_seconds": round(float(delta), 3),
+            }
+        )
+    return sorted(rows, key=lambda item: float(item["delta_seconds"]), reverse=True)
 
 
 if __name__ == "__main__":

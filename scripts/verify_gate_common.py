@@ -212,3 +212,98 @@ def capability_sla_from_result(result_path: Path) -> dict[str, Any]:
     if items:
         result["items"] = dict(sorted(items.items()))
     return result
+
+
+def capability_turns_from_result(result_path: Path) -> dict[str, Any]:
+    if not result_path.exists():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    turns: list[dict[str, Any]] = []
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        capability = task.get("capability_summary") or {}
+        if not isinstance(capability, dict):
+            continue
+        for turn in capability.get("turn_diagnostics") or []:
+            if isinstance(turn, dict):
+                turns.append(turn)
+    slowest = sorted(
+        turns,
+        key=lambda item: float(item.get("provider_duration_seconds") or 0.0),
+        reverse=True,
+    )[:5]
+    return {
+        "turn_count": len(turns),
+        "provider_time_seconds": round(
+            sum(float(turn.get("provider_duration_seconds") or 0.0) for turn in turns),
+            3,
+        ),
+        "tool_call_count": sum(len(turn.get("tool_calls") or []) for turn in turns),
+        "review_event_count": sum(len(turn.get("review_events") or []) for turn in turns),
+        "slowest_turns": [
+            {
+                "turn": turn.get("turn"),
+                "phase_id": turn.get("phase_id"),
+                "purpose": turn.get("purpose"),
+                "provider_duration_seconds": turn.get("provider_duration_seconds"),
+                "tool_call_count": len(turn.get("tool_calls") or []),
+                "review_event_count": len(turn.get("review_events") or []),
+            }
+            for turn in slowest
+        ],
+    }
+
+
+def capability_review_from_result(result_path: Path) -> dict[str, Any]:
+    if not result_path.exists():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    review_events: list[dict[str, Any]] = []
+    review_time = 0.0
+    critic_time = 0.0
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id") or "")
+        capability = task.get("capability_summary") or {}
+        if not isinstance(capability, dict):
+            continue
+        timing = capability.get("timing") or {}
+        if isinstance(timing, dict):
+            review_time += float(timing.get("edit_apply_review_time_seconds") or 0.0)
+            critic_time += float(timing.get("edit_apply_critic_time_seconds") or 0.0)
+        for turn in capability.get("turn_diagnostics") or []:
+            if not isinstance(turn, dict):
+                continue
+            for event in turn.get("review_events") or []:
+                if not isinstance(event, dict):
+                    continue
+                review_events.append(
+                    {
+                        "task_id": task_id,
+                        "turn": turn.get("turn"),
+                        "stage": event.get("stage"),
+                        "duration_seconds": event.get("duration_seconds"),
+                        "critic_duration_seconds": event.get("critic_duration_seconds"),
+                        "model_critic_status": event.get("model_critic_status"),
+                        "critic_reused": bool(event.get("critic_reused")),
+                        "critic_skipped_reason": str(event.get("critic_skipped_reason") or ""),
+                        "critic_reuse_skip_reason": str(event.get("critic_reuse_skip_reason") or ""),
+                        "critic_source_status": str(event.get("critic_source_status") or ""),
+                    }
+                )
+    return {
+        "edit_apply_review_time_seconds": round(review_time, 3),
+        "edit_apply_critic_time_seconds": round(critic_time, 3),
+        "review_event_count": len(review_events),
+        "critic_reused_count": sum(1 for event in review_events if event.get("critic_reused")),
+        "critic_skipped_count": sum(1 for event in review_events if event.get("critic_skipped_reason")),
+        "review_events": review_events,
+    }

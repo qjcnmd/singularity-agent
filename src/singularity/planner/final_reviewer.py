@@ -157,6 +157,17 @@ def _json_payload(text: str) -> dict[str, Any]:
     return result.parsed  # type: ignore[return-value]
 
 
+def _needs_model_confirmation(criteria: list[CriterionAssessment]) -> bool:
+    for criterion in criteria:
+        if criterion.satisfied:
+            continue
+        if criterion.failed_evidence or criterion.risk_remaining:
+            continue
+        if criterion.missing_evidence:
+            return True
+    return False
+
+
 def _emit(
     trace: Any,
     event: str,
@@ -239,8 +250,18 @@ class FinalReviewer:
                     verification_strategies=verification_strategies,
                 )
             )
-        if self.model_runner is not None:
+        if self.model_runner is not None and _needs_model_confirmation(criteria):
             criteria = self._model_confirm(criteria, evidence, context_payload or {})
+        elif self.model_runner is not None:
+            _emit(
+                self.trace,
+                "final_reviewer.assess.model_skipped",
+                summary="final_reviewer model confirm skipped; deterministic evidence gate is decisive",
+                payload={
+                    "reason": "deterministic_gate_decisive",
+                    "criteria_count": len(criteria),
+                },
+            )
         blocking: list[str] = []
         for item in criteria:
             if item.required and not item.satisfied:

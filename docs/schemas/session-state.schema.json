@@ -3,6 +3,7 @@
   "$id": "https://singularity.local/schemas/session-state.schema.json",
   "title": "Singularity Session State",
   "description": "Session state models for Singularity sessions",
+  "type": "object",
   "anyOf": [
     { "$ref": "#/$defs/SessionSummary" },
     { "$ref": "#/$defs/SessionRun" },

@@ -8,8 +8,10 @@ import pytest
 
 from scripts.verify_gate_common import (
     capability_metrics_from_result,
+    capability_review_from_result,
     capability_sla_from_result,
     capability_timing_from_result,
+    capability_turns_from_result,
 )
 
 yaml = pytest.importorskip("yaml")
@@ -308,6 +310,85 @@ def test_capability_sla_reads_task_result_diagnostics(tmp_path: Path) -> None:
                 "blocking": False,
             },
         },
+    }
+
+
+def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> None:
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task_1",
+                        "capability_summary": {
+                            "turn_diagnostics": [
+                                {
+                                    "turn": 1,
+                                    "phase_id": "applying_changes",
+                                    "purpose": "plan_next_action",
+                                    "provider_duration_seconds": 2.5,
+                                    "tool_calls": [{"tool_name": "edit_apply", "status": "ok"}],
+                                    "review_events": [
+                                        {
+                                            "stage": "pre_edit",
+                                            "duration_seconds": 0.8,
+                                            "critic_duration_seconds": 0.6,
+                                            "model_critic_status": "ok",
+                                            "critic_source_status": "ok",
+                                            "critic_reuse_skip_reason": "stage_not_reusable",
+                                        }
+                                    ],
+                                }
+                            ],
+                            "timing": {
+                                "edit_apply_review_time_seconds": 0.8,
+                                "edit_apply_critic_time_seconds": 0.6,
+                            },
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert capability_turns_from_result(result_path) == {
+        "turn_count": 1,
+        "provider_time_seconds": 2.5,
+        "tool_call_count": 1,
+        "review_event_count": 1,
+        "slowest_turns": [
+            {
+                "turn": 1,
+                "phase_id": "applying_changes",
+                "purpose": "plan_next_action",
+                "provider_duration_seconds": 2.5,
+                "tool_call_count": 1,
+                "review_event_count": 1,
+            }
+        ],
+    }
+    assert capability_review_from_result(result_path) == {
+        "edit_apply_review_time_seconds": 0.8,
+        "edit_apply_critic_time_seconds": 0.6,
+        "review_event_count": 1,
+        "critic_reused_count": 0,
+        "critic_skipped_count": 0,
+        "review_events": [
+            {
+                "task_id": "task_1",
+                "turn": 1,
+                "stage": "pre_edit",
+                "duration_seconds": 0.8,
+                "critic_duration_seconds": 0.6,
+                "model_critic_status": "ok",
+                "critic_reused": False,
+                "critic_skipped_reason": "",
+                "critic_reuse_skip_reason": "stage_not_reusable",
+                "critic_source_status": "ok",
+            }
+        ],
     }
 
 
