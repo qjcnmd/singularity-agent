@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from singularity.evaluation import targeted_replay
 from singularity.evaluation.targeted_replay import TargetedFailureReplayRunner
 
 pytestmark = [pytest.mark.evaluation, pytest.mark.external]
@@ -71,6 +72,44 @@ def test_targeted_failure_replay_runner_activates_repair_chain_and_completes(tmp
         and "write_file is allowed" in str((event.get("data") or {}).get("reason") or "")
         for event in trace_events
     )
+
+
+def test_targeted_replay_counts_only_failure_analyzer_results():
+    failure_analyses = [
+        {
+            "request_id": "verification_failure_1",
+            "analysis_id": "local_verification_analysis",
+        },
+        {
+            "request_id": "failure_analysis_1",
+            "analysis_id": "model_failure_analysis",
+        },
+    ]
+    repair_plans = [
+        {
+            "analysis_id": "local_verification_analysis",
+            "repair_contract": {"target_files": ["sandbox/quicksort.py"]},
+        },
+        {
+            "analysis_id": "model_failure_analysis",
+            "repair_contract": {"target_files": ["quicksort.py"]},
+        },
+    ]
+
+    request_ids = {"failure_analysis_1"}
+    analysis_ids = targeted_replay._failure_analysis_ids_for_requests(
+        failure_analyses,
+        request_ids,
+    )
+
+    assert targeted_replay._failure_analyzer_result_count(
+        failure_analyses,
+        request_ids=request_ids,
+    ) == 1
+    assert analysis_ids == {"model_failure_analysis"}
+    assert targeted_replay._repair_plans_for_analysis_ids(repair_plans, analysis_ids) == [
+        repair_plans[1]
+    ]
 
 
 def test_targeted_failure_replay_runner_writes_bounded_json_and_markdown_reports(tmp_path):

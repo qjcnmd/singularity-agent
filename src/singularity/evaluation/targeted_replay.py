@@ -222,7 +222,6 @@ class TargetedFailureReplayRunner:
         agent_result = agent.run("repair quicksort.py after a failing verification and verify it")
         planner_status_history = _planner_status_history(trace.path, planner)
         phase_history = _phase_history(planner_status_history)
-        repair_contract = _latest_repair_contract(planner.evidence.repair_plans)
         repairing_evidence = _repairing_failures_evidence(
             trace.path,
             planner_status_history=planner_status_history,
@@ -234,25 +233,40 @@ class TargetedFailureReplayRunner:
             if planner.final_report is not None
             else getattr(getattr(planner.state, "status", None), "value", "")
         )
+        failure_analysis_request_ids = _trace_event_request_ids(trace.path, "failure_analysis_completed")
+        failure_analysis_ids = _failure_analysis_ids_for_requests(
+            planner.evidence.failure_analyses,
+            failure_analysis_request_ids,
+        )
+        failure_analyzer_repair_plans = _repair_plans_for_analysis_ids(
+            planner.evidence.repair_plans,
+            failure_analysis_ids,
+        )
         return TargetedFailureReplayResult(
             status=agent_result.status.value,
             agent_completed=agent_result.status == AgentLoopStatus.COMPLETED,
             entered_agent_loop=bool(provider.calls),
             failure_trigger=_failure_trigger(planner),
             failure_analysis_request_count=_trace_event_count(trace.path, "failure_analysis_requested"),
-            failure_analysis_result_count=_failure_analyzer_result_count(planner.evidence.failure_analyses),
-            repair_plan_count=_authoritative_repair_plan_count(planner.evidence.repair_plans),
-            repair_contract_count=_repair_contract_count(planner.evidence.repair_plans),
-            repair_attempt_count=_repair_attempt_count(planner.evidence.repair_plans),
-            repair_execution_count=_repair_execution_count(planner.evidence.repair_plans, planner.evidence.verification_results),
+            failure_analysis_result_count=_failure_analyzer_result_count(
+                planner.evidence.failure_analyses,
+                request_ids=failure_analysis_request_ids,
+            ),
+            repair_plan_count=_authoritative_repair_plan_count(failure_analyzer_repair_plans),
+            repair_contract_count=_repair_contract_count(failure_analyzer_repair_plans),
+            repair_attempt_count=_repair_attempt_count(failure_analyzer_repair_plans),
+            repair_execution_count=_repair_execution_count(
+                failure_analyzer_repair_plans,
+                planner.evidence.verification_results,
+            ),
             repairing_failures_seen=bool(repairing_evidence.get("seen")),
             verification_contract_satisfaction=planner.assess_verification_contract_satisfaction().to_dict(),
-            repair_scope=_repair_scope(planner.evidence.repair_plans, planner.evidence.verification_results),
+            repair_scope=_repair_scope(failure_analyzer_repair_plans, planner.evidence.verification_results),
             final_report_status=final_report_status,
             trace_path=str(trace.path),
             phase_history=phase_history,
             planner_status_history=planner_status_history,
-            repair_contract_summary=_repair_contract_summary(repair_contract),
+            repair_contract_summary=_repair_contract_summary(_latest_repair_contract(failure_analyzer_repair_plans)),
             repairing_failures_evidence=repairing_evidence,
             trace_refs=_trace_refs(trace.path),
         )
@@ -318,8 +332,40 @@ def _authoritative_repair_plan_count(repair_plans: list[dict[str, Any]]) -> int:
     return _repair_contract_count(repair_plans)
 
 
-def _failure_analyzer_result_count(failure_analyses: list[dict[str, Any]]) -> int:
-    return sum(1 for item in failure_analyses if isinstance(item, dict) and item.get("request_id"))
+def _failure_analyzer_result_count(
+    failure_analyses: list[dict[str, Any]],
+    *,
+    request_ids: set[str],
+) -> int:
+    return sum(
+        1
+        for item in failure_analyses
+        if isinstance(item, dict) and str(item.get("request_id") or "") in request_ids
+    )
+
+
+def _failure_analysis_ids_for_requests(
+    failure_analyses: list[dict[str, Any]],
+    request_ids: set[str],
+) -> set[str]:
+    return {
+        str(item.get("analysis_id"))
+        for item in failure_analyses
+        if isinstance(item, dict)
+        and str(item.get("request_id") or "") in request_ids
+        and item.get("analysis_id")
+    }
+
+
+def _repair_plans_for_analysis_ids(
+    repair_plans: list[dict[str, Any]],
+    analysis_ids: set[str],
+) -> list[dict[str, Any]]:
+    return [
+        plan
+        for plan in repair_plans
+        if isinstance(plan, dict) and str(plan.get("analysis_id") or "") in analysis_ids
+    ]
 
 
 def _repair_attempt_count(repair_plans: list[dict[str, Any]]) -> int:
@@ -518,6 +564,19 @@ def _trace_event_count(path: Path, event_name: str) -> int:
         if event.get("event") == event_name or event.get("event_type") == event_name:
             count += 1
     return count
+
+
+def _trace_event_request_ids(path: Path, event_name: str) -> set[str]:
+    request_ids: set[str] = set()
+    for event in _trace_events(path):
+        if event.get("event") != event_name and event.get("event_type") != event_name:
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        request_id = str(data.get("request_id") or payload.get("request_id") or "")
+        if request_id:
+            request_ids.add(request_id)
+    return request_ids
 
 
 def _trace_repairing_phase_event_count(path: Path) -> int:
