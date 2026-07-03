@@ -70,6 +70,7 @@ class TraceEventType(StrEnum):
     TOOL_PROTOCOL_RECOVERY_COMPLETED = "tool_protocol.recovery_completed"
     TOOL_VALIDATION_STARTED = "tool.validation.started"
     TOOL_VALIDATION_FAILED = "tool.validation.failed"
+    TOOL_EXPOSURE_DECIDED = "tool.exposure_decided"
     TOOL_DISPATCH_STARTED = "tool.dispatch.started"
     TOOL_DISPATCH_COMPLETED = "tool.dispatch.completed"
     TOOL_DISPATCH_FAILED = "tool.dispatch.failed"

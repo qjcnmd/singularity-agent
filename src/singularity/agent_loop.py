@@ -179,7 +179,12 @@ class AgentLoop:
             planner.step()
             effective_goal = getattr(planner.state, "effective_goal", None) or user_goal
             context.set_user_goal(effective_goal)
-            active_tool_schemas = planner.filtered_tools(tool_schemas, tool_specs=self.tools.list())
+            turn_action_id = f"turn_{turn}"
+            active_tool_schemas = planner.filtered_tools(
+                tool_schemas,
+                tool_specs=self.tools.list(),
+                action_id=turn_action_id,
+            )
             allowed_tool_names = [
                 tool.get("function", {}).get("name")
                 for tool in active_tool_schemas
@@ -191,7 +196,7 @@ class AgentLoop:
                 session_id=getattr(planner, "session_id", self.trace.run_id),
                 task_id=getattr(planner, "task_id", self.trace.run_id),
                 phase_id=planner.state.current_phase if planner.state else "model",
-                action_id=f"turn_{turn}",
+                action_id=turn_action_id,
                 purpose=ModelPurpose.PLAN_NEXT_ACTION,
                 allowed_tool_names=allowed_tool_names,
                 planner_context=planner.planner_context_message(),

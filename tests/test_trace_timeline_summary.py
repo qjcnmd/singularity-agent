@@ -87,6 +87,34 @@ def test_session_recovery_events_are_typed_trace_events(tmp_path) -> None:
     assert events[-1].component == "session"
 
 
+def test_tool_exposure_decision_is_typed_trace_event(tmp_path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
+
+    trace.emit(
+        "tool.exposure_decided",
+        component="planner",
+        summary="Tool exposure decision created.",
+        ids={"task_id": "task_1", "phase_id": "running_verification", "action_id": "turn_1"},
+        payload={
+            "phase": "running_verification",
+            "selected_tools": ["read_file", "run_verification"],
+            "blocked": [
+                {
+                    "name": "search_text",
+                    "reason_code": "phase_not_allowed",
+                    "stage_basis": "planner_phase",
+                    "phase": "running_verification",
+                }
+            ],
+        },
+    )
+
+    events = trace.store.query_events()
+
+    assert events[-1].event_type == TraceEventType.TOOL_EXPOSURE_DECIDED
+    assert events[-1].action_id == "turn_1"
+
+
 def test_timeline_preserves_write_order_for_same_clock_tick(tmp_path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
     timestamp = datetime(2026, 1, 1, tzinfo=UTC)

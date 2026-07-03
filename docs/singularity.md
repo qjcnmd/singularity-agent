@@ -1,6 +1,6 @@
 # Singularity 主链路完整调用链（全部分支路径）
 
-> 基于 `origin/main@05e11471` 源码核对：`agent_loop.py`(891行)、`run_controller.py`(479行)、`execution_outcome.py`(60行)、`error_codes.py`(123行)、`kernel/agent_kernel.py`(483行)、`tool_protocol/engine.py`(946行)。
+> 基于当前源码核对：`agent_loop.py`(896行)、`run_controller.py`(479行)、`execution_outcome.py`(60行)、`error_codes.py`(123行)、`kernel/agent_kernel.py`(483行)、`tool_protocol/engine.py`(946行)。
 > `[成功]` / `[失败]` / `[阻断]` 为关键分叉点；缩进表示嵌套层级。
 
 ---
@@ -292,8 +292,13 @@
 │  │                                                                          │
 │  ├── context.set_user_goal(effective_goal)                                  │
 │  │                                                                          │
-│  ├── active_tool_schemas = planner.filtered_tools(tool_schemas, …)          │
-│  │   └── 基于当前 phase / permission_level / benchmark 约束过滤工具 schema   │
+│  ├── turn_action_id = f"turn_{turn}"                                        │
+│  │                                                                          │
+│  ├── active_tool_schemas = planner.filtered_tools(tool_schemas, …,          │
+│  │       action_id=turn_action_id)                                          │
+│  │   └── 先用 PlannerPolicy.is_allowed() 计算与 authorize_tool_call()       │
+│  │       同源的可授权工具集合，再叠加 repair contract / benchmark 约束，     │
+│  │       过滤工具 schema，并写 tool.exposure_decided 诊断事件                │
 │  │                                                                          │
 │  └── allowed_tool_names = [name for tool in active_tool_schemas             │
 │          if tool.get("function",{}).get("name")]                             │
@@ -309,7 +314,7 @@
 │      session_id      = planner.session_id,                                  │
 │      task_id         = planner.task_id,                                     │
 │      phase_id        = planner.state.current_phase,                         │
-│      action_id       = f"turn_{turn}",                                      │
+│      action_id       = turn_action_id,                                      │
 │      purpose         = ModelPurpose.PLAN_NEXT_ACTION,                       │
 │      allowed_tool_names,                                                    │
 │      planner_context = planner.planner_context_message(),                   │
@@ -322,6 +327,9 @@
 │      context_metadata, trace_metadata,                                      │
 │      model_config, max_tokens, temperature, …                               │
 │  }                                                                          │
+│  其中 tools、ToolChoicePolicy.allowed_tool_names 与                         │
+│  tool.exposure_decided.selected_tools 来自同一 deterministic projection；    │
+│  semantic rolling plan 不扩大当前 phase 的 model-visible tool schema。        │
 │                                                                             │
 │  内部调用链：                                                                  │
 │  ├── ContextManager.build_bundle()                                          │
@@ -1795,6 +1803,8 @@
       output collection、cleanup 与 diagnostics overhead，并标记 actual_execution /
       diagnostic_observation；
       turn_diagnostics 只保存安全 ID、phase/purpose、provider latency、
+      tool choice allowed names、tool exposure selected/blocked/deferred/
+      suppressed names 与 reason_code/stage_basis、denied tool attribution、
       token/cache 计数、tool call、review/verification/finalization 事件状态
       和耗时，不保存 prompt、response、文件内容或 evaluator-only metadata。
       review 事件只保存 model-assisted review 的 output_mode、

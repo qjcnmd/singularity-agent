@@ -9,6 +9,7 @@ import pytest
 from scripts.verify_gate_common import (
     capability_latency_attribution_from_result,
     capability_metrics_from_result,
+    capability_policy_diagnostics_from_result,
     capability_repeated_timing_compare,
     capability_review_from_result,
     capability_sla_diagnostics,
@@ -331,6 +332,33 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                                     "phase_id": "applying_changes",
                                     "purpose": "plan_next_action",
                                     "provider_duration_seconds": 2.5,
+                                    "tool_choice": {
+                                        "mode": "allowed_tools",
+                                        "allowed_tool_names": ["edit_apply", "read_file"],
+                                        "max_tool_calls": 1,
+                                    },
+                                    "tool_exposure": {
+                                        "selected_tools": ["edit_apply", "read_file"],
+                                        "blocked_tools": [
+                                            {
+                                                "name": "search_text",
+                                                "reason_code": "phase_not_allowed",
+                                                "stage_basis": "planner_phase",
+                                                "phase": "applying_changes",
+                                            }
+                                        ],
+                                        "deferred_tools": [],
+                                        "suppressed_tools": [],
+                                    },
+                                    "denied_tools": [
+                                        {
+                                            "tool_name": "search_text",
+                                            "error_code": "action_not_allowed",
+                                            "blocked_reason": "phase_not_allowed",
+                                            "stage_basis": "planner_phase",
+                                            "phase": "applying_changes",
+                                        }
+                                    ],
                                     "tool_calls": [{"tool_name": "edit_apply", "status": "ok"}],
                                     "review_events": [
                                         {
@@ -374,6 +402,7 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
         "provider_time_seconds": 2.5,
         "tool_call_count": 1,
         "review_event_count": 1,
+        "denied_tool_count": 1,
         "slowest_turns": [
             {
                 "turn": 1,
@@ -382,6 +411,34 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                 "provider_duration_seconds": 2.5,
                 "tool_call_count": 1,
                 "review_event_count": 1,
+                "denied_tool_count": 1,
+            }
+        ],
+    }
+    assert capability_policy_diagnostics_from_result(result_path) == {
+        "schema_version": "evaluation.policy_diagnostics_summary/v1",
+        "blocking": False,
+        "denied_tool_count": 1,
+        "denied_tools": [
+            {
+                "task_id": "task_1",
+                "turn": 1,
+                "phase": "applying_changes",
+                "tool_name": "search_text",
+                "error_code": "action_not_allowed",
+                "blocked_reason": "phase_not_allowed",
+                "stage_basis": "planner_phase",
+            }
+        ],
+        "tool_exposure_by_turn": [
+            {
+                "task_id": "task_1",
+                "turn": 1,
+                "phase": "applying_changes",
+                "selected_tools": ["edit_apply", "read_file"],
+                "blocked_tools": ["search_text"],
+                "deferred_tools": [],
+                "suppressed_tools": [],
             }
         ],
     }
@@ -493,7 +550,8 @@ def test_capability_gate_reads_latency_attribution_and_critical_path(tmp_path: P
     capability_script = Path("scripts/verify_capability.py").read_text(encoding="utf-8")
     assert '"latency_attribution": latency_attribution' in capability_script
     assert '"critical_path_breakdown": latency_attribution.get("critical_path_breakdown", [])' in capability_script
-    assert '"8_11_vs_current_timing": phase_8_11_vs_current_timing' in capability_script
+    assert '"8_12_vs_current_timing": phase_8_12_vs_current_timing' in capability_script
+    assert "capability_policy_diagnostics_from_result" in capability_script
 
 
 def test_capability_repeated_timing_compare_reports_min_median_current(tmp_path: Path) -> None:

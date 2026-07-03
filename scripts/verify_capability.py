@@ -13,6 +13,7 @@ from typing import Any
 from verify_gate_common import (
     capability_latency_attribution_from_result,
     capability_metrics_from_result,
+    capability_policy_diagnostics_from_result,
     capability_repeated_timing_compare,
     capability_review_from_result,
     capability_sla_diagnostics,
@@ -105,7 +106,8 @@ def main() -> int:
     sla_diagnostics = capability_sla_diagnostics(capability_sla, timing_compare)
     turn_diagnostics = capability_turns_from_result(result_path)
     review_diagnostics = capability_review_from_result(result_path)
-    phase_8_11_vs_current_timing = _phase_8_11_vs_current_timing(result_path, cwd=cwd)
+    policy_diagnostics = capability_policy_diagnostics_from_result(result_path)
+    phase_8_12_vs_current_timing = _phase_8_12_vs_current_timing(result_path, cwd=cwd)
     print_json_summary(
         {
             "gate": "capability",
@@ -122,7 +124,8 @@ def main() -> int:
             "latency_attribution": latency_attribution,
             "critical_path_breakdown": latency_attribution.get("critical_path_breakdown", []),
             "capability_sla_diagnostics": sla_diagnostics,
-            "8_11_vs_current_timing": phase_8_11_vs_current_timing,
+            "policy_diagnostics": policy_diagnostics,
+            "8_12_vs_current_timing": phase_8_12_vs_current_timing,
             "timing_compare": timing_compare,
             "turn_diagnostics": turn_diagnostics,
             "review_diagnostics": review_diagnostics,
@@ -142,15 +145,16 @@ def main() -> int:
     return 0 if result.passed else 1
 
 
-def _phase_8_11_vs_current_timing(result_path: Path, *, cwd: Path) -> dict[str, Any]:
-    baseline_path = cwd / "work" / "evaluations" / "phase8-11-windows-sandbox-readiness" / "result.json"
+def _phase_8_12_vs_current_timing(result_path: Path, *, cwd: Path) -> dict[str, Any]:
+    baseline_run_id = "phase8-12-agentloop-latency-attribution-rerun"
+    baseline_path = cwd / "work" / "evaluations" / baseline_run_id / "result.json"
     baseline = _timing_record_for_compare(baseline_path)
     current = _timing_record_for_compare(result_path)
     if not baseline or not current:
         return {
             "schema_version": "evaluation.phase_timing_compare/v1",
             "status": "unavailable",
-            "baseline_run_id": "phase8-11-windows-sandbox-readiness",
+            "baseline_run_id": baseline_run_id,
             "current_run_id": result_path.parent.name,
             "reason": "baseline or current result is unavailable",
             "metrics": {},
@@ -165,7 +169,7 @@ def _phase_8_11_vs_current_timing(result_path: Path, *, cwd: Path) -> dict[str, 
             else None
         )
         metrics[name] = {
-            "phase_8_11_seconds": baseline_value,
+            "phase_8_12_seconds": baseline_value,
             "current_seconds": current_value,
             "delta_seconds": delta,
             "status": "improved" if isinstance(delta, int | float) and delta < 0 else "regressed"
@@ -177,7 +181,7 @@ def _phase_8_11_vs_current_timing(result_path: Path, *, cwd: Path) -> dict[str, 
     return {
         "schema_version": "evaluation.phase_timing_compare/v1",
         "status": "available",
-        "baseline_run_id": "phase8-11-windows-sandbox-readiness",
+        "baseline_run_id": baseline_run_id,
         "current_run_id": result_path.parent.name,
         "metrics": metrics,
     }

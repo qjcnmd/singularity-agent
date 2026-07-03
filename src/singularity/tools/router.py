@@ -107,7 +107,11 @@ class ToolRouter:
             )
             if record is None:
                 selected.append(spec.name)
-            elif record.reason_code.startswith("blocked_") or record.reason_code.startswith("user_"):
+            elif (
+                record.reason_code == "phase_not_allowed"
+                or record.reason_code.startswith("blocked_")
+                or record.reason_code.startswith("user_")
+            ):
                 blocked.append(record)
             elif record.reason_code.endswith("_indirect") or record.reason_code == "low_level_internal_capability":
                 deferred.append(record)

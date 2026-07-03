@@ -770,6 +770,11 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
                 "message_count": 4,
                 "tool_count": 2,
                 "estimated_usage": {"input_tokens": 100},
+                "tool_choice": {
+                    "mode": "allowed_tools",
+                    "allowed_tool_names": ["edit_apply", "read_file"],
+                    "max_tool_calls": 1,
+                },
             },
         },
         {
@@ -797,6 +802,26 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
                 "request_id": "req_1",
                 "tool_call_id": "call_1",
                 "function": "edit_apply",
+            },
+        },
+        {
+            "event_type": "tool.exposure_decided",
+            "monotonic_ms": 2602,
+            "phase_id": "applying_changes",
+            "action_id": "turn_1",
+            "payload": {
+                "phase": "applying_changes",
+                "selected_tools": ["edit_apply", "read_file"],
+                "blocked": [
+                    {
+                        "name": "run_command",
+                        "reason_code": "command_executor_indirect",
+                        "stage_basis": "executor_indirection",
+                        "phase": "applying_changes",
+                    }
+                ],
+                "deferred": [],
+                "suppressed": [],
             },
         },
         {
@@ -847,6 +872,12 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
             "phase_id": "finalizing",
             "payload": {"status": "ready"},
         },
+        {
+            "event_type": "final_reviewer.assess.done",
+            "monotonic_ms": 3450,
+            "phase_id": "finalizing",
+            "payload": {"status": "ready"},
+        },
     ]
 
     assert evaluation_runner._turn_diagnostics(events) == [
@@ -860,6 +891,25 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
             "status": "completed",
             "message_count": 4,
             "tool_count": 2,
+            "tool_choice": {
+                "mode": "allowed_tools",
+                "allowed_tool_names": ["edit_apply", "read_file"],
+                "max_tool_calls": 1,
+            },
+            "tool_exposure": {
+                "selected_tools": ["edit_apply", "read_file"],
+                "blocked_tools": [
+                    {
+                        "name": "run_command",
+                        "reason_code": "command_executor_indirect",
+                        "stage_basis": "executor_indirection",
+                        "phase": "applying_changes",
+                    }
+                ],
+                "deferred_tools": [],
+                "suppressed_tools": [],
+            },
+            "denied_tools": [],
             "tool_call_count": 1,
             "finish_reason": "tool_calls",
             "input_tokens": 120,
@@ -918,6 +968,179 @@ def test_turn_diagnostics_correlates_provider_tools_context_and_review() -> None
             ],
         }
     ]
+
+
+def test_turn_diagnostics_attributes_denied_tool_to_phase_and_tool_choice() -> None:
+    events = [
+        {
+            "event_type": "tool.exposure_decided",
+            "monotonic_ms": 90,
+            "phase_id": "running_verification",
+            "action_id": "turn_6",
+            "payload": {
+                "phase": "running_verification",
+                "selected_tools": ["get_verification_result", "read_file", "run_verification"],
+                "blocked": [
+                    {
+                        "name": "search_text",
+                        "reason_code": "phase_not_allowed",
+                        "stage_basis": "planner_phase",
+                        "phase": "running_verification",
+                    }
+                ],
+                "deferred": [],
+                "suppressed": [],
+            },
+        },
+        {
+            "event_type": "model.request.created",
+            "monotonic_ms": 100,
+            "phase_id": "running_verification",
+            "action_id": "turn_6",
+            "payload": {
+                "request_id": "req_6",
+                "purpose": "plan_next_action",
+                "message_count": 22,
+                "tool_count": 3,
+                "estimated_usage": {"input_tokens": 14000},
+                "tool_choice": {
+                    "mode": "allowed_tools",
+                    "allowed_tool_names": [
+                        "get_verification_result",
+                        "read_file",
+                        "run_verification",
+                    ],
+                    "max_tool_calls": 1,
+                },
+            },
+        },
+        {
+            "event_type": "model.response.received",
+            "monotonic_ms": 9300,
+            "phase_id": "running_verification",
+            "action_id": "turn_6",
+            "payload": {
+                "request_id": "req_6",
+                "finish_reason": "tool_calls",
+                "tool_call_count": 1,
+                "usage": {"input_tokens": 14094, "output_tokens": 758},
+            },
+        },
+        {
+            "event_type": "model.tool_call.proposed",
+            "monotonic_ms": 9301,
+            "action_id": "call_search",
+            "payload": {
+                "request_id": "req_6",
+                "tool_call_id": "call_search",
+                "function": "search_text",
+            },
+        },
+        {
+            "event_type": "tool_protocol.call_completed",
+            "monotonic_ms": 9400,
+            "action_id": "call_search",
+            "payload": {
+                "tool_call_id": "call_search",
+                "tool_name": "search_text",
+                "status": "failed",
+                "ok": False,
+                "error_code": "action_not_allowed",
+            },
+        },
+    ]
+
+    row = evaluation_runner._turn_diagnostics(events)[0]
+
+    assert row["tool_choice"]["allowed_tool_names"] == [
+        "get_verification_result",
+        "read_file",
+        "run_verification",
+    ]
+    assert row["tool_exposure"]["blocked_tools"] == [
+        {
+            "name": "search_text",
+            "reason_code": "phase_not_allowed",
+            "stage_basis": "planner_phase",
+            "phase": "running_verification",
+        }
+    ]
+    assert row["denied_tools"] == [
+        {
+            "tool_name": "search_text",
+            "error_code": "action_not_allowed",
+            "blocked_reason": "phase_not_allowed",
+            "stage_basis": "planner_phase",
+            "phase": "running_verification",
+        }
+    ]
+
+
+def test_secret_leak_detection_ignores_redaction_rule_names() -> None:
+    events = [
+        {
+            "event_type": "command.completed",
+            "payload": {
+                "env_policy": {
+                    "redaction_rules": [
+                        "*_TOKEN",
+                        "*_KEY",
+                        "*_SECRET",
+                        "OPENAI_API_KEY",
+                    ]
+                }
+            },
+        }
+    ]
+
+    assert evaluation_runner._secret_leak_detected(events) is False
+
+
+def test_secret_leak_detection_flags_unredacted_secret_values() -> None:
+    events = [
+        {
+            "event_type": "command.completed",
+            "payload": {
+                "env": {"OPENAI_API_KEY": "sk-local-test-secret"},
+                "headers": {"Authorization": "Bearer raw-token-value"},
+            },
+        }
+    ]
+
+    assert evaluation_runner._secret_leak_detected(events) is True
+
+
+def test_secret_leak_detection_allows_safe_token_usage_metrics() -> None:
+    events = [
+        {
+            "event_type": "model.response.received",
+            "payload": {
+                "usage": {
+                    "input_tokens": 14094,
+                    "cached_input_tokens": 1024,
+                    "output_tokens": 758,
+                    "total_tokens": 14852,
+                },
+                "token_usage": {
+                    "prompt_tokens": 14094,
+                    "completion_tokens": 758,
+                },
+            },
+        }
+    ]
+
+    assert evaluation_runner._secret_leak_detected(events) is False
+
+
+def test_secret_leak_detection_flags_unredacted_access_token() -> None:
+    events = [
+        {
+            "event_type": "command.completed",
+            "payload": {"headers": {"access_token": "raw-access-token-value"}},
+        }
+    ]
+
+    assert evaluation_runner._secret_leak_detected(events) is True
 
 
 def test_capability_summary_groups_review_provider_latency_by_stage(tmp_path: Path) -> None:

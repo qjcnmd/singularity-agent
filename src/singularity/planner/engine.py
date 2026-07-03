@@ -1640,14 +1640,12 @@ class Planner:
         policy_profile: str | None = None,
         sandbox_mode: str | None = None,
         workspace_state: dict[str, Any] | None = None,
+        action_id: str | None = None,
     ) -> ToolExposureDecision:
         self._throw_if_cancelled()
         state = self._state()
         phase = self._plan().phase(state.current_phase)
-        allowed = set(phase.allowed_tools)
-        current_step = self.semantic_rolling_plan().current_step()
-        if current_step is not None:
-            allowed.update(current_step.allowed_capabilities)
+        allowed = self._authorized_tool_names_for_phase(phase, available_tools)
         repair_execution_block = self._repair_contract_execution_block()
         if repair_execution_block:
             allowed &= self._repair_contract_evidence_tools()
@@ -1669,7 +1667,27 @@ class Planner:
             workspace_state=workspace_state,
         )
         if self.trace is not None:
-            self.trace.record("tool.exposure_decided", decision.to_trace_data())
+            payload = {
+                **decision.to_trace_data(),
+                "task_id": getattr(state, "task_id", ""),
+                "phase_id": phase.phase_id,
+                "action_id": action_id or self._current_turn_action_id(),
+            }
+            if hasattr(self.trace, "emit"):
+                self.trace.emit(
+                    "tool.exposure_decided",
+                    component="planner",
+                    summary="Tool exposure decision created.",
+                    payload=payload,
+                    ids={
+                        "session_id": self.session_id,
+                        "task_id": self.task_id,
+                        "phase_id": phase.phase_id,
+                        "action_id": payload["action_id"],
+                    },
+                )
+            else:
+                self.trace.record("tool.exposure_decided", payload)
         return decision
 
     def filtered_tools(
@@ -1680,6 +1698,7 @@ class Planner:
         policy_profile: str | None = None,
         sandbox_mode: str | None = None,
         workspace_state: dict[str, Any] | None = None,
+        action_id: str | None = None,
     ) -> list[dict[str, Any]]:
         self._throw_if_cancelled()
         if tool_specs is not None:
@@ -1689,13 +1708,12 @@ class Planner:
                     policy_profile=policy_profile,
                     sandbox_mode=sandbox_mode,
                     workspace_state=workspace_state,
+                    action_id=action_id,
                 ).selected_tool_names
             )
         else:
-            allowed = set(self._plan().phase(self._state().current_phase).allowed_tools)
-            current_step = self.semantic_rolling_plan().current_step()
-            if current_step is not None:
-                allowed.update(current_step.allowed_capabilities)
+            phase = self._plan().phase(self._state().current_phase)
+            allowed = self._authorized_tool_names_for_phase(phase)
             repair_execution_block = self._repair_contract_execution_block()
             if repair_execution_block:
                 allowed &= self._repair_contract_evidence_tools()
@@ -1711,6 +1729,23 @@ class Planner:
             for tool in tools
             if tool.get("function", {}).get("name") in allowed
         ]
+
+    def _authorized_tool_names_for_phase(
+        self,
+        phase: TaskPhase,
+        available_tools: list[ToolSpec] | None = None,
+    ) -> set[str]:
+        if available_tools is None:
+            return {
+                tool_name
+                for tool_name in phase.allowed_tools
+                if self.policy.action_for_tool(tool_name) in phase.allowed_actions
+            }
+        return {
+            spec.name
+            for spec in available_tools
+            if self.policy.is_allowed(phase=phase, tool_name=spec.name, spec=spec)
+        }
 
     def semantic_rolling_plan(self) -> RollingPlan:
         state = self._state()
@@ -2265,6 +2300,20 @@ class Planner:
             reason=f"Recorded {trigger} retrieval guidance.",
             extra={"retrieval": result},
         )
+
+    def _current_turn_action_id(self) -> str:
+        count = 0
+        if self.trace is not None and hasattr(self.trace, "store"):
+            try:
+                count = sum(
+                    1
+                    for event in self.trace.store.query_events()
+                    if str(getattr(event.event_type, "value", event.event_type)) == "model.request.created"
+                    and str(event.action_id or "").startswith("turn_")
+                )
+            except Exception:
+                count = 0
+        return f"turn_{count + 1}"
 
     def _persist(self) -> None:
         if self.state is None or self.plan is None:

@@ -87,7 +87,8 @@ def test_planner_context_exposes_rolling_plan_and_current_step_tools(tmp_path: P
     exposed = {tool["function"]["name"] for tool in planner.filtered_tools(tools)}
     context = json.loads(planner.planner_context_message()["content"])["planner"]
 
-    assert "write_file" in exposed
+    assert "write_file" not in exposed
+    assert "read_file" in exposed
     assert context["rolling_plan"]["current_step_id"] == deliver_step.step_id
     assert context["rolling_plan"]["steps"][1]["acceptance_criterion_id"] == "deliver_quicksort_py"
 

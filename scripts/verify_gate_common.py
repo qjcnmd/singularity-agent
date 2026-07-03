@@ -531,6 +531,7 @@ def capability_turns_from_result(result_path: Path) -> dict[str, Any]:
         ),
         "tool_call_count": sum(len(turn.get("tool_calls") or []) for turn in turns),
         "review_event_count": sum(len(turn.get("review_events") or []) for turn in turns),
+        "denied_tool_count": sum(len(turn.get("denied_tools") or []) for turn in turns),
         "slowest_turns": [
             {
                 "turn": turn.get("turn"),
@@ -539,10 +540,78 @@ def capability_turns_from_result(result_path: Path) -> dict[str, Any]:
                 "provider_duration_seconds": turn.get("provider_duration_seconds"),
                 "tool_call_count": len(turn.get("tool_calls") or []),
                 "review_event_count": len(turn.get("review_events") or []),
+                "denied_tool_count": len(turn.get("denied_tools") or []),
             }
             for turn in slowest
         ],
     }
+
+
+def capability_policy_diagnostics_from_result(result_path: Path) -> dict[str, Any]:
+    if not result_path.exists():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    denied_tools: list[dict[str, Any]] = []
+    exposure_by_turn: list[dict[str, Any]] = []
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id") or "")
+        capability = task.get("capability_summary") or {}
+        if not isinstance(capability, dict):
+            continue
+        for turn in capability.get("turn_diagnostics") or []:
+            if not isinstance(turn, dict):
+                continue
+            turn_id = int(turn.get("turn") or 0)
+            phase = str(turn.get("phase_id") or "")
+            for item in turn.get("denied_tools") or []:
+                if not isinstance(item, dict):
+                    continue
+                denied_tools.append(
+                    {
+                        "task_id": task_id,
+                        "turn": turn_id,
+                        "phase": phase,
+                        "tool_name": str(item.get("tool_name") or ""),
+                        "error_code": str(item.get("error_code") or ""),
+                        "blocked_reason": str(item.get("blocked_reason") or ""),
+                        "stage_basis": str(item.get("stage_basis") or ""),
+                    }
+                )
+            exposure = turn.get("tool_exposure") if isinstance(turn.get("tool_exposure"), dict) else {}
+            if exposure:
+                exposure_by_turn.append(
+                    {
+                        "task_id": task_id,
+                        "turn": turn_id,
+                        "phase": phase,
+                        "selected_tools": [str(item) for item in exposure.get("selected_tools") or []],
+                        "blocked_tools": _exposure_names(exposure.get("blocked_tools")),
+                        "deferred_tools": _exposure_names(exposure.get("deferred_tools")),
+                        "suppressed_tools": _exposure_names(exposure.get("suppressed_tools")),
+                    }
+                )
+    return {
+        "schema_version": "evaluation.policy_diagnostics_summary/v1",
+        "blocking": False,
+        "denied_tool_count": len(denied_tools),
+        "denied_tools": denied_tools,
+        "tool_exposure_by_turn": exposure_by_turn,
+    }
+
+
+def _exposure_names(payload: Any) -> list[str]:
+    names: list[str] = []
+    for item in payload or []:
+        if isinstance(item, dict):
+            names.append(str(item.get("name") or ""))
+        else:
+            names.append(str(item))
+    return names
 
 
 def capability_review_from_result(result_path: Path) -> dict[str, Any]:

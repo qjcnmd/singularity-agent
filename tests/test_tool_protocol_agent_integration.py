@@ -10,7 +10,7 @@ from singularity.context import ContextManager
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.observability.models import TraceEvent, TraceEventType
 from singularity.observability.summary import TraceSummaryBuilder
-from singularity.planner import Planner
+from singularity.planner import Planner, TaskStatus
 from tests.agent_loop_helpers import make_agent_session
 
 
@@ -240,6 +240,69 @@ def test_agent_delegates_tool_call_processing_to_tool_protocol(tmp_path: Path) -
     payload = json.loads(tool_messages[0]["content"])
     assert payload["tool_name"] == "read_file"
     assert payload["status"] == "rejected"
+
+
+def test_agent_loop_uses_single_tool_projection_for_schema_choice_and_policy_trace(
+    tmp_path: Path,
+) -> None:
+    provider = MockProvider(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "done",
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22},
+        },
+    )
+    trace = JsonlTraceRecorder.create(tmp_path)
+    planner = Planner(tmp_path, session_id=trace.run_id, task_id=trace.run_id, trace=trace)
+    planner.start_task("verify safely")
+    assert planner.state is not None
+    planner.state.status = TaskStatus.RUNNING_VERIFICATION
+    planner.state.current_phase = "running_verification"
+    planner.state.rolling_plan = {
+        "plan_id": "rolling_1",
+        "version": 1,
+        "user_goal": "verify safely",
+        "current_step_id": "step_verify",
+        "steps": [
+            {
+                "step_id": "step_verify",
+                "title": "Search then verify",
+                "kind": "verify",
+                "allowed_capabilities": ["search_text", "run_verification", "read_file"],
+                "expected_evidence": [],
+                "fallback_steps": [],
+            }
+        ],
+    }
+    agent = make_agent_session(
+        tmp_path,
+        provider=provider,  # type: ignore[arg-type]
+        trace=trace,
+        planner=planner,
+        max_turns=1,
+    )
+
+    agent.run("verify safely")
+
+    events = [json.loads(line) for line in trace.path.read_text(encoding="utf-8").splitlines()]
+    exposure = next(event["data"] for event in events if event["event"] == "tool.exposure_decided")
+    request = next(event["data"] for event in events if event["event"] == "model.request.created")
+    schema_names = [tool["function"]["name"] for tool in provider.calls[0]["tools"]]
+
+    assert exposure["action_id"] == request["action_id"] == "turn_1"
+    assert schema_names == exposure["selected_tools"]
+    assert request["tool_choice"]["allowed_tool_names"] == schema_names
+    assert "search_text" not in schema_names
+    assert any(
+        item["name"] == "search_text" and item["reason_code"] == "phase_not_allowed"
+        for item in exposure["blocked"]
+    )
 
 
 def test_agent_loop_continues_after_compaction_with_usage_tool_observation_and_finalization(

@@ -211,7 +211,9 @@ def test_tool_router_blocks_write_tools_for_active_tests_write_constraint(tmp_pa
     assert "apply_patch" not in decision.selected_tool_names
     assert "write_file" not in decision.selected_tool_names
     assert {item.name for item in decision.blocked_tools} >= {"apply_patch", "write_file"}
-    assert all(item.reason_code == "user_constraint_blocks_write_path" for item in decision.blocked_tools)
+    blocked_by_name = {item.name: item.reason_code for item in decision.blocked_tools}
+    assert blocked_by_name["apply_patch"] == "user_constraint_blocks_write_path"
+    assert blocked_by_name["write_file"] == "user_constraint_blocks_write_path"
 
     events = [json.loads(line) for line in trace.path.read_text(encoding="utf-8").splitlines()]
     exposure = [event for event in events if event["event"] == "tool.exposure_decided"][-1]
@@ -279,3 +281,53 @@ def test_model_request_contains_only_selected_tool_schemas_not_router_internals(
     assert "hidden_tools" not in serialized
     assert "suppressed_tools" not in serialized
     assert "blocked_tools" not in serialized
+
+
+def test_semantic_capabilities_do_not_widen_phase_tool_exposure(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    for tool_spec in _tool_specs():
+        registry.register(tool_spec)
+    planner = _planner(tmp_path, "running_verification")
+    assert planner.state is not None
+    planner.state.rolling_plan = {
+        "plan_id": "rolling_1",
+        "version": 1,
+        "user_goal": "verify",
+        "current_step_id": "step_verify",
+        "steps": [
+            {
+                "step_id": "step_verify",
+                "title": "Verify",
+                "kind": "verify",
+                "allowed_capabilities": ["read_file", "search_text", "run_verification"],
+                "expected_evidence": [],
+                "fallback_steps": [],
+            }
+        ],
+    }
+
+    decision = planner.decide_tool_exposure(registry.list())
+    blocked = {item.name: item.reason_code for item in decision.blocked_tools}
+
+    assert "search_text" not in decision.selected_tool_names
+    assert blocked["search_text"] == "phase_not_allowed"
+    assert "run_verification" in decision.selected_tool_names
+
+
+def test_tool_exposure_matches_authorization_actions_in_repair_phase(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    for tool_spec in _tool_specs():
+        registry.register(tool_spec)
+    planner = _planner(tmp_path, "repairing_failures")
+
+    decision = planner.decide_tool_exposure(registry.list())
+    blocked = {item.name: item.reason_code for item in decision.blocked_tools}
+
+    assert "search_text" not in decision.selected_tool_names
+    assert blocked["search_text"] == "phase_not_allowed"
+    assert planner.authorize_tool_call(
+        tool_name="search_text",
+        tool_call_id="call_search",
+        spec=next(tool for tool in registry.list() if tool.name == "search_text"),
+        arguments={"query": "needle"},
+    ).allowed is False

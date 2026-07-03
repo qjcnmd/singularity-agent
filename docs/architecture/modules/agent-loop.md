@@ -34,7 +34,7 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`AgentKernel.run_task()` -> `AgentLoop.run()` -> `ModelRunner.build_request_from_context()` 先生成对象 `ModelTurnRequest`，`ModelRunner.run_turn()` 返回 `ModelTurnResult` 后交给 `ToolProtocolEngine.process_model_turn()`。工具结果通过 `ContextManager.add_tool_protocol_result()` 和 `Planner.update_from_tool_result()` 写入 `context.sqlite3`、planner evidence 和 trace 事件；关键 tool/verification/policy/sandbox/task outcome evidence 由 `EvidenceLedger.add_*()` typed helper 写入 JSON 投影。当 completion gate 通过时，`AgentLoop._attempt_finalize()` 调用 `Planner.finalize()`，`Finalizer.build()` 通过 typed evidence helper 生成 `FinalReport`，然后写入 `final_answer` trace event。若模型失败，`_outcome_from_model_failure()` 归类 provider 错误，`_terminal_result_from_outcome()` 返回带 `error_code` 的 `AgentLoopResult`。
+以用户要求修复 `quicksort.py` 为例：`AgentKernel.run_task()` -> `AgentLoop.run()` -> `ModelRunner.build_request_from_context()` 先生成对象 `ModelTurnRequest`，`ModelRunner.run_turn()` 返回 `ModelTurnResult` 后交给 `ToolProtocolEngine.process_model_turn()`。每个 turn 在构造模型请求前先生成 `turn_action_id="turn_N"` 并传给 `Planner.filtered_tools()`；Planner 先通过 `PlannerPolicy.is_allowed()` 对当前 phase 的 allowed tools、allowed actions、permission level、mutation manager 和 command executor 要求求交，得到与 `authorize_tool_call()` 同源的可授权集合，再叠加 benchmark constraints 与 repair contract 生成同一份 deterministic projection，并把 `tool.exposure_decided` trace event 与 `ModelTurnRequest.action_id` 绑定。模型可见 tool schema、`ToolChoicePolicy.allowed_tool_names` 和 `tool.exposure_decided.selected_tools` 必须来自同一 selected tool 集合；semantic rolling plan 只能进入 planner context，不会扩大当前 phase 可暴露工具。工具结果通过 `ContextManager.add_tool_protocol_result()` 和 `Planner.update_from_tool_result()` 写入 `context.sqlite3`、planner evidence 和 trace 事件；关键 tool/verification/policy/sandbox/task outcome evidence 由 `EvidenceLedger.add_*()` typed helper 写入 JSON 投影。当 completion gate 通过时，`AgentLoop._attempt_finalize()` 调用 `Planner.finalize()`，`Finalizer.build()` 通过 typed evidence helper 生成 `FinalReport`，然后写入 `final_answer` trace event。若模型失败，`_outcome_from_model_failure()` 归类 provider 错误，`_terminal_result_from_outcome()` 返回带 `error_code` 的 `AgentLoopResult`。
 
 ## 真实对象完整结构
 
@@ -94,6 +94,7 @@ class AgentLoopStatus(StrEnum):
 ## 是否进入 trace / audit
 
 - `_record_outcome_context()` 写 `execution_outcome` event，并把同一 outcome 加入 planner context；模型失败由 `_record_model_failure()` 写 `model_failure`，超 turn 另写 `error(type=MaxTurnsExceeded)`。
+- `Planner.filtered_tools()` 在每个模型 turn 前写 `tool.exposure_decided` trace event，payload 只包含 `selected_tools`、blocked/deferred/suppressed tool 名称、`reason_code`、`stage_basis`、phase、policy/sandbox/constraint factors 和 action id；不包含 raw prompt、raw response、raw patch text、secret、文件内容或 evaluator-only metadata。
 - 所有终止分支写 `final_answer` event，payload 来源是 `turn` 与最终文本；trace 记录的是这些事件和 outcome，而不是完整 `AgentLoopResult` 对象。
 - AgentLoop 自身不写 policy audit。tool/command/verification 触发的 `PolicyRequest`/`PolicyDecision` 由相应执行器和 policy audit ledger 记录。
 

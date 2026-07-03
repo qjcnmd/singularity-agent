@@ -3886,11 +3886,57 @@ def _cost_payload(
 
 
 def _secret_leak_detected(events: list[dict[str, Any]]) -> bool:
-    for event in events:
-        rendered = json.dumps(_event_payload(event), ensure_ascii=False).lower()
-        if "api_key" in rendered or "authorization" in rendered or "bearer " in rendered:
-            return True
+    return any(_payload_has_secret_leak(_event_payload(event)) for event in events)
+
+
+def _payload_has_secret_leak(value: Any, *, path: tuple[str, ...] = ()) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key).lower()
+            next_path = (*path, key_text)
+            if next_path[-2:] == ("env_policy", "redaction_rules"):
+                continue
+            if _secret_key_contains_unredacted_value(key_text, item):
+                return True
+            if _payload_has_secret_leak(item, path=next_path):
+                return True
+        return False
+    if isinstance(value, list):
+        if path[-2:] == ("env_policy", "redaction_rules"):
+            return False
+        return any(_payload_has_secret_leak(item, path=path) for item in value)
+    if isinstance(value, str):
+        lowered = value.lower()
+        if _is_redacted_secret_marker(lowered):
+            return False
+        return "sk-" in lowered or "bearer " in lowered
     return False
+
+
+def _secret_key_contains_unredacted_value(key: str, value: Any) -> bool:
+    safe_token_metric_keys = {
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "layer_token_usage",
+        "token_usage",
+    }
+    if key in safe_token_metric_keys or key.endswith("_tokens"):
+        return False
+    if not isinstance(value, str):
+        return False
+    if not any(part in key for part in ("api_key", "authorization", "access_token", "refresh_token", "secret")):
+        return False
+    lowered = value.lower()
+    return bool(lowered) and not _is_redacted_secret_marker(lowered)
+
+
+def _is_redacted_secret_marker(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized in {"<redacted>", "[redacted]", "present_redacted", "present(redacted)", "redacted"}
 
 
 def _read_trace_events(trace: Path | None) -> list[dict[str, Any]]:
@@ -3913,7 +3959,7 @@ def _read_trace_events(trace: Path | None) -> list[dict[str, Any]]:
 
 
 def _event_type(event: dict[str, Any]) -> str:
-    return str(event.get("event_type") or event.get("type") or "")
+    return str(event.get("event_type") or event.get("event") or event.get("type") or "")
 
 
 def _count_events(events: list[dict[str, Any]], event_type: str) -> int:
@@ -3929,7 +3975,7 @@ def _count_events_with_contains(events: list[dict[str, Any]], needles: tuple[str
 
 
 def _event_payload(event: dict[str, Any]) -> dict[str, Any]:
-    payload = event.get("payload")
+    payload = event.get("payload") if "payload" in event else event.get("data")
     return payload if isinstance(payload, dict) else {}
 
 
@@ -4062,6 +4108,7 @@ def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     request_to_row: dict[str, dict[str, Any]] = {}
     tool_to_request: dict[str, str] = {}
     tool_starts: dict[str, int] = {}
+    exposure_by_action: dict[str, dict[str, Any]] = {}
     latest_context: dict[str, Any] | None = None
     latest_model_row: dict[str, Any] | None = None
 
@@ -4069,6 +4116,14 @@ def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         event_type = _event_type(event)
         payload = _event_payload(event)
         monotonic_ms = _safe_int(event.get("monotonic_ms"))
+        action_id = _event_action_id(event, payload)
+        phase_id = _event_phase_id(event, payload)
+        if event_type == "tool.exposure_decided" and action_id:
+            exposure_by_action[action_id] = _safe_tool_exposure(payload)
+            row = next((item for item in rows if item.get("action_id") == action_id), None)
+            if row is not None:
+                row["tool_exposure"] = exposure_by_action[action_id]
+            continue
         if event_type == "context.rendered_for_model":
             latest_context = {
                 "bundle_id": str(payload.get("bundle_id") or ""),
@@ -4081,17 +4136,18 @@ def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         request_id = str(payload.get("request_id") or "")
         if event_type == "model.request.created" and request_id:
-            action_id = str(event.get("action_id") or "")
             if not action_id.startswith("turn_"):
                 continue
             estimated_usage = payload.get("estimated_usage")
             starts[request_id] = {
                 "monotonic_ms": monotonic_ms,
-                "phase_id": str(event.get("phase_id") or ""),
+                "phase_id": phase_id,
                 "action_id": action_id,
                 "purpose": str(payload.get("purpose") or ""),
                 "message_count": _safe_int(payload.get("message_count")),
                 "tool_count": _safe_int(payload.get("tool_count")),
+                "tool_choice": _safe_tool_choice(payload.get("tool_choice")),
+                "tool_exposure": exposure_by_action.get(action_id, _empty_tool_exposure()),
                 "estimated_input_tokens": _safe_int(
                     estimated_usage.get("input_tokens") if isinstance(estimated_usage, dict) else 0
                 ),
@@ -4115,6 +4171,9 @@ def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "status": "completed" if event_type == "model.response.received" else "failed",
                 "message_count": started["message_count"],
                 "tool_count": started["tool_count"],
+                "tool_choice": started["tool_choice"],
+                "tool_exposure": started["tool_exposure"],
+                "denied_tools": [],
                 "tool_call_count": _safe_int(payload.get("tool_call_count")),
                 "finish_reason": str(payload.get("finish_reason") or ""),
                 "input_tokens": _safe_int(usage.get("input_tokens")) or started["estimated_input_tokens"],
@@ -4156,16 +4215,21 @@ def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if started_ms is not None and monotonic_ms >= started_ms
                 else 0.0
             )
-            row["tool_calls"].append(
-                {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": str(payload.get("tool_name") or ""),
-                    "status": str(payload.get("status") or ""),
-                    "ok": bool(payload.get("ok")),
-                    "error_code": payload.get("error_code"),
-                    "duration_seconds": duration,
-                }
-            )
+            tool_name = str(payload.get("tool_name") or "")
+            error_code = payload.get("error_code")
+            tool_row = {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "status": str(payload.get("status") or ""),
+                "ok": bool(payload.get("ok")),
+                "error_code": error_code,
+                "duration_seconds": duration,
+            }
+            row["tool_calls"].append(tool_row)
+            if error_code:
+                denied = _denied_tool_diagnostic(row, tool_name=tool_name, error_code=str(error_code))
+                if denied:
+                    row["denied_tools"].append(denied)
             continue
 
         if event_type == "review.completed":
@@ -4179,7 +4243,7 @@ def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["review_events"].append(
                 {
                     "stage": str(payload.get("review_stage") or ""),
-                    "action_id": str(event.get("action_id") or ""),
+                    "action_id": action_id,
                     "decision": str(payload.get("decision") or ""),
                     "duration_seconds": round(_safe_float(payload.get("duration_ms")) / 1000.0, 3),
                     "critic_duration_seconds": round(_safe_float(payload.get("critic_duration_ms")) / 1000.0, 3),
@@ -4221,14 +4285,81 @@ def _turn_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row = latest_model_row
             if row is None:
                 continue
-            row["finalization_events"].append(
-                {
-                    "event_type": event_type,
-                    "status": str(payload.get("status") or payload.get("overall_status") or ""),
-                }
-            )
+            event_row = {
+                "event_type": event_type,
+                "status": str(payload.get("status") or payload.get("overall_status") or ""),
+            }
+            if event_row not in row["finalization_events"]:
+                row["finalization_events"].append(event_row)
 
     return rows
+
+
+def _event_action_id(event: dict[str, Any], payload: dict[str, Any]) -> str:
+    return str(event.get("action_id") or payload.get("action_id") or "")
+
+
+def _event_phase_id(event: dict[str, Any], payload: dict[str, Any]) -> str:
+    return str(event.get("phase_id") or payload.get("phase_id") or payload.get("phase") or "")
+
+
+def _safe_tool_choice(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "mode": str(payload.get("mode") or ""),
+        "allowed_tool_names": [str(item) for item in payload.get("allowed_tool_names") or []],
+        "max_tool_calls": _safe_int(payload.get("max_tool_calls")),
+    }
+
+
+def _empty_tool_exposure() -> dict[str, Any]:
+    return {
+        "selected_tools": [],
+        "blocked_tools": [],
+        "deferred_tools": [],
+        "suppressed_tools": [],
+    }
+
+
+def _safe_tool_exposure(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "selected_tools": [str(item) for item in payload.get("selected_tools") or []],
+        "blocked_tools": _safe_exposure_records(payload.get("blocked")),
+        "deferred_tools": _safe_exposure_records(payload.get("deferred")),
+        "suppressed_tools": _safe_exposure_records(payload.get("suppressed")),
+    }
+
+
+def _safe_exposure_records(payload: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in payload or []:
+        if not isinstance(item, dict):
+            continue
+        records.append(
+            {
+                "name": str(item.get("name") or ""),
+                "reason_code": str(item.get("reason_code") or ""),
+                "stage_basis": str(item.get("stage_basis") or ""),
+                "phase": str(item.get("phase") or ""),
+            }
+        )
+    return records
+
+
+def _denied_tool_diagnostic(row: dict[str, Any], *, tool_name: str, error_code: str) -> dict[str, Any]:
+    exposure = row.get("tool_exposure") if isinstance(row.get("tool_exposure"), dict) else {}
+    records: list[dict[str, Any]] = []
+    for key in ("blocked_tools", "deferred_tools", "suppressed_tools"):
+        records.extend(item for item in exposure.get(key) or [] if isinstance(item, dict))
+    match = next((item for item in records if item.get("name") == tool_name), {})
+    return {
+        "tool_name": tool_name,
+        "error_code": error_code,
+        "blocked_reason": str(match.get("reason_code") or error_code),
+        "stage_basis": str(match.get("stage_basis") or ""),
+        "phase": str(match.get("phase") or row.get("phase_id") or ""),
+    }
 
 
 def _provider_latency_by_review_stage(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
