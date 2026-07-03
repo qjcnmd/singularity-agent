@@ -134,11 +134,11 @@ class ContextSensitivity(str, Enum):
 
 ### 数据流概述
 
-`ContextManager.add_tool_result()` / `add_tool_protocol_result()` 生成 `ToolObservation`，写入 `context.sqlite3`。`ContextCompactionPlanner.prepare()` 生成 `CompactionPlan`，`ContextCompactionExecutor.summary_envelope_for_plan()` 生成 `ContextSummaryEnvelope`，`ContextCompactionCommitter.commit()` 标记旧 item 并写 summary item。恢复时 `RecoveryManager.recover()` 从 SQLite、planner/protocol 状态和 trace 尾事件重建 `RecoveredContext`。observation 生成的安全 tool message 与 recovered messages/items 可进入后续模型请求；snapshot/recovered/range 本体不进入 provider。
+`ContextManager.add_tool_result()` / `add_tool_protocol_result()` 生成 `ToolObservation`，写入 `context.sqlite3`。`add_tool_protocol_result()` 先把 `ToolProtocolResultEnvelope` 投影为 `ToolObservationView`，若投影已带 `observation_id`，则该值同时作为 `ToolObservation.id`、tool message payload 中的 `observation_id`、`ContextItem.item_id` 以及 artifact `ContextReference.source_item_id` / `observation_id`；若缺失才生成新的 observation id。`ContextCompactionPlanner.prepare()` 生成 `CompactionPlan`，`ContextCompactionExecutor.summary_envelope_for_plan()` 生成 `ContextSummaryEnvelope`，`ContextCompactionCommitter.commit()` 标记旧 item 并写 summary item。恢复时 `RecoveryManager.recover()` 从 SQLite、planner/protocol 状态和 trace 尾事件重建 `RecoveredContext`。observation 生成的安全 tool message 与 recovered messages/items 可进入后续模型请求；snapshot/recovered/range 本体不进入 provider。
 
 ## 谁生成这些对象
 
-compaction commit 成功后生成 `ContextSnapshot`；`ContextManager.add_tool_result()` / `add_tool_protocol_result()` 生成 `ToolObservation`。`RecoveryManager.recover()` 从 SQLite、planner/protocol 状态和 trace 尾事件重建 `RecoveredContext`。`PartialCompactionRange` 由 compaction 调用方显式给定，生产源码没有自动构造点。
+compaction commit 成功后生成 `ContextSnapshot`；`ContextManager.add_tool_result()` / `add_tool_protocol_result()` 生成 `ToolObservation`。协议结果路径的 observation id 来自 `ToolObservationView.observation_id` 或本层新生成的 id，生成后会同步写入 store item 与 source refs，不再让协议结果、模型可见 payload 和 context store 分别拥有不同身份。`RecoveryManager.recover()` 从 SQLite、planner/protocol 状态和 trace 尾事件重建 `RecoveredContext`。`PartialCompactionRange` 由 compaction 调用方显式给定，生产源码没有自动构造点。
 
 ## 谁消费这些对象
 

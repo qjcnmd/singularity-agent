@@ -121,6 +121,34 @@ def test_tool_protocol_result_message_omits_internal_only_fields() -> None:
     assert observation.raw_result == payload
 
 
+def test_tool_protocol_result_observation_id_is_shared_with_context_store() -> None:
+    context = ContextManager(system_prompt="system rules", user_goal="inspect project")
+    envelope = ToolProtocolResultEnvelope(
+        tool_call_id="call_shared_observation",
+        tool_name="read_file",
+        ok=True,
+        status="ok",
+        content_preview="README",
+        content_digest="digest_shared",
+        raw_result_ref="result_ref_shared",
+        artifact_refs=["artifact_shared"],
+        observation_id="obs_shared",
+    )
+
+    observation = context.add_tool_protocol_result(envelope)
+
+    tool_message = context.messages()[-1]
+    payload = json.loads(tool_message["content"])
+    stored_item = context.store.load_item("obs_shared")
+
+    assert observation.id == "obs_shared"
+    assert payload["observation_id"] == "obs_shared"
+    assert stored_item is not None
+    assert stored_item.item_id == "obs_shared"
+    assert stored_item.references[0].source_item_id == "obs_shared"
+    assert stored_item.references[0].observation_id == "obs_shared"
+
+
 def test_add_memory_context_block_adds_untrusted_memory_item() -> None:
     context = ContextManager(system_prompt="system rules", user_goal="inspect project")
     block = MemoryContextBlock(

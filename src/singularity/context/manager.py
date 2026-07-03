@@ -508,7 +508,10 @@ class ContextManager:
             else envelope
         )
         payload = result_envelope.to_dict()
-        model_payload = result_envelope.to_observation_view().to_model_payload()
+        observation_view = result_envelope.to_observation_view()
+        observation_id = observation_view.observation_id or uuid4().hex
+        observation_view.observation_id = observation_id
+        model_payload = observation_view.to_model_payload()
         preview = str(payload.get("content_preview") or "")
         sensitivity = self.classifier.classify(payload)
         rendered_preview = self.redactor.redact_text(preview)
@@ -534,15 +537,15 @@ class ContextManager:
             },
         }
         observation = ToolObservation(
-            id=uuid4().hex,
+            id=observation_id,
             run_id=self.run_id,
             turn=turn,
-            tool_name=str(payload.get("tool_name") or "<unknown>"),
-            tool_call_id=payload.get("tool_call_id"),
-            ok=bool(payload.get("ok")),
+            tool_name=observation_view.tool_name,
+            tool_call_id=observation_view.tool_call_id,
+            ok=observation_view.ok,
             raw_result=model_payload,
             preview=rendered_preview,
-            truncated=bool(payload.get("truncated")),
+            truncated=observation_view.truncated,
             metadata=metadata,
             created_at=self._now(),
             input_tokens=0,
@@ -553,15 +556,16 @@ class ContextManager:
                     ref_id=str(ref),
                     ref_type="artifact",
                     target=str(ref),
-                    source_item_id="",
+                    source_item_id=observation_id,
+                    observation_id=observation_id,
                 )
-                for ref in list(payload.get("artifact_refs") or [])
+                for ref in observation_view.reference_ids
             ],
             cache_hit=bool(metadata.get("cache_hit")),
             duration_seconds=metadata.get("duration_seconds"),
-            error_code=payload.get("error_code"),
+            error_code=observation_view.error_code,
             tool_version=metadata.get("tool_version"),
-            truncation_reason="tool_result" if payload.get("truncated") else None,
+            truncation_reason="tool_result" if observation_view.truncated else None,
             sensitivity=sensitivity,
         )
         self.tool_observations.append(observation)
