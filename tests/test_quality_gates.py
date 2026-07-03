@@ -373,7 +373,22 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                                             "fallback_reason": "",
                                             "critic_source_status": "ok",
                                             "critic_reuse_skip_reason": "stage_not_reusable",
-                                        }
+                                        },
+                                        {
+                                            "stage": "final",
+                                            "duration_seconds": 0.02,
+                                            "critic_duration_seconds": 0.0,
+                                            "model_critic_status": "reused",
+                                            "output_mode": "forced_tool_call",
+                                            "schema_validation_passed": True,
+                                            "retry_count": 0,
+                                            "retry_reason": "none",
+                                            "fallback_reason": "",
+                                            "critic_reused": True,
+                                            "critic_skipped_reason": "post_verification_evidence_unchanged",
+                                            "critic_reuse_skip_reason": "",
+                                            "critic_source_status": "ok",
+                                        },
                                     ],
                                 }
                             ],
@@ -401,7 +416,7 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
         "turn_count": 1,
         "provider_time_seconds": 2.5,
         "tool_call_count": 1,
-        "review_event_count": 1,
+        "review_event_count": 2,
         "denied_tool_count": 1,
         "slowest_turns": [
             {
@@ -410,7 +425,7 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                 "purpose": "plan_next_action",
                 "provider_duration_seconds": 2.5,
                 "tool_call_count": 1,
-                "review_event_count": 1,
+                "review_event_count": 2,
                 "denied_tool_count": 1,
             }
         ],
@@ -445,9 +460,9 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
     assert capability_review_from_result(result_path) == {
         "edit_apply_review_time_seconds": 0.8,
         "edit_apply_critic_time_seconds": 0.6,
-        "review_event_count": 1,
-        "critic_reused_count": 0,
-        "critic_skipped_count": 0,
+        "review_event_count": 2,
+        "critic_reused_count": 1,
+        "critic_skipped_count": 1,
         "review_events": [
             {
                 "task_id": "task_1",
@@ -464,6 +479,23 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
                 "critic_reused": False,
                 "critic_skipped_reason": "",
                 "critic_reuse_skip_reason": "stage_not_reusable",
+                "critic_source_status": "ok",
+            },
+            {
+                "task_id": "task_1",
+                "turn": 1,
+                "stage": "final",
+                "duration_seconds": 0.02,
+                "critic_duration_seconds": 0.0,
+                "model_critic_status": "reused",
+                "output_mode": "forced_tool_call",
+                "schema_validation_passed": True,
+                "retry_count": 0,
+                "retry_reason": "none",
+                "fallback_reason": "",
+                "critic_reused": True,
+                "critic_skipped_reason": "post_verification_evidence_unchanged",
+                "critic_reuse_skip_reason": "",
                 "critic_source_status": "ok",
             }
         ],

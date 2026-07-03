@@ -46,6 +46,7 @@ class ReviewPipeline:
         self.cancellation_token: Any | None = None
         self._critic_cache: dict[str, dict[str, Any]] = {}
         self._pre_edit_by_patch_digest: dict[str, dict[str, Any]] = {}
+        self._latest_post_verification_critic: dict[str, Any] | None = None
 
     def pre_edit_review(
         self,
@@ -241,7 +242,12 @@ class ReviewPipeline:
         critic_reused = False
         critic_skipped_reason = ""
         critic_reuse_skip_reason = ""
-        cached_outcome = self._cached_critic_outcome(target=target, evidence=evidence, context=context)
+        cached_outcome = self._cached_critic_outcome(
+            target=target,
+            evidence=evidence,
+            context=context,
+            rule_decision=rule_decision,
+        )
         if cached_outcome is not None:
             critic_reused = True
             critic_skipped_reason = str(cached_outcome.get("reason") or "cached_critic_outcome")
@@ -267,7 +273,11 @@ class ReviewPipeline:
                 report.decision = self.decision_engine.decide(target=target, findings=report.findings, context=context)
                 report.next_actions = list(report.decision.next_actions)
         elif self.enable_model_critic:
-            critic_reuse_skip_reason = self._critic_reuse_skip_reason(target=target, context=context)
+            critic_reuse_skip_reason = self._critic_reuse_skip_reason(
+                target=target,
+                context=context,
+                rule_decision=rule_decision,
+            )
             self._throw_if_cancelled()
             critic = ModelCritic(self.model_runner)
             critic_started = time.perf_counter()
@@ -527,6 +537,7 @@ class ReviewPipeline:
         target: ReviewTarget,
         evidence: list[ReviewEvidence],
         context: dict[str, Any],
+        rule_decision: Any,
     ) -> dict[str, Any] | None:
         if not self.enable_model_critic:
             return None
@@ -534,6 +545,13 @@ class ReviewPipeline:
         cached = self._critic_cache.get(cache_key)
         if cached is not None and _critic_status_reusable(cached):
             return {**cached, "reason": "identical_review_evidence"}
+        if target.stage == ReviewStage.FINAL:
+            if getattr(rule_decision, "action", None) != ReviewDecisionAction.ACCEPT:
+                return None
+            post_verification = self._post_verification_critic_for_final(context)
+            if post_verification is not None:
+                return {**post_verification, "reason": "post_verification_evidence_unchanged"}
+            return None
         if target.stage != ReviewStage.POST_PATCH or not target.patch_digest:
             return None
         if not self._post_patch_can_reuse_pre_edit_critic(context):
@@ -545,7 +563,15 @@ class ReviewPipeline:
             return None
         return {**pre_edit, "reason": "pre_edit_evidence_unchanged"}
 
-    def _critic_reuse_skip_reason(self, *, target: ReviewTarget, context: dict[str, Any]) -> str:
+    def _critic_reuse_skip_reason(
+        self,
+        *,
+        target: ReviewTarget,
+        context: dict[str, Any],
+        rule_decision: Any,
+    ) -> str:
+        if target.stage == ReviewStage.FINAL:
+            return self._final_reuse_skip_reason(context, rule_decision=rule_decision)
         if target.stage != ReviewStage.POST_PATCH:
             return "stage_not_reusable"
         if not target.patch_digest:
@@ -583,6 +609,28 @@ class ReviewPipeline:
                 if finding.source == "model_critic"
             ],
         }
+        if report.target.stage == ReviewStage.POST_VERIFICATION and self._post_verification_can_seed_final_critic(
+            report,
+            context=context,
+        ):
+            verification = context.get("verification") if isinstance(context.get("verification"), dict) else {}
+            self._latest_post_verification_critic = {
+                "review_id": report.review_id,
+                "task_id": report.target.task_id,
+                "status": "reused",
+                "original_status": report.model_critic_status,
+                "source_status": report.model_critic_status,
+                "error": report.model_critic_error,
+                "verification_digest": _stable_review_hash(_final_verification_reuse_context(verification)),
+                **_review_output_metadata(report.metadata),
+                "findings": [
+                    finding.model_dump(mode="json")
+                    for finding in report.findings
+                    if finding.source == "model_critic"
+                ],
+            }
+        elif report.target.stage == ReviewStage.POST_VERIFICATION:
+            self._latest_post_verification_critic = None
 
     def _store_pre_edit_reference(
         self,
@@ -658,6 +706,57 @@ class ReviewPipeline:
         if status in {"failed", "blocked", "needs_review"}:
             return False
         return _risk_level(context) in {"", "low", "none"}
+
+    def _post_verification_can_seed_final_critic(
+        self,
+        report: ReviewReport,
+        *,
+        context: dict[str, Any],
+    ) -> bool:
+        if report.decision.action != ReviewDecisionAction.ACCEPT:
+            return False
+        if report.blocking_findings:
+            return False
+        if any(finding.source == "model_critic" and finding.blocking for finding in report.findings):
+            return False
+        verification = context.get("verification") if isinstance(context.get("verification"), dict) else {}
+        return _final_verification_reusable(verification)
+
+    def _post_verification_critic_for_final(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        cached = self._latest_post_verification_critic
+        if cached is None or not _critic_status_reusable(cached):
+            return None
+        cached_task_id = str(cached.get("task_id") or "")
+        current_task_id = str(_task_id_from_context(context) or "")
+        if cached_task_id and current_task_id and cached_task_id != current_task_id:
+            return None
+        verification = context.get("verification") if isinstance(context.get("verification"), dict) else {}
+        if not _final_verification_reusable(verification):
+            return None
+        digest = _stable_review_hash(_final_verification_reuse_context(verification))
+        if cached.get("verification_digest") != digest:
+            return None
+        return cached
+
+    def _final_reuse_skip_reason(self, context: dict[str, Any], *, rule_decision: Any) -> str:
+        if getattr(rule_decision, "action", None) != ReviewDecisionAction.ACCEPT:
+            return "final_rule_decision_not_accept"
+        verification = context.get("verification") if isinstance(context.get("verification"), dict) else {}
+        if not _final_verification_reusable(verification):
+            return "post_verification_not_reusable"
+        cached = self._latest_post_verification_critic
+        if cached is None:
+            return "post_verification_reference_missing"
+        if not _critic_status_reusable(cached):
+            return "post_verification_status_not_reusable"
+        cached_task_id = str(cached.get("task_id") or "")
+        current_task_id = str(_task_id_from_context(context) or "")
+        if cached_task_id and current_task_id and cached_task_id != current_task_id:
+            return "post_verification_task_changed"
+        digest = _stable_review_hash(_final_verification_reuse_context(verification))
+        if cached.get("verification_digest") != digest:
+            return "post_verification_evidence_changed"
+        return "cache_key_miss"
 
     def _throw_if_cancelled(self) -> None:
         token = getattr(self, "cancellation_token", None)
@@ -810,6 +909,42 @@ def _risk_level(context: dict[str, Any]) -> str:
 def _critic_status_reusable(outcome: dict[str, Any]) -> bool:
     status = str(outcome.get("source_status") or outcome.get("original_status") or outcome.get("status") or "")
     return status == "ok"
+
+
+def _task_id_from_context(context: dict[str, Any]) -> str | None:
+    task_state = context.get("task_state") if isinstance(context.get("task_state"), dict) else {}
+    return task_state.get("task_id")
+
+
+def _final_verification_reusable(verification: dict[str, Any]) -> bool:
+    assessment = verification.get("completion_assessment") if isinstance(verification.get("completion_assessment"), dict) else {}
+    status = str(assessment.get("status") or verification.get("status") or "").lower()
+    if status not in {"ready", "ready_with_warnings"}:
+        return False
+    groups = _verification_check_groups(verification)
+    if groups["failed_required_checks"] or groups["blocked_required_checks"] or groups["flaky_required_checks"]:
+        return False
+    return not verification.get("failed_checks")
+
+
+def _final_verification_reuse_context(verification: dict[str, Any]) -> dict[str, Any]:
+    assessment = verification.get("completion_assessment") if isinstance(verification.get("completion_assessment"), dict) else {}
+    plan = verification.get("plan") if isinstance(verification.get("plan"), dict) else {}
+    return {
+        "verification_plan_id": plan.get("verification_plan_id") or verification.get("verification_plan_id"),
+        "changeset_id": plan.get("changeset_id"),
+        "transaction_id": plan.get("transaction_id"),
+        "status": assessment.get("status") or verification.get("status"),
+        "check_status": [
+            {
+                "check_id": item.get("check_id"),
+                "status": item.get("status"),
+                "failure_type": item.get("failure_type"),
+            }
+            for item in verification.get("check_status") or []
+            if isinstance(item, dict)
+        ],
+    }
 
 
 def _review_output_metadata(payload: dict[str, Any]) -> dict[str, Any]:

@@ -1811,7 +1811,8 @@
       schema_validation_passed、retry_count、retry_reason、
       fallback_reason、model_critic_status 和耗时/复用状态；
       provider_latency_by_review_stage 只按 review stage 聚合
-      provider call count、failed count、total/max seconds；模型输出边界按
+      真实 provider call count、failed count、total/max seconds，
+      reused final review 不伪造 provider call；模型输出边界按
       Structured Outputs / JSON Schema、strict tool calling with pinned
       tool choice、json_mode、rule-only fallback path 的顺序降级，
       本地 schema validation / Pydantic validation 仍是最终边界。

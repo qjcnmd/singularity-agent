@@ -308,6 +308,243 @@ def test_post_patch_reuses_pre_edit_critic_when_evidence_is_unchanged(tmp_path: 
     assert completed[-1]["payload"]["critic_reuse_skip_reason"] == ""
 
 
+def test_final_review_reuses_ready_post_verification_critic(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_{len(requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "traces")
+    component = ReviewPipeline(
+        tmp_path,
+        trace=trace,
+        model_runner=FakeModelRunner(),
+        enable_model_critic=True,
+    )
+    verification = {
+        "plan": {"verification_plan_id": "verify_1", "changeset_id": "changeset_1"},
+        "check_status": [{"check_id": "check_1", "kind": "unit_test", "status": "passed"}],
+        "failed_checks": [],
+        "completion_assessment": {"status": "ready", "warnings": [], "remaining_risks": []},
+    }
+
+    post = component.post_verification_review(verification=verification)
+    final = component.final_review(
+        task_state={"task_id": "task_final", "final_assessment": {"status": "ready"}},
+        task_plan={"plan_id": "plan_final"},
+        evidence_ledger={
+            "verification_results": [verification],
+            "review_results": [post.model_dump(mode="json")],
+        },
+    )
+
+    assert post.model_critic_status == "ok"
+    assert final.model_critic_status == "reused"
+    assert final.metadata["critic_reused"] is True
+    assert final.metadata["critic_skipped_reason"] == "post_verification_evidence_unchanged"
+    assert final.metadata["critic_source_status"] == "ok"
+    assert len(requests) == 1
+    events = [json.loads(line) for line in trace.path.read_text(encoding="utf-8").splitlines()]
+    completed = [
+        event
+        for event in events
+        if event["event_type"] == "review.completed" and event["payload"]["review_stage"] == "final"
+    ]
+    assert completed[-1]["payload"]["critic_reused"] is True
+    assert completed[-1]["payload"]["critic_skipped_reason"] == "post_verification_evidence_unchanged"
+    assert "raw_prompt" not in completed[-1]["payload"]
+    assert "raw_response" not in completed[-1]["payload"]
+
+
+def test_final_review_does_not_reuse_failed_post_verification_critic(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_{len(requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    component = ReviewPipeline(tmp_path, model_runner=FakeModelRunner(), enable_model_critic=True)
+    verification = {
+        "plan": {"verification_plan_id": "verify_1"},
+        "check_status": [{"check_id": "check_1", "kind": "unit_test", "status": "failed"}],
+        "failed_checks": [
+            {
+                "check_id": "check_1",
+                "kind": "unit_test",
+                "status": "failed",
+                "failure_type": "unit_test_failure",
+            }
+        ],
+        "completion_assessment": {"status": "failed", "remaining_risks": ["tests failed"]},
+    }
+
+    post = component.post_verification_review(verification=verification)
+    final = component.final_review(
+        task_state={"task_id": "task_final", "final_assessment": {"status": "failed"}},
+        task_plan={"plan_id": "plan_final"},
+        evidence_ledger={
+            "verification_results": [verification],
+            "review_results": [post.model_dump(mode="json")],
+        },
+    )
+
+    assert post.decision.action == ReviewDecisionAction.REPAIR
+    assert final.metadata["critic_reused"] is False
+    assert final.metadata["critic_reuse_skip_reason"] == "final_rule_decision_not_accept"
+    assert len(requests) == 2
+
+
+def test_final_review_does_not_reuse_when_final_rules_reject(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_{len(requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    component = ReviewPipeline(tmp_path, model_runner=FakeModelRunner(), enable_model_critic=True)
+    verification = {
+        "plan": {"verification_plan_id": "verify_1"},
+        "check_status": [{"check_id": "check_1", "kind": "unit_test", "status": "passed"}],
+        "failed_checks": [],
+        "completion_assessment": {"status": "ready", "warnings": [], "remaining_risks": []},
+    }
+
+    post = component.post_verification_review(verification=verification)
+    stale_verification = {
+        "plan": {"verification_plan_id": "verify_1"},
+        "check_status": [{"check_id": "check_1", "kind": "unit_test", "status": "passed"}],
+        "failed_checks": [],
+        "completion_assessment": {"status": "not_run", "warnings": [], "remaining_risks": []},
+    }
+    final = component.final_review(
+        task_state={"task_id": "task_final", "final_assessment": {"status": "ready"}},
+        task_plan={"plan_id": "plan_final"},
+        evidence_ledger={
+            "verification_results": [stale_verification],
+            "review_results": [post.model_dump(mode="json")],
+        },
+    )
+
+    assert final.decision.action != ReviewDecisionAction.ACCEPT
+    assert final.metadata["critic_reused"] is False
+    assert final.metadata["critic_reuse_skip_reason"] == "final_rule_decision_not_accept"
+    assert len(requests) == 2
+
+
+def test_final_review_does_not_reuse_post_verification_from_another_task(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_{len(requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    class Planner:
+        session_id = "session_critic"
+        task_id = "task_1"
+        state = type("State", (), {"current_phase": "review_phase"})()
+
+    planner = Planner()
+    component = ReviewPipeline(
+        tmp_path,
+        planner=planner,
+        model_runner=FakeModelRunner(),
+        enable_model_critic=True,
+    )
+    verification = {
+        "plan": {"verification_plan_id": "verify_1"},
+        "check_status": [{"check_id": "check_1", "kind": "unit_test", "status": "passed"}],
+        "failed_checks": [],
+        "completion_assessment": {"status": "ready", "warnings": [], "remaining_risks": []},
+    }
+
+    post = component.post_verification_review(verification=verification)
+    planner.task_id = "task_2"
+    final = component.final_review(
+        task_state={"task_id": "task_2", "final_assessment": {"status": "ready"}},
+        task_plan={"plan_id": "plan_final"},
+        evidence_ledger={
+            "verification_results": [verification],
+            "review_results": [post.model_dump(mode="json")],
+        },
+    )
+
+    assert final.metadata["critic_reused"] is False
+    assert final.metadata["critic_reuse_skip_reason"] == "post_verification_task_changed"
+    assert len(requests) == 2
+
+
+def test_non_reusable_post_verification_clears_final_reuse_reference(tmp_path: Path) -> None:
+    requests = []
+
+    class FakeModelRunner:
+        def run_turn(self, request):
+            requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_{len(requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text('{"findings": []}'),
+            )
+
+    component = ReviewPipeline(tmp_path, model_runner=FakeModelRunner(), enable_model_critic=True)
+    ready_verification = {
+        "plan": {"verification_plan_id": "verify_1"},
+        "check_status": [{"check_id": "check_1", "kind": "unit_test", "status": "passed"}],
+        "failed_checks": [],
+        "completion_assessment": {"status": "ready", "warnings": [], "remaining_risks": []},
+    }
+    failed_verification = {
+        "plan": {"verification_plan_id": "verify_2"},
+        "check_status": [{"check_id": "check_2", "kind": "unit_test", "status": "failed"}],
+        "failed_checks": [
+            {
+                "check_id": "check_2",
+                "kind": "unit_test",
+                "status": "failed",
+                "failure_type": "unit_test_failure",
+            }
+        ],
+        "completion_assessment": {"status": "failed", "remaining_risks": ["tests failed"]},
+    }
+
+    component.post_verification_review(verification=ready_verification)
+    component.post_verification_review(verification=failed_verification)
+    final = component.final_review(
+        task_state={"task_id": "task_final", "final_assessment": {"status": "ready"}},
+        task_plan={"plan_id": "plan_final"},
+        evidence_ledger={"verification_results": [ready_verification]},
+    )
+
+    assert final.metadata["critic_reused"] is False
+    assert final.metadata["critic_reuse_skip_reason"] == "post_verification_reference_missing"
+    assert len(requests) == 3
+
+
 def test_post_patch_reuse_matches_pre_edit_patch_touched_paths(tmp_path: Path) -> None:
     requests = []
 
