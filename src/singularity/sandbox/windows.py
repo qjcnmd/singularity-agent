@@ -2499,6 +2499,7 @@ def _python_runtime_smoke_diagnostics(
                 {
                     "kind": "python_runtime_environment_blocker",
                     "status": "blocked",
+                    "failure_type": "probe_acl_setup_failed",
                     "reason": "Python runtime smoke ACL setup failed.",
                     "evidence": {
                         **_probe_evidence("python_runtime_smoke_acl", state_dir=state_dir, probe_root=root),
@@ -2521,6 +2522,7 @@ def _python_runtime_smoke_diagnostics(
                     {
                         "kind": "python_runtime_environment_blocker",
                         "status": "blocked",
+                        "failure_type": "role_probe_acl_setup_failed",
                         "reason": "Python runtime smoke role directory ACL setup failed.",
                         "evidence": {
                             **_probe_evidence(
@@ -2563,6 +2565,7 @@ def _python_runtime_smoke_diagnostics(
             {
                 "kind": "python_runtime_environment_blocker",
                 "status": "blocked",
+                "failure_type": "probe_execution_failed",
                 "reason": "Python runtime smoke failed before module import checks completed.",
                 "evidence": _exception_diagnostics(
                     "python_runtime_smoke",

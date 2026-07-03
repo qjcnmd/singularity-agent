@@ -2486,6 +2486,40 @@ def test_python_runtime_smoke_applies_acl_to_role_directories_after_creation(
     assert tmp_path / "python-runtime-smoke" / "online" in acl_paths
 
 
+def test_python_runtime_smoke_acl_failure_reports_failure_type(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_windows_state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        windows,
+        "_apply_probe_root_acl",
+        lambda _path, **_kwargs: windows._OperationResult(
+            False,
+            "acl denied",
+            {"target_hash": "hash_only"},
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(windows, "_cleanup_probe_root", lambda _path: None)
+
+    diagnostics = windows._python_runtime_smoke_diagnostics(
+        (
+            windows._sandbox_identity_for_mode(sandbox.SandboxNetworkMode.DENIED),
+            windows._sandbox_identity_for_mode(sandbox.SandboxNetworkMode.ALLOWED),
+        )
+    )
+
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic["kind"] == "python_runtime_environment_blocker"
+    assert diagnostic["status"] == "blocked"
+    assert diagnostic["failure_type"] == "probe_acl_setup_failed"
+    assert diagnostic["reason"] == "Python runtime smoke ACL setup failed."
+    assert "S-1-5-21" not in json.dumps(diagnostic)
+
+
 def test_python_runtime_failure_classifies_localized_dll_initialization_error() -> None:
     payload = {
         "modules": {
