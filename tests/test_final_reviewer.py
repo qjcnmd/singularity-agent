@@ -412,6 +412,89 @@ def test_final_reviewer_uses_forced_tool_calling_fallback() -> None:
     assert runner.requests[0].tools[0].metadata["strict"] is True
 
 
+def test_final_reviewer_accepts_valid_forced_tool_raw_arguments_without_retry() -> None:
+    class ToolRunner(FakeModelRunner):
+        def run_turn(self, request: ModelTurnRequest) -> ModelTurnResult:
+            self.requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id="resp_tool",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text(""),
+                tool_calls=[
+                    ModelToolCall(
+                        tool_call_id="call_1",
+                        tool_name="submit_final_review",
+                        arguments={},
+                        raw_arguments='{"criteria":[{"criterion_id":"c1","satisfied":true,"evidence_refs":["custom_evidence:1"]}]}',
+                        parse_status=ModelToolParseStatus.SCHEMA_MISMATCH,
+                    )
+                ],
+            )
+
+    contract = _make_contract(
+        criteria=[
+            AcceptanceCriterion(
+                criterion_id="c1",
+                description="Custom evidence",
+                evidence=["custom_evidence"],
+                required=True,
+            ),
+        ]
+    )
+    runner = ToolRunner({ModelPurpose.FINAL_REVIEW: "{}", "supported_output_modes": {"forced_tool_call"}})
+    reviewer = FinalReviewer(model_runner=runner)
+
+    assessment = reviewer.assess(contract=contract, plan=None, evidence=EvidenceLedger(), state=_make_state())
+
+    assert assessment.overall_satisfied is True
+    assert len(runner.requests) == 1
+
+
+def test_final_reviewer_invalid_forced_tool_raw_arguments_still_retries_once() -> None:
+    class ToolRunner(FakeModelRunner):
+        def run_turn(self, request: ModelTurnRequest) -> ModelTurnResult:
+            self.requests.append(request)
+            return ModelTurnResult(
+                request_id=request.request_id,
+                response_id=f"resp_tool_{len(self.requests)}",
+                status=ModelTurnStatus.SUCCESS,
+                assistant_message=ModelMessage.assistant_text(""),
+                tool_calls=[
+                    ModelToolCall(
+                        tool_call_id=f"call_{len(self.requests)}",
+                        tool_name="submit_final_review",
+                        arguments={},
+                        raw_arguments='{"criteria":',
+                        parse_status=ModelToolParseStatus.INVALID_JSON,
+                    )
+                ],
+            )
+
+    contract = _make_contract(
+        criteria=[
+            AcceptanceCriterion(
+                criterion_id="c1",
+                description="Custom evidence",
+                evidence=["custom_evidence"],
+                required=True,
+            ),
+        ]
+    )
+    runner = ToolRunner({ModelPurpose.FINAL_REVIEW: "{}", "supported_output_modes": {"forced_tool_call"}})
+    trace = FakeTrace()
+    reviewer = FinalReviewer(model_runner=runner, trace=trace)
+
+    assessment = reviewer.assess(contract=contract, plan=None, evidence=EvidenceLedger(), state=_make_state())
+
+    assert assessment.overall_satisfied is False
+    assert len(runner.requests) == 2
+    fallback_events = [payload for event, payload in trace.events if event == "final_reviewer.assess.fallback"]
+    assert fallback_events
+    assert fallback_events[-1]["payload"]["retry_count"] == 1
+    assert fallback_events[-1]["payload"]["retry_reason"] == "tool_call_parse_error"
+
+
 def test_final_reviewer_business_rule_failure_falls_back_to_rules() -> None:
     contract = _make_contract()
     evidence = EvidenceLedger()

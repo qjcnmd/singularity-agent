@@ -243,8 +243,8 @@ def _build_request(
         }
     elif mode == OUTPUT_MODE_TOOL:
         content = (
-            f"Call the {tool_name} tool with JSON arguments that conform to the JSON Schema. "
-            "Do not answer in natural language.\n\n"
+            f"Call exactly one {tool_name} tool with a JSON object argument that conforms to the JSON Schema. "
+            "Do not answer in natural language or include extra tool calls.\n\n"
             f"{content}"
         )
         tools = [
@@ -297,7 +297,13 @@ def _payload_from_result(result: Any, *, mode: str, tool_name: str) -> dict[str,
             raise ToolCallParseError("forced tool calling response did not include the required tool")
         call = calls[0]
         if call.parse_status != ModelToolParseStatus.VALID:
-            raise ToolCallParseError("forced tool calling arguments failed JSON/schema parsing")
+            try:
+                raw_payload = json.loads(call.raw_arguments or "{}")
+            except json.JSONDecodeError as exc:
+                raise ToolCallParseError("forced tool calling arguments failed JSON/schema parsing") from exc
+            if not isinstance(raw_payload, dict):
+                raise ToolCallParseError("forced tool calling arguments were not a JSON object")
+            return raw_payload
         return dict(call.arguments)
     text = getattr(getattr(result, "assistant_message", None), "text", "") or ""
     return _load_json_object(text)

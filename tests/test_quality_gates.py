@@ -10,6 +10,7 @@ from scripts.verify_gate_common import (
     capability_metrics_from_result,
     capability_repeated_timing_compare,
     capability_review_from_result,
+    capability_sla_diagnostics,
     capability_sla_from_result,
     capability_timing_from_result,
     capability_turns_from_result,
@@ -532,6 +533,94 @@ def test_capability_repeated_timing_compare_is_null_aware(tmp_path: Path) -> Non
         "min": 2.0,
         "median": 2.0,
     }
+
+
+def test_capability_sla_diagnostics_classifies_jitter_without_changing_sla(tmp_path: Path) -> None:
+    output_root = tmp_path / "work" / "evaluations"
+    timings = [
+        ("run_a", 263.0, 208.0, 50.0, 49.5),
+        ("run_b", 264.0, 212.0, 60.0, 49.8),
+        ("run_c", 263.899, 214.726, 62.922, 50.081),
+    ]
+    for run_id, wall, agent_loop, provider, sandbox in timings:
+        run_dir = output_root / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "result.json").write_text(
+            json.dumps(
+                {
+                    "summary": {
+                        "capability_sla": {
+                            "schema_version": "evaluation.capability_sla_summary/v1",
+                            "status": "over_sla",
+                            "blocking": False,
+                            "violations": {"agent_loop": 1, "provider": 1, "sandbox": 1},
+                            "task_count": 1,
+                        }
+                    },
+                    "tasks": [
+                        {
+                            "task_id": "task.public",
+                            "reproducible_environment": {"workspace": {"start_commit": "abc123"}},
+                            "timing": {
+                                "wall_time_seconds": wall,
+                                "provider_time_seconds": provider,
+                                "sandbox_time_seconds": sandbox,
+                            },
+                            "capability_summary": {
+                                "wall_phases": {"agent_loop_time_seconds": agent_loop},
+                            },
+                            "capability_sla": {
+                                "schema_version": "evaluation.capability_sla/v1",
+                                "status": "over_sla",
+                                "blocking": False,
+                                "violations": ["agent_loop", "provider", "sandbox"],
+                                "items": {
+                                    "agent_loop": {
+                                        "actual_seconds": agent_loop,
+                                        "target_seconds": 210.0,
+                                        "status": "over_sla",
+                                        "delta_seconds": round(agent_loop - 210.0, 3),
+                                        "blocking": False,
+                                    },
+                                    "provider": {
+                                        "actual_seconds": provider,
+                                        "target_seconds": 55.0,
+                                        "status": "over_sla",
+                                        "delta_seconds": round(provider - 55.0, 3),
+                                        "blocking": False,
+                                    },
+                                    "sandbox": {
+                                        "actual_seconds": sandbox,
+                                        "target_seconds": 50.0,
+                                        "status": "over_sla",
+                                        "delta_seconds": round(sandbox - 50.0, 3),
+                                        "blocking": False,
+                                    },
+                                },
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    result_path = output_root / "run_c" / "result.json"
+    sla = capability_sla_from_result(result_path)
+    compare = capability_repeated_timing_compare(result_path)
+    diagnostics = capability_sla_diagnostics(sla, compare)
+
+    assert sla["status"] == "over_sla"
+    assert diagnostics["schema_version"] == "evaluation.capability_sla_diagnostics/v1"
+    assert diagnostics["blocking"] is False
+    assert diagnostics["items"]["sandbox"]["diagnosis"] == "timing_jitter"
+    assert diagnostics["items"]["sandbox"]["median_seconds"] == 49.8
+    assert diagnostics["items"]["sandbox"]["current_seconds"] == 50.081
+    assert diagnostics["items"]["provider"]["diagnosis"] == "persistent_over_sla"
+    assert diagnostics["items"]["agent_loop"]["diagnosis"] == "persistent_over_sla"
+    capability_script = Path("scripts/verify_capability.py").read_text(encoding="utf-8")
+    assert '"capability_sla_diagnostics": sla_diagnostics' in capability_script
+    assert "_remaining_bottlenecks(capability_sla, sla_diagnostics)" in capability_script
 
 
 def test_local_gate_pytest_commands_override_default_evaluation_exclusion() -> None:

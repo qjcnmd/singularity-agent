@@ -139,7 +139,7 @@ def test_model_critic_uses_forced_tool_calling_when_structured_outputs_are_unsup
     assert outcome.metadata["output_mode"] == "forced_tool_call"
     assert runner.requests[0].tool_choice.tool_name == "submit_review_findings"
     assert runner.requests[0].tools[0].metadata["strict"] is True
-    assert "Call the submit_review_findings tool" in runner.requests[0].messages[0].text
+    assert "Call exactly one submit_review_findings tool" in runner.requests[0].messages[0].text
     assert "Do not answer in natural language" in runner.requests[0].messages[0].text
 
 

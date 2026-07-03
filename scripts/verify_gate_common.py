@@ -215,6 +215,106 @@ def capability_sla_from_result(result_path: Path) -> dict[str, Any]:
     return result
 
 
+_SLA_ITEM_TO_TIMING_METRIC = {
+    "wall": "wall_time_seconds",
+    "agent_loop": "agent_loop_time_seconds",
+    "provider": "provider_time_seconds",
+    "sandbox": "sandbox_time_seconds",
+    "dependency_setup": "dependency_setup_time_seconds",
+    "verification": "verification_time_seconds",
+    "unattributed_time": "unattributed_time_seconds",
+}
+
+
+def capability_sla_diagnostics(
+    capability_sla: dict[str, Any],
+    timing_compare: dict[str, Any],
+) -> dict[str, Any]:
+    items = capability_sla.get("items") if isinstance(capability_sla, dict) else {}
+    compare_metrics = timing_compare.get("metrics") if isinstance(timing_compare, dict) else {}
+    compare_available = (
+        isinstance(timing_compare, dict)
+        and timing_compare.get("status") == "available"
+        and isinstance(compare_metrics, dict)
+    )
+    diagnostic_items: dict[str, dict[str, Any]] = {}
+    if isinstance(items, dict):
+        for name, item in items.items():
+            if not isinstance(item, dict):
+                continue
+            metric_name = _SLA_ITEM_TO_TIMING_METRIC.get(str(name))
+            if metric_name is None:
+                continue
+            comparison = compare_metrics.get(metric_name) if isinstance(compare_metrics, dict) else {}
+            diagnostic_items[str(name)] = _sla_diagnostic_item(
+                item,
+                metric_name=metric_name,
+                comparison=comparison if isinstance(comparison, dict) else {},
+                compare_available=compare_available,
+            )
+    return {
+        "schema_version": "evaluation.capability_sla_diagnostics/v1",
+        "status": str(capability_sla.get("status") or "unknown") if isinstance(capability_sla, dict) else "unknown",
+        "blocking": False,
+        "compare_status": str(timing_compare.get("status") or "unavailable")
+        if isinstance(timing_compare, dict)
+        else "unavailable",
+        "run_count": int(timing_compare.get("run_count") or 0) if isinstance(timing_compare, dict) else 0,
+        "items": dict(sorted(diagnostic_items.items())),
+    }
+
+
+def _sla_diagnostic_item(
+    item: dict[str, Any],
+    *,
+    metric_name: str,
+    comparison: dict[str, Any],
+    compare_available: bool,
+) -> dict[str, Any]:
+    status = str(item.get("status") or "")
+    target = _safe_optional_float(item.get("target_seconds"))
+    delta = _safe_optional_float(item.get("delta_seconds"))
+    current = _safe_optional_float(comparison.get("current"))
+    minimum = _safe_optional_float(comparison.get("min"))
+    median = _safe_optional_float(comparison.get("median"))
+    diagnosis = "within_sla"
+    reason = ""
+    if status == "over_sla":
+        if not compare_available or target is None or median is None:
+            diagnosis = "current_run_over_sla"
+            reason = "repeated timing compare unavailable or incomplete"
+        elif median > target:
+            diagnosis = "persistent_over_sla"
+            reason = "median repeated timing exceeds target"
+        elif delta is not None and 0.0 < delta <= 1.0:
+            diagnosis = "timing_jitter"
+            reason = "current run is slightly over target while median repeated timing is within target"
+        else:
+            diagnosis = "current_run_over_sla"
+            reason = "current run exceeds target but repeated median is within target"
+    elif status == "unavailable":
+        diagnosis = "unavailable"
+        reason = "current SLA item is unavailable"
+    return {
+        "metric": metric_name,
+        "status": status,
+        "diagnosis": diagnosis,
+        "reason": reason,
+        "current_seconds": current,
+        "min_seconds": minimum,
+        "median_seconds": median,
+        "target_seconds": target,
+        "delta_seconds": delta,
+        "blocking": False,
+    }
+
+
+def _safe_optional_float(value: Any) -> float | None:
+    if isinstance(value, int | float):
+        return round(float(value), 3)
+    return None
+
+
 def capability_repeated_timing_compare(result_path: Path) -> dict[str, Any]:
     current = _capability_timing_record(result_path)
     if not current:
