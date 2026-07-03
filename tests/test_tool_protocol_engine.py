@@ -447,6 +447,65 @@ def test_tool_protocol_creates_synthetic_result_for_rejected_call(tmp_path: Path
     assert payload["ok"] is False
     assert payload["status"] == "rejected"
     assert payload["error_code"] == "unknown_tool"
+    assert payload["error_kind"] == "unknown_tool"
+
+
+def test_tool_protocol_maps_internal_validation_reason_to_canonical_error_code(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    batch = ToolCallBatch(
+        batch_id="batch_internal_validation",
+        run_id=context.run_id,
+        session_id=context.session_id,
+        task_id=context.task_id,
+        phase_id=context.phase_id,
+        model_request_id="req_internal_validation",
+        model_response_id="resp_internal_validation",
+        assistant_message={"role": "assistant", "content": None, "tool_calls": []},
+        tool_calls=[
+            ToolCallEnvelope(
+                protocol_version="1.0",
+                run_id=context.run_id,
+                session_id=context.session_id,
+                task_id=context.task_id,
+                phase_id=context.phase_id,
+                model_request_id="req_internal_validation",
+                model_response_id="resp_internal_validation",
+                assistant_message_id="assistant_internal_validation",
+                tool_call_id="call_internal",
+                tool_name="read_file",
+                raw_arguments="{}",
+                parsed_arguments={},
+                normalized_arguments={},
+                validation_errors=["missing_tool_call_id"],
+            )
+        ],
+    )
+    tool_protocol.state_store.save_batch(batch)
+    tool_executor = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=None,
+        workspace_root=tmp_path,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+
+    result = tool_protocol.execute_plan(
+        tool_protocol.build_execution_plan(batch),
+        context=context,
+        tool_executor=tool_executor,
+        planner=None,
+    )
+
+    payload = json.loads(context.messages()[-1]["content"])
+    assert result.status == ToolProtocolTurnStatus.REJECTED
+    assert payload["error_kind"] == "missing_tool_call_id"
+    assert payload["error_code"] == "protocol_violation"
 
 
 def test_parallel_readonly_validation_uses_same_synthetic_lifecycle_trace(

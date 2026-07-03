@@ -7,13 +7,16 @@ from typing import Any, TypeVar
 
 from singularity.context.models import ToolObservation
 from singularity.error_codes import (
-    TOOL_BLOCKING_ERROR_CODES,
-    TOOL_REPLAN_ERROR_CODES,
-    TOOL_RETRYABLE_ERROR_CODES,
     ErrorCode,
 )
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.planner import Planner, PlannerStore
+from singularity.status_mapping import (
+    PROTOCOL_TERMINAL_RETRY_STATUSES,
+    execution_outcome_is_terminal,
+    lifecycle_status_for_protocol_next_action,
+    protocol_error_code_to_outcome,
+)
 
 
 class RunLifecycleStatus(StrEnum):
@@ -86,10 +89,10 @@ class RunOutcomeReducer:
             terminal = to_status == RunLifecycleStatus.COMPLETED
         elif status == ExecutionOutcomeStatus.BLOCKED:
             to_status = RunLifecycleStatus.BLOCKED
-            terminal = True
+            terminal = execution_outcome_is_terminal(status)
         elif status == ExecutionOutcomeStatus.FATAL:
             to_status = RunLifecycleStatus.FAILED
-            terminal = True
+            terminal = execution_outcome_is_terminal(status)
         return RunControlEvent(
             kind=RunControlEventKind.OUTCOME_RECORDED,
             from_status=current_status,
@@ -154,59 +157,43 @@ class RunOutcomeReducer:
         summary = self._protocol_observation_summary(observations, protocol_result)
 
         if pending_count or next_action == "pending_approval" or ErrorCode.APPROVAL_REQUIRED.value in error_codes:
+            mapping = protocol_error_code_to_outcome(ErrorCode.APPROVAL_REQUIRED.value)
+            assert mapping is not None
             return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.APPROVAL_REQUIRED,
-                source="protocol",
+                status=mapping.status,
+                source=mapping.source,
                 reason="Tool execution is waiting for approval.",
-                error_code=ErrorCode.APPROVAL_REQUIRED.value,
-                next_action="wait_for_approval",
+                error_code=mapping.error_code,
+                next_action=mapping.next_action,
                 observation_summary=summary,
-                retry_allowed=False,
+                retry_allowed=mapping.retry_allowed,
             )
         if ErrorCode.POLICY_ASK_USER_REQUIRED.value in error_codes:
+            mapping = protocol_error_code_to_outcome(ErrorCode.POLICY_ASK_USER_REQUIRED.value)
+            assert mapping is not None
             return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
-                source="tool",
+                status=mapping.status,
+                source=mapping.source,
                 reason="Policy requires user input.",
-                error_code=ErrorCode.POLICY_ASK_USER_REQUIRED.value,
-                next_action="ask_user",
+                error_code=mapping.error_code,
+                next_action=mapping.next_action,
                 observation_summary=summary,
-                retry_allowed=False,
+                retry_allowed=mapping.retry_allowed,
             )
-        if any(code in TOOL_BLOCKING_ERROR_CODES for code in error_codes):
-            code = next(code for code in error_codes if code in TOOL_BLOCKING_ERROR_CODES)
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.BLOCKED,
-                source="tool",
-                reason=f"Tool execution blocked: {code}.",
-                error_code=code,
-                next_action="blocked",
+        for target_status, reason_template in (
+            (ExecutionOutcomeStatus.BLOCKED, "Tool execution blocked: {error_code}."),
+            (ExecutionOutcomeStatus.REPLAN_REQUIRED, "Tool result requires replanning: {error_code}."),
+            (ExecutionOutcomeStatus.RETRYABLE, "Tool call can be retried after correction: {error_code}."),
+        ):
+            outcome = self._protocol_mapping_outcome(
+                error_codes,
+                target_status=target_status,
+                reason_template=reason_template,
                 observation_summary=summary,
-                retry_allowed=False,
             )
-        if any(code in TOOL_REPLAN_ERROR_CODES for code in error_codes):
-            code = next(code for code in error_codes if code in TOOL_REPLAN_ERROR_CODES)
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.REPLAN_REQUIRED,
-                source="tool",
-                reason=f"Tool result requires replanning: {code}.",
-                error_code=code,
-                next_action="replan",
-                observation_summary=summary,
-                retry_allowed=True,
-            )
-        if any(code in TOOL_RETRYABLE_ERROR_CODES for code in error_codes):
-            code = next(code for code in error_codes if code in TOOL_RETRYABLE_ERROR_CODES)
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.RETRYABLE,
-                source="protocol" if "json" in code or "schema" in code else "tool",
-                reason=f"Tool call can be retried after correction: {code}.",
-                error_code=code,
-                next_action="retry",
-                observation_summary=summary,
-                retry_allowed=True,
-            )
-        if next_action == "fail_safe" or status in {"failed", "invalid_assistant"}:
+            if outcome is not None:
+                return outcome
+        if next_action == "fail_safe" or status in PROTOCOL_TERMINAL_RETRY_STATUSES:
             metadata = getattr(protocol_result, "metadata", {}) or {}
             reason = metadata.get("reason") if isinstance(metadata, dict) else None
             return ExecutionOutcome(
@@ -227,6 +214,29 @@ class RunOutcomeReducer:
                 next_action="retry",
                 observation_summary=summary,
                 retry_allowed=True,
+            )
+        return None
+
+    @staticmethod
+    def _protocol_mapping_outcome(
+        error_codes: list[str],
+        *,
+        target_status: ExecutionOutcomeStatus,
+        reason_template: str,
+        observation_summary: str,
+    ) -> ExecutionOutcome | None:
+        for code in error_codes:
+            mapping = protocol_error_code_to_outcome(code)
+            if mapping is None or mapping.status != target_status:
+                continue
+            return ExecutionOutcome(
+                status=mapping.status,
+                source=mapping.source,
+                reason=reason_template.format(error_code=mapping.error_code),
+                error_code=mapping.error_code,
+                next_action=mapping.next_action,
+                observation_summary=observation_summary,
+                retry_allowed=mapping.retry_allowed,
             )
         return None
 
@@ -269,15 +279,12 @@ class RunOutcomeReducer:
         pending_approval_count: int,
         current_status: RunLifecycleStatus,
     ) -> RunLifecycleStatus:
-        if pending_approval_count or next_action in {"pending_approval", "resume_pending_approval"}:
-            return RunLifecycleStatus.WAITING_APPROVAL
-        if next_action in {"ask_user", "request_user_input"}:
-            return RunLifecycleStatus.WAITING_USER
-        if next_action in {"await_tool_result", "execute_pending_tool", "append_tool_message", "request_model", "continue"}:
-            return RunLifecycleStatus.RUNNING
-        if next_action == "finalize":
-            return RunLifecycleStatus.REPORTING
-        return current_status
+        mapped = lifecycle_status_for_protocol_next_action(
+            next_action,
+            pending_approval_count=pending_approval_count,
+            current_status=current_status.value,
+        )
+        return RunLifecycleStatus(mapped)
 
 
 class RunCheckpointStore:

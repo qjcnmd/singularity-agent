@@ -604,6 +604,7 @@
 │      → ExecutionOutcome | None                              │
 │      │                                                      │
 │      ★★★ RunOutcomeReducer.protocol_result_to_outcome() ★★★ │
+│      │  调用 status_mapping.protocol_error_code_to_outcome() │
 │      │  按优先级逐级判定（一旦匹配即返回，不继续 fall-through）：│
 │      │                                                      │
 │      ├── ① pending_count > 0 or APPROVAL_REQUIRED          │
@@ -1614,6 +1615,23 @@
     VALIDATION_ERROR, SCHEMA_MISMATCH, UNKNOWN_TOOL,
     TOOL_NOT_FOUND, DISALLOWED_TOOL, PROTOCOL_VIOLATION,
     INTERNAL_ERROR
+
+  Tool Protocol validation error kind → canonical ErrorCode:
+    error_mapping.tool_protocol_validation_error_kind()
+      保留内部 failure kind，例如 missing_tool_call_id、
+      duplicate_tool_call_id、conflicting_replay。
+    error_mapping.tool_protocol_validation_error_code()
+      将内部 failure kind 投影成 canonical ErrorCode；
+      missing_tool_call_id / duplicate_tool_call_id →
+      PROTOCOL_VIOLATION，unknown_tool → UNKNOWN_TOOL，
+      schema_mismatch → SCHEMA_MISMATCH。
+
+  status_mapping.protocol_error_code_to_outcome():
+    APPROVAL_REQUIRED → APPROVAL_REQUIRED / wait_for_approval
+    POLICY_ASK_USER_REQUIRED → USER_INPUT_REQUIRED / ask_user
+    TOOL_BLOCKING_ERROR_CODES → BLOCKED / blocked
+    TOOL_REPLAN_ERROR_CODES → REPLAN_REQUIRED / replan
+    TOOL_RETRYABLE_ERROR_CODES → RETRYABLE / retry
 
   FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES (13 codes → 不触发分析):
     APPROVAL_REQUIRED, APPROVAL_DENIED, PERMISSION_DENIED,

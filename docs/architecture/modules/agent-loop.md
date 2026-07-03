@@ -8,6 +8,8 @@
 - src/singularity/agent_loop_failure_recovery.py
 - src/singularity/agent_loop_turns.py
 - src/singularity/error_codes.py
+- src/singularity/error_mapping.py
+- src/singularity/status_mapping.py
 
 关键符号:
 - AgentLoop
@@ -17,6 +19,7 @@
 - CompletionGate
 - FailureRecoveryCoordinator
 - TurnCoordinator
+- ProtocolOutcomeMapping
 
 字段清单:
 - AgentLoopResult: status, final_answer, turn, error_code, diagnostics
@@ -32,6 +35,8 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 - src/singularity/agent_loop_failure_recovery.py
 - src/singularity/agent_loop_turns.py
 - src/singularity/error_codes.py
+- src/singularity/error_mapping.py
+- src/singularity/status_mapping.py
 
 ## 关键类、函数、字段
 
@@ -75,7 +80,21 @@ class AgentLoopStatus(StrEnum):
 
 ### ErrorCode（错误码注册表）
 
-`AgentLoop` 不再在终止分支中维护分散的错误码字面量集合。`max_turns_exceeded`、`completion_rejected`、`final_review_rejected`、`model_runner_failed`、`repair_budget_exceeded` 以及 failure-analysis 排除集合来自 `singularity.error_codes.ErrorCode` 和 `FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES`；对外仍序列化为同名字符串。工具 observation 的 `error_code` 由 `RunOutcomeReducer.protocol_result_to_outcome()` 按 `TOOL_BLOCKING_ERROR_CODES`、`TOOL_REPLAN_ERROR_CODES` 和 `TOOL_RETRYABLE_ERROR_CODES` 归类为 blocked、replan 或 retry，不在 `AgentLoop.run()` 内重复判定。
+`AgentLoop` 不再在终止分支中维护分散的错误码字面量集合。`max_turns_exceeded`、`completion_rejected`、`final_review_rejected`、`model_runner_failed`、`repair_budget_exceeded` 以及 failure-analysis 排除集合来自 `singularity.error_codes.ErrorCode` 和 `FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES`；对外仍序列化为同名字符串。Tool Protocol validation 的内部 `ToolCallFailureKind` 先由 `error_mapping.tool_protocol_validation_error_kind()` 保留为 `error_kind`，再由 `tool_protocol_validation_error_code()` 投影成 canonical `ErrorCode` 字符串；例如 `missing_tool_call_id` 和 `duplicate_tool_call_id` 作为内部 failure kind 保留，但对外 `error_code` 为 `protocol_violation`。工具 observation 的 canonical `error_code` 由 `status_mapping.protocol_error_code_to_outcome()` 归类为 waiting、blocked、replan 或 retry，不在 `AgentLoop.run()` 内重复判定。
+
+### ProtocolOutcomeMapping（协议结果到执行结果映射）
+
+`RunOutcomeReducer.protocol_result_to_outcome()` 使用的只读映射对象。**边界**：内部治理对象，不落盘，不进入模型请求。
+
+```python
+@dataclass(frozen=True)
+class ProtocolOutcomeMapping:
+    status: ExecutionOutcomeStatus
+    source: str
+    error_code: str
+    next_action: str
+    retry_allowed: bool
+```
 
 ### 数据流概述
 
@@ -92,7 +111,7 @@ class AgentLoopStatus(StrEnum):
 
 - `AgentKernel.run_task()` 接收 `AgentLoopResult`，更新 `AgentRun`/`AgentSession` 生命周期并返回 CLI；`EvaluationRunner.run_task()` 读取其 `status`、`turn`、`final_answer` 和 `error_code` 生成 `EvaluationTaskResult`。
 - `AgentLoopResult` 不进入模型请求。模型只在结果生成前接收 `ModelRunner.build_request_from_context()` 构造的 request；结果生成后执行已经终止。
-- `RunOutcomeReducer` 只把 `ExecutionOutcomeStatus.SUCCESS` 且 `next_action="finalize"` 的 outcome 归约为 terminal completed；`sandbox_unavailable`、policy denied、protected path、cwd denied 等 runtime error code 仍归约为 blocked。
+- `RunOutcomeReducer` 只把 `ExecutionOutcomeStatus.SUCCESS` 且 `next_action="finalize"` 的 outcome 归约为 terminal completed；terminal 判定来自 `status_mapping.EXECUTION_OUTCOME_TERMINAL_MAP`。`sandbox_unavailable`、policy denied、protected path、cwd denied 等 runtime error code 仍经 `status_mapping.protocol_error_code_to_outcome()` 归约为 blocked。
 - CLI 将 `final_answer` 输出给用户，并依据最终状态/内核错误确定退出；targeted replay 读取同一结果生成 `TargetedFailureReplayResult`。
 
 ## 是否落盘

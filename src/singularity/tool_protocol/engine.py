@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from singularity.context import ContextManager
+from singularity.error_mapping import (
+    tool_protocol_validation_error_code,
+    tool_protocol_validation_error_kind,
+)
 from singularity.model import ModelCapabilities, ModelRole, ModelTurnResult
 from singularity.observability.models import TraceSeverity
 from singularity.planner import Planner
@@ -813,49 +817,11 @@ class ToolProtocolEngine:
 
 
 def _error_kind_from_validation(errors: list[str]) -> ToolCallFailureKind:
-    if "conflicting_replay" in errors:
-        return ToolCallFailureKind.conflicting_replay
-    if "unknown_tool" in errors:
-        return ToolCallFailureKind.unknown_tool
-    if "missing_tool_call_id" in errors:
-        return ToolCallFailureKind.missing_tool_call_id
-    if "duplicate_tool_call_id" in errors:
-        return ToolCallFailureKind.duplicate_tool_call_id
-    if "invalid_json" in errors:
-        return ToolCallFailureKind.invalid_json
-    if "arguments_not_object" in errors:
-        return ToolCallFailureKind.arguments_not_object
-    if "schema_mismatch" in errors:
-        return ToolCallFailureKind.schema_mismatch
-    if "approval_required" in errors:
-        return ToolCallFailureKind.approval_required
-    if "approval_denied" in errors:
-        return ToolCallFailureKind.approval_denied
-    if "sandbox_required" in errors:
-        return ToolCallFailureKind.sandbox_required
-    if "disallowed_tool" in errors:
-        return ToolCallFailureKind.disallowed_tool
-    return ToolCallFailureKind.protocol_violation
+    return tool_protocol_validation_error_kind(errors)
 
 
 def _error_code_from_validation(errors: list[str]) -> str | None:
-    for candidate in (
-        "conflicting_replay",
-        "unknown_tool",
-        "missing_tool_call_id",
-        "duplicate_tool_call_id",
-        "invalid_json",
-        "arguments_not_object",
-        "schema_mismatch",
-        "approval_required",
-        "approval_denied",
-        "sandbox_required",
-        "disallowed_tool",
-        "protocol_violation",
-    ):
-        if candidate in errors:
-            return candidate
-    return None
+    return tool_protocol_validation_error_code(errors)
 
 
 def _allowed_tool_names_from_request(request: Any | None) -> list[str] | None:
