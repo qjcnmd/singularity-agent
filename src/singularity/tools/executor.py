@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -106,6 +107,29 @@ class ToolPolicyEngineProtocol(Protocol):
         ...
 
 
+@dataclass
+class _ExecutionPipelineState:
+    request: ToolExecutionRequest
+    started_at: str
+    started: float
+    tool_call_id: str | None
+    tool_name: str
+    spec: ToolSpec | None = None
+    parsed_args: Any | None = None
+    validated: Any | None = None
+    validated_args: dict[str, Any] | None = None
+    args_fingerprint: str | None = None
+    planner_action_id: str | None = None
+    approval_grant_id: str | None = None
+    policy_decision_id: str | None = None
+    cache_key: str | None = None
+    cache_hit: bool = False
+    output_digest: str | None = None
+    result: ToolResult | None = None
+    planner_updated: bool = False
+    remember_replay: bool = False
+
+
 class ToolExecutor:
     def __init__(
         self,
@@ -143,240 +167,28 @@ class ToolExecutor:
 
     def execute_request(self, request: ToolExecutionRequest | dict[str, Any]) -> ToolResult:
         request = self._normalize_execution_request(request)
-        self._throw_if_cancelled()
-        started_at = datetime.now(UTC).isoformat()
-        started = time.perf_counter()
-        tool_call_id = request.tool_call_id
-        tool_name = request.tool_name or "<unknown>"
-        spec: ToolSpec | None = None
-        validated_args: dict[str, Any] | None = None
-        planner_action_id: str | None = None
-        cache_hit = False
-        output_digest: str | None = None
-        result: ToolResult
-        planner_updated = False
+        state = _ExecutionPipelineState(
+            request=request,
+            started_at=datetime.now(UTC).isoformat(),
+            started=time.perf_counter(),
+            tool_call_id=request.tool_call_id,
+            tool_name=request.tool_name or "<unknown>",
+        )
 
         try:
-            self._throw_if_cancelled()
-            spec = self.registry.get(tool_name)
-            if spec is None or not spec.enabled:
-                result = ToolResult.failure(
-                    code="tool_not_found",
-                    message=f"Unknown tool: {tool_name}",
-                )
-                output_digest = self._result_digest(result)
-                return result
-
-            try:
-                arguments = self._arguments_for_execution_validation(request)
-            except json.JSONDecodeError as exc:
-                self._emit_trace(
-                    TraceEventType.TOOL_VALIDATION_FAILED,
-                    summary=f"Tool {tool_name} arguments were invalid JSON.",
-                    payload={
-                        "tool_name": tool_name,
-                        "tool_call_id": tool_call_id,
-                        "batch_id": request.batch_id,
-                        "argument_digest": request.argument_digest,
-                        "validation_scope": "execution_validation",
-                    },
-                    ids=self._request_trace_ids(request, action_id=tool_call_id),
-                    severity=TraceSeverity.ERROR,
-                )
-                result = ToolResult.failure(
-                    code="bad_arguments_json",
-                    message=f"Invalid JSON arguments: {exc}",
-                )
-                output_digest = self._result_digest(result)
-                return result
-
-            self._emit_trace(
-                TraceEventType.TOOL_VALIDATION_STARTED,
-                summary=f"Validating tool {tool_name}.",
-                payload={
-                    "tool_name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "batch_id": request.batch_id,
-                    "argument_digest": request.argument_digest,
-                    "validation_scope": "execution_validation",
-                    "arguments": self._argument_trace_summary(arguments),
-                },
-                ids=self._request_trace_ids(request, action_id=tool_call_id),
-            )
-            try:
-                validated = spec.input_model.model_validate(arguments)
-            except ValidationError as exc:
-                result = ToolResult.failure(
-                    code="validation_error",
-                    message="Tool arguments failed validation.",
-                    details=self._redactor.redact_value(exc.errors()),
-                )
-                output_digest = self._result_digest(result)
-                self._emit_trace(
-                    TraceEventType.TOOL_VALIDATION_FAILED,
-                    summary=f"Tool {tool_name} arguments failed validation.",
-                    payload={
-                        "tool_name": tool_name,
-                        "tool_call_id": tool_call_id,
-                        "batch_id": request.batch_id,
-                        "argument_digest": request.argument_digest,
-                        "validation_scope": "execution_validation",
-                        "errors": result.error.details if result.error else None,
-                    },
-                    ids=self._request_trace_ids(request, action_id=tool_call_id),
-                    severity=TraceSeverity.ERROR,
-                )
-                return result
-            validated_args = validated.model_dump(mode="json")
-            args_fingerprint = self._digest(
-                json.dumps(validated_args, ensure_ascii=False, sort_keys=True, default=str)
-            )
-
-            replay = self._ledger.check(
-                tool_call_id,
-                args_fingerprint,
-                replay_allowed=spec.idempotency_policy.replay_returns_previous
-                if spec.idempotency_policy
-                else spec.idempotent,
-            )
-            if replay is not None:
-                result = replay
-                output_digest = result.metadata.get("output_digest") or self._result_digest(result)
-                return result
-
-            boundary_error = self._check_execution_boundary(spec)
-            if boundary_error is not None:
-                result = boundary_error
-                output_digest = self._result_digest(result)
-                self._remember_replay(tool_call_id, args_fingerprint, spec, result)
-                return result
-
-            dry_run_error = self._dry_run_error(spec)
-            if dry_run_error is not None:
-                result = dry_run_error
-                output_digest = self._result_digest(result)
-                self._remember_replay(tool_call_id, args_fingerprint, spec, result)
-                return result
-
-            delegated_preflight_error = self._preflight_delegated_handler(spec, validated)
-            if delegated_preflight_error is not None:
-                result = delegated_preflight_error
-                output_digest = self._result_digest(result)
-                self._remember_replay(tool_call_id, args_fingerprint, spec, result)
-                return result
-
-            policy_result, approval_grant_id, policy_decision_id = self._enforce_policy(
-                tool_name=tool_name,
-                spec=spec,
-                validated_args=validated_args,
-                tool_call_id=tool_call_id,
-            )
-            if (
-                policy_result is not None
-                and self._delegates_policy_decision(spec, policy_result)
+            for stage in (
+                self._stage_load_spec,
+                self._stage_validate_arguments,
+                self._stage_replay_precheck,
+                self._stage_pre_policy_preflight,
+                self._stage_enforce_policy,
+                self._stage_authorize_with_planner,
+                self._stage_cache_precheck,
             ):
-                policy_result = None
-            if policy_result is not None:
-                result = policy_result
-                output_digest = self._result_digest(result)
-                self._remember_replay(tool_call_id, args_fingerprint, spec, result)
-                return result
-
-            planner_decision = self._authorize_with_planner(
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                spec=spec,
-                validated_args=validated_args,
-            )
-            if planner_decision is not None and not planner_decision.allowed:
-                self._record_planner_denial(tool_name, planner_decision)
-                planner_updated = True
-                result = ToolResult.failure(
-                    code=planner_decision.error_code or "action_not_allowed",
-                    message="Planner denied tool execution.",
-                    details={
-                        "planner_reason": planner_decision.reason,
-                        "risk_decision": planner_decision.risk_decision.value,
-                    },
-                )
-                output_digest = self._result_digest(result)
-                self._remember_replay(tool_call_id, args_fingerprint, spec, result)
-                return result
-            if planner_decision is not None and planner_decision.action is not None:
-                planner_action_id = planner_decision.action.action_id
-
-            self._throw_if_cancelled()
-            cache_key = self._cache_key(spec, validated_args)
-            cache_policy = spec.cache_policy
-            if self._should_cache(spec):
-                cached = self._cache.get(
-                    cache_key,
-                    ttl_seconds=cache_policy.ttl_seconds if cache_policy else None,
-                )
-                if cached is not None:
-                    cache_hit = True
-                    cached.metadata["cache_hit"] = True
-                    if approval_grant_id:
-                        cached.metadata["approval_grant_id"] = approval_grant_id
-                    if policy_decision_id:
-                        cached.metadata["policy_decision_id"] = policy_decision_id
-                    result = cached
-                    output_digest = result.metadata.get("output_digest") or self._result_digest(result)
-                    self._remember_replay(tool_call_id, args_fingerprint, spec, result)
-                    return result
-
-            delegated_error = self._delegated_backend_error(spec)
-            if delegated_error is not None:
-                result = delegated_error
-                output_digest = self._result_digest(result)
-                self._remember_replay(tool_call_id, args_fingerprint, spec, result)
-                return result
-
-            self._emit_trace(
-                TraceEventType.TOOL_DISPATCH_STARTED,
-                summary=f"Dispatching tool {tool_name}.",
-                payload={
-                    "tool_name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "permission_level": spec.permission_level.value,
-                    "risk_tags": list(spec.risk_tags),
-                    "backend": spec.execution_backend.value,
-                    "batch_id": request.batch_id,
-                    "argument_digest": request.argument_digest,
-                    "arguments": self._argument_trace_summary(validated_args),
-                },
-                ids=self._request_trace_ids(request, action_id=planner_action_id or tool_call_id),
-            )
-            self._throw_if_cancelled()
-            result, output_digest = self._execute_handler(spec, validated)
-            self._throw_if_cancelled()
-            if approval_grant_id:
-                result.metadata["approval_grant_id"] = approval_grant_id
-            if policy_decision_id:
-                result.metadata["policy_decision_id"] = policy_decision_id
-            self._update_planner(
-                tool_call_id=tool_call_id,
-                tool_name=tool_name,
-                result=result,
-                action_id=planner_action_id,
-            )
-            planner_updated = True
-            if self._should_cache(spec) and result.ok and not self._is_sensitive_result(spec, result):
-                touched_paths = self._touched_paths(spec, validated_args)
-                self._cache.set(
-                    cache_key,
-                    result,
-                    max_entries=spec.cache_policy.max_entries if spec.cache_policy else 128,
-                    touched_paths=touched_paths,
-                )
-            if spec.permission_level != PermissionLevel.READ_ONLY:
-                # Incremental invalidation: evict only cache entries whose
-                # touched paths overlap the mutated paths, instead of clearing
-                # the whole cache. This preserves unrelated read-only results
-                # (e.g. cached reads of other files) across a targeted write.
-                self._invalidate_after_write(spec, validated_args, result)
-            self._remember_replay(tool_call_id, args_fingerprint, spec, result)
-            return result
+                result = stage(state)
+                if result is not None:
+                    return self._finish_pipeline_result(state, result)
+            return self._finish_pipeline_result(state, self._stage_dispatch(state))
         except Exception as exc:
             if _is_cancellation_error(exc):
                 raise
@@ -385,38 +197,303 @@ class ToolExecutor:
                 message=self._redactor.redact_text(str(exc)),
                 details={"type": type(exc).__name__},
             )
-            output_digest = self._result_digest(result)
-            return result
+            return self._finish_pipeline_result(state, result)
         finally:
-            ended_at = datetime.now(UTC).isoformat()
-            duration_seconds = time.perf_counter() - started
-            if "result" in locals():
-                result.metadata.setdefault("cache_hit", cache_hit)
-                result.metadata.setdefault("duration_seconds", duration_seconds)
-                result.metadata.setdefault("output_digest", output_digest)
-                self._annotate_result_metadata(result, request)
-                if spec is not None:
-                    result.metadata.setdefault("backend", spec.execution_backend.value)
-                if not planner_updated:
-                    self._safe_update_planner(
-                        tool_call_id=tool_call_id,
-                        tool_name=tool_name,
-                        result=result,
-                        action_id=planner_action_id,
-                    )
-                self._record_trace(
-                    request=request,
-                    tool_call_id=tool_call_id,
-                    tool_name=tool_name,
-                    spec=spec,
-                    validated_args=validated_args,
-                    started_at=started_at,
-                    ended_at=ended_at,
-                    duration_seconds=duration_seconds,
-                    result=result,
-                    output_digest=output_digest,
-                    cache_hit=cache_hit,
-                )
+            self._finalize_pipeline_state(state)
+
+    def _stage_load_spec(self, state: _ExecutionPipelineState) -> ToolResult | None:
+        self._throw_if_cancelled()
+        state.spec = self.registry.get(state.tool_name)
+        if state.spec is None or not state.spec.enabled:
+            return ToolResult.failure(
+                code="tool_not_found",
+                message=f"Unknown tool: {state.tool_name}",
+            )
+        return None
+
+    def _stage_validate_arguments(self, state: _ExecutionPipelineState) -> ToolResult | None:
+        assert state.spec is not None
+        try:
+            state.parsed_args = self._arguments_for_execution_validation(state.request)
+        except json.JSONDecodeError as exc:
+            self._emit_trace(
+                TraceEventType.TOOL_VALIDATION_FAILED,
+                summary=f"Tool {state.tool_name} arguments were invalid JSON.",
+                payload={
+                    "tool_name": state.tool_name,
+                    "tool_call_id": state.tool_call_id,
+                    "batch_id": state.request.batch_id,
+                    "argument_digest": state.request.argument_digest,
+                    "validation_scope": "execution_validation",
+                },
+                ids=self._request_trace_ids(state.request, action_id=state.tool_call_id),
+                severity=TraceSeverity.ERROR,
+            )
+            return ToolResult.failure(
+                code="bad_arguments_json",
+                message=f"Invalid JSON arguments: {exc}",
+            )
+
+        self._emit_trace(
+            TraceEventType.TOOL_VALIDATION_STARTED,
+            summary=f"Validating tool {state.tool_name}.",
+            payload={
+                "tool_name": state.tool_name,
+                "tool_call_id": state.tool_call_id,
+                "batch_id": state.request.batch_id,
+                "argument_digest": state.request.argument_digest,
+                "validation_scope": "execution_validation",
+                "arguments": self._argument_trace_summary(state.parsed_args),
+            },
+            ids=self._request_trace_ids(state.request, action_id=state.tool_call_id),
+        )
+        try:
+            state.validated = state.spec.input_model.model_validate(state.parsed_args)
+        except ValidationError as exc:
+            result = ToolResult.failure(
+                code="validation_error",
+                message="Tool arguments failed validation.",
+                details=self._redactor.redact_value(exc.errors()),
+            )
+            self._emit_trace(
+                TraceEventType.TOOL_VALIDATION_FAILED,
+                summary=f"Tool {state.tool_name} arguments failed validation.",
+                payload={
+                    "tool_name": state.tool_name,
+                    "tool_call_id": state.tool_call_id,
+                    "batch_id": state.request.batch_id,
+                    "argument_digest": state.request.argument_digest,
+                    "validation_scope": "execution_validation",
+                    "errors": result.error.details if result.error else None,
+                },
+                ids=self._request_trace_ids(state.request, action_id=state.tool_call_id),
+                severity=TraceSeverity.ERROR,
+            )
+            return result
+        state.validated_args = state.validated.model_dump(mode="json")
+        state.args_fingerprint = self._digest(
+            json.dumps(state.validated_args, ensure_ascii=False, sort_keys=True, default=str)
+        )
+        return None
+
+    def _stage_replay_precheck(self, state: _ExecutionPipelineState) -> ToolResult | None:
+        assert state.spec is not None
+        assert state.args_fingerprint is not None
+        replay = self._ledger.check(
+            state.tool_call_id,
+            state.args_fingerprint,
+            replay_allowed=state.spec.idempotency_policy.replay_returns_previous
+            if state.spec.idempotency_policy
+            else state.spec.idempotent,
+        )
+        if replay is None:
+            return None
+        state.output_digest = replay.metadata.get("output_digest") or self._result_digest(replay)
+        return replay
+
+    def _stage_pre_policy_preflight(self, state: _ExecutionPipelineState) -> ToolResult | None:
+        assert state.spec is not None
+        assert state.validated is not None
+        result = self._check_execution_boundary(state.spec)
+        if result is not None:
+            state.remember_replay = True
+            return result
+        result = self._dry_run_error(state.spec)
+        if result is not None:
+            state.remember_replay = True
+            return result
+        result = self._preflight_delegated_handler(state.spec, state.validated)
+        if result is not None:
+            state.remember_replay = True
+            return result
+        return None
+
+    def _stage_enforce_policy(self, state: _ExecutionPipelineState) -> ToolResult | None:
+        assert state.spec is not None
+        assert state.validated_args is not None
+        policy_result, approval_grant_id, policy_decision_id = self._enforce_policy(
+            tool_name=state.tool_name,
+            spec=state.spec,
+            validated_args=state.validated_args,
+            tool_call_id=state.tool_call_id,
+        )
+        state.approval_grant_id = approval_grant_id
+        state.policy_decision_id = policy_decision_id
+        if (
+            policy_result is not None
+            and self._delegates_policy_decision(state.spec, policy_result)
+        ):
+            return None
+        if policy_result is not None:
+            state.remember_replay = True
+            return policy_result
+        return None
+
+    def _stage_authorize_with_planner(self, state: _ExecutionPipelineState) -> ToolResult | None:
+        assert state.spec is not None
+        assert state.validated_args is not None
+        planner_decision = self._authorize_with_planner(
+            tool_name=state.tool_name,
+            tool_call_id=state.tool_call_id,
+            spec=state.spec,
+            validated_args=state.validated_args,
+        )
+        if planner_decision is not None and not planner_decision.allowed:
+            self._record_planner_denial(state.tool_name, planner_decision)
+            state.planner_updated = True
+            state.remember_replay = True
+            return ToolResult.failure(
+                code=planner_decision.error_code or "action_not_allowed",
+                message="Planner denied tool execution.",
+                details={
+                    "planner_reason": planner_decision.reason,
+                    "risk_decision": planner_decision.risk_decision.value,
+                },
+            )
+        if planner_decision is not None and planner_decision.action is not None:
+            state.planner_action_id = planner_decision.action.action_id
+        return None
+
+    def _stage_cache_precheck(self, state: _ExecutionPipelineState) -> ToolResult | None:
+        assert state.spec is not None
+        assert state.validated_args is not None
+        self._throw_if_cancelled()
+        state.cache_key = self._cache_key(state.spec, state.validated_args)
+        cache_policy = state.spec.cache_policy
+        if self._should_cache(state.spec):
+            cached = self._cache.get(
+                state.cache_key,
+                ttl_seconds=cache_policy.ttl_seconds if cache_policy else None,
+            )
+            if cached is not None:
+                state.cache_hit = True
+                cached.metadata["cache_hit"] = True
+                if state.approval_grant_id:
+                    cached.metadata["approval_grant_id"] = state.approval_grant_id
+                if state.policy_decision_id:
+                    cached.metadata["policy_decision_id"] = state.policy_decision_id
+                state.output_digest = cached.metadata.get("output_digest") or self._result_digest(cached)
+                state.remember_replay = True
+                return cached
+
+        delegated_error = self._delegated_backend_error(state.spec)
+        if delegated_error is not None:
+            state.remember_replay = True
+            return delegated_error
+        return None
+
+    def _stage_dispatch(self, state: _ExecutionPipelineState) -> ToolResult:
+        assert state.spec is not None
+        assert state.validated is not None
+        assert state.validated_args is not None
+        self._emit_trace(
+            TraceEventType.TOOL_DISPATCH_STARTED,
+            summary=f"Dispatching tool {state.tool_name}.",
+            payload={
+                "tool_name": state.tool_name,
+                "tool_call_id": state.tool_call_id,
+                "permission_level": state.spec.permission_level.value,
+                "risk_tags": list(state.spec.risk_tags),
+                "backend": state.spec.execution_backend.value,
+                "batch_id": state.request.batch_id,
+                "argument_digest": state.request.argument_digest,
+                "arguments": self._argument_trace_summary(state.validated_args),
+            },
+            ids=self._request_trace_ids(
+                state.request,
+                action_id=state.planner_action_id or state.tool_call_id,
+            ),
+        )
+        self._throw_if_cancelled()
+        result, state.output_digest = self._execute_handler(state.spec, state.validated)
+        self._throw_if_cancelled()
+        if state.approval_grant_id:
+            result.metadata["approval_grant_id"] = state.approval_grant_id
+        if state.policy_decision_id:
+            result.metadata["policy_decision_id"] = state.policy_decision_id
+        self._update_planner(
+            tool_call_id=state.tool_call_id,
+            tool_name=state.tool_name,
+            result=result,
+            action_id=state.planner_action_id,
+        )
+        state.planner_updated = True
+        if (
+            self._should_cache(state.spec)
+            and result.ok
+            and not self._is_sensitive_result(state.spec, result)
+        ):
+            assert state.cache_key is not None
+            touched_paths = self._touched_paths(state.spec, state.validated_args)
+            self._cache.set(
+                state.cache_key,
+                result,
+                max_entries=state.spec.cache_policy.max_entries
+                if state.spec.cache_policy
+                else 128,
+                touched_paths=touched_paths,
+            )
+        if state.spec.permission_level != PermissionLevel.READ_ONLY:
+            # Incremental invalidation: evict only cache entries whose touched
+            # paths overlap the mutated paths, instead of clearing the whole
+            # cache. This preserves unrelated read-only results across a
+            # targeted write.
+            self._invalidate_after_write(state.spec, state.validated_args, result)
+        state.remember_replay = True
+        return result
+
+    def _finish_pipeline_result(
+        self,
+        state: _ExecutionPipelineState,
+        result: ToolResult,
+    ) -> ToolResult:
+        state.result = result
+        if state.output_digest is None:
+            state.output_digest = self._result_digest(result)
+        if (
+            state.remember_replay
+            and state.spec is not None
+            and state.args_fingerprint is not None
+        ):
+            self._remember_replay(
+                state.tool_call_id,
+                state.args_fingerprint,
+                state.spec,
+                result,
+            )
+        return result
+
+    def _finalize_pipeline_state(self, state: _ExecutionPipelineState) -> None:
+        result = state.result
+        if result is None:
+            return
+        duration_seconds = time.perf_counter() - state.started
+        result.metadata.setdefault("cache_hit", state.cache_hit)
+        result.metadata.setdefault("duration_seconds", duration_seconds)
+        result.metadata.setdefault("output_digest", state.output_digest)
+        self._annotate_result_metadata(result, state.request)
+        if state.spec is not None:
+            result.metadata.setdefault("backend", state.spec.execution_backend.value)
+        if not state.planner_updated:
+            self._safe_update_planner(
+                tool_call_id=state.tool_call_id,
+                tool_name=state.tool_name,
+                result=result,
+                action_id=state.planner_action_id,
+            )
+        self._record_trace(
+            request=state.request,
+            tool_call_id=state.tool_call_id,
+            tool_name=state.tool_name,
+            spec=state.spec,
+            validated_args=state.validated_args,
+            started_at=state.started_at,
+            ended_at=datetime.now(UTC).isoformat(),
+            duration_seconds=duration_seconds,
+            result=result,
+            output_digest=state.output_digest,
+            cache_hit=state.cache_hit,
+        )
 
     def invalidate_paths(self, paths: list[str]) -> None:
         self._cache.invalidate_paths(paths)
