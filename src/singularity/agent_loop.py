@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -8,22 +7,22 @@ from typing import Any
 
 from rich.console import Console
 
+from singularity.agent_loop_completion import CompletionGate
+from singularity.agent_loop_failure_recovery import FailureRecoveryCoordinator
+from singularity.agent_loop_turns import TurnCoordinator
 from singularity.context import ContextManager
-from singularity.error_codes import FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES, ErrorCode
+from singularity.error_codes import ErrorCode
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
 from singularity.failure_analysis.analyzer import FailureAnalyzer
-from singularity.failure_analysis.request import FailureAnalysisRequest
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.interaction import InteractionController, ProgressEvent
 from singularity.model import (
     ChatCompletionProvider,
     ModelErrorKind,
-    ModelPurpose,
     ModelRunner,
-    ModelTurnStatus,
 )
 from singularity.observability.protocols import TraceStorageProtocol
-from singularity.planner import Planner, TaskStatus
+from singularity.planner import Planner
 from singularity.repair import RepairPlanner
 from singularity.run_controller import RunController
 from singularity.tool_protocol.engine import ToolProtocolEngine
@@ -145,7 +144,79 @@ class AgentLoop:
         self._failure_replan_signals: dict[str, Any] = {}
         self._failure_analysis_snapshots: dict[str, dict[str, int]] = {}
         self._completion_rejection_state: dict[str, dict[str, Any]] = {}
+        self.failure_recovery = FailureRecoveryCoordinator(
+            failure_analyzer=self.failure_analyzer,
+            repair_planner=self.repair_planner,
+            failure_analysis_fingerprints=self._failure_analysis_fingerprints,
+            failure_replan_signals=self._failure_replan_signals,
+            failure_analysis_snapshots=self._failure_analysis_snapshots,
+            completion_rejection_state=self._completion_rejection_state,
+        )
+        self.completion_gate = self._build_completion_gate()
         self.strict = strict
+
+    def _build_completion_gate(self) -> CompletionGate:
+        return CompletionGate(
+            trace=self.trace,
+            result_factory=lambda **kwargs: AgentLoopResult(
+                status=AgentLoopStatus(kwargs["status"]),
+                final_answer=kwargs["final_answer"],
+                turn=kwargs["turn"],
+                error_code=kwargs.get("error_code"),
+                diagnostics=kwargs.get("diagnostics"),
+            ),
+            terminal_result_from_outcome=self._terminal_result_from_outcome,
+            record_outcome_context=self._record_outcome_context,
+            maybe_analyze_failure=self._maybe_analyze_failure,
+        )
+
+    def _completion_gate(self) -> CompletionGate:
+        gate = getattr(self, "completion_gate", None)
+        if isinstance(gate, CompletionGate):
+            return gate
+        gate = self._build_completion_gate()
+        self.completion_gate = gate
+        return gate
+
+    def _turn_coordinator(self) -> TurnCoordinator:
+        coordinator = getattr(self, "turn_coordinator", None)
+        if isinstance(coordinator, TurnCoordinator):
+            return coordinator
+        coordinator = TurnCoordinator(
+            trace=self.trace,
+            model_runner=self.model_runner,
+            tools=self.tools,
+            tool_executor=self.tool_executor,
+            tool_protocol=self.tool_protocol,
+            prompt_assembly=self.prompt_assembly,
+            strict=self.strict,
+            publish_progress=self._publish_progress,
+            record_model_failure=self._record_model_failure,
+            outcome_from_model_failure=self._outcome_from_model_failure,
+            terminal_result_from_outcome=self._terminal_result_from_outcome,
+            record_outcome_context=self._record_outcome_context,
+            assistant_message_from_result=self._assistant_message_from_result,
+            attempt_finalize=self._attempt_finalize,
+            maybe_analyze_failure=self._maybe_analyze_failure,
+            should_auto_finalize_after_tools=self._should_auto_finalize_after_tools,
+        )
+        self.turn_coordinator = coordinator
+        return coordinator
+
+    def _failure_recovery_coordinator(self) -> FailureRecoveryCoordinator:
+        coordinator = getattr(self, "failure_recovery", None)
+        if isinstance(coordinator, FailureRecoveryCoordinator):
+            return coordinator
+        coordinator = FailureRecoveryCoordinator(
+            failure_analyzer=getattr(self, "failure_analyzer", None),
+            repair_planner=getattr(self, "repair_planner", None),
+            failure_analysis_fingerprints=getattr(self, "_failure_analysis_fingerprints", None),
+            failure_replan_signals=getattr(self, "_failure_replan_signals", None),
+            failure_analysis_snapshots=getattr(self, "_failure_analysis_snapshots", None),
+            completion_rejection_state=getattr(self, "_completion_rejection_state", None),
+        )
+        self.failure_recovery = coordinator
+        return coordinator
 
     def run(self, user_goal: str) -> AgentLoopResult:
         planner = self.planner
@@ -168,138 +239,17 @@ class AgentLoop:
             )
         else:
             context.set_user_goal(effective_goal)
-        model_runner = self.model_runner
-        prompt_assembly = self.prompt_assembly
         tool_schemas = self.tools.openai_tools(strict=self.strict)
-        tool_executor = self.tool_executor
-        tool_protocol = self.tool_protocol
 
         def run_turn(turn: int) -> AgentLoopResult | None:
-            self._publish_progress(turn)
-            planner.step()
-            effective_goal = getattr(planner.state, "effective_goal", None) or user_goal
-            context.set_user_goal(effective_goal)
-            turn_action_id = f"turn_{turn}"
-            active_tool_schemas = planner.filtered_tools(
-                tool_schemas,
-                tool_specs=self.tools.list(),
-                action_id=turn_action_id,
-            )
-            allowed_tool_names = [
-                tool.get("function", {}).get("name")
-                for tool in active_tool_schemas
-                if tool.get("function", {}).get("name")
-            ]
-            request = model_runner.build_request_from_context(
-                context,
-                run_id=self.trace.run_id,
-                session_id=getattr(planner, "session_id", self.trace.run_id),
-                task_id=getattr(planner, "task_id", self.trace.run_id),
-                phase_id=planner.state.current_phase if planner.state else "model",
-                action_id=turn_action_id,
-                purpose=ModelPurpose.PLAN_NEXT_ACTION,
-                allowed_tool_names=allowed_tool_names,
-                planner_context=planner.planner_context_message(),
-                prompt_assembly=prompt_assembly,
-                user_task=effective_goal,
-                strict_tools=self.strict,
-            )
-            planner.record_instruction_prompt_observation(dict(prompt_assembly.summary()))
-            result = model_runner.run_turn(request)
-            context.record_model_usage(result)
-            if result.status != ModelTurnStatus.SUCCESS:
-                self._record_model_failure(planner, result, turn=turn)
-                outcome = self._outcome_from_model_failure(result)
-                controller.apply_outcome(outcome)
-                self._record_outcome_context(context, planner, outcome)
-                terminal = self._terminal_result_from_outcome(outcome, turn=turn)
-                if terminal is not None:
-                    return terminal
-                return None
-
-            assistant_message = self._assistant_message_from_result(result)
-            if not result.tool_calls:
-                context.add_assistant_message(assistant_message)
-                final = self._attempt_finalize(
-                    planner,
-                    controller=controller,
-                    context=context,
-                    turn=turn,
-                    model_answer=assistant_message.get("content") or "",
-                )
-                if final is not None:
-                    return final
-                return None
-
-            observation_start = len(context.tool_observations)
-            protocol_result = tool_protocol.process_model_turn(
-                request=request,
-                result=result,
-                turn=turn,
-                context=context,
-                tool_executor=tool_executor,
+            return self._turn_coordinator().run_turn(
+                turn,
+                user_goal=user_goal,
                 planner=planner,
+                controller=controller,
+                context=context,
+                tool_schemas=tool_schemas,
             )
-            if protocol_result.next_action == "finalize":
-                final = self._attempt_finalize(
-                    planner,
-                    controller=controller,
-                    context=context,
-                    turn=turn,
-                    model_answer=assistant_message.get("content") or "",
-                )
-                if final is not None:
-                    return final
-                return None
-
-            observations = context.tool_observations[observation_start:]
-            controller.apply_protocol_result(protocol_result, observations=observations)
-            reduced_outcome = controller.reduce_protocol_result(
-                protocol_result,
-                observations=observations,
-            )
-            if reduced_outcome is not None:
-                controller.apply_outcome(reduced_outcome)
-                self._record_outcome_context(context, planner, reduced_outcome)
-                blocked = self._maybe_analyze_failure(
-                    planner,
-                    context,
-                    outcome=reduced_outcome,
-                    failure_source="tool",
-                    turn=turn,
-                )
-                if blocked is not None:
-                    controller.apply_outcome(blocked)
-                    self._record_outcome_context(context, planner, blocked)
-                    terminal = self._terminal_result_from_outcome(blocked, turn=turn)
-                    if terminal is not None:
-                        return terminal
-                terminal = self._terminal_result_from_outcome(reduced_outcome, turn=turn)
-                if terminal is not None:
-                    return terminal
-            blocked = self._maybe_analyze_failure(
-                planner,
-                context,
-                failure_source="verification",
-                turn=turn,
-            )
-            if blocked is not None:
-                controller.apply_outcome(blocked)
-                self._record_outcome_context(context, planner, blocked)
-                terminal = self._terminal_result_from_outcome(blocked, turn=turn)
-                if terminal is not None:
-                    return terminal
-            if self._should_auto_finalize_after_tools(planner, protocol_result):
-                final = self._attempt_finalize(
-                    planner,
-                    controller=controller,
-                    context=context,
-                    turn=turn,
-                    model_answer=assistant_message.get("content") or "",
-                )
-                if final is not None:
-                    return final
-            return None
 
         def on_max_turns(max_turns: int) -> AgentLoopResult:
             message = f"Stopped after max_turns={max_turns}; the model did not produce a final answer."
@@ -340,137 +290,12 @@ class AgentLoop:
         turn: int,
         model_answer: str,
     ) -> AgentLoopResult | None:
-        assessment = planner.assess_completion(mark_blocked=False)
-        if assessment["status"] != TaskStatus.COMPLETED.value:
-            outcome = ExecutionOutcome(
-                status=ExecutionOutcomeStatus.REPLAN_REQUIRED,
-                source="completion",
-                reason="completion_rejected",
-                error_code=ErrorCode.COMPLETION_REJECTED.value,
-                missing_evidence=list(assessment["unmet"]),
-                next_action="continue",
-                observation_summary=(
-                    "Completion rejected because evidence is missing: "
-                    + ", ".join(assessment["unmet"])
-                ),
-                retry_allowed=True,
-                metadata={"assessment": assessment},
-            )
-            controller.apply_outcome(outcome)
-            self._record_outcome_context(context, planner, outcome)
-            blocked = self._maybe_analyze_failure(
-                planner,
-                context,
-                outcome=outcome,
-                failure_source="completion",
-                turn=turn,
-            )
-            if blocked is not None:
-                controller.apply_outcome(blocked)
-                self._record_outcome_context(context, planner, blocked)
-                return self._terminal_result_from_outcome(blocked, turn=turn)
-            repair_blocked = self._repair_phase_completion_blocked_outcome(
-                planner,
-                assessment=assessment,
-            )
-            if repair_blocked is not None:
-                controller.apply_outcome(repair_blocked)
-                self._record_outcome_context(context, planner, repair_blocked)
-                return self._terminal_result_from_outcome(repair_blocked, turn=turn)
-            return None
-        if (
-            planner.state is not None
-            and not planner.state.completion_criteria.required_changes_applied
-            and not planner.state.completion_criteria.required_verifications_passed
-        ):
-            outcome = ExecutionOutcome(
-                status=ExecutionOutcomeStatus.SUCCESS,
-                source="completion",
-                reason="completion_ready",
-                next_action="finalize",
-                observation_summary="Completion evidence satisfied.",
-                retry_allowed=False,
-            )
-            controller.apply_outcome(outcome)
-            self._record_outcome_context(context, planner, outcome)
-            self.trace.record("final_answer", {"turn": turn, "content": model_answer})
-            return AgentLoopResult(
-                status=AgentLoopStatus.COMPLETED,
-                final_answer=model_answer,
-                turn=turn,
-            )
-        report = planner.finalize()
-        report.context_usage_diagnostic = context.context_usage_diagnostic()
-        if report.status != TaskStatus.COMPLETED:
-            retry_allowed = report.status in {
-                TaskStatus.INSPECTING_WORKSPACE,
-                TaskStatus.PLANNING_CHANGES,
-                TaskStatus.APPLYING_CHANGES,
-                TaskStatus.RUNNING_VERIFICATION,
-                TaskStatus.REPAIRING_FAILURES,
-                TaskStatus.FINALIZING,
-            }
-            outcome = ExecutionOutcome(
-                status=(
-                    ExecutionOutcomeStatus.REPLAN_REQUIRED
-                    if retry_allowed
-                    else ExecutionOutcomeStatus.BLOCKED
-                ),
-                source="completion",
-                reason=f"Final report did not complete: {report.status.value}.",
-                error_code=ErrorCode.FINAL_REVIEW_REJECTED.value,
-                missing_evidence=list(report.next_steps or ["final_report_completed"]),
-                next_action="continue" if retry_allowed else "blocked",
-                observation_summary=(
-                    f"Final report status={report.status.value}; "
-                    f"verification={report.verification_summary.get('status', 'unknown')}."
-                ),
-                retry_allowed=retry_allowed,
-                metadata={
-                    "final_report_status": report.status.value,
-                    "verification_summary": report.verification_summary,
-                    "review_summary": report.review_summary,
-                },
-            )
-            controller.apply_outcome(outcome)
-            self._record_outcome_context(context, planner, outcome)
-            blocked = self._maybe_analyze_failure(
-                planner,
-                context,
-                outcome=outcome,
-                failure_source="completion_review",
-                turn=turn,
-            )
-            if blocked is not None:
-                controller.apply_outcome(blocked)
-                self._record_outcome_context(context, planner, blocked)
-                return self._terminal_result_from_outcome(blocked, turn=turn)
-            return self._terminal_result_from_outcome(outcome, turn=turn)
-        final_answer = "\n".join(
-            [
-                f"status: {report.status.value}",
-                f"files_changed: {', '.join(report.files_changed) if report.files_changed else '-'}",
-                f"verification: {report.verification_summary.get('status', 'unknown')}",
-                f"unresolved_issues: {len(report.unresolved_issues)}",
-                f"risks: {len(report.risks)}",
-            ]
-        )
-        outcome = ExecutionOutcome(
-            status=ExecutionOutcomeStatus.SUCCESS,
-            source="completion",
-            reason="completion_ready",
-            next_action="finalize",
-            observation_summary="Completion evidence satisfied.",
-            retry_allowed=False,
-            metadata={"verification_summary": report.verification_summary},
-        )
-        controller.apply_outcome(outcome)
-        self._record_outcome_context(context, planner, outcome)
-        self.trace.record("final_answer", {"turn": turn, "content": final_answer})
-        return AgentLoopResult(
-            status=AgentLoopStatus.COMPLETED,
-            final_answer=final_answer,
+        return self._completion_gate().attempt_finalize(
+            planner,
+            controller=controller,
+            context=context,
             turn=turn,
+            model_answer=model_answer,
         )
 
     @staticmethod
@@ -478,16 +303,7 @@ class AgentLoop:
         planner: Planner,
         protocol_result: Any,
     ) -> bool:
-        state = planner.state
-        if state is None:
-            return False
-        if state.status != TaskStatus.FINALIZING and state.current_phase != TaskStatus.FINALIZING.value:
-            return False
-        if int(getattr(protocol_result, "pending_approval_count", 0) or 0):
-            return False
-        if int(getattr(protocol_result, "failed_count", 0) or 0):
-            return False
-        return not int(getattr(protocol_result, "rejected_count", 0) or 0)
+        return CompletionGate.should_auto_finalize_after_tools(planner, protocol_result)
 
     def _outcome_from_model_failure(self, result: Any) -> ExecutionOutcome:
         message = (
@@ -595,198 +411,30 @@ class AgentLoop:
         turn: int,
         outcome: ExecutionOutcome | None = None,
     ) -> ExecutionOutcome | None:
-        if outcome is not None and not self._should_analyze_outcome(planner, outcome):
-            return None
-        if outcome is None and not self._has_repairable_planner_failure(planner):
-            return None
-        request = FailureAnalysisRequest.from_planner(
+        return self._failure_recovery_coordinator().maybe_analyze_failure(
             planner,
             context,
             failure_source=failure_source,
             outcome=outcome,
             turn=turn,
         )
-        if not request.has_failure:
-            return None
-        snapshot = self._failure_snapshot(planner)
-        if request.fingerprint in self._failure_analysis_fingerprints:
-            if not self._duplicate_failure_has_new_evidence(request.fingerprint, snapshot):
-                if self._is_stalled_completion_gate_failure(
-                    failure_source=failure_source,
-                    outcome=outcome,
-                ):
-                    signal_payload = self._failure_replan_signals.get(request.fingerprint)
-                    return ExecutionOutcome(
-                        status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
-                        source="failure_analysis",
-                        reason="Repeated completion/final review failure without new repair evidence.",
-                        error_code=ErrorCode.REPAIR_BUDGET_EXCEEDED.value,
-                        next_action="ask_user",
-                        observation_summary=(
-                            "Completion gate is still blocked after failure analysis and no new repair evidence."
-                        ),
-                        retry_allowed=False,
-                        metadata={"replan_signal": signal_payload or {}},
-                    )
-                return None
-            signal_payload = self._failure_replan_signals.get(request.fingerprint)
-            if signal_payload is None:
-                return None
-            self._failure_analysis_snapshots[request.fingerprint] = snapshot
-            decision = planner.replan(signal_payload)
-            if getattr(getattr(decision, "decision", None), "value", "") == "ask_user":
-                return ExecutionOutcome(
-                    status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
-                    source="failure_analysis",
-                    reason=decision.reason,
-                    error_code=ErrorCode.REPAIR_BUDGET_EXCEEDED.value,
-                    next_action="ask_user",
-                    observation_summary=decision.reason,
-                    retry_allowed=False,
-                    metadata={"replan_signal": signal_payload},
-                )
-            return None
-        self._failure_analysis_fingerprints.add(request.fingerprint)
-        analysis = self.failure_analyzer.analyze(request)
-        repair_plan = self.repair_planner.plan(analysis, repair_policy=request.repair_policy)
-        replan_signal = self.repair_planner.to_replan_signal(
-            request=request,
-            analysis=analysis,
-            plan=repair_plan,
-        )
-        replan_signal_payload = replan_signal.to_dict()
-        planner.record_failure_analysis(
-            analysis,
-            repair_plan,
-            replan_signal=replan_signal_payload,
-        )
-        context.add_failure(
-            {
-                "failure_analysis": analysis.to_dict(),
-                "repair_plan": repair_plan.to_dict(),
-                "replan_signal": replan_signal_payload,
-            }
-        )
-        self._failure_analysis_snapshots[request.fingerprint] = snapshot
-        if repair_plan.needs_user_input or repair_plan.blocked_reason:
-            return self.repair_planner.blocked_outcome(repair_plan)
-        self._failure_replan_signals[request.fingerprint] = replan_signal_payload
-        decision = planner.replan(replan_signal_payload)
-        if getattr(getattr(decision, "decision", None), "value", "") == "ask_user":
-            return ExecutionOutcome(
-                status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
-                source="failure_analysis",
-                reason=decision.reason,
-                error_code=ErrorCode.REPAIR_BUDGET_EXCEEDED.value,
-                next_action="ask_user",
-                observation_summary=decision.reason,
-                retry_allowed=False,
-                metadata={"repair_plan": repair_plan.to_dict(), "replan_signal": replan_signal_payload},
-            )
-        return None
 
     def _should_analyze_outcome(self, planner: Planner, outcome: ExecutionOutcome) -> bool:
-        if outcome.status != ExecutionOutcomeStatus.REPLAN_REQUIRED:
-            return False
-        if outcome.error_code in FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES:
-            return False
-        if outcome.error_code == ErrorCode.COMPLETION_REJECTED.value:
-            return self._should_escalate_completion_rejection(planner, outcome)
-        return True
+        return self._failure_recovery_coordinator().should_analyze_outcome(planner, outcome)
 
     def _should_escalate_completion_rejection(self, planner: Planner, outcome: ExecutionOutcome) -> bool:
-        missing = sorted(str(item) for item in outcome.missing_evidence)
-        key = json.dumps({"missing": missing}, ensure_ascii=False, sort_keys=True)
-        phase = getattr(getattr(planner, "state", None), "current_phase", "")
-        snapshot = self._evidence_snapshot(planner)
-        previous = self._completion_rejection_state.get("latest")
-        if not previous or previous.get("key") != key:
-            self._completion_rejection_state["latest"] = {
-                "key": key,
-                "count": 1,
-                "phase": phase,
-                "snapshot": snapshot,
-            }
-            return False
-        count = int(previous.get("count") or 0) + 1
-        phase_stalled = previous.get("phase") == phase
-        evidence_stalled = previous.get("snapshot") == snapshot
-        self._completion_rejection_state["latest"] = {
-            "key": key,
-            "count": count,
-            "phase": phase,
-            "snapshot": snapshot,
-        }
-        return count >= 2 and phase_stalled and evidence_stalled
+        return self._failure_recovery_coordinator().should_escalate_completion_rejection(
+            planner,
+            outcome,
+        )
 
     @staticmethod
     def _evidence_snapshot(planner: Planner) -> dict[str, int]:
-        evidence = planner.evidence
-        return {
-            "inspected_files": len(evidence.inspected_files),
-            "applied_changes": len(evidence.applied_changes),
-            "command_results": len(evidence.command_results),
-            "verification_results": len(evidence.verification_results),
-            "tool_results": len(evidence.tool_results),
-            "edit_results": len(evidence.edit_results),
-            "review_results": len(evidence.review_results),
-        }
+        return FailureRecoveryCoordinator.evidence_snapshot(planner)
 
     @staticmethod
     def _failure_snapshot(planner: Planner) -> dict[str, int]:
-        evidence = planner.evidence
-        return {
-            "failed_command_results": len(
-                [
-                    item
-                    for item in evidence.command_results
-                    if item.get("semantic_status") not in {None, "succeeded", "SUCCEEDED"}
-                    or item.get("error_code")
-                ]
-            ),
-            "failed_verification_results": len(
-                [
-                    item
-                    for item in evidence.verification_results
-                    if isinstance(item, dict)
-                    and (
-                        (item.get("completion_assessment") or {}).get("status")
-                        in {"failed", "blocked", "needs_review"}
-                        or any(
-                            result.get("status") in {"failed", "blocked", "timeout", "flaky"}
-                            for result in item.get("results") or []
-                            if isinstance(result, dict)
-                        )
-                    )
-                ]
-            ),
-            "failed_tool_results": len(
-                [
-                    item
-                    for item in evidence.tool_results
-                    if item.get("ok") is False or item.get("error_code")
-                ]
-            ),
-            "failed_edit_results": len(
-                [
-                    item
-                    for item in evidence.edit_results
-                    if item.get("error_code") or item.get("status") in {"failed", "blocked"}
-                ]
-            ),
-            "failed_review_results": len(
-                [
-                    item
-                    for item in evidence.review_results
-                    if isinstance(item.get("decision"), dict)
-                    and item["decision"].get("action") in {
-                        "repair",
-                        "reject",
-                        "needs_human_approval",
-                    }
-                ]
-            ),
-        }
+        return FailureRecoveryCoordinator.failure_snapshot(planner)
 
     @staticmethod
     def _is_stalled_completion_gate_failure(
@@ -794,15 +442,9 @@ class AgentLoop:
         failure_source: str,
         outcome: ExecutionOutcome | None,
     ) -> bool:
-        if failure_source in {"completion", "completion_review"}:
-            return True
-        return bool(
-            outcome is not None
-            and outcome.error_code
-            in {
-                ErrorCode.COMPLETION_REJECTED.value,
-                ErrorCode.FINAL_REVIEW_REJECTED.value,
-            }
+        return FailureRecoveryCoordinator.is_stalled_completion_gate_failure(
+            failure_source=failure_source,
+            outcome=outcome,
         )
 
     @staticmethod
@@ -811,53 +453,20 @@ class AgentLoop:
         *,
         assessment: dict[str, Any],
     ) -> ExecutionOutcome | None:
-        state = getattr(planner, "state", None)
-        if getattr(state, "current_phase", "") != "repairing_failures":
-            return None
-        unmet = [str(item) for item in assessment.get("unmet") or []]
-        if "verification_contract_satisfaction" not in unmet:
-            return None
-        return ExecutionOutcome(
-            status=ExecutionOutcomeStatus.BLOCKED,
-            source="completion",
-            reason="Repair phase completion rejected because the active repair contract is unsatisfied.",
-            error_code=ErrorCode.REPAIR_BUDGET_EXCEEDED.value,
-            missing_evidence=unmet,
-            next_action="blocked",
-            observation_summary=(
-                "Repair phase cannot complete because the active repair verification contract is unsatisfied."
-            ),
-            retry_allowed=False,
-            metadata={"assessment": assessment},
+        return CompletionGate.repair_phase_completion_blocked_outcome(
+            planner,
+            assessment=assessment,
         )
 
     def _duplicate_failure_has_new_evidence(self, fingerprint: str, snapshot: dict[str, int]) -> bool:
-        previous = self._failure_analysis_snapshots.get(fingerprint)
-        if previous is None:
-            return True
-        return any(snapshot.get(key, 0) > previous.get(key, 0) for key in snapshot)
+        return self._failure_recovery_coordinator().duplicate_failure_has_new_evidence(
+            fingerprint,
+            snapshot,
+        )
 
     @staticmethod
     def _has_repairable_planner_failure(planner: Planner) -> bool:
-        if planner.state is None:
-            return False
-        latest = planner.evidence.verification_results[-1] if planner.evidence.verification_results else {}
-        assessment = latest.get("completion_assessment") if isinstance(latest, dict) else {}
-        if isinstance(assessment, dict) and assessment.get("status") in {"ready", "ready_with_warnings"}:
-            return False
-        if isinstance(assessment, dict) and assessment.get("status") in {"failed", "blocked", "needs_review"}:
-            return True
-        for failure in planner.evidence.unresolved_failures[-5:]:
-            if not isinstance(failure, dict):
-                return True
-            code = (
-                failure.get("error_code")
-                or (failure.get("execution_outcome") or {}).get("error_code")
-                or failure.get("status")
-            )
-            if code not in FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES:
-                return True
-        return False
+        return FailureRecoveryCoordinator.has_repairable_planner_failure(planner)
 
     def _publish_progress(self, turn: int) -> None:
         if self.interaction_controller is None:

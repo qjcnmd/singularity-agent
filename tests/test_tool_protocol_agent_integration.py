@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from singularity.agent_loop import AgentLoop, AgentLoopStatus
+from singularity.agent_loop_turns import TurnCoordinator
 from singularity.context import ContextManager
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.observability.models import TraceEvent, TraceEventType
@@ -363,12 +364,15 @@ def test_agent_loop_continues_after_compaction_with_usage_tool_observation_and_f
 
 def test_agent_run_does_not_manually_loop_tool_calls() -> None:
     source = inspect.getsource(AgentLoop.run)
+    turn_source = inspect.getsource(TurnCoordinator.run_turn)
+    combined_source = source + turn_source
 
-    assert "for tool_call in tool_calls" not in source
-    assert ".execute_tool_call(tool_call)" not in source
+    assert "for tool_call in tool_calls" not in combined_source
+    assert ".execute_tool_call(tool_call)" not in combined_source
     assert "Planner(" not in source
     assert "ToolExecutor(" not in source
     assert "ToolProtocolEngine(" not in source
     assert "PromptAssemblyPipeline(" not in source
-    assert "self.tool_protocol" in source
-    assert "process_model_turn" in source
+    assert "_turn_coordinator()" in source
+    assert "self.tool_protocol" in turn_source
+    assert "process_model_turn" in turn_source

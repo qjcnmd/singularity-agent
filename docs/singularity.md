@@ -1,6 +1,6 @@
 # Singularity 主链路完整调用链（全部分支路径）
 
-> 基于当前源码核对：`agent_loop.py`(896行)、`run_controller.py`(479行)、`execution_outcome.py`(60行)、`error_codes.py`(123行)、`kernel/agent_kernel.py`(483行)、`tool_protocol/engine.py`(946行)。
+> 基于当前源码核对：`agent_loop.py`、`agent_loop_turns.py`、`agent_loop_completion.py`、`agent_loop_failure_recovery.py`、`run_controller.py`、`execution_outcome.py`、`error_codes.py`、`kernel/agent_kernel.py`、`tool_protocol/engine.py`。
 > `[成功]` / `[失败]` / `[阻断]` 为关键分叉点；缩进表示嵌套层级。
 
 ---
@@ -194,7 +194,7 @@
                                    │
                                    ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║              AgentLoop.run(user_goal)  (agent_loop.py:150-327)              ║
+║              AgentLoop.run(user_goal)  (agent_loop.py)                      ║
 ║                        ★★★ 核心循环入口 ★★★                                 ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
                                    │
@@ -237,7 +237,7 @@
 │                                                                             │
 │  for turn in range(1, max_turns + 1):                                       │
 │      │                                                                      │
-│      ├── result = run_turn(turn)     ← 核心闭包（下方详图）                   │
+│      ├── result = run_turn(turn)     ← 委托 TurnCoordinator（下方详图）       │
 │      │   │                                                                  │
 │      │   ├── result is not None ───────────────────────────────────────┐   │
 │      │   │   │  ★ AgentLoopResult 被返回 → 终止循环 ★                   │   │
@@ -274,8 +274,8 @@
                                    │
                                    ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║                run_turn(turn) 闭包 — 单 Turn 完整流程                        ║
-║              (agent_loop.py:177-297, 闭包捕获 8+ 外部变量)                    ║
+║                TurnCoordinator.run_turn(turn) — 单 Turn 完整流程             ║
+║              (agent_loop_turns.py，经 AgentLoop.run 的 callback 调用)        ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
                                    │
                                    ▼
@@ -512,14 +512,14 @@
 │  B2. context.add_assistant_message(assistant_message)       │
 │      → ObservationStore 写入 assistant 消息                  │
 │                                                            │
-│  B3. final = _attempt_finalize(                             │
+│  B3. final = CompletionGate.attempt_finalize(                │
 │          planner, controller, context, turn,                │
 │          model_answer=assistant_message["content"]          │
 │      )                                                      │
 │      │                                                      │
-│      ▼  ★★★ 分叉：_attempt_finalize() 详图 ★★★              │
+│      ▼  ★★★ 分叉：CompletionGate.attempt_finalize() 详图 ★★★│
 │      ╔════════════════════════════════════════════════════╗ │
-│      ║     _attempt_finalize() 见下方独立详图              ║ │
+│      ║     CompletionGate.attempt_finalize() 见下方独立详图 ║ │
 │      ╚════════════════════════════════════════════════════╝ │
 │      │                                                      │
 │      ├── [返回 AgentLoopResult] → return final              │
@@ -568,7 +568,7 @@
 │      ├── next_action == "finalize" ────────────────────┐   │
 │      │   │  ★ 模型声明完成（无 tool_calls 时触发） ★      │   │
 │      │   │                                               │   │
-│      │   │  final = _attempt_finalize(planner,           │   │
+│      │   │  final = CompletionGate.attempt_finalize(      │   │
 │      │   │      controller, context, turn,               │   │
 │      │   │      model_answer)                            │   │
 │      │   │                                               │   │
@@ -674,7 +674,8 @@
 │      │   ├── _record_outcome_context(context, planner,    │   │
 │      │   │       reduced_outcome)                        │   │
 │      │   │                                               │   │
-│      │   ├── blocked = _maybe_analyze_failure(           │   │
+│      │   ├── blocked = FailureRecoveryCoordinator.       │   │
+│      │   │   maybe_analyze_failure(                      │   │
 │      │   │       planner, context,                       │   │
 │      │   │       outcome=reduced_outcome,                │   │
 │      │   │       failure_source="tool",                  │   │
@@ -716,7 +717,7 @@
 │          │ ★ 工具执行正常，无异常 outcome ★                    │
 │          └── 继续执行后续步骤                                   │
 │                                                            │
-│  C8. blocked = _maybe_analyze_failure(                     │
+│  C8. blocked = FailureRecoveryCoordinator.maybe_analyze_failure(│
 │          planner, context,                                  │
 │          failure_source="verification",  ← 无 outcome 参数！│
 │          turn=turn                                          │
@@ -744,7 +745,7 @@
 │      │  ├── failed_count == 0                               │
 │      │  └── rejected_count == 0                             │
 │      │                                                      │
-│      ├── [True] → final = _attempt_finalize(planner,        │
+│      ├── [True] → final = CompletionGate.attempt_finalize(  │
 │      │       controller, context, turn, model_answer)        │
 │      │   ├── [非 None] → return final (终止)                 │
 │      │   └── [None]    → 继续                                │
@@ -757,8 +758,8 @@
 
 
 ╔══════════════════════════════════════════════════════════════╗
-║        _attempt_finalize() — 最终化尝试 详图                  ║
-║        (agent_loop.py:_attempt_finalize)                    ║
+║        CompletionGate.attempt_finalize() — 最终化尝试 详图   ║
+║        (agent_loop_completion.py，经 AgentLoop wrapper 调用) ║
 ╚══════════════════════════════════════════════════════════════╝
                                    │
                                    ▼
@@ -787,7 +788,7 @@
 │  │   ├── controller.apply_outcome(outcome)                │  │
 │  │   ├── _record_outcome_context(context, planner, outcome)│  │
 │  │   │                                                    │  │
-│  │   ├── _maybe_analyze_failure(                          │  │
+│  │   ├── FailureRecoveryCoordinator.maybe_analyze_failure( │  │
 │  │   │       planner, context,                            │  │
 │  │   │       outcome=outcome,                             │  │
 │  │   │       failure_source="completion",                 │  │
@@ -892,7 +893,7 @@
 │  │   │   ├── controller.apply_outcome(outcome)          │    │
 │  │   │   ├── _record_outcome_context(…)                 │    │
 │  │   │   │                                              │    │
-│  │   │   ├── _maybe_analyze_failure(                    │    │
+│  │   │   ├── FailureRecoveryCoordinator.maybe_analyze_failure(│    │
 │  │   │   │       planner, context,                      │    │
 │  │   │   │       outcome=outcome,                       │    │
 │  │   │   │       failure_source="completion_review",    │    │
@@ -938,8 +939,8 @@
 
 
 ╔══════════════════════════════════════════════════════════════╗
-║     _maybe_analyze_failure() — 失败分析完整流程 详图          ║
-║     (agent_loop.py:_maybe_analyze_failure)                  ║
+║     FailureRecoveryCoordinator.maybe_analyze_failure() — 失败分析完整流程 详图 ║
+║     (agent_loop_failure_recovery.py，经 AgentLoop wrapper 调用)              ║
 ╚══════════════════════════════════════════════════════════════╝
                                    │
                                    ▼
@@ -1202,7 +1203,7 @@
 │  │       NO_TOOL_CALLS,                                      │
 │  │       next_action = "finalize")                           │
 │  │   → 回到 AgentLoop 路径 C3: next_action=="finalize"       │
-│  │   → 触发 _attempt_finalize()                              │
+│  │   → 触发 CompletionGate.attempt_finalize()                 │
 │  │                                                           │
 │  └── [有 tool_calls]                                         │
 │      ↓                                                       │
@@ -1574,7 +1575,7 @@
   │ COMPLETED / BLOCKED / FAILED │         │ COMPLETED / BLOCKED / FAILED  │
   │ CANCELLED → 终端，退出循环     │         │ CANCELLED / RUNNING / READY  │
   └──────────────────────────────┘         └───────────────────────────────┘
-                                           _attempt_finalize() 返回:
+                                           CompletionGate.attempt_finalize() 返回:
   TaskStatus (14 值, planner 层)           ├── AgentLoopResult(COMPLETED)
   ┌──────────────────────────────┐         │   → 终止循环
   │ INSPECTING_WORKSPACE         │         ├── AgentLoopResult(BLOCKED)
@@ -1635,7 +1636,7 @@
 
   路径 3: [无 tool_calls → 最终化成功]
     run_turn → result.tool_calls 为空
-    → _attempt_finalize()
+    → CompletionGate.attempt_finalize()
     → assess_completion() == COMPLETED
     → planner.finalize() → FinalReport.status == COMPLETED
     → AgentLoopResult(COMPLETED)
@@ -1643,7 +1644,7 @@
 
   路径 4: [无 tool_calls → 最终化被拒绝 → 继续]
     → assess_completion() != COMPLETED → REPLAN_REQUIRED
-    → _maybe_analyze_failure() 未触发阻塞
+    → FailureRecoveryCoordinator.maybe_analyze_failure() 未触发阻塞
     → return None
     → ★ 继续循环 ★
 
@@ -1656,7 +1657,7 @@
   路径 6: [工具执行 → 正常 → 自动最终化成功]
     → reduced_outcome 为 None 或 RETRYABLE/REPLAN_REQUIRED
     → _should_auto_finalize_after_tools() == True
-    → _attempt_finalize() → COMPLETED
+    → CompletionGate.attempt_finalize() → COMPLETED
     → AgentLoopResult(COMPLETED)
     → ★ 终止 ★
 
@@ -1668,10 +1669,10 @@
 
 
 ═══════════════════════════════════════════════════════════════
-           附 D：_maybe_analyze_failure() 触发条件汇总
+           附 D：FailureRecoveryCoordinator.maybe_analyze_failure() 触发条件汇总
 ═══════════════════════════════════════════════════════════════
 
-  AgentLoop 中 5 处调用 _maybe_analyze_failure()：
+  TurnCoordinator / CompletionGate 中 4 处调用 FailureRecoveryCoordinator.maybe_analyze_failure()：
 
   调用点 1: 路径 C7 — tool 失败后
     outcome=reduced_outcome, failure_source="tool"
@@ -1686,18 +1687,13 @@
       1) 最近 verification assessment 为 failed/blocked/needs_review
       2) 或 unresolved_failures 有非排除 error_code
 
-  调用点 3: _attempt_finalize → 门控未通过
+  调用点 3: CompletionGate.attempt_finalize → 门控未通过
     outcome=REPLAN_REQUIRED, failure_source="completion"
     → 同 _should_analyze_outcome()
 
-  调用点 4: _attempt_finalize → 最终化后 final_report rejected
+  调用点 4: CompletionGate.attempt_finalize → 最终化后 final_report rejected
     outcome, failure_source="completion_review"
     → 同 _should_analyze_outcome()
-
-  调用点 5: _attempt_finalize → 路径 F1 中的 _maybe_analyze_failure
-    outcome=REPLAN_REQUIRED, failure_source="completion"
-    → 同调用点 3
-
 
 ═══════════════════════════════════════════════════════════════
            附 E：Phase 6.2 sandbox / verification / eval 旁路

@@ -4,6 +4,9 @@
 
 源码证据路径:
 - src/singularity/agent_loop.py
+- src/singularity/agent_loop_completion.py
+- src/singularity/agent_loop_failure_recovery.py
+- src/singularity/agent_loop_turns.py
 - src/singularity/error_codes.py
 
 关键符号:
@@ -11,6 +14,9 @@
 - AgentLoop.run
 - AgentLoopResult
 - AgentLoopStatus
+- CompletionGate
+- FailureRecoveryCoordinator
+- TurnCoordinator
 
 字段清单:
 - AgentLoopResult: status, final_answer, turn, error_code, diagnostics
@@ -22,6 +28,9 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 ## 当前源码位置
 
 - src/singularity/agent_loop.py
+- src/singularity/agent_loop_completion.py
+- src/singularity/agent_loop_failure_recovery.py
+- src/singularity/agent_loop_turns.py
 - src/singularity/error_codes.py
 
 ## 关键类、函数、字段
@@ -30,11 +39,11 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 
 ## 真实运行时调用链
 
-`AgentKernel.run_task()` 构造 `AgentLoop` -> `AgentLoop.run()` 创建 `RunController` 并启动 planner 状态；`run()` 内部的 `run_turn()` callback 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`，最后通过 `Planner.finalize()` 或失败 outcome 结束。
+`AgentKernel.run_task()` 构造 `AgentLoop` -> `AgentLoop.run()` 创建 `RunController` 并启动 planner 状态；`run()` 内部的 `run_turn()` callback 委托 `TurnCoordinator.run_turn()`，逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion/final review 由 `CompletionGate.attempt_finalize()` 调用 `Planner.finalize()` 或生成 completion outcome；工具、验证和 completion 失败的 repair/replan 由 `FailureRecoveryCoordinator.maybe_analyze_failure()` 协调。
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`AgentKernel.run_task()` -> `AgentLoop.run()` -> `ModelRunner.build_request_from_context()` 先生成对象 `ModelTurnRequest`，`ModelRunner.run_turn()` 返回 `ModelTurnResult` 后交给 `ToolProtocolEngine.process_model_turn()`。每个 turn 在构造模型请求前先生成 `turn_action_id="turn_N"` 并传给 `Planner.filtered_tools()`；Planner 先通过 `PlannerPolicy.is_allowed()` 对当前 phase 的 allowed tools、allowed actions、permission level、mutation manager 和 command executor 要求求交，得到与 `authorize_tool_call()` 同源的可授权集合，再叠加 benchmark constraints 与 repair contract 生成同一份 deterministic projection，并把 `tool.exposure_decided` trace event 与 `ModelTurnRequest.action_id` 绑定。模型可见 tool schema、`ToolChoicePolicy.allowed_tool_names` 和 `tool.exposure_decided.selected_tools` 必须来自同一 selected tool 集合；semantic rolling plan 只能进入 planner context，不会扩大当前 phase 可暴露工具。工具结果通过 `ContextManager.add_tool_protocol_result()` 和 `Planner.update_from_tool_result()` 写入 `context.sqlite3`、planner evidence 和 trace 事件；关键 tool/verification/policy/sandbox/task outcome evidence 由 `EvidenceLedger.add_*()` typed helper 写入 JSON 投影。当 completion gate 通过时，`AgentLoop._attempt_finalize()` 调用 `Planner.finalize()`，`Finalizer.build()` 通过 typed evidence helper 生成 `FinalReport`，然后写入 `final_answer` trace event。若模型失败，`_outcome_from_model_failure()` 归类 provider 错误，`_terminal_result_from_outcome()` 返回带 `error_code` 的 `AgentLoopResult`。
+以用户要求修复 `quicksort.py` 为例：`AgentKernel.run_task()` -> `AgentLoop.run()` -> `TurnCoordinator.run_turn()` -> `ModelRunner.build_request_from_context()` 先生成对象 `ModelTurnRequest`，`ModelRunner.run_turn()` 返回 `ModelTurnResult` 后交给 `ToolProtocolEngine.process_model_turn()`。每个 turn 在构造模型请求前先生成 `turn_action_id="turn_N"` 并传给 `Planner.filtered_tools()`；Planner 先通过 `PlannerPolicy.is_allowed()` 对当前 phase 的 allowed tools、allowed actions、permission level、mutation manager 和 command executor 要求求交，得到与 `authorize_tool_call()` 同源的可授权集合，再叠加 benchmark constraints 与 repair contract 生成同一份 deterministic projection，并把 `tool.exposure_decided` trace event 与 `ModelTurnRequest.action_id` 绑定。模型可见 tool schema、`ToolChoicePolicy.allowed_tool_names` 和 `tool.exposure_decided.selected_tools` 必须来自同一 selected tool 集合；semantic rolling plan 只能进入 planner context，不会扩大当前 phase 可暴露工具。工具结果通过 `ContextManager.add_tool_protocol_result()` 和 `Planner.update_from_tool_result()` 写入 `context.sqlite3`、planner evidence 和 trace 事件；关键 tool/verification/policy/sandbox/task outcome evidence 由 `EvidenceLedger.add_*()` typed helper 写入 JSON 投影。当 completion gate 通过时，`CompletionGate.attempt_finalize()` 调用 `Planner.finalize()`，`Finalizer.build()` 通过 typed evidence helper 生成 `FinalReport`，然后写入 `final_answer` trace event。若模型失败，`AgentLoop._outcome_from_model_failure()` 归类 provider 错误，`AgentLoop._terminal_result_from_outcome()` 返回带 `error_code` 的 `AgentLoopResult`。
 
 ## 真实对象完整结构
 
@@ -70,13 +79,13 @@ class AgentLoopStatus(StrEnum):
 
 ### 数据流概述
 
-`AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部创建 `RunController`，再把每一轮执行封装在局部 `run_turn()` callback 中：`planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `_attempt_finalize()` 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `_terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
+`AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部创建 `RunController`，再把每一轮执行封装在局部 `run_turn()` callback 中并委托 `TurnCoordinator.run_turn()`：`planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `CompletionGate.attempt_finalize()` 通过 `AgentLoop` 注入的 result factory 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `AgentLoop._terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
 
-完成判定只消费 AgentLoop 内部 evidence：`Planner.update_from_verification()` 通过 `EvidenceLedger.add_verification_result()` 写入的最新 `completion_assessment.status` 必须为 `ready` 或 `ready_with_warnings`，`Planner.assess_completion()` 必须没有 unmet，`Planner.finalize()` 的 final review 必须没有 blocking finding 且 `FinalReport.status=completed`。`Finalizer.build()` 通过 `latest_verification_result()`、`policy_records()`、`sandbox_records()`、`tool_result_records()` 汇总 completion/report 关键 bucket，避免从裸 dict 随意读取缺字段。 当这些条件满足时，`Planner.finalize()` 会清理已经被最新 final report 解决的 completion blocker（例如 `required_verifications_passed`、`unresolved_failures_empty`、旧的 sandbox backend unavailable 记录），再由 `_attempt_finalize()` 返回 `AgentLoopStatus.COMPLETED`。未被最新证据解决的 policy、approval、workspace conflict、sandbox/backend unavailable 当前失败仍保持 fail-closed，不会被 reducer 或 finalizer 改写成 completed。
+完成判定只消费 AgentLoop 内部 evidence：`Planner.update_from_verification()` 通过 `EvidenceLedger.add_verification_result()` 写入的最新 `completion_assessment.status` 必须为 `ready` 或 `ready_with_warnings`，`Planner.assess_completion()` 必须没有 unmet，`Planner.finalize()` 的 final review 必须没有 blocking finding 且 `FinalReport.status=completed`。`Finalizer.build()` 通过 `latest_verification_result()`、`policy_records()`、`sandbox_records()`、`tool_result_records()` 汇总 completion/report 关键 bucket，避免从裸 dict 随意读取缺字段。 当这些条件满足时，`Planner.finalize()` 会清理已经被最新 final report 解决的 completion blocker（例如 `required_verifications_passed`、`unresolved_failures_empty`、旧的 sandbox backend unavailable 记录），再由 `CompletionGate.attempt_finalize()` 返回 `AgentLoopStatus.COMPLETED`。未被最新证据解决的 policy、approval、workspace conflict、sandbox/backend unavailable 当前失败仍保持 fail-closed，不会被 reducer 或 finalizer 改写成 completed。
 
 ## 谁生成这些对象
 
-- `AgentLoop.run()` 内部的 `run_turn()` 在 completion gate 通过时调用 `_attempt_finalize()` 构造 `status=completed` 的 `AgentLoopResult`；`on_max_turns()` 构造 `status=max_turns_exceeded` 的结果。
+- `AgentLoop.run()` 内部的 `run_turn()` 委托 `TurnCoordinator.run_turn()`；当 completion gate 通过时，`CompletionGate.attempt_finalize()` 通过注入的 result factory 构造 `status=completed` 的 `AgentLoopResult`；`on_max_turns()` 构造 `status=max_turns_exceeded` 的结果。
 - `_terminal_result_from_outcome()` 把不可重试的 `ExecutionOutcome` 映射成 `blocked` 或 `failed`，同时把 `outcome.to_dict()` 放入 `diagnostics`。`AgentLoopStatus` 由这些构造点直接选择，不存在第二套字符串状态 alias。
 
 ## 谁消费这些对象
@@ -88,7 +97,7 @@ class AgentLoopStatus(StrEnum):
 
 ## 是否落盘
 
-- `AgentLoopResult` 没有独立 store。`_attempt_finalize()` / `_terminal_result_from_outcome()` / `on_max_turns()` 先写 `final_answer` trace event；evaluation 运行再把结果投影进 `<evaluation_run>/result.json`、`report.json` 和 `report.md`。
+- `AgentLoopResult` 没有独立 store。`CompletionGate.attempt_finalize()` / `_terminal_result_from_outcome()` / `on_max_turns()` 先写 `final_answer` trace event；evaluation 运行再把结果投影进 `<evaluation_run>/result.json`、`report.json` 和 `report.md`。
 - 主循环创建或复用的 `ContextManager` 把消息、观察和 bundle 写入当前 trace run 目录下的 `context.sqlite3`；该数据库保存的是循环输入证据，不是 `AgentLoopResult` 序列化副本。
 
 ## 是否进入 trace / audit
@@ -106,7 +115,7 @@ class AgentLoopStatus(StrEnum):
 
 ## 当前结构问题
 
-`run()` 内嵌 turn callback 与 max-turn callback，终止结果同时由 `_attempt_finalize()` 和 `_terminal_result_from_outcome()` 构造；新增状态时必须同时检查 kernel、evaluation 和 targeted replay 的消费分支，避免状态存在但报告层无法分类。
+`AgentLoop.run()` 仍是对外 facade，负责 context/controller 生命周期和 max-turn callback；单 turn 编排已由 `TurnCoordinator` 承担，completion/final review 已由 `CompletionGate` 承担，failure-analysis/replan 已由 `FailureRecoveryCoordinator` 承担。新增状态时仍必须同时检查 kernel、evaluation 和 targeted replay 的消费分支，避免状态存在但报告层无法分类。
 
 ## 维护规则
 

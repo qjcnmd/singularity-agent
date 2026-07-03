@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from singularity.agent_loop import AgentLoopStatus
+from singularity.agent_loop_failure_recovery import FailureRecoveryCoordinator
 from singularity.command import CommandRequest, SemanticStatus
 from singularity.failure_analysis import (
     MIN_REPAIR_CONFIDENCE,
@@ -1688,6 +1689,24 @@ class TestRepairTelemetryHardening:
 
 class TestPolicyBlockedNotRepair:
     """Verify policy-blocked paths do NOT produce repair telemetry."""
+
+    def test_failure_recovery_reuses_agent_loop_state_containers(self) -> None:
+        fingerprints: set[str] = set()
+        replan_signals: dict[str, Any] = {}
+        snapshots: dict[str, dict[str, int]] = {}
+        completion_rejections: dict[str, dict[str, Any]] = {}
+
+        coordinator = FailureRecoveryCoordinator(
+            failure_analysis_fingerprints=fingerprints,
+            failure_replan_signals=replan_signals,
+            failure_analysis_snapshots=snapshots,
+            completion_rejection_state=completion_rejections,
+        )
+
+        assert coordinator.failure_analysis_fingerprints is fingerprints
+        assert coordinator.failure_replan_signals is replan_signals
+        assert coordinator.failure_analysis_snapshots is snapshots
+        assert coordinator.completion_rejection_state is completion_rejections
 
     def test_policy_blocked_outcome_not_analyzed(self, tmp_path: Path) -> None:
         """AgentLoop should NOT trigger failure analysis for policy-blocked outcomes."""
