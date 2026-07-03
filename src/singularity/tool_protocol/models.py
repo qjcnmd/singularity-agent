@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+
 from singularity.model.models import (
     ModelToolParseStatus,
     provider_tool_call_dict,
@@ -344,6 +346,55 @@ class ToolObservationVisibility(StrEnum):
     REFERENCE_ONLY = "reference_only"
 
 
+class _ToolProtocolResultEnvelopePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    tool_call_id: str = ""
+    tool_name: str = ""
+    ok: bool = False
+    status: str = "ok"
+    error_code: Any = None
+    error_kind: Any = None
+    content_preview: str = ""
+    content_digest: str = ""
+    raw_result_ref: Any = None
+    artifact_refs: list[Any] = Field(default_factory=list)
+    observation_id: Any = None
+    policy_decision_id: Any = None
+    approval_grant_id: Any = None
+    truncated: bool = False
+    redacted: bool = False
+    metadata: dict[Any, Any] = Field(default_factory=dict)
+
+    @field_validator("tool_call_id", "tool_name", "content_preview", "content_digest", mode="before")
+    @classmethod
+    def _string_or_empty(cls, value: Any) -> str:
+        return str(value or "")
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _status_or_ok(cls, value: Any) -> str:
+        return str(value or "ok")
+
+    @field_validator("ok", "truncated", "redacted", mode="before")
+    @classmethod
+    def _bool_or_false(cls, value: Any) -> bool:
+        return bool(value)
+
+    @field_validator("artifact_refs", mode="before")
+    @classmethod
+    def _list_or_empty(cls, value: Any) -> list[Any]:
+        return list(value or [])
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def _dict_or_empty(cls, value: Any) -> dict[str, Any]:
+        return dict(value or {})
+
+
+_RESULT_ENVELOPE_PAYLOAD_ADAPTER = TypeAdapter(_ToolProtocolResultEnvelopePayload)
+
+
 @dataclass
 class ToolObservationView(SerializableDataclass):
     tool_call_id: str
@@ -454,24 +505,24 @@ class ToolProtocolResultEnvelope(SerializableDataclass):
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ToolProtocolResultEnvelope:
-        error_kind = payload.get("error_kind")
+        parsed = _RESULT_ENVELOPE_PAYLOAD_ADAPTER.validate_python(payload or {})
         return cls(
-            tool_call_id=str(payload.get("tool_call_id") or ""),
-            tool_name=str(payload.get("tool_name") or ""),
-            ok=bool(payload.get("ok")),
-            status=str(payload.get("status") or "ok"),
-            error_code=payload.get("error_code"),
-            error_kind=error_kind,
-            content_preview=str(payload.get("content_preview") or ""),
-            content_digest=str(payload.get("content_digest") or ""),
-            raw_result_ref=payload.get("raw_result_ref"),
-            artifact_refs=list(payload.get("artifact_refs") or []),
-            observation_id=payload.get("observation_id"),
-            policy_decision_id=payload.get("policy_decision_id"),
-            approval_grant_id=payload.get("approval_grant_id"),
-            truncated=bool(payload.get("truncated")),
-            redacted=bool(payload.get("redacted")),
-            metadata=dict(payload.get("metadata") or {}),
+            tool_call_id=parsed.tool_call_id,
+            tool_name=parsed.tool_name,
+            ok=parsed.ok,
+            status=parsed.status,
+            error_code=parsed.error_code,
+            error_kind=parsed.error_kind,
+            content_preview=parsed.content_preview,
+            content_digest=parsed.content_digest,
+            raw_result_ref=parsed.raw_result_ref,
+            artifact_refs=parsed.artifact_refs,
+            observation_id=parsed.observation_id,
+            policy_decision_id=parsed.policy_decision_id,
+            approval_grant_id=parsed.approval_grant_id,
+            truncated=parsed.truncated,
+            redacted=parsed.redacted,
+            metadata=parsed.metadata,
         )
 
 

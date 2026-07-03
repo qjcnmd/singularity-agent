@@ -210,6 +210,69 @@ def test_tool_protocol_result_envelope_context_message_contract() -> None:
     assert "raw_arguments" not in message["content"]
 
 
+def test_tool_protocol_result_envelope_from_dict_preserves_wire_shape() -> None:
+    payload = {
+        "tool_call_id": "call_roundtrip",
+        "tool_name": "read_file",
+        "ok": False,
+        "status": "error",
+        "error_code": "policy_denied",
+        "error_kind": "policy_denied",
+        "content_preview": "safe preview",
+        "content_digest": "digest_roundtrip",
+        "raw_result_ref": "raw_ref",
+        "artifact_refs": ["artifact_1"],
+        "observation_id": "obs_1",
+        "policy_decision_id": "policy_1",
+        "approval_grant_id": "grant_1",
+        "truncated": True,
+        "redacted": True,
+        "metadata": {"nested": {"kept": True}},
+    }
+
+    restored = ToolProtocolResultEnvelope.from_dict({**payload, "ignored": "value"})
+
+    assert restored.error_kind == ToolCallFailureKind.policy_denied
+    assert restored.to_dict() == payload
+
+
+def test_tool_protocol_result_envelope_from_dict_keeps_legacy_defaults() -> None:
+    restored = ToolProtocolResultEnvelope.from_dict(
+        {
+            "tool_call_id": None,
+            "tool_name": None,
+            "ok": "",
+            "status": "",
+            "content_preview": None,
+            "content_digest": None,
+            "artifact_refs": None,
+            "truncated": "",
+            "redacted": "",
+            "metadata": None,
+            "ignored": {"not": "projected"},
+        }
+    )
+
+    assert restored.to_dict() == {
+        "tool_call_id": "",
+        "tool_name": "",
+        "ok": False,
+        "status": "ok",
+        "error_code": None,
+        "error_kind": None,
+        "content_preview": "",
+        "content_digest": "",
+        "raw_result_ref": None,
+        "artifact_refs": [],
+        "observation_id": None,
+        "policy_decision_id": None,
+        "approval_grant_id": None,
+        "truncated": False,
+        "redacted": False,
+        "metadata": {},
+    }
+
+
 def test_protocol_status_and_report_models_are_serializable() -> None:
     turn_result = ToolProtocolTurnResult(
         status=ToolProtocolTurnStatus.PROCESSED,
