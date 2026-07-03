@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from singularity.observability.redaction import TraceRedactor
 from singularity.policy.config import PolicyConfig
 from singularity.policy.models import (
     ApprovalGrant,
@@ -15,9 +14,10 @@ from singularity.policy.models import (
     PolicyRequest,
     stable_hash,
 )
+from singularity.redaction import RedactionMarker, RedactionProvider
 
 SECRET_KEY_RE = re.compile(
-    r"(authorization|token|api[_-]?key|secret|password|database[_-]?url|dsn|conn(?:ection)?[_-]?(?:str|string))",
+    r"(authorization|cookie|token|api[_-]?key|secret|password|database[_-]?url|dsn|conn(?:ection)?[_-]?(?:str|string))",
     re.IGNORECASE,
 )
 SECRET_VALUE_RE = re.compile(
@@ -30,7 +30,7 @@ SENSITIVE_PATH_RE = re.compile(
     r"credentials?|credential|token|secret|api[_-]?key|password|\.pem$|\.pfx$|\.p12$|\.key$)",
     re.IGNORECASE,
 )
-_TRACE_REDACTOR = TraceRedactor()
+_AUDIT_REDACTOR = RedactionProvider(marker=RedactionMarker.BRACKETED)
 
 
 class PolicyAuditWriter:
@@ -108,7 +108,7 @@ def redact(value: Any) -> Any:
     if isinstance(value, list):
         return [redact(item) for item in value]
     if isinstance(value, str):
-        redacted_text = _TRACE_REDACTOR.redact_text(value)
+        redacted_text = _AUDIT_REDACTOR.redact_text(value)
         return SECRET_VALUE_RE.sub(lambda match: (match.group(1) if match.group(1) else "") + "[REDACTED]", redacted_text)
     return value
 

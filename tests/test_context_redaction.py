@@ -93,6 +93,13 @@ def test_context_redactor_redacts_google_api_key() -> None:
     assert "<redacted:" in redacted
 
 
+def test_context_classifier_does_not_promote_trace_only_patterns_to_secret() -> None:
+    classifier = SensitivityClassifier()
+
+    assert classifier.classify("tool --password placeholder") == ContextSensitivity.SENSITIVE
+    assert classifier.classify('["curl", "--api-key", "demo"]') == ContextSensitivity.WORKSPACE
+
+
 def test_context_redactor_redacts_sensitive_dict_field_values() -> None:
     payload = {
         "authorization": "Bearer abcdefgh",

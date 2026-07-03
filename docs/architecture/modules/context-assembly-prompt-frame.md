@@ -8,8 +8,10 @@
 - src/singularity/context/assembler.py
 - src/singularity/context/compaction.py
 - src/singularity/context/compression.py
+- src/singularity/context/redaction.py
 - src/singularity/instructions/prompt_assembly.py
 - src/singularity/instructions/models.py
+- src/singularity/redaction.py
 
 关键符号:
 - ContextItem
@@ -28,6 +30,8 @@
 - CacheAttribution
 - PromptManifest
 - PromptBundle
+- ContextRedactor
+- RedactionProvider
 
 字段清单:
 - ContextReference: ref_id, ref_type, target, path, line_start, line_end, digest, observed_at, freshness, source_item_id, metadata, observation_id
@@ -60,8 +64,10 @@ Context 层把系统提示、用户目标、planner 状态、memory、project in
 - src/singularity/context/assembler.py
 - src/singularity/context/compaction.py
 - src/singularity/context/compression.py
+- src/singularity/context/redaction.py
 - src/singularity/instructions/prompt_assembly.py
 - src/singularity/instructions/models.py
+- src/singularity/redaction.py
 
 ## 关键类、函数、字段
 
@@ -73,7 +79,7 @@ Context 层把系统提示、用户目标、planner 状态、memory、project in
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`ContextManager.add_user_message()`、`add_assistant_message()`、`add_tool_result()`、`add_tool_protocol_result()`、`add_synthetic_tool_error()`、`add_trace_summary()`、`add_policy_observation()`、`add_planner_state()`、`add_mutation_evidence()`、`add_command_observation()`、`add_verification_evidence()`、`add_workspace_state()`、`add_edit_result()`、`add_project_index()`、`add_memory_context_block()` 与 `add_failure()` 把组件观察投影成 `ContextItem`、`ContextReference` 或专门 observation dataclass，并通过 `ObservationStore.append_message()` / `append_item()` 写入 `context.sqlite3`。`add_tool_protocol_result()` 只消费 `ToolProtocolResultEnvelope` 的 `ToolObservationView` 投影；该投影的 `observation_id` 会同步成为安全 tool message payload、`ContextItem.item_id` 和 artifact reference 的 observation/source id。随后 `ModelRunner.build_request_from_context()` -> `ContextManager.build_bundle()` -> `ContextAssembler.build_bundle()` 读取这些 item，生成 `ContextBundle` 与 `ContextUsageReport`；同一 request 构建过程调用 `PromptAssemblyPipeline.build_for_model_turn()`，它内部通过 `collect_sources()`、`resolve()`、`build_prompt_bundle()` 和 `compile_prompt()` 生成 `PromptBundle` 与 `PromptManifest`，再由 `ModelTurnRequestBuilder.build_request()` 合并为 `ModelTurnRequest.messages`。溢出时 `ContextAssembler.needs_compression()` 触发 compaction；失败返回 `ContextOverflowError` 或带 excluded item 的 usage report，不把所有 context 无界送入 provider。
+以用户要求修复 `quicksort.py` 为例：`ContextManager.add_user_message()`、`add_assistant_message()`、`add_tool_result()`、`add_tool_protocol_result()`、`add_synthetic_tool_error()`、`add_trace_summary()`、`add_policy_observation()`、`add_planner_state()`、`add_mutation_evidence()`、`add_command_observation()`、`add_verification_evidence()`、`add_workspace_state()`、`add_edit_result()`、`add_project_index()`、`add_memory_context_block()` 与 `add_failure()` 把组件观察投影成 `ContextItem`、`ContextReference` 或专门 observation dataclass，并通过 `ObservationStore.append_message()` / `append_item()` 写入 `context.sqlite3`。写入和渲染前由 `ContextRedactor.redact_text()` / `redact_value()` 执行 context profile redaction；`ContextRedactor` 保留 `<redacted:{digest}>` 模型可见 marker，内部委托 `RedactionProvider(marker=RedactionMarker.DIGEST)` 复用统一规则。`add_tool_protocol_result()` 只消费 `ToolProtocolResultEnvelope` 的 `ToolObservationView` 投影；该投影的 `observation_id` 会同步成为安全 tool message payload、`ContextItem.item_id` 和 artifact reference 的 observation/source id。随后 `ModelRunner.build_request_from_context()` -> `ContextManager.build_bundle()` -> `ContextAssembler.build_bundle()` 读取这些 item，生成 `ContextBundle` 与 `ContextUsageReport`；同一 request 构建过程调用 `PromptAssemblyPipeline.build_for_model_turn()`，它内部通过 `collect_sources()`、`resolve()`、`build_prompt_bundle()` 和 `compile_prompt()` 生成 `PromptBundle` 与 `PromptManifest`，再由 `ModelTurnRequestBuilder.build_request()` 合并为 `ModelTurnRequest.messages`。溢出时 `ContextAssembler.needs_compression()` 触发 compaction；失败返回 `ContextOverflowError` 或带 excluded item 的 usage report，不把所有 context 无界送入 provider。
 
 ## 真实对象完整结构
 
@@ -334,7 +340,7 @@ class ContextSensitivity(str, Enum): # ContextItem.sensitivity
 
 ## 谁消费这些对象
 
-- ObservationStore、assembler、compaction 和 failure request 消费 `ContextReference`/`ContextItem`。只有通过 visibility、预算与 redaction 的 item 内容进入 `ContextBundle.messages`；完整 item/reference 元数据不发送给 provider。
+- ObservationStore、assembler、compaction 和 failure request 消费 `ContextReference`/`ContextItem`。只有通过 visibility、预算与 `ContextRedactor` redaction 的 item 内容进入 `ContextBundle.messages`；完整 item/reference 元数据不发送给 provider。统一 `RedactionProvider` 是实现层依赖，不改变 `ContextItem`、`ContextBundle`、`PromptManifest` 字段或 `<redacted:{digest}>` marker。
 - `ModelRunner.build_request_from_context()` 消费 `ContextBundle`；其中 `messages` 直接组成 `ModelTurnRequest.messages`，`ContextBudgetPlan`、`ContextRenderPolicy` 与 `ContextUsageReport` 只用于内部诊断，不作为消息正文。
 - compaction committer/recovery 消费 `ContextSummaryEnvelope`，其 `rendered_summary` 通过 summary item 进入后续模型请求。`ModelTurnRequestBuilder.build_request()` 消费 `PromptBundle.messages` 并与 context messages 合并；`PromptManifest` 不进模型，只用于 hash、预算、trace 与诊断。
 

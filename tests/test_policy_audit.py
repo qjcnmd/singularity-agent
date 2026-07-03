@@ -28,9 +28,16 @@ def test_policy_audit_writes_jsonl_and_redacts_secrets(tmp_path: Path) -> None:
         capability=Capability.NETWORK_ACCESS,
         subject=PolicySubject(subject_type="component", name="test"),
         resource=ResourceRef(resource_type="network", identifier="https://example.test"),
-        reason="Authorization: Bearer secret-token OPENAI_API_KEY=sk-test",
+        reason=(
+            "Authorization: Bearer secret-token Cookie: sid=abc123 "
+            "OPENAI_API_KEY=sk-test https://example.test?api_key=query-secret"
+        ),
         workspace_root=str(tmp_path),
-        metadata={"token": "secret-token", "Authorization": "Bearer secret-token"},
+        metadata={
+            "token": "secret-token",
+            "Authorization": "Bearer secret-token",
+            "Cookie": "sid=abc123",
+        },
     )
     decision = PolicyDecision(
         request_id=request.request_id,
@@ -48,4 +55,7 @@ def test_policy_audit_writes_jsonl_and_redacts_secrets(tmp_path: Path) -> None:
     assert payload["outcome"] == "require_review"
     assert "secret-token" not in text
     assert "sk-test" not in text
+    assert "abc123" not in text
+    assert "query-secret" not in text
     assert "[REDACTED]" in text
+    assert "<redacted>" not in text
