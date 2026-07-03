@@ -8,6 +8,7 @@
 - src/singularity/sandbox/backends.py
 - src/singularity/sandbox/filesystem.py
 - src/singularity/sandbox/windows.py
+- src/singularity/sandbox/windows_models.py
 - src/singularity/sandbox/windows_runner.py
 - src/singularity/command/executor.py
 
@@ -67,6 +68,7 @@ Windows 当前实现是双 principal 的 account-backed OS sandbox：父进程�
 - `src/singularity/sandbox/backends.py`：默认 backend 注册；Windows 上注册 `WindowsSandboxBackend`，非 Windows 返回空列表。
 - `src/singularity/sandbox/filesystem.py`：workspace projection、protected glob 排除、变化检测和清理辅助。
 - `src/singularity/sandbox/windows.py`：Windows doctor/setup/cleanup、account/firewall/ACL/login UI/logon rights probe、backend prepare/run/cleanup。
+- `src/singularity/sandbox/windows_models.py`：Windows sandbox schema 常量、双账户 identity 映射、doctor/setup/cleanup DTO 和 `to_dict()` wire projection。
 - `src/singularity/sandbox/windows_runner.py`：sandbox account runner、restricted token child、private desktop、Job Object、timeout/output/network probe/result JSON。
 - `src/singularity/command/executor.py`：依据会话级 `PermissionProfile` 构造完整 `SandboxRequest`，并把 `SandboxResult` 投影成 command evidence。
 
@@ -74,7 +76,7 @@ Windows 当前实现是双 principal 的 account-backed OS sandbox：父进程�
 
 `SandboxManager.run()`只消费由`CommandExecutor`构造完成的请求，不重新解释`PolicyDecision`。`WindowsSandboxBackend.prepare()`只接受`denied`和`allowed`：前者选择offline账户，后者选择online账户；`allowlist`和`unsupported`在准备文件系统前fail closed。`setup()`在elevated shell中幂等创建两个账户和独立credential，设置两个登录UI隐藏值，保留`SeInteractiveLogonRight`并移除`SeDenyInteractiveLogonRight`，清除batch/network/RDP/service allow right并添加对应deny right，强制直接本地组仅为通过SID解析的内置Users，授权machine state dir和probe/run控制目录ACL，授权当前Python runner所需runtime read/execute ACL，并只为offline SID创建outbound block。control目录授权只允许落在`%PROGRAMDATA%\Singularity\windows-sandbox`内的state/probe/run目标，授予sandbox账户Modify和宿主SID cleanup用Full Control；不递归授权用户目录、仓库、整个Python base或危险路径。runtime授权由当前`sys.executable`、`sys.prefix`、`sys.base_prefix`、`sys.exec_prefix`和`sysconfig`发现明确目标，只覆盖Python executable目录、`DLLs`、`Library/bin`、`Library/ssl`、`Library/lib/ossl-modules`、`_ssl/_hashlib/_socket.pyd`、`libssl/libcrypto`、`openssl.cnf`、provider module和base根顶层`python*.dll`；不递归授权整个base安装、包缓存、用户目录、profile或配置文件，也不授予write/modify。两个账户分别执行ACL boundary、restricted low-integrity runner身份smoke；network probe必须同时证明offline denied与online allowed。新结构验证完成后才删除固定legacy账户、credential、login UI、firewall和ACL资产；legacy残留使doctor fail closed。
 
-Windows setup按`_SANDBOX_IDENTITIES`逐个调用`_account_exists()`、`_create_sandbox_account()`、`_set_account_password()`与`_store_credential()`；账户创建和删除使用`netapi32`，超长名称校验只约束创建/改密，不阻止精确legacy删除。Firewall由PowerShell按固定`Singularity Sandbox`group重建和核验，Credential Manager、登录UI registry、LSA rights、组成员、ACL、runner smoke、Python runtime smoke与network probe均执行真实检查。Python runtime smoke分别用offline/online账户导入`_ssl`、`ssl`、`socket`、`hashlib`和`pathlib`，读取`_ssl.__file__`、`ssl.OPENSSL_VERSION`、`ssl.get_default_verify_paths()`，并检查OpenSSL config/provider/cert与TEMP/TMP/profile目标可访问性；失败时只在doctor `diagnostics`追加`kind="python_runtime_environment_blocker"`、`failure_type`、模块状态、runner evidence和hash/redacted路径，不改变doctor schema v2，也不让不依赖这些模块的任务被提前阻断。
+Windows setup按`windows_models._SANDBOX_IDENTITIES`逐个调用`_account_exists()`、`_create_sandbox_account()`、`_set_account_password()`与`_store_credential()`；账户创建和删除使用`netapi32`，超长名称校验只约束创建/改密，不阻止精确legacy删除。Firewall由PowerShell按固定`Singularity Sandbox`group重建和核验，Credential Manager、登录UI registry、LSA rights、组成员、ACL、runner smoke、Python runtime smoke与network probe均执行真实检查。Python runtime smoke分别用offline/online账户导入`_ssl`、`ssl`、`socket`、`hashlib`和`pathlib`，读取`_ssl.__file__`、`ssl.OPENSSL_VERSION`、`ssl.get_default_verify_paths()`，并检查OpenSSL config/provider/cert与TEMP/TMP/profile目标可访问性；失败时只在doctor `diagnostics`追加`kind="python_runtime_environment_blocker"`、`failure_type`、模块状态、runner evidence和hash/redacted路径，不改变doctor schema v2，也不让不依赖这些模块的任务被提前阻断。
 
 `execution.launcher`不再只检查`CreateProcessWithLogonW` / `CreateProcessAsUserW`符号，而是真实报告account logon rights、window station/desktop、executable、working directory、domain/username form和logon flags。Level-1使用flags=0，不加载普通用户profile；runner使用显式受限环境，不依赖profile，从而减少专用账户对普通用户profile与登录体验的副作用。`launcher.status=available`要求真实interactive logon能力、无deny-interactive且代表性working directory对sandbox账户可访问；若`working_directory.account_has_access=false`，doctor必须把`execution.launchers`记为missing，不得同时报告preconditions satisfied。完整setup还要求RDP/network/service/batch deny且对应allow不存在。
 
@@ -165,7 +167,7 @@ class SandboxProfile:
 
 ### WindowsSandboxDoctorReport（Windows capability/setup 报告）
 
-`to_dict()`输出`schema_version: "sandbox.windows.doctor/v2"`；复数状态聚合offline/online两个principal，每个capability item仍是`{status, checked, reason, evidence}`，证据经过`TraceRedactor`脱敏。
+定义位于`src/singularity/sandbox/windows_models.py`；`windows.py`继续导入并对外暴露同名对象。`to_dict()`输出`schema_version: "sandbox.windows.doctor/v2"`；复数状态聚合offline/online两个principal，每个capability item仍是`{status, checked, reason, evidence}`，证据经过`TraceRedactor`脱敏。
 
 ```python
 @dataclass(frozen=True)
@@ -368,6 +370,7 @@ class SandboxNetworkMode(str, Enum):
 
 - `CommandExecutor._sandbox_request()` 生成 `SandboxProfile` 和 `SandboxRequest`。
 - `default_sandbox_profile()` 生成基础 profile，`CommandExecutor` 再写入会话权限边界、protected globs、network mode 和 resource limits。
+- `windows_models.py` 定义 Windows sandbox schema 常量、offline/online identity 映射和 doctor/setup/cleanup DTO class。
 - `probe_windows_sandbox()` 生成 `WindowsSandboxDoctorReport`。
 - `setup_windows_sandbox()`生成`WindowsSandboxSetupReport`，在elevated shell下配置两个账户、独立credential、登录UI、LSA rights、受限组成员、双账户state ACL、offline firewall、ACL/runner/network probes，并迁移固定legacy资产。
 - `cleanup_windows_sandbox_assets()`生成`WindowsSandboxCleanupReport`，删除current/legacy账户、credential、firewall group、登录UI值与machine state dir，执行LSA rights清理和最终residual audit。
