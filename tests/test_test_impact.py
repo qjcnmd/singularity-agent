@@ -268,6 +268,26 @@ class TestGateRecommendation:
             "src/singularity/context/manager.py",
         ]
 
+    def test_capability_triggers_can_be_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import scripts.test_impact as test_impact
+
+        monkeypatch.setattr(
+            test_impact,
+            "_load_capability_trigger_paths",
+            lambda _workspace=Path("."): (
+                ("custom runtime", "src/singularity/custom_runtime/"),
+            ),
+        )
+
+        triggers = _capability_triggers([
+            "src/singularity/custom_runtime/driver.py",
+            "src/singularity/agent_loop.py",
+        ])
+
+        assert triggers["required"] is True
+        assert triggers["areas"] == ["custom runtime"]
+        assert triggers["files"] == ["src/singularity/custom_runtime/driver.py"]
+
 
 # ---------------------------------------------------------------------------
 # JSON output

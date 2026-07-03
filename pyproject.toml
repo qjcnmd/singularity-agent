@@ -133,6 +133,26 @@ files = [
     "src/singularity/tools/executor.py",
 ]
 
+[tool.singularity.test_impact]
+capability_triggers = [
+    { area = "AgentLoop", prefix = "src/singularity/agent_loop.py" },
+    { area = "AgentLoop", prefix = "src/singularity/agent_loop/" },
+    { area = "ToolProtocol", prefix = "src/singularity/tool_protocol/" },
+    { area = "sandbox", prefix = "src/singularity/sandbox/" },
+    { area = "sandbox", prefix = "src/singularity/command/" },
+    { area = "context", prefix = "src/singularity/context/" },
+    { area = "compaction", prefix = "src/singularity/context/compaction" },
+    { area = "verification", prefix = "src/singularity/verification/" },
+    { area = "verification", prefix = "src/singularity/tools/verification.py" },
+    { area = "CompletionGate", prefix = "src/singularity/completion/" },
+    { area = "CompletionGate", prefix = "src/singularity/kernel/completion" },
+    { area = "FinalReport", prefix = "src/singularity/kernel/finalization.py" },
+    { area = "FinalReport", prefix = "src/singularity/reporting/" },
+    { area = "evaluation runner", prefix = "src/singularity/evaluation/" },
+    { area = "evaluation runner", prefix = "docs/evaluation/" },
+    { area = "evaluation runner", prefix = "scripts/verify_capability.py" },
+]
+
 [tool.coverage.run]
 branch = true
 source = ["singularity"]

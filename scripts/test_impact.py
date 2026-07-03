@@ -32,6 +32,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -66,7 +67,7 @@ _SPECIAL_PATH_WARNINGS: dict[str, str] = {
     ),
 }
 
-_CAPABILITY_TRIGGER_PATHS: tuple[tuple[str, str], ...] = (
+_DEFAULT_CAPABILITY_TRIGGER_PATHS: tuple[tuple[str, str], ...] = (
     ("AgentLoop", "src/singularity/agent_loop.py"),
     ("AgentLoop", "src/singularity/agent_loop/"),
     ("ToolProtocol", "src/singularity/tool_protocol/"),
@@ -84,6 +85,36 @@ _CAPABILITY_TRIGGER_PATHS: tuple[tuple[str, str], ...] = (
     ("evaluation runner", "docs/evaluation/"),
     ("evaluation runner", "scripts/verify_capability.py"),
 )
+
+
+def _load_capability_trigger_paths(
+    workspace: Path = Path("."),
+) -> tuple[tuple[str, str], ...]:
+    config_path = workspace / "pyproject.toml"
+    if not config_path.exists():
+        return _DEFAULT_CAPABILITY_TRIGGER_PATHS
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return _DEFAULT_CAPABILITY_TRIGGER_PATHS
+    test_impact = (
+        config.get("tool", {})
+        .get("singularity", {})
+        .get("test_impact", {})
+    )
+    configured = test_impact.get("capability_triggers") if isinstance(test_impact, dict) else None
+    if not isinstance(configured, list):
+        return _DEFAULT_CAPABILITY_TRIGGER_PATHS
+    triggers: list[tuple[str, str]] = []
+    for item in configured:
+        if not isinstance(item, dict):
+            return _DEFAULT_CAPABILITY_TRIGGER_PATHS
+        area = item.get("area")
+        prefix = item.get("prefix")
+        if not isinstance(area, str) or not area or not isinstance(prefix, str) or not prefix:
+            return _DEFAULT_CAPABILITY_TRIGGER_PATHS
+        triggers.append((area, prefix.replace("\\", "/")))
+    return tuple(triggers) or _DEFAULT_CAPABILITY_TRIGGER_PATHS
 
 
 def _is_pytest_collectable(path: str) -> bool:
@@ -302,13 +333,18 @@ def _compute_confidence(
     return "low"
 
 
-def _capability_triggers(changed_files: list[str]) -> dict[str, Any]:
+def _capability_triggers(
+    changed_files: list[str],
+    *,
+    workspace: Path = Path("."),
+) -> dict[str, Any]:
     areas: list[str] = []
     files: list[str] = []
+    trigger_paths = _load_capability_trigger_paths(workspace)
     for raw_path in changed_files:
         path = raw_path.replace("\\", "/")
         matched = False
-        for area, prefix in _CAPABILITY_TRIGGER_PATHS:
+        for area, prefix in trigger_paths:
             if path == prefix or path.startswith(prefix):
                 areas.append(area)
                 matched = True
@@ -395,7 +431,7 @@ def main() -> int:
                     "confidence": "low",
                     "fallback_gate": None,
                     "skipped_reason": "no changed files detected",
-                    "capability_gate": _capability_triggers([]),
+                    "capability_gate": _capability_triggers([], workspace=workspace),
                 }, indent=2))
             else:
                 print("No changed files detected.")
@@ -436,7 +472,7 @@ def main() -> int:
                     "confidence": "low",
                     "fallback_gate": "stage",
                     "skipped_reason": msg,
-                    "capability_gate": _capability_triggers(changed_files),
+                    "capability_gate": _capability_triggers(changed_files, workspace=workspace),
                 }, indent=2))
             else:
                 print(f"ERROR: {msg}", file=sys.stderr)
@@ -473,7 +509,7 @@ def main() -> int:
         recommended_tests=likely_tests,
         warnings=all_warnings,
     )
-    capability_gate = _capability_triggers(changed_files)
+    capability_gate = _capability_triggers(changed_files, workspace=workspace)
 
     # Output
     if args.json_output:
