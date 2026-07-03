@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -58,6 +59,16 @@ from singularity.tools.router import (
 )
 from singularity.verification.contract import VerificationContract, VerificationStep
 from singularity.verification.satisfaction import ContractSatisfaction, StepEvidence
+
+
+@dataclass(frozen=True)
+class _ToolScope:
+    allowed_tools: set[str]
+    phase_allowed: set[str]
+    repair_allowed: set[str]
+    repair_evidence_allowed: set[str]
+    repair_execution_block: tuple[str, str] | None
+    benchmark_allowed: set[str]
 
 
 class Planner:
@@ -324,10 +335,9 @@ class Planner:
         plan = self._plan()
         phase = plan.phase(state.current_phase)
         normalized_args = self.policy.normalize_arguments(arguments or {})
-        repair_allowed = self._active_repair_allowed_tools()
-        repair_execution_block = self._repair_contract_execution_block()
-        if repair_execution_block and tool_name not in self._repair_contract_evidence_tools():
-            error_code, block_reason = repair_execution_block
+        tool_scope = self._active_tool_scope()
+        if tool_scope.repair_execution_block and tool_name not in tool_scope.repair_evidence_allowed:
+            error_code, block_reason = tool_scope.repair_execution_block
             decision = AuthorizationDecision(
                 allowed=False,
                 error_code=error_code,
@@ -347,7 +357,7 @@ class Planner:
                 },
             )
             return decision
-        if repair_allowed and tool_name not in repair_allowed:
+        if tool_scope.repair_allowed and tool_name not in tool_scope.repair_allowed:
             decision = AuthorizationDecision(
                 allowed=False,
                 error_code="repair_contract_tool_not_allowed",
@@ -364,8 +374,7 @@ class Planner:
                 },
             )
             return decision
-        benchmark_allowed = self._benchmark_allowed_tools()
-        if benchmark_allowed and tool_name not in benchmark_allowed:
+        if tool_scope.benchmark_allowed and tool_name not in tool_scope.benchmark_allowed:
             decision = AuthorizationDecision(
                 allowed=False,
                 error_code="benchmark_tool_not_allowed",
@@ -447,7 +456,7 @@ class Planner:
 
         # During repair phase, constrain run_verification / rerun_check to the
         # active VerificationContract's allowed commands.
-        if tool_name in {"run_verification", "rerun_check"} and repair_allowed:
+        if tool_name in {"run_verification", "rerun_check"} and tool_scope.repair_allowed:
             smoke_commands = normalized_args.get("smoke_commands")
             if isinstance(smoke_commands, list) and smoke_commands:
                 vcontract = self._active_repair_verification_contract()
@@ -1645,17 +1654,10 @@ class Planner:
         self._throw_if_cancelled()
         state = self._state()
         phase = self._plan().phase(state.current_phase)
-        allowed = self._authorized_tool_names_for_phase(phase, available_tools)
-        repair_execution_block = self._repair_contract_execution_block()
-        if repair_execution_block:
-            allowed &= self._repair_contract_evidence_tools()
-        else:
-            repair_allowed = self._active_repair_allowed_tools()
-            if repair_allowed:
-                allowed &= repair_allowed
-        benchmark_allowed = self._benchmark_allowed_tools()
-        if benchmark_allowed:
-            allowed &= benchmark_allowed
+        allowed = self._active_tool_scope(
+            phase=phase,
+            available_tools=available_tools,
+        ).allowed_tools
         decision = self.tool_router.decide(
             phase=phase.phase_id,
             phase_allowed_tool_names=allowed,
@@ -1713,17 +1715,7 @@ class Planner:
             )
         else:
             phase = self._plan().phase(self._state().current_phase)
-            allowed = self._authorized_tool_names_for_phase(phase)
-            repair_execution_block = self._repair_contract_execution_block()
-            if repair_execution_block:
-                allowed &= self._repair_contract_evidence_tools()
-            else:
-                repair_allowed = self._active_repair_allowed_tools()
-                if repair_allowed:
-                    allowed &= repair_allowed
-            benchmark_allowed = self._benchmark_allowed_tools()
-            if benchmark_allowed:
-                allowed &= benchmark_allowed
+            allowed = self._active_tool_scope(phase=phase).allowed_tools
         return [
             tool
             for tool in tools
@@ -1746,6 +1738,37 @@ class Planner:
             for spec in available_tools
             if self.policy.is_allowed(phase=phase, tool_name=spec.name, spec=spec)
         }
+
+    def _active_tool_scope(
+        self,
+        *,
+        phase: TaskPhase | None = None,
+        available_tools: list[ToolSpec] | None = None,
+    ) -> _ToolScope:
+        phase = phase or self._plan().phase(self._state().current_phase)
+        phase_allowed = self._authorized_tool_names_for_phase(phase, available_tools)
+        allowed = set(phase_allowed)
+        repair_execution_block = self._repair_contract_execution_block()
+        repair_evidence_allowed: set[str] = set()
+        repair_allowed: set[str] = set()
+        if repair_execution_block:
+            repair_evidence_allowed = self._repair_contract_evidence_tools()
+            allowed &= repair_evidence_allowed
+        else:
+            repair_allowed = self._active_repair_allowed_tools()
+            if repair_allowed:
+                allowed &= repair_allowed
+        benchmark_allowed = self._benchmark_allowed_tools()
+        if benchmark_allowed:
+            allowed &= benchmark_allowed
+        return _ToolScope(
+            allowed_tools=allowed,
+            phase_allowed=phase_allowed,
+            repair_allowed=repair_allowed,
+            repair_evidence_allowed=repair_evidence_allowed,
+            repair_execution_block=repair_execution_block,
+            benchmark_allowed=benchmark_allowed,
+        )
 
     def semantic_rolling_plan(self) -> RollingPlan:
         state = self._state()

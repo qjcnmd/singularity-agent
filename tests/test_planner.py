@@ -108,6 +108,46 @@ def test_benchmark_constraints_limit_tool_exposure_and_authorization(tmp_path: P
     assert state.task_contract["benchmark_constraints"]["allowed_tools"] == ["read_file"]
 
 
+def test_benchmark_constraints_share_tool_scope_for_exposure_and_authorization(tmp_path: Path) -> None:
+    planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
+    planner.apply_benchmark_constraints(
+        {
+            "task_id": "bench.task",
+            "allowed_tools": ["read_file", "inspect_diff"],
+            "expected_file_changes": ["app.py"],
+        }
+    )
+    state = planner.start_task("Exercise shared tool scope")
+    state.current_phase = "running_verification"
+
+    tool_specs = [
+        spec("read_file"),
+        spec("inspect_diff"),
+        spec("run_verification", permission=PermissionLevel.SHELL),
+        spec("write_file", permission=PermissionLevel.WRITE),
+    ]
+    exposure = planner.decide_tool_exposure(tool_specs)
+
+    assert exposure.selected_tool_names == ["inspect_diff", "read_file"]
+    for tool_name in exposure.selected_tool_names:
+        decision = planner.authorize_tool_call(
+            tool_name=tool_name,
+            tool_call_id=f"call_{tool_name}",
+            spec=spec(tool_name),
+            arguments={},
+        )
+        assert decision.allowed is True
+    denied = planner.authorize_tool_call(
+        tool_name="run_verification",
+        tool_call_id="call_verify",
+        spec=spec("run_verification", permission=PermissionLevel.SHELL),
+        arguments={},
+    )
+
+    assert denied.allowed is False
+    assert denied.error_code == "benchmark_tool_not_allowed"
+
+
 def test_benchmark_expected_file_changes_delay_verification_phase(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.apply_benchmark_constraints(
