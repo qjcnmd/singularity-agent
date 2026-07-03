@@ -10,7 +10,6 @@ from uuid import uuid4
 import httpx
 
 from singularity.config import Settings
-from singularity.model.messages import MessageConverter
 from singularity.model.models import (
     ContentBlock,
     ModelCapabilities,
@@ -25,6 +24,11 @@ from singularity.model.models import (
     ModelUsage,
     ToolChoiceMode,
     ToolChoicePolicy,
+)
+from singularity.model.openai_format import (
+    model_messages_to_openai,
+    model_tool_to_openai,
+    serialize_tool_choice,
 )
 from singularity.model.streaming import ProviderStreamEvent, ProviderStreamEventType
 
@@ -211,11 +215,11 @@ class ChatProviderModelProvider:
         return self._capabilities
 
     def complete(self, request: ProviderRequest) -> ProviderResponse:
-        messages = _model_messages_to_openai(request.messages, self.capabilities())
-        tools = [_model_tool_to_openai(tool) for tool in request.tools]
+        messages = model_messages_to_openai(request.messages, self.capabilities())
+        tools = [model_tool_to_openai(tool) for tool in request.tools]
         kwargs: dict[str, Any] = {"messages": messages, "tools": tools}
         if _chat_accepts_tool_choice(self.provider):
-            kwargs["tool_choice"] = _serialize_tool_choice(request.tool_choice)
+            kwargs["tool_choice"] = serialize_tool_choice(request.tool_choice)
         response = self.provider.chat(**kwargs)
         return ProviderResponse.from_openai_response(
             response,
@@ -353,12 +357,12 @@ class OpenAICompatibleModelProvider:
     def _chat_completion_payload(self, request: ProviderRequest) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": request.preferences.model_name or self.settings.model,
-            "messages": _model_messages_to_openai(
+            "messages": model_messages_to_openai(
                 request.messages,
                 self.capabilities(),
             ),
-            "tools": [_model_tool_to_openai(tool) for tool in request.tools],
-            "tool_choice": _serialize_tool_choice(request.tool_choice),
+            "tools": [model_tool_to_openai(tool) for tool in request.tools],
+            "tool_choice": serialize_tool_choice(request.tool_choice),
         }
         if request.preferences.temperature is not None:
             payload["temperature"] = request.preferences.temperature
@@ -396,68 +400,6 @@ class _StreamParseState:
     seen_tool_call_ids: set[str] = field(default_factory=set)
     completed_tool_call_ids: set[str] = field(default_factory=set)
     finish_reason: str = "stop"
-
-
-def _model_messages_to_openai(
-    messages: list[ModelMessage],
-    capabilities: ModelCapabilities,
-) -> list[dict[str, Any]]:
-    converter = MessageConverter()
-    provider_messages = converter.to_provider_messages(
-        messages,
-        capabilities=capabilities,
-    )
-    for index, payload in enumerate(provider_messages):
-        metadata = payload.pop("metadata", {}) or {}
-        tool_calls = messages[index].metadata.get("tool_calls") or metadata.get("tool_calls")
-        if tool_calls:
-            payload["tool_calls"] = [_safe_provider_tool_call(tool_call) for tool_call in tool_calls]
-    return provider_messages
-
-
-def _safe_provider_tool_call(tool_call: Any) -> dict[str, Any]:
-    if not isinstance(tool_call, dict):
-        return {
-            "id": "",
-            "type": "function",
-            "function": {"name": "<unknown>", "arguments": "{}"},
-        }
-    raw_function = tool_call.get("function")
-    function = raw_function if isinstance(raw_function, dict) else {}
-    arguments = function.get("arguments", "{}")
-    if not isinstance(arguments, str):
-        arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
-    return {
-        "id": str(tool_call.get("id") or ""),
-        "type": str(tool_call.get("type") or "function"),
-        "function": {
-            "name": str(function.get("name") or "<unknown>"),
-            "arguments": arguments or "{}",
-        },
-    }
-
-
-def _model_tool_to_openai(tool: ModelToolSchema) -> dict[str, Any]:
-    function: dict[str, Any] = {
-        "name": tool.name,
-        "description": tool.description,
-        "parameters": tool.parameters_schema,
-    }
-    if tool.metadata.get("strict"):
-        function["strict"] = True
-    return {"type": "function", "function": function}
-
-
-def _serialize_tool_choice(policy: ToolChoicePolicy | ToolChoiceMode | str) -> Any:
-    if isinstance(policy, ToolChoiceMode):
-        return policy.value
-    if isinstance(policy, str):
-        return policy
-    if policy.mode == ToolChoiceMode.SPECIFIC_TOOL and policy.tool_name:
-        return {"type": "function", "function": {"name": policy.tool_name}}
-    if policy.mode == ToolChoiceMode.ALLOWED_TOOLS:
-        return ToolChoiceMode.AUTO.value
-    return policy.mode.value
 
 
 def _raw_provider_tool_call(tool_call: dict[str, Any]) -> ModelToolCall:

@@ -8,7 +8,7 @@ from singularity.model import (
     ModelRole,
     ProviderRequest,
 )
-from singularity.model.providers import _model_messages_to_openai
+from singularity.model.openai_format import model_messages_to_openai
 
 
 def test_message_converter_preserves_tool_call_id_and_developer_fallback() -> None:
@@ -79,7 +79,7 @@ def test_provider_messages_use_safe_empty_arguments_for_historical_tool_calls() 
         },
     )
 
-    provider_messages = _model_messages_to_openai(
+    provider_messages = model_messages_to_openai(
         [message],
         ModelCapabilities(supports_tools=True),
     )

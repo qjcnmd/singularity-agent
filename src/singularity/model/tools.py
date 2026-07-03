@@ -12,6 +12,7 @@ from singularity.model.models import (
     ModelToolParseStatus,
     ModelToolSchema,
 )
+from singularity.model.openai_format import model_tool_to_openai
 from singularity.tools.models import PermissionLevel
 from singularity.tools.registry import ToolRegistry
 
@@ -55,17 +56,7 @@ class ModelToolRenderer:
         return schemas
 
     def to_provider_tools(self, tools: list[ModelToolSchema], *, strict: bool = False) -> list[dict[str, Any]]:
-        provider_tools: list[dict[str, Any]] = []
-        for tool in tools:
-            function: dict[str, Any] = {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.parameters_schema,
-            }
-            if strict:
-                function["strict"] = True
-            provider_tools.append({"type": "function", "function": function})
-        return provider_tools
+        return [model_tool_to_openai(tool, strict=strict) for tool in tools]
 
     @staticmethod
     def schema_hash(tools: list[ModelToolSchema]) -> str:
