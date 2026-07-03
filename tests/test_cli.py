@@ -21,6 +21,7 @@ from singularity.kernel.finalization import FinalReport
 from singularity.kernel.models import RunStatus
 from singularity.observability import TraceEventType, TraceRecorder
 from singularity.planner import Planner, TaskStatus, create_or_resume_planner
+from singularity.sandbox import WindowsSandboxDoctorReport
 from singularity.workspace_state import WorkspaceHealthReport, WorkspaceHealthStatus
 
 runner = CliRunner()
@@ -46,6 +47,31 @@ def test_workspace_health_summary_lists_state_categories() -> None:
     assert "rollback_available: true" in summary
     assert "rollback_conflicts: app.py" in summary
     assert "recommended_next_action: re-read changed files before continuing" in summary
+
+
+def test_sandbox_doctor_json_emits_machine_readable_report(monkeypatch) -> None:
+    class FakeWindowsSandboxBackend:
+        def doctor(self) -> WindowsSandboxDoctorReport:
+            return WindowsSandboxDoctorReport.ready_for_tests()
+
+    monkeypatch.setattr("singularity.cli.WindowsSandboxBackend", FakeWindowsSandboxBackend)
+
+    result = runner.invoke(app, ["sandbox", "doctor", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "sandbox.windows.doctor/v2"
+    assert payload["available"] is True
+    assert payload["enforcement_status"] == "available"
+    assert payload["missing_requirements"] == payload["blocking_requirements"]
+    assert set(payload["primitives"]) == {
+        "restricted_token",
+        "job_object",
+        "low_integrity",
+        "acl",
+        "firewall",
+        "private_desktop",
+    }
 
 
 def test_create_or_resume_planner_marks_conflicted_workspace_needs_review(tmp_path: Path) -> None:

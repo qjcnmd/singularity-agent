@@ -9,6 +9,9 @@ from singularity.interaction import InteractionController, UserDecision
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import (
     ApprovalGate,
+    ApprovalGrant,
+    ApprovalScope,
+    Capability,
     DecisionOutcome,
     PolicyConfig,
     PolicyDecision,
@@ -54,6 +57,7 @@ class SequencedPolicyEngine:
 
     def enforce(self, request: PolicyRequest) -> PolicyDecision:
         return self.evaluate(request)
+
 
 class ApprovingProvider:
     def request_decision(self, prompt):
@@ -289,3 +293,105 @@ def test_tool_policy_request_preserves_all_resolved_resources(tmp_path: Path) ->
     assert [item["identifier"] for item in resources] == ["old.txt", "new.txt"]
     assert request.resource.metadata["related_resources"][0]["identifier"] == "new.txt"
     assert approval_scope_for_request(request).path_globs == ["old.txt", "new.txt"]
+
+
+def test_tool_executor_enforces_policy_approval_planner_then_dispatch_order(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class RecordingPolicyEngine(SequencedPolicyEngine):
+        def enforce(self, request: PolicyRequest) -> PolicyDecision:
+            events.append("policy")
+            decision = super().enforce(request)
+            return decision.model_copy_with(
+                required_approval=type(
+                    "Requirement",
+                    (),
+                    {
+                        "scope": ApprovalScope(
+                            capabilities=[Capability.READ_WORKSPACE],
+                            path_globs=["*"],
+                            single_use=True,
+                        )
+                    },
+                )()
+            )
+
+    class RecordingApprovalGate:
+        def is_grant_store_trusted(self, _workspace_root: Path) -> bool:
+            events.append("approval_trust_check")
+            return False
+
+        def resolve(
+            self,
+            request: PolicyRequest,
+            decision: PolicyDecision,
+        ) -> ApprovalGrant:
+            events.append("approval_resolve")
+            return ApprovalGrant(
+                decision_id=decision.decision_id,
+                request_id=request.request_id,
+                approved_by="test-user",
+                session_id=request.session_id,
+                scope=ApprovalScope(
+                    capabilities=[Capability.READ_WORKSPACE],
+                    path_globs=["*"],
+                    single_use=True,
+                ),
+                grant_id="grant_contract",
+            )
+
+        def register_grant(self, _grant: ApprovalGrant) -> None:
+            events.append("approval_register")
+
+        def consume_grant(self, grant: ApprovalGrant) -> ApprovalGrant:
+            events.append("approval_consume")
+            return grant
+
+    class RecordingPlanner:
+        state = type("State", (), {"current_phase": "phase_contract"})()
+
+        def authorize_tool_call(self, **_kwargs: Any) -> Any:
+            events.append("planner_authorize")
+            return type("Decision", (), {"allowed": True, "action": None})()
+
+        def update_from_tool_result(self, **_kwargs: Any) -> None:
+            events.append("planner_update")
+
+    def handler(_args: EmptyInput) -> dict[str, str]:
+        events.append("handler")
+        return {"ok": "yes"}
+
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="read_contract",
+            description="policy order contract",
+            input_model=EmptyInput,
+            handler=handler,
+        )
+    )
+    component = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=JsonlTraceRecorder.create(tmp_path),
+        workspace_root=tmp_path,
+        planner=RecordingPlanner(),
+        policy_engine=RecordingPolicyEngine([DecisionOutcome.REQUIRE_REVIEW]),
+        approval_gate=RecordingApprovalGate(),
+    )
+
+    result = component.execute_tool_call(make_tool_call("read_contract"))
+
+    assert result.ok is True
+    assert events == [
+        "policy",
+        "approval_trust_check",
+        "approval_resolve",
+        "approval_register",
+        "approval_consume",
+        "planner_authorize",
+        "handler",
+        "planner_update",
+    ]

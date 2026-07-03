@@ -56,6 +56,73 @@ def test_kernel_finalizer_builds_safe_final_report(tmp_path) -> None:
     assert "secret-value" not in str(payload)
 
 
+def test_kernel_final_report_to_dict_field_contract(tmp_path) -> None:
+    identity = RunIdentity.new(run_id="run_1", session_id="session_1", task_id="task_1")
+    context = KernelContext(
+        project_root=tmp_path,
+        identity=identity,
+        run=AgentRun(identity=identity, user_goal="Build kernel"),
+        status=KernelStatus.SHUTTING_DOWN,
+        workspace_lock_status="released",
+    )
+
+    report = KernelFinalizer().finalize(
+        context=context,
+        planner_report={
+            "verification_summary": {"status": "ready"},
+            "policy_approval_summary": {"denied_actions_count": 0},
+            "sandbox_isolation_summary": {"backend": "windows"},
+            "model_usage_summary": {"requests": 1},
+            "execution_trace_summary": {"tool_calls": 1},
+        },
+        component_health_summary={"planner": "ok"},
+        shutdown_summary=ShutdownSummary(ShutdownReason.NORMAL, "completed", []),
+        recovery_summary={"recovered": False},
+        lifecycle_summary={"events": 3},
+        config_summary={"dry_run": True},
+        workspace_summary={"status": "clean"},
+        session_summary={"status": "completed"},
+        checkpoint_summary={"count": 1},
+        recovery_gate_summary={"can_call_model": True},
+    )
+
+    payload = report.to_dict()
+
+    assert list(payload) == [
+        "run_id",
+        "session_id",
+        "task_id",
+        "kernel_status",
+        "shutdown_reason",
+        "diagnostics_count",
+        "cleanup_status",
+        "recovered_previous_run",
+        "uncertain_transactions",
+        "workspace_lock_status",
+        "planner_summary",
+        "verification_summary",
+        "policy_summary",
+        "sandbox_summary",
+        "model_summary",
+        "trace_summary",
+        "config_summary",
+        "workspace_summary",
+        "component_health_summary",
+        "shutdown_summary",
+        "recovery_summary",
+        "session_summary",
+        "checkpoint_summary",
+        "recovery_gate_summary",
+        "lifecycle_summary",
+    ]
+    assert payload["verification_summary"] == {"status": "ready"}
+    assert payload["policy_summary"] == {"denied_actions_count": 0}
+    assert payload["sandbox_summary"] == {"backend": "windows"}
+    assert payload["model_summary"] == {"requests": 1}
+    assert payload["trace_summary"] == {"tool_calls": 1}
+    assert "final_report" not in payload
+
+
 def test_agent_kernel_finalizes_cancelled_run_before_raising(tmp_path: Path) -> None:
     kernel, trace = _build_kernel(tmp_path)
     kernel.cancellation.cancel(CancellationReason.USER_INTERRUPTED, "stop now")

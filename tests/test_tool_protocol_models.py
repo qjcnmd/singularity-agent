@@ -159,6 +159,57 @@ def test_tool_protocol_result_envelope_uses_explicit_observation_view() -> None:
     assert ref_payload["result_ref"] == "raw_1"
 
 
+def test_tool_protocol_result_envelope_context_message_contract() -> None:
+    envelope = ToolProtocolResultEnvelope(
+        tool_call_id="call_contract",
+        tool_name="read_file",
+        ok=False,
+        status="error",
+        error_code="policy_denied",
+        error_kind=ToolCallFailureKind.policy_denied,
+        content_preview="safe preview",
+        content_digest="digest_contract",
+        raw_result_ref="result_ref_contract",
+        artifact_refs=["artifact_a", "artifact_b"],
+        observation_id="observation_contract",
+        policy_decision_id="policy_internal",
+        approval_grant_id="approval_internal",
+        truncated=True,
+        redacted=True,
+        metadata={"raw_arguments": {"path": "secret.txt"}, "duration_seconds": 0.2},
+    )
+
+    message = envelope.to_context_message()
+    payload = json.loads(message["content"])
+
+    assert message == {
+        "role": "tool",
+        "tool_call_id": "call_contract",
+        "name": "read_file",
+        "content": message["content"],
+    }
+    assert payload == {
+        "ok": False,
+        "tool_name": "read_file",
+        "tool_call_id": "call_contract",
+        "status": "error",
+        "content_digest": "digest_contract",
+        "result_ref": "result_ref_contract",
+        "error_code": "policy_denied",
+        "error_kind": "policy_denied",
+        "reference_ids": ["artifact_a", "artifact_b"],
+        "observation_id": "observation_contract",
+        "truncated": True,
+        "redacted": True,
+        "content": "safe preview",
+        "content_preview": "safe preview",
+    }
+    assert "policy_decision_id" not in payload
+    assert "approval_grant_id" not in payload
+    assert "metadata" not in payload
+    assert "raw_arguments" not in message["content"]
+
+
 def test_protocol_status_and_report_models_are_serializable() -> None:
     turn_result = ToolProtocolTurnResult(
         status=ToolProtocolTurnStatus.PROCESSED,

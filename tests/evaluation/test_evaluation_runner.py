@@ -1665,6 +1665,147 @@ def test_evaluation_sanitized_result_shape_is_safe_and_current() -> None:
         assert removed not in task
 
 
+def test_evaluation_task_result_to_dict_contract_keeps_gate_fields_separate(
+    tmp_path: Path,
+) -> None:
+    result = EvaluationTaskResult(
+        task_id="contract.task",
+        tests_passed=False,
+        infrastructure_blocked=True,
+        prompt_tokens=11,
+        cached_tokens=3,
+        request_cache_hit_rate=0.25,
+        run_cache_hit_rate=0.5,
+        tool_calls=2,
+        files_changed=["src/app.py"],
+        duration_seconds=1.25,
+        error_summary="sandbox unavailable",
+        workspace=str(tmp_path / "workspace"),
+        trace=str(tmp_path / "trace"),
+        status="environment_blocker",
+        turn_count=4,
+        agent_completed=True,
+        evaluation_passed=False,
+        patch_applicable=True,
+        allowed_scope_passed=True,
+        public_verification_passed=False,
+        hidden_verification_passed=False,
+        sandbox_enforcement_passed=False,
+        evaluator_visibility_audit_passed=True,
+        local_process_fallback_count=0,
+        repair_attempt_count=1,
+        repair_execution_count=0,
+        miscompletion_count=1,
+        blocked_reason="backend_unavailable",
+        failure_category="environment_blocker",
+        request_cache_hit_rates={"turn_1": 0.25},
+        verification_result={"status": "not_run"},
+        contract_satisfaction={"status": "not_recorded"},
+        final_report_status="completed",
+        policy_blocks=0,
+        token_usage={"input_tokens": 11, "cached_input_tokens": 3},
+        cache_usage={"run_cache_hit_rate": 0.5},
+        trace_artifact_refs=["planner/report.md"],
+        reproducible_environment={"workspace": {"type": "fixture"}},
+        capability_summary={
+            "schema_version": "evaluation.capability_summary/v2",
+            "local_process_fallback_count": 0,
+        },
+        capability_sla={
+            "schema_version": "evaluation.capability_sla/v1",
+            "status": "over_sla",
+            "blocking": False,
+            "items": {"wall_time_seconds": {"blocking": False}},
+        },
+        timing={"wall_time_seconds": 42.0},
+        baseline_failed=True,
+        baseline_checks={"public": {"status": "failed"}},
+        patch_applied=True,
+        fail_to_pass_satisfied=False,
+        verification_misconfiguration_reason="",
+        evaluation_metrics={
+            "schema_version": "evaluation.metrics/v1",
+            "resolved": {"value": False, "reason": "environment_blocker"},
+        },
+    )
+
+    payload = result.to_dict()
+
+    assert list(payload) == [
+        "task_id",
+        "status",
+        "tests_passed",
+        "infrastructure_blocked",
+        "turn_count",
+        "prompt_tokens",
+        "cached_tokens",
+        "request_cache_hit_rate",
+        "run_cache_hit_rate",
+        "tool_calls",
+        "files_changed",
+        "duration_seconds",
+        "error_summary",
+        "workspace",
+        "trace",
+        "verification_workspace",
+        "patch",
+        "checks",
+        "verification",
+        "agent_completed",
+        "evaluation_passed",
+        "patch_applicable",
+        "allowed_scope_passed",
+        "public_verification_passed",
+        "hidden_verification_passed",
+        "sandbox_enforcement_passed",
+        "evaluator_visibility_audit_passed",
+        "local_process_fallback_count",
+        "repair_attempt_count",
+        "repair_execution_count",
+        "miscompletion_count",
+        "blocked_reason",
+        "failure_category",
+        "request_cache_hit_rates",
+        "verification_result",
+        "contract_satisfaction",
+        "final_report_status",
+        "policy_blocks",
+        "token_usage",
+        "cache_usage",
+        "trace_artifact_refs",
+        "reproducible_environment",
+        "capability_summary",
+        "capability_sla",
+        "timing",
+        "baseline_failed",
+        "baseline_checks",
+        "patch_applied",
+        "fail_to_pass_satisfied",
+        "verification_misconfiguration_reason",
+        "evaluation_metrics",
+    ]
+    assert payload["status"] == "environment_blocker"
+    assert payload["agent_completed"] is True
+    assert payload["tests_passed"] is False
+    assert payload["evaluation_passed"] is False
+    assert payload["infrastructure_blocked"] is True
+    assert payload["capability_sla"]["blocking"] is False
+    assert payload["local_process_fallback_count"] == 0
+    assert payload["baseline_failed"] is True
+    assert payload["patch_applied"] is True
+    assert payload["fail_to_pass_satisfied"] is False
+    assert payload["evaluation_metrics"]["schema_version"] == "evaluation.metrics/v1"
+    for removed in [
+        "success",
+        "completed",
+        "task_verification_result",
+        "repair_verification_contract",
+        "result_extraction",
+        "agent_loop_ref",
+    ]:
+        assert removed not in payload
+
+
 def test_private_adapter_converts_benchmark_tasks_to_evaluation_task_set(tmp_path: Path) -> None:
     task_set = tmp_path / "private.json"
     task_set.write_text(
