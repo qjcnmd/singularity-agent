@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from verify_gate_common import (
+    capability_latency_attribution_from_result,
     capability_metrics_from_result,
     capability_repeated_timing_compare,
     capability_review_from_result,
@@ -99,10 +100,12 @@ def main() -> int:
     capability_timing = capability_timing_from_result(result_path)
     capability_metrics = capability_metrics_from_result(result_path)
     capability_sla = capability_sla_from_result(result_path)
+    latency_attribution = capability_latency_attribution_from_result(result_path)
     timing_compare = capability_repeated_timing_compare(result_path)
     sla_diagnostics = capability_sla_diagnostics(capability_sla, timing_compare)
     turn_diagnostics = capability_turns_from_result(result_path)
     review_diagnostics = capability_review_from_result(result_path)
+    phase_8_11_vs_current_timing = _phase_8_11_vs_current_timing(result_path, cwd=cwd)
     print_json_summary(
         {
             "gate": "capability",
@@ -116,7 +119,10 @@ def main() -> int:
             "result_path": str(result_path),
             "evaluation_metrics": capability_metrics,
             "capability_sla": capability_sla,
+            "latency_attribution": latency_attribution,
+            "critical_path_breakdown": latency_attribution.get("critical_path_breakdown", []),
             "capability_sla_diagnostics": sla_diagnostics,
+            "8_11_vs_current_timing": phase_8_11_vs_current_timing,
             "timing_compare": timing_compare,
             "turn_diagnostics": turn_diagnostics,
             "review_diagnostics": review_diagnostics,
@@ -134,6 +140,75 @@ def main() -> int:
         }
     )
     return 0 if result.passed else 1
+
+
+def _phase_8_11_vs_current_timing(result_path: Path, *, cwd: Path) -> dict[str, Any]:
+    baseline_path = cwd / "work" / "evaluations" / "phase8-11-windows-sandbox-readiness" / "result.json"
+    baseline = _timing_record_for_compare(baseline_path)
+    current = _timing_record_for_compare(result_path)
+    if not baseline or not current:
+        return {
+            "schema_version": "evaluation.phase_timing_compare/v1",
+            "status": "unavailable",
+            "baseline_run_id": "phase8-11-windows-sandbox-readiness",
+            "current_run_id": result_path.parent.name,
+            "reason": "baseline or current result is unavailable",
+            "metrics": {},
+        }
+    metrics: dict[str, dict[str, float | None]] = {}
+    for name in sorted(set(baseline) | set(current)):
+        baseline_value = baseline.get(name)
+        current_value = current.get(name)
+        delta = (
+            round(float(current_value) - float(baseline_value), 3)
+            if isinstance(baseline_value, int | float) and isinstance(current_value, int | float)
+            else None
+        )
+        metrics[name] = {
+            "phase_8_11_seconds": baseline_value,
+            "current_seconds": current_value,
+            "delta_seconds": delta,
+            "status": "improved" if isinstance(delta, int | float) and delta < 0 else "regressed"
+            if isinstance(delta, int | float) and delta > 0
+            else "unchanged"
+            if delta == 0
+            else "unavailable",
+        }
+    return {
+        "schema_version": "evaluation.phase_timing_compare/v1",
+        "status": "available",
+        "baseline_run_id": "phase8-11-windows-sandbox-readiness",
+        "current_run_id": result_path.parent.name,
+        "metrics": metrics,
+    }
+
+
+def _timing_record_for_compare(result_path: Path) -> dict[str, float]:
+    if not result_path.exists():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    task = next((item for item in payload.get("tasks") or [] if isinstance(item, dict)), None)
+    if task is None:
+        return {}
+    timing = task.get("timing") if isinstance(task.get("timing"), dict) else {}
+    capability = task.get("capability_summary") if isinstance(task.get("capability_summary"), dict) else {}
+    wall_phases = capability.get("wall_phases") if isinstance(capability.get("wall_phases"), dict) else {}
+    metrics: dict[str, float] = {}
+    for output_name, source in (
+        ("wall", timing.get("wall_time_seconds")),
+        ("provider", timing.get("provider_time_seconds")),
+        ("sandbox", timing.get("sandbox_time_seconds")),
+        ("verification", timing.get("verification_time_seconds")),
+        ("dependency_setup", timing.get("dependency_setup_time_seconds")),
+        ("agent_loop", wall_phases.get("agent_loop_time_seconds")),
+        ("unattributed_time", capability.get("unattributed_time_seconds")),
+    ):
+        if isinstance(source, int | float):
+            metrics[output_name] = round(float(source), 3)
+    return metrics
 
 
 def _remaining_bottlenecks(

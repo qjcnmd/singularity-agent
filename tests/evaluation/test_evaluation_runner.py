@@ -1123,6 +1123,29 @@ def test_capability_summary_v2_aggregates_component_spans_without_payload_conten
             "payload": {"duration_ms": 50, "compaction_decision_duration_ms": 10},
         },
         {"event_type": "retrieval.query.completed", "payload": {"duration_ms": 20}},
+        {
+            "event_type": "model.response.received",
+            "payload": {
+                "duration_ms": 1200,
+                "raw_response": "do not project raw response",
+            },
+        },
+        {
+            "event_type": "finalization.completed",
+            "payload": {"duration_ms": 300, "raw_prompt": "do not project raw prompt"},
+        },
+        {
+            "event_type": "artifact.write.completed",
+            "payload": {"duration_ms": 40, "raw_patch": "do not project raw patch"},
+        },
+        {
+            "event_type": "trace.flush.completed",
+            "payload": {"duration_ms": 30, "secret": "do not project secret"},
+        },
+        {
+            "event_type": "evaluation.summary.completed",
+            "payload": {"duration_ms": 70, "file_content": "do not project file content"},
+        },
     ]
     (trace_dir / "events.jsonl").write_text(
         "\n".join(json.dumps(event) for event in events) + "\n",
@@ -1194,6 +1217,63 @@ def test_capability_summary_v2_aggregates_component_spans_without_payload_conten
     assert summary["timing_diagnostics"]["context_assembly_time_seconds"]["source"] == "context_trace"
     assert summary["wall_phases"]["agent_loop_time_seconds"] == 3.0
     assert summary["unattributed_time_seconds"] == 0.9
+    attribution = summary["latency_attribution"]
+    assert attribution["schema_version"] == "evaluation.latency_attribution/v1"
+    assert set(attribution["items"]) >= {
+        "provider_latency",
+        "tool_execution_latency",
+        "model_assisted_review_latency",
+        "finalization_latency",
+        "context_assembly_latency",
+        "trace_audit_overhead",
+        "artifact_writes",
+        "summary_aggregation",
+        "sandbox",
+        "verification",
+        "dependency_setup",
+        "workspace_materialization",
+        "unattributed_time",
+    }
+    assert attribution["items"]["provider_latency"] == {
+        "component": "provider_latency",
+        "actual_seconds": 1.2,
+        "source": "trace.model_turns",
+        "kind": "model_provider",
+        "critical_path": True,
+        "status": "measured",
+        "notes": "component attribution may overlap agent_loop wall phase",
+    }
+    assert attribution["items"]["artifact_writes"]["actual_seconds"] == 0.04
+    assert attribution["items"]["model_assisted_review_latency"]["actual_seconds"] == 1.0
+    assert attribution["items"]["summary_aggregation"]["actual_seconds"] == 0.07
+    assert attribution["items"]["trace_audit_overhead"]["actual_seconds"] == 0.03
+    critical_path = summary["critical_path_breakdown"]
+    assert [item["component"] for item in critical_path[:3]] == [
+        "sandbox",
+        "agent_loop",
+        "tool_execution_latency",
+    ]
+    assert [item["actual_seconds"] for item in critical_path] == sorted(
+        [item["actual_seconds"] for item in critical_path],
+        reverse=True,
+    )
+    rendered_attribution = json.dumps(
+        {
+            "latency_attribution": attribution,
+            "critical_path_breakdown": critical_path,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
+    for forbidden in [
+        "raw_prompt",
+        "raw_response",
+        "raw_patch",
+        "secret",
+        "file_content",
+        "do not project",
+    ]:
+        assert forbidden not in rendered_attribution
 
 
 def test_capability_sla_reports_non_blocking_violations_without_changing_gate() -> None:
@@ -1723,7 +1803,10 @@ def test_evaluation_report_markdown_includes_metrics_scorecard(tmp_path: Path) -
     assert "clone path" in markdown
 
 
-def test_evaluation_runner_writes_result_without_provider(tmp_path: Path) -> None:
+def test_evaluation_runner_writes_result_without_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     py = json.dumps(sys.executable)
     manifest_payload = {
         "schema_version": EVALUATION_TASK_SET_SCHEMA_VERSION,
@@ -1814,8 +1897,24 @@ def test_evaluation_runner_writes_result_without_provider(tmp_path: Path) -> Non
         def boot(self, _goal: str) -> FakeKernel:
             return FakeKernel(self.project_root)
 
+    output_root = tmp_path / "out"
+    final_artifact_counts: dict[str, int] = {}
+    original_write_text = Path.write_text
+
+    def counted_write_text(self: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if self.parent == output_root / "run_fake" and self.name in {
+            "result.json",
+            "report.json",
+            "report.md",
+            "failure_cases.json",
+        }:
+            final_artifact_counts[self.name] = final_artifact_counts.get(self.name, 0) + 1
+        return original_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", counted_write_text)
+
     result = EvaluationRunner(
-        output_root=tmp_path / "out",
+        output_root=output_root,
         run_id="run_fake",
         bootstrap_cls=FakeBootstrap,
     ).run(manifest)
@@ -1891,6 +1990,12 @@ def test_evaluation_runner_writes_result_without_provider(tmp_path: Path) -> Non
     assert Path(result["report_path"]).exists()
     assert Path(result["markdown_path"]).exists()
     assert "Agent Evaluation" in Path(result["markdown_path"]).read_text(encoding="utf-8")
+    assert final_artifact_counts == {
+        "failure_cases.json": 1,
+        "report.md": 1,
+        "report.json": 1,
+        "result.json": 1,
+    }
 
 
 def test_evaluation_runner_compares_against_previous_run(tmp_path: Path) -> None:

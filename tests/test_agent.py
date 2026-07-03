@@ -5,7 +5,7 @@ from typing import Any
 from singularity.agent_loop import AgentLoopStatus
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.model import ModelError, ModelErrorKind
-from singularity.planner import Planner
+from singularity.planner import Planner, TaskStatus
 from singularity.review import (
     ReviewDecision,
     ReviewDecisionAction,
@@ -277,6 +277,64 @@ def test_agent_returns_planner_final_report_when_completion_evidence_exists(tmp_
     assert "status: completed" in answer
     assert "files_changed: README.md" in answer
     assert "model says done" not in answer
+
+
+def test_agent_completed_path_finalizes_once(tmp_path: Path) -> None:
+    class CountingPlanner(Planner):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.finalize_calls = 0
+
+        def finalize(self) -> Any:
+            self.finalize_calls += 1
+            return super().finalize()
+
+    planner = CountingPlanner(tmp_path, session_id="session_1", task_id="task_1")
+    provider = MockProvider(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "model says done",
+                    }
+                }
+            ]
+        }
+    )
+    agent = make_agent_session(
+        tmp_path,
+        provider=provider,
+        max_turns=1,
+        planner=planner,
+    )
+
+    original_start = planner.start_task
+
+    def start_with_evidence(goal: str) -> Any:
+        state = original_start(goal)
+        planner.evidence.inspected_files.append("README.md")
+        planner.evidence.applied_changes.append(
+            {"changed_files": ["README.md"], "transaction_id": "tx_1"}
+        )
+        planner.state.linked_transactions.append("tx_1")
+        planner.evidence.verification_results.append(
+            {
+                "completion_assessment": {"status": "ready", "warnings": [], "remaining_risks": []},
+                "check_status": [{"check_id": "check_1", "status": "passed"}],
+            }
+        )
+        planner.state.final_assessment = {"status": "ready"}
+        return state
+
+    planner.start_task = start_with_evidence  # type: ignore[method-assign]
+
+    answer = agent.run("finish with facts")
+
+    assert answer.status == AgentLoopStatus.COMPLETED
+    assert planner.finalize_calls == 1
+    assert planner.final_report is not None
+    assert planner.final_report.status == TaskStatus.COMPLETED
 
 
 def test_agent_does_not_complete_when_final_review_rejects(tmp_path: Path) -> None:

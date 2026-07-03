@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from scripts.verify_gate_common import (
+    capability_latency_attribution_from_result,
     capability_metrics_from_result,
     capability_repeated_timing_compare,
     capability_review_from_result,
@@ -420,6 +421,81 @@ def test_capability_gate_reads_turn_and_review_diagnostics(tmp_path: Path) -> No
     }
 
 
+def test_capability_gate_reads_latency_attribution_and_critical_path(tmp_path: Path) -> None:
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task_1",
+                        "capability_summary": {
+                            "latency_attribution": {
+                                "schema_version": "evaluation.latency_attribution/v1",
+                                "items": {
+                                    "provider_latency": {
+                                        "component": "provider_latency",
+                                        "actual_seconds": 12.5,
+                                        "source": "trace.model_turns",
+                                        "kind": "model_provider",
+                                        "critical_path": True,
+                                        "status": "measured",
+                                        "notes": "",
+                                    },
+                                    "unattributed_time": {
+                                        "component": "unattributed_time",
+                                        "actual_seconds": 1.2,
+                                        "source": "capability_summary.unattributed_time_seconds",
+                                        "kind": "timing_gap",
+                                        "critical_path": False,
+                                        "status": "diagnostic",
+                                        "notes": "diagnostic only; does not affect evaluation_passed",
+                                    },
+                                },
+                            },
+                            "critical_path_breakdown": [
+                                {
+                                    "component": "provider_latency",
+                                    "actual_seconds": 12.5,
+                                    "source": "trace.model_turns",
+                                    "kind": "model_provider",
+                                    "critical_path": True,
+                                    "status": "measured",
+                                    "notes": "",
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    attribution = capability_latency_attribution_from_result(result_path)
+
+    assert attribution["schema_version"] == "evaluation.latency_attribution_summary/v1"
+    assert attribution["task_count"] == 1
+    assert attribution["items"]["provider_latency"]["actual_seconds"] == 12.5
+    assert attribution["items"]["unattributed_time"]["status"] == "diagnostic"
+    assert attribution["critical_path_breakdown"] == [
+        {
+            "task_id": "task_1",
+            "component": "provider_latency",
+            "actual_seconds": 12.5,
+            "source": "trace.model_turns",
+            "kind": "model_provider",
+            "critical_path": True,
+            "status": "measured",
+            "notes": "",
+        }
+    ]
+    capability_script = Path("scripts/verify_capability.py").read_text(encoding="utf-8")
+    assert '"latency_attribution": latency_attribution' in capability_script
+    assert '"critical_path_breakdown": latency_attribution.get("critical_path_breakdown", [])' in capability_script
+    assert '"8_11_vs_current_timing": phase_8_11_vs_current_timing' in capability_script
+
+
 def test_capability_repeated_timing_compare_reports_min_median_current(tmp_path: Path) -> None:
     output_root = tmp_path / "work" / "evaluations"
     timings = [
@@ -454,6 +530,20 @@ def test_capability_repeated_timing_compare_reports_min_median_current(tmp_path:
                                     "agent_loop_time_seconds": agent_loop,
                                 },
                                 "unattributed_time_seconds": unattributed,
+                                "latency_attribution": {
+                                    "schema_version": "evaluation.latency_attribution/v1",
+                                    "items": {
+                                        "provider_latency": {
+                                            "component": "provider_latency",
+                                            "actual_seconds": provider,
+                                            "source": "trace.model_turns",
+                                            "kind": "model_provider",
+                                            "critical_path": True,
+                                            "status": "measured",
+                                            "notes": "",
+                                        }
+                                    },
+                                },
                                 "sandbox_breakdown": {
                                     "items": {
                                         "doctor_readiness": {
@@ -500,6 +590,11 @@ def test_capability_repeated_timing_compare_reports_min_median_current(tmp_path:
         "median": 30.0,
     }
     assert compare["metrics"]["sandbox_breakdown.command_runtime.actual_seconds"]["current"] == 1.0
+    assert compare["metrics"]["latency_attribution.provider_latency.actual_seconds"] == {
+        "current": 24.0,
+        "min": 20.0,
+        "median": 22.0,
+    }
 
 
 def test_capability_repeated_timing_compare_is_null_aware(tmp_path: Path) -> None:

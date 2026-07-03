@@ -496,11 +496,8 @@ class EvaluationRunner:
         if previous:
             payload["regression"] = compare_evaluation_results(previous, payload)
         result_path = self.run_dir / "result.json"
-        result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         report_path = self.run_dir / "report.json"
         markdown_path = self.run_dir / "report.md"
-        report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        markdown_path.write_text(evaluation_report_markdown(payload), encoding="utf-8")
         regression = payload.get("regression")
         regression_artifact_path: Path | None = None
         if isinstance(regression, dict):
@@ -523,7 +520,7 @@ class EvaluationRunner:
         failure_cases = FailureCaseReplayRunner(
             report_path=report_path,
             regression_path=regression_artifact_path,
-        ).write(failure_cases_path)
+        ).write(failure_cases_path, report_payload=payload)
         payload["failure_cases_path"] = str(failure_cases_path)
         payload["failure_case_count"] = len(failure_cases)
         payload["result_path"] = str(result_path)
@@ -2747,6 +2744,22 @@ def _build_capability_summary(
         max(0.0, wall_time_seconds - sum(wall_phases.values())),
         3,
     )
+    timing_payload = {
+        "wall_time_seconds": wall_time_seconds,
+        "provider_time_seconds": provider_seconds,
+        "sandbox_time_seconds": sandbox_seconds,
+        "context_retrieval_compaction_time_seconds": context_seconds,
+        "pytest_time_seconds": pytest_seconds,
+        "verification_time_seconds": verification_seconds,
+        **detailed_timing,
+    }
+    latency_attribution = _build_latency_attribution(
+        events=events,
+        timing=timing_payload,
+        wall_phases=wall_phases,
+        unattributed_time_seconds=unattributed_time,
+        evaluation_timing=evaluation_timing or {},
+    )
     return {
         "schema_version": "evaluation.capability_summary/v2",
         "model_turn_request_count": model_requests,
@@ -2775,17 +2788,278 @@ def _build_capability_summary(
         "sandbox_breakdown": _sandbox_breakdown(events),
         "wall_phases": wall_phases,
         "unattributed_time_seconds": unattributed_time,
-        "timing": {
-            "wall_time_seconds": wall_time_seconds,
-            "provider_time_seconds": provider_seconds,
-            "sandbox_time_seconds": sandbox_seconds,
-            "context_retrieval_compaction_time_seconds": context_seconds,
-            "pytest_time_seconds": pytest_seconds,
-            "verification_time_seconds": verification_seconds,
-            **detailed_timing,
-        },
+        "latency_attribution": latency_attribution,
+        "critical_path_breakdown": _critical_path_breakdown(latency_attribution, wall_phases=wall_phases),
+        "timing": timing_payload,
         "timing_diagnostics": timing_diagnostics,
     }
+
+
+def _build_latency_attribution(
+    *,
+    events: list[dict[str, Any]],
+    timing: dict[str, Any],
+    wall_phases: dict[str, float],
+    unattributed_time_seconds: float,
+    evaluation_timing: dict[str, Any],
+) -> dict[str, Any]:
+    provider_seconds = _safe_optional_timing(timing.get("provider_time_seconds"))
+    tool_seconds = _sum_optional_timings(
+        timing,
+        (
+            "edit_apply_total_time_seconds",
+            "command_runtime_time_seconds",
+            "process_spawn_time_seconds",
+            "output_collection_time_seconds",
+        ),
+    )
+    review_seconds = _safe_optional_timing(timing.get("edit_apply_review_time_seconds"))
+    finalization_seconds = _event_duration_total(
+        events,
+        (
+            "finalization.",
+            "final_report.",
+            "final_reviewer.",
+        ),
+    )
+    context_seconds = _sum_optional_timings(
+        timing,
+        (
+            "context_assembly_time_seconds",
+            "retrieval_time_seconds",
+            "compaction_decision_time_seconds",
+        ),
+    )
+    trace_audit_seconds = _event_duration_total(
+        events,
+        (
+            "trace.",
+            "audit.",
+        ),
+    )
+    artifact_seconds = _event_duration_total(
+        events,
+        (
+            "artifact.",
+            "report.write.",
+            "result.write.",
+        ),
+    )
+    artifact_seconds += _safe_optional_timing(evaluation_timing.get("artifact_writes_time_seconds"))
+    summary_seconds = _event_duration_total(
+        events,
+        (
+            "evaluation.summary.",
+            "summary.",
+            "report.render.",
+        ),
+    )
+    summary_seconds += _safe_optional_timing(evaluation_timing.get("summary_aggregation_time_seconds"))
+    sandbox_seconds = _safe_optional_timing(timing.get("sandbox_time_seconds"))
+    verification_seconds = _safe_optional_timing(timing.get("verification_time_seconds"))
+    dependency_seconds = _safe_optional_timing(timing.get("dependency_setup_time_seconds"))
+    workspace_seconds = _safe_optional_timing(timing.get("workspace_materialization_time_seconds"))
+    agent_loop_seconds = _safe_optional_timing(wall_phases.get("agent_loop_time_seconds"))
+
+    items = [
+        _latency_item(
+            "agent_loop",
+            agent_loop_seconds,
+            source="capability_summary.wall_phases",
+            kind="agent_loop",
+            status="measured" if agent_loop_seconds else "unavailable",
+            notes="wall phase; overlaps provider/tool/review components in critical path analysis",
+        ),
+        _latency_item(
+            "provider_latency",
+            provider_seconds,
+            source="trace.model_turns",
+            kind="model_provider",
+            status="measured" if provider_seconds else "unavailable",
+            notes="component attribution may overlap agent_loop wall phase",
+        ),
+        _latency_item(
+            "tool_execution_latency",
+            tool_seconds,
+            source="tool_trace",
+            kind="tool_execution",
+            status="measured" if tool_seconds else "unavailable",
+            notes="component attribution may overlap agent_loop wall phase",
+        ),
+        _latency_item(
+            "model_assisted_review_latency",
+            review_seconds,
+            source="review_trace",
+            kind="model_assisted_review",
+            status="measured" if review_seconds else "unavailable",
+            notes="Structured Outputs / tool calling review latency; diagnostic only; may overlap agent_loop wall phase",
+        ),
+        _latency_item(
+            "finalization_latency",
+            finalization_seconds,
+            source="trace.finalization",
+            kind="finalization",
+            status="measured" if finalization_seconds else "unavailable",
+            notes="component attribution may overlap agent_loop wall phase",
+        ),
+        _latency_item(
+            "context_assembly_latency",
+            context_seconds,
+            source="context_trace",
+            kind="context_assembly",
+            status="measured" if context_seconds else "unavailable",
+            notes="component attribution may overlap agent_loop wall phase",
+        ),
+        _latency_item(
+            "trace_audit_overhead",
+            trace_audit_seconds,
+            source="trace.audit_events",
+            kind="trace_audit",
+            status="measured" if trace_audit_seconds else "unavailable",
+        ),
+        _latency_item(
+            "artifact_writes",
+            artifact_seconds,
+            source="evaluation_runner.artifacts",
+            kind="artifact_write",
+            status="measured" if artifact_seconds else "unavailable",
+        ),
+        _latency_item(
+            "summary_aggregation",
+            summary_seconds,
+            source="evaluation_runner.summary",
+            kind="summary_aggregation",
+            status="measured" if summary_seconds else "unavailable",
+        ),
+        _latency_item(
+            "sandbox",
+            sandbox_seconds,
+            source="sandbox_trace",
+            kind="sandbox_execution",
+            status="measured" if sandbox_seconds else "unavailable",
+        ),
+        _latency_item(
+            "verification",
+            verification_seconds,
+            source="evaluation_runner.verification",
+            kind="verification",
+            status="measured" if verification_seconds else "unavailable",
+        ),
+        _latency_item(
+            "dependency_setup",
+            dependency_seconds,
+            source="evaluation_runner.dependency_setup",
+            kind="dependency_setup",
+            status="measured" if dependency_seconds else "unavailable",
+        ),
+        _latency_item(
+            "workspace_materialization",
+            workspace_seconds,
+            source="evaluation_runner.workspace",
+            kind="workspace_materialization",
+            status="measured" if workspace_seconds else "unavailable",
+        ),
+        _latency_item(
+            "unattributed_time",
+            unattributed_time_seconds,
+            source="capability_summary.unattributed_time_seconds",
+            kind="timing_gap",
+            status="diagnostic",
+            notes="diagnostic only; does not affect evaluation_passed",
+        ),
+    ]
+    positive_items = [item for item in items if item["actual_seconds"] > 0]
+    top_components = {
+        item["component"]
+        for item in sorted(
+            positive_items,
+            key=lambda item: float(item["actual_seconds"]),
+            reverse=True,
+        )[:5]
+    }
+    safe_items = {}
+    for item in items:
+        item["critical_path"] = bool(item["component"] in top_components)
+        safe_items[item["component"]] = item
+    return {
+        "schema_version": "evaluation.latency_attribution/v1",
+        "items": safe_items,
+        "total_accounted_seconds": round(sum(item["actual_seconds"] for item in safe_items.values()), 3),
+        "notes": "diagnostic-only latency attribution for critical path analysis, repeated-run timing comparison, and performance regression analysis; component seconds are not a mutually exclusive sum",
+    }
+
+
+def _latency_item(
+    component: str,
+    actual_seconds: float,
+    *,
+    source: str,
+    kind: str,
+    status: str,
+    notes: str = "",
+) -> dict[str, Any]:
+    return {
+        "component": component,
+        "actual_seconds": round(max(0.0, float(actual_seconds)), 3),
+        "source": source,
+        "kind": kind,
+        "critical_path": False,
+        "status": status,
+        "notes": notes,
+    }
+
+
+def _critical_path_breakdown(
+    latency_attribution: dict[str, Any],
+    *,
+    wall_phases: dict[str, float],
+) -> list[dict[str, Any]]:
+    items = latency_attribution.get("items") if isinstance(latency_attribution, dict) else {}
+    rows: list[dict[str, Any]] = []
+    if isinstance(items, dict):
+        rows.extend(
+            dict(item)
+            for item in items.values()
+            if isinstance(item, dict) and float(item.get("actual_seconds") or 0.0) > 0.0
+        )
+    for name, value in wall_phases.items():
+        if name == "agent_loop_time_seconds":
+            continue
+        if not isinstance(value, int | float) or float(value) <= 0.0:
+            continue
+        rows.append(
+            _latency_item(
+                name.removesuffix("_time_seconds"),
+                float(value),
+                source="capability_summary.wall_phases",
+                kind="wall_phase",
+                status="measured",
+            )
+        )
+    sorted_rows = sorted(
+        rows,
+        key=lambda item: float(item.get("actual_seconds") or 0.0),
+        reverse=True,
+    )
+    return sorted_rows[:12]
+
+
+def _sum_optional_timings(values: dict[str, Any], names: tuple[str, ...]) -> float:
+    return round(sum(_safe_optional_timing(values.get(name)) for name in names), 3)
+
+
+def _safe_optional_timing(value: Any) -> float:
+    return round(float(value), 3) if isinstance(value, int | float) else 0.0
+
+
+def _event_duration_total(events: list[dict[str, Any]], prefixes: tuple[str, ...]) -> float:
+    total = 0.0
+    for event in events:
+        event_type = _event_type(event)
+        if not event_type.startswith(prefixes):
+            continue
+        total += _duration_seconds_from_payload(_event_payload(event))
+    return round(total, 3)
 
 
 _CAPABILITY_SLA_THRESHOLDS_SECONDS = {

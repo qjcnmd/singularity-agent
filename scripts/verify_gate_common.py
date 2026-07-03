@@ -215,6 +215,82 @@ def capability_sla_from_result(result_path: Path) -> dict[str, Any]:
     return result
 
 
+def capability_latency_attribution_from_result(result_path: Path) -> dict[str, Any]:
+    if not result_path.exists():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    aggregated: dict[str, dict[str, Any]] = {}
+    critical_path: list[dict[str, Any]] = []
+    task_count = 0
+    for task in payload.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id") or "")
+        capability = task.get("capability_summary") or {}
+        if not isinstance(capability, dict):
+            continue
+        attribution = capability.get("latency_attribution") or {}
+        if isinstance(attribution, dict):
+            items = attribution.get("items") if isinstance(attribution.get("items"), dict) else {}
+            if items:
+                task_count += 1
+            for name, item in items.items():
+                if not isinstance(item, dict):
+                    continue
+                component = str(item.get("component") or name)
+                actual = item.get("actual_seconds")
+                target = aggregated.setdefault(
+                    component,
+                    {
+                        "component": component,
+                        "actual_seconds": 0.0,
+                        "source": str(item.get("source") or ""),
+                        "kind": str(item.get("kind") or ""),
+                        "critical_path": False,
+                        "status": str(item.get("status") or ""),
+                        "notes": str(item.get("notes") or ""),
+                    },
+                )
+                if isinstance(actual, int | float):
+                    target["actual_seconds"] = round(float(target["actual_seconds"]) + float(actual), 3)
+                target["critical_path"] = bool(target.get("critical_path") or item.get("critical_path"))
+                if not target["status"] and item.get("status"):
+                    target["status"] = str(item.get("status") or "")
+                if not target["notes"] and item.get("notes"):
+                    target["notes"] = str(item.get("notes") or "")
+        task_breakdown = capability.get("critical_path_breakdown") or []
+        for item in task_breakdown:
+            if not isinstance(item, dict):
+                continue
+            critical_path.append(
+                {
+                    "task_id": task_id,
+                    "component": str(item.get("component") or ""),
+                    "actual_seconds": _safe_optional_float(item.get("actual_seconds")),
+                    "source": str(item.get("source") or ""),
+                    "kind": str(item.get("kind") or ""),
+                    "critical_path": bool(item.get("critical_path")),
+                    "status": str(item.get("status") or ""),
+                    "notes": str(item.get("notes") or ""),
+                }
+            )
+    return {
+        "schema_version": "evaluation.latency_attribution_summary/v1",
+        "status": "available" if aggregated else "unavailable",
+        "task_count": task_count,
+        "items": dict(sorted(aggregated.items())),
+        "critical_path_breakdown": sorted(
+            critical_path,
+            key=lambda item: float(item.get("actual_seconds") or 0.0),
+            reverse=True,
+        )[:12],
+        "blocking": False,
+    }
+
+
 _SLA_ITEM_TO_TIMING_METRIC = {
     "wall": "wall_time_seconds",
     "agent_loop": "agent_loop_time_seconds",
@@ -408,6 +484,15 @@ def _capability_timing_record(result_path: Path) -> dict[str, Any]:
             value = item.get("actual_seconds")
             if isinstance(value, int | float):
                 metrics[f"sandbox_breakdown.{name}.actual_seconds"] = round(float(value), 3)
+    attribution = capability.get("latency_attribution") if isinstance(capability, dict) else {}
+    if isinstance(attribution, dict):
+        items = attribution.get("items") if isinstance(attribution.get("items"), dict) else {}
+        for name, item in items.items():
+            if not isinstance(item, dict):
+                continue
+            value = item.get("actual_seconds")
+            if isinstance(value, int | float):
+                metrics[f"latency_attribution.{name}.actual_seconds"] = round(float(value), 3)
     return {
         "task_id": str(task.get("task_id") or ""),
         "start_commit": str(workspace.get("start_commit") or ""),

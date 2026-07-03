@@ -20,8 +20,13 @@ class FailureCaseReplayRunner:
         self.report_path = Path(report_path)
         self.regression_path = Path(regression_path) if regression_path else None
 
-    def extract(self, *, task_id: str | None = None) -> list[FailureCaseRecord]:
-        report = json.loads(self.report_path.read_text(encoding="utf-8"))
+    def extract(
+        self,
+        *,
+        task_id: str | None = None,
+        report_payload: dict[str, Any] | None = None,
+    ) -> list[FailureCaseRecord]:
+        report = report_payload if report_payload is not None else json.loads(self.report_path.read_text(encoding="utf-8"))
         tasks = report.get("tasks") or []
         records: list[FailureCaseRecord] = []
         for task in tasks:
@@ -34,8 +39,14 @@ class FailureCaseReplayRunner:
             records.append(self._record_from_task(task))
         return records
 
-    def write(self, output_path: Path | str, *, task_id: str | None = None) -> list[FailureCaseRecord]:
-        records = self.extract(task_id=task_id)
+    def write(
+        self,
+        output_path: Path | str,
+        *,
+        task_id: str | None = None,
+        report_payload: dict[str, Any] | None = None,
+    ) -> list[FailureCaseRecord]:
+        records = self.extract(task_id=task_id, report_payload=report_payload)
         payload = {
             "schema_version": FAILURE_CASE_REPLAY_SCHEMA_VERSION,
             "runner_mode": "post_run_failure_extraction",
