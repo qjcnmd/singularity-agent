@@ -26,6 +26,7 @@ from tests.conftest import (
     _SLOW_TEST_IDS,
     _SMOKE_FILE_STEMS,
     _SMOKE_TEST_IDS,
+    _is_full_suite_collection,
 )
 
 # ---------------------------------------------------------------------------
@@ -37,7 +38,7 @@ _FULL_SUITE_THRESHOLD = 100  # minimum items to consider collection complete
 
 def _is_full_collection(request: pytest.FixtureRequest) -> bool:
     """Check if the current collection represents the full test suite."""
-    return len(request.session.items) >= _FULL_SUITE_THRESHOLD
+    return _is_full_suite_collection(request.config, list(request.session.items))
 
 
 def _collect_nodeids_and_stems(request: pytest.FixtureRequest):
@@ -159,6 +160,37 @@ class TestCuratedListIntegrity:
         missing = _EXTERNAL_FILE_STEMS - stems
         assert not missing, (
             f"External file stems not found in collection: {sorted(missing)}"
+        )
+
+    def test_large_single_file_collection_is_not_full_suite(
+        self,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        if len(request.session.items) < _FULL_SUITE_THRESHOLD:
+            pytest.skip("Requires a large collected file")
+
+        stems = {Path(item.fspath).stem for item in request.session.items}
+        if len(stems) != 1:
+            pytest.skip("Only exercises single-file subset collections")
+
+        assert not _is_full_suite_collection(request.config, list(request.session.items))
+
+    def test_windows_sandbox_backend_file_is_not_implicitly_external(
+        self,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        selected = [
+            item
+            for item in request.session.items
+            if Path(item.fspath).stem == "test_sandbox_backend_windows"
+        ]
+        if not selected:
+            pytest.skip("Windows sandbox backend tests not collected")
+
+        external = [item.nodeid for item in selected if "external" in {m.name for m in item.iter_markers()}]
+        assert not external, (
+            "Windows sandbox backend contract tests should not be excluded "
+            f"as external by file/name heuristics: {external[:5]}"
         )
 
 
@@ -358,9 +390,9 @@ class TestMarkerCounts:
     # Expected counts (approximate, used for soft validation).
     # Lists filtered by default addopts have expected count 0.
     _EXPECTED: ClassVar[dict[str, int]] = {
-        "smoke": 26,
+        "smoke": 27,
         "unit": 260,
-        "integration": 589,
+        "integration": 762,
         "regression": 68,
         "security": 54,
         "flaky": 4,

@@ -32,6 +32,15 @@ _KNOWN_MARKERS: set[str] = {
     "flaky",
 }
 
+_FUNCTIONAL_MARKERS: set[str] = {
+    "unit",
+    "integration",
+    "regression",
+    "security",
+    "evaluation",
+    "provider_eval",
+}
+
 
 # ---------------------------------------------------------------------------
 # Smoke suite: curated tests that cover core paths in <30 seconds.
@@ -108,9 +117,7 @@ _SLOW_TEST_IDS: set[str] = {
 # External-dependency tests: require OS sandbox/git/network but are fast when
 # available. Separated from "slow" to avoid misleading duration expectations.
 # ---------------------------------------------------------------------------
-_EXTERNAL_FILE_KEYWORDS: tuple[str, ...] = (
-    "sandbox_backend_windows",
-)
+_EXTERNAL_FILE_KEYWORDS: tuple[str, ...] = ()
 
 # Files whose tests all require real git subprocess calls.
 _EXTERNAL_FILE_STEMS: set[str] = {
@@ -121,9 +128,7 @@ _EXTERNAL_FILE_STEMS: set[str] = {
 }
 
 # Explicit test name keywords that indicate external dependency.
-_EXTERNAL_TEST_KEYWORDS: tuple[str, ...] = (
-    "backend_windows",
-)
+_EXTERNAL_TEST_KEYWORDS: tuple[str, ...] = ()
 
 # ---------------------------------------------------------------------------
 # Integration-dense files: tests that wire real subsystems together but are
@@ -195,9 +200,7 @@ def _validate_curated_lists(
     collected_nodeids = {item.nodeid for item in items}
     collected_stems = {Path(item.fspath).stem for item in items}
 
-    # Only check nodeid-based lists if the collection is large enough
-    # to represent the full suite (at least 100 tests).
-    is_full_collection = len(items) >= 100
+    is_full_collection = _is_full_suite_collection(config, items)
 
     if is_full_collection:
         for label, id_set in [
@@ -264,12 +267,6 @@ def _validate_curated_lists(
             )
 
     # --- Slow/external tests must have non-unit functional classification ---
-    # Functional markers (mutually exclusive): unit, integration, regression,
-    # security, evaluation, provider_eval.
-    _FUNCTIONAL_MARKERS = {
-        "unit", "integration", "regression", "security",
-        "evaluation", "provider_eval",
-    }
     for item in items:
         item_markers = {m.name for m in item.iter_markers()}
         is_slow_or_external = ("slow" in item_markers or "external" in item_markers)
@@ -362,6 +359,47 @@ def _module_imports_integration_indicators(item: pytest.Item) -> bool:
     return bool(module_names & _EXTERNAL_WIRING_SYMBOLS)
 
 
+def _is_full_suite_collection(config: pytest.Config, items: list[pytest.Item]) -> bool:
+    """Return true only for broad suite collections, not targeted subsets."""
+    if len(items) < 100:
+        return False
+
+    args = tuple(str(arg) for arg in getattr(config, "args", ()) or ())
+    if not args:
+        return True
+
+    root = Path(getattr(config, "rootpath", Path.cwd())).resolve()
+    tests_root = Path(__file__).resolve().parent
+    return all(
+        not _is_targeted_collection_arg(arg, root=root, tests_root=tests_root)
+        for arg in args
+    )
+
+
+def _is_targeted_collection_arg(arg: str, *, root: Path, tests_root: Path) -> bool:
+    target = arg.split("::", 1)[0]
+    if not target or target.startswith("-"):
+        return False
+
+    path = Path(target)
+    if not path.is_absolute():
+        path = root / path
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+
+    if resolved in {root, tests_root.resolve()}:
+        return False
+
+    try:
+        resolved.relative_to(tests_root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Apply markers to tests based on file path, test name, and curated lists.
 
@@ -411,9 +449,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             _add_marker(item, "external")
 
         # --- If the test has an explicit functional marker, stop here ---
-        # provider_eval is always respected; other explicit markers mean
-        # the developer already chose a category.
-        if explicit - {"smoke", "flaky", "slow", "external"}:
+        # pytest control markers such as parametrize do not choose a
+        # functional category, so slow/external tests still need fallback
+        # classification.
+        if explicit & _FUNCTIONAL_MARKERS:
             continue
 
         # --- Auto-classify by file path / test name ---

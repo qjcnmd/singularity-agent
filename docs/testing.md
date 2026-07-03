@@ -11,15 +11,15 @@ Singularity 测试体系按 pytest marker 分为以下层级。
 
 | Marker | 测试数 | 分类 | 说明 | 默认是否运行 |
 |--------|--------|------|------|-------------|
-| `smoke` | 25 | 运行属性 | 核心路径烟雾测试，覆盖 CLI/Context/Planner/Policy/Tool/Verification | ❌ 显式运行 |
+| `smoke` | 27 | 运行属性 | 核心路径烟雾测试，覆盖 CLI/Context/Planner/Policy/Tool/Verification | ❌ 显式运行 |
 | `unit` | ~260 | 功能分类 | 纯函数/类测试，最小化跨组件依赖 | ✅ |
-| `integration` | ~589 | 功能分类 | 多组件集成测试（agent simulation、component wiring、subprocess、threading、真实 git） | ✅ |
+| `integration` | ~762 | 功能分类 | 多组件集成测试（agent simulation、component wiring、subprocess、threading、真实 git） | ✅ |
 | `regression` | 68 | 功能分类 | 生产基线、文档一致性、schema 稳定性守卫 | ✅ |
 | `security` | 54 | 功能分类 | 信任边界、脱敏、注入、密钥安全测试 | ✅ |
 | `flaky` | 4 | 运行属性 | 已知偶发失败测试（默认仍运行，见下方处理策略） | ✅ |
 | `evaluation` | 58 | 功能分类 | 评估基础设施：评分、回放、benchmark harness | ❌ 显式运行 |
 | `slow` | ~25 | 运行属性 | 真正慢的测试（>3s），agent loop 模拟/并发 | ❌ 显式运行 |
-| `external` | ~22 | 运行属性 | 依赖外部资源或平台能力（git/network/Windows OS sandbox APIs），实际通常较快 | ❌ 显式运行 |
+| `external` | ~14 | 运行属性 | 依赖外部资源或平台能力（git/network/真实 OS sandbox setup），实际通常较快 | ❌ 显式运行 |
 | `provider_eval` | 1 | 运行属性 | 需真实模型 provider 的烟雾测试 | ❌ 显式运行 |
 
 > **注意**：数量会随重分类调整而变化。以实际 `python -m pytest --co -q` 为准。
@@ -30,11 +30,11 @@ Singularity 测试体系按 pytest marker 分为以下层级。
 
 1. **显式 `@pytest.mark.X`**：开发者手动指定，绝对优先。
 2. **`tests/evaluation/` 目录**：硬约定 → `evaluation`。
-3. **精选列表**（`_SMOKE_TEST_IDS`、`_FLAKY_TEST_IDS`、`_SLOW_TEST_IDS`、`_EXTERNAL_*`）：手动维护。
+3. **精选列表**（`_SMOKE_TEST_IDS`、`_FLAKY_TEST_IDS`、`_SLOW_TEST_IDS`、`_EXTERNAL_FILE_STEMS`）：手动维护。
 4. **关键字推断**：`security/redaction/secret/injection` → `security`；`production/docs_consistency/runtime_docs/runtime_sqlite/singularity_identity` → `regression`；`code_index/diagnostics/edit/interaction/memory/plugins/review/` 子目录 或 文件名含 `integration` → `integration`。
 5. **`_INTEGRATION_FILE_STEMS` 精选列表**：手动维护的 35 个集成密集型文件茎。
 6. **导入特征推断**（`_module_imports_integration_indicators`）：自动检测模块是否 `import subprocess`、`multiprocessing`、`threading`、或使用了 `make_agent_session`/`AgentLoop`/`DockerSandboxBackend` 等集成符号 → `integration`。
-7. **slow/external 后修正**：如果测试已有 `slow`/`external` 标记，绝不落入 `unit`。
+7. **slow/external 后修正**：如果测试已有 `slow`/`external` 标记，且没有显式功能分类，则落入 `integration` 而不是 `unit`。
 8. **其余** → `unit`。
 
 ### 新增测试文件注意事项
@@ -238,15 +238,14 @@ Slow 测试主要是 agent loop 多轮模拟（3-8s）和并发测试。日常�
 python -m pytest -m external -v
 ```
 
-External 测试依赖 git、network 或Windows OS sandbox能力。本地与CI都必须按实际平台能力运行；backend capability/setup缺失时应断言`backend_unavailable`，不能改用普通本地进程获得通过。
+External 测试依赖 git、network 或真实 Windows OS sandbox setup。本地与 CI 都必须按实际平台能力运行；backend capability/setup 缺失时应断言 `backend_unavailable`，不能改用普通本地进程获得通过。大多数 Windows sandbox contract tests 使用 monkeypatch/fake-ready backend 验证 fail-closed 边界，默认测试会运行；只有真正依赖外部平台资源的测试才应显式标记 `external`。
 
 `tests/evaluation/test_targeted_failure_replay.py` 需要可用的 OS sandbox 才能完成真实 verification/repair 回放，因此同时标记为 `evaluation` 和 `external`。sandbox 未完成 setup 时测试必须明确 `skip` 并保留 `sandbox backend unavailable` 原因，不能切换到普通本地进程或伪造完成。
 
 Windows sandbox定向验证：
 
 ```bash
-python -m pytest -m external tests/test_sandbox_backend_windows.py -v
-python -m pytest tests/test_sandbox_backend_windows.py -m "" -v
+python -m pytest tests/test_sandbox_backend_windows.py -v
 python -m pytest tests -k sandbox -m "not evaluation and not provider_eval and not slow" -v
 ```
 
