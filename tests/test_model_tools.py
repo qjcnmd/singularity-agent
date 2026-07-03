@@ -97,6 +97,35 @@ def test_tool_call_normalizer_coerces_json_string_for_list_fields_only(tmp_path:
     }
 
 
+def test_tool_renderer_to_provider_tools_keeps_openai_shape(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="rendered_tool",
+            version="test",
+            description="rendered tool",
+            input_model=ListInput,
+            handler=lambda _args: {},
+        )
+    )
+    renderer = ModelToolRenderer(registry)
+
+    provider_tools = renderer.to_provider_tools(renderer.render(strict=True), strict=True)
+
+    assert provider_tools == [
+        {
+            "type": "function",
+            "function": {
+                "name": "rendered_tool",
+                "description": "rendered tool",
+                "parameters": provider_tools[0]["function"]["parameters"],
+                "strict": True,
+            },
+        }
+    ]
+    assert provider_tools[0]["function"]["parameters"]["additionalProperties"] is False
+
+
 def test_empty_allowed_tool_list_exposes_no_tools(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path)
     renderer = ModelToolRenderer(registry)

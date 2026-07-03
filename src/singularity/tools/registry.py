@@ -97,24 +97,44 @@ class ToolRegistry:
         ]
 
     def to_openai_tools(self, *, strict: bool = False) -> builtins.list[dict[str, Any]]:
-        tools: builtins.list[dict[str, Any]] = []
-        for spec in self.list_model_visible():
-            parameters = spec.input_model.model_json_schema()
-            function: dict[str, Any] = {
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": self._parameters_schema(parameters, strict=strict),
-            }
-            if strict:
-                function["strict"] = True
-            tools.append({"type": "function", "function": function})
-        return tools
+        from singularity.model.openai_format import tool_schema_to_openai
+
+        return [
+            tool_schema_to_openai(tool, strict=strict)
+            for tool in self.schema_export(strict=strict)
+        ]
 
     def openai_tools(self, *, strict: bool = False) -> builtins.list[dict[str, Any]]:
         return self.to_openai_tools(strict=strict)
 
     def schema_export(self, *, strict: bool = False) -> builtins.list[dict[str, Any]]:
-        return self.to_openai_tools(strict=strict)
+        exports: builtins.list[dict[str, Any]] = []
+        for record in self.list_records(include_disabled=False, admitted_only=True):
+            spec = record.spec
+            exports.append(
+                {
+                    "name": spec.name,
+                    "version": spec.version,
+                    "description": spec.description,
+                    "input_schema": self._parameters_schema(
+                        spec.input_model.model_json_schema(), strict=strict
+                    ),
+                    "permission_level": spec.permission_level.value,
+                    "side_effects": spec.side_effects.value if spec.side_effects else None,
+                    "capabilities": [capability.value for capability in spec.capabilities],
+                    "operation": spec.operation.value if spec.operation else None,
+                    "cache_policy": spec.cache_policy.model_dump(mode="json")
+                    if spec.cache_policy
+                    else None,
+                    "idempotency_policy": spec.idempotency_policy.model_dump(mode="json")
+                    if spec.idempotency_policy
+                    else None,
+                    "retry_policy": spec.retry_policy.model_dump(mode="json"),
+                    "execution_backend": spec.execution_backend.value,
+                    "origin": self._origin_export(record.origin),
+                }
+            )
+        return exports
 
     def dispatch(self, tool_call: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(
@@ -166,6 +186,15 @@ class ToolRegistry:
         if strict:
             _forbid_additional_properties(parameters)
         return parameters
+
+    @staticmethod
+    def _origin_export(origin: ToolOrigin) -> dict[str, Any]:
+        exported: dict[str, Any] = {"kind": origin.kind.value}
+        if origin.plugin_id:
+            exported["plugin_id"] = origin.plugin_id
+        if origin.exposed_name:
+            exported["exposed_name"] = origin.exposed_name
+        return exported
 
     @staticmethod
     def _validate_spec(spec: ToolSpec) -> None:

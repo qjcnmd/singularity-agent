@@ -152,7 +152,7 @@ class PluginDiagnosticSeverity(str, Enum): # PluginDiagnostic.severity
 
 - discovery/check/loader、`PluginManager._policy_gate()` 和 permission admission 消费 `PluginManifest`、`DiscoveredPlugin`、`PluginStatus` 与 diagnostics；`PluginManager.activate()` 消费 `PluginLoadResult` 和 `PluginContributionSet.tools`。
 - `_admit_tool_contribution()` 校验 `PluginToolContribution` 的 identity、声明/批准权限、schema、risk tags 与 approval profile；通过后 `ToolRegistry.register()` 消费其 `spec`，并由 `_tool_origin()` 生成内部 provenance。
-- plugin 对象不直接进入模型请求。只有 admitted `ToolSpec` 经 `ToolRegistry.openai_tools()` 投影出的 name、description、parameters schema 进入 provider；manifest、status、permissions、origin、diagnostics 与非 tool contribution 均保持内部数据。
+- plugin 对象不直接进入模型请求。只有 admitted `ToolSpec` 经 `ToolRegistry.openai_tools()` 投影出的 name、description、parameters schema 进入 provider；manifest、status、permissions、diagnostics 与非 tool contribution 均保持内部数据。`ToolRegistry.schema_export()` 若导出插件来源，也只导出最小白名单 provenance（kind、plugin_id、exposed_name），不导出 source_path、manifest_hash、permission 列表、activation_hash 或 schema_digest。
 
 ## 是否落盘
 

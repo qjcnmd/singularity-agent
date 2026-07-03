@@ -7,6 +7,7 @@
 - src/singularity/tools/registry.py
 - src/singularity/tools/router.py
 - src/singularity/model/tools.py
+- src/singularity/model/openai_format.py
 
 关键符号:
 - ToolSpec
@@ -15,6 +16,7 @@
 - RegisteredToolRecord
 - ToolOrigin
 - ToolRegistry
+- tool_schema_to_openai
 
 字段清单:
 - ToolSpec: name, version, description, input_model, output_model, handler, permission_level, risk_tags, timeout_seconds, max_output_chars, cacheable, idempotent, uses_edit_executor, uses_mutation_manager, uses_command_executor, delegates_policy_constraints, capabilities, operation, resource_resolver, side_effects, sensitivity, cache_policy, idempotency_policy, retry_policy, execution_backend, approval_profile, artifact_policy, streamable, enabled
@@ -28,7 +30,7 @@
 
 ## 这一层解决什么问题
 
-工具注册层把内置工具和插件工具统一为 `ToolSpec（工具规格）`，再投影成 provider 可见的工具 schema。
+工具注册层把内置工具和插件工具统一为 `ToolSpec（工具规格）`，先导出 provider-neutral 工具 schema，再由模型/provider 格式层投影成当前 OpenAI-compatible provider 可见的工具 schema。
 
 ## 当前源码位置
 
@@ -36,6 +38,7 @@
 - src/singularity/tools/registry.py
 - src/singularity/tools/router.py
 - src/singularity/model/tools.py
+- src/singularity/model/openai_format.py
 
 ## 关键类、函数、字段
 
@@ -43,11 +46,11 @@
 
 ## 真实运行时调用链
 
-`AgentGraphBuilder._build_tools_protocol()` 创建 `ToolRegistry` -> 注册 mutation/edit/command/workspace/code-index/verification/plugin tools -> `AgentLoop` 调用 `tools.openai_tools()` 生成模型可见 schema。
+`AgentGraphBuilder._build_tools_protocol()` 创建 `ToolRegistry` -> 注册 mutation/edit/command/workspace/code-index/verification/plugin tools -> `AgentLoop` 调用 `tools.openai_tools()` 生成模型可见 OpenAI-compatible schema。`ToolRegistry.schema_export()` 是 provider-neutral 导出，不是 provider payload。
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`AgentGraphBuilder._build_tools_protocol()` -> `ToolRegistry.register()` -> `ToolRegistry.list_model_visible()` / `to_openai_tools()` -> `ModelToolRenderer.render()` 先注册内置 read/edit/command/verification/workspace 工具，为每个 `ToolSpec` 生成对象 `RegisteredToolRecord` 和 `ToolOrigin`，再把 admitted/enabled spec 投影成 provider tool schema。插件工具经过 `PluginManager.activate()` 后也以同一入口注册；registry 本体不写 sqlite/jsonl，执行阶段才由 tool protocol 写 `tool_protocol.sqlite3`。重复名、冻结后注册、非法 backend 或 schema 校验失败会抛错或产生 diagnostic，工具不会暴露给模型。
+以用户要求修复 `quicksort.py` 为例：`AgentGraphBuilder._build_tools_protocol()` -> `ToolRegistry.register()` -> `ToolRegistry.list_model_visible()` / `schema_export()` / `to_openai_tools()` -> `ModelToolRenderer.render()` 先注册内置 read/edit/command/verification/workspace 工具，为每个 `ToolSpec` 生成对象 `RegisteredToolRecord` 和 `ToolOrigin`。`schema_export()` 只导出 admitted/enabled 工具的中立描述：name、version、description、input_schema、permission_level、side_effects、capabilities、operation、cache_policy、idempotency_policy、retry_policy、execution_backend、origin；不包含 OpenAI 顶层 `type="function"`、`function` 或 `parameters` 包装，也不包含 handler、resource_resolver、record metadata 或 policy 对象。当前 OpenAI-compatible 入口 `to_openai_tools()` 读取中立 schema 后调用 `tool_schema_to_openai()`，只把 name、description、input_schema 投影为 provider tool schema。插件工具经过 `PluginManager.activate()` 后也以同一入口注册；registry 本体不写 sqlite/jsonl，执行阶段才由 tool protocol 写 `tool_protocol.sqlite3`。重复名、冻结后注册、非法 backend 或 schema 校验失败会抛错或产生 diagnostic，工具不会暴露给模型。
 ## 真实对象完整结构
 
 ### ToolSpec（工具规格）
@@ -157,7 +160,7 @@ class ToolOriginKind(str, Enum):     # ToolOrigin.kind
 
 ### 数据流概述
 
-各 `register_*` 函数或 `PluginHost.register_tool()` 生成 `ToolSpec`，`ToolRegistry.register()` 生成 `ToolOrigin` 和 `RegisteredToolRecord`。`ToolRegistry.openai_tools()` / `ModelToolRenderer.render()` 只投影 name、description、parameters_schema 进入 `ModelToolSchema`，不暴露 handler、permission、risk、origin 等内部字段。执行阶段 `ToolExecutionRequest.from_envelope()` 从 `ToolCallEnvelope` 生成 request，handler 返回 `ToolResult`，再投影为 `ToolProtocolResultEnvelope`。
+各 `register_*` 函数或 `PluginHost.register_tool()` 生成 `ToolSpec`，`ToolRegistry.register()` 生成 `ToolOrigin` 和 `RegisteredToolRecord`。`ToolRegistry.schema_export()` 导出 provider-neutral schema，保留 permission、side_effect、capabilities、operation、cache/idempotency/retry policy、execution_backend 和 origin 供内部控制面/契约检查使用，但不作为模型请求直接发送。`ToolRegistry.openai_tools()` 通过 `tool_schema_to_openai()` 只把 name、description、input_schema 投影为 OpenAI-compatible `type/function/parameters/strict`；`ModelToolRenderer.render()` 只投影 name、description、parameters_schema 进入 `ModelToolSchema`。handler、resource_resolver、record metadata 和 policy 对象不会进入 provider。执行阶段 `ToolExecutionRequest.from_envelope()` 从 `ToolCallEnvelope` 生成 request，handler 返回 `ToolResult`，再投影为 `ToolProtocolResultEnvelope`。
 
 ## 谁生成这些对象
 
@@ -165,7 +168,7 @@ class ToolOriginKind(str, Enum):     # ToolOrigin.kind
 
 ## 谁消费这些对象
 
-registry/router/renderer/executor消费spec/record/request。provider只看到`ToolRegistry.openai_tools()`/`ModelToolRenderer`投影的name、description、input schema；origin、permission、risk、handler与policy对象不发送。ToolProtocol将安全`ToolResult`投影回下一轮模型。
+registry/router/renderer/executor消费spec/record/request。provider只看到`ToolRegistry.openai_tools()`/`ModelToolRenderer`经模型格式层投影的name、description、input schema和strict标志；`schema_export()`中的origin、permission、capabilities、backend、cache/idempotency/retry policy、handler、resource_resolver与policy对象不发送。ToolProtocol将安全`ToolResult`投影回下一轮模型。
 
 ## 是否落盘
 
@@ -181,7 +184,7 @@ registry冻结后注册、重复名、非法write/shell backend或schema会抛�
 
 ## 当前结构问题
 
-内部ToolSpec明显宽于provider schema；插件provenance必须留在RegisteredToolRecord，不能为模型解释而加alias字段或把metadata暴露到parameters。
+内部ToolSpec和`schema_export()`明显宽于provider schema；插件provenance必须留在RegisteredToolRecord或中立控制面导出，不能为模型解释而加alias字段或把metadata暴露到provider parameters。
 
 ## 维护规则
 

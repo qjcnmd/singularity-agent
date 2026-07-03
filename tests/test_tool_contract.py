@@ -12,6 +12,8 @@ from singularity.tools import (
     ToolExecutionBackendKind,
     ToolExecutor,
     ToolIdempotencyPolicy,
+    ToolOrigin,
+    ToolOriginKind,
     ToolOutputEnvelope,
     ToolRegistry,
     ToolRetryPolicy,
@@ -132,11 +134,172 @@ def test_strict_schema_export_recursively_forbids_extra_properties(tmp_path: Pat
         )
     )
 
-    schema = registry.to_openai_tools(strict=True)[0]["function"]["parameters"]
+    schema = registry.schema_export(strict=True)[0]["input_schema"]
 
     assert schema["additionalProperties"] is False
     nested_schema = schema["$defs"]["Nested"]
     assert nested_schema["additionalProperties"] is False
+
+
+def test_schema_export_is_provider_neutral(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="neutral",
+            version="1.2.3",
+            description="Neutral schema.",
+            input_model=StrictInput,
+            handler=lambda args: {"value": args.value},
+            permission_level=PermissionLevel.READ_ONLY,
+            cache_policy=ToolCachePolicy(cacheable=True, ttl_seconds=5),
+            idempotency_policy=ToolIdempotencyPolicy(idempotent=True),
+        )
+    )
+
+    exported = registry.schema_export(strict=True)
+
+    assert len(exported) == 1
+    tool = exported[0]
+    assert tool["name"] == "neutral"
+    assert tool["description"] == "Neutral schema."
+    assert tool["input_schema"]["additionalProperties"] is False
+    assert tool["permission_level"] == "read_only"
+    assert tool["side_effects"] == "read_workspace"
+    assert tool["cache_policy"]["cacheable"] is True
+    assert tool["idempotency_policy"]["idempotent"] is True
+    assert tool["origin"]["kind"] == "builtin"
+    assert "type" not in tool
+    assert "function" not in tool
+    assert "parameters" not in tool
+
+
+def test_schema_export_origin_uses_minimal_safe_projection(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="plugin_tool",
+            description="Plugin tool.",
+            input_model=StrictInput,
+            handler=lambda args: {"value": args.value},
+        ),
+        origin=ToolOrigin(
+            kind=ToolOriginKind.PLUGIN,
+            plugin_id="sample_plugin",
+            local_tool_name="local",
+            exposed_name="sample_plugin__local",
+            manifest_hash="manifest-hash",
+            source_path=str(tmp_path / ".singularity" / "plugins" / "sample_plugin"),
+            required_permissions=("read_workspace",),
+            approved_permissions=("read_workspace",),
+            activation_hash="activation-hash",
+            schema_digest="schema-digest",
+        ),
+    )
+
+    origin = registry.schema_export()[0]["origin"]
+
+    assert origin == {
+        "kind": "plugin",
+        "plugin_id": "sample_plugin",
+        "exposed_name": "sample_plugin__local",
+    }
+
+
+def test_schema_export_filters_non_model_visible_tools(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="visible",
+            description="Visible tool.",
+            input_model=StrictInput,
+            handler=lambda args: {"value": args.value},
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="disabled",
+            description="Disabled tool.",
+            input_model=StrictInput,
+            handler=lambda args: {"value": args.value},
+            enabled=False,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="not_admitted",
+            description="Not admitted tool.",
+            input_model=StrictInput,
+            handler=lambda args: {"value": args.value},
+        ),
+        admitted=False,
+        admission_reason="failed_check",
+    )
+
+    exported_names = [tool["name"] for tool in registry.schema_export()]
+
+    assert exported_names == ["visible"]
+
+
+def test_to_openai_tools_filters_non_model_visible_tools(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="visible",
+            description="Visible tool.",
+            input_model=StrictInput,
+            handler=lambda args: {"value": args.value},
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="disabled",
+            description="Disabled tool.",
+            input_model=StrictInput,
+            handler=lambda args: {"value": args.value},
+            enabled=False,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="not_admitted",
+            description="Not admitted tool.",
+            input_model=StrictInput,
+            handler=lambda args: {"value": args.value},
+        ),
+        admitted=False,
+        admission_reason="failed_check",
+    )
+
+    exported_names = [tool["function"]["name"] for tool in registry.to_openai_tools()]
+
+    assert exported_names == ["visible"]
+
+
+def test_to_openai_tools_keeps_openai_function_shape(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+    registry.register(
+        ToolSpec(
+            name="openai_visible",
+            description="OpenAI visible tool.",
+            input_model=StrictInput,
+            handler=lambda args: {"value": args.value},
+        )
+    )
+
+    exported = registry.to_openai_tools(strict=True)
+
+    assert exported == [
+        {
+            "type": "function",
+            "function": {
+                "name": "openai_visible",
+                "description": "OpenAI visible tool.",
+                "parameters": exported[0]["function"]["parameters"],
+                "strict": True,
+            },
+        }
+    ]
+    assert exported[0]["function"]["parameters"]["additionalProperties"] is False
 
 
 def test_contract_policy_models_are_serializable() -> None:
