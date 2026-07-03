@@ -67,6 +67,7 @@ LEGACY_SANDBOX_ACCOUNTS = (
 FIREWALL_RULE_GROUP = "Singularity Sandbox"
 FIREWALL_RULE_NAME = "Singularity Sandbox Outbound Block"
 LEGACY_FIREWALL_RULE_NAME = "Singularity Sandbox Runner Outbound Block"
+READINESS_SNAPSHOT_TTL_SECONDS = 30.0
 LOGIN_UI_USERLIST_KEY = (
     r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
 )
@@ -461,6 +462,8 @@ class WindowsSandboxBackend:
         self._run_root_provider = run_root_provider or (
             lambda request: _windows_state_dir_path() / "runs" / request.sandbox_id
         )
+        self._readiness_snapshot: WindowsSandboxDoctorReport | None = None
+        self._readiness_snapshot_at: float | None = None
 
     def name(self) -> str:
         return "windows"
@@ -469,16 +472,22 @@ class WindowsSandboxBackend:
         return self._doctor_provider()
 
     def setup(self) -> WindowsSandboxSetupReport:
-        return self._setup_provider()
+        report = self._setup_provider()
+        self._clear_readiness_snapshot()
+        return report
 
     def cleanup_assets(self) -> WindowsSandboxCleanupReport:
-        return self._cleanup_provider()
+        report = self._cleanup_provider()
+        self._clear_readiness_snapshot()
+        return report
 
     def is_available(self) -> bool:
-        return self.doctor().available
+        report, _elapsed = self._readiness_report()
+        return report.available
 
     def capabilities(self) -> SandboxCapabilities:
-        if not self.is_available():
+        report, _elapsed = self._readiness_report()
+        if not report.available:
             return SandboxCapabilities(
                 filesystem_isolation=False,
                 copy_on_write=False,
@@ -510,9 +519,8 @@ class WindowsSandboxBackend:
 
     def prepare(self, request: SandboxRequest) -> PreparedSandbox:
         timing: dict[str, float] = {}
-        phase_started = time.perf_counter()
-        report = self.doctor()
-        timing["sandbox_doctor_readiness_time_seconds"] = time.perf_counter() - phase_started
+        report, elapsed = self._readiness_report()
+        timing["sandbox_doctor_readiness_time_seconds"] = elapsed
         if not report.available:
             raise SandboxCapabilityError(report.reason)
         phase_started = time.perf_counter()
@@ -530,8 +538,15 @@ class WindowsSandboxBackend:
             )
         filesystem_policy = request.profile.filesystem
         original_sandbox_root = filesystem_policy.sandbox_root
-        filesystem_policy.sandbox_root = self._run_root_provider(request)
+        sandbox_root = self._run_root_provider(request)
+        filesystem_policy.sandbox_root = sandbox_root
         try:
+            if sandbox_root.exists() and any(sandbox_root.iterdir()):
+                self.filesystem.cleanup(sandbox_root)
+            sandbox_root.mkdir(parents=True, exist_ok=True)
+            phase_started = time.perf_counter()
+            self._acl_applier(sandbox_root, identity.account_name)
+            timing["acl_grant_time_seconds"] = time.perf_counter() - phase_started
             phase_started = time.perf_counter()
             fs = self.filesystem.prepare_filesystem(
                 sandbox_id=request.sandbox_id,
@@ -542,8 +557,8 @@ class WindowsSandboxBackend:
         finally:
             filesystem_policy.sandbox_root = original_sandbox_root
         phase_started = time.perf_counter()
-        self._acl_applier(fs.sandbox_root, identity.account_name)
-        timing["acl_grant_time_seconds"] = time.perf_counter() - phase_started
+        self._apply_workspace_low_integrity(fs.workspace_copy_root)
+        timing["workspace_low_integrity_time_seconds"] = time.perf_counter() - phase_started
         env = SandboxEnvironmentBuilder().build_env(request.profile.env, os.environ)
         env = self._runtime_env(env)
         trace_id = random_trace_id()
@@ -580,6 +595,7 @@ class WindowsSandboxBackend:
                 "sandbox_account": identity.account_name,
                 "credential_target": identity.credential_target,
                 "sandbox_role": identity.role,
+                "readiness": self._readiness_evidence(report),
                 "timing": timing,
             },
         )
@@ -587,12 +603,10 @@ class WindowsSandboxBackend:
     def run(self, prepared: PreparedSandbox) -> SandboxResult:
         started = time.perf_counter()
         timing = dict(prepared.baseline.get("timing") or {})
-        phase_started = time.perf_counter()
-        enforcement = self._runtime_enforcement_report()
+        enforcement, elapsed = self._runtime_enforcement_report(prepared)
         timing["sandbox_doctor_readiness_time_seconds"] = (
             timing.get("sandbox_doctor_readiness_time_seconds", 0.0)
-            + time.perf_counter()
-            - phase_started
+            + elapsed
         )
         if not enforcement.available and not _can_ignore_unrelated_network_probe_blocker(
             prepared,
@@ -828,7 +842,100 @@ class WindowsSandboxBackend:
                 "backend_unavailable: sandbox account workspace pre-cleanup failed."
             )
 
-    def _runtime_enforcement_report(self) -> WindowsSandboxDoctorReport:
+    def _readiness_report(
+        self,
+        *,
+        refresh: bool = False,
+        force_uncached_default: bool = False,
+    ) -> tuple[WindowsSandboxDoctorReport, float]:
+        started = time.perf_counter()
+        if not refresh and self._readiness_snapshot is not None and not self._readiness_snapshot_expired():
+            return self._readiness_snapshot, time.perf_counter() - started
+        if (
+            force_uncached_default
+            and type(self).doctor is WindowsSandboxBackend.doctor
+            and self._doctor_provider is probe_windows_sandbox
+        ):
+            report = _probe_windows_sandbox_uncached()
+        else:
+            report = self.doctor()
+        self._store_readiness_snapshot(report)
+        return report, time.perf_counter() - started
+
+    def _store_readiness_snapshot(self, report: WindowsSandboxDoctorReport) -> None:
+        self._readiness_snapshot = report
+        self._readiness_snapshot_at = time.perf_counter()
+
+    def _clear_readiness_snapshot(self) -> None:
+        self._readiness_snapshot = None
+        self._readiness_snapshot_at = None
+
+    def _readiness_snapshot_expired(self) -> bool:
+        if self._readiness_snapshot_at is None:
+            return True
+        return (time.perf_counter() - self._readiness_snapshot_at) > READINESS_SNAPSHOT_TTL_SECONDS
+
+    def _readiness_evidence(self, report: WindowsSandboxDoctorReport) -> dict[str, Any]:
+        return {
+            "source": "windows_sandbox_doctor",
+            "available": report.available,
+            "enforcement_status": report.enforcement_status,
+            "blocking_requirements": list(report.blocking_requirements),
+            "captured_at_monotonic": self._readiness_snapshot_at,
+            "ttl_seconds": READINESS_SNAPSHOT_TTL_SECONDS,
+        }
+
+    def _runtime_enforcement_report(
+        self,
+        prepared: PreparedSandbox,
+    ) -> tuple[WindowsSandboxDoctorReport, float]:
+        cached = self._readiness_snapshot
+        if (
+            cached is not None
+            and not self._prepared_readiness_requires_recheck(prepared, cached)
+        ):
+            started = time.perf_counter()
+            return cached, time.perf_counter() - started
+        return self._readiness_report(refresh=True, force_uncached_default=True)
+
+    def _prepared_readiness_requires_recheck(
+        self,
+        prepared: PreparedSandbox,
+        report: WindowsSandboxDoctorReport,
+    ) -> bool:
+        if type(self).doctor is not WindowsSandboxBackend.doctor:
+            return True
+        evidence = prepared.baseline.get("readiness")
+        if not isinstance(evidence, dict):
+            return True
+        if evidence.get("source") != "windows_sandbox_doctor":
+            return True
+        if evidence.get("available") is not True or not report.available:
+            return True
+        captured_at = evidence.get("captured_at_monotonic")
+        ttl_seconds = evidence.get("ttl_seconds")
+        if not isinstance(captured_at, int | float) or not isinstance(ttl_seconds, int | float):
+            return True
+        if (time.perf_counter() - float(captured_at)) > float(ttl_seconds):
+            return True
+        return self._network_readiness_needs_recheck(prepared, report)
+
+    @staticmethod
+    def _network_readiness_needs_recheck(
+        prepared: PreparedSandbox,
+        report: WindowsSandboxDoctorReport,
+    ) -> bool:
+        if prepared.request.profile.network.mode != SandboxNetworkMode.DENIED:
+            return False
+        role = str(prepared.baseline.get("sandbox_role") or "")
+        if role not in {"offline", "online"}:
+            return True
+        return not (
+            report.setup.offline_network_filter.ready
+            and _network_probe_state_for_role(report.execution.network_probe, role).ready
+        )
+
+    def _fresh_runtime_enforcement_report(self) -> WindowsSandboxDoctorReport:
         if (
             type(self).doctor is WindowsSandboxBackend.doctor
             and self._doctor_provider is probe_windows_sandbox
@@ -874,6 +981,10 @@ class WindowsSandboxBackend:
             raise SandboxCapabilityError(
                 "backend_unavailable: sandbox ACL boundary could not be applied."
             )
+
+    def _apply_workspace_low_integrity(self, workspace_root: Path) -> None:
+        if os.name != "nt":
+            return
         icacls = shutil.which("icacls")
         if icacls is None:
             raise SandboxCapabilityError(
@@ -882,7 +993,7 @@ class WindowsSandboxBackend:
         commands = (
             [
                 icacls,
-                str(sandbox_root / "workspace"),
+                str(workspace_root),
                 "/setintegritylevel",
                 "(OI)(CI)L",
                 "/T",

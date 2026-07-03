@@ -1237,6 +1237,103 @@ def test_windows_backend_uses_short_machine_state_run_root(
     assert prepared.execution_cwd == prepared.sandbox_root / "workspace"
 
 
+def test_windows_backend_reuses_readiness_snapshot_for_prepare(
+    tmp_path: Path,
+) -> None:
+    doctor_calls = 0
+
+    def doctor_provider() -> sandbox.WindowsSandboxDoctorReport:
+        nonlocal doctor_calls
+        doctor_calls += 1
+        return sandbox.WindowsSandboxDoctorReport.ready_for_tests()
+
+    backend = sandbox.WindowsSandboxBackend(
+        acl_applier=lambda _path, _account: None,
+        doctor_provider=doctor_provider,
+        run_root_provider=lambda request: (
+            request.workspace_root / "work" / "sandboxes" / request.sandbox_id
+        ),
+    )
+
+    assert backend.is_available() is True
+    assert backend.capabilities().network_isolation is True
+    prepared = backend.prepare(_request(tmp_path))
+
+    assert doctor_calls == 1
+    assert prepared.baseline["readiness"]["source"] == "windows_sandbox_doctor"
+    assert prepared.baseline["readiness"]["available"] is True
+
+
+def test_windows_backend_applies_run_root_acl_before_workspace_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "copied.txt").write_text("content", encoding="utf-8")
+    state_dir = tmp_path / "machine-state"
+    run_root = state_dir / "runs" / "sandbox_windows"
+    grant_workspace_file_existed: list[bool] = []
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if "/grant:r" in command and command[1] == str(run_root):
+            grant_workspace_file_existed.append((run_root / "workspace" / "copied.txt").exists())
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
+    monkeypatch.setattr(windows.shutil, "which", lambda name, **_kwargs: f"{name}.exe")
+    monkeypatch.setattr(windows, "_run_command", fake_run_command)
+    backend = sandbox.WindowsSandboxBackend(
+        doctor_provider=sandbox.WindowsSandboxDoctorReport.ready_for_tests,
+        run_root_provider=lambda request: run_root,
+    )
+
+    backend.prepare(_request(workspace))
+
+    assert grant_workspace_file_existed == [False]
+    grant_commands = [command for command in commands if "/grant:r" in command]
+    assert [command[1] for command in grant_commands] == [str(run_root)]
+    assert any(command[1] == str(run_root / "workspace") for command in commands if "/setintegritylevel" in command)
+
+
+def test_windows_backend_cleans_stale_run_root_before_acl_grant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "copied.txt").write_text("content", encoding="utf-8")
+    state_dir = tmp_path / "machine-state"
+    run_root = state_dir / "runs" / "sandbox_windows"
+    stale_file = run_root / "workspace" / "stale.txt"
+    stale_file.parent.mkdir(parents=True)
+    stale_file.write_text("old", encoding="utf-8")
+    stale_file_existed_at_grant: list[bool] = []
+
+    def fake_run_command(command: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        if "/grant:r" in command and command[1] == str(run_root):
+            stale_file_existed_at_grant.append(stale_file.exists())
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
+    monkeypatch.setattr(windows.shutil, "which", lambda name, **_kwargs: f"{name}.exe")
+    monkeypatch.setattr(windows, "_run_command", fake_run_command)
+    backend = sandbox.WindowsSandboxBackend(
+        doctor_provider=sandbox.WindowsSandboxDoctorReport.ready_for_tests,
+        run_root_provider=lambda request: run_root,
+    )
+
+    backend.prepare(_request(workspace))
+
+    assert stale_file_existed_at_grant == [False]
+
+
 def test_windows_backend_cleanup_uses_sandbox_account_preclean_before_host_delete(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1577,6 +1674,39 @@ def test_windows_backend_rechecks_enforcement_before_launching_runner(tmp_path: 
     runner = _FakeRunner()
     backend = FlappingBackend(runner=runner)
     prepared = backend.prepare(_request(tmp_path))
+
+    result = backend.run(prepared)
+
+    assert result.status == SandboxStatus.BACKEND_UNAVAILABLE
+    assert result.metadata["error_code"] == "backend_unavailable"
+    assert runner.calls == []
+
+
+def test_windows_backend_rechecks_when_readiness_evidence_is_missing(
+    tmp_path: Path,
+) -> None:
+    class FlappingBackend(_FakeReadyWindowsBackend):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.doctor_calls = 0
+
+        def doctor(self) -> sandbox.WindowsSandboxDoctorReport:
+            self.doctor_calls += 1
+            if self.doctor_calls == 1:
+                return sandbox.WindowsSandboxDoctorReport.ready_for_tests()
+            available = sandbox.WindowsSandboxDoctorReport.ready_for_tests()
+            return replace(
+                available,
+                available=False,
+                enforcement_status="backend_unavailable",
+                blocking_requirements=("setup:network_filter",),
+                recommended_action="rerun setup",
+            )
+
+    runner = _FakeRunner()
+    backend = FlappingBackend(runner=runner)
+    prepared = backend.prepare(_request(tmp_path))
+    prepared.baseline.pop("readiness", None)
 
     result = backend.run(prepared)
 

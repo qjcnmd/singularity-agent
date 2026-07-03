@@ -46,7 +46,7 @@ class SandboxFilesystemManager:
             policy.sandbox_root
             or (workspace_root / self.default_root_name / sandbox_id)
         )
-        if sandbox_root.exists():
+        if sandbox_root.exists() and any(sandbox_root.iterdir()):
             shutil.rmtree(sandbox_root)
         sandbox_root.mkdir(parents=True, exist_ok=True)
         artifact_root = sandbox_root / "artifacts"

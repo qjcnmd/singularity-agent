@@ -1733,7 +1733,9 @@
     CommandExecutor.run()
     → SandboxManager.run()
     → WindowsSandboxBackend.run(prepared)
-    → uncached enforcement probe
+    → 复用 prepare 阶段写入的 readiness snapshot；
+      snapshot 缺失、过期、unavailable 或网络隔离证据不足时再执行
+      uncached enforcement probe
     → 若 blocking_requirements == ["execution:network_probe"]：
          读取 PreparedSandbox.baseline.sandbox_role
          只消费当前命令账户对应 offline/online 子状态；
@@ -1788,9 +1790,9 @@
       unattributed_time_seconds 与细分
       timing/timing_diagnostics；
       sandbox_breakdown 把 run_verification sandbox path 拆成
-      doctor readiness、ACL grant、workspace materialization、
-      process spawn、command runtime、output collection、cleanup
-      与 diagnostics overhead，并标记 actual_execution /
+      doctor readiness、ACL grant、workspace low integrity、
+      workspace materialization、process spawn、command runtime、
+      output collection、cleanup 与 diagnostics overhead，并标记 actual_execution /
       diagnostic_observation；
       turn_diagnostics 只保存安全 ID、phase/purpose、provider latency、
       token/cache 计数、tool call、review/verification/finalization 事件状态
