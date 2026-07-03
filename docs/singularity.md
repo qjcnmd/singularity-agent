@@ -1153,7 +1153,7 @@
 
 ╔══════════════════════════════════════════════════════════════╗
 ║   ToolProtocolEngine — 工具协议引擎内部完整调用链               ║
-║   (tool_protocol/engine.py:ToolProtocolEngine)              ║
+║   (tool_protocol/engine.py:ToolProtocolEngine facade)       ║
 ╚══════════════════════════════════════════════════════════════╝
                                    │
                                    ▼
@@ -1228,11 +1228,11 @@
 │  counters = _ToolExecutionCounters()                          │
 │  ★ serial 与 parallel_readonly 共用同一组 call lifecycle helper：│
 │    _prepare_call()       → validation trace / record upsert / │
-│                            synthetic result / replay check / │
+│                            synthetic result factory / replay check /│
 │                            scheduled+running transition       │
 │    _bind_synthetic_result() → rejected / replay-blocked 结果绑定│
 │    _complete_call()      → result builder / state transition /│
-│                            context append / trace emit        │
+│                            context projector append / trace emit│
 │    _turn_result()        → ToolProtocolTurnResult 汇总         │
 │                                                              │
 │  ★★★ 分叉：执行模式 ★★★                                      │
@@ -1270,13 +1270,15 @@
 │  │      │   ├── synthetic = _synthetic_result(          │   │   │
 │  │      │   │       call, error_kind, message,          │   │   │
 │  │      │   │       error_code)                         │   │   │
+│  │      │   │   → ToolProtocolSyntheticResultFactory    │   │   │
 │  │      │   │   → ToolProtocolResultEnvelope            │   │   │
 │  │      │   │       (synthetic, 非真实执行)              │   │   │
 │  │      │   ├── state_store.transition(REJECTED, …)     │   │   │
 │  │      │   ├── state_store.bind_result(result)          │   │   │
 │  │      │   ├── _append_result(context, record,          │   │   │
 │  │      │   │       synthetic, turn)                    │   │   │
-│  │      │   │   → ContextManager.add_tool_result()       │   │   │
+│  │      │   │   → ToolProtocolContextProjector.append_result()│
+│  │      │   │   → ContextManager.add_tool_protocol_result()│  │   │
 │  │      │   ├── appended_tool_message_count++            │   │   │
 │  │      │   ├── trace.emit("tool_protocol.call_rejected")│  │   │
 │  │      │   ├── trace.emit("tool_protocol.synthetic_result_created")│
@@ -1297,6 +1299,7 @@
 │  │      │   │   ├── state_store.transition(RECOVERED)     │   │
 │  │      │   │   ├── _append_result(context, record,       │   │
 │  │      │   │   │       cached_result, turn)              │   │
+│  │      │   │   │   → ToolProtocolContextProjector 去重/append│
 │  │      │   │   ├── trace.emit("tool_protocol.replay_detected")│
 │  │      │   │   └── continue → next call                  │   │
 │  │      │   │                                             │   │
@@ -1469,7 +1472,8 @@
 │  │      │       │                                         │   │
 │  │      │       ├── _append_result(context, record,        │   │
 │  │      │       │       tool_result, turn)                 │   │
-│  │      │       │   → ContextManager.add_tool_result()     │   │
+│  │      │       │   → ToolProtocolContextProjector.append_result()│
+│  │      │       │   → ContextManager.add_tool_protocol_result()│ │
 │  │      │       │   → context.tool_observations 列表新增    │   │
 │  │      │       │                                         │   │
 │  │      │       ├── [ok]        → executed_count++         │   │

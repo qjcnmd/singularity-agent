@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +9,7 @@ from singularity.context import ContextManager
 from singularity.model import ModelCapabilities, ModelRole, ModelTurnResult
 from singularity.observability.models import TraceSeverity
 from singularity.planner import Planner
+from singularity.tool_protocol.context_projection import ToolProtocolContextProjector
 from singularity.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
@@ -28,6 +27,7 @@ from singularity.tool_protocol.recovery import ToolProtocolRecoveryManager
 from singularity.tool_protocol.result import ToolProtocolResultBuilder
 from singularity.tool_protocol.scheduler import ToolProtocolScheduler
 from singularity.tool_protocol.state import ToolProtocolStateStore
+from singularity.tool_protocol.synthetic_result import ToolProtocolSyntheticResultFactory
 from singularity.tool_protocol.trace import ToolProtocolTrace
 from singularity.tool_protocol.validator import ToolProtocolValidator
 from singularity.tools import ToolExecutionRequest, ToolExecutor, ToolRegistry
@@ -67,6 +67,8 @@ class ToolProtocolEngine:
         self.validator = ToolProtocolValidator(registry)
         self.scheduler = ToolProtocolScheduler(registry)
         self.result_builder = result_builder or ToolProtocolResultBuilder()
+        self.synthetic_results = ToolProtocolSyntheticResultFactory()
+        self.context_projector = ToolProtocolContextProjector(self.state_store)
         self.parallel_executor = parallel_executor or ParallelToolExecutor()
         self.recovery_manager = ToolProtocolRecoveryManager(self.state_store)
         self.workspace_state_hook = workspace_state_hook
@@ -692,23 +694,12 @@ class ToolProtocolEngine:
         result: ToolProtocolResultEnvelope,
         turn: int = 0,
     ) -> str | None:
-        record = self.state_store.record_by_tool_call_id(envelope.tool_call_id)
-        if self._context_has_tool_message(
+        return self.context_projector.append_result(
             context,
-            envelope.tool_call_id,
-            content_digest=result.content_digest,
-        ):
-            self.state_store.mark_result_appended(
-                record.record_id,
-                context_message_id=record.context_message_id,
-            )
-            return None
-        observation = context.add_tool_protocol_result(result, turn=turn)
-        self.state_store.mark_result_appended(
-            record.record_id,
-            context_message_id=observation.id,
+            envelope=envelope,
+            result=result,
+            turn=turn,
         )
-        return observation.id
 
     def _append_result(
         self,
@@ -787,18 +778,11 @@ class ToolProtocolEngine:
         *,
         content_digest: str | None = None,
     ) -> bool:
-        for message in context.messages(persist=False):
-            if message.get("role") != "tool" or message.get("tool_call_id") != tool_call_id:
-                continue
-            if content_digest is None:
-                return True
-            try:
-                payload = json.loads(str(message.get("content") or "{}"))
-            except json.JSONDecodeError:
-                return True
-            if payload.get("content_digest") == content_digest:
-                return True
-        return False
+        return ToolProtocolContextProjector.has_tool_message(
+            context,
+            tool_call_id,
+            content_digest=content_digest,
+        )
 
     def _synthetic_result(
         self,
@@ -808,34 +792,11 @@ class ToolProtocolEngine:
         message: str,
         error_code: str | None,
     ) -> ToolProtocolResultEnvelope:
-        digest = hashlib.sha256(
-            json.dumps(
-                {
-                    "tool_call_id": envelope.tool_call_id,
-                    "tool_name": envelope.tool_name,
-                    "error_kind": error_kind.value,
-                    "error_code": error_code,
-                    "message": message,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
-        return ToolProtocolResultEnvelope(
-            tool_call_id=envelope.tool_call_id,
-            tool_name=envelope.tool_name,
-            ok=False,
-            status="rejected",
-            error_code=error_code,
+        return self.synthetic_results.create(
+            envelope,
             error_kind=error_kind,
-            content_preview=message,
-            content_digest=digest,
-            raw_result_ref=None,
-            artifact_refs=[],
-            truncated=False,
-            redacted=True,
-            metadata={"validation_errors": list(envelope.validation_errors), "synthetic": True},
+            message=message,
+            error_code=error_code,
         )
 
     def _trace_ids(self, batch: ToolCallBatch, *, call: ToolCallEnvelope | None = None) -> dict[str, Any]:
