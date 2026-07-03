@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from singularity.observability.models import TraceEventType
+from singularity.observability.recorder import TraceRecorder
 from singularity.policy import (
     ApprovalGate,
     ApprovalGrant,
@@ -479,8 +481,13 @@ def test_policy_allows_reads_outside_policy_dir(tmp_path: Path) -> None:
     assert read.outcome == DecisionOutcome.ALLOW
 
 
-def test_policy_evaluate_and_enforce_share_request_evaluation(tmp_path: Path, monkeypatch) -> None:
-    component = PolicyEngine(PolicyConfig(workspace_root=tmp_path))
+def test_policy_evaluate_is_pure_decision_without_audit_or_trace(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    trace = TraceRecorder.create(tmp_path, run_id="run_policy_eval", session_id="session")
+    component = PolicyEngine(
+        PolicyConfig(workspace_root=tmp_path, audit_log_path=audit_path),
+        trace=trace,
+    )
     request = req(
         tmp_path,
         operation=OperationKind.READ_FILE,
@@ -488,15 +495,66 @@ def test_policy_evaluate_and_enforce_share_request_evaluation(tmp_path: Path, mo
         resource_type="file",
         identifier="README.md",
     )
-    expected = component.evaluate(request)
-    calls: list[PolicyRequest] = []
 
-    def evaluate_once(candidate: PolicyRequest):
-        calls.append(candidate)
-        return expected
+    decision = component.evaluate(request)
 
-    monkeypatch.setattr(component, "_evaluate_request", evaluate_once)
+    assert decision.outcome == DecisionOutcome.ALLOW
+    assert not audit_path.exists()
+    assert trace.store.query_events() == []
 
-    assert component.evaluate(request) is expected
-    assert component.enforce(request) is expected
-    assert calls == [request, request]
+
+def test_policy_enforce_writes_audit_and_trace(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    trace = TraceRecorder.create(tmp_path, run_id="run_policy_enforce", session_id="session")
+    component = PolicyEngine(
+        PolicyConfig(workspace_root=tmp_path, audit_log_path=audit_path),
+        trace=trace,
+    )
+    request = req(
+        tmp_path,
+        operation=OperationKind.DELETE_FILE,
+        capability=Capability.DELETE_FILE,
+        resource_type="file",
+        identifier=".env",
+    )
+
+    decision = component.enforce(request)
+
+    assert decision.outcome == DecisionOutcome.DENY
+    assert audit_path.exists()
+    assert request.request_id in audit_path.read_text(encoding="utf-8")
+    event_types = [event.event_type for event in trace.store.query_events()]
+    assert event_types == [
+        TraceEventType.POLICY_REQUESTED,
+        TraceEventType.POLICY_BLOCKED,
+    ]
+
+
+def test_policy_enforce_allow_path_writes_decided_trace(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    trace = TraceRecorder.create(
+        tmp_path,
+        run_id="run_policy_enforce_allow",
+        session_id="session",
+    )
+    component = PolicyEngine(
+        PolicyConfig(workspace_root=tmp_path, audit_log_path=audit_path),
+        trace=trace,
+    )
+    request = req(
+        tmp_path,
+        operation=OperationKind.READ_FILE,
+        capability=Capability.READ_WORKSPACE,
+        resource_type="file",
+        identifier="README.md",
+    )
+
+    decision = component.enforce(request)
+
+    assert decision.outcome == DecisionOutcome.ALLOW
+    assert audit_path.exists()
+    event_types = [event.event_type for event in trace.store.query_events()]
+    assert event_types == [
+        TraceEventType.POLICY_REQUESTED,
+        TraceEventType.POLICY_DECIDED,
+    ]

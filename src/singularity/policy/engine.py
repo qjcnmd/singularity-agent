@@ -30,12 +30,10 @@ class PolicyEngine:
         self.trace = trace
 
     def evaluate(self, request: PolicyRequest) -> PolicyDecision:
-        return self._evaluate_request(request)
+        return self._decide(request)
 
     def enforce(self, request: PolicyRequest) -> PolicyDecision:
-        return self._evaluate_request(request)
-
-    def _evaluate_request(self, request: PolicyRequest) -> PolicyDecision:
+        self._emit_policy_trace(TraceEventType.POLICY_REQUESTED, request=request)
         decision = self._decide(request)
         self.audit.append(request=request, decision=decision)
         self._emit_policy_trace(
@@ -48,7 +46,6 @@ class PolicyEngine:
         return decision
 
     def _decide(self, request: PolicyRequest) -> PolicyDecision:
-        self._emit_policy_trace(TraceEventType.POLICY_REQUESTED, request=request)
         risk = self.classifier.classify(request)
         return self.rules.decide(request, risk=risk, config=self.config)
 
