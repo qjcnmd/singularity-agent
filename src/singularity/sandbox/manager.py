@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import shlex
+import signal
+import subprocess
 import time
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -9,7 +12,8 @@ from typing import Any, Protocol
 
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.observability.protocols import TraceEmitterProtocol
-from singularity.policy import PermissionProfile
+from singularity.observability.redaction import TraceRedactor
+from singularity.policy import PermissionProfile, PermissionProfileName
 from singularity.sandbox.backends import SandboxBackend, default_sandbox_backends
 from singularity.sandbox.exceptions import SandboxCapabilityError
 from singularity.sandbox.models import (
@@ -20,6 +24,10 @@ from singularity.sandbox.models import (
     SandboxStatus,
 )
 from singularity.sandbox.trace_recorder import SandboxJsonlTraceRecorder
+
+_RELAXED_BACKEND_NAME = "local_process"
+_DANGER_FULL_ACCESS_FALLBACK_REASON = "danger-full-access sandbox mode"
+_PROCESS_TERMINATE_TIMEOUT_SECONDS = 2.0
 
 
 class SandboxAppendTraceRecorderProtocol(Protocol):
@@ -76,12 +84,16 @@ class SandboxManager:
             backend = selected[0] if selected is not None else None
             backend_capabilities = selected[1] if selected is not None else None
             if backend is None:
-                result = self._unavailable(
-                    request,
-                    self._backend_unavailable_reason(),
-                    started,
-                    backend_name=self.backends[0].name() if self.backends else "unavailable",
-                )
+                reason = self._backend_unavailable_reason()
+                if self._allows_relaxed_local_process():
+                    result = self._run_relaxed_local_process(request, started, reason)
+                else:
+                    result = self._unavailable(
+                        request,
+                        reason,
+                        started,
+                        backend_name=self.backends[0].name() if self.backends else "unavailable",
+                    )
                 self._record_trace(
                     prepared=None,
                     result=result,
@@ -138,12 +150,15 @@ class SandboxManager:
             )
             return result
         except SandboxCapabilityError as exc:
-            result = self._unavailable(
-                request,
-                str(exc),
-                started,
-                backend_name=backend.name() if backend is not None else "unavailable",
-            )
+            if self._allows_relaxed_local_process():
+                result = self._run_relaxed_local_process(request, started, str(exc))
+            else:
+                result = self._unavailable(
+                    request,
+                    str(exc),
+                    started,
+                    backend_name=backend.name() if backend is not None else "unavailable",
+                )
             self._emit_trace(
                 TraceEventType.SANDBOX_CAPABILITY_FAILED,
                 request=request,
@@ -272,6 +287,176 @@ class SandboxManager:
             return "; ".join(reasons)
         return "backend_unavailable: no available OS sandbox backend is registered."
 
+    def _allows_relaxed_local_process(self) -> bool:
+        return self.permission_profile.profile == PermissionProfileName.DANGER_FULL_ACCESS
+
+    def _run_relaxed_local_process(
+        self,
+        request: SandboxRequest,
+        started: float,
+        unavailable_reason: str,
+    ) -> SandboxResult:
+        self._emit_trace(
+            TraceEventType.SANDBOX_STARTED,
+            request=request,
+            result=None,
+            summary=(
+                "Sandbox command started with relaxed local process execution "
+                "for danger-full-access mode."
+            ),
+            payload={
+                "sandbox_id": request.sandbox_id,
+                "backend": _RELAXED_BACKEND_NAME,
+                "sandbox_mode": self.permission_profile.profile.value,
+                "sandbox_enforcement": "relaxed",
+                "local_process_fallback_reason": _DANGER_FULL_ACCESS_FALLBACK_REASON,
+            },
+            severity=TraceSeverity.WARNING,
+        )
+        command, shell = _subprocess_command(request.command)
+        env = _relaxed_env(request)
+        timeout = request.profile.resources.timeout_seconds
+        output_limit = request.profile.resources.max_output_chars
+        result_started = _now()
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(request.cwd),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=shell,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                start_new_session=os.name != "nt",
+            )
+        except FileNotFoundError as exc:
+            return self._relaxed_process_result(
+                request,
+                started,
+                started_at=result_started,
+                status=SandboxStatus.FAILED,
+                exit_code=None,
+                stdout="",
+                stderr=str(exc),
+                unavailable_reason=unavailable_reason,
+                error_code="command_not_found",
+            )
+        except PermissionError as exc:
+            return self._relaxed_process_result(
+                request,
+                started,
+                started_at=result_started,
+                status=SandboxStatus.FAILED,
+                exit_code=None,
+                stdout="",
+                stderr=str(exc),
+                unavailable_reason=unavailable_reason,
+                error_code="permission_error",
+            )
+        except Exception as exc:
+            return self._relaxed_process_result(
+                request,
+                started,
+                started_at=result_started,
+                status=SandboxStatus.SETUP_FAILED,
+                exit_code=None,
+                stdout="",
+                stderr=str(exc),
+                unavailable_reason=unavailable_reason,
+                error_code="spawn_failed",
+            )
+        timed_out = False
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_tree(process)
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS
+                )
+            except subprocess.TimeoutExpired:
+                with suppress(Exception):
+                    process.kill()
+                stdout, stderr = "", "Process timed out and could not be terminated cleanly."
+        stdout, stderr, output_truncated = _limit_output(
+            TraceRedactor().redact_text(stdout or ""),
+            TraceRedactor().redact_text(stderr or ""),
+            output_limit,
+        )
+        status = (
+            SandboxStatus.TIMEOUT
+            if timed_out
+            else SandboxStatus.SUCCESS
+            if process.returncode == 0
+            else SandboxStatus.FAILED
+        )
+        return self._relaxed_process_result(
+            request,
+            started,
+            started_at=result_started,
+            status=status,
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            unavailable_reason=unavailable_reason,
+            error_code="timeout" if timed_out else None,
+            timed_out=timed_out,
+            output_truncated=output_truncated,
+        )
+
+    def _relaxed_process_result(
+        self,
+        request: SandboxRequest,
+        started: float,
+        *,
+        started_at: str,
+        status: SandboxStatus,
+        exit_code: int | None,
+        stdout: str,
+        stderr: str,
+        unavailable_reason: str,
+        error_code: str | None,
+        timed_out: bool = False,
+        output_truncated: bool = False,
+    ) -> SandboxResult:
+        metadata = {
+            "error_code": error_code,
+            "reason": unavailable_reason,
+            "sandbox_mode": self.permission_profile.profile.value,
+            "sandbox_enforcement": "relaxed",
+            "enforcement_status": "relaxed",
+            "execution_backend": _RELAXED_BACKEND_NAME,
+            "backend_is_local_process": True,
+            "used_local_process_fallback": True,
+            "local_process_fallback_reason": _DANGER_FULL_ACCESS_FALLBACK_REASON,
+            "network_denied_verified": False,
+            "process_tree_kill": True,
+            "timeout_enforced": True,
+            "timed_out": timed_out,
+            "output_truncated": output_truncated,
+        }
+        metadata["timing"] = {
+            "relaxed_local_process_time_seconds": time.perf_counter() - started
+        }
+        return SandboxResult(
+            sandbox_id=request.sandbox_id,
+            backend_name=_RELAXED_BACKEND_NAME,
+            status=status,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            started_at=started_at,
+            ended_at=_now(),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            cleanup_status="not_required",
+            metadata=metadata,
+        )
+
     @staticmethod
     def _capabilities_for_trace(
         backend: SandboxBackend | None,
@@ -348,7 +533,7 @@ class SandboxManager:
                     (raw if raw.is_absolute() else request.workspace_root / raw, "execute")
                 )
         command = request.command if isinstance(request.command, list) else _split_command(request.command)
-        for token in command[1:]:
+        for token in command:
             if not _looks_like_path(token):
                 continue
             raw = Path(token).expanduser()
@@ -474,3 +659,80 @@ def _looks_like_path(value: str) -> bool:
         or Path(token).suffix.lower()
         in {".env", ".json", ".pem", ".key", ".pfx", ".p12"}
     )
+
+
+def _subprocess_command(command: list[str] | str) -> tuple[list[str] | str, bool]:
+    if isinstance(command, list):
+        return [str(part) for part in command], False
+    return command, True
+
+
+def _relaxed_env(request: SandboxRequest) -> dict[str, str]:
+    env = dict(request.profile.env.extra_env)
+    for name in _runtime_env_names():
+        value = os.environ.get(name)
+        if value is not None and name not in env:
+            env[name] = value
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
+
+def _runtime_env_names() -> tuple[str, ...]:
+    if os.name == "nt":
+        return (
+            "COMSPEC",
+            "PATH",
+            "PATHEXT",
+            "SYSTEMDRIVE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "WINDIR",
+        )
+    return ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
+
+
+def _kill_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        with suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS,
+            )
+        if process.poll() is None:
+            with suppress(Exception):
+                process.kill()
+        return
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    if callable(killpg) and callable(getpgid):
+        with suppress(Exception):
+            killpg(getpgid(process.pid), signal.SIGTERM)
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+    if process.poll() is None:
+        with suppress(Exception):
+            if callable(killpg) and callable(getpgid):
+                killpg(getpgid(process.pid), getattr(signal, "SIGKILL", signal.SIGTERM))
+            else:
+                process.kill()
+
+
+def _limit_output(
+    stdout: str,
+    stderr: str,
+    max_output_chars: int | None,
+) -> tuple[str, str, bool]:
+    if max_output_chars is None or max_output_chars <= 0:
+        return stdout, stderr, False
+    remaining = max_output_chars
+    limited_stdout = stdout[:remaining]
+    remaining -= len(limited_stdout)
+    limited_stderr = stderr[: max(0, remaining)]
+    truncated = len(limited_stdout) < len(stdout) or len(limited_stderr) < len(stderr)
+    return limited_stdout, limited_stderr, truncated

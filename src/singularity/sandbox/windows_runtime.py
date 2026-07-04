@@ -14,6 +14,7 @@ from typing import Any
 from singularity.sandbox.models import SandboxResourceLimits
 from singularity.sandbox.windows_common import (
     SANDBOX_ACCOUNTS,
+    WINDOWS_PATH_SEPARATOR,
     WindowsCapabilityState,
     WindowsSandboxRunner,
     _account_runner_launch_exception_diagnostics,
@@ -876,11 +877,11 @@ def _runtime_env(env: dict[str, str]) -> dict[str, str]:
             runtime[name] = value
     path_entries = [str(path) for path in _python_runtime_path_directories()]
     existing_path = runtime.get("PATH", "")
-    for entry in existing_path.split(os.pathsep):
+    for entry in existing_path.split(WINDOWS_PATH_SEPARATOR):
         if entry and entry not in path_entries:
             path_entries.append(entry)
     if path_entries:
-        runtime["PATH"] = os.pathsep.join(path_entries)
+        runtime["PATH"] = WINDOWS_PATH_SEPARATOR.join(path_entries)
     runtime.setdefault("PYTHONIOENCODING", "utf-8")
     return runtime
 

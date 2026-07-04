@@ -941,6 +941,7 @@ def _windows_extended_path(path: Path) -> str:
     if value.startswith("\\\\"):
         return "\\\\?\\UNC\\" + value[2:]
     if re.match(r"^[A-Za-z]:[\\/]", value):
+        value = value[:2] + re.sub(r"[\\/]+", r"\\", value[2:])
         return "\\\\?\\" + value
     if path.is_absolute():
         return "\\\\?\\" + value

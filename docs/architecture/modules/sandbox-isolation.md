@@ -64,7 +64,7 @@
 
 ## 这一层解决什么问题
 
-Sandbox 层消费已经解析完成的 `SandboxRequest`，选择能够满足 filesystem、network 和 resource 要求的 OS-native backend，并统一返回执行结果或明确的 `backend_unavailable`。这一层不决定会话权限、不发放审批，也不把普通本地执行或 workspace copy 表述为强隔离。
+Sandbox 层消费已经解析完成的 `SandboxRequest`，选择能够满足 filesystem、network 和 resource 要求的 OS-native backend，并统一返回执行结果或明确的 `backend_unavailable`。这一层不决定会话权限、不发放审批，也不把普通本地执行或 workspace copy 表述为强隔离。唯一例外是会话级 `danger-full-access` 模式：当调用方仍显式要求 sandbox 但 native backend 不可用或能力不足时，`SandboxManager` 可执行 relaxed `local_process`，并必须把 `sandbox_enforcement="relaxed"` 与 `used_local_process_fallback=true` 写入 result、trace 和 command evidence；`read-only` 与 `workspace-write` 仍 fail closed。
 
 Windows 当前实现是双 principal 的 account-backed OS sandbox：父进程按`SandboxNetworkMode`选择`SingularityOffline`或`SingularityOnline`，准备 COW workspace projection，并只把本次 run root 授权给选中账户；runner 再用 restricted low-integrity token、private desktop 和 kill-on-close Job Object 启动实际命令。offline SID 被 account-scoped outbound firewall 阻断，online SID不得被该规则命中。该方向只对齐 OpenAI Codex 公开资料中的专用低权限账户、ACL、firewall、本地策略和受控 setup 原则，不声称与 Codex App 完全相同，也不复制其具体 token flags。任一账户、登录UI隐藏、logon rights、组成员、credential、state dir ACL、ACL boundary、offline firewall/online排除、private desktop、runner smoke或双向network probe缺失时，backend不可用。
 
@@ -86,7 +86,7 @@ Windows 当前实现是双 principal 的 account-backed OS sandbox：父进程�
 - `src/singularity/sandbox/windows_doctor.py`：`probe_windows_sandbox()` doctor facade 和缓存入口。
 - `src/singularity/sandbox/windows_cleanup.py`：`cleanup_windows_sandbox_assets()` cleanup 流程入口。
 - `src/singularity/sandbox/windows_models.py`：Windows sandbox schema 常量、双账户 identity 映射、doctor/setup/cleanup DTO 和 `to_dict()` wire projection。
-- `src/singularity/sandbox/trace_recorder.py`：默认 sandbox JSONL trace writer，使用 `TraceRedactor` 脱敏 command summary、timing 和 violation 投影。
+- `src/singularity/sandbox/trace_recorder.py`：默认 sandbox JSONL trace writer，使用 `TraceRedactor` 脱敏 command summary、timing、violation 和 relaxed fallback 审计投影。
 - `src/singularity/sandbox/windows_runner.py`：sandbox account runner、restricted token child、private desktop、Job Object、timeout/output/network probe/result JSON。
 - `src/singularity/command/executor.py`：依据会话级 `PermissionProfile` 构造完整 `SandboxRequest`，并把 `SandboxResult` 投影成 command evidence。
 
@@ -145,9 +145,11 @@ PolicyEngine / ApprovalGate
 
 `SandboxManager.run()`不修改这些边界。Windows可用时，`prepare()`根据network mode把`baseline.sandbox_account`、`credential_target`和`sandbox_role`写成offline或online身份；run root对sandbox principal只授权选中的账户，同时保留宿主cleanup ACE。`WindowsSandboxBackend.run()`在启动 runner 前仍执行 uncached enforcement probe，除当前命令不相关的 network probe 单项波动外，任一 setup、primitive、launcher、ACL、runner smoke 或网络过滤 blocker 都 fail closed。runner读取对应credential并创建restricted low-integrity child。cleanup只接受位于machine state `runs/<sandbox_id>`下、名称为`sandbox_*`的单个run root。删除前先复用同一个sandbox账户启动Level-1 runner执行`operation="workspace_cleanup"`，仅删除当前run root下的`workspace/` projection；该cleanup不创建Level-2 low-integrity child，不访问网络，也不扩大任何Python runtime ACL。随后宿主进程对该run root执行take ownership、ACL继承/重置、宿主SID full-control恢复、medium integrity恢复和只读/系统/隐藏属性清理，再删除整个短路径root；失败时返回`cleanup_failed`，不把命令exit 0伪装为整体成功。
 
+`danger-full-access` 模式不注册新的 native backend，也不改变 Windows backend 的 fail-closed 规则。它只在 `SandboxManager._select_backend()` 找不到可用 backend 或 `ensure_capabilities()` 报能力不足后进入私有 relaxed 本地进程分支。该分支先执行 protected path preflight，使用有界 timeout 和输出截断，stdout/stderr 经过 `TraceRedactor`，`SandboxResult.backend_name="local_process"`，`cleanup_status="not_required"`，metadata 写入 `sandbox_mode`、`sandbox_enforcement`、`enforcement_status`、`execution_backend`、`used_local_process_fallback` 和 `local_process_fallback_reason`。
+
 workspace 外 additional writable directories 当前不会被投影，也不会被 ACL 授权；只要 `writable_paths` 中出现 workspace 外目录，Windows backend 立即 fail closed。path-specific `readonly_paths` 也因尚无目录级 ACL lease 支持而 fail closed。workspace 内 protected paths 通过 projection exclude 和 manager preflight 生效。
 
-`CommandExecutor._result_from_sandbox()` 消费 `SandboxResult`，把 backend、enforcement_status、execution_backend、network_denied_verified、process_tree_kill、job_killed、timeout_enforced、artifact refs、violations 和 changed files 写入 `CommandResult.isolation_report["sandbox"]` 与 metadata。
+`CommandExecutor._result_from_sandbox()` 消费 `SandboxResult`，把 backend、enforcement_status、execution_backend、sandbox_mode、sandbox_enforcement、used_local_process_fallback、local_process_fallback_reason、network_denied_verified、process_tree_kill、job_killed、timeout_enforced、artifact refs、violations 和 changed files 写入 `CommandResult.isolation_report["sandbox"]` 与 metadata。relaxed `local_process` 结果必须保持 `filesystem_isolation="workspace_cwd_advisory"`，不能被投影为 `native_os_sandbox`。
 
 ## 真实对象完整结构
 
@@ -412,9 +414,9 @@ Windows凭据分别写入Credential Manager target`SingularityOffline`与`Singul
 
 ## 是否进入 trace / audit
 
-`SandboxManager` 可发出 `sandbox.requested`、`sandbox.prepared`、`sandbox.started`、`sandbox.cleaned`、`sandbox.capability_failed`、`sandbox.violation` 和 `sandbox.completed`。`sandbox.prepared` 与 terminal payload 只增加数值 timing，不写 argv、credential 或路径正文；分段包括 doctor/readiness、account selection、ACL grant、process spawn、command runtime、output collection、artifact collection 和当前 run-root cleanup。`SandboxJsonlTraceRecorder.append()` 写相同的 result timing 安全投影，并使用 manager 选择阶段已经取得的同次 `SandboxCapabilities` 快照，避免为 trace 再次触发普通 capability probe；JSONL payload 通过 `TraceRedactor` 委托统一 `RedactionProvider` plain profile，list command 中的 secret flag 后续参数也会被替换为 `<redacted>`。sandbox result 不直接写 policy audit；关联的 policy decision 由 Policy 层记录。
+`SandboxManager` 可发出 `sandbox.requested`、`sandbox.prepared`、`sandbox.started`、`sandbox.cleaned`、`sandbox.capability_failed`、`sandbox.violation` 和 `sandbox.completed`。`sandbox.prepared` 与 terminal payload 只增加数值 timing，不写 argv、credential 或路径正文；分段包括 doctor/readiness、account selection、ACL grant、process spawn、command runtime、output collection、artifact collection 和当前 run-root cleanup。`SandboxJsonlTraceRecorder.append()` 写相同的 result timing 安全投影，并使用 manager 选择阶段已经取得的同次 `SandboxCapabilities` 快照，避免为 trace 再次触发普通 capability probe；JSONL payload 通过 `TraceRedactor` 委托统一 `RedactionProvider` plain profile，list command 中的 secret flag 后续参数也会被替换为 `<redacted>`。当 `danger-full-access` relaxed fallback 生效时，JSONL 还写 `sandbox_mode`、`sandbox_enforcement`、`enforcement_status`、`execution_backend`、`used_local_process_fallback` 和 `local_process_fallback_reason`。sandbox result 不直接写 policy audit；关联的 policy decision 由 Policy 层记录。
 
-`CommandExecutor._result_from_sandbox()` 会把 selected backend、enforcement status、execution backend、network denied proof、Job Object/timeout 状态、artifact refs、changed files 和 violations 放入 `CommandResult.isolation_report["sandbox"]`。Planner 和 final report 从这里聚合 `sandbox_isolation_summary`。
+`CommandExecutor._result_from_sandbox()` 会把 selected backend、enforcement status、execution backend、sandbox mode/enforcement、local-process fallback 审计、network denied proof、Job Object/timeout 状态、artifact refs、changed files 和 violations 放入 `CommandResult.isolation_report["sandbox"]`。Planner 和 final report 从这里聚合 `sandbox_isolation_summary`。
 
 ## 失败路径
 
@@ -438,7 +440,8 @@ Windows凭据分别写入Credential Manager target`SingularityOffline`与`Singul
 - restricted token、low integrity、private desktop 或 Job Object evidence 未验证：返回 `SandboxStatus.VIOLATION`。
 - timeout：runner 通过 Job Object/进程终止路径返回 `SandboxStatus.TIMEOUT`，metadata 记录 `job_killed`。
 - run-root cleanup 异常：删除前会先用同一sandbox账户Level-1 runner删除当前`workspace/` projection，再修复单个run root的owner、ACL、宿主SID full-control、完整性级别和文件属性；任一步失败时`SandboxResult.cleanup_status`标记`cleanup_failed`，不得保留 success；asset cleanup 异常：`WindowsSandboxCleanupReport.status=failed`，对应 failed_steps 带 hash/redacted diagnostics。
-- 所有不可用路径均禁止回退到普通本地执行。
+- `read-only` 和 `workspace-write` 的所有不可用路径均禁止回退到普通本地执行。
+- `danger-full-access` 是显式 relaxed 模式：native backend 不可用或能力不足时可走本地进程，但 protected path preflight 仍先执行，结果必须审计为 `sandbox_enforcement="relaxed"` 和 `used_local_process_fallback=true`，不能声明 native OS sandbox enforcement。
 
 ## 当前结构问题
 

@@ -1784,6 +1784,17 @@
   E2. Windows sandbox command runtime recheck（AgentLoop 内命令分支）
     CommandExecutor.run()
     → SandboxManager.run()
+    → 先执行 protected path preflight；命中 .env / credential /
+      runtime state 等 hard-deny 规则时直接 POLICY_BLOCKED。
+    → 若会话 permission_profile 为 danger-full-access，且 native
+      backend 不可用或能力不足：
+         执行 relaxed local_process fallback；
+         SandboxResult.backend_name="local_process"；
+         metadata.sandbox_enforcement="relaxed"；
+         metadata.used_local_process_fallback=true；
+         CommandResult.isolation_report.filesystem_isolation 保持
+         workspace_cwd_advisory，不声明 native_os_sandbox。
+      read-only / workspace-write 不进入该分支。
     → WindowsSandboxBackend.run(prepared)
     → 平台判断统一经 windows_platform.is_windows()，测试不 patch 全局 os.name
     → 复用 prepare 阶段写入的 readiness snapshot；
@@ -1875,6 +1886,8 @@
       local_process_fallback_count 必须为 0；模型可见 task projection
       和 AgentLoop trace 必须通过 evaluator-only metadata visibility audit。
       两项任一不可审计或失败时 evaluation_passed=false。
+      public representative task 默认 permission_profile=workspace-write，
+      不使用 danger-full-access relaxed fallback。
     → final report / failure repair summary 中的 latest_failure_category:
         environment_error 或 sandbox_limitation → environment_blocker
 

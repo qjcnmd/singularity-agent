@@ -79,6 +79,7 @@ __all__ = [
     "SETUP_SCHEMA_VERSION",
     "SETUP_STEP_ORDER",
     "WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT",
+    "WINDOWS_PATH_SEPARATOR",
     "_SANDBOX_IDENTITIES",
     "WindowsCapabilityState",
     "WindowsSandboxCleanupReport",
@@ -138,6 +139,7 @@ NERR_MEMBER_IN_GROUP = 2118
 ERROR_MEMBER_IN_ALIAS = 1378
 ERROR_NOT_FOUND = 1168
 STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+WINDOWS_PATH_SEPARATOR = ";"
 
 
 
@@ -266,8 +268,11 @@ def _missing(reason: str, evidence: dict[str, Any]) -> WindowsCapabilityState:
 def _has_windows_symbols(library: str, *symbols: str) -> bool:
     if not _is_windows():
         return False
+    windll = getattr(ctypes, "WinDLL", None)
+    if windll is None:
+        return False
     try:
-        dll = ctypes.WinDLL(library, use_last_error=True)
+        dll = windll(library, use_last_error=True)
         return all(hasattr(dll, symbol) for symbol in symbols)
     except (AttributeError, OSError):
         return False

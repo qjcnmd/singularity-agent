@@ -59,6 +59,8 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 
 在 `workspace-write` 且 `PolicyDecision.outcome=sandbox_required` 时，普通本地验证命令不得走 `local_process`。Windows backend 可用时，`CommandResult.backend` 为 `windows`，`isolation_report["sandbox"]` 和 metadata 同步记录 `enforcement_status`、`execution_backend`、`backend_is_local_process`、`network_denied_verified`、`process_tree_kill`、`job_killed`、`timeout_enforced`、`artifact_refs`、`sandbox_artifacts`、`sandbox_changed_files` 和 `sandbox_violations`。Windows backend 不可用时，结果是 `ExecutionStatus.BACKEND_ERROR` / `error_code=sandbox_unavailable`，不是普通本地执行。
 
+只有会话级 `PermissionProfile.profile == "danger-full-access"` 且调用方仍显式要求 sandbox 时，`SandboxManager` 才允许在 native backend 不可用或无法满足能力要求时走 relaxed `local_process`。该分支不改变 policy/protected path 前置检查，`CommandResult.backend` 为 `local_process`，`isolation_report["filesystem_isolation"]` 保持 `workspace_cwd_advisory`，`isolation_report["sandbox"]` 与 metadata 必须写入 `sandbox_mode="danger-full-access"`、`sandbox_enforcement="relaxed"`、`used_local_process_fallback=true` 和 `local_process_fallback_reason`。`read-only` 与 `workspace-write` 不使用该分支。
+
 ## 真实对象完整结构
 
 ### CommandRequest（命令请求）
@@ -123,7 +125,7 @@ class CommandResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 ```
 
-当结果来自 sandbox，`isolation_report["sandbox"]` 是 command 层对 `SandboxResult` 的安全投影，包含 `sandbox_id`、`backend`、`status`、`trace_id`、`enforcement_status`、`execution_backend`、`backend_is_local_process`、`network_denied_verified`、`process_tree_kill`、`job_killed`、`timeout_enforced`、`artifact_count`、`artifacts`、`artifact_refs`、`changed_files`、`changed_files_count`、`violations`、`cleanup_status`、`imported_changes_count` 和数值 `timing`。同一批字段的简化版本与 `sandbox_timing` 也进入 `CommandResult.metadata`，供 VerificationRunner、Planner、Finalizer 和 evaluation timing 聚合；timing 不包含命令正文或环境值。
+当结果来自 sandbox，`isolation_report["sandbox"]` 是 command 层对 `SandboxResult` 的安全投影，包含 `sandbox_id`、`backend`、`status`、`trace_id`、`enforcement_status`、`execution_backend`、`backend_is_local_process`、`sandbox_mode`、`sandbox_enforcement`、`used_local_process_fallback`、`local_process_fallback_reason`、`network_denied_verified`、`process_tree_kill`、`job_killed`、`timeout_enforced`、`artifact_count`、`artifacts`、`artifact_refs`、`changed_files`、`changed_files_count`、`violations`、`cleanup_status`、`imported_changes_count` 和数值 `timing`。同一批字段的简化版本与 `sandbox_timing` 也进入 `CommandResult.metadata`，供 VerificationRunner、Planner、Finalizer 和 evaluation timing 聚合；timing 不包含命令正文或环境值。
 
 ### CommandPolicyResult（命令策略投影）
 
@@ -217,7 +219,7 @@ CommandExecutor 发出 `COMMAND_*` event 与 legacy `command` record，payload �
 
 ## 失败路径
 
-`PolicyEngine` 返回 `REQUIRE_REVIEW`/`DENY`、cwd denied、sandbox setup/backend error、timeout/idle timeout、kill 或非零退出时生成非成功 `CommandResult`；process API 通过 `status`、`error_code`、`killed_reason` 表达失败，不把启动失败登记为 running session。`workspace-write` 下 sandbox backend unavailable 时 `backend` 不得是 `local_process`，`sandbox_availability` 必须说明 backend 状态，输出仍按 `SecretRedactor` 和 output limit 处理。
+`PolicyEngine` 返回 `REQUIRE_REVIEW`/`DENY`、cwd denied、sandbox setup/backend error、timeout/idle timeout、kill 或非零退出时生成非成功 `CommandResult`；process API 通过 `status`、`error_code`、`killed_reason` 表达失败，不把启动失败登记为 running session。`workspace-write` 下 sandbox backend unavailable 时 `backend` 不得是 `local_process`，`sandbox_availability` 必须说明 backend 状态，输出仍按 `SecretRedactor` 和 output limit 处理。`danger-full-access` 的 relaxed fallback 是显式会话模式，不得被当作 native sandbox enforcement，也不得让 `filesystem_isolation` 显示为 `native_os_sandbox`。
 
 ## 当前结构问题
 

@@ -53,11 +53,13 @@ class _WindowsTestFacade:
         windows_runtime,
         windows_cleanup,
         windows_doctor,
+        windows_backend,
     )
     _runner_modules: ClassVar[tuple[object, ...]] = (
         windows_common,
         windows_firewall,
         windows_runtime,
+        windows_backend,
     )
 
     def __getattr__(self, name: str):
@@ -1864,6 +1866,7 @@ def test_apply_account_acl_scopes_low_integrity_to_workspace(
         commands.append(command)
         return subprocess.CompletedProcess(command, 0, "", "")
 
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
     monkeypatch.setattr(windows, "_run_command", fake_run_command)
     run_root = tmp_path / "run"
@@ -2127,7 +2130,7 @@ def test_runtime_env_prepends_discovered_python_dll_directories(
 
     env = windows._runtime_env({"PATH": "C:\\Existing"})
 
-    path_entries = env["PATH"].split(windows.os.pathsep)
+    path_entries = env["PATH"].split(windows.WINDOWS_PATH_SEPARATOR)
     assert path_entries[:3] == [str(scripts), str(dlls), str(library_bin)]
     assert path_entries[-1] == "C:\\Existing"
     assert env["TEMP"] == "C:\\Temp"
@@ -2240,6 +2243,7 @@ def test_network_probe_requires_host_connectivity_baseline(
         launched = True
         raise AssertionError("runner should not launch without host network baseline")
 
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_network_state",

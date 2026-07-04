@@ -26,6 +26,7 @@ from singularity.command.output import SecretRedactor
 from singularity.context import ContextManager
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import DecisionOutcome, PolicyConfig, PolicyEngine
+from singularity.policy.models import PolicyConstraints, PolicyDecision, PolicyRequest, RiskLevel
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.sandbox import SandboxManager
 from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
@@ -65,6 +66,26 @@ def unrestricted_command_executor(tmp_path: Path, **kwargs) -> CommandExecutor:
         ),
         **kwargs,
     )
+
+
+class _SandboxRequiredDangerPolicyEngine:
+    def __init__(self, workspace: Path) -> None:
+        self.config = PolicyConfig(
+            workspace_root=workspace,
+            permission_profile=PermissionProfile.default_for_workspace(
+                workspace,
+                profile=PermissionProfileName.DANGER_FULL_ACCESS,
+            ),
+        )
+
+    def enforce(self, request: PolicyRequest) -> PolicyDecision:
+        return PolicyDecision(
+            request_id=request.request_id,
+            outcome=DecisionOutcome.SANDBOX_REQUIRED,
+            reason="sandbox required by test",
+            risk_level=RiskLevel.MEDIUM,
+            constraints=PolicyConstraints(sandbox_required=True),
+        )
 
 
 def test_command_reader_reads_output_in_chunks() -> None:
@@ -161,6 +182,46 @@ def test_workspace_write_command_requires_sandbox_instead_of_local_process(
     assert result.backend != "local_process"
     assert result.error_code in {"sandbox_unavailable", None}
     assert result.isolation_report["filesystem_isolation"] != "workspace_cwd_advisory"
+
+
+def test_danger_full_access_relaxes_sandbox_required_when_backend_missing(
+    tmp_path: Path,
+) -> None:
+    component = CommandExecutor(
+        tmp_path,
+        policy_engine=_SandboxRequiredDangerPolicyEngine(tmp_path),  # type: ignore[arg-type]
+        sandbox_manager=SandboxManager(
+            tmp_path,
+            backends=[],
+            permission_profile=PermissionProfile.default_for_workspace(
+                tmp_path,
+                profile=PermissionProfileName.DANGER_FULL_ACCESS,
+            ),
+        ),
+    )
+
+    result = component.run(
+        CommandRequest(
+            argv=[sys.executable, "-c", "print('relaxed command')"],
+            cwd=".",
+            purpose=CommandPurpose.READ_ONLY_COMMAND,
+        )
+    )
+
+    assert result.execution_status == ExecutionStatus.COMPLETED
+    assert result.semantic_status == SemanticStatus.SUCCEEDED
+    assert result.backend == "local_process"
+    assert result.stdout_preview.strip() == "relaxed command"
+    assert result.error_code is None
+    sandbox_report = result.isolation_report["sandbox"]
+    assert sandbox_report["backend_is_local_process"] is True
+    assert sandbox_report["enforcement_status"] == "relaxed"
+    assert sandbox_report["execution_backend"] == "local_process"
+    assert sandbox_report["sandbox_mode"] == "danger-full-access"
+    assert sandbox_report["used_local_process_fallback"] is True
+    assert result.isolation_report["filesystem_isolation"] == "workspace_cwd_advisory"
+    assert result.metadata["used_local_process_fallback"] is True
+    assert result.metadata["local_process_fallback_reason"] == "danger-full-access sandbox mode"
 
 
 def test_workspace_write_low_risk_verification_runs_through_windows_sandbox(

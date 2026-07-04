@@ -57,6 +57,7 @@ from singularity.sandbox.windows_common import (
     SETUP_SCHEMA_VERSION,
     SETUP_STEP_ORDER,
     WINDOWS_LOCAL_ACCOUNT_NAME_LIMIT,
+    WINDOWS_PATH_SEPARATOR,
     WindowsCapabilityState,
     WindowsSandboxCleanupReport,
     WindowsSandboxDoctorReport,
@@ -710,10 +711,10 @@ class WindowsSandboxBackend:
                 runtime[name] = value
         path_entries = [str(path) for path in _python_runtime_path_directories()]
         existing_path = runtime.get("PATH", "")
-        for entry in existing_path.split(os.pathsep):
+        for entry in existing_path.split(WINDOWS_PATH_SEPARATOR):
             if entry and entry not in path_entries:
                 path_entries.append(entry)
         if path_entries:
-            runtime["PATH"] = os.pathsep.join(path_entries)
+            runtime["PATH"] = WINDOWS_PATH_SEPARATOR.join(path_entries)
         runtime.setdefault("PYTHONIOENCODING", "utf-8")
         return runtime

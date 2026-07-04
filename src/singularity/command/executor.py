@@ -765,12 +765,22 @@ class CommandExecutor:
             ),
             "execution_backend": sandbox_result.metadata.get("execution_backend"),
             "backend_is_local_process": sandbox_result.backend_name == "local_process",
+            "sandbox_mode": sandbox_result.metadata.get("sandbox_mode"),
+            "sandbox_enforcement": sandbox_result.metadata.get("sandbox_enforcement"),
+            "used_local_process_fallback": bool(
+                sandbox_result.metadata.get("used_local_process_fallback")
+            ),
+            "local_process_fallback_reason": sandbox_result.metadata.get(
+                "local_process_fallback_reason"
+            ),
             "network_denied_verified": sandbox_result.metadata.get(
                 "network_denied_verified"
             ),
             "process_tree_kill": sandbox_result.metadata.get("process_tree_kill"),
             "job_killed": sandbox_result.metadata.get("job_killed"),
-            "timeout_enforced": sandbox_result.status == SandboxStatus.TIMEOUT,
+            "timeout_enforced": sandbox_result.metadata.get("timeout_enforced")
+            if sandbox_result.metadata.get("timeout_enforced") is not None
+            else sandbox_result.status == SandboxStatus.TIMEOUT,
             "artifact_count": len(sandbox_result.artifacts),
             "artifacts": [artifact.to_dict() for artifact in sandbox_result.artifacts],
             "artifact_refs": [
@@ -785,7 +795,8 @@ class CommandExecutor:
         }
         isolation_report = self._isolation_report(request.resource_limits)
         isolation_report["backend"] = sandbox_result.backend_name
-        isolation_report["filesystem_isolation"] = "native_os_sandbox"
+        if not sandbox_report["backend_is_local_process"]:
+            isolation_report["filesystem_isolation"] = "native_os_sandbox"
         isolation_report["sandbox"] = sandbox_report
         return CommandResult(
             command_id=request.command_id,
@@ -837,6 +848,12 @@ class CommandExecutor:
                 "sandbox_timing": dict(sandbox_result.metadata.get("timing") or {}),
                 "enforcement_status": sandbox_report["enforcement_status"],
                 "execution_backend": sandbox_report["execution_backend"],
+                "sandbox_mode": sandbox_report["sandbox_mode"],
+                "sandbox_enforcement": sandbox_report["sandbox_enforcement"],
+                "used_local_process_fallback": sandbox_report["used_local_process_fallback"],
+                "local_process_fallback_reason": sandbox_report[
+                    "local_process_fallback_reason"
+                ],
                 "network_denied_verified": sandbox_report["network_denied_verified"],
                 "process_tree_kill": sandbox_report["process_tree_kill"],
                 "job_killed": sandbox_report["job_killed"],

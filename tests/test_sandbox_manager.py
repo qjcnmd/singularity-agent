@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.sandbox import (
     PreparedSandbox,
     SandboxCapabilities,
@@ -103,6 +106,22 @@ def _request(tmp_path: Path) -> SandboxRequest:
     )
 
 
+def _manager_with_profile(
+    tmp_path: Path,
+    profile: PermissionProfileName,
+    *,
+    backends: list[_Backend] | None = None,
+) -> SandboxManager:
+    return SandboxManager(
+        tmp_path,
+        backends=backends if backends is not None else [],
+        permission_profile=PermissionProfile.default_for_workspace(
+            tmp_path,
+            profile=profile,
+        ),
+    )
+
+
 def test_default_backends_contain_only_native_os_backend() -> None:
     names = [backend.name() for backend in default_sandbox_backends()]
 
@@ -122,6 +141,125 @@ def test_manager_fails_closed_without_available_backend_and_does_not_prepare(
     assert result.metadata["error_code"] == "backend_unavailable"
     assert backend.prepare_calls == 0
     assert backend.run_calls == 0
+
+
+def test_manager_read_only_mode_fails_closed_without_native_backend(
+    tmp_path: Path,
+) -> None:
+    component = _manager_with_profile(tmp_path, PermissionProfileName.READ_ONLY)
+
+    result = component.run(_request(tmp_path))
+
+    assert result.status == SandboxStatus.BACKEND_UNAVAILABLE
+    assert result.backend_name == "unavailable"
+    assert result.metadata["error_code"] == "backend_unavailable"
+    assert result.metadata.get("used_local_process_fallback") is not True
+
+
+def test_manager_workspace_write_mode_fails_closed_without_native_backend(
+    tmp_path: Path,
+) -> None:
+    component = _manager_with_profile(tmp_path, PermissionProfileName.WORKSPACE_WRITE)
+
+    result = component.run(_request(tmp_path))
+
+    assert result.status == SandboxStatus.BACKEND_UNAVAILABLE
+    assert result.backend_name == "unavailable"
+    assert result.metadata["error_code"] == "backend_unavailable"
+    assert result.metadata.get("used_local_process_fallback") is not True
+
+
+def test_manager_danger_full_access_runs_local_process_when_backend_missing(
+    tmp_path: Path,
+) -> None:
+    component = _manager_with_profile(
+        tmp_path,
+        PermissionProfileName.DANGER_FULL_ACCESS,
+    )
+    request = _request(tmp_path)
+    request.command = [sys.executable, "-c", "print('relaxed sandbox')"]
+
+    result = component.run(request)
+
+    assert result.status == SandboxStatus.SUCCESS
+    assert result.backend_name == "local_process"
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "relaxed sandbox"
+    assert result.metadata["sandbox_mode"] == "danger-full-access"
+    assert result.metadata["sandbox_enforcement"] == "relaxed"
+    assert result.metadata["enforcement_status"] == "relaxed"
+    assert result.metadata["execution_backend"] == "local_process"
+    assert result.metadata["backend_is_local_process"] is True
+    assert result.metadata["used_local_process_fallback"] is True
+    assert result.metadata["local_process_fallback_reason"] == "danger-full-access sandbox mode"
+
+
+def test_manager_danger_full_access_records_relaxed_trace(tmp_path: Path) -> None:
+    component = _manager_with_profile(
+        tmp_path,
+        PermissionProfileName.DANGER_FULL_ACCESS,
+    )
+    request = _request(tmp_path)
+    request.command = [
+        sys.executable,
+        "-c",
+        "print('trace ok')",
+        "--token",
+        "plain-secret-value",
+    ]
+
+    result = component.run(request)
+
+    assert result.status == SandboxStatus.SUCCESS
+    trace_path = tmp_path / ".singularity" / "sandbox" / "trace.jsonl"
+    trace_entries = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    entry = trace_entries[-1]
+    assert entry["backend_name"] == "local_process"
+    assert entry["sandbox_mode"] == "danger-full-access"
+    assert entry["sandbox_enforcement"] == "relaxed"
+    assert entry["enforcement_status"] == "relaxed"
+    assert entry["used_local_process_fallback"] is True
+    assert entry["local_process_fallback_reason"] == "danger-full-access sandbox mode"
+    assert "plain-secret-value" not in trace_path.read_text(encoding="utf-8")
+
+
+def test_manager_danger_full_access_still_blocks_protected_paths(
+    tmp_path: Path,
+) -> None:
+    component = _manager_with_profile(
+        tmp_path,
+        PermissionProfileName.DANGER_FULL_ACCESS,
+    )
+    request = _request(tmp_path)
+    request.command = [sys.executable, ".env"]
+
+    result = component.run(request)
+
+    assert result.status == SandboxStatus.POLICY_BLOCKED
+    assert result.backend_name == "policy"
+    assert result.metadata["error_code"] == "protected_path_denied"
+    assert result.metadata.get("used_local_process_fallback") is not True
+
+
+def test_manager_danger_full_access_blocks_protected_executable_path(
+    tmp_path: Path,
+) -> None:
+    component = _manager_with_profile(
+        tmp_path,
+        PermissionProfileName.DANGER_FULL_ACCESS,
+    )
+    request = _request(tmp_path)
+    request.command = [".env"]
+
+    result = component.run(request)
+
+    assert result.status == SandboxStatus.POLICY_BLOCKED
+    assert result.backend_name == "policy"
+    assert result.metadata["error_code"] == "protected_path_denied"
+    assert result.metadata.get("used_local_process_fallback") is not True
 
 
 def test_manager_enforces_resolved_request_capabilities_before_prepare(tmp_path: Path) -> None:

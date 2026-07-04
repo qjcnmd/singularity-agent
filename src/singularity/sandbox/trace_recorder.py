@@ -58,6 +58,16 @@ class SandboxJsonlTraceRecorder:
             "changed_files_count": result.filesystem_changes.total_changed_files,
             "violations": [violation.to_dict() for violation in result.violations],
             "cleanup_status": result.cleanup_status,
+            "sandbox_mode": result.metadata.get("sandbox_mode"),
+            "sandbox_enforcement": result.metadata.get("sandbox_enforcement"),
+            "enforcement_status": result.metadata.get("enforcement_status"),
+            "execution_backend": result.metadata.get("execution_backend"),
+            "used_local_process_fallback": bool(
+                result.metadata.get("used_local_process_fallback")
+            ),
+            "local_process_fallback_reason": result.metadata.get(
+                "local_process_fallback_reason"
+            ),
             "timing": dict(result.metadata.get("timing") or {}),
             "policy_decision_id": request.policy_decision_id if request else None,
         }
