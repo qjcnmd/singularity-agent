@@ -573,32 +573,7 @@ class Planner:
                     "failure": failure,
                 }
             )
-        if tool_name == "read_file" and isinstance(content, dict):
-            self.evidence.add_unique_file(str(content.get("path") or ""))
-        elif tool_name == "list_files" and isinstance(content, dict):
-            root = content.get("root")
-            if root:
-                self.evidence.add_unique_file(str(root))
-        elif tool_name == "search_text" and isinstance(content, dict):
-            self.evidence.search_results.extend(content.get("matches") or [])
-        elif tool_name.startswith("index_") and isinstance(content, dict):
-            project_index = content.get("project_index")
-            observation = project_index if isinstance(project_index, dict) else content
-            self.record_project_index_observation(observation)
-        elif tool_name in DIFF_TOOLS and isinstance(content, dict):
-            self.record_diff_observation(content, tool_call_id=tool_call_id)
-        elif tool_name in MUTATION_TOOLS and isinstance(content, dict):
-            self.update_from_mutation(content, tool_call_id=tool_call_id)
-        elif tool_name.startswith("edit_") and isinstance(content, dict):
-            self.update_from_edit(content, tool_call_id=tool_call_id)
-        elif tool_name.startswith("review_") and isinstance(content, dict):
-            self.record_review_observation(content)
-        elif tool_name.startswith("workspace_") and isinstance(content, dict):
-            self.update_from_mutation(content, tool_call_id=tool_call_id)
-        elif tool_name in {"run_command", "start_process", "stop_process"} and isinstance(content, dict):
-            self.update_from_command(content, tool_call_id=tool_call_id)
-        elif "verification" in tool_name and isinstance(content, dict):
-            self.update_from_verification(content, tool_call_id=tool_call_id)
+        self._record_tool_content(tool_name=tool_name, content=content, tool_call_id=tool_call_id)
 
         if action_id and action_id in self.actions:
             self.actions[action_id].status = ActionStatus.SUCCEEDED if payload.get("ok") else ActionStatus.FAILED
@@ -613,6 +588,42 @@ class Planner:
             reason=f"Recorded result for {tool_name}.",
             evidence_refs=[tool_call_id] if tool_call_id else [],
         )
+
+    def _record_tool_content(
+        self,
+        *,
+        tool_name: str,
+        content: Any,
+        tool_call_id: str | None,
+    ) -> None:
+        if not isinstance(content, dict):
+            return
+        if tool_name == "read_file":
+            self.evidence.add_unique_file(str(content.get("path") or ""))
+        elif tool_name == "list_files":
+            root = content.get("root")
+            if root:
+                self.evidence.add_unique_file(str(root))
+        elif tool_name == "search_text":
+            self.evidence.search_results.extend(content.get("matches") or [])
+        elif tool_name.startswith("index_"):
+            project_index = content.get("project_index")
+            observation = project_index if isinstance(project_index, dict) else content
+            self.record_project_index_observation(observation)
+        elif tool_name in DIFF_TOOLS:
+            self.record_diff_observation(content, tool_call_id=tool_call_id)
+        elif tool_name in MUTATION_TOOLS:
+            self.update_from_mutation(content, tool_call_id=tool_call_id)
+        elif tool_name.startswith("edit_"):
+            self.update_from_edit(content, tool_call_id=tool_call_id)
+        elif tool_name.startswith("review_"):
+            self.record_review_observation(content)
+        elif tool_name.startswith("workspace_"):
+            self.update_from_mutation(content, tool_call_id=tool_call_id)
+        elif tool_name in {"run_command", "start_process", "stop_process"}:
+            self.update_from_command(content, tool_call_id=tool_call_id)
+        elif "verification" in tool_name:
+            self.update_from_verification(content, tool_call_id=tool_call_id)
 
     def update_from_mutation(
         self, result: Any, *, tool_call_id: str | None = None

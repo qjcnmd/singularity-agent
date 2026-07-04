@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
-import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from singularity.atomic_io import atomic_write_text, file_lock
 from singularity.memory.models import (
     SCHEMA_VERSION,
     MemoryCandidate,
@@ -58,11 +56,11 @@ class MemoryStore:
         self._migrate_legacy_auto_files()
         for path in (self.layout.entries_jsonl, self.layout.candidates_jsonl):
             if not path.exists():
-                _atomic_write(path, "")
+                atomic_write_text(path, "")
         for label, filename in HUMAN_FILES.items():
             path = self.layout.human_dir / filename
             if not path.exists():
-                _atomic_write(path, _initial_markdown(label))
+                atomic_write_text(path, _initial_markdown(label))
         legacy_preferences = self.layout.human_dir / "user_preferences.md"
         preferences = self.layout.human_dir / HUMAN_FILES["preferences"]
         if (
@@ -70,7 +68,7 @@ class MemoryStore:
             and preferences.exists()
             and _is_template_only(preferences.read_text(encoding="utf-8"))
         ):
-            _atomic_write(preferences, legacy_preferences.read_text(encoding="utf-8"))
+            atomic_write_text(preferences, legacy_preferences.read_text(encoding="utf-8"))
         if rebuild_index and not self.layout.index_json.exists():
             self.rebuild_index()
 
@@ -100,7 +98,7 @@ class MemoryStore:
         raise KeyError(candidate_id)
 
     def upsert_entry(self, entry: MemoryEntry) -> MemoryEntry:
-        with _file_lock(self._lock_path):
+        with file_lock(self._lock_path):
             entries = self.load_entries()
             updated = False
             for index, existing in enumerate(entries):
@@ -114,7 +112,7 @@ class MemoryStore:
         return entry
 
     def upsert_candidate(self, candidate: MemoryCandidate) -> MemoryCandidate:
-        with _file_lock(self._lock_path):
+        with file_lock(self._lock_path):
             candidates = self.load_candidates()
             updated = False
             for index, existing in enumerate(candidates):
@@ -128,7 +126,7 @@ class MemoryStore:
         return candidate
 
     def accept_candidate(self, candidate_id: str) -> MemoryEntry:
-        with _file_lock(self._lock_path):
+        with file_lock(self._lock_path):
             candidates = self.load_candidates()
             candidate = _find_candidate(candidates, candidate_id)
             accepted = candidate.with_status(MemoryStatus.ACTIVE, reason="accepted")
@@ -154,7 +152,7 @@ class MemoryStore:
             return entry
 
     def reject_candidate(self, candidate_id: str, *, reason: str = "rejected") -> MemoryCandidate:
-        with _file_lock(self._lock_path):
+        with file_lock(self._lock_path):
             candidates = self.load_candidates()
             rejected = _find_candidate(candidates, candidate_id).with_status(MemoryStatus.REJECTED, reason=reason)
             _upsert_candidate(candidates, rejected)
@@ -162,7 +160,7 @@ class MemoryStore:
             return rejected
 
     def tombstone_entry(self, entry_id: str, *, reason: str = "deleted") -> MemoryEntry:
-        with _file_lock(self._lock_path):
+        with file_lock(self._lock_path):
             entries = self.load_entries()
             entry = _find_entry(entries, entry_id)
             payload = entry.to_dict()
@@ -175,14 +173,14 @@ class MemoryStore:
             return tombstone
 
     def replace_entries(self, entries: list[MemoryEntry], *, rebuild: bool = True) -> None:
-        with _file_lock(self._lock_path):
+        with file_lock(self._lock_path):
             if rebuild:
                 self._write_entries(entries)
                 return
             _write_jsonl(self.layout.entries_jsonl, [entry.to_dict() for entry in entries])
 
     def replace_candidates(self, candidates: list[MemoryCandidate], *, rebuild: bool = True) -> None:
-        with _file_lock(self._lock_path):
+        with file_lock(self._lock_path):
             if rebuild:
                 self._write_candidates(candidates)
                 return
@@ -217,7 +215,7 @@ class MemoryStore:
             "modules": sorted({module for entry in active for module in entry.modules}),
             "error_types": sorted({error for entry in active for error in entry.error_types}),
         }
-        _atomic_write(self.layout.index_json, json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True))
+        atomic_write_text(self.layout.index_json, json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True))
         return index
 
     def write_human_projection(self, entries: list[MemoryEntry] | None = None) -> None:
@@ -239,7 +237,7 @@ class MemoryStore:
             legacy = self.root / filename
             target = self.layout.auto_dir / filename
             if legacy.exists() and not target.exists():
-                _atomic_write(target, legacy.read_text(encoding="utf-8"))
+                atomic_write_text(target, legacy.read_text(encoding="utf-8"))
 
 
 def _render_markdown(label: str, entries: list[MemoryEntry]) -> str:
@@ -315,7 +313,7 @@ def _write_jsonl(path: Path, items: list[dict[str, Any]]) -> None:
         json.dumps(item, ensure_ascii=False, sort_keys=True, default=str) + "\n"
         for item in items
     )
-    _atomic_write(path, text)
+    atomic_write_text(path, text)
 
 
 def _find_entry(entries: list[MemoryEntry], entry_id: str) -> MemoryEntry:
@@ -346,74 +344,6 @@ def _upsert_candidate(candidates: list[MemoryCandidate], candidate: MemoryCandid
             candidates[index] = candidate
             return
     candidates.append(candidate)
-
-
-@contextmanager
-def _file_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as handle:
-        _lock_file(handle)
-        try:
-            yield
-        finally:
-            _unlock_file(handle)
-
-
-def _lock_file(handle: Any) -> None:
-    if os.name == "nt":
-        import msvcrt
-
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-
-
-def _unlock_file(handle: Any) -> None:
-    if os.name == "nt":
-        import msvcrt
-
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    _replace_with_retry(tmp, path)
-    try:
-        directory_fd = os.open(str(path.parent), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(directory_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(directory_fd)
-
-
-def _replace_with_retry(tmp: Path, path: Path) -> None:
-    last_error: PermissionError | None = None
-    for attempt in range(8):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError as exc:
-            last_error = exc
-            time.sleep(0.05 * (attempt + 1))
-    if last_error is not None:
-        raise last_error
 
 
 def _count_by(entries: list[MemoryEntry], attr: str) -> dict[str, int]:

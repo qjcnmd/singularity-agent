@@ -216,24 +216,15 @@ class EvaluationRunner:
         fail_to_pass_satisfied = False
         verification_misconfiguration_reason = ""
         try:
-            phase_started = time.perf_counter()
-            _reset_dir(task_dir, root=self.run_dir)
-            evaluation_timing["run_root_reset_time_seconds"] = time.perf_counter() - phase_started
             try:
-                phase_started = time.perf_counter()
-                self._materialize_workspace(
+                self._prepare_task_workspace(
                     task,
+                    task_dir=task_dir,
                     workspace=workspace,
                     manifest_base=manifest_base,
                     timing=evaluation_timing,
                 )
-                evaluation_timing["workspace_materialization_time_seconds"] = (
-                    time.perf_counter() - phase_started
-                )
             except EvaluationSetupError as exc:
-                evaluation_timing["workspace_materialization_time_seconds"] = (
-                    time.perf_counter() - phase_started
-                )
                 errors.append(str(exc))
                 return self._task_result(
                     task=task,
@@ -431,27 +422,19 @@ class EvaluationRunner:
                         evaluation_timing=evaluation_timing,
                     )
             goal = _task_goal(task)
-            phase_started = time.perf_counter()
-            kernel = self.bootstrap_cls(project_root=workspace, config=config, console=self.console).boot(goal)
-            _apply_benchmark_constraints(kernel, task)
-            agent_result = kernel.run_task(goal)
-            evaluation_timing["agent_loop_time_seconds"] = time.perf_counter() - phase_started
-            trace_path = _trace_path(kernel)
-            trace_summary = _trace_summary(kernel, agent_result)
-            final_report_payload = _final_report_payload(agent_result)
-            usage = dict(trace_summary.get("model_usage_summary") or {})
-            tool_calls = _safe_int(trace_summary.get("tool_calls")) or _safe_int(usage.get("tool_calls_proposed"))
-            turn_count = _turn_count(agent_result, usage)
-            policy_blocks = _policy_blocks(final_report_payload, trace_summary)
-            trace_artifact_refs = _trace_artifact_refs(final_report_payload, trace_summary)
-            agent_status = _agent_status(agent_result)
-            environment_blocker_reason = ""
-            if _infrastructure_blocked(agent_result, usage=usage, tool_calls=tool_calls):
-                environment_blocker_reason = "model provider unavailable"
-            elif _sandbox_environment_blocked(kernel, agent_status=agent_status):
-                environment_blocker_reason = _sandbox_environment_blocker_reason(kernel)
-            elif _final_report_environment_blocked(final_report_payload):
-                environment_blocker_reason = _final_report_environment_blocker_reason(final_report_payload)
+            agent_run = self._run_agent_task(task, workspace=workspace, config=config, goal=goal, timing=evaluation_timing)
+            kernel = agent_run["kernel"]
+            agent_result = agent_run["agent_result"]
+            trace_path = agent_run["trace_path"]
+            trace_summary = agent_run["trace_summary"]
+            final_report_payload = agent_run["final_report_payload"]
+            usage = agent_run["usage"]
+            tool_calls = agent_run["tool_calls"]
+            turn_count = agent_run["turn_count"]
+            policy_blocks = agent_run["policy_blocks"]
+            trace_artifact_refs = agent_run["trace_artifact_refs"]
+            agent_status = agent_run["agent_status"]
+            environment_blocker_reason = agent_run["environment_blocker_reason"]
             if environment_blocker_reason:
                 errors.append(f"environment blocker: {environment_blocker_reason}")
                 files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
@@ -512,107 +495,60 @@ class EvaluationRunner:
             )
             patch_payload["applicable"] = applicable
             patch_applied = applicable
-            public_command = _public_verification_command(task)
-            hidden_command = _hidden_verification_command(task)
-            if task.verification_prepare_commands:
-                if public_command:
-                    phase_started = time.perf_counter()
-                    public_verification = _run_shell(
-                        public_command,
-                        cwd=verification_workspace,
-                        timeout_seconds=task.verification_timeout_seconds,
-                        redactor=self.redactor,
-                    )
-                    evaluation_timing["public_verification_time_seconds"] = (
-                        time.perf_counter() - phase_started
-                    )
-                else:
-                    public_verification = CommandEvalResult(
-                        command="",
-                        exit_code=0,
-                        duration_seconds=0.0,
-                        error_summary="hidden verifier only",
-                        interpreter_strategy={
-                            "schema_version": "evaluation.command_interpreter/v1",
-                            "mode": "not_run",
-                            "reason": "hidden_verifier_only",
-                            "shell": False,
-                            "harness_executable": sys.executable,
-                        },
-                    )
-            else:
-                phase_started = time.perf_counter()
-                public_verification = _run_shell(
-                    public_command,
-                    cwd=verification_workspace,
-                    timeout_seconds=task.verification_timeout_seconds,
-                    redactor=self.redactor,
+            verification_run = self._run_task_verification(
+                task,
+                verification_workspace=verification_workspace,
+                timing=evaluation_timing,
+            )
+            public_verification = verification_run["public_verification"]
+            hidden_verification = verification_run["hidden_verification"]
+            verification = verification_run["verification"]
+            checks = verification_run["checks"]
+            failed_prepare_command = verification_run["failed_prepare_command"]
+            if failed_prepare_command:
+                prepared = verification
+                errors.append(f"verification prepare failed: {prepared.error_summary or failed_prepare_command}")
+                allowed_ok = _allowed_scope_ok(files_changed, task.allowed_paths)
+                contract_satisfaction = _contract_satisfaction(
+                    task,
+                    files_changed=files_changed,
+                    allowed_scope=allowed_ok,
+                    verification=prepared,
+                    public_verification=public_verification,
+                    agent_status=agent_status,
+                    final_report_status=_final_report_status(final_report_payload, agent_status=agent_status),
+                    policy_blocks=policy_blocks,
+                    patch=patch_payload,
+                    final_report_payload=final_report_payload,
                 )
-                evaluation_timing["public_verification_time_seconds"] = (
-                    time.perf_counter() - phase_started
+                return self._task_result(
+                    task=task,
+                    workspace=workspace,
+                    trace=trace_path,
+                    started=started,
+                    verification=prepared,
+                    verification_workspace=verification_workspace,
+                    files_changed=files_changed,
+                    usage=usage,
+                    tool_calls=tool_calls,
+                    errors=errors,
+                    patch=patch_payload,
+                    checks=checks,
+                    success=False,
+                    tests_passed=False,
+                    infrastructure_blocked=False,
+                    agent_status=agent_status,
+                    final_report_payload=final_report_payload,
+                    trace_summary=trace_summary,
+                    turn_count=turn_count,
+                    policy_blocks=policy_blocks,
+                    trace_artifact_refs=trace_artifact_refs,
+                    contract_satisfaction=contract_satisfaction,
+                    reproducible_environment=reproducible_environment,
+                    public_verification=public_verification,
+                    hidden_verification=prepared,
+                    evaluation_timing=evaluation_timing,
                 )
-            verification_prepare_started = time.perf_counter()
-            for command in task.verification_prepare_commands:
-                prepared = _run_shell(command, cwd=verification_workspace, timeout_seconds=120, redactor=self.redactor)
-                if not prepared.passed:
-                    errors.append(f"verification prepare failed: {prepared.error_summary or command}")
-                    checks = _checks_payload(public_verification, prepared)
-                    allowed_ok = _allowed_scope_ok(files_changed, task.allowed_paths)
-                    contract_satisfaction = _contract_satisfaction(
-                        task,
-                        files_changed=files_changed,
-                        allowed_scope=allowed_ok,
-                        verification=prepared,
-                        public_verification=public_verification,
-                        agent_status=agent_status,
-                        final_report_status=_final_report_status(final_report_payload, agent_status=agent_status),
-                        policy_blocks=policy_blocks,
-                        patch=patch_payload,
-                        final_report_payload=final_report_payload,
-                    )
-                    return self._task_result(
-                        task=task,
-                        workspace=workspace,
-                        trace=trace_path,
-                        started=started,
-                        verification=prepared,
-                        verification_workspace=verification_workspace,
-                        files_changed=files_changed,
-                        usage=usage,
-                        tool_calls=tool_calls,
-                        errors=errors,
-                        patch=patch_payload,
-                        checks=checks,
-                        success=False,
-                        tests_passed=False,
-                        infrastructure_blocked=False,
-                        agent_status=agent_status,
-                        final_report_payload=final_report_payload,
-                        trace_summary=trace_summary,
-                        turn_count=turn_count,
-                        policy_blocks=policy_blocks,
-                        trace_artifact_refs=trace_artifact_refs,
-                        contract_satisfaction=contract_satisfaction,
-                        reproducible_environment=reproducible_environment,
-                        public_verification=public_verification,
-                        hidden_verification=prepared,
-                        evaluation_timing=evaluation_timing,
-                    )
-            evaluation_timing["verification_prepare_time_seconds"] = (
-                time.perf_counter() - verification_prepare_started
-            )
-            phase_started = time.perf_counter()
-            hidden_verification = _run_shell(
-                hidden_command,
-                cwd=verification_workspace,
-                timeout_seconds=task.verification_timeout_seconds,
-                redactor=self.redactor,
-            )
-            evaluation_timing["hidden_verification_time_seconds"] = (
-                time.perf_counter() - phase_started
-            )
-            verification = hidden_verification
-            checks = _checks_payload(public_verification, hidden_verification)
             tests_passed = verification.passed
             allowed_ok = _allowed_scope_ok(files_changed, task.allowed_paths)
             criterion_ok = _success_criterion_ok(
@@ -723,6 +659,143 @@ class EvaluationRunner:
             verification_misconfiguration_reason=verification_misconfiguration_reason,
             evaluation_timing=evaluation_timing,
         )
+
+    def _prepare_task_workspace(
+        self,
+        task: EvaluationTask,
+        *,
+        task_dir: Path,
+        workspace: Path,
+        manifest_base: Path,
+        timing: dict[str, Any],
+    ) -> None:
+        phase_started = time.perf_counter()
+        _reset_dir(task_dir, root=self.run_dir)
+        timing["run_root_reset_time_seconds"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
+        try:
+            self._materialize_workspace(
+                task,
+                workspace=workspace,
+                manifest_base=manifest_base,
+                timing=timing,
+            )
+        finally:
+            timing["workspace_materialization_time_seconds"] = time.perf_counter() - phase_started
+
+    def _run_agent_task(
+        self,
+        task: EvaluationTask,
+        *,
+        workspace: Path,
+        config: ProductionConfig,
+        goal: str,
+        timing: dict[str, Any],
+    ) -> dict[str, Any]:
+        phase_started = time.perf_counter()
+        kernel = self.bootstrap_cls(project_root=workspace, config=config, console=self.console).boot(goal)
+        _apply_benchmark_constraints(kernel, task)
+        agent_result = kernel.run_task(goal)
+        timing["agent_loop_time_seconds"] = time.perf_counter() - phase_started
+        trace_path = _trace_path(kernel)
+        trace_summary = _trace_summary(kernel, agent_result)
+        final_report_payload = _final_report_payload(agent_result)
+        usage = dict(trace_summary.get("model_usage_summary") or {})
+        tool_calls = _safe_int(trace_summary.get("tool_calls")) or _safe_int(usage.get("tool_calls_proposed"))
+        agent_status = _agent_status(agent_result)
+        environment_blocker_reason = ""
+        if _infrastructure_blocked(agent_result, usage=usage, tool_calls=tool_calls):
+            environment_blocker_reason = "model provider unavailable"
+        elif _sandbox_environment_blocked(kernel, agent_status=agent_status):
+            environment_blocker_reason = _sandbox_environment_blocker_reason(kernel)
+        elif _final_report_environment_blocked(final_report_payload):
+            environment_blocker_reason = _final_report_environment_blocker_reason(final_report_payload)
+        return {
+            "kernel": kernel,
+            "agent_result": agent_result,
+            "trace_path": trace_path,
+            "trace_summary": trace_summary,
+            "final_report_payload": final_report_payload,
+            "usage": usage,
+            "tool_calls": tool_calls,
+            "turn_count": _turn_count(agent_result, usage),
+            "policy_blocks": _policy_blocks(final_report_payload, trace_summary),
+            "trace_artifact_refs": _trace_artifact_refs(final_report_payload, trace_summary),
+            "agent_status": agent_status,
+            "environment_blocker_reason": environment_blocker_reason,
+        }
+
+    def _run_task_verification(
+        self,
+        task: EvaluationTask,
+        *,
+        verification_workspace: Path,
+        timing: dict[str, Any],
+    ) -> dict[str, Any]:
+        public_verification = self._run_public_verification(
+            task,
+            verification_workspace=verification_workspace,
+            timing=timing,
+        )
+        verification_prepare_started = time.perf_counter()
+        for command in task.verification_prepare_commands:
+            prepared = _run_shell(command, cwd=verification_workspace, timeout_seconds=120, redactor=self.redactor)
+            if not prepared.passed:
+                return {
+                    "public_verification": public_verification,
+                    "hidden_verification": prepared,
+                    "verification": prepared,
+                    "checks": _checks_payload(public_verification, prepared),
+                    "failed_prepare_command": command,
+                }
+        timing["verification_prepare_time_seconds"] = time.perf_counter() - verification_prepare_started
+        phase_started = time.perf_counter()
+        hidden_verification = _run_shell(
+            _hidden_verification_command(task),
+            cwd=verification_workspace,
+            timeout_seconds=task.verification_timeout_seconds,
+            redactor=self.redactor,
+        )
+        timing["hidden_verification_time_seconds"] = time.perf_counter() - phase_started
+        return {
+            "public_verification": public_verification,
+            "hidden_verification": hidden_verification,
+            "verification": hidden_verification,
+            "checks": _checks_payload(public_verification, hidden_verification),
+            "failed_prepare_command": "",
+        }
+
+    def _run_public_verification(
+        self,
+        task: EvaluationTask,
+        *,
+        verification_workspace: Path,
+        timing: dict[str, Any],
+    ) -> CommandEvalResult:
+        public_command = _public_verification_command(task)
+        if task.verification_prepare_commands and not public_command:
+            return CommandEvalResult(
+                command="",
+                exit_code=0,
+                duration_seconds=0.0,
+                error_summary="hidden verifier only",
+                interpreter_strategy={
+                    "schema_version": "evaluation.command_interpreter/v1",
+                    "mode": "not_run",
+                    "reason": "hidden_verifier_only",
+                    "shell": False,
+                    "harness_executable": sys.executable,
+                },
+            )
+        phase_started = time.perf_counter()
+        result = _run_shell(
+            public_command,
+            cwd=verification_workspace,
+            timeout_seconds=task.verification_timeout_seconds,
+            redactor=self.redactor,
+        )
+        timing["public_verification_time_seconds"] = time.perf_counter() - phase_started
+        return result
 
     def _materialize_workspace(
         self,
