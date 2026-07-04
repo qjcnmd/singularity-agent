@@ -384,6 +384,7 @@ def test_windows_doctor_and_setup_message_report_legacy_artifacts(
     monkeypatch.setattr(windows, "_command_state", lambda *_args: ready)
     monkeypatch.setattr(windows, "_powershell_state", lambda *_args: ready)
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
+    monkeypatch.setattr(windows_doctor, "_enumerate_account_logon_rights", lambda _sid: {})
     monkeypatch.setattr(windows, "_acl_state", lambda *_args: ready)
     monkeypatch.setattr(windows, "_network_state", lambda _sid: ready)
     monkeypatch.setattr(windows, "_online_network_filter_state", lambda _sid: ready)
@@ -1418,7 +1419,14 @@ def test_windows_backend_cleanup_uses_sandbox_account_preclean_before_host_delet
     runner = _FakeRunner(stdout="cleanup ok\n")
     cleaned: list[Path] = []
 
+    monkeypatch.setattr(windows_backend, "_is_windows", lambda: True)
     monkeypatch.setattr(windows_backend, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(windows_backend.shutil, "which", lambda name, **_kwargs: f"{name}.exe")
+    monkeypatch.setattr(
+        windows_backend,
+        "_run_command",
+        lambda command: subprocess.CompletedProcess(command, 0, "", ""),
+    )
     monkeypatch.setattr(
         windows_backend,
         "_normalize_run_root_for_cleanup",
@@ -2560,16 +2568,17 @@ def test_python_runtime_smoke_applies_acl_to_role_directories_after_creation(
 
     monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir", lambda: tmp_path)
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: tmp_path)
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
     monkeypatch.setattr(
-        windows,
+        windows_runtime,
         "_apply_probe_root_acl",
         lambda path, **_kwargs: acl_paths.append(Path(path))
         or windows._OperationResult(True),
         raising=False,
     )
     monkeypatch.setattr(
-        windows,
+        windows_runtime,
         "_account_python_smoke",
         lambda **_kwargs: sandbox.WindowsRunnerResult(
             exit_code=0,
@@ -2581,7 +2590,7 @@ def test_python_runtime_smoke_applies_acl_to_role_directories_after_creation(
             duration_ms=1,
         ),
     )
-    monkeypatch.setattr(windows, "_cleanup_probe_root", lambda _path: None)
+    monkeypatch.setattr(windows_runtime, "_cleanup_probe_root", lambda _path: None)
 
     diagnostics = windows._python_runtime_smoke_diagnostics(
         (
@@ -2602,8 +2611,9 @@ def test_python_runtime_smoke_acl_failure_reports_failure_type(
 ) -> None:
     monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir", lambda: tmp_path)
+    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: tmp_path)
     monkeypatch.setattr(
-        windows,
+        windows_runtime,
         "_apply_probe_root_acl",
         lambda _path, **_kwargs: windows._OperationResult(
             False,
@@ -2612,7 +2622,7 @@ def test_python_runtime_smoke_acl_failure_reports_failure_type(
         ),
         raising=False,
     )
-    monkeypatch.setattr(windows, "_cleanup_probe_root", lambda _path: None)
+    monkeypatch.setattr(windows_runtime, "_cleanup_probe_root", lambda _path: None)
 
     diagnostics = windows._python_runtime_smoke_diagnostics(
         (
@@ -2966,8 +2976,14 @@ def test_windows_setup_state_dir_unwritable_fails_closed_with_hash_diagnostics(
 ) -> None:
     state_root = Path("C:/ProgramData/Singularity/windows-sandbox")
 
-    monkeypatch.setattr(windows, "_is_windows", lambda: True)
-    monkeypatch.setattr(windows.os.environ, "get", lambda name, default=None: "C:\\ProgramData" if name == "PROGRAMDATA" else default)
+    monkeypatch.setattr(windows_acl, "_is_windows", lambda: True)
+    monkeypatch.setattr(windows_acl, "_windows_state_dir_path", lambda: state_root)
+
+    def state_dir_with_mkdir() -> Path:
+        state_root.mkdir(parents=True, exist_ok=True)
+        return state_root
+
+    monkeypatch.setattr(windows_acl, "_windows_state_dir", state_dir_with_mkdir)
 
     def fail_mkdir(self: Path, *args, **kwargs) -> None:
         if self == state_root:
@@ -2978,7 +2994,7 @@ def test_windows_setup_state_dir_unwritable_fails_closed_with_hash_diagnostics(
 
     monkeypatch.setattr(Path, "mkdir", fail_mkdir)
 
-    result = windows._ensure_state_dir_acl()
+    result = windows_acl._ensure_state_dir_acl()
 
     assert result.ok is False
     assert "could not be created" in result.reason
