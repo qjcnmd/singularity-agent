@@ -6,6 +6,7 @@ import signal
 import subprocess
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -26,8 +27,25 @@ from singularity.sandbox.models import (
 from singularity.sandbox.trace_recorder import SandboxJsonlTraceRecorder
 
 _RELAXED_BACKEND_NAME = "local_process"
+_WINDOWS_ELEVATED_BACKEND_NAME = "windows_elevated"
+_WINDOWS_UNELEVATED_BACKEND_NAME = "windows_unelevated"
 _DANGER_FULL_ACCESS_FALLBACK_REASON = "danger-full-access sandbox mode"
 _PROCESS_TERMINATE_TIMEOUT_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class _SelectedSandboxBackend:
+    backend: SandboxBackend
+    capabilities: Any
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _FallbackRun:
+    result: SandboxResult
+    selected: _SelectedSandboxBackend
+    capabilities: Any
+    prepared: Any | None
 
 
 class SandboxAppendTraceRecorderProtocol(Protocol):
@@ -63,6 +81,7 @@ class SandboxManager:
         started = time.perf_counter()
         backend: SandboxBackend | None = None
         backend_capabilities = None
+        selected: _SelectedSandboxBackend | None = None
         prepared = None
         self._emit_trace(
             TraceEventType.SANDBOX_REQUESTED,
@@ -81,8 +100,8 @@ class SandboxManager:
             return result
         try:
             selected = self._select_backend(request)
-            backend = selected[0] if selected is not None else None
-            backend_capabilities = selected[1] if selected is not None else None
+            backend = selected.backend if selected is not None else None
+            backend_capabilities = selected.capabilities if selected is not None else None
             if backend is None:
                 reason = self._backend_unavailable_reason()
                 if self._allows_relaxed_local_process():
@@ -92,7 +111,7 @@ class SandboxManager:
                         request,
                         reason,
                         started,
-                        backend_name=self.backends[0].name() if self.backends else "unavailable",
+                        backend_name="unavailable",
                     )
                 self._record_trace(
                     prepared=None,
@@ -101,7 +120,13 @@ class SandboxManager:
                     request=request,
                 )
                 return result
-            self.ensure_capabilities(request, backend, capabilities=backend_capabilities)
+            self.ensure_capabilities(
+                request,
+                backend,
+                capabilities=backend_capabilities,
+                reduced_enforcement_allowed=backend.name()
+                == _WINDOWS_UNELEVATED_BACKEND_NAME,
+            )
             self._throw_if_cancelled()
             prepared = backend.prepare(request)
             self._throw_if_cancelled()
@@ -143,6 +168,25 @@ class SandboxManager:
                 result.metadata["cleanup_error"] = str(exc)
                 if result.status == SandboxStatus.SUCCESS:
                     result.status = SandboxStatus.CLEANUP_FAILED
+            if (
+                selected is not None
+                and result.status == SandboxStatus.BACKEND_UNAVAILABLE
+                and backend.name() == _WINDOWS_ELEVATED_BACKEND_NAME
+            ):
+                fallback = self._run_unelevated_fallback(
+                    request,
+                    started,
+                    elevated_result=result,
+                )
+                if fallback is not None:
+                    self._record_trace(
+                        prepared=fallback.prepared,
+                        result=fallback.result,
+                        capabilities=fallback.capabilities,
+                    )
+                    return fallback.result
+            if selected is not None:
+                self._apply_selection_metadata(result, selected)
             self._record_trace(
                 prepared=prepared,
                 result=result,
@@ -159,6 +203,8 @@ class SandboxManager:
                     started,
                     backend_name=backend.name() if backend is not None else "unavailable",
                 )
+            if selected is not None:
+                self._apply_selection_metadata(result, selected)
             self._emit_trace(
                 TraceEventType.SANDBOX_CAPABILITY_FAILED,
                 request=request,
@@ -192,6 +238,8 @@ class SandboxManager:
                 cleanup_status="not_started",
                 metadata={"error_code": "sandbox_setup_failed"},
             )
+            if selected is not None:
+                self._apply_selection_metadata(result, selected)
             self._record_trace(
                 prepared=prepared,
                 result=result,
@@ -206,13 +254,19 @@ class SandboxManager:
         backend: SandboxBackend,
         *,
         capabilities: Any | None = None,
+        reduced_enforcement_allowed: bool = False,
     ) -> None:
         capabilities = capabilities if capabilities is not None else backend.capabilities()
-        if request.profile.network.require_hard_isolation and not capabilities.network_isolation:
+        if (
+            request.profile.network.require_hard_isolation
+            and not capabilities.network_isolation
+            and not reduced_enforcement_allowed
+        ):
             raise SandboxCapabilityError("Backend cannot enforce required network isolation.")
         if (
             request.profile.network.mode == SandboxNetworkMode.DENIED
             and not capabilities.network_isolation
+            and not reduced_enforcement_allowed
         ):
             raise SandboxCapabilityError(
                 f"Backend {backend.name()} cannot enforce denied network mode."
@@ -243,23 +297,240 @@ class SandboxManager:
             "capabilities": backends,
         }
 
-    def _select_backend(
-        self, request: SandboxRequest
-    ) -> tuple[SandboxBackend, Any] | None:
+    def _select_backend(self, request: SandboxRequest) -> _SelectedSandboxBackend | None:
+        mode = self._sandbox_mode()
+        elevated_backend = self._backend_by_name(_WINDOWS_ELEVATED_BACKEND_NAME)
+        elevated_available = (
+            self._backend_available(elevated_backend)
+            if elevated_backend is not None
+            else False
+        )
+        elevated_blocker_summary = (
+            ""
+            if elevated_available
+            else self._backend_reason(elevated_backend)
+            if elevated_backend is not None
+            else ""
+        )
+        fallback_reason = elevated_blocker_summary
+        ordered = self._ordered_backends()
         first_capability_error: SandboxCapabilityError | None = None
-        for backend in self.backends:
+        for backend in ordered:
+            backend_name = backend.name()
+            if not self._backend_allowed_for_mode(backend_name, mode):
+                continue
             if not self._backend_available(backend):
                 continue
             capabilities = backend.capabilities()
+            reduced = backend_name == _WINDOWS_UNELEVATED_BACKEND_NAME
             try:
-                self.ensure_capabilities(request, backend, capabilities=capabilities)
+                self.ensure_capabilities(
+                    request,
+                    backend,
+                    capabilities=capabilities,
+                    reduced_enforcement_allowed=reduced,
+                )
             except SandboxCapabilityError as exc:
                 first_capability_error = first_capability_error or exc
                 continue
-            return backend, capabilities
+            return _SelectedSandboxBackend(
+                backend=backend,
+                capabilities=capabilities,
+                metadata=self._selection_metadata(
+                    backend_name,
+                    elevated_available=elevated_available,
+                    elevated_blocker_summary=elevated_blocker_summary,
+                    fallback_reason=fallback_reason,
+                ),
+            )
         if first_capability_error is not None:
             raise first_capability_error
         return None
+
+    def _ordered_backends(self) -> list[SandboxBackend]:
+        by_name = {backend.name(): backend for backend in self.backends}
+        ordered: list[SandboxBackend] = []
+        for name in (_WINDOWS_ELEVATED_BACKEND_NAME, _WINDOWS_UNELEVATED_BACKEND_NAME):
+            backend = by_name.get(name)
+            if backend is not None:
+                ordered.append(backend)
+        ordered.extend(
+            backend
+            for backend in self.backends
+            if backend.name()
+            not in {_WINDOWS_ELEVATED_BACKEND_NAME, _WINDOWS_UNELEVATED_BACKEND_NAME}
+        )
+        return ordered
+
+    def _backend_by_name(self, name: str) -> SandboxBackend | None:
+        return next((backend for backend in self.backends if backend.name() == name), None)
+
+    def _backend_allowed_for_mode(self, backend_name: str, mode: str) -> bool:
+        if backend_name == _RELAXED_BACKEND_NAME:
+            return mode == PermissionProfileName.DANGER_FULL_ACCESS.value
+        if mode in {
+            PermissionProfileName.READ_ONLY.value,
+            PermissionProfileName.WORKSPACE_WRITE.value,
+        }:
+            return backend_name in {
+                _WINDOWS_ELEVATED_BACKEND_NAME,
+                _WINDOWS_UNELEVATED_BACKEND_NAME,
+            } or not backend_name.startswith("windows_")
+        return True
+
+    def _selection_metadata(
+        self,
+        backend_name: str,
+        *,
+        elevated_available: bool,
+        elevated_blocker_summary: str,
+        fallback_reason: str,
+    ) -> dict[str, Any]:
+        mode = self._sandbox_mode()
+        reduced = backend_name == _WINDOWS_UNELEVATED_BACKEND_NAME
+        strict = backend_name == _WINDOWS_ELEVATED_BACKEND_NAME or not reduced
+        metadata = {
+            "sandbox_mode": mode,
+            "sandbox_backend": backend_name,
+            "sandbox_enforcement": "reduced" if reduced else "strict",
+            "enforcement_status": "degraded" if reduced else "available",
+            "fallback_used": reduced,
+            "fallback_reason": fallback_reason if reduced else "",
+            "elevated_available": elevated_available,
+            "elevated_blocker_summary": elevated_blocker_summary,
+        }
+        if strict and backend_name == _WINDOWS_ELEVATED_BACKEND_NAME:
+            metadata.setdefault("execution_backend", "account_restricted_token")
+        elif reduced:
+            metadata.setdefault("execution_backend", "current_user_process")
+        return metadata
+
+    @staticmethod
+    def _apply_selection_metadata(
+        result: SandboxResult,
+        selected: _SelectedSandboxBackend,
+    ) -> None:
+        for key, value in selected.metadata.items():
+            if value == "":
+                result.metadata.setdefault(key, value)
+            else:
+                result.metadata[key] = value
+        result.metadata.setdefault("sandbox_backend", result.backend_name)
+        result.metadata.setdefault("sandbox_mode", selected.metadata["sandbox_mode"])
+        result.metadata.setdefault(
+            "backend_is_local_process",
+            result.backend_name == _RELAXED_BACKEND_NAME,
+        )
+
+    def _run_unelevated_fallback(
+        self,
+        request: SandboxRequest,
+        started: float,
+        *,
+        elevated_result: SandboxResult,
+    ) -> _FallbackRun | None:
+        backend = self._backend_by_name(_WINDOWS_UNELEVATED_BACKEND_NAME)
+        if backend is None or not self._backend_available(backend):
+            return None
+        capabilities = backend.capabilities()
+        try:
+            self.ensure_capabilities(
+                request,
+                backend,
+                capabilities=capabilities,
+                reduced_enforcement_allowed=True,
+            )
+        except SandboxCapabilityError:
+            return None
+        reason = str(
+            elevated_result.metadata.get("reason")
+            or elevated_result.stderr
+            or self._backend_reason(self._backend_by_name(_WINDOWS_ELEVATED_BACKEND_NAME))
+            or "native_windows_elevated_sandbox_unavailable"
+        )
+        selected = _SelectedSandboxBackend(
+            backend=backend,
+            capabilities=capabilities,
+            metadata=self._selection_metadata(
+                backend.name(),
+                elevated_available=False,
+                elevated_blocker_summary=_safe_reason(reason),
+                fallback_reason=_safe_reason(reason),
+            ),
+        )
+        prepared = None
+        try:
+            prepared = backend.prepare(request)
+            self._emit_trace(
+                TraceEventType.SANDBOX_PREPARED,
+                request=request,
+                result=None,
+                summary=f"Sandbox prepared with {backend.name()}.",
+                payload={
+                    "sandbox_id": prepared.sandbox_id,
+                    "backend": prepared.backend_name,
+                    "sandbox_handle": _relative_handle(prepared.sandbox_root, self.workspace_root),
+                    "timing": dict(prepared.baseline.get("timing") or {}),
+                },
+            )
+            self._emit_trace(
+                TraceEventType.SANDBOX_STARTED,
+                request=request,
+                result=None,
+                summary=f"Sandbox command started in {prepared.sandbox_id}.",
+            )
+            result = backend.run(prepared)
+            try:
+                cleanup_started = time.perf_counter()
+                backend.cleanup(prepared)
+                result.metadata.setdefault("timing", {})["run_root_cleanup_time_seconds"] = (
+                    time.perf_counter() - cleanup_started
+                )
+                result.cleanup_status = "cleaned"
+                self._emit_trace(
+                    TraceEventType.SANDBOX_CLEANED,
+                    request=request,
+                    result=result,
+                    summary=f"Sandbox cleaned for {result.sandbox_id}.",
+                )
+            except Exception as exc:
+                result.cleanup_status = "cleanup_failed"
+                result.metadata["cleanup_error"] = str(exc)
+                if result.status == SandboxStatus.SUCCESS:
+                    result.status = SandboxStatus.CLEANUP_FAILED
+            self._apply_selection_metadata(result, selected)
+            return _FallbackRun(
+                result=result,
+                selected=selected,
+                capabilities=capabilities,
+                prepared=prepared,
+            )
+        except Exception as exc:
+            if _is_cancellation_error(exc):
+                if prepared is not None:
+                    with suppress(Exception):
+                        backend.cleanup(prepared)
+                raise
+            result = SandboxResult(
+                sandbox_id=request.sandbox_id,
+                backend_name=backend.name(),
+                status=SandboxStatus.SETUP_FAILED,
+                exit_code=None,
+                stdout="",
+                stderr=str(exc),
+                started_at=_now(),
+                ended_at=_now(),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                cleanup_status="not_started",
+                metadata={"error_code": "sandbox_setup_failed"},
+            )
+            self._apply_selection_metadata(result, selected)
+            return _FallbackRun(
+                result=result,
+                selected=selected,
+                capabilities=capabilities,
+                prepared=prepared,
+            )
 
     @staticmethod
     def _backend_available(backend: SandboxBackend) -> bool:
@@ -274,21 +545,37 @@ class SandboxManager:
     def _backend_unavailable_reason(self) -> str:
         reasons: list[str] = []
         for backend in self.backends:
-            doctor = getattr(backend, "doctor", None)
-            if callable(doctor):
-                try:
-                    report = doctor()
-                    reason = getattr(report, "reason", None)
-                    if reason:
-                        reasons.append(str(reason))
-                except Exception as exc:
-                    reasons.append(f"{backend.name()}: capability probe failed: {exc}")
+            reason = self._backend_reason(backend)
+            if reason:
+                reasons.append(reason)
         if reasons:
             return "; ".join(reasons)
         return "backend_unavailable: no available OS sandbox backend is registered."
 
+    @staticmethod
+    def _backend_reason(backend: SandboxBackend | None) -> str:
+        if backend is None:
+            return ""
+        doctor = getattr(backend, "doctor", None)
+        if callable(doctor):
+            try:
+                report = doctor()
+                reason = getattr(report, "reason", None)
+                if reason:
+                    return _safe_reason(str(reason))
+                diagnostics = getattr(report, "diagnostics", None) or ()
+                summary = _diagnostic_summary(diagnostics)
+                if summary:
+                    return summary
+            except Exception as exc:
+                return _safe_reason(f"{backend.name()}: capability probe failed: {exc}")
+        return ""
+
     def _allows_relaxed_local_process(self) -> bool:
         return self.permission_profile.profile == PermissionProfileName.DANGER_FULL_ACCESS
+
+    def _sandbox_mode(self) -> str:
+        return self.permission_profile.profile.value
 
     def _run_relaxed_local_process(
         self,
@@ -428,10 +715,15 @@ class SandboxManager:
             "error_code": error_code,
             "reason": unavailable_reason,
             "sandbox_mode": self.permission_profile.profile.value,
+            "sandbox_backend": _RELAXED_BACKEND_NAME,
             "sandbox_enforcement": "relaxed",
             "enforcement_status": "relaxed",
             "execution_backend": _RELAXED_BACKEND_NAME,
             "backend_is_local_process": True,
+            "fallback_used": True,
+            "fallback_reason": _DANGER_FULL_ACCESS_FALLBACK_REASON,
+            "elevated_available": False,
+            "elevated_blocker_summary": _safe_reason(unavailable_reason),
             "used_local_process_fallback": True,
             "local_process_fallback_reason": _DANGER_FULL_ACCESS_FALLBACK_REASON,
             "network_denied_verified": False,
@@ -490,7 +782,31 @@ class SandboxManager:
             ended_at=_now(),
             duration_ms=int((time.perf_counter() - started) * 1000),
             cleanup_status="not_started",
-            metadata={"error_code": "backend_unavailable", "reason": reason},
+            metadata={
+                "error_code": "backend_unavailable",
+                "reason": reason,
+                "sandbox_mode": self.permission_profile.profile.value,
+                "sandbox_backend": "unavailable",
+                "sandbox_enforcement": "strict",
+                "enforcement_status": "blocked",
+                "execution_backend": "unavailable",
+                "backend_is_local_process": False,
+                "network_isolation": "blocked",
+                "filesystem_isolation": "blocked",
+                "fallback_used": False,
+                "fallback_reason": "",
+                "elevated_available": self._backend_available(
+                    self._backend_by_name(_WINDOWS_ELEVATED_BACKEND_NAME)
+                )
+                if self._backend_by_name(_WINDOWS_ELEVATED_BACKEND_NAME)
+                else False,
+                "elevated_blocker_summary": _safe_reason(
+                    self._backend_reason(
+                        self._backend_by_name(_WINDOWS_ELEVATED_BACKEND_NAME)
+                    )
+                    or reason
+                ),
+            },
         )
 
     def _blocked(
@@ -510,7 +826,25 @@ class SandboxManager:
             ended_at=_now(),
             duration_ms=int((time.perf_counter() - started) * 1000),
             cleanup_status="not_started",
-            metadata={"error_code": "protected_path_denied"},
+            metadata={
+                "error_code": "protected_path_denied",
+                "sandbox_mode": self.permission_profile.profile.value,
+                "sandbox_backend": "policy",
+                "sandbox_enforcement": "strict",
+                "enforcement_status": "blocked",
+                "execution_backend": "policy",
+                "backend_is_local_process": False,
+                "network_isolation": "blocked",
+                "filesystem_isolation": "blocked",
+                "fallback_used": False,
+                "fallback_reason": "",
+                "elevated_available": self._backend_available(
+                    self._backend_by_name(_WINDOWS_ELEVATED_BACKEND_NAME)
+                )
+                if self._backend_by_name(_WINDOWS_ELEVATED_BACKEND_NAME)
+                else False,
+                "elevated_blocker_summary": "",
+            },
         )
 
     def _protected_path_violation(self, request: SandboxRequest) -> str | None:
@@ -736,3 +1070,26 @@ def _limit_output(
     limited_stderr = stderr[: max(0, remaining)]
     truncated = len(limited_stdout) < len(stdout) or len(limited_stderr) < len(stderr)
     return limited_stdout, limited_stderr, truncated
+
+
+def _safe_reason(reason: str) -> str:
+    return TraceRedactor().redact_text(reason)[:500]
+
+
+def _diagnostic_summary(diagnostics: Any) -> str:
+    if not isinstance(diagnostics, list | tuple):
+        return ""
+    summaries: list[str] = []
+    for item in diagnostics:
+        if not isinstance(item, dict):
+            continue
+        failure_type = item.get("failure_type")
+        kind = item.get("kind")
+        reason = item.get("reason")
+        if failure_type:
+            summaries.append(str(failure_type))
+        elif kind:
+            summaries.append(str(kind))
+        elif reason:
+            summaries.append(str(reason))
+    return _safe_reason("; ".join(summaries))

@@ -701,10 +701,10 @@ def test_provider_time_falls_back_to_request_response_monotonic_ms() -> None:
 def test_sandbox_backend_prefers_sandbox_lifecycle_over_in_process_tools() -> None:
     events = [
         {"event_type": "tool.dispatch.completed", "payload": {"backend": "in_process"}},
-        {"event_type": "sandbox.prepared", "payload": {"backend": "windows"}},
+        {"event_type": "sandbox.prepared", "payload": {"backend": "windows_elevated"}},
     ]
 
-    assert evaluation_runner._sandbox_backend(events, {}) == "windows"
+    assert evaluation_runner._sandbox_backend(events, {}) == "windows_elevated"
 
 
 def test_sandbox_time_deduplicates_terminal_events_by_command_id() -> None:
@@ -717,13 +717,13 @@ def test_sandbox_time_deduplicates_terminal_events_by_command_id() -> None:
         {
             "event_type": "command.completed",
             "command_id": "cmd_1",
-            "payload": {"command_id": "cmd_1", "duration_ms": 71000, "backend": "windows"},
+            "payload": {"command_id": "cmd_1", "duration_ms": 71000, "backend": "windows_elevated"},
         },
         {
             "event_type": "sandbox.completed",
             "command_id": "cmd_1",
             "sandbox_id": "sandbox_1",
-            "payload": {"duration_ms": 400, "backend": "windows"},
+            "payload": {"duration_ms": 400, "backend": "windows_elevated"},
         },
         {
             "event_type": "command.completed",
@@ -1606,8 +1606,60 @@ def test_public_task_sandbox_enforcement_audit_fails_on_local_fallback() -> None
         "passed": False,
         "required": True,
         "local_process_fallback_count": 1,
+        "reduced_backend_count": 0,
+        "reduced_backends": [],
         "reason": "sandbox-required evaluation used a local process fallback",
     }
+
+
+def test_public_task_sandbox_enforcement_audit_reports_reduced_unelevated_backend() -> None:
+    task = load_evaluation_task_set("docs/evaluation/public-representative-task.json").tasks[0]
+    events = [
+        {
+            "event_type": "sandbox.completed",
+            "payload": {
+                "backend": "windows_unelevated",
+                "sandbox_backend": "windows_unelevated",
+                "sandbox_enforcement": "reduced",
+                "enforcement_status": "degraded",
+                "fallback_used": True,
+                "used_local_process_fallback": False,
+            },
+        }
+    ]
+
+    assert evaluation_runner._sandbox_enforcement_audit(task, events, {}) == {
+        "passed": True,
+        "required": True,
+        "local_process_fallback_count": 0,
+        "reduced_backend_count": 1,
+        "reduced_backends": ["windows_unelevated"],
+        "reason": "",
+    }
+
+
+def test_sandbox_enforcement_audit_reads_finalization_sandbox_summary() -> None:
+    task = load_evaluation_task_set("docs/evaluation/public-representative-task.json").tasks[0]
+    events = [
+        {
+            "event_type": "finalization.completed",
+            "payload": {
+                "sandbox_summary": {
+                    "selected_backends": ["windows_unelevated"],
+                    "local_process_backend_count": 0,
+                    "reduced_backend_count": 2,
+                    "reduced_backends": ["windows_unelevated"],
+                }
+            },
+        }
+    ]
+
+    audit = evaluation_runner._sandbox_enforcement_audit(task, events, {})
+
+    assert audit["passed"] is True
+    assert audit["local_process_fallback_count"] == 0
+    assert audit["reduced_backend_count"] == 1
+    assert audit["reduced_backends"] == ["windows_unelevated"]
 
 
 def test_evaluator_visibility_audit_detects_hidden_payload_in_trace(tmp_path: Path) -> None:
@@ -3601,7 +3653,7 @@ def test_evaluation_classifies_observed_sandbox_unavailability_as_environment_bl
         sandbox_observations: ClassVar[list[dict[str, Any]]] = [
             {
                 "source": "verification",
-                "backend": "windows",
+                "backend": "windows_elevated",
                 "status": "backend_unavailable",
                 "enforcement_status": "backend_unavailable",
                 "sandbox_id": "sandbox_1",
@@ -3763,7 +3815,7 @@ def test_evaluation_short_circuits_python_ssl_environment_error_before_post_veri
                     ),
                 },
                 "sandbox_isolation_summary": {
-                    "selected_backends": ["windows"],
+                    "selected_backends": ["windows_elevated"],
                     "local_process_backend_count": 0,
                 },
             },
@@ -3938,7 +3990,7 @@ def test_evaluation_reduces_python_ssl_environment_error_to_environment_blocker(
                 ),
             },
             "sandbox_isolation_summary": {
-                "selected_backends": ["windows"],
+                "selected_backends": ["windows_elevated"],
                 "local_process_backend_count": 0,
             },
         }

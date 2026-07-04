@@ -1786,16 +1786,46 @@
     → SandboxManager.run()
     → 先执行 protected path preflight；命中 .env / credential /
       runtime state 等 hard-deny 规则时直接 POLICY_BLOCKED。
-    → 若会话 permission_profile 为 danger-full-access，且 native
-      backend 不可用或能力不足：
-         执行 relaxed local_process fallback；
-         SandboxResult.backend_name="local_process"；
-         metadata.sandbox_enforcement="relaxed"；
-         metadata.used_local_process_fallback=true；
-         CommandResult.isolation_report.filesystem_isolation 保持
-         workspace_cwd_advisory，不声明 native_os_sandbox。
-      read-only / workspace-write 不进入该分支。
-    → WindowsSandboxBackend.run(prepared)
+    → 集中 selector 按 permission_profile.profile 选择 backend：
+      read-only:
+         优先 windows_elevated；elevated 不可用时可用
+         windows_unelevated reduced backend；仍不允许写入，
+         不进入 local_process。
+      workspace-write:
+         优先 windows_elevated；elevated doctor 或 run-time
+         recheck 因 native_windows_elevated_sandbox_unavailable /
+         elevated_python_runtime_blocker /
+         python_c_extension_low_integrity_runtime_initialization_failed
+         等本机 blocker 不可用时，降级 windows_unelevated；
+         两者都不可用才返回 backend_unavailable /
+         error_code=sandbox_unavailable。
+      danger-full-access:
+         不强制 native sandbox；backend 不可用或能力不足时执行
+         relaxed local_process fallback。
+    → selector/result metadata 统一写入：
+      sandbox_mode、sandbox_backend、sandbox_enforcement、
+      enforcement_status、fallback_used、fallback_reason、
+      elevated_available、elevated_blocker_summary、execution_backend。
+      windows_elevated = strict / available /
+      execution_backend=account_restricted_token；
+      windows_unelevated = reduced / degraded /
+      execution_backend=current_user_process；
+      local_process = relaxed / relaxed。
+    → windows_unelevated 在当前用户上下文执行 staged workspace：
+      复用 workspace path 边界、protected path hard-deny、
+      policy/approval 顺序、timeout、output limit、artifact/change
+      detection；network_isolation=advisory，
+      filesystem_isolation=workspace_policy_enforced；
+      不声明 sandbox account、ACL/firewall/logon rights、
+      low-integrity、restricted token 或 native OS sandbox。
+    → danger-full-access local_process fallback：
+      SandboxResult.backend_name="local_process"；
+      metadata.sandbox_enforcement="relaxed"；
+      metadata.fallback_used=true；
+      metadata.used_local_process_fallback=true；
+      CommandResult.isolation_report.filesystem_isolation 保持
+      workspace_cwd_advisory，不声明 native_os_sandbox。
+    → WindowsSandboxBackend.run(prepared)  # windows_elevated
     → 平台判断统一经 windows_platform.is_windows()，测试不 patch 全局 os.name
     → 复用 prepare 阶段写入的 readiness snapshot；
       snapshot 缺失、过期、unavailable 或网络隔离证据不足时再执行
@@ -1806,6 +1836,8 @@
          当前角色 ready 时可忽略另一账户瞬时 network_probe 失败。
       否则任一 setup、launcher、ACL、runner smoke、network filter
       或其他 enforcement blocker 仍 fail closed → BACKEND_UNAVAILABLE。
+      manager 可在该 elevated runtime blocker 后重试一次
+      windows_unelevated，并把 elevated blocker 摘要透传到 trace/report。
     → account runner timeout 且未写 result file 时：
          WindowsRunnerResult.timed_out=true
          metadata.error_code="account_runner_timeout"

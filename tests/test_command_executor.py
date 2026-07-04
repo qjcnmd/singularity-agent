@@ -291,14 +291,14 @@ def test_workspace_write_low_risk_verification_runs_through_windows_sandbox(
     )
 
     assert result.execution_status == ExecutionStatus.COMPLETED
-    assert result.backend == "windows"
+    assert result.backend == "windows_elevated"
     assert result.error_code is None
     assert result.stdout_preview == "pytest passed\n"
-    assert result.isolation_report["backend"] == "windows"
+    assert result.isolation_report["backend"] == "windows_elevated"
     sandbox_report = result.isolation_report["sandbox"]
     assert len(runner.calls) == 1
     prepared = runner.calls[0]
-    assert prepared.backend_name == "windows"
+    assert prepared.backend_name == "windows_elevated"
     assert prepared.request.command == [sys.executable, "-m", "pytest", "-q"]
     assert prepared.baseline["runner_spec"]
     assert prepared.baseline["runner_result"]
@@ -306,6 +306,118 @@ def test_workspace_write_low_risk_verification_runs_through_windows_sandbox(
     assert sandbox_report["network_denied_verified"] is True
     assert sandbox_report["execution_backend"] == "account_restricted_token"
     assert result.metadata["network_denied_verified"] is True
+
+
+def test_workspace_write_unelevated_sandbox_projection_is_reduced_not_native(
+    tmp_path: Path,
+) -> None:
+    class UnelevatedBackend:
+        def name(self) -> str:
+            return "windows_unelevated"
+
+        def is_available(self) -> bool:
+            return True
+
+        def capabilities(self):
+            return sandbox.SandboxCapabilities(
+                filesystem_isolation=True,
+                copy_on_write=True,
+                readonly_mount=True,
+                network_isolation=False,
+                env_isolation=True,
+                process_tree_kill=True,
+                timeout=True,
+                output_limit=True,
+                memory_limit=False,
+                process_limit=False,
+                artifact_capture=True,
+                change_detection=True,
+            )
+
+        def prepare(self, request):
+            return sandbox.PreparedSandbox(
+                sandbox_id=request.sandbox_id,
+                backend_name=self.name(),
+                sandbox_root=tmp_path / "sandbox",
+                workspace_copy_root=tmp_path / "sandbox" / "workspace",
+                execution_cwd=tmp_path / "sandbox" / "workspace",
+                env={},
+                request=request,
+                created_at="2026-01-01T00:00:00+00:00",
+                trace_id="trace_unelevated",
+            )
+
+        def run(self, prepared):
+            return sandbox.SandboxResult(
+                sandbox_id=prepared.sandbox_id,
+                backend_name=self.name(),
+                status=sandbox.SandboxStatus.SUCCESS,
+                exit_code=0,
+                stdout="unelevated ok\n",
+                stderr="",
+                started_at="2026-01-01T00:00:00+00:00",
+                ended_at="2026-01-01T00:00:01+00:00",
+                duration_ms=1,
+                trace_id=prepared.trace_id,
+                metadata={
+                    "sandbox_mode": "workspace-write",
+                    "sandbox_backend": "windows_unelevated",
+                    "sandbox_enforcement": "reduced",
+                    "enforcement_status": "degraded",
+                    "fallback_used": True,
+                    "fallback_reason": "python_c_extension_low_integrity_runtime_initialization_failed",
+                    "elevated_available": False,
+                    "elevated_blocker_summary": "python_c_extension_low_integrity_runtime_initialization_failed",
+                    "execution_backend": "current_user_process",
+                    "backend_is_local_process": False,
+                    "network_isolation": "advisory",
+                    "filesystem_isolation": "workspace_policy_enforced",
+                    "network_denied_verified": False,
+                    "process_tree_kill": True,
+                },
+            )
+
+        def cleanup(self, _prepared) -> None:
+            return None
+
+    profile = PermissionProfile.default_for_workspace(
+        tmp_path,
+        profile=PermissionProfileName.WORKSPACE_WRITE,
+    )
+    component = CommandExecutor(
+        tmp_path,
+        policy_engine=PolicyEngine(
+            PolicyConfig(workspace_root=tmp_path, permission_profile=profile)
+        ),
+        sandbox_manager=SandboxManager(
+            tmp_path,
+            backends=[UnelevatedBackend()],
+            permission_profile=profile,
+        ),
+    )
+
+    result = component.run(
+        CommandRequest(
+            argv=[sys.executable, "-m", "pytest", "-q"],
+            cwd=".",
+            purpose=CommandPurpose.PROJECT_VERIFICATION,
+        )
+    )
+
+    assert result.execution_status == ExecutionStatus.COMPLETED
+    assert result.backend == "windows_unelevated"
+    assert result.isolation_report["backend"] == "windows_unelevated"
+    assert result.isolation_report["filesystem_isolation"] == "workspace_policy_enforced"
+    sandbox_report = result.isolation_report["sandbox"]
+    assert sandbox_report["sandbox_backend"] == "windows_unelevated"
+    assert sandbox_report["sandbox_enforcement"] == "reduced"
+    assert sandbox_report["enforcement_status"] == "degraded"
+    assert sandbox_report["fallback_used"] is True
+    assert sandbox_report["elevated_available"] is False
+    assert sandbox_report["elevated_blocker_summary"]
+    assert sandbox_report["execution_backend"] == "current_user_process"
+    assert result.metadata["sandbox_backend"] == "windows_unelevated"
+    assert result.metadata["fallback_used"] is True
 
 
 def test_danger_full_access_allows_inline_interpreter_execution(tmp_path: Path) -> None:

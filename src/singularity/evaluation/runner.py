@@ -902,6 +902,10 @@ class EvaluationRunner:
             evaluation_timing=evaluation_timing,
         )
         capability_summary["sandbox_enforcement"] = sandbox_audit
+        capability_summary["reduced_backend_count"] = sandbox_audit[
+            "reduced_backend_count"
+        ]
+        capability_summary["reduced_backends"] = list(sandbox_audit["reduced_backends"])
         capability_summary["evaluator_visibility_audit"] = visibility_audit
         capability_sla = _build_capability_sla(capability_summary)
         result_patch = patch or {"diff": "", "applicable": False, "changed_files": []}
@@ -1621,11 +1625,14 @@ def _sandbox_enforcement_audit(
 ) -> dict[str, Any]:
     required = task.task_type == "public_representative"
     fallback_count = _local_process_fallback_count(events, trace_summary)
+    reduced_backends = _reduced_sandbox_backends(events, trace_summary)
     passed = not required or fallback_count == 0
     return {
         "passed": passed,
         "required": required,
         "local_process_fallback_count": fallback_count,
+        "reduced_backend_count": len(reduced_backends),
+        "reduced_backends": reduced_backends,
         "reason": "" if passed else "sandbox-required evaluation used a local process fallback",
     }
 
@@ -3091,9 +3098,8 @@ def _sandbox_backend(events: list[dict[str, Any]], trace_summary: dict[str, Any]
         backend = payload.get("backend") or payload.get("sandbox_backend")
         if backend:
             return str(backend)
-    planner = trace_summary.get("sandbox_isolation_summary") if isinstance(trace_summary, dict) else {}
-    if isinstance(planner, dict):
-        backends = planner.get("selected_backends") or planner.get("available_backends") or []
+    for summary in _sandbox_summary_payloads(events, trace_summary):
+        backends = summary.get("selected_backends") or summary.get("available_backends") or []
         if backends:
             return str(backends[0])
     for event in events:
@@ -3112,10 +3118,59 @@ def _local_process_fallback_count(events: list[dict[str, Any]], trace_summary: d
         fallback = payload.get("local_process_fallback") or payload.get("used_local_process_fallback")
         if backend == "local_process" or fallback is True:
             count += 1
-    planner = trace_summary.get("sandbox_isolation_summary") if isinstance(trace_summary, dict) else {}
-    if isinstance(planner, dict):
-        count = max(count, _safe_int(planner.get("local_process_backend_count")))
+    for summary in _sandbox_summary_payloads(events, trace_summary):
+        count = max(
+            count,
+            _safe_int(summary.get("local_process_backend_count")),
+            _safe_int(summary.get("local_process_fallback_count")),
+        )
     return count
+
+
+def _reduced_sandbox_backends(
+    events: list[dict[str, Any]],
+    trace_summary: dict[str, Any],
+) -> list[str]:
+    backends: set[str] = set()
+    for event in events:
+        payload = _event_payload(event)
+        enforcement = str(payload.get("sandbox_enforcement") or "")
+        status = str(payload.get("enforcement_status") or "")
+        backend = str(payload.get("sandbox_backend") or payload.get("backend") or "")
+        if backend and (enforcement == "reduced" or status == "degraded"):
+            backends.add(backend)
+    for summary in _sandbox_summary_payloads(events, trace_summary):
+        for backend in summary.get("reduced_backends") or []:
+            if backend:
+                backends.add(str(backend))
+    return sorted(backends)
+
+
+def _sandbox_summary_payloads(
+    events: list[dict[str, Any]],
+    trace_summary: dict[str, Any],
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+
+    def collect(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        for key in ("sandbox_isolation_summary", "sandbox_summary"):
+            summary = payload.get(key)
+            if isinstance(summary, dict):
+                summaries.append(summary)
+        planner = payload.get("planner_summary")
+        if isinstance(planner, dict):
+            summary = planner.get("sandbox_isolation_summary") or planner.get(
+                "sandbox_summary"
+            )
+            if isinstance(summary, dict):
+                summaries.append(summary)
+
+    collect(trace_summary)
+    for event in events:
+        collect(_event_payload(event))
+    return summaries
 
 
 def _sandbox_time_seconds(events: list[dict[str, Any]]) -> float:

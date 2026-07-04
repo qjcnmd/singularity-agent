@@ -335,7 +335,7 @@ def test_finalizer_sandbox_summary_reports_backend_and_enforcement_evidence() ->
         sandbox_observations=[
             {
                 "source": "verification",
-                "backend": "windows",
+                "backend": "windows_elevated",
                 "status": "success",
                 "enforcement_status": "available",
                 "execution_backend": "account_restricted_token",
@@ -351,7 +351,40 @@ def test_finalizer_sandbox_summary_reports_backend_and_enforcement_evidence() ->
 
     summary = Finalizer._sandbox_summary(evidence)
 
-    assert summary["selected_backends"] == ["windows"]
+    assert summary["selected_backends"] == ["windows_elevated"]
     assert summary["network_denied_verified_count"] == 1
     assert summary["local_process_backend_count"] == 0
     assert summary["artifact_refs"] == ["artifact_stdout"]
+
+
+def test_finalizer_sandbox_summary_reports_reduced_backend_and_elevated_blocker() -> None:
+    evidence = EvidenceLedger(
+        sandbox_observations=[
+            {
+                "source": "verification",
+                "backend": "windows_unelevated",
+                "status": "success",
+                "sandbox_enforcement": "reduced",
+                "enforcement_status": "degraded",
+                "execution_backend": "current_user_process",
+                "fallback_used": True,
+                "fallback_reason": "python_c_extension_low_integrity_runtime_initialization_failed",
+                "elevated_available": False,
+                "elevated_blocker_summary": (
+                    "python_c_extension_low_integrity_runtime_initialization_failed"
+                ),
+                "artifact_count": 0,
+                "artifact_refs": [],
+            }
+        ]
+    )
+
+    summary = Finalizer._sandbox_summary(evidence)
+
+    assert summary["selected_backends"] == ["windows_unelevated"]
+    assert summary["local_process_backend_count"] == 0
+    assert summary["reduced_backend_count"] == 1
+    assert summary["reduced_backends"] == ["windows_unelevated"]
+    assert summary["elevated_blocker_summaries"] == [
+        "python_c_extension_low_integrity_runtime_initialization_failed"
+    ]

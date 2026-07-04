@@ -179,6 +179,45 @@ def test_windows_backend_is_unavailable_until_all_enforcement_is_configured() ->
         assert backend.capabilities().network_isolation is False
 
 
+def test_windows_elevated_backend_name_is_explicit() -> None:
+    assert sandbox.WindowsSandboxBackend().name() == "windows_elevated"
+
+
+def test_windows_unelevated_backend_reports_reduced_truthful_metadata(
+    tmp_path: Path,
+) -> None:
+    backend = sandbox.WindowsUnelevatedSandboxBackend()
+    request = _request(tmp_path)
+    prepared = backend.prepare(request)
+
+    result = backend.run(prepared)
+    backend.cleanup(prepared)
+
+    assert result.status == SandboxStatus.SUCCESS
+    assert result.backend_name == "windows_unelevated"
+    assert result.metadata["sandbox_backend"] == "windows_unelevated"
+    assert result.metadata["sandbox_enforcement"] == "reduced"
+    assert result.metadata["enforcement_status"] == "degraded"
+    assert result.metadata["execution_backend"] == "current_user_process"
+    assert result.metadata["network_isolation"] in {"advisory", "not_enforced"}
+    assert result.metadata["filesystem_isolation"] == "workspace_policy_enforced"
+    assert result.metadata["backend_is_local_process"] is False
+    assert result.metadata["restricted_token"] is False
+    assert result.metadata["low_integrity"] is False
+    assert result.metadata["sandbox_account"] is None
+
+
+def test_windows_unelevated_capabilities_do_not_claim_native_network_or_memory_limits() -> None:
+    capabilities = sandbox.WindowsUnelevatedSandboxBackend().capabilities()
+
+    assert capabilities.filesystem_isolation is True
+    assert capabilities.copy_on_write is True
+    assert capabilities.readonly_mount is True
+    assert capabilities.network_isolation is False
+    assert capabilities.memory_limit is False
+    assert capabilities.process_limit is False
+
+
 def test_windows_setup_reports_machine_readable_status() -> None:
     backend = sandbox.WindowsSandboxBackend()
 
@@ -1486,7 +1525,7 @@ class _FakeRunner:
         self.network_denied = network_denied
         self.metadata = metadata or {
             "runner": "fake",
-            "backend": "windows",
+            "backend": "windows_elevated",
             "restricted_token": True,
             "low_integrity": True,
             "private_desktop": True,
@@ -1518,7 +1557,7 @@ def test_windows_backend_records_safe_lifecycle_timing(tmp_path: Path) -> None:
         runner=_FakeRunner(
             metadata={
                 "runner": "fake",
-                "backend": "windows",
+                "backend": "windows_elevated",
                 "restricted_token": True,
                 "low_integrity": True,
                 "private_desktop": True,
@@ -1603,7 +1642,7 @@ def test_windows_backend_runs_low_risk_verification_with_ready_runner(tmp_path: 
 
     assert runner.calls == [prepared]
     assert result.status == SandboxStatus.SUCCESS
-    assert result.backend_name == "windows"
+    assert result.backend_name == "windows_elevated"
     assert result.exit_code == 0
     assert result.stdout == "pytest ok\n"
     assert result.metadata["execution_backend"] == "account_restricted_token"
@@ -1619,7 +1658,7 @@ def test_windows_backend_does_not_forge_runner_enforcement_evidence(tmp_path: Pa
         runner=_FakeRunner(
             metadata={
                 "runner": "fake",
-                "backend": "windows",
+                "backend": "windows_elevated",
                 "restricted_token": False,
                 "low_integrity": False,
                 "private_desktop": False,

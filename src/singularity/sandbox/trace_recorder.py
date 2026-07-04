@@ -59,9 +59,17 @@ class SandboxJsonlTraceRecorder:
             "violations": [violation.to_dict() for violation in result.violations],
             "cleanup_status": result.cleanup_status,
             "sandbox_mode": result.metadata.get("sandbox_mode"),
+            "sandbox_backend": result.metadata.get("sandbox_backend")
+            or result.backend_name,
             "sandbox_enforcement": result.metadata.get("sandbox_enforcement"),
             "enforcement_status": result.metadata.get("enforcement_status"),
             "execution_backend": result.metadata.get("execution_backend"),
+            "fallback_used": bool(result.metadata.get("fallback_used")),
+            "fallback_reason": result.metadata.get("fallback_reason"),
+            "elevated_available": result.metadata.get("elevated_available"),
+            "elevated_blocker_summary": result.metadata.get(
+                "elevated_blocker_summary"
+            ),
             "used_local_process_fallback": bool(
                 result.metadata.get("used_local_process_fallback")
             ),

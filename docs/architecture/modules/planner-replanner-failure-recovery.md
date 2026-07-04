@@ -35,7 +35,7 @@
 - TaskPlan: plan_id, task_id, phases, current_phase, version, updated_at
 - AgentAction: kind, intent, phase_id, preconditions, allowed_tools, expected_evidence, risk_level, status, action_id, result_ref
 - VerificationEvidenceRecord: completion_assessment, check_status, results, tool_call_id, plan, extra
-- SandboxObservationRecord: source, backend, status, enforcement_status, execution_backend, network_denied_verified, process_tree_kill, job_killed, timeout_enforced, artifact_count, artifact_refs, changed_files_count, violations, imported_changes_count, extra
+- SandboxObservationRecord: source, backend, status, sandbox_enforcement, enforcement_status, execution_backend, fallback_used, fallback_reason, elevated_available, elevated_blocker_summary, network_denied_verified, process_tree_kill, job_killed, timeout_enforced, artifact_count, artifact_refs, changed_files_count, violations, imported_changes_count, extra
 - PolicyObservationRecord: outcome, component, operation, reason, risk_level, resource, approval_grant_id, approved_by_user, extra
 - ToolResultRecord: tool_call_id, tool_name, action_id, ok, status, error_code, failure, extra
 - TaskOutcomeRecord: status, error_code, summary, reason, next_action, retry_allowed, missing_evidence, extra
@@ -164,8 +164,13 @@ class SandboxObservationRecord:
     source: str | None = None
     backend: str | None = None
     status: str | None = None
+    sandbox_enforcement: str | None = None
     enforcement_status: str | None = None
     execution_backend: str | None = None
+    fallback_used: bool | None = None
+    fallback_reason: str | None = None
+    elevated_available: bool | None = None
+    elevated_blocker_summary: str | None = None
     network_denied_verified: bool | None = None
     process_tree_kill: bool | None = None
     job_killed: bool | None = None
@@ -300,6 +305,8 @@ class RiskDecisionKind(str, Enum):   # AuthorizationDecision.risk_decision
 `Planner.start_task()` 生成 `TaskState` 和 `TaskPlan`，`Planner.step()` 生成 `AgentAction`。工具/命令/验证结果写入 `EvidenceLedger`（25 个 evidence bucket），其中 `verification_results`、`sandbox_observations`、`policy_observations`、`tool_results`、`task_outcomes` 通过 typed helper 写入和读取；持久化仍保持 list-of-dict JSON shape。`ExecutionBudget` 跟踪计数器。`Planner._persist()` 写 `state.json`/`plan.json`/`evidence.json`/`budget.json`。`Planner._active_tool_scope()` 生成 `_ToolScope`，把 phase policy、repair contract、repair evidence block 和 benchmark constraints 收敛为同一份 `allowed_tools`；`Planner.decide_tool_exposure()`、`Planner.filtered_tools()` 和 `Planner.authorize_tool_call()` 共用该结果，确保模型可见工具、ToolChoicePolicy allowed names、`tool.exposure_decided.selected_tools` 和执行授权来自同一来源，同时授权拒绝仍按 repair block、repair allowed、benchmark allowed、phase policy 的原有顺序返回具体 error code。`Finalizer.build()` 通过 `latest_verification_result()`、`sandbox_records()`、`policy_records()`、`tool_result_records()` 聚合关键 summary 并生成 `FinalReport`，落盘 `final_report.json`/`.md`。`PlannerContextRenderer` 只投影 goal、phase、allowed tools、rolling plan 与选择性 evidence 进入模型上下文。
 
 `FinalReport.status` 的完成边界来自三层内部证据：最新 `verification_summary.status` 必须是 `ready` 或 `ready_with_warnings`，final review `latest_decision` 必须是 `accept`，active repair `contract_satisfaction.satisfied` 不能为 false。三者满足时 `Planner.finalize()` 把 `TaskState.status` 置为 `completed`、设置 `completion_criteria.final_report_ready=True`，并清理已由本次 final report 解决的历史 completion blocker。`contract_satisfaction` 随 report 落盘和进入 kernel planner summary；它不进入主模型请求，也不由 evaluation 后验 verification 改写。
+
+`Finalizer._sandbox_summary()` 从 `SandboxObservationRecord` 聚合 `selected_backends`、`backend_unavailable_count`、`local_process_backend_count`、`reduced_backend_count`、`reduced_backends`、`elevated_blocker_summaries`、network/process proof、artifact refs 和 change counts。`windows_unelevated` 会作为 reduced backend 进入 summary；`local_process` 仍单独计入 `local_process_backend_count`，用于 evaluation 的 public task sandbox enforcement audit。
 
 ## 谁生成这些对象
 

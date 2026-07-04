@@ -888,8 +888,15 @@ class VerificationRunner:
             sandbox_artifacts=list(command_result.metadata.get("sandbox_artifacts") or []),
             sandbox_changed_files=dict(command_result.metadata.get("sandbox_changed_files") or {}),
             sandbox_violations=list(command_result.metadata.get("sandbox_violations") or []),
+            sandbox_enforcement=command_result.metadata.get("sandbox_enforcement"),
             enforcement_status=command_result.metadata.get("enforcement_status"),
             execution_backend=command_result.metadata.get("execution_backend"),
+            fallback_used=command_result.metadata.get("fallback_used"),
+            fallback_reason=command_result.metadata.get("fallback_reason"),
+            elevated_available=command_result.metadata.get("elevated_available"),
+            elevated_blocker_summary=command_result.metadata.get(
+                "elevated_blocker_summary"
+            ),
             network_denied_verified=command_result.metadata.get("network_denied_verified"),
             process_tree_kill=command_result.metadata.get("process_tree_kill"),
             job_killed=command_result.metadata.get("job_killed"),

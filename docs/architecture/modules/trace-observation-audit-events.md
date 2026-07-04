@@ -408,6 +408,8 @@ TraceStore消费event/span/artifact；CLI、final report、evaluation/replay消�
 
 TraceEvent在append前执行payload redaction并计算payload_hash；span/artifact通过refs关联。`TraceRedactor` 使用统一 `RedactionProvider` 的 plain profile，因此 trace 仍输出 `<redacted>` 而不是 context 的 `<redacted:{digest}>`。Policy audit是独立JSONL，由PolicyAuditWriter保存request/decision摘要，不能用events.jsonl替代审计账本，也不能把audit entry称为TraceEvent。
 
+Sandbox JSONL trace 由 `SandboxJsonlTraceRecorder.append()` 追加到 `<workspace>/.singularity/sandbox/trace.jsonl`，不是 `TraceEvent` schema 的替代物。每条 sandbox JSONL 记录除生命周期、capabilities、timing、artifact 和 violation 安全摘要外，还写入 `sandbox_mode`、`sandbox_backend`、`sandbox_enforcement`、`enforcement_status`、`execution_backend`、`fallback_used`、`fallback_reason`、`elevated_available`、`elevated_blocker_summary`、`used_local_process_fallback` 和 `local_process_fallback_reason`。`windows_unelevated` 必须以 `sandbox_enforcement="reduced"` / `enforcement_status="degraded"` 出现；`danger-full-access` 的 `local_process` fallback 必须以 `sandbox_enforcement="relaxed"` 出现；二者都不得被 trace 或 report 误标为 elevated/native OS sandbox。
+
 ## 失败路径
 
 非法run id抛`ValueError`，未知span抛`TraceStoreError`，artifact错误抛`TraceArtifactError`。`TraceRecorder.emit()`写失败降级返回`trace_write_failed` warning dict并输出脱敏stderr警告；业务执行继续，但final diagnostics应暴露trace不完整。

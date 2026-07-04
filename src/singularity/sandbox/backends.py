@@ -8,7 +8,7 @@ from singularity.sandbox.models import (
     SandboxRequest,
     SandboxResult,
 )
-from singularity.sandbox.windows import WindowsSandboxBackend
+from singularity.sandbox.windows import WindowsSandboxBackend, WindowsUnelevatedSandboxBackend
 from singularity.sandbox.windows_platform import is_windows
 
 
@@ -32,4 +32,4 @@ class SandboxBackend(Protocol):
 def default_sandbox_backends() -> list[SandboxBackend]:
     if not is_windows():
         return []
-    return [WindowsSandboxBackend()]
+    return [WindowsSandboxBackend(), WindowsUnelevatedSandboxBackend()]

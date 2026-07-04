@@ -540,13 +540,13 @@ def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path)
                 "raw_command": ["python", "-c", "print('ok')"],
             },
             "sandbox_availability": {
-                "available_backends": ["windows"],
-                "selected_backend": "windows",
+                "available_backends": ["windows_elevated"],
+                "selected_backend": "windows_elevated",
                 "hard_isolation_available": False,
                 "absolute_path": str(tmp_path),
             },
             "sandbox_id": "sandbox_1",
-            "sandbox_backend": "windows",
+            "sandbox_backend": "windows_elevated",
             "sandbox_status": "success",
             "enforcement_status": "available",
             "execution_backend": "account_restricted_token",
@@ -576,12 +576,12 @@ def test_verification_evidence_records_safe_capability_summaries(tmp_path: Path)
         "provider": {"provider": "mock", "supports_streaming": False},
         "command": {"backend": "local_process", "timeout": True},
         "sandbox": {
-            "available_backends": ["windows"],
-            "selected_backend": "windows",
+                "available_backends": ["windows_elevated"],
+                "selected_backend": "windows_elevated",
             "hard_isolation_available": False,
         },
     }
-    assert evidence["sandbox_backend"] == "windows"
+    assert evidence["sandbox_backend"] == "windows_elevated"
     assert evidence["enforcement_status"] == "available"
     assert evidence["execution_backend"] == "account_restricted_token"
     assert evidence["network_denied_verified"] is True

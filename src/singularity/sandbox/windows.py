@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
+import subprocess
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -117,6 +119,7 @@ __all__ = [
     "WindowsSandboxPrimitives",
     "WindowsSandboxSetup",
     "WindowsSandboxSetupReport",
+    "WindowsUnelevatedSandboxBackend",
     "cleanup_windows_sandbox_assets",
     "probe_windows_sandbox",
     "sandbox_exception_diagnostics",
@@ -151,7 +154,7 @@ class WindowsSandboxBackend:
         self._readiness_snapshot_at: float | None = None
 
     def name(self) -> str:
-        return "windows"
+        return "windows_elevated"
 
     def doctor(self) -> WindowsSandboxDoctorReport:
         return self._doctor_provider()
@@ -368,7 +371,13 @@ class WindowsSandboxBackend:
         metadata = {
             **runner_metadata,
             "error_code": None,
+            "sandbox_backend": self.name(),
+            "sandbox_enforcement": "strict",
+            "enforcement_status": "available",
             "execution_backend": "account_restricted_token",
+            "backend_is_local_process": False,
+            "network_isolation": "native_os_enforced",
+            "filesystem_isolation": "native_os_sandbox",
             "sandbox_role": str(prepared.baseline.get("sandbox_role") or "unknown"),
             "restricted_token": restricted_token,
             "low_integrity": low_integrity,
@@ -718,3 +727,275 @@ class WindowsSandboxBackend:
             runtime["PATH"] = WINDOWS_PATH_SEPARATOR.join(path_entries)
         runtime.setdefault("PYTHONIOENCODING", "utf-8")
         return runtime
+
+
+class WindowsUnelevatedSandboxBackend:
+    def __init__(
+        self,
+        *,
+        filesystem: SandboxFilesystemManager | None = None,
+        artifact_collector: SandboxArtifactCollector | None = None,
+        run_root_provider: Callable[[SandboxRequest], Path] | None = None,
+    ) -> None:
+        self.filesystem = filesystem or SandboxFilesystemManager()
+        self.artifact_collector = artifact_collector or SandboxArtifactCollector()
+        self._run_root_provider = run_root_provider or (
+            lambda request: _windows_state_dir_path()
+            / "runs"
+            / f"{request.sandbox_id}-unelevated"
+        )
+
+    def name(self) -> str:
+        return "windows_unelevated"
+
+    def is_available(self) -> bool:
+        return True
+
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            filesystem_isolation=True,
+            copy_on_write=True,
+            readonly_mount=True,
+            network_isolation=False,
+            env_isolation=True,
+            process_tree_kill=True,
+            timeout=True,
+            output_limit=True,
+            memory_limit=False,
+            process_limit=False,
+            artifact_capture=True,
+            change_detection=True,
+        )
+
+    def prepare(self, request: SandboxRequest) -> PreparedSandbox:
+        timing: dict[str, float] = {}
+        filesystem_policy = request.profile.filesystem
+        original_sandbox_root = filesystem_policy.sandbox_root
+        sandbox_root = self._run_root_provider(request)
+        filesystem_policy.sandbox_root = sandbox_root
+        try:
+            phase_started = time.perf_counter()
+            fs = self.filesystem.prepare_filesystem(
+                sandbox_id=request.sandbox_id,
+                policy=filesystem_policy,
+                cwd=request.cwd,
+            )
+            timing["workspace_materialization_time_seconds"] = (
+                time.perf_counter() - phase_started
+            )
+        finally:
+            filesystem_policy.sandbox_root = original_sandbox_root
+        env = SandboxEnvironmentBuilder().build_env(request.profile.env, os.environ)
+        env = WindowsSandboxBackend._runtime_env(env)
+        trace_id = random_trace_id()
+        baseline = self.filesystem.capture_baseline(fs.workspace_copy_root)
+        return PreparedSandbox(
+            sandbox_id=request.sandbox_id,
+            backend_name=self.name(),
+            sandbox_root=fs.sandbox_root,
+            workspace_copy_root=fs.workspace_copy_root,
+            execution_cwd=fs.execution_cwd,
+            env=env,
+            request=request,
+            created_at=_now(),
+            trace_id=trace_id,
+            baseline={"files": baseline, "timing": timing},
+        )
+
+    def run(self, prepared: PreparedSandbox) -> SandboxResult:
+        started = time.perf_counter()
+        timing = dict(prepared.baseline.get("timing") or {})
+        command = _resolve_command(prepared.request.command, env=prepared.env)
+        timeout = prepared.request.profile.resources.timeout_seconds
+        output_limit = prepared.request.profile.resources.max_output_chars
+        result_started = _now()
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(prepared.execution_cwd),
+                env=prepared.env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=isinstance(command, str),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if _is_windows() else 0,
+                start_new_session=not _is_windows(),
+            )
+        except FileNotFoundError as exc:
+            return self._process_result(
+                prepared,
+                started,
+                started_at=result_started,
+                status=SandboxStatus.FAILED,
+                exit_code=None,
+                stdout="",
+                stderr=str(exc),
+                error_code="command_not_found",
+            )
+        except PermissionError as exc:
+            return self._process_result(
+                prepared,
+                started,
+                started_at=result_started,
+                status=SandboxStatus.FAILED,
+                exit_code=None,
+                stdout="",
+                stderr=str(exc),
+                error_code="permission_error",
+            )
+        except Exception as exc:
+            return self._process_result(
+                prepared,
+                started,
+                started_at=result_started,
+                status=SandboxStatus.SETUP_FAILED,
+                exit_code=None,
+                stdout="",
+                stderr=str(exc),
+                error_code="spawn_failed",
+            )
+        timed_out = False
+        phase_started = time.perf_counter()
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_tree(process)
+            with suppress(subprocess.TimeoutExpired):
+                stdout, stderr = process.communicate(timeout=2.0)
+            if process.poll() is None:
+                with suppress(Exception):
+                    process.kill()
+                stdout, stderr = "", "Process timed out and could not be terminated cleanly."
+        timing["command_runtime_time_seconds"] = time.perf_counter() - phase_started
+        stdout = TraceRedactor().redact_text(stdout or "")
+        stderr = TraceRedactor().redact_text(stderr or "")
+        stdout, stderr, output_truncated = _limit_output(stdout, stderr, output_limit)
+        status = (
+            SandboxStatus.TIMEOUT
+            if timed_out
+            else SandboxStatus.SUCCESS
+            if process.returncode == 0
+            else SandboxStatus.FAILED
+        )
+        return self._process_result(
+            prepared,
+            started,
+            started_at=result_started,
+            status=status,
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            error_code="timeout" if timed_out else None,
+            timed_out=timed_out,
+            output_truncated=output_truncated,
+            timing=timing,
+        )
+
+    def cleanup(self, prepared: PreparedSandbox) -> None:
+        self.filesystem.cleanup(prepared.sandbox_root)
+
+    def _process_result(
+        self,
+        prepared: PreparedSandbox,
+        started: float,
+        *,
+        started_at: str,
+        status: SandboxStatus,
+        exit_code: int | None,
+        stdout: str,
+        stderr: str,
+        error_code: str | None,
+        timed_out: bool = False,
+        output_truncated: bool = False,
+        timing: dict[str, float] | None = None,
+    ) -> SandboxResult:
+        timing = dict(timing or prepared.baseline.get("timing") or {})
+        phase_started = time.perf_counter()
+        changes = self.filesystem.detect_changes(
+            prepared.workspace_copy_root,
+            dict(prepared.baseline.get("files") or {}),
+        )
+        timing["change_detection_time_seconds"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
+        artifacts = self.artifact_collector.collect(
+            sandbox_id=prepared.sandbox_id,
+            workspace_root=prepared.workspace_copy_root,
+            artifact_root=prepared.sandbox_root / "artifacts",
+            artifact_paths=prepared.request.profile.filesystem.artifact_paths,
+            limits=prepared.request.profile.resources,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        timing["artifact_collection_time_seconds"] = time.perf_counter() - phase_started
+        metadata = {
+            "error_code": error_code,
+            "sandbox_backend": self.name(),
+            "sandbox_enforcement": "reduced",
+            "enforcement_status": "degraded",
+            "execution_backend": "current_user_process",
+            "backend_is_local_process": False,
+            "network_isolation": "advisory",
+            "filesystem_isolation": "workspace_policy_enforced",
+            "restricted_token": False,
+            "low_integrity": False,
+            "private_desktop": False,
+            "sandbox_account": None,
+            "process_tree_kill": True,
+            "network_denied_verified": False,
+            "timeout_enforced": True,
+            "timed_out": timed_out,
+            "output_truncated": output_truncated,
+            "artifact_refs": [artifact.artifact_id for artifact in artifacts],
+            "timing": timing,
+        }
+        return SandboxResult(
+            sandbox_id=prepared.sandbox_id,
+            backend_name=self.name(),
+            status=status,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            started_at=started_at,
+            ended_at=_now(),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            artifacts=artifacts,
+            filesystem_changes=changes,
+            trace_id=prepared.trace_id,
+            cleanup_status="not_started",
+            metadata=metadata,
+        )
+
+
+def _kill_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if _is_windows():
+        with suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2.0,
+            )
+        if process.poll() is None:
+            with suppress(Exception):
+                process.kill()
+        return
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    if callable(killpg) and callable(getpgid):
+        with suppress(Exception):
+            killpg(getpgid(process.pid), getattr(signal, "SIGTERM", signal.SIGTERM))
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+    if process.poll() is None:
+        with suppress(Exception):
+            if callable(killpg) and callable(getpgid):
+                killpg(getpgid(process.pid), getattr(signal, "SIGKILL", signal.SIGTERM))
+            else:
+                process.kill()

@@ -97,7 +97,7 @@ def test_key_evidence_buckets_round_trip_as_typed_records() -> None:
     evidence.add_sandbox_observation(
         {
             "source": "verification",
-            "backend": "windows",
+            "backend": "windows_elevated",
             "status": "backend_unavailable",
             "enforcement_status": "backend_unavailable",
             "execution_backend": None,

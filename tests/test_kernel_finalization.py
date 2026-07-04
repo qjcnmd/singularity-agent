@@ -71,7 +71,7 @@ def test_kernel_final_report_to_dict_field_contract(tmp_path) -> None:
         planner_report={
             "verification_summary": {"status": "ready"},
             "policy_approval_summary": {"denied_actions_count": 0},
-            "sandbox_isolation_summary": {"backend": "windows"},
+            "sandbox_isolation_summary": {"backend": "windows_elevated"},
             "model_usage_summary": {"requests": 1},
             "execution_trace_summary": {"tool_calls": 1},
         },
@@ -117,7 +117,7 @@ def test_kernel_final_report_to_dict_field_contract(tmp_path) -> None:
     ]
     assert payload["verification_summary"] == {"status": "ready"}
     assert payload["policy_summary"] == {"denied_actions_count": 0}
-    assert payload["sandbox_summary"] == {"backend": "windows"}
+    assert payload["sandbox_summary"] == {"backend": "windows_elevated"}
     assert payload["model_summary"] == {"requests": 1}
     assert payload["trace_summary"] == {"tool_calls": 1}
     assert "final_report" not in payload

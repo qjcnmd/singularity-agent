@@ -164,8 +164,15 @@ class Finalizer:
                             "source": "command",
                             "backend": sandbox.get("backend"),
                             "status": sandbox.get("status"),
+                            "sandbox_enforcement": sandbox.get("sandbox_enforcement"),
                             "enforcement_status": sandbox.get("enforcement_status"),
                             "execution_backend": sandbox.get("execution_backend"),
+                            "fallback_used": sandbox.get("fallback_used"),
+                            "fallback_reason": sandbox.get("fallback_reason"),
+                            "elevated_available": sandbox.get("elevated_available"),
+                            "elevated_blocker_summary": sandbox.get(
+                                "elevated_blocker_summary"
+                            ),
                             "network_denied_verified": sandbox.get("network_denied_verified"),
                             "process_tree_kill": sandbox.get("process_tree_kill"),
                             "job_killed": sandbox.get("job_killed"),
@@ -186,8 +193,19 @@ class Finalizer:
                                 "source": "verification",
                                 "backend": result_evidence.get("sandbox_backend"),
                                 "status": result_evidence.get("sandbox_status"),
+                                "sandbox_enforcement": result_evidence.get(
+                                    "sandbox_enforcement"
+                                ),
                                 "enforcement_status": result_evidence.get("enforcement_status"),
                                 "execution_backend": result_evidence.get("execution_backend"),
+                                "fallback_used": result_evidence.get("fallback_used"),
+                                "fallback_reason": result_evidence.get("fallback_reason"),
+                                "elevated_available": result_evidence.get(
+                                    "elevated_available"
+                                ),
+                                "elevated_blocker_summary": result_evidence.get(
+                                    "elevated_blocker_summary"
+                                ),
                                 "network_denied_verified": result_evidence.get("network_denied_verified"),
                                 "process_tree_kill": result_evidence.get("process_tree_kill"),
                                 "job_killed": result_evidence.get("job_killed"),
@@ -222,6 +240,32 @@ class Finalizer:
             "job_killed_count": len([item for item in observations if item.job_killed is True]),
             "local_process_backend_count": len(
                 [item for item in observations if item.backend == "local_process"]
+            ),
+            "reduced_backend_count": len(
+                [
+                    item
+                    for item in observations
+                    if item.sandbox_enforcement == "reduced"
+                    or item.enforcement_status == "degraded"
+                ]
+            ),
+            "reduced_backends": sorted(
+                {
+                    str(item.backend)
+                    for item in observations
+                    if item.backend
+                    and (
+                        item.sandbox_enforcement == "reduced"
+                        or item.enforcement_status == "degraded"
+                    )
+                }
+            ),
+            "elevated_blocker_summaries": sorted(
+                {
+                    str(item.elevated_blocker_summary)
+                    for item in observations
+                    if item.elevated_blocker_summary
+                }
             ),
             "artifact_count": sum(int(item.artifact_count or 0) for item in observations),
             "artifact_refs": [

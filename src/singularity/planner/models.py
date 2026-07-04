@@ -403,8 +403,13 @@ class SandboxObservationRecord:
     source: str | None = None
     backend: str | None = None
     status: str | None = None
+    sandbox_enforcement: str | None = None
     enforcement_status: str | None = None
     execution_backend: str | None = None
+    fallback_used: bool | None = None
+    fallback_reason: str | None = None
+    elevated_available: bool | None = None
+    elevated_blocker_summary: str | None = None
     network_denied_verified: bool | None = None
     process_tree_kill: bool | None = None
     job_killed: bool | None = None
@@ -423,8 +428,13 @@ class SandboxObservationRecord:
                 "source": self.source,
                 "backend": self.backend,
                 "status": self.status,
+                "sandbox_enforcement": self.sandbox_enforcement,
                 "enforcement_status": self.enforcement_status,
                 "execution_backend": self.execution_backend,
+                "fallback_used": self.fallback_used,
+                "fallback_reason": self.fallback_reason,
+                "elevated_available": self.elevated_available,
+                "elevated_blocker_summary": self.elevated_blocker_summary,
                 "network_denied_verified": self.network_denied_verified,
                 "process_tree_kill": self.process_tree_kill,
                 "job_killed": self.job_killed,
@@ -444,8 +454,13 @@ class SandboxObservationRecord:
             "source",
             "backend",
             "status",
+            "sandbox_enforcement",
             "enforcement_status",
             "execution_backend",
+            "fallback_used",
+            "fallback_reason",
+            "elevated_available",
+            "elevated_blocker_summary",
             "network_denied_verified",
             "process_tree_kill",
             "job_killed",
@@ -460,8 +475,15 @@ class SandboxObservationRecord:
             source=_optional_str(payload.get("source")),
             backend=_optional_str(payload.get("backend")),
             status=_optional_str(payload.get("status")),
+            sandbox_enforcement=_optional_str(payload.get("sandbox_enforcement")),
             enforcement_status=_optional_str(payload.get("enforcement_status")),
             execution_backend=_optional_str(payload.get("execution_backend")),
+            fallback_used=_optional_bool(payload.get("fallback_used")),
+            fallback_reason=_optional_str(payload.get("fallback_reason")),
+            elevated_available=_optional_bool(payload.get("elevated_available")),
+            elevated_blocker_summary=_optional_str(
+                payload.get("elevated_blocker_summary")
+            ),
             network_denied_verified=_optional_bool(payload.get("network_denied_verified")),
             process_tree_kill=_optional_bool(payload.get("process_tree_kill")),
             job_killed=_optional_bool(payload.get("job_killed")),

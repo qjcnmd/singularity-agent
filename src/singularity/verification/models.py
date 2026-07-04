@@ -330,8 +330,13 @@ class VerificationEvidence:
     sandbox_artifacts: list[dict[str, Any]] = field(default_factory=list)
     sandbox_changed_files: dict[str, Any] = field(default_factory=dict)
     sandbox_violations: list[dict[str, Any]] = field(default_factory=list)
+    sandbox_enforcement: str | None = None
     enforcement_status: str | None = None
     execution_backend: str | None = None
+    fallback_used: bool | None = None
+    fallback_reason: str | None = None
+    elevated_available: bool | None = None
+    elevated_blocker_summary: str | None = None
     network_denied_verified: bool | None = None
     process_tree_kill: bool | None = None
     job_killed: bool | None = None
@@ -359,8 +364,13 @@ class VerificationEvidence:
             "sandbox_artifacts": self.sandbox_artifacts,
             "sandbox_changed_files": self.sandbox_changed_files,
             "sandbox_violations": self.sandbox_violations,
+            "sandbox_enforcement": self.sandbox_enforcement,
             "enforcement_status": self.enforcement_status,
             "execution_backend": self.execution_backend,
+            "fallback_used": self.fallback_used,
+            "fallback_reason": self.fallback_reason,
+            "elevated_available": self.elevated_available,
+            "elevated_blocker_summary": self.elevated_blocker_summary,
             "network_denied_verified": self.network_denied_verified,
             "process_tree_kill": self.process_tree_kill,
             "job_killed": self.job_killed,

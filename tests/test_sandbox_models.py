@@ -40,7 +40,7 @@ def test_sandbox_models_construct_and_serialize(tmp_path: Path) -> None:
     )
     result = SandboxResult(
         sandbox_id="sandbox_1",
-        backend_name="windows",
+        backend_name="windows_elevated",
         status=SandboxStatus.SUCCESS,
         exit_code=0,
         stdout="ok\n",

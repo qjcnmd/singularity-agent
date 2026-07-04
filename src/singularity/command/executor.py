@@ -754,6 +754,8 @@ class CommandExecutor:
         sandbox_report = {
             "sandbox_id": sandbox_result.sandbox_id,
             "backend": sandbox_result.backend_name,
+            "sandbox_backend": sandbox_result.metadata.get("sandbox_backend")
+            or sandbox_result.backend_name,
             "status": sandbox_result.status.value,
             "trace_id": sandbox_result.trace_id,
             "enforcement_status": sandbox_result.metadata.get("enforcement_status")
@@ -767,6 +769,12 @@ class CommandExecutor:
             "backend_is_local_process": sandbox_result.backend_name == "local_process",
             "sandbox_mode": sandbox_result.metadata.get("sandbox_mode"),
             "sandbox_enforcement": sandbox_result.metadata.get("sandbox_enforcement"),
+            "fallback_used": bool(sandbox_result.metadata.get("fallback_used")),
+            "fallback_reason": sandbox_result.metadata.get("fallback_reason"),
+            "elevated_available": sandbox_result.metadata.get("elevated_available"),
+            "elevated_blocker_summary": sandbox_result.metadata.get(
+                "elevated_blocker_summary"
+            ),
             "used_local_process_fallback": bool(
                 sandbox_result.metadata.get("used_local_process_fallback")
             ),
@@ -776,6 +784,8 @@ class CommandExecutor:
             "network_denied_verified": sandbox_result.metadata.get(
                 "network_denied_verified"
             ),
+            "network_isolation": sandbox_result.metadata.get("network_isolation"),
+            "filesystem_isolation": sandbox_result.metadata.get("filesystem_isolation"),
             "process_tree_kill": sandbox_result.metadata.get("process_tree_kill"),
             "job_killed": sandbox_result.metadata.get("job_killed"),
             "timeout_enforced": sandbox_result.metadata.get("timeout_enforced")
@@ -795,7 +805,10 @@ class CommandExecutor:
         }
         isolation_report = self._isolation_report(request.resource_limits)
         isolation_report["backend"] = sandbox_result.backend_name
-        if not sandbox_report["backend_is_local_process"]:
+        filesystem_isolation = sandbox_report.get("filesystem_isolation")
+        if isinstance(filesystem_isolation, str) and filesystem_isolation:
+            isolation_report["filesystem_isolation"] = filesystem_isolation
+        elif sandbox_report["sandbox_backend"] == "windows_elevated":
             isolation_report["filesystem_isolation"] = "native_os_sandbox"
         isolation_report["sandbox"] = sandbox_report
         return CommandResult(
@@ -839,7 +852,7 @@ class CommandExecutor:
             git_after=git_after,
             metadata={
                 "sandbox_id": sandbox_result.sandbox_id,
-                "sandbox_backend": sandbox_result.backend_name,
+                "sandbox_backend": sandbox_report["sandbox_backend"],
                 "sandbox_status": sandbox_result.status.value,
                 "sandbox_trace_id": sandbox_result.trace_id,
                 "sandbox_artifacts": [artifact.to_dict() for artifact in sandbox_result.artifacts],
@@ -850,6 +863,12 @@ class CommandExecutor:
                 "execution_backend": sandbox_report["execution_backend"],
                 "sandbox_mode": sandbox_report["sandbox_mode"],
                 "sandbox_enforcement": sandbox_report["sandbox_enforcement"],
+                "fallback_used": sandbox_report["fallback_used"],
+                "fallback_reason": sandbox_report["fallback_reason"],
+                "elevated_available": sandbox_report["elevated_available"],
+                "elevated_blocker_summary": sandbox_report[
+                    "elevated_blocker_summary"
+                ],
                 "used_local_process_fallback": sandbox_report["used_local_process_fallback"],
                 "local_process_fallback_reason": sandbox_report[
                     "local_process_fallback_reason"

@@ -14,6 +14,7 @@
 关键符号:
 - VerificationCheck
 - VerificationResult
+- VerificationEvidence
 - CompletionAssessment
 - VerificationStep
 - VerificationContract
@@ -25,6 +26,7 @@
 字段清单:
 - VerificationCheck: kind, command, scope, required, timeout, risk_tags, failure_policy, id, policy_decision, policy_reasons, skip_reason, source, contract_step_id
 - VerificationResult: check_id, kind, status, failure_type, evidence, repair_hints, confidence_impact, duration_ms, attempts, policy_decision
+- VerificationEvidence: command_id, command, exit_code, output_excerpt, artifact_path, parsed_failures, duration_ms, timestamp, stdout_excerpt, stderr_excerpt, sandbox_id, sandbox_backend, sandbox_status, sandbox_artifacts, sandbox_changed_files, sandbox_violations, sandbox_enforcement, enforcement_status, execution_backend, fallback_used, fallback_reason, elevated_available, elevated_blocker_summary, network_denied_verified, process_tree_kill, job_killed, timeout_enforced, capability_summary
 - CompletionAssessment: status, confidence, passed_checks, failed_checks, skipped_checks, warnings, remaining_risks
 - VerificationStep: step_id, command, kind, required
 - VerificationContract: contract_id, steps, status, validation_errors
@@ -100,6 +102,43 @@ class VerificationResult:
     duration_ms: int
     attempts: list[VerificationEvidence] = field(default_factory=list)
     policy_decision: CommandPolicyResult | None = None
+```
+
+### VerificationEvidence（验证证据）
+
+单次验证命令的安全证据投影。**边界**：由 `VerificationRunner._result_from_command()` 从 `CommandResult` 生成，写入 verification result、planner evidence 和 trace 安全摘要；长输出只通过 artifact ref 关联。sandbox 字段来自 command metadata，用于区分 `windows_elevated`、`windows_unelevated` 与 `local_process`，并保留降级原因摘要。
+
+```python
+@dataclass(frozen=True)
+class VerificationEvidence:
+    command_id: str | None
+    command: str | None
+    exit_code: int | None
+    output_excerpt: str
+    artifact_path: str | None
+    parsed_failures: list[ParsedFailure]
+    duration_ms: int
+    timestamp: str
+    stdout_excerpt: str = ""
+    stderr_excerpt: str = ""
+    sandbox_id: str | None = None
+    sandbox_backend: str | None = None
+    sandbox_status: str | None = None
+    sandbox_artifacts: list[dict[str, Any]] = field(default_factory=list)
+    sandbox_changed_files: dict[str, Any] = field(default_factory=dict)
+    sandbox_violations: list[dict[str, Any]] = field(default_factory=list)
+    sandbox_enforcement: str | None = None
+    enforcement_status: str | None = None
+    execution_backend: str | None = None
+    fallback_used: bool | None = None
+    fallback_reason: str | None = None
+    elevated_available: bool | None = None
+    elevated_blocker_summary: str | None = None
+    network_denied_verified: bool | None = None
+    process_tree_kill: bool | None = None
+    job_killed: bool | None = None
+    timeout_enforced: bool | None = None
+    capability_summary: dict[str, Any] = field(default_factory=dict)
 ```
 
 ### ContractSatisfaction（契约满足度）
@@ -185,7 +224,7 @@ class CompletionStatus(str, Enum):   # CompletionAssessment.status
 
 `VerificationRunner.plan_verification()` 生成 `VerificationCheck` 列表，`VerificationPolicy.evaluate()` 只做 plan-time 结构检查和风险标签补充。`run_plan()` 调用 `PolicyEngine.enforce()` 做 verification-level preflight，再调用 `CommandExecutor.run()` 执行命令生成 `VerificationResult`。`CompletionAssessor.assess()` 消费 result 列表返回 `CompletionAssessment`。`VerificationContract.from_plan_strings()` 生成 `VerificationContract`。`Planner.assess_verification_contract_satisfaction()` 读取 contract 和 evidence 生成 `StepEvidence` 和 `ContractSatisfaction`。可执行 check 的 `PolicyRequest`/`PolicyDecision` 在执行阶段进入 policy audit ledger。
 
-`VerificationRunner._result_from_command()` 对命令输出先走 `FailureParserRegistry.parse()`，再由 `classify_failure()` 将 sandbox backend unavailable归为`sandbox_limitation`、sandbox violation归为`sandbox_violation`、timeout归为`timeout`、missing command归为`missing_command`。Python DLL/import初始化类环境问题（例如 `ImportError: DLL load failed while importing _ssl`、`_hashlib`、`_socket`、`libssl/libcrypto`缺失、OpenSSL provider/config不可读、证书路径不可读、DLL search path失败或 DLL initialization routine failed）优先归为`environment_error`，状态为`blocked`，不会按pytest普通失败进入代码修复。`environment_error`、`sandbox_limitation`和`sandbox_violation`不生成普通`repair_hints`；调用方必须把它们作为环境/沙箱 blocker 处理，而不是让模型修改业务代码。
+`VerificationRunner._result_from_command()` 对命令输出先走 `FailureParserRegistry.parse()`，再由 `classify_failure()` 将 sandbox backend unavailable归为`sandbox_limitation`、sandbox violation归为`sandbox_violation`、timeout归为`timeout`、missing command归为`missing_command`。它同时把 `CommandResult.metadata` 中的 `sandbox_enforcement`、`enforcement_status`、`execution_backend`、`fallback_used`、`fallback_reason`、`elevated_available` 和 `elevated_blocker_summary` 写入 `VerificationEvidence`，因此 verification evidence 能区分严格 elevated sandbox、降级 unelevated sandbox 和 relaxed local process。Python DLL/import初始化类环境问题（例如 `ImportError: DLL load failed while importing _ssl`、`_hashlib`、`_socket`、`libssl/libcrypto`缺失、OpenSSL provider/config不可读、证书路径不可读、DLL search path失败或 DLL initialization routine failed）优先归为`environment_error`，状态为`blocked`，不会按pytest普通失败进入代码修复。`environment_error`、`sandbox_limitation`和`sandbox_violation`不生成普通`repair_hints`；调用方必须把它们作为环境/沙箱 blocker 处理，而不是让模型修改业务代码。
 
 benchmark/public task 的 AgentLoop 内 smoke command 来自 Planner `contract_smoke_commands()`；Planner 已把 manifest 可见的 `verification_command` 收敛为唯一 required requirement。benchmark constraint 存在时，这组 contract smoke 优先于模型传给 `run_verification` 的 `smoke_commands`，因此模型不能在 tool 参数中追加 broad pytest；普通非 benchmark task 仍保留显式 smoke 的原有优先级。语法检查仍可作为独立 syntax check 生成；仅当 manifest smoke 与自动 syntax 都是 Python-like executable、精确 `-m py_compile` 且规范化文件参数完全一致时，runner 保留 manifest smoke 并跳过自动 syntax。文件子集、pytest、`-c`、不同命令或不同参数不去重，也不把 evaluator-owned public/hidden verification 注入 AgentLoop。
 
