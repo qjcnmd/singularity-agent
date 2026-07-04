@@ -8,6 +8,12 @@
 - src/singularity/sandbox/backends.py
 - src/singularity/sandbox/filesystem.py
 - src/singularity/sandbox/windows.py
+- src/singularity/sandbox/windows_identity.py
+- src/singularity/sandbox/windows_acl.py
+- src/singularity/sandbox/windows_firewall.py
+- src/singularity/sandbox/windows_runtime.py
+- src/singularity/sandbox/windows_doctor.py
+- src/singularity/sandbox/windows_cleanup.py
 - src/singularity/sandbox/windows_models.py
 - src/singularity/sandbox/windows_runner.py
 - src/singularity/command/executor.py
@@ -67,7 +73,13 @@ Windows 当前实现是双 principal 的 account-backed OS sandbox：父进程�
 - `src/singularity/sandbox/manager.py`：backend 选择、capability 校验、protected path preflight、生命周期和 trace。
 - `src/singularity/sandbox/backends.py`：默认 backend 注册；Windows 上注册 `WindowsSandboxBackend`，非 Windows 返回空列表。
 - `src/singularity/sandbox/filesystem.py`：workspace projection、protected glob 排除、变化检测和清理辅助。
-- `src/singularity/sandbox/windows.py`：Windows doctor/setup/cleanup、account/firewall/ACL/login UI/logon rights probe、backend prepare/run/cleanup。
+- `src/singularity/sandbox/windows.py`：Windows sandbox backend facade，保留 `WindowsSandboxBackend`、`setup_windows_sandbox()` 和既有测试/内部 helper 的 facade 出口；能力入口由下列 Windows 子模块承接。
+- `src/singularity/sandbox/windows_identity.py`：sandbox account identity、credential 创建/刷新入口。
+- `src/singularity/sandbox/windows_acl.py`：sandbox control dir / probe root ACL 授权入口。
+- `src/singularity/sandbox/windows_firewall.py`：offline firewall rule 状态探测入口。
+- `src/singularity/sandbox/windows_runtime.py`：account-backed runner smoke 入口。
+- `src/singularity/sandbox/windows_doctor.py`：`probe_windows_sandbox()` doctor facade 和缓存入口。
+- `src/singularity/sandbox/windows_cleanup.py`：`cleanup_windows_sandbox_assets()` cleanup 流程入口。
 - `src/singularity/sandbox/windows_models.py`：Windows sandbox schema 常量、双账户 identity 映射、doctor/setup/cleanup DTO 和 `to_dict()` wire projection。
 - `src/singularity/sandbox/windows_runner.py`：sandbox account runner、restricted token child、private desktop、Job Object、timeout/output/network probe/result JSON。
 - `src/singularity/command/executor.py`：依据会话级 `PermissionProfile` 构造完整 `SandboxRequest`，并把 `SandboxResult` 投影成 command evidence。
@@ -371,9 +383,9 @@ class SandboxNetworkMode(str, Enum):
 - `CommandExecutor._sandbox_request()` 生成 `SandboxProfile` 和 `SandboxRequest`。
 - `default_sandbox_profile()` 生成基础 profile，`CommandExecutor` 再写入会话权限边界、protected globs、network mode 和 resource limits。
 - `windows_models.py` 定义 Windows sandbox schema 常量、offline/online identity 映射和 doctor/setup/cleanup DTO class。
-- `probe_windows_sandbox()` 生成 `WindowsSandboxDoctorReport`。
-- `setup_windows_sandbox()`生成`WindowsSandboxSetupReport`，在elevated shell下配置两个账户、独立credential、登录UI、LSA rights、受限组成员、双账户state ACL、offline firewall、ACL/runner/network probes，并迁移固定legacy资产。
-- `cleanup_windows_sandbox_assets()`生成`WindowsSandboxCleanupReport`，删除current/legacy账户、credential、firewall group、登录UI值与machine state dir，执行LSA rights清理和最终residual audit。
+- `windows_doctor.py` 中的 `probe_windows_sandbox()` 生成 `WindowsSandboxDoctorReport`，`windows.py` 继续导出同名入口。
+- `windows.py` 中的 `setup_windows_sandbox()`生成`WindowsSandboxSetupReport`，在elevated shell下配置两个账户、独立credential、登录UI、LSA rights、受限组成员、双账户state ACL、offline firewall、ACL/runner/network probes，并迁移固定legacy资产。
+- `windows_cleanup.py` 中的 `cleanup_windows_sandbox_assets()`生成`WindowsSandboxCleanupReport`，删除current/legacy账户、credential、firewall group、登录UI值与machine state dir，执行LSA rights清理和最终residual audit；`windows.py` 继续导出同名入口。
 - `WindowsSandboxBackend.prepare()` 生成 `PreparedSandbox` 与 runner spec；`WindowsSandboxBackend.run()` 生成执行型 `SandboxResult`。
 - `WindowsSandboxRunner.run()` / `run_spec()` 生成 `WindowsRunnerResult`。
 

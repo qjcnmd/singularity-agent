@@ -1724,7 +1724,7 @@
   E1. sandbox doctor / setup / cleanup（CLI 能力诊断，不进入 AgentLoop）
     python -m singularity.cli sandbox doctor --json
     → WindowsSandboxBackend.doctor()
-    → probe_windows_sandbox()
+    → windows_doctor.probe_windows_sandbox()
     → offline / online 双账户检查：
       1) account / credential / login UI / logon rights / group membership
       2) state dir ACL boundary / runner smoke / network probe
@@ -1744,13 +1744,17 @@
 
     python -m singularity.cli sandbox setup --json
     → setup_windows_sandbox()
+    → windows_identity._ensure_sandbox_identity()
+    → windows_acl._apply_sandbox_control_dir_acl()
+    → windows_firewall._network_state()
+    → windows_runtime._runner_smoke_state()
     → 授权 Python runtime targets 前：
       清理 base runtime 根目录上 sandbox 账户 stale explicit ACE
     → 只恢复 base 根目录 RX 和精确 runtime targets RX/(OI)(CI)RX
       不递归授权整个 Anaconda/base install、包缓存、用户目录或配置目录。
 
     python -m singularity.cli sandbox cleanup --json
-    → cleanup_windows_sandbox_assets()
+    → windows_cleanup.cleanup_windows_sandbox_assets()
     → 删除 credential / firewall / login UI / attestation
     → 移除两个 current sandbox 账户在相同 runtime targets 上的全部显式 ACE
     → residual_audit 非零则 cleanup failed。

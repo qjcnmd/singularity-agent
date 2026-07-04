@@ -786,58 +786,8 @@ def _network_probe_state_for_role(
 
 
 @lru_cache(maxsize=1)
-def probe_windows_sandbox() -> WindowsSandboxDoctorReport:
+def _probe_windows_sandbox_cached_impl() -> WindowsSandboxDoctorReport:
     return _probe_windows_sandbox_uncached()
-
-
-def _ensure_sandbox_identity(identity: _WindowsSandboxIdentity) -> _OperationResult:
-    name_error = _validate_sandbox_account_name(identity.account_name)
-    if name_error is not None:
-        return _OperationResult(
-            False,
-            name_error["reason"],
-            dict(name_error["details"]),
-        )
-    changed = False
-    password = ""
-    try:
-        if not _account_exists(identity.account_name):
-            password = _generate_account_password()
-            created = _create_sandbox_account(identity.account_name, password)
-            if not created.ok:
-                return _OperationResult(
-                    False,
-                    created.reason,
-                    {"phase": "sandbox_accounts", **created.details},
-                )
-            changed = True
-            credential = _store_credential(identity, password)
-            if not credential.ok:
-                return _OperationResult(
-                    False,
-                    credential.reason,
-                    {"phase": "credentials", **credential.details},
-                )
-        elif not _credential_state(identity).ready:
-            password = _generate_account_password()
-            reset = _set_account_password(identity.account_name, password)
-            if not reset.ok:
-                return _OperationResult(
-                    False,
-                    reset.reason,
-                    {"phase": "credentials", **reset.details},
-                )
-            credential = _store_credential(identity, password)
-            if not credential.ok:
-                return _OperationResult(
-                    False,
-                    credential.reason,
-                    {"phase": "credentials", **credential.details},
-                )
-            changed = True
-        return _OperationResult(True, "identity_ready", {"changed": changed})
-    finally:
-        password = ""
 
 
 def _setup_identity_security(identity: _WindowsSandboxIdentity) -> _OperationResult:
@@ -1262,147 +1212,6 @@ def _sandbox_residual_audit() -> dict[str, int]:
         "security_attestations": int(_security_attestation_exists()),
         "state_dirs": int(_windows_state_dir_path().exists()),
     }
-
-
-def cleanup_windows_sandbox_assets() -> WindowsSandboxCleanupReport:
-    if os.name != "nt":
-        return WindowsSandboxCleanupReport(
-            status="not_supported",
-            requested_operation="cleanup",
-            requires_elevation=False,
-            changed=False,
-            completed_steps=(),
-            failed_steps=({"step": "platform", "reason": "Windows sandbox cleanup requires Windows."},),
-            diagnostics=(),
-        )
-    if not _is_elevated():
-        return WindowsSandboxCleanupReport(
-            status="requires_elevation",
-            requested_operation="cleanup",
-            requires_elevation=True,
-            changed=False,
-            completed_steps=(),
-            failed_steps=(),
-            diagnostics=(
-                {
-                    "kind": "cleanup_requires_elevation",
-                    "status": "blocked",
-                    "reason": "Run sandbox cleanup from an elevated shell.",
-                },
-            ),
-        )
-
-    changed = False
-    completed: list[str] = []
-    failed: list[dict[str, Any]] = []
-    diagnostics: list[dict[str, Any]] = list(_legacy_artifact_diagnostics())
-
-    asset_accounts = tuple(dict.fromkeys((*SANDBOX_ACCOUNTS, *LEGACY_SANDBOX_ACCOUNTS)))
-    for target in asset_accounts:
-        if not target:
-            continue
-        credential = _delete_credential(target)
-        if credential.ok:
-            changed = changed or bool(credential.details.get("changed"))
-            completed.append(f"credential:{_hash_text(target)}")
-        else:
-            failed.append({"step": "credential", "reason": credential.reason, "details": credential.details})
-
-    firewall = _delete_firewall_group()
-    if firewall.ok:
-        changed = changed or bool(firewall.details.get("changed"))
-        completed.append("firewall_group")
-    else:
-        failed.append(
-            {"step": "firewall_group", "reason": firewall.reason, "details": firewall.details}
-        )
-
-    attestation = _delete_security_attestation()
-    if attestation.ok:
-        changed = changed or bool(attestation.details.get("changed"))
-        completed.append("security_attestation")
-    else:
-        failed.append(
-            {
-                "step": "security_attestation",
-                "reason": attestation.reason,
-                "details": attestation.details,
-            }
-        )
-
-    for target in asset_accounts:
-        if not target:
-            continue
-        visibility = _remove_login_ui_visibility_entry(target)
-        if visibility.ok:
-            changed = changed or bool(visibility.details.get("changed"))
-            completed.append(f"login_ui_visibility:{_hash_text(target)}")
-        else:
-            failed.append({"step": "login_ui_visibility", "reason": visibility.reason, "details": visibility.details})
-
-    runtime_accounts = tuple(target for target in asset_accounts if target and _account_exists(target))
-    runtime_access = _remove_runner_runtime_access(runtime_accounts)
-    if runtime_access.ok:
-        changed = changed or bool(runtime_access.details.get("changed"))
-        completed.append("runner_runtime_access")
-    else:
-        failed.append(
-            {
-                "step": "runner_runtime_access",
-                "reason": runtime_access.reason,
-                "details": runtime_access.details,
-            }
-        )
-
-    state_dir = _delete_windows_state_dir()
-    if state_dir.ok:
-        changed = changed or bool(state_dir.details.get("changed"))
-        completed.append("state_dir")
-    else:
-        failed.append({"step": "state_dir", "reason": state_dir.reason, "details": state_dir.details})
-
-    for target in reversed(asset_accounts):
-        if not target:
-            continue
-        sid = _account_sid(target)
-        rights = _remove_all_account_rights(sid)
-        if not rights.ok:
-            failed.append(
-                {"step": "account_rights", "reason": rights.reason, "details": rights.details}
-            )
-        account = _delete_sandbox_account(target)
-        if account.ok:
-            changed = changed or bool(account.details.get("changed"))
-            completed.append(f"sandbox_account:{_hash_text(target)}")
-        else:
-            failed.append({"step": "sandbox_account", "reason": account.reason, "details": account.details})
-
-    residual_audit = _sandbox_residual_audit()
-    residual_count = sum(residual_audit.values())
-    if residual_count:
-        failed.append(
-            {
-                "step": "residual_audit",
-                "reason": "Singularity Windows sandbox assets remain after cleanup.",
-                "details": {"residual_audit": residual_audit},
-            }
-        )
-    else:
-        completed.append("residual_audit")
-    probe_windows_sandbox.cache_clear()
-    status = "failed" if failed else "completed"
-    if not changed and not failed:
-        status = "completed"
-    return WindowsSandboxCleanupReport(
-        status=status,
-        requested_operation="cleanup",
-        requires_elevation=False,
-        changed=changed,
-        completed_steps=tuple(dict.fromkeys(completed)),
-        failed_steps=tuple(failed),
-        diagnostics=tuple(diagnostics),
-        residual_audit=residual_audit,
-    )
 
 
 def _probe_windows_sandbox_uncached() -> WindowsSandboxDoctorReport:
@@ -5184,3 +4993,11 @@ def _limit_output(stdout: str, stderr: str, max_chars: int | None) -> tuple[str,
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+from singularity.sandbox.windows_acl import _apply_sandbox_control_dir_acl as _apply_sandbox_control_dir_acl
+from singularity.sandbox.windows_cleanup import cleanup_windows_sandbox_assets as cleanup_windows_sandbox_assets
+from singularity.sandbox.windows_doctor import probe_windows_sandbox as probe_windows_sandbox
+from singularity.sandbox.windows_firewall import _network_state as _network_state
+from singularity.sandbox.windows_identity import _ensure_sandbox_identity as _ensure_sandbox_identity
+from singularity.sandbox.windows_runtime import _runner_smoke_state as _runner_smoke_state
