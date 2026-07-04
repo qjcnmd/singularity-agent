@@ -33,7 +33,7 @@ from singularity.interaction import RichCliRenderer
 from singularity.kernel import CancellationError, KernelBootstrap
 from singularity.kernel.models import RunStatus
 from singularity.memory.cli import memory_app
-from singularity.observability import TraceRedactor, TraceStore
+from singularity.observability import TraceStore, shared_trace_redactor
 from singularity.plugins.cli import plugin_app
 from singularity.policy import PolicyConfig, PolicyEngine
 from singularity.policy.cli import approval_app
@@ -52,11 +52,13 @@ from singularity.release.repair import (
     repair_user_data,
     uninstall_user_data,
 )
+from singularity.runtime.resources import close_runtime_resources
 from singularity.sandbox import SandboxManager, WindowsSandboxBackend
 from singularity.sandbox.windows import sandbox_exception_diagnostics
 from singularity.session.history import SessionHistoryReader
 from singularity.session.models import SessionCheckpointKind, SessionRunMode, SessionStatus
 from singularity.session.store import SessionStore
+from singularity.utils.attributes import nested_getattr
 from singularity.verification import VerificationRunner
 from singularity.workspace_state import (
     WorkspaceHealthReport,
@@ -114,7 +116,7 @@ eval_app.add_typer(eval_ab_app, name="ab")
 eval_app.add_typer(eval_regression_app, name="regression")
 eval_app.add_typer(eval_report_app, name="report")
 console = Console()
-_REDACTOR = TraceRedactor()
+_REDACTOR = shared_trace_redactor()
 ProjectRootOption = Annotated[
     Path | None,
     typer.Option("--project-root", help="Workspace/project root; defaults to the current directory."),
@@ -431,7 +433,7 @@ def _run_with_config(
             config=production_config,
             console=console,
         ).boot(goal)
-        identity = getattr(getattr(kernel, "context", None), "identity", None)
+        identity = nested_getattr(kernel, "context.identity")
         run_id = str(getattr(identity, "run_id", "run_unknown"))
         session_id = str(getattr(identity, "session_id", run_id))
         task_id = str(getattr(identity, "task_id", session_id))
@@ -509,7 +511,7 @@ def _run_with_config(
                 "[yellow]workspace recovery[/yellow] "
                 + json_dumps(kernel.recovery_report.to_dict())
             )
-        workspace_state = getattr(getattr(kernel, "graph", None), "workspace_state", None)
+        workspace_state = nested_getattr(kernel, "graph.workspace_state")
         if workspace_state is not None and getattr(workspace_state, "baseline", None) is not None:
             baseline = workspace_state.baseline
             console.print(
@@ -595,7 +597,7 @@ def _run_with_config(
         if isinstance(details, dict):
             session_id_from_error = details.get("session_id")
         if kernel is not None:
-            identity = getattr(getattr(kernel, "context", None), "identity", None)
+            identity = nested_getattr(kernel, "context.identity")
             if identity is not None:
                 run_id = str(getattr(identity, "run_id", "run_unknown"))
                 session_id = str(getattr(identity, "session_id", run_id))
@@ -639,9 +641,7 @@ def _run_with_config(
                     "[yellow]final report unavailable[/yellow] "
                     + _REDACTOR.redact_text(str(report_exc))
                 )
-        close_resources = getattr(kernel, "close_resources", None) if kernel is not None else None
-        if callable(close_resources):
-            close_resources()
+        close_runtime_resources(kernel)
         session_store.close()
         raise typer.Exit(1) from exc
 
@@ -653,9 +653,7 @@ def _run_with_config(
         )
         console.print(_workspace_health_panel(final_health))
     finally:
-        close_resources = getattr(kernel, "close_resources", None) if kernel is not None else None
-        if callable(close_resources):
-            close_resources()
+        close_runtime_resources(kernel)
         session_store.close()
 
 
@@ -928,12 +926,12 @@ def _print_session_commands(session_id: str) -> None:
 
 
 def _trace_run_dir(kernel: Any) -> Path:
-    run_dir = getattr(getattr(getattr(getattr(kernel, "graph", None), "trace", None), "store", None), "run_dir", None)
+    run_dir = nested_getattr(kernel, "graph.trace.store.run_dir")
     return Path(run_dir) if run_dir is not None else Path("work") / "traces" / "runs" / "unknown"
 
 
 def _trace_record(kernel: Any, event: str, payload: dict[str, Any]) -> None:
-    trace = getattr(getattr(kernel, "graph", None), "trace", None)
+    trace = nested_getattr(kernel, "graph.trace")
     record = getattr(trace, "record", None)
     if callable(record):
         record(event, payload)
@@ -1486,7 +1484,29 @@ def _run_evaluation_task_set(
     baseline_result: Path | None,
     project_root: Path | None,
 ) -> dict[str, Any]:
-    manifest = load_evaluation_task_set(task_set)
+    return _run_loaded_evaluation_task_set(
+        manifest=load_evaluation_task_set(task_set),
+        output_dir=output_dir,
+        run_id=run_id,
+        max_turns=max_turns,
+        model=model,
+        base_url=base_url,
+        baseline_result=baseline_result,
+        project_root=project_root,
+    )
+
+
+def _run_loaded_evaluation_task_set(
+    *,
+    manifest: Any,
+    output_dir: Path | None,
+    run_id: str | None,
+    max_turns: int | None,
+    model: str | None,
+    base_url: str | None,
+    baseline_result: Path | None,
+    project_root: Path | None,
+) -> dict[str, Any]:
     env_root = resolve_project_root(project_root)
     return EvaluationRunner(
         output_root=output_dir,
@@ -1561,18 +1581,16 @@ def _run_private_evaluation_task_set(
     baseline_result: Path | None,
     project_root: Path | None,
 ) -> dict[str, Any]:
-    manifest = SingularityPrivateBenchmarkAdapter().load(task_set)
-    env_root = resolve_project_root(project_root)
-    return EvaluationRunner(
-        output_root=output_dir,
+    return _run_loaded_evaluation_task_set(
+        manifest=SingularityPrivateBenchmarkAdapter().load(task_set),
+        output_dir=output_dir,
         run_id=run_id,
         max_turns=max_turns,
         model=model,
         base_url=base_url,
-        baseline_result_path=baseline_result,
-        env_root=env_root,
-        console=console,
-    ).run(manifest)
+        baseline_result=baseline_result,
+        project_root=project_root,
+    )
 
 
 @eval_app.command("private")
@@ -1744,9 +1762,7 @@ def _run_provider_smoke_benchmark(
             },
         }
     finally:
-        close_resources = getattr(kernel, "close_resources", None)
-        if callable(close_resources):
-            close_resources()
+        close_runtime_resources(kernel)
 
 
 def _profiles_from_cli(profile_json: list[str] | None) -> list[EvaluationProfile]:

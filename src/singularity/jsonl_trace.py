@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 
 
 class JsonlTraceRecorder:
@@ -21,7 +21,7 @@ class JsonlTraceRecorder:
         return cls(run_id=run_id, path=trace_dir / f"{run_id}.jsonl")
 
     def record(self, event: str, data: dict) -> None:
-        redactor = TraceRedactor()
+        redactor = shared_trace_redactor()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "ts": datetime.now(UTC).isoformat(),

@@ -10,12 +10,12 @@ from singularity.instructions.models import (
     PromptSection,
     _new_id,
 )
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import TraceRedactor, shared_trace_redactor
 
 
 class PromptManifestBuilder:
     def __init__(self, *, redactor: TraceRedactor | None = None) -> None:
-        self.redactor = redactor or TraceRedactor()
+        self.redactor = redactor or shared_trace_redactor()
 
     def build(
         self,

@@ -24,7 +24,7 @@ from singularity.observability.protocols import (
     TraceStorageProtocol,
 )
 from singularity.observability.recorder import TraceRecorder
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import TraceRedactor, shared_trace_redactor
 from singularity.observability.spans import SpanManager
 from singularity.observability.store import TraceStore
 from singularity.observability.summary import TraceSummaryBuilder
@@ -56,4 +56,5 @@ __all__ = [
     "TraceSummaryBuilder",
     "TraceTimelineBuilder",
     "TraceTimelineItem",
+    "shared_trace_redactor",
 ]

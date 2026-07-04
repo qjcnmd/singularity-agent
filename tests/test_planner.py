@@ -148,6 +148,15 @@ def test_benchmark_constraints_share_tool_scope_for_exposure_and_authorization(t
     assert denied.error_code == "benchmark_tool_not_allowed"
 
 
+def test_authorize_tool_call_uses_single_deny_helper(tmp_path: Path) -> None:
+    import inspect
+
+    source = inspect.getsource(Planner.authorize_tool_call)
+
+    assert "self._deny_tool_call(" in source
+    assert source.count("AuthorizationDecision(\n                allowed=False") == 0
+
+
 def test_benchmark_expected_file_changes_delay_verification_phase(tmp_path: Path) -> None:
     planner = Planner(tmp_path, session_id="session_1", task_id="task_1")
     planner.apply_benchmark_constraints(

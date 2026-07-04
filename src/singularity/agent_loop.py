@@ -9,7 +9,7 @@ from rich.console import Console
 
 from singularity.agent_loop_completion import CompletionGate
 from singularity.agent_loop_failure_recovery import FailureRecoveryCoordinator
-from singularity.agent_loop_turns import TurnCoordinator
+from singularity.agent_loop_turns import TurnCoordinator, TurnCoordinatorCallbacks
 from singularity.context import ContextManager
 from singularity.error_codes import ErrorCode
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
@@ -27,6 +27,7 @@ from singularity.repair import RepairPlanner
 from singularity.run_controller import RunController
 from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tools import ToolExecutor, ToolRegistry
+from singularity.utils.attributes import nested_getattr
 
 SYSTEM_PROMPT = """You are Singularity, a local coding agent harness.
 
@@ -190,15 +191,17 @@ class AgentLoop:
             tool_protocol=self.tool_protocol,
             prompt_assembly=self.prompt_assembly,
             strict=self.strict,
-            publish_progress=self._publish_progress,
-            record_model_failure=self._record_model_failure,
-            outcome_from_model_failure=self._outcome_from_model_failure,
-            terminal_result_from_outcome=self._terminal_result_from_outcome,
-            record_outcome_context=self._record_outcome_context,
-            assistant_message_from_result=self._assistant_message_from_result,
-            attempt_finalize=self._attempt_finalize,
-            maybe_analyze_failure=self._maybe_analyze_failure,
-            should_auto_finalize_after_tools=self._should_auto_finalize_after_tools,
+            callbacks=TurnCoordinatorCallbacks(
+                publish_progress=self._publish_progress,
+                record_model_failure=self._record_model_failure,
+                outcome_from_model_failure=self._outcome_from_model_failure,
+                terminal_result_from_outcome=self._terminal_result_from_outcome,
+                record_outcome_context=self._record_outcome_context,
+                assistant_message_from_result=self._assistant_message_from_result,
+                attempt_finalize=self._attempt_finalize,
+                maybe_analyze_failure=self._maybe_analyze_failure,
+                should_auto_finalize_after_tools=self._should_auto_finalize_after_tools,
+            ),
         )
         self.turn_coordinator = coordinator
         return coordinator
@@ -471,10 +474,7 @@ class AgentLoop:
     def _publish_progress(self, turn: int) -> None:
         if self.interaction_controller is None:
             return
-        phase = (
-            getattr(getattr(self.planner, "state", None), "current_phase", None)
-            or "model"
-        )
+        phase = nested_getattr(self.planner, "state.current_phase") or "model"
         self.interaction_controller.publish(
             ProgressEvent(
                 phase=str(phase),

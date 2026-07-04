@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.observability.protocols import TraceEmitterProtocol
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 from singularity.policy import PermissionProfile, PermissionProfileName
 from singularity.sandbox.backends import SandboxBackend, default_sandbox_backends
 from singularity.sandbox.exceptions import SandboxCapabilityError
@@ -671,8 +671,8 @@ class SandboxManager:
                     process.kill()
                 stdout, stderr = "", "Process timed out and could not be terminated cleanly."
         stdout, stderr, output_truncated = _limit_output(
-            TraceRedactor().redact_text(stdout or ""),
-            TraceRedactor().redact_text(stderr or ""),
+            shared_trace_redactor().redact_text(stdout or ""),
+            shared_trace_redactor().redact_text(stderr or ""),
             output_limit,
         )
         status = (
@@ -1073,7 +1073,7 @@ def _limit_output(
 
 
 def _safe_reason(reason: str) -> str:
-    return TraceRedactor().redact_text(reason)[:500]
+    return shared_trace_redactor().redact_text(reason)[:500]
 
 
 def _diagnostic_summary(diagnostics: Any) -> str:

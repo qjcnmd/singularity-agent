@@ -65,6 +65,7 @@ from singularity.sandbox import (
     default_sandbox_profile,
 )
 from singularity.sandbox.models import new_sandbox_id
+from singularity.utils.attributes import nested_getattr
 
 if TYPE_CHECKING:
     from singularity.workspace_state import WorkspaceStateManager
@@ -1065,7 +1066,7 @@ class CommandExecutor:
             ids={
                 "session_id": getattr(self.planner, "session_id", None),
                 "task_id": getattr(self.planner, "task_id", None),
-                "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+                "phase_id": nested_getattr(self.planner, "state.current_phase"),
                 "action_id": tool_call_id or request.command_id,
                 "command_id": request.command_id,
                 "transaction_id": transaction_id,
@@ -1355,7 +1356,7 @@ class CommandExecutor:
         return PolicyRequest(
             session_id=getattr(self.planner, "session_id", "command_session"),
             task_id=getattr(self.planner, "task_id", "command_task"),
-            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "command"),
+            phase_id=nested_getattr(self.planner, "state.current_phase", default="command"),
             action_id=request.command_id,
             component=PolicyComponent.COMMAND,
             operation=operation,

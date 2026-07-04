@@ -86,7 +86,7 @@
 │     └── return RunResult(BLOCKED)                                           │
 │     该分支不创建 AgentLoop、不调用模型、不继续写 workspace。                 │
 │                                                                             │
-│  5. 组装 AgentLoop（注入 13 个依赖）                                          │
+│  5. 组装 AgentLoop（注入运行时依赖）                                          │
 │     agent = AgentLoop(                                                      │
 │         model_runner    = graph.model_runner,                               │
 │         tools           = graph.tools,         # ToolRegistry               │
@@ -275,14 +275,14 @@
                                    ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
 ║                TurnCoordinator.run_turn(turn) — 单 Turn 完整流程             ║
-║              (agent_loop_turns.py，经 AgentLoop.run 的 callback 调用)        ║
+║              (agent_loop_turns.py，经 AgentLoop.run 的 callback bundle 调用) ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  步骤 ① —— 前置准备                                                          │
 │                                                                             │
-│  ├── _publish_progress(turn)                                                │
+│  ├── callbacks.publish_progress(turn)                                       │
 │  │   └── InteractionController.publish(ProgressEvent(phase, status, …))     │
 │  │                                                                          │
 │  ├── planner.step()              → 状态机推进 + completion gate 初检          │

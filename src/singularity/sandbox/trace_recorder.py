@@ -5,10 +5,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 from singularity.sandbox.models import PreparedSandbox, SandboxCapabilities, SandboxRequest, SandboxResult
 
-_REDACTOR = TraceRedactor()
+_REDACTOR = shared_trace_redactor()
 
 
 class SandboxJsonlTraceRecorder:

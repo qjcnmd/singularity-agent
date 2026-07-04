@@ -388,11 +388,11 @@ class TraceEventType(StrEnum):
 
 ### 数据流概述
 
-`TraceEvent` 是最小单元，写入 `events.jsonl`；`TraceSpan` 是区间单元，写入 `spans.jsonl`；`TraceArtifact` 是文件引用，写入 `artifacts.jsonl` + 实际文件。`TraceStore.get_timeline()` 从 events 派生 `TraceTimelineItem`，`TraceStore.summarize()` 聚合为 `TraceSummary`。Trace redaction 的规则实现来自 `RedactionProvider`，但对外仍由 `TraceRedactor` 维持 `<redacted>`、safe token usage metrics、`restricted_token` 例外和 payload hash 语义。Policy audit 是独立层，由 `PolicyAuditWriter.append()` 写 `audit.jsonl`，不能用 trace event 替代；audit 使用 `RedactionProvider(marker=RedactionMarker.BRACKETED)`，继续保留 `[REDACTED]` 形状。完整 trace 对象不自动进入模型；只有 `ContextManager.add_trace_summary()` 生成的安全文本摘要进入 context。
+`TraceEvent` 是最小单元，写入 `events.jsonl`；`TraceSpan` 是区间单元，写入 `spans.jsonl`；`TraceArtifact` 是文件引用，写入 `artifacts.jsonl` + 实际文件。`TraceStore.get_timeline()` 从 events 派生 `TraceTimelineItem`，`TraceStore.summarize()` 聚合为 `TraceSummary`。Trace redaction 的规则实现来自 `RedactionProvider`，但对外仍由 `TraceRedactor` 维持 `<redacted>`、safe token usage metrics、`restricted_token` 例外和 payload hash 语义；默认配置的热路径通过 `shared_trace_redactor()` 复用同一实例，需要非默认 `output_limit_chars` 或显式注入时才创建独立实例。Policy audit 是独立层，由 `PolicyAuditWriter.append()` 写 `audit.jsonl`，不能用 trace event 替代；audit 使用 `RedactionProvider(marker=RedactionMarker.BRACKETED)`，继续保留 `[REDACTED]` 形状。完整 trace 对象不自动进入模型；只有 `ContextManager.add_trace_summary()` 生成的安全文本摘要进入 context。
 
 ## 谁生成这些对象
 
-`TraceRecorder.emit()`经`TraceRedactor`生成`TraceEvent`；`TraceRedactor` 内部调用 `RedactionProvider`，不改变 trace event 字段。SpanManager的start/end生成追加式`TraceSpan`；TraceArtifactStore写文件后生成`TraceArtifact`。`TraceTimelineBuilder`从events派生`TraceTimelineItem`，`TraceSummaryBuilder`从events/spans/artifacts聚合`TraceSummary`。
+`TraceRecorder.emit()`经`TraceRedactor`生成`TraceEvent`；`TraceRedactor` 内部调用 `RedactionProvider`，不改变 trace event 字段。默认 redaction 可由 `shared_trace_redactor()` 提供稳定实例；需要不同输出长度或可测试注入时，调用方仍可创建独立 `TraceRedactor`。SpanManager的start/end生成追加式`TraceSpan`；TraceArtifactStore写文件后生成`TraceArtifact`。`TraceTimelineBuilder`从events派生`TraceTimelineItem`，`TraceSummaryBuilder`从events/spans/artifacts聚合`TraceSummary`。
 
 ## 谁消费这些对象
 
@@ -406,7 +406,7 @@ TraceStore消费event/span/artifact；CLI、final report、evaluation/replay消�
 
 性能 span 只进入现有安全事件的数值 payload：sandbox lifecycle 的 `timing`、`review.completed` 的 `review_stage`/`decision`/`duration_ms`/`critic_duration_ms`/`model_critic_status`/`output_mode`/`schema_validation_passed`/`retry_count`/`fallback_reason`/`critic_reused`/`critic_skipped_reason`/`critic_reuse_skip_reason`/`critic_source_status`、`context.bundle_built` 的 `duration_ms`/`compaction_decision_duration_ms`，以及 `retrieval.query.completed` 的 `duration_ms`/`result_count`。`review.completed` 可用 `critic_reused=true` 和 `critic_skipped_reason=post_verification_evidence_unchanged` 表示 final review 复用 post-verification model-assisted review evidence；该事件仍只记录安全状态与耗时，不记录模型输入输出。这些字段不包含 prompt、response、memory query、credential、环境值或 evaluator-only metadata；evaluation 只按安全 ID、状态和耗时聚合。
 
-TraceEvent在append前执行payload redaction并计算payload_hash；span/artifact通过refs关联。`TraceRedactor` 使用统一 `RedactionProvider` 的 plain profile，因此 trace 仍输出 `<redacted>` 而不是 context 的 `<redacted:{digest}>`。Policy audit是独立JSONL，由PolicyAuditWriter保存request/decision摘要，不能用events.jsonl替代审计账本，也不能把audit entry称为TraceEvent。
+TraceEvent在append前执行payload redaction并计算payload_hash；span/artifact通过refs关联。`TraceRedactor` 使用统一 `RedactionProvider` 的 plain profile，因此 trace 仍输出 `<redacted>` 而不是 context 的 `<redacted:{digest}>`。默认热路径复用 `shared_trace_redactor()`，该复用不改变 redaction profile、payload shape 或 hash 语义。Policy audit是独立JSONL，由PolicyAuditWriter保存request/decision摘要，不能用events.jsonl替代审计账本，也不能把audit entry称为TraceEvent。
 
 Sandbox JSONL trace 由 `SandboxJsonlTraceRecorder.append()` 追加到 `<workspace>/.singularity/sandbox/trace.jsonl`，不是 `TraceEvent` schema 的替代物。每条 sandbox JSONL 记录除生命周期、capabilities、timing、artifact 和 violation 安全摘要外，还写入 `sandbox_mode`、`sandbox_backend`、`sandbox_enforcement`、`enforcement_status`、`execution_backend`、`fallback_used`、`fallback_reason`、`elevated_available`、`elevated_blocker_summary`、`used_local_process_fallback` 和 `local_process_fallback_reason`。`windows_unelevated` 必须以 `sandbox_enforcement="reduced"` / `enforcement_status="degraded"` 出现；`danger-full-access` 的 `local_process` fallback 必须以 `sandbox_enforcement="relaxed"` 出现；二者都不得被 trace 或 report 误标为 elevated/native OS sandbox。
 

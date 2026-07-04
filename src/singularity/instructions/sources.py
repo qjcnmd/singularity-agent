@@ -15,7 +15,7 @@ from singularity.instructions.models import (
 )
 from singularity.instructions.project import ProjectInstructionLoader
 from singularity.instructions.prompt_config import PromptAssemblyConfig
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import TraceRedactor, shared_trace_redactor
 
 SYSTEM_INVARIANTS = "\n".join(
     [
@@ -49,7 +49,7 @@ class InstructionSourceCollector:
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.config = config or PromptAssemblyConfig()
-        self.redactor = redactor or TraceRedactor()
+        self.redactor = redactor or shared_trace_redactor()
         self.project_loader = ProjectInstructionLoader(self.workspace_root, config=self.config)
 
     def collect_sources(

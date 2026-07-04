@@ -1007,3 +1007,13 @@ def test_cli_eval_run_rejects_unsupported_manifest_schema(
     assert "Unsupported evaluation schema_version" in str(result.exception)
     assert seen["ran"] is False
 
+
+def test_evaluation_task_set_runners_share_cli_runner_body() -> None:
+    import inspect
+
+    from singularity import cli
+
+    source = inspect.getsource(cli)
+    assert "def _run_loaded_evaluation_task_set" in source
+    assert source.count("EvaluationRunner(") == 1
+

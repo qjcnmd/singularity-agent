@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 
 SENSITIVE_NAME_RE = re.compile(
     r"(^\.env(?:\..*)?$|^id_rsa$|^id_dsa$|^id_ecdsa$|^id_ed25519$|"
@@ -46,7 +46,7 @@ class FileSensitivityClassifier:
         return self.classify_path(path) in {"sensitive", "secret"}
 
 
-_REDACTOR = TraceRedactor()
+_REDACTOR = shared_trace_redactor()
 
 
 def redact_secret_text(text: str) -> str:

@@ -18,6 +18,7 @@ from singularity.review.models import (
     ReviewTarget,
 )
 from singularity.review.policy import extract_policy_context
+from singularity.utils.attributes import nested_getattr
 
 
 class ReviewPipeline:
@@ -502,7 +503,7 @@ class ReviewPipeline:
         ids = {
             "session_id": _planner_attr(self.planner, "session_id"),
             "task_id": target.task_id or _planner_attr(self.planner, "task_id"),
-            "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+            "phase_id": nested_getattr(self.planner, "state.current_phase"),
             "action_id": _review_action_id(target),
             "transaction_id": target.transaction_id,
             "verification_id": target.verification_id,
@@ -790,7 +791,7 @@ class ReviewPipeline:
             "run_id": getattr(self.trace, "run_id", None),
             "session_id": _planner_attr(self.planner, "session_id"),
             "task_id": target.task_id or _planner_attr(self.planner, "task_id"),
-            "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None) or target.stage.value,
+            "phase_id": nested_getattr(self.planner, "state.current_phase") or target.stage.value,
             "action_id": _review_action_id(target),
         }
 

@@ -11,7 +11,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 from singularity.sandbox.artifacts import SandboxArtifactCollector
 from singularity.sandbox.environment import SandboxEnvironmentBuilder
 from singularity.sandbox.exceptions import SandboxCapabilityError
@@ -325,8 +325,8 @@ class WindowsSandboxBackend:
         timing["command_runtime_time_seconds"] = time.perf_counter() - phase_started
         timing.update(dict(runner_result.metadata.get("timing") or {}))
         phase_started = time.perf_counter()
-        stdout = TraceRedactor().redact_text(runner_result.stdout)
-        stderr = TraceRedactor().redact_text(runner_result.stderr)
+        stdout = shared_trace_redactor().redact_text(runner_result.stdout)
+        stderr = shared_trace_redactor().redact_text(runner_result.stderr)
         stdout, stderr, backend_output_truncated = _limit_output(
             stdout,
             stderr,
@@ -871,8 +871,8 @@ class WindowsUnelevatedSandboxBackend:
                     process.kill()
                 stdout, stderr = "", "Process timed out and could not be terminated cleanly."
         timing["command_runtime_time_seconds"] = time.perf_counter() - phase_started
-        stdout = TraceRedactor().redact_text(stdout or "")
-        stderr = TraceRedactor().redact_text(stderr or "")
+        stdout = shared_trace_redactor().redact_text(stdout or "")
+        stderr = shared_trace_redactor().redact_text(stderr or "")
         stdout, stderr, output_truncated = _limit_output(stdout, stderr, output_limit)
         status = (
             SandboxStatus.TIMEOUT
