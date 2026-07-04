@@ -2583,6 +2583,44 @@ def test_python_runtime_failure_classifies_escaped_localized_dll_initialization_
     assert module == "_ssl"
 
 
+def test_python_runtime_failure_classifies_c_extension_low_integrity_failure() -> None:
+    payload = {
+        "modules": {
+            "_ctypes": {
+                "status": "failed",
+                "error_type": "ImportError",
+                "message": "DLL load failed while importing _ctypes: 动态链接库(DLL)初始化例程失败。",
+            },
+            "ctypes": {
+                "status": "failed",
+                "error_type": "ImportError",
+                "message": "DLL load failed while importing _ctypes: 动态链接库(DLL)初始化例程失败。",
+            },
+            "_ssl": {
+                "status": "failed",
+                "error_type": "ImportError",
+                "message": "DLL load failed while importing _ssl: 动态链接库(DLL)初始化例程失败。",
+            },
+            "ssl": {"status": "failed"},
+        },
+        "runtime_access": {},
+    }
+    result = sandbox.WindowsRunnerResult(
+        exit_code=7,
+        stdout=json.dumps(payload, ensure_ascii=False),
+        stderr="",
+        timed_out=False,
+        started_at="2026-06-30T00:00:00+00:00",
+        ended_at="2026-06-30T00:00:01+00:00",
+        duration_ms=1,
+    )
+
+    failure_type, module = windows._python_runtime_failure(payload, result)
+
+    assert failure_type == "python_c_extension_low_integrity_runtime_initialization_failed"
+    assert module == "_ctypes"
+
+
 def test_python_runtime_failure_classifies_unstructured_ssl_import_error() -> None:
     result = sandbox.WindowsRunnerResult(
         exit_code=7,
@@ -2691,6 +2729,34 @@ def test_python_runtime_smoke_code_reports_discovered_openssl_target_access(
     assert runtime_access["openssl_providers"]["status"] == "passed"
     encoded = json.dumps(runtime_access)
     assert str(root) not in encoded
+
+
+def test_python_runtime_smoke_code_marks_absent_openssl_provider_dir_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "python"
+    library_bin = root / "Library" / "bin"
+    openssl_config = root / "Library" / "ssl" / "openssl.cnf"
+    library_bin.mkdir(parents=True)
+    openssl_config.parent.mkdir(parents=True)
+    (library_bin / "libssl-3-x64.dll").write_bytes(b"")
+    (library_bin / "libcrypto-3-x64.dll").write_bytes(b"")
+    openssl_config.write_text("", encoding="utf-8")
+
+    monkeypatch.delenv("OPENSSL_MODULES", raising=False)
+    monkeypatch.setattr(sys, "prefix", str(root))
+    monkeypatch.setattr(sys, "base_prefix", str(root))
+    monkeypatch.setattr(sys, "exec_prefix", str(root))
+    stdout = io.StringIO()
+
+    with redirect_stdout(stdout), pytest.raises(SystemExit):
+        exec(windows._PYTHON_RUNTIME_SMOKE_CODE, {})
+
+    payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
+    runtime_access = payload["runtime_access"]
+    assert runtime_access["openssl_config"]["status"] == "passed"
+    assert runtime_access["openssl_providers"]["status"] == "not_configured"
 
 
 def test_network_probe_oserror_reports_structured_diagnostics(

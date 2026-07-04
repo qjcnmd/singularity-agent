@@ -2177,7 +2177,7 @@ def _python_runtime_module_status(payload: dict[str, Any]) -> dict[str, str]:
     if not isinstance(modules, dict):
         return {}
     result: dict[str, str] = {}
-    for name in ("_ssl", "ssl", "socket", "hashlib", "pathlib"):
+    for name in ("_ctypes", "ctypes", "_ssl", "ssl", "socket", "hashlib", "pathlib"):
         value = modules.get(name)
         if isinstance(value, dict):
             result[name] = str(value.get("status") or "unknown")
@@ -2195,6 +2195,17 @@ def _python_runtime_failure(
     runtime_access_payload = payload.get("runtime_access")
     runtime_access: dict[str, Any] = runtime_access_payload if isinstance(runtime_access_payload, dict) else {}
     output = f"{result.stdout}\n{result.stderr}\n{_python_runtime_payload_text(payload)}".lower()
+    low_integrity_failed_modules = [
+        name for name in ("_ctypes", "ctypes", "_ssl", "ssl") if _module_failed(modules, name)
+    ]
+    generic_c_extension_failures = [
+        name for name in low_integrity_failed_modules if name not in {"_ssl", "ssl"}
+    ]
+    if generic_c_extension_failures and _looks_like_dll_initialization_failed(output):
+        return (
+            "python_c_extension_low_integrity_runtime_initialization_failed",
+            generic_c_extension_failures[0],
+        )
     if _module_failed(modules, "_ssl"):
         if "dll search path" in output:
             return "dll_search_path_failed", "_ssl"
@@ -2336,7 +2347,7 @@ def _check_many(paths):
 
 modules = {}
 ok = True
-for name in ("_ssl", "ssl", "socket", "hashlib", "pathlib"):
+for name in ("_ctypes", "ctypes", "_ssl", "ssl", "socket", "hashlib", "pathlib"):
     try:
         module = importlib.import_module(name)
         state = {"status": "passed"}
@@ -2399,6 +2410,10 @@ if openssl_configs:
     runtime_access["openssl_config"] = _check_many(openssl_configs)
 if openssl_providers:
     runtime_access["openssl_providers"] = _check_many(openssl_providers)
+elif runtime_access.get("openssl_providers", {}).get("status") == "missing" and not os.environ.get(
+    "OPENSSL_MODULES"
+):
+    runtime_access["openssl_providers"] = {"status": "not_configured"}
 
 print(json.dumps({"modules": modules, "ssl": ssl_info, "runtime_access": runtime_access}, sort_keys=True))
 raise SystemExit(0 if ok else 7)

@@ -1742,10 +1742,11 @@
       1) account / credential / login UI / logon rights / group membership
       2) state dir ACL boundary / runner smoke / network probe
       3) Python runtime smoke:
-         import _ssl, ssl, socket, hashlib, pathlib
+         import _ctypes, ctypes, _ssl, ssl, socket, hashlib, pathlib
          → _ssl.__file__, ssl.OPENSSL_VERSION,
             ssl.get_default_verify_paths()
          → OpenSSL DLL / config / provider / cert / TEMP access
+         → missing provider dir without OPENSSL_MODULES => not_configured
     → Python runtime smoke 失败：
       diagnostics += {kind: "python_runtime_environment_blocker",
                       failure_type, module, sandbox_role,
