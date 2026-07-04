@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -367,6 +369,106 @@ def test_tool_protocol_executes_parallel_read_only_group_concurrently(tmp_path: 
     assert [payload["tool_call_id"] for payload in tool_payloads] == [
         "call_read_one",
         "call_read_two",
+    ]
+
+
+def test_parallel_readonly_planner_updates_are_serial_in_call_order(tmp_path: Path) -> None:
+    barrier = threading.Barrier(2, timeout=3)
+    main_thread_id = threading.get_ident()
+    registry = ToolRegistry(tmp_path, include_default_tools=False)
+
+    class RecordingPlanner:
+        def __init__(self) -> None:
+            self.updates: list[tuple[str | None, str, int]] = []
+
+        def authorize_tool_call(self, **_kwargs: Any) -> None:
+            return None
+
+        def update_from_tool_result(self, **kwargs: Any) -> None:
+            self.updates.append(
+                (
+                    kwargs["tool_call_id"],
+                    kwargs["tool_name"],
+                    threading.get_ident(),
+                )
+            )
+
+    def make_handler(name: str):
+        def handler(_args: _EmptyInput) -> dict[str, str]:
+            barrier.wait()
+            if name == "read_one":
+                time.sleep(0.05)
+            return {"name": name}
+
+        return handler
+
+    for name in ("read_one", "read_two"):
+        registry.register(
+            ToolSpec(
+                name=name,
+                description=name,
+                input_model=_EmptyInput,
+                handler=make_handler(name),
+                permission_level=PermissionLevel.READ_ONLY,
+                side_effects=ToolSideEffectKind.READ_WORKSPACE,
+                idempotent=True,
+            )
+        )
+
+    planner = RecordingPlanner()
+    context = ContextManager(system_prompt="system", user_goal="inspect")
+    tool_executor = ToolExecutor(
+        registry=registry,
+        policy=ToolPolicy.read_only(),
+        trace=None,
+        workspace_root=tmp_path,
+        planner=planner,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+    tool_protocol = ToolProtocolEngine(
+        registry=registry,
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+    model_result = ModelTurnResult(
+        request_id="req_parallel_planner",
+        response_id="resp_parallel_planner",
+        status=ModelTurnStatus.SUCCESS,
+        assistant_message=ModelMessage.assistant_text(""),
+        tool_calls=[
+            ModelToolCall(
+                tool_call_id="call_one",
+                tool_name="read_one",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            ),
+            ModelToolCall(
+                tool_call_id="call_two",
+                tool_name="read_two",
+                arguments={},
+                raw_arguments="{}",
+                parse_status=ModelToolParseStatus.VALID,
+            ),
+        ],
+        metadata={
+            "provider_capabilities": ModelCapabilities(
+                supports_parallel_tool_calls=True
+            ).to_dict()
+        },
+    )
+
+    result = tool_protocol.handle_model_turn_result(
+        model_result,
+        context=context,
+        tool_executor=tool_executor,
+        planner=planner,
+    )
+
+    assert result.status == ToolProtocolTurnStatus.PROCESSED
+    assert planner.updates == [
+        ("call_one", "read_one", main_thread_id),
+        ("call_two", "read_two", main_thread_id),
     ]
 
 
@@ -816,6 +918,30 @@ def test_tool_protocol_engine_delegates_execution_state_and_binding_boundaries(
     assert isinstance(tool_protocol.plan_executor, ToolProtocolPlanExecutor)
     assert isinstance(tool_protocol.state_transitions, ToolProtocolStateTransitioner)
     assert isinstance(tool_protocol.result_binder, ToolProtocolResultBinder)
+    assert not hasattr(tool_protocol.plan_executor, "engine")
+
+
+def test_tool_protocol_plan_executor_owns_execution_without_engine_private_calls() -> None:
+    source = inspect.getsource(ToolProtocolPlanExecutor)
+
+    assert "self.engine" not in source
+    assert "engine._execute_plan_impl" not in source
+    assert "engine._execute_parallel_readonly_plan" not in source
+    assert "engine._prepare_call" not in source
+    assert "engine._complete_call" not in source
+    assert "engine._bind_synthetic_result" not in source
+
+
+def test_tool_protocol_engine_no_longer_defines_execution_and_binding_bodies() -> None:
+    forbidden = {
+        "_execute_plan_impl",
+        "_execute_parallel_readonly_plan",
+        "_prepare_call",
+        "_complete_call",
+        "_bind_synthetic_result",
+    }
+
+    assert forbidden.isdisjoint(vars(ToolProtocolEngine))
 
 
 def test_tool_protocol_blocks_side_effect_replay_without_calling_handler(tmp_path: Path) -> None:

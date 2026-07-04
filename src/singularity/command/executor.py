@@ -139,8 +139,9 @@ class WorkspaceSnapshot:
 @dataclass
 class _SessionRecord:
     session: ProcessSession
-    running: RunningProcess
+    running: RunningProcess | None
     before_snapshot: Any
+    output_summary: ProcessOutput | None = None
 
 
 class CommandExecutor:
@@ -491,8 +492,26 @@ class CommandExecutor:
                 truncated=False,
                 artifact_path=None,
             )
+        if record.running is None:
+            return record.output_summary or ProcessOutput(
+                process_id=process_id,
+                stdout="",
+                stderr="",
+                combined_output="",
+                truncated=False,
+                artifact_path=record.session.logs_artifact_path,
+            )
         if isinstance(self.backend, LocalProcessBackend):
             self.backend.poll_output(record.running)
+        if record.running.collector is None:
+            return record.output_summary or ProcessOutput(
+                process_id=process_id,
+                stdout="",
+                stderr="",
+                combined_output="",
+                truncated=False,
+                artifact_path=record.session.logs_artifact_path,
+            )
         snapshot = record.running.collector.read_since_last()
         return ProcessOutput(
             process_id=process_id,
@@ -513,6 +532,15 @@ class CommandExecutor:
                 killed_reason=None,
                 error_code=ErrorCode.PROCESS_NOT_FOUND.value,
             )
+        if record.running is None:
+            return ProcessStopResult(
+                process_id=process_id,
+                status=record.session.status,
+                exit_code=record.session.exit_code,
+                killed_reason="stopped" if record.session.status == "stopped" else None,
+                artifact_path=record.session.logs_artifact_path,
+                error_code=record.session.error_code,
+            )
         exit_code = None
         if isinstance(self.backend, LocalProcessBackend):
             exit_code = self.backend.stop(record.running, reason="stopped")
@@ -530,14 +558,18 @@ class CommandExecutor:
             after_snapshot=after_snapshot,
             transaction_id=record.session.owner_transaction,
         )
-        snapshot = record.running.collector.snapshot()
+        snapshot = (
+            record.running.collector.snapshot()
+            if record.running.collector is not None
+            else None
+        )
         stopped = ProcessStopResult(
             process_id=process_id,
             status="stopped",
             exit_code=exit_code,
             killed_reason="stopped",
             changed_files=changed_files,
-            artifact_path=snapshot.artifact_path,
+            artifact_path=snapshot.artifact_path if snapshot is not None else None,
         )
         old_session = record.session
         record.session = ProcessSession(
@@ -551,19 +583,29 @@ class CommandExecutor:
             started_at=old_session.started_at,
             ports=old_session.ports,
             health_check=old_session.health_check,
-            logs_artifact_path=snapshot.artifact_path,
+            logs_artifact_path=snapshot.artifact_path if snapshot is not None else None,
             owner_transaction=old_session.owner_transaction,
             exit_code=exit_code,
             error_code=old_session.error_code,
         )
+        if snapshot is not None:
+            record.output_summary = ProcessOutput(
+                process_id=process_id,
+                stdout=snapshot.stdout_preview,
+                stderr=snapshot.stderr_preview,
+                combined_output=snapshot.combined_output_preview,
+                truncated=snapshot.output_truncated,
+                artifact_path=snapshot.artifact_path,
+            )
+        record.running = None
         return stopped
 
     def list_processes(self) -> list[ProcessSession]:
         sessions: list[ProcessSession] = []
         for record in self._sessions.values():
-            process = record.running.process
             status = record.session.status
             exit_code = record.session.exit_code
+            process = record.running.process if record.running is not None else None
             if process is not None and process.poll() is not None:
                 status = "exited"
                 exit_code = process.returncode
@@ -579,7 +621,11 @@ class CommandExecutor:
                     started_at=record.session.started_at,
                     ports=record.session.ports,
                     health_check=record.session.health_check,
-                    logs_artifact_path=record.running.collector.snapshot().artifact_path,
+                    logs_artifact_path=(
+                        record.running.collector.snapshot().artifact_path
+                        if record.running is not None and record.running.collector is not None
+                        else record.session.logs_artifact_path
+                    ),
                     owner_transaction=record.session.owner_transaction,
                     exit_code=exit_code,
                     error_code=record.session.error_code,

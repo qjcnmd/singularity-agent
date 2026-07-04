@@ -1227,7 +1227,7 @@
 │                                                              │
 │  execute_plan() facade                                       │
 │  → ToolProtocolPlanExecutor.execute()                        │
-│  → _execute_plan_impl()                                      │
+│  → executor owns serial / parallel readonly execution         │
 │  state transition 由 ToolProtocolStateTransitioner 集中写入    │
 │  result binding / context append 由 ToolProtocolResultBinder  │
 │  委托 ToolProtocolContextProjector 完成                        │
@@ -1238,20 +1238,23 @@
 │    _prepare_call()       → validation trace / record upsert / │
 │                            synthetic result factory / replay check /│
 │                            scheduled+running transition       │
-│    _bind_synthetic_result() → rejected / replay-blocked 结果绑定│
+│    ToolProtocolResultBinder.bind_synthetic()                  │
+│                         → rejected / replay-blocked 结果绑定   │
 │    _complete_call()      → result builder / state transition /│
 │                            context projector append / trace emit│
-│    _turn_result()        → ToolProtocolTurnResult 汇总         │
+│    build_tool_protocol_turn_result()                          │
+│                         → ToolProtocolTurnResult 汇总          │
 │                                                              │
 │  ★★★ 分叉：执行模式 ★★★                                      │
 │                                                              │
 │  ┌─ PARALLEL_READONLY (plan.execution_mode)              ──┐ │
 │  │   │  AND plan.parallel_groups is not empty              │ │
-│  │   └── _execute_parallel_readonly_plan(                   │ │
-│  │           plan, batch, context, tool_executor, turn)    │ │
+│  │   └── executor parallel-readonly branch                  │ │
 │  │       → group trace 记录调度组边界                         │ │
 │  │       → 每个 call 仍先走 _prepare_call()                   │ │
 │  │       → prepared read-only calls 交给 ParallelToolExecutor│ │
+│  │       → worker 请求标记 defer_planner_update，避免并发写 planner│ │
+│  │       → 结果按原 call 顺序回到 executor 后串行更新 planner │ │
 │  │       → 每个执行结果仍走 _complete_call()                  │ │
 │  │       → 返回 ToolProtocolTurnResult                      │ │
 │  └──────────────────────────────────────────────────────────┘ │
@@ -1356,7 +1359,7 @@
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ⑤ 策略引擎                           │   │
 │  │      │       │  │   ToolExecutionPolicyGate.enforce()│   │
-│  │      │       │  │   _enforce_policy()                  │   │
+│  │      │       │  │   owns policy request / approval flow│   │
 │  │      │       │  │   → policy_engine.enforce(PolicyRequest)│
 │  │      │       │  │   → PolicyDecision {                 │   │
 │  │      │       │  │       outcome, reason, risk_level,    │   │
@@ -1387,6 +1390,7 @@
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ⑧ 结果缓存检查                         │   │
 │  │      │       │  │   ToolExecutionCache.precheck()      │   │
+│  │      │       │  │   owns cache key / snapshot / sensitivity│
 │  │      │       │  │   ToolResultCache.get(cache_key)       │   │
 │  │      │       │  │   ├── [命中] → 返回缓存 ToolResult      │   │
 │  │      │       │  │   └── [未命中] → 继续                   │   │
@@ -1396,11 +1400,12 @@
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ⑩ 工具处理器调用                       │   │
 │  │      │       │  │   ToolExecutionDispatcher.dispatch()  │   │
-│  │      │       │  │   result = _execute_handler(spec, validated)│
+│  │      │       │  │   owns handler execution + output mapping│
 │  │      │       │  │   │                                  │   │
 │  │      │       │  │   ├── [命令工具]                       │   │
 │  │      │       │  │   │   CommandExecutor.run(           │   │
 │  │      │       │  │   │       command, cwd, env, …)      │   │
+│  │      │       │  │   │   start/read/stop_process 走同一 policy 边界；stop 后释放进程资源│
 │  │      │       │  │   │   ├── _policy_request()          │   │
 │  │      │       │  │   │   │   + CommandPolicy.classify() │   │
 │  │      │       │  │   │   │   → command PolicyRequest     │   │
@@ -1460,6 +1465,7 @@
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ⑪ Planner 更新                         │   │
 │  │      │       │  │   _update_planner() / _safe_update_planner()│
+│  │      │       │  │   parallel readonly 延后到协议层按 call 顺序串行写│
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ⑫ 缓存写入 / 写后失效                  │   │
 │  │      │       │  │   ToolResultCache.set()               │   │
@@ -1470,21 +1476,21 @@
 │  │      │       │  │                                      │   │
 │  │      │       │  └── ⑭ Trace 记录与 metadata 标注            │   │
 │  │      │       │      ToolExecutionTraceRecorder.finalize()│  │
-│  │      │       │      _record_trace() / _emit_trace()      │   │
+│  │      │       │      owns final metadata / trace record    │   │
 │  │      │       │                                         │   │
-│  │      │       │  ↓ 回到 ToolProtocolEngine                │   │
+│  │      │       │  ↓ 回到 ToolProtocolPlanExecutor          │   │
 │  │      │       │                                         │   │
-│  │      │       ├── state_store.transition(                │   │
+│  │      │       ├── state_transitions.completed(           │   │
 │  │      │       │       call.tool_call_id,                 │   │
 │  │      │       │       SUCCEEDED / WAITING_APPROVAL / FAILED,│
 │  │      │       │       error_kind, error_message,         │   │
 │  │      │       │       tool_result_digest)                │   │
-│  │      │       ├── state_store.bind_result(               │   │
+│  │      │       ├── result_binder.bind(                    │   │
 │  │      │       │       record.record_id,                  │   │
 │  │      │       │       result=tool_result,                │   │
 │  │      │       │       raw_result_ref=…)                  │   │
 │  │      │       │                                         │   │
-│  │      │       ├── _append_result(context, record,        │   │
+│  │      │       ├── result_binder.append(context, record,  │   │
 │  │      │       │       tool_result, turn)                 │   │
 │  │      │       │   → ToolProtocolContextProjector.append_result()│
 │  │      │       │   → ContextManager.add_tool_protocol_result()│ │

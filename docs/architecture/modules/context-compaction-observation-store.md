@@ -134,7 +134,7 @@ class ContextSensitivity(str, Enum):
 
 ### 数据流概述
 
-`ContextManager.add_tool_result()` / `add_tool_protocol_result()` 生成 `ToolObservation`，写入 `context.sqlite3`。`add_tool_protocol_result()` 先把 `ToolProtocolResultEnvelope` 投影为 `ToolObservationView`，若投影已带 `observation_id`，则该值同时作为 `ToolObservation.id`、tool message payload 中的 `observation_id`、`ContextItem.item_id` 以及 artifact `ContextReference.source_item_id` / `observation_id`；若缺失才生成新的 observation id。`ContextCompactionPlanner.prepare()` 生成 `CompactionPlan`，`ContextCompactionExecutor.summary_envelope_for_plan()` 生成 `ContextSummaryEnvelope`，`ContextCompactionCommitter.commit()` 标记旧 item 并写 summary item。恢复时 `RecoveryManager.recover()` 从 SQLite、planner/protocol 状态和 trace 尾事件重建 `RecoveredContext`。observation 生成的安全 tool message 与 recovered messages/items 可进入后续模型请求；snapshot/recovered/range 本体不进入 provider。
+`ContextManager.add_tool_result()` / `add_tool_protocol_result()` 生成 `ToolObservation`，写入 `context.sqlite3`。`add_tool_protocol_result()` 先把 `ToolProtocolResultEnvelope` 投影为 `ToolObservationView`，若投影已带 `observation_id`，则该值同时作为 `ToolObservation.id`、tool message payload 中的 `observation_id`、`ContextItem.item_id` 以及 artifact `ContextReference.source_item_id` / `observation_id`；若缺失才生成新的 observation id。`ContextCompactionPlanner.prepare()` 生成 `CompactionPlan`，utility score 使用 `context/ranking.py` 中与 assembler 共享的 layer/authority 权重 helper；`ContextCompactionExecutor.summary_envelope_for_plan()` 生成 `ContextSummaryEnvelope`，`ContextCompactionCommitter.commit()` 标记旧 item 并写 summary item。恢复时 `RecoveryManager.recover()` 从 SQLite、planner/protocol 状态和 trace 尾事件重建 `RecoveredContext`。observation 生成的安全 tool message 与 recovered messages/items 可进入后续模型请求；snapshot/recovered/range 本体不进入 provider。
 
 ## 谁生成这些对象
 

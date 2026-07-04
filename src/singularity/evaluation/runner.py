@@ -40,12 +40,6 @@ from singularity.evaluation.manifests import (
     SingularityPrivateBenchmarkAdapter as SingularityPrivateBenchmarkAdapter,
 )
 from singularity.evaluation.manifests import (
-    SweBenchAdapter as SweBenchAdapter,
-)
-from singularity.evaluation.manifests import (
-    TerminalBenchAdapter as TerminalBenchAdapter,
-)
-from singularity.evaluation.manifests import (
     load_evaluation_task_set as load_evaluation_task_set,
 )
 from singularity.evaluation.results import (
@@ -4562,7 +4556,13 @@ def _check_payload(result: CommandEvalResult | None) -> dict[str, Any]:
 
 
 def _run_git(args: list[str], *, cwd: Path) -> None:
-    completed = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=False)
+    completed = subprocess.run(
+        ["git", "-c", "core.longpaths=true", *args],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
     if completed.returncode:
         raise RuntimeError((completed.stderr or completed.stdout or "git command failed").strip())
 

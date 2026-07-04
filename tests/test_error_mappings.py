@@ -9,7 +9,7 @@ from singularity.error_mapping import (
     tool_protocol_validation_error_code,
     tool_protocol_validation_error_kind,
 )
-from singularity.tool_protocol.engine import (
+from singularity.tool_protocol.executor import (
     _error_code_from_validation,
     _error_kind_from_validation,
 )

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from singularity.tool_protocol.models import ToolCallBatch, ToolCallEnvelope
 from singularity.tools import ToolExecutor, ToolResult
+from singularity.tools.execution_pipeline import DEFER_PLANNER_UPDATE_METADATA_KEY
 from singularity.tools.models import ToolExecutionRequest
 
 
@@ -26,13 +27,20 @@ class ParallelToolExecutor:
         *,
         tool_executor: ToolExecutor,
         batch: ToolCallBatch | None = None,
+        defer_planner_update: bool = False,
     ) -> list[ParallelToolExecutionResult]:
         if not calls:
             return []
         worker_count = min(len(calls), self.max_workers or len(calls))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
-                executor.submit(_execute_call, tool_executor, call, batch): (index, call)
+                executor.submit(
+                    _execute_call,
+                    tool_executor,
+                    call,
+                    batch,
+                    defer_planner_update,
+                ): (index, call)
                 for index, call in enumerate(calls)
             }
             results: list[ParallelToolExecutionResult | None] = [None] * len(calls)
@@ -54,7 +62,11 @@ def _execute_call(
     tool_executor: ToolExecutor,
     call: ToolCallEnvelope,
     batch: ToolCallBatch | None,
+    defer_planner_update: bool,
 ) -> ToolResult:
     if hasattr(tool_executor, "execute_request"):
-        return tool_executor.execute_request(ToolExecutionRequest.from_envelope(call, batch=batch))
+        request = ToolExecutionRequest.from_envelope(call, batch=batch)
+        if defer_planner_update:
+            request.metadata[DEFER_PLANNER_UPDATE_METADATA_KEY] = True
+        return tool_executor.execute_request(request)
     return tool_executor.execute_tool_call(call.to_provider_tool_call())

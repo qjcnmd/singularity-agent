@@ -585,6 +585,44 @@ def test_long_running_process_can_start_read_stop_and_list(tmp_path: Path) -> No
     assert stopped.exit_code is not None
 
 
+def test_stopped_long_running_session_releases_process_resources(tmp_path: Path) -> None:
+    component = unrestricted_command_executor(tmp_path)
+    request = CommandRequest(
+        argv=[
+            sys.executable,
+            "-c",
+            "import sys, time; print('ready'); sys.stdout.flush(); time.sleep(20)",
+        ],
+        cwd=".",
+        purpose=CommandPurpose.LONG_RUNNING,
+        risk_acceptance_reason="test owns this long-running process",
+    )
+
+    session = component.start_process(request)
+    output = ""
+    deadline = time.time() + 3
+    while time.time() < deadline and "ready" not in output:
+        time.sleep(0.05)
+        output = component.read_process_output(session.process_id).combined_output
+    running = component._sessions[session.process_id].running
+    assert running is not None
+
+    stopped = component.stop_process(session.process_id)
+    listed = component.list_processes()
+    output_after_stop = component.read_process_output(session.process_id)
+
+    assert stopped.status == "stopped"
+    assert all(not thread.is_alive() for thread in running.reader_threads)
+    assert running.reader_threads == []
+    assert running.process is None
+    assert component._sessions[session.process_id].running is None
+    assert [item.status for item in listed if item.process_id == session.process_id] == [
+        "stopped"
+    ]
+    assert "ready" in output_after_stop.combined_output
+    assert component.stop_process(session.process_id).status == "stopped"
+
+
 def test_start_process_tracks_files_written_immediately_after_spawn(tmp_path: Path) -> None:
     class ImmediateWriteBackend:
         name = "immediate_write"

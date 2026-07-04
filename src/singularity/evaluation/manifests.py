@@ -267,16 +267,6 @@ class SingularityPrivateBenchmarkAdapter:
         )
 
 
-class SweBenchAdapter:
-    def load(self, _path: Path | str) -> EvaluationTaskSet:
-        raise NotImplementedError("SWE-bench adapter boundary is reserved; use SingularityPrivateBenchmarkAdapter today.")
-
-
-class TerminalBenchAdapter:
-    def load(self, _path: Path | str) -> EvaluationTaskSet:
-        raise NotImplementedError("Terminal-Bench adapter boundary is reserved; use SingularityPrivateBenchmarkAdapter today.")
-
-
 def load_evaluation_task_set(path: Path | str) -> EvaluationTaskSet:
     manifest_path = Path(path)
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))

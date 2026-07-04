@@ -4,8 +4,9 @@ from typing import Any
 
 from singularity.context import ContextManager
 from singularity.tool_protocol.context_projection import ToolProtocolContextProjector
-from singularity.tool_protocol.models import ToolProtocolResultEnvelope
+from singularity.tool_protocol.models import ToolCallEnvelope, ToolCallPhase, ToolProtocolResultEnvelope
 from singularity.tool_protocol.state import ToolProtocolStateStore
+from singularity.tool_protocol.transitions import ToolProtocolStateTransitioner
 
 
 class ToolProtocolResultBinder:
@@ -54,3 +55,23 @@ class ToolProtocolResultBinder:
     ) -> str | None:
         self.bind(record=record, result=result)
         return self.append(context, record=record, result=result, turn=turn)
+
+    def bind_synthetic(
+        self,
+        context: ContextManager,
+        *,
+        transitions: ToolProtocolStateTransitioner,
+        call: ToolCallEnvelope,
+        record: Any,
+        result: ToolProtocolResultEnvelope,
+        phase: ToolCallPhase,
+        error_message: str,
+        turn: int = 0,
+    ) -> str | None:
+        transitions.synthetic_result(
+            call,
+            phase=phase,
+            result=result,
+            error_message=error_message,
+        )
+        return self.bind_and_append(context, record=record, result=result, turn=turn)

@@ -5,6 +5,10 @@ from typing import Any
 
 from singularity.tools.models import ToolExecutionRequest, ToolResult, ToolSpec
 
+DEFER_PLANNER_UPDATE_METADATA_KEY = "defer_planner_update"
+PLANNER_ACTION_ID_METADATA_KEY = "planner_action_id"
+PLANNER_UPDATE_DEFERRED_METADATA_KEY = "planner_update_deferred"
+
 
 @dataclass
 class ToolExecutionPipelineState:
@@ -27,3 +31,7 @@ class ToolExecutionPipelineState:
     result: ToolResult | None = None
     planner_updated: bool = False
     remember_replay: bool = False
+
+    @property
+    def defer_planner_update(self) -> bool:
+        return bool(self.request.metadata.get(DEFER_PLANNER_UPDATE_METADATA_KEY))
