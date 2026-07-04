@@ -20,6 +20,7 @@ from singularity.context.models import (
     PartialCompactionRange,
     digest_value,
 )
+from singularity.context.ranking import authority_weight, layer_weight
 
 COMPACTION_RECENT_TAIL_MESSAGES = 8
 COMPACTION_FRAGMENT_LIMIT = 8000
@@ -185,8 +186,8 @@ class ContextCompactionPlanner:
 
     def utility_score(self, item: ContextItem) -> float:
         score = float(item.importance)
-        score += self.layer_weight(item.layer) / 100.0
-        score += self.authority_weight(item.authority) / 100.0
+        score += layer_weight(item.layer) / 100.0
+        score += authority_weight(item.authority) / 100.0
         if item.relevance_score is not None:
             score += float(item.relevance_score)
         if item.pinned:
@@ -227,38 +228,6 @@ class ContextCompactionPlanner:
         if item.freshness == ContextFreshness.STALE:
             return 0.3
         return 0.0
-
-    @staticmethod
-    def layer_weight(layer: ContextLayer) -> float:
-        weights = {
-            ContextLayer.SYSTEM: 100,
-            ContextLayer.USER_GOAL: 90,
-            ContextLayer.TASK_STATE: 40,
-            ContextLayer.PLANNER_STATE: 38,
-            ContextLayer.POLICY_STATE: 36,
-            ContextLayer.VERIFICATION: 34,
-            ContextLayer.FAILURE_MEMORY: 32,
-            ContextLayer.WORKSPACE_STATE: 30,
-            ContextLayer.EVIDENCE: 26,
-            ContextLayer.TOOL_OBSERVATIONS: 24,
-            ContextLayer.COMPRESSED_HISTORY: 22,
-            ContextLayer.RECENT_DIALOGUE: 10,
-            ContextLayer.REFERENCES: 8,
-            ContextLayer.SCRATCHPAD: 0,
-        }
-        return float(weights.get(layer, 0))
-
-    @staticmethod
-    def authority_weight(authority: ContextAuthority) -> float:
-        weights = {
-            ContextAuthority.SYSTEM: 10,
-            ContextAuthority.USER: 9,
-            ContextAuthority.COMPONENT: 7,
-            ContextAuthority.TOOL: 6,
-            ContextAuthority.SUMMARY: 4,
-            ContextAuthority.MODEL: 1,
-        }
-        return float(weights.get(authority, 0))
 
     @staticmethod
     def current_summary_item_ids(items: list[ContextItem]) -> list[str]:

@@ -51,7 +51,7 @@ Command 层规范化 argv/shell、cwd、purpose、env、network/filesystem polic
 
 `run_command` / verification tools -> `CommandExecutor.run()` -> `CommandRequest` -> `CommandExecutor._policy_request()` -> `PolicyEngine.enforce()` -> `CommandExecutor._command_policy_result()` -> optional `ApprovalGate` / sandbox/backend -> `CommandResult` -> trace/context/planner evidence。`ExecutionBackend.execute()` 的当前签名必须接收 `cancellation_token` 关键字参数；`CommandExecutor` 不再静默回退到旧签名。
 
-`LocalProcessBackend` 通过 stdout/stderr reader thread 将管道输出送入 `OutputCollector`；reader 优先使用 `read1(8192)` 读取可用缓冲，回退到 `read(8192)`，避免大输出逐字节读取，同时保持长进程的实时输出可被 `read_process_output()` 轮询。
+`LocalProcessBackend` 通过 stdout/stderr reader thread 将管道输出送入 `OutputCollector`；reader 优先使用 `read1(8192)` 读取可用缓冲，回退到 `read(8192)`，避免大输出逐字节读取，同时保持长进程的实时输出可被 `read_process_output()` 轮询。`stop_process()` 后 backend 会 drain 队列、bounded join reader thread、关闭 stdout/stderr pipe，并释放 `Popen`、reader thread 列表和队列引用；`CommandExecutor` 只保留停止后的 `ProcessSession` 与 bounded `ProcessOutput` summary，后续 `read_process_output()` / `list_processes()` / repeated `stop_process()` 不依赖活进程对象。
 
 ## 真实任务中的对象流
 
@@ -201,7 +201,7 @@ class CommandDecision(str, Enum):    # CommandPolicyResult.decision
 ## 谁生成这些对象
 
 - command tool、VerificationRunner 与 evaluation setup 生成 `ResourceLimits`/`CommandRequest`；`CommandExecutor._policy_request()` 生成 `PolicyRequest`，`PolicyEngine.enforce()` 生成最终 `PolicyDecision`，`CommandExecutor._command_policy_result()` 或 executor 的 fail-closed 分支生成 command-local `CommandPolicyResult`，`CommandExecutor.plan()` 组合为 `CommandPlan`。
-- `CommandExecutor.run()` 的 backend、sandbox、blocked 分支生成 `CommandResult`；`start_process()`、`read_process_output()`、`stop_process()` 分别生成 `ProcessSession`、`ProcessOutput`、`ProcessStopResult`。
+- `CommandExecutor.run()` 的 backend、sandbox、blocked 分支生成 `CommandResult`；`start_process()`、`read_process_output()`、`stop_process()` 分别生成 `ProcessSession`、`ProcessOutput`、`ProcessStopResult`。长运行进程停止后，executor 内部 session record 生成停止态 `ProcessSession` 和输出摘要，并清空 `RunningProcess` 强引用。
 
 ## 谁消费这些对象
 
@@ -209,7 +209,7 @@ class CommandDecision(str, Enum):    # CommandPolicyResult.decision
 
 ## 是否落盘
 
-Command plan 和 process session 只在 executor 内存；长 stdout/stderr 由 `OutputCollector` 写 artifact，路径放入 `CommandResult.artifact_path` / `ProcessSession.logs_artifact_path`。result 的安全 observation 写 context SQLite，side effects 可写 workspace state journal。
+Command plan 和 process session 只在 executor 内存；长 stdout/stderr 由 `OutputCollector` 写 artifact，路径放入 `CommandResult.artifact_path` / `ProcessSession.logs_artifact_path`。停止后的 process session 仍保留 bounded output summary 与 artifact path，但不保留 live process、pipe、reader thread 或 queue。result 的安全 observation 写 context SQLite，side effects 可写 workspace state journal。
 
 ## 是否进入 trace / audit
 

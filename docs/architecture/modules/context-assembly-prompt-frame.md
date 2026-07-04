@@ -330,12 +330,12 @@ class ContextSensitivity(str, Enum): # ContextItem.sensitivity
 
 ### 数据流概述
 
-各组件通过 `ContextManager.add_*()` 入口生成 `ContextItem`，写入 `context.sqlite3`。`ContextAssembler.build_bundle()` 根据 token counter、phase、visibility、freshness、sensitivity 和 `ContextRenderPolicy` 选择 item，生成 `ContextBundle` 和 `ContextUsageReport`。`ContextBundle.messages` 直接组成 `ModelTurnRequest.messages`，但 `ContextBudgetPlan`、`ContextRenderPolicy` 和 `ContextUsageReport` 只用于内部诊断。`PromptAssemblyPipeline.build_for_model_turn()` 收集 instruction sources，`PromptCompiler.compile()` 生成 `PromptManifest` 和 `PromptBundle`；`PromptBundle.messages` 与 context messages 在 request builder 合并，`PromptManifest` 不进模型，只用于 hash、预算、trace 与诊断。
+各组件通过 `ContextManager.add_*()` 入口生成 `ContextItem`，写入 `context.sqlite3`。`ContextAssembler.build_bundle()` 根据 token counter、phase、visibility、freshness、sensitivity 和 `ContextRenderPolicy` 选择 item，并通过 `context/ranking.py` 中与 compaction 共享的 layer/authority 权重 helper 计算优先级，生成 `ContextBundle` 和 `ContextUsageReport`。`ContextBundle.messages` 直接组成 `ModelTurnRequest.messages`，但 `ContextBudgetPlan`、`ContextRenderPolicy` 和 `ContextUsageReport` 只用于内部诊断。`PromptAssemblyPipeline.build_for_model_turn()` 收集 instruction sources，`PromptCompiler.compile()` 生成 `PromptManifest` 和 `PromptBundle`；`PromptBundle.messages` 与 context messages 在 request builder 合并，`PromptManifest` 不进模型，只用于 hash、预算、trace 与诊断。
 
 ## 谁生成这些对象
 
 - `ContextManager._make_item()` 与各 `add_*` 入口生成 `ContextItem` 和 `ContextReference`；tool result、planner state、memory、project index、policy、verification 与 assistant message 都先转换成这两个内部对象。协议结果路径由 `ToolObservationView.observation_id` 决定共享身份，缺失时由 `ContextManager.add_tool_protocol_result()` 生成一次并复用到 observation、message、item 与 references。
-- `ContextAssembler.build_bundle()` 根据 token counter、phase、visibility、freshness、sensitivity 和 `ContextRenderPolicy` 生成 `ContextBudgetPlan`、`ContextBundle` 与初始 `ContextUsageReport`；usage reporter 再用实际 provider usage 更新报告。
+- `ContextAssembler.build_bundle()` 根据 token counter、phase、visibility、freshness、sensitivity、`ContextRenderPolicy` 和 `context/ranking.py` 中的共享排序权重生成 `ContextBudgetPlan`、`ContextBundle` 与初始 `ContextUsageReport`；usage reporter 再用实际 provider usage 更新报告。
 - compaction executor 生成并校验 `ContextSummaryPayload`，`summary_envelope_for_plan()` 生成 `ContextSummaryEnvelope`。`PromptAssemblyPipeline.build_for_model_turn()` 收集/解析 instruction sources，`PromptCompiler.compile()` 生成 `PromptManifest` 与 `PromptBundle`。
 
 ## 谁消费这些对象

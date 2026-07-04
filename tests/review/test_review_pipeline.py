@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
@@ -32,6 +33,16 @@ def test_pre_edit_review_emits_trace_and_blocks_validation_review(tmp_path: Path
     completed = next(event for event in events if event["event_type"] == "review.completed")
     assert completed["payload"]["duration_ms"] >= 0
     assert completed["payload"]["critic_duration_ms"] == 0
+
+
+def test_review_stage_methods_delegate_common_review_execution() -> None:
+    assert hasattr(ReviewPipeline, "_run_stage_review")
+
+    pipeline_source = inspect.getsource(ReviewPipeline)
+    assert "def pre_edit_review" in pipeline_source
+    assert "def post_patch_review" in pipeline_source
+    assert "def post_verification_review" in pipeline_source
+    assert "def final_review" in pipeline_source
 
 
 def test_post_verification_review_repairs_failed_checks(tmp_path: Path) -> None:

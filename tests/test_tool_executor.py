@@ -1,3 +1,4 @@
+import inspect
 import json
 import time
 from pathlib import Path
@@ -27,7 +28,12 @@ from singularity.tools import (
 from singularity.tools.edit import register_edit_tools
 from singularity.tools.execution_cache import ToolExecutionCache
 from singularity.tools.execution_dispatch import ToolExecutionDispatcher
-from singularity.tools.execution_pipeline import ToolExecutionPipelineState
+from singularity.tools.execution_pipeline import (
+    DEFER_PLANNER_UPDATE_METADATA_KEY,
+    PLANNER_ACTION_ID_METADATA_KEY,
+    PLANNER_UPDATE_DEFERRED_METADATA_KEY,
+    ToolExecutionPipelineState,
+)
 from singularity.tools.execution_policy import ToolExecutionPolicyGate
 from singularity.tools.execution_trace import ToolExecutionTraceRecorder
 from singularity.workspace import WorkspaceMutationManager
@@ -72,6 +78,25 @@ def test_tool_executor_exposes_pipeline_boundary_components(tmp_path: Path) -> N
     assert isinstance(component.execution_dispatch, ToolExecutionDispatcher)
     assert isinstance(component.execution_trace, ToolExecutionTraceRecorder)
     assert component._pipeline_state_type is ToolExecutionPipelineState
+
+
+def test_tool_executor_pipeline_collaborators_do_not_call_executor_private_methods() -> None:
+    for collaborator in (
+        ToolExecutionPolicyGate,
+        ToolExecutionCache,
+        ToolExecutionDispatcher,
+        ToolExecutionTraceRecorder,
+    ):
+        source = inspect.getsource(collaborator)
+        assert "self.executor" not in source
+        assert "executor._" not in source
+
+
+def test_tool_executor_file_stays_under_pipeline_orchestration_size() -> None:
+    source_path = Path(inspect.getsourcefile(ToolExecutor) or "")
+    lines = source_path.read_text(encoding="utf-8").splitlines()
+
+    assert len(lines) < 900
 
 
 def test_tool_executor_successfully_calls_registered_read_only_tool(tmp_path: Path) -> None:
@@ -573,6 +598,55 @@ def test_tool_executor_reports_executed_tool_result_to_planner(tmp_path: Path) -
     assert planner.updates[0]["tool_name"] == "read_file"
     assert planner.updates[0]["result"].ok is True
     assert planner.updates[0]["action_id"].startswith("action_")
+
+
+def test_tool_executor_can_defer_planner_update_for_protocol_ordering(tmp_path: Path) -> None:
+    class RecordingPlanner:
+        def __init__(self) -> None:
+            self.updates: list[dict[str, Any]] = []
+
+        def authorize_tool_call(self, **_kwargs: Any) -> AuthorizationDecision:
+            return AuthorizationDecision(
+                allowed=True,
+                action=AgentAction(
+                    kind=ActionKind.READ_RELEVANT_FILES,
+                    intent="read",
+                    phase_id="inspecting_workspace",
+                    preconditions=[],
+                    allowed_tools=["read_file"],
+                    expected_evidence=["inspected_files"],
+                    risk_level=RiskLevel.LOW,
+                ),
+            )
+
+        def update_from_tool_result(self, **kwargs: Any) -> None:
+            self.updates.append(kwargs)
+
+    readme = tmp_path / "README.md"
+    readme.write_text("planner bridge", encoding="utf-8")
+    planner = RecordingPlanner()
+    component = ToolExecutor(
+        registry=ToolRegistry(tmp_path),
+        policy=ToolPolicy.read_only(),
+        trace=JsonlTraceRecorder.create(tmp_path),
+        workspace_root=tmp_path,
+        planner=planner,
+        policy_engine=make_test_policy_engine(tmp_path),
+    )
+
+    result = component.execute_request(
+        ToolExecutionRequest(
+            tool_call_id="call_read",
+            tool_name="read_file",
+            raw_arguments='{"path": "README.md"}',
+            metadata={DEFER_PLANNER_UPDATE_METADATA_KEY: True},
+        )
+    )
+
+    assert result.ok is True
+    assert planner.updates == []
+    assert result.metadata[PLANNER_UPDATE_DEFERRED_METADATA_KEY] is True
+    assert result.metadata[PLANNER_ACTION_ID_METADATA_KEY].startswith("action_")
 
 
 def test_tool_executor_fails_closed_when_planner_update_fails(tmp_path: Path) -> None:

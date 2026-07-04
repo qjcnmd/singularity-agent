@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 import pytest
 
+import singularity.evaluation as evaluation_package
 import singularity.evaluation.runner as evaluation_runner
 from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
 from singularity.evaluation.models import FAILURE_CASE_RECORD_SCHEMA_VERSION
@@ -63,6 +64,35 @@ def test_load_evaluation_task_set_rejects_unsupported_schema(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="Unsupported evaluation schema_version"):
         load_evaluation_task_set(task_set)
+
+
+def test_evaluation_public_api_does_not_export_placeholder_adapters() -> None:
+    assert not hasattr(evaluation_package, "SweBenchAdapter")
+    assert not hasattr(evaluation_package, "TerminalBenchAdapter")
+    assert not hasattr(evaluation_runner, "SweBenchAdapter")
+    assert not hasattr(evaluation_runner, "TerminalBenchAdapter")
+
+
+def test_evaluation_git_commands_enable_windows_long_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(args: list[str], **kwargs: Any) -> Completed:
+        calls.append(args)
+        return Completed()
+
+    monkeypatch.setattr(evaluation_runner.subprocess, "run", fake_run)
+
+    evaluation_runner._run_git(["status"], cwd=tmp_path)
+
+    assert calls == [["git", "-c", "core.longpaths=true", "status"]]
 
 
 def test_load_public_representative_task_manifest_is_public_swe_bench() -> None:

@@ -9,7 +9,6 @@ from uuid import uuid4
 from singularity.context.models import (
     CacheAttribution,
     CacheAttributionSource,
-    ContextAuthority,
     ContextBudget,
     ContextBudgetPlan,
     ContextBundle,
@@ -21,6 +20,7 @@ from singularity.context.models import (
     ContextSensitivity,
     ContextUsageReport,
 )
+from singularity.context.ranking import authority_weight, layer_order, layer_weight
 from singularity.context.redaction import ContextRedactor
 from singularity.context.tokens import TokenCounter
 
@@ -518,8 +518,8 @@ class ContextAssembler:
             score += 2
         if item.freshness == ContextFreshness.STALE:
             score -= 2
-        score += _layer_weight(item.layer)
-        score += _authority_weight(item.authority)
+        score += layer_weight(item.layer)
+        score += authority_weight(item.authority)
         if item.relevance_score is not None:
             score += item.relevance_score
         return score
@@ -542,7 +542,7 @@ class ContextAssembler:
         front = [group for group in groups if group.layer in front_layers]
         middle = [group for group in groups if group.layer not in front_layers | near_end_layers]
         tail = [group for group in groups if group.layer in near_end_layers]
-        front.sort(key=lambda group: _layer_order(group.layer))
+        front.sort(key=lambda group: layer_order(group.layer))
         middle.sort(key=lambda group: group.score)
         tail.sort(key=lambda group: group.score)
         return front + middle + tail
@@ -678,49 +678,6 @@ class ContextAssembler:
     ) -> bool:
         included = set(included_item_ids)
         return any(item.item_id not in included for item in items)
-
-
-def _layer_weight(layer: ContextLayer) -> float:
-    weights = {
-        ContextLayer.SYSTEM: 100,
-        ContextLayer.USER_GOAL: 90,
-        ContextLayer.TASK_STATE: 40,
-        ContextLayer.PLANNER_STATE: 38,
-        ContextLayer.POLICY_STATE: 36,
-        ContextLayer.VERIFICATION: 34,
-        ContextLayer.FAILURE_MEMORY: 32,
-        ContextLayer.WORKSPACE_STATE: 30,
-        ContextLayer.EVIDENCE: 26,
-        ContextLayer.TOOL_OBSERVATIONS: 24,
-        ContextLayer.COMPRESSED_HISTORY: 22,
-        ContextLayer.RECENT_DIALOGUE: 10,
-        ContextLayer.REFERENCES: 8,
-        ContextLayer.SCRATCHPAD: 0,
-    }
-    return weights.get(layer, 0)
-
-
-def _authority_weight(authority: ContextAuthority) -> float:
-    weights = {
-        ContextAuthority.SYSTEM: 10,
-        ContextAuthority.USER: 9,
-        ContextAuthority.COMPONENT: 7,
-        ContextAuthority.TOOL: 6,
-        ContextAuthority.SUMMARY: 4,
-        ContextAuthority.MODEL: 1,
-    }
-    return weights.get(authority, 0)
-
-
-def _layer_order(layer: ContextLayer) -> int:
-    order = {
-        ContextLayer.SYSTEM: 0,
-        ContextLayer.USER_GOAL: 1,
-        ContextLayer.COMPRESSED_HISTORY: 2,
-        ContextLayer.TASK_STATE: 3,
-        ContextLayer.PLANNER_STATE: 4,
-    }
-    return order.get(layer, 50)
 
 
 def _hash_json(value: Any) -> str:

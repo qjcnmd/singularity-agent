@@ -34,9 +34,9 @@ class RunningProcess:
     process: subprocess.Popen[bytes] | None
     request: CommandRequest
     cwd: Path
-    collector: OutputCollector
+    collector: OutputCollector | None
     reader_threads: list[threading.Thread]
-    output_queue: queue.Queue[tuple[str, bytes]]
+    output_queue: queue.Queue[tuple[str, bytes]] | None
     started_at_monotonic: float
     owner_transaction: str | None = None
     start_error_code: str | None = None
@@ -195,6 +195,8 @@ class LocalProcessBackend(ExecutionBackend):
         )
 
     def poll_output(self, running: RunningProcess) -> None:
+        if running.output_queue is None or running.collector is None:
+            return
         while True:
             try:
                 stream, chunk = running.output_queue.get_nowait()
@@ -207,8 +209,20 @@ class LocalProcessBackend(ExecutionBackend):
         if process is None:
             return None
         self._terminate_and_wait(process, reason=reason)
-        self.poll_output(running)
-        return process.returncode
+        self._drain_until_threads_quiet(running)
+        return_code = process.returncode
+        self.release(running)
+        return return_code
+
+    def release(self, running: RunningProcess) -> None:
+        self._close_process_pipes(running.process)
+        self._join_reader_threads(running)
+        running.reader_threads.clear()
+        running.output_queue = None
+        if running.process is not None:
+            with suppress(Exception):
+                running.process.close()
+        running.process = None
 
     def _monitor_until_exit(
         self,
@@ -264,15 +278,19 @@ class LocalProcessBackend(ExecutionBackend):
         self._drain_until_threads_quiet(running)
         return_code = process.returncode
         process_signal = -return_code if return_code is not None and return_code < 0 else None
-        return BackendRunResult(
+        result = BackendRunResult(
             exit_code=return_code,
             signal=process_signal,
             timed_out=timed_out,
             idle_timed_out=idle_timed_out,
             killed_reason=killed_reason,
         )
+        self.release(running)
+        return result
 
     def _drain_available_output(self, running: RunningProcess) -> bool:
+        if running.output_queue is None or running.collector is None:
+            return False
         saw_output = False
         while True:
             try:
@@ -291,6 +309,23 @@ class LocalProcessBackend(ExecutionBackend):
                 break
             time.sleep(0.01)
         self._drain_available_output(running)
+        self._join_reader_threads(running)
+
+    @staticmethod
+    def _close_process_pipes(process: subprocess.Popen[bytes] | None) -> None:
+        if process is None:
+            return
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                with suppress(Exception):
+                    pipe.close()
+
+    @staticmethod
+    def _join_reader_threads(running: RunningProcess) -> None:
+        deadline = time.perf_counter() + 1
+        for thread in list(running.reader_threads):
+            remaining = max(0.0, deadline - time.perf_counter())
+            thread.join(timeout=remaining)
 
     def _terminate_and_wait(
         self,

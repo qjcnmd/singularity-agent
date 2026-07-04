@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import multiprocessing
-import pickle
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
-from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -19,97 +14,28 @@ from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.observability.redaction import TraceRedactor
 from singularity.policy import (
     ApprovalGate,
-    Capability,
-    DecisionOutcome,
-    OperationKind,
-    PolicyComponent,
-    PolicyDecision,
-    PolicyRequest,
-    PolicySubject,
-    ResourceRef,
-)
-from singularity.policy.audit import redact_resource_identifier
-from singularity.policy.config import PolicyConfig
-from singularity.policy.exceptions import (
-    ApprovalDenied,
-    ApprovalRequired,
-    PolicyAskUserRequired,
-    PolicyDenied,
-    PolicyEscalationRequired,
-    SandboxRequired,
 )
 from singularity.tools.cache import ToolResultCache
 from singularity.tools.execution_cache import ToolExecutionCache
 from singularity.tools.execution_dispatch import ToolExecutionDispatcher
-from singularity.tools.execution_pipeline import ToolExecutionPipelineState
-from singularity.tools.execution_policy import ToolExecutionPolicyGate
+from singularity.tools.execution_pipeline import (
+    PLANNER_ACTION_ID_METADATA_KEY,
+    PLANNER_UPDATE_DEFERRED_METADATA_KEY,
+    ToolExecutionPipelineState,
+)
+from singularity.tools.execution_policy import ToolExecutionPolicyGate, ToolPolicyEngineProtocol
+from singularity.tools.execution_resources import is_read_only_side_effect
 from singularity.tools.execution_trace import ToolExecutionTraceRecorder
 from singularity.tools.idempotency import IdempotencyLedger
 from singularity.tools.models import (
     PermissionLevel,
     ToolExecutionBackendKind,
-    ToolExecutionFailure,
     ToolExecutionRequest,
     ToolResult,
-    ToolSensitivityLevel,
-    ToolSideEffectKind,
     ToolSpec,
 )
 from singularity.tools.policy import ToolPolicy
 from singularity.tools.registry import ToolRegistry
-
-
-def _tool_process_entrypoint(handler: Any, validated_args: Any, conn: Any) -> None:
-    try:
-        output = handler(validated_args)
-        _send_tool_process_payload(conn, {"status": "success", "output": output})
-    except ToolExecutionFailure as exc:
-        _send_tool_process_payload(
-            conn,
-            {
-                "status": "tool_failure",
-                "code": exc.code,
-                "message": exc.message,
-                "details": _json_safe_process_value(exc.details),
-            },
-        )
-    except Exception as exc:
-        _send_tool_process_payload(
-            conn,
-            {
-                "status": "exception",
-                "message": str(exc),
-                "type": type(exc).__name__,
-            },
-        )
-    finally:
-        conn.close()
-
-
-def _send_tool_process_payload(conn: Any, payload: dict[str, Any]) -> None:
-    try:
-        conn.send(payload)
-    except Exception as exc:
-        with suppress(Exception):
-            conn.send(
-                {
-                    "status": "exception",
-                    "message": f"Tool process could not return result: {exc}",
-                    "type": type(exc).__name__,
-                }
-            )
-
-
-def _json_safe_process_value(value: Any) -> Any:
-    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
-
-
-class ToolPolicyEngineProtocol(Protocol):
-    config: PolicyConfig
-
-    def enforce(self, request: PolicyRequest) -> PolicyDecision:
-        ...
-
 
 _ExecutionPipelineState = ToolExecutionPipelineState
 
@@ -144,10 +70,46 @@ class ToolExecutor:
         self._cache = ToolResultCache()
         self._ledger = IdempotencyLedger()
         self._redactor = TraceRedactor()
-        self.execution_policy = ToolExecutionPolicyGate(self)
-        self.execution_cache = ToolExecutionCache(self, self._cache)
-        self.execution_dispatch = ToolExecutionDispatcher(self)
-        self.execution_trace = ToolExecutionTraceRecorder(self)
+        self.execution_policy = ToolExecutionPolicyGate(
+            policy_engine=self.policy_engine,
+            approval_gate=self.approval_gate,
+            workspace_root=self.workspace_root,
+            trace=self.trace,
+            planner=self.planner,
+            redactor=self._redactor,
+            argument_summary=self._argument_trace_summary,
+        )
+        self.execution_cache = ToolExecutionCache(
+            cache=self._cache,
+            workspace_root=self.workspace_root,
+            redactor=self._redactor,
+            result_digest=self._result_digest,
+            output_text=self._output_text,
+            throw_if_cancelled=self._throw_if_cancelled,
+            standalone_can_execute=self.standalone_can_execute,
+        )
+        self.execution_dispatch = ToolExecutionDispatcher(
+            workspace_root=self.workspace_root,
+            redactor=self._redactor,
+            cache=self.execution_cache,
+            emit_trace=self._emit_trace,
+            request_trace_ids=self._request_trace_ids,
+            argument_summary=self._argument_trace_summary,
+            result_digest=self._result_digest,
+            limit_output=self._limit_output,
+            throw_if_cancelled=self._throw_if_cancelled,
+            update_planner=self._update_planner,
+        )
+        self.execution_trace = ToolExecutionTraceRecorder(
+            trace=self.trace,
+            planner=self.planner,
+            redactor=self._redactor,
+            annotate_result_metadata=self._annotate_result_metadata,
+            argument_summary=self._argument_trace_summary,
+            request_trace_ids=self._request_trace_ids,
+            emit_trace=self._emit_trace,
+            safe_update_planner=self._safe_update_planner,
+        )
         self._pipeline_state_type = ToolExecutionPipelineState
         self.cancellation_token: Any | None = None
 
@@ -291,7 +253,7 @@ class ToolExecutor:
         if result is not None:
             state.remember_replay = True
             return result
-        result = self._preflight_delegated_handler(state.spec, state.validated)
+        result = self.execution_dispatch.preflight_delegated_handler(state.spec, state.validated)
         if result is not None:
             state.remember_replay = True
             return result
@@ -337,6 +299,10 @@ class ToolExecutor:
         result: ToolResult,
     ) -> ToolResult:
         state.result = result
+        if state.planner_action_id:
+            result.metadata[PLANNER_ACTION_ID_METADATA_KEY] = state.planner_action_id
+        if state.defer_planner_update and not state.planner_updated:
+            result.metadata[PLANNER_UPDATE_DEFERRED_METADATA_KEY] = True
         if state.output_digest is None:
             state.output_digest = self._result_digest(result)
         if (
@@ -355,74 +321,8 @@ class ToolExecutor:
     def _finalize_pipeline_state(self, state: _ExecutionPipelineState) -> None:
         self.execution_trace.finalize(state)
 
-    def _finalize_pipeline_state_impl(self, state: _ExecutionPipelineState) -> None:
-        result = state.result
-        if result is None:
-            return
-        duration_seconds = time.perf_counter() - state.started
-        result.metadata.setdefault("cache_hit", state.cache_hit)
-        result.metadata.setdefault("duration_seconds", duration_seconds)
-        result.metadata.setdefault("output_digest", state.output_digest)
-        self._annotate_result_metadata(result, state.request)
-        if state.spec is not None:
-            result.metadata.setdefault("backend", state.spec.execution_backend.value)
-        if not state.planner_updated:
-            self._safe_update_planner(
-                tool_call_id=state.tool_call_id,
-                tool_name=state.tool_name,
-                result=result,
-                action_id=state.planner_action_id,
-            )
-        self._record_trace(
-            request=state.request,
-            tool_call_id=state.tool_call_id,
-            tool_name=state.tool_name,
-            spec=state.spec,
-            validated_args=state.validated_args,
-            started_at=state.started_at,
-            ended_at=datetime.now(UTC).isoformat(),
-            duration_seconds=duration_seconds,
-            result=result,
-            output_digest=state.output_digest,
-            cache_hit=state.cache_hit,
-        )
-
     def invalidate_paths(self, paths: list[str]) -> None:
-        self._cache.invalidate_paths(paths)
-
-    def _invalidate_after_write(
-        self,
-        spec: ToolSpec,
-        validated_args: dict[str, Any],
-        result: ToolResult,
-    ) -> None:
-        # Collect the paths a write tool touched. Prefer the mutation
-        # observation's ``changed_files`` (most accurate) and merge in the
-        # spec's resource_resolver output. Fall back to a full clear when no
-        # affected paths can be determined (e.g. free-form shell tools) so we
-        # never serve stale read-only results.
-        affected: list[str] = []
-        seen: set[str] = set()
-
-        content = result.content if isinstance(result.content, dict) else {}
-        for key in ("changed_files", "affected_files"):
-            value = content.get(key)
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, str) and item not in seen:
-                        seen.add(item)
-                        affected.append(item)
-
-        for path in self._touched_paths(spec, validated_args):
-            if path not in seen:
-                seen.add(path)
-                affected.append(path)
-
-        if affected:
-            self._cache.invalidate_paths(affected)
-        else:
-            # Could not determine the mutation surface - conservative clear.
-            self._cache.clear()
+        self.execution_cache.invalidate_paths(paths)
 
     @staticmethod
     def _normalize_execution_request(
@@ -560,490 +460,6 @@ class ToolExecutor:
                 }
             )
 
-    def _enforce_policy(
-        self,
-        *,
-        tool_name: str,
-        spec: ToolSpec,
-        validated_args: dict[str, Any],
-        tool_call_id: str | None,
-    ) -> tuple[ToolResult | None, str | None, str | None]:
-        request = self._policy_request(
-            tool_name=tool_name,
-            spec=spec,
-            validated_args=validated_args,
-            tool_call_id=tool_call_id,
-        )
-        decision = self.policy_engine.enforce(request)
-        if decision.outcome == DecisionOutcome.ALLOW:
-            return None, decision.approval_grant_id, decision.decision_id
-        # CommandExecutor and WorkspaceMutationManager are the authoritative
-        # execution boundaries for delegated tools.  They must consume review
-        # grants exactly once; ToolExecutor only enforces hard denials here.
-        if (
-            decision.outcome != DecisionOutcome.DENY
-            and (spec.uses_command_executor or spec.uses_mutation_manager)
-        ):
-            return None, None, decision.decision_id
-        if decision.outcome == DecisionOutcome.REQUIRE_REVIEW and self.approval_gate is not None:
-            # Trust boundary: only consume pre-existing grants when the grant
-            # store is trusted (i.e. lives outside the model-writable
-            # workspace). Grants persisted inside the workspace could have been
-            # forged by the model via shell writes and must not auto-approve
-            # subsequent actions.
-            grant_store_trusted = True
-            if hasattr(self.approval_gate, "is_grant_store_trusted"):
-                grant_store_trusted = self.approval_gate.is_grant_store_trusted(self.workspace_root)
-            if hasattr(self.approval_gate, "consume_matching_grant") and grant_store_trusted:
-                existing_grant = self.approval_gate.consume_matching_grant(request)
-                if existing_grant is not None:
-                    allowed = _decision_allowed_by_grant(decision, existing_grant.grant_id)
-                    return None, existing_grant.grant_id, allowed.decision_id
-            try:
-                grant = self.approval_gate.resolve(request, decision)
-            except (
-                ApprovalDenied,
-                ApprovalRequired,
-                PolicyAskUserRequired,
-                PolicyDenied,
-                PolicyEscalationRequired,
-                SandboxRequired,
-            ):
-                self._record_policy_observation(request, decision)
-                return self._policy_failure(request, decision), None, decision.decision_id
-            if grant is None:
-                self._record_policy_observation(request, decision)
-                return self._policy_failure(request, decision), None, decision.decision_id
-            if hasattr(self.approval_gate, "register_grant"):
-                self.approval_gate.register_grant(grant)
-            consumed_grant = (
-                self.approval_gate.consume_grant(grant)
-                if hasattr(self.approval_gate, "consume_grant")
-                else grant
-            )
-            if consumed_grant is None:
-                self._record_policy_observation(request, decision)
-                return self._policy_failure(request, decision), None, decision.decision_id
-            allowed = _decision_allowed_by_grant(decision, consumed_grant.grant_id)
-            return None, consumed_grant.grant_id, allowed.decision_id
-        self._record_policy_observation(request, decision)
-        return self._policy_failure(request, decision), None, decision.decision_id
-
-    def _policy_failure(self, request: PolicyRequest, decision: PolicyDecision) -> ToolResult:
-        return ToolResult.failure(
-            code=_policy_error_code(decision.outcome),
-            message=self._redactor.redact_text(decision.reason),
-            details={
-                "policy": self._redactor.redact_value(decision.to_dict()),
-                "request": self._safe_request_details(request),
-            },
-            metadata={"policy_decision_id": decision.decision_id},
-        )
-
-    def _policy_request(
-        self,
-        *,
-        tool_name: str,
-        spec: ToolSpec,
-        validated_args: dict[str, Any],
-        tool_call_id: str | None,
-    ) -> PolicyRequest:
-        resources = self._resources_for(spec, validated_args)
-        resource = resources[0] if resources else ResourceRef("workspace", tool_name, workspace_relative=True)
-        resource_details = [item.to_dict() for item in resources] or [resource.to_dict()]
-        related_resources = resource_details[1:]
-        if related_resources and not resource.metadata.get("related_resources"):
-            resource = ResourceRef(
-                resource.resource_type,
-                resource.identifier,
-                normalized_identifier=resource.normalized_identifier,
-                workspace_relative=resource.workspace_relative,
-                sensitive=resource.sensitive,
-                metadata={**resource.metadata, "related_resources": related_resources},
-            )
-        operation = spec.operation or OperationKind.READ_FILE
-        capability = spec.capabilities[0] if spec.capabilities else Capability.READ_WORKSPACE
-        return PolicyRequest(
-            session_id=getattr(self.planner, "session_id", self.trace.run_id if self.trace else "tool_session"),
-            task_id=getattr(self.planner, "task_id", self.trace.run_id if self.trace else "tool_task"),
-            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "tool_dispatch"),
-            action_id=tool_call_id or "tool_dispatch",
-            component=PolicyComponent.TOOL,
-            operation=operation,
-            capability=capability,
-            subject=PolicySubject(subject_type="component", name="ToolExecutor"),
-            resource=resource,
-            reason=f"Dispatch tool {tool_name}",
-            proposed_by_model=True,
-            risk_tags=list(spec.risk_tags),
-            metadata={
-                "tool_name": tool_name,
-                "argument_fingerprint": self._argument_trace_summary(validated_args)["hash"],
-                "permission_level": spec.permission_level.value,
-                "risk_tags": list(spec.risk_tags),
-                "delegated_executor": spec.uses_mutation_manager or spec.uses_command_executor,
-                "timeout": spec.timeout_seconds,
-                "max_output_chars": spec.max_output_chars,
-                "backend": spec.execution_backend.value,
-                "resources": resource_details,
-                **self._policy_argument_metadata(validated_args),
-            },
-            touches_workspace=capability
-            in {
-                Capability.READ_WORKSPACE,
-                Capability.LIST_DIRECTORY,
-                Capability.MUTATE_WORKSPACE,
-                Capability.CREATE_FILE,
-                Capability.DELETE_FILE,
-                Capability.MOVE_FILE,
-            },
-            touches_secrets=any(item.sensitive for item in resources)
-            or resource.sensitive
-            or capability in {Capability.READ_SECRET, Capability.READ_ENV},
-            destructive=capability == Capability.DELETE_FILE,
-            long_running=operation == OperationKind.START_LONG_PROCESS,
-            workspace_root=str(self.workspace_root),
-        )
-
-    def _resources_for(self, spec: ToolSpec, args: dict[str, Any]) -> list[ResourceRef]:
-        if spec.resource_resolver is not None:
-            return spec.resource_resolver(args, self.workspace_root)
-        return [_default_resource(spec, args)]
-
-    @staticmethod
-    def _policy_argument_metadata(args: dict[str, Any]) -> dict[str, Any]:
-        metadata: dict[str, Any] = {}
-        for key in (
-            "argv",
-            "shell",
-            "filesystem_mode",
-            "network_mode",
-            "purpose",
-            "risk_acceptance_reason",
-        ):
-            if key in args:
-                metadata[key] = args[key]
-        if args.get("argv"):
-            metadata["command"] = " ".join(str(part) for part in args["argv"])
-        elif args.get("shell"):
-            metadata["command"] = str(args["shell"])
-        return metadata
-
-    def _record_policy_observation(self, request: PolicyRequest, decision: PolicyDecision) -> None:
-        if self.planner is None or not hasattr(self.planner, "record_policy_observation"):
-            return
-        self.planner.record_policy_observation(
-            {
-                "outcome": decision.outcome.value,
-                "component": request.component.value,
-                "operation": request.operation.value,
-                "reason": decision.reason,
-                "risk_level": decision.risk_level.value,
-                "resource": redact_resource_identifier(request.resource.identifier),
-                "resources": _redacted_resource_details(
-                    request.metadata.get("resources")
-                ),
-                "decision_id": decision.decision_id,
-            }
-        )
-
-    def _delegates_policy_decision(self, spec: ToolSpec, result: ToolResult) -> bool:
-        if result.error_code != "sandbox_required":
-            return False
-        if not spec.delegates_policy_constraints:
-            return False
-        return spec.execution_backend == ToolExecutionBackendKind.DELEGATED_VERIFICATION_RUNNER
-
-    def _preflight_delegated_handler(
-        self,
-        spec: ToolSpec,
-        validated_args: Any,
-    ) -> ToolResult | None:
-        if spec.execution_backend != ToolExecutionBackendKind.DELEGATED_COMMAND_EXECUTOR:
-            return None
-        owner = getattr(spec.handler, "__self__", None)
-        validator = getattr(owner, "validate_direct_command", None)
-        request_builder = getattr(owner, "_request", None)
-        if not callable(validator) or not callable(request_builder):
-            return None
-        try:
-            validator(request_builder(validated_args))
-        except ToolExecutionFailure as exc:
-            return ToolResult.failure(
-                code=exc.code,
-                message=exc.message,
-                details=exc.details,
-            )
-        return None
-
-    def _execute_handler(self, spec: ToolSpec, validated_args: Any) -> tuple[ToolResult, str]:
-        if _prefer_thread_handler(spec):
-            return self._execute_handler_in_thread(spec, validated_args)
-        if (
-            spec.execution_backend == ToolExecutionBackendKind.IN_PROCESS
-            and self._handler_can_run_in_process(spec.handler, validated_args)
-        ):
-            return self._execute_handler_in_process(spec, validated_args)
-        return self._execute_handler_in_thread(spec, validated_args)
-
-    @staticmethod
-    def _handler_can_run_in_process(handler: Any, validated_args: Any) -> bool:
-        try:
-            pickle.dumps((handler, validated_args))
-        except Exception:
-            return False
-        return True
-
-    def _execute_handler_in_process(
-        self, spec: ToolSpec, validated_args: Any
-    ) -> tuple[ToolResult, str]:
-        context = multiprocessing.get_context("spawn")
-        parent_conn, child_conn = context.Pipe(duplex=False)
-        process = context.Process(
-            target=_tool_process_entrypoint,
-            args=(spec.handler, validated_args, child_conn),
-        )
-        try:
-            process.start()
-        except Exception as exc:
-            parent_conn.close()
-            child_conn.close()
-            result = ToolResult.failure(
-                code="execution_error",
-                message=self._redactor.redact_text(f"Tool process failed to start: {exc}"),
-                details={"type": type(exc).__name__},
-                metadata={
-                    "backend": spec.execution_backend.value,
-                    "handler_isolation": "process",
-                },
-            )
-            return result, self._result_digest(result)
-        child_conn.close()
-
-        try:
-            process.join(spec.timeout_seconds)
-            if process.is_alive():
-                process.terminate()
-                process.join(1)
-                killed = False
-                if process.is_alive():
-                    kill = getattr(process, "kill", None)
-                    if kill is not None:
-                        kill()
-                        killed = True
-                        process.join(1)
-                still_alive = process.is_alive()
-                result = ToolResult.failure(
-                    code="timeout",
-                    message=f"Tool timed out after {spec.timeout_seconds} seconds.",
-                    metadata={
-                        "backend": spec.execution_backend.value,
-                        "handler_isolation": "process",
-                        "timeout_type": "execution",
-                        "timeout_terminated": not still_alive,
-                        "timeout_killed": killed,
-                        "timeout_untrusted_state": still_alive,
-                        "process_exitcode": process.exitcode,
-                    },
-                )
-                return result, self._result_digest(result)
-
-            if not parent_conn.poll():
-                result = ToolResult.failure(
-                    code="execution_error",
-                    message="Tool process exited without returning a result.",
-                    details={"process_exitcode": process.exitcode},
-                    metadata={
-                        "backend": spec.execution_backend.value,
-                        "handler_isolation": "process",
-                    },
-                )
-                return result, self._result_digest(result)
-
-            payload = parent_conn.recv()
-        finally:
-            parent_conn.close()
-            with suppress(ValueError):
-                process.close()
-
-        return self._process_payload_to_result(spec, payload)
-
-    def _execute_handler_in_thread(
-        self, spec: ToolSpec, validated_args: Any
-    ) -> tuple[ToolResult, str]:
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(spec.handler, validated_args)
-        shutdown_wait = True
-        try:
-            output = future.result(timeout=spec.timeout_seconds)
-        except FutureTimeout:
-            future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-            shutdown_wait = False
-            result = ToolResult.failure(
-                code="timeout",
-                message=f"Tool timed out after {spec.timeout_seconds} seconds.",
-                metadata={
-                    "backend": spec.execution_backend.value,
-                    "handler_isolation": "thread",
-                    "timeout_type": "execution",
-                    "timeout_untrusted_state": True,
-                },
-            )
-            return result, self._result_digest(result)
-        except ToolExecutionFailure as exc:
-            result = ToolResult.failure(
-                code=exc.code,
-                message=self._redactor.redact_text(exc.message),
-                details=self._redactor.redact_value(exc.details),
-                metadata={
-                    "backend": spec.execution_backend.value,
-                    "handler_isolation": "thread",
-                },
-            )
-            return result, self._result_digest(result)
-        except Exception as exc:
-            result = ToolResult.failure(
-                code="execution_error",
-                message=self._redactor.redact_text(str(exc)),
-                details={"type": type(exc).__name__},
-                metadata={
-                    "backend": spec.execution_backend.value,
-                    "handler_isolation": "thread",
-                },
-            )
-            return result, self._result_digest(result)
-        finally:
-            if shutdown_wait:
-                executor.shutdown(wait=True, cancel_futures=True)
-
-        return self._handler_output_to_result(spec, output, handler_isolation="thread")
-
-    def _process_payload_to_result(
-        self, spec: ToolSpec, payload: dict[str, Any]
-    ) -> tuple[ToolResult, str]:
-        status = payload.get("status")
-        if status == "success":
-            return self._handler_output_to_result(
-                spec,
-                payload.get("output"),
-                handler_isolation="process",
-            )
-        if status == "tool_failure":
-            result = ToolResult.failure(
-                code=str(payload.get("code") or "execution_error"),
-                message=self._redactor.redact_text(str(payload.get("message") or "")),
-                details=self._redactor.redact_value(payload.get("details")),
-                metadata={
-                    "backend": spec.execution_backend.value,
-                    "handler_isolation": "process",
-                },
-            )
-            return result, self._result_digest(result)
-
-        result = ToolResult.failure(
-            code="execution_error",
-            message=self._redactor.redact_text(str(payload.get("message") or "Tool failed.")),
-            details={"type": payload.get("type") or "Exception"},
-            metadata={
-                "backend": spec.execution_backend.value,
-                "handler_isolation": "process",
-            },
-        )
-        return result, self._result_digest(result)
-
-    def _handler_output_to_result(
-        self,
-        spec: ToolSpec,
-        output: Any,
-        *,
-        handler_isolation: str,
-    ) -> tuple[ToolResult, str]:
-        if spec.output_model is not None:
-            try:
-                output = spec.output_model.model_validate(output).model_dump(mode="json")
-            except ValidationError as exc:
-                result = ToolResult.failure(
-                    code="output_validation_error",
-                    message="Tool output failed validation.",
-                    details=self._redactor.redact_value(exc.errors()),
-                    metadata={
-                        "backend": spec.execution_backend.value,
-                        "handler_isolation": handler_isolation,
-                    },
-                )
-                return result, self._result_digest(result)
-        content, truncated, metadata, digest = self._limit_output(output, spec.max_output_chars)
-        result = ToolResult.success(
-            content=self._redactor.redact_value(content),
-            truncated=truncated,
-            metadata={
-                **metadata,
-                "backend": spec.execution_backend.value,
-                "handler_isolation": handler_isolation,
-            },
-        )
-        result.metadata["output_digest"] = digest
-        return result, digest
-
-    def _record_trace(
-        self,
-        *,
-        request: ToolExecutionRequest,
-        tool_call_id: str | None,
-        tool_name: str,
-        spec: ToolSpec | None,
-        validated_args: dict[str, Any] | None,
-        started_at: str,
-        ended_at: str,
-        duration_seconds: float,
-        result: ToolResult,
-        output_digest: str | None,
-        cache_hit: bool,
-    ) -> None:
-        if self.trace is None:
-            return
-        args_summary = (
-            self._argument_trace_summary(validated_args)
-            if validated_args is not None
-            else None
-        )
-        payload = {
-            "tool_call_id": tool_call_id,
-            "tool_name": tool_name,
-            "batch_id": request.batch_id,
-            "run_id": request.run_id,
-            "session_id": request.session_id,
-            "task_id": request.task_id,
-            "phase_id": request.phase_id,
-            "model_request_id": request.model_request_id,
-            "model_response_id": request.model_response_id,
-            "argument_digest": request.argument_digest,
-            "policy_decision_id": result.metadata.get("policy_decision_id"),
-            "argument_summary": args_summary,
-            "permission_level": spec.permission_level.value if spec is not None else None,
-            "risk_tags": list(spec.risk_tags) if spec is not None else [],
-            "start": started_at,
-            "end": ended_at,
-            "duration_seconds": duration_seconds,
-            "status": "ok" if result.ok else "error",
-            "error_code": result.error_code,
-            "truncated": result.truncated,
-            "output_digest": output_digest,
-            "cache_hit": cache_hit,
-            "backend": spec.execution_backend.value if spec is not None else None,
-        }
-        if not hasattr(self.trace, "emit"):
-            self.trace.record("tool_call", payload)
-            return
-        self._emit_trace(
-            TraceEventType.TOOL_DISPATCH_COMPLETED if result.ok else TraceEventType.TOOL_DISPATCH_FAILED,
-            summary=f"Tool {tool_name} {'completed' if result.ok else 'failed'}.",
-            payload=payload,
-            ids=self._request_trace_ids(request, action_id=tool_call_id),
-            severity=TraceSeverity.INFO if result.ok else TraceSeverity.ERROR,
-        )
-
     def _emit_trace(
         self,
         event_type: TraceEventType,
@@ -1112,13 +528,9 @@ class ToolExecutor:
     def _dry_run_error(self, spec: ToolSpec) -> ToolResult | None:
         if not self.dry_run:
             return None
-        read_only_side_effects = {
-            ToolSideEffectKind.NONE,
-            ToolSideEffectKind.READ_WORKSPACE,
-        }
         if (
             spec.permission_level == PermissionLevel.READ_ONLY
-            and spec.side_effects in read_only_side_effects
+            and is_read_only_side_effect(spec.side_effects)
         ):
             return None
         return ToolResult.failure(
@@ -1132,87 +544,11 @@ class ToolExecutor:
             },
         )
 
-    def _delegated_backend_error(self, spec: ToolSpec) -> ToolResult | None:
-        if spec.execution_backend == ToolExecutionBackendKind.IN_PROCESS:
-            return None
-        if self.standalone_can_execute:
-            return None
-        return ToolResult.failure(
-            code="delegated_backend_unavailable",
-            message=f"Delegated backend is unavailable: {spec.execution_backend.value}",
-            metadata={"backend": spec.execution_backend.value},
-        )
-
     @staticmethod
     def _parse_arguments(raw_arguments: Any) -> Any:
         if isinstance(raw_arguments, dict):
             return raw_arguments
         return json.loads(raw_arguments)
-
-    @staticmethod
-    def _should_cache(spec: ToolSpec) -> bool:
-        return (
-            bool(spec.cache_policy and spec.cache_policy.cacheable)
-            and spec.permission_level == PermissionLevel.READ_ONLY
-            and bool(spec.idempotency_policy and spec.idempotency_policy.idempotent)
-            and spec.sensitivity not in {
-                ToolSensitivityLevel.SENSITIVE,
-                ToolSensitivityLevel.SECRET,
-            }
-        )
-
-    def _cache_key(self, spec: ToolSpec, validated_args: dict[str, Any]) -> str:
-        payload = {
-            "tool_name": spec.name,
-            "version": spec.version,
-            "schema": self._model_schema_fingerprint(spec),
-            "arguments": validated_args,
-            "workspace_root": str(self.workspace_root),
-            "paths": self._file_snapshots(spec, validated_args),
-        }
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-
-    def _file_snapshots(self, spec: ToolSpec, args: dict[str, Any]) -> dict[str, Any]:
-        # Lightweight cache-key fingerprints based on per-path stat() data
-        # (size + mtime). This avoids the previous behavior of scanning an
-        # entire workspace tree via rglob("*") and hashing every file with
-        # sha256. Callers are expected to invalidate cache entries through
-        # ``invalidate_paths`` (or the write-tool invalidation hook) when a
-        # mutation is not observable via stat() - e.g. directory children
-        # changing content without changing the directory's own mtime.
-        snapshots: dict[str, Any] = {}
-        for path in self._touched_paths(spec, args):
-            full = (self.workspace_root / path).resolve(strict=False)
-            try:
-                stat = full.stat()
-            except OSError:
-                snapshots[path] = {"exists": False}
-                continue
-            snapshots[path] = {
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-                "is_dir": full.is_dir(),
-            }
-        return snapshots
-
-    def _touched_paths(self, spec: ToolSpec, args: dict[str, Any]) -> tuple[str, ...]:
-        paths: list[str] = []
-        for resource in self._resources_for(spec, args):
-            if resource.resource_type in {"file", "directory"} and resource.workspace_relative:
-                paths.append(Path(resource.identifier).as_posix())
-        return tuple(sorted(set(paths)))
-
-    @staticmethod
-    def _model_schema_fingerprint(spec: ToolSpec) -> str:
-        schema = spec.input_model.model_json_schema()
-        text = json.dumps(schema, ensure_ascii=False, sort_keys=True, default=str)
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-    def _is_sensitive_result(self, spec: ToolSpec, result: ToolResult) -> bool:
-        if spec.sensitivity in {ToolSensitivityLevel.SENSITIVE, ToolSensitivityLevel.SECRET}:
-            return True
-        text = self._output_text(result.content)
-        return self._redactor.redact_text(text) != text
 
     def _limit_output(
         self, output: Any, max_output_chars: int
@@ -1282,27 +618,6 @@ class ToolExecutor:
         dumped = self._redactor.redact_value(result.model_dump(mode="json"))
         return self._digest(json.dumps(dumped, ensure_ascii=False, sort_keys=True, default=str))
 
-    def _safe_request_details(self, request: PolicyRequest) -> dict[str, Any]:
-        payload = request.to_dict()
-        payload["resource"]["identifier"] = redact_resource_identifier(
-            request.resource.identifier
-        )
-        payload["resource"]["normalized_identifier"] = (
-            redact_resource_identifier(request.resource.normalized_identifier)
-            if request.resource.normalized_identifier
-            else None
-        )
-        payload["metadata"] = {
-            key: (
-                _redacted_resource_details(value)
-                if key == "resources"
-                else value
-            )
-            for key, value in payload.get("metadata", {}).items()
-            if key != "arguments"
-        }
-        return self._redactor.redact_value(payload)
-
     def _remember_replay(
         self,
         tool_call_id: str | None,
@@ -1322,100 +637,8 @@ class ToolExecutor:
         )
 
 
-def _redacted_resource_details(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    resources: list[dict[str, Any]] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        identifier = item.get("identifier")
-        normalized_identifier = item.get("normalized_identifier")
-        resources.append(
-            {
-                **item,
-                "identifier": redact_resource_identifier(str(identifier))
-                if identifier is not None
-                else "",
-                "normalized_identifier": (
-                    redact_resource_identifier(str(normalized_identifier))
-                    if normalized_identifier is not None
-                    else None
-                ),
-            }
-        )
-    return resources
-
-
-def _prefer_thread_handler(spec: ToolSpec) -> bool:
-    return (
-        spec.name in {"list_files", "read_file", "search_text"}
-        and spec.permission_level == PermissionLevel.READ_ONLY
-        and spec.side_effects == ToolSideEffectKind.READ_WORKSPACE
-        and spec.execution_backend == ToolExecutionBackendKind.IN_PROCESS
-    )
-
-
-def _default_resource(spec: ToolSpec, args: dict[str, Any]) -> ResourceRef:
-    name = spec.name
-    if name in {"edit_plan", "edit_preview", "edit_apply"}:
-        operations = args.get("operations") or []
-        if isinstance(operations, list):
-            for operation in operations:
-                if isinstance(operation, dict) and operation.get("path"):
-                    return ResourceRef("file", str(operation.get("path")), workspace_relative=True)
-        return ResourceRef("workspace", "edit", workspace_relative=True)
-    if name in {"read_file", "workspace_create_file", "workspace_delete_file", "workspace_replace_text"}:
-        return ResourceRef("file", str(args.get("path") or "."), workspace_relative=True)
-    if name == "workspace_move_file":
-        return ResourceRef("file", str(args.get("path") or "."), workspace_relative=True)
-    if name in {"list_files", "search_text"}:
-        return ResourceRef("directory", str(args.get("path") or "."), workspace_relative=True)
-    if name == "start_process":
-        return ResourceRef("command", _command_identifier(args))
-    if name == "stop_process":
-        return ResourceRef("process", str(args.get("process_id") or ""))
-    if name == "run_command":
-        return ResourceRef("command", _command_identifier(args))
-    if name in {"plan_verification", "get_verification_result"}:
-        return ResourceRef("workspace", name, workspace_relative=True)
-    if name in {"run_verification", "rerun_check"}:
-        return ResourceRef("workspace", name, workspace_relative=True)
-    if spec.permission_level == PermissionLevel.SHELL:
-        return ResourceRef("command", _command_identifier(args) or name)
-    return ResourceRef("tool", name)
-
-
-def _command_identifier(args: dict[str, Any]) -> str:
-    if args.get("shell"):
-        return str(args["shell"])
-    if args.get("argv"):
-        return " ".join(str(part) for part in args["argv"])
-    return ""
-
-
 def _is_cancellation_error(exc: BaseException) -> bool:
     return (
         getattr(exc, "code", None) == "cancelled"
         or exc.__class__.__name__ == "CancellationError"
-    )
-
-
-def _policy_error_code(outcome: DecisionOutcome) -> str:
-    mapping = {
-        DecisionOutcome.DENY: "policy_denied",
-        DecisionOutcome.REQUIRE_REVIEW: "approval_required",
-        DecisionOutcome.SANDBOX_REQUIRED: "sandbox_required",
-        DecisionOutcome.ASK_USER: "policy_ask_user_required",
-        DecisionOutcome.ESCALATE: "policy_escalation_required",
-    }
-    return mapping.get(outcome, "policy_denied")
-
-
-def _decision_allowed_by_grant(decision: PolicyDecision, grant_id: str) -> PolicyDecision:
-    return decision.model_copy_with(
-        outcome=DecisionOutcome.ALLOW,
-        reason="Action allowed by matching ApprovalGrant.",
-        approval_grant_id=grant_id,
-        required_approval=None,
     )

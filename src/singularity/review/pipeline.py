@@ -81,17 +81,20 @@ class ReviewPipeline:
             patch_digest=_attr(patch, "digest") or context.get("patch_digest"),
             policy_decision_id=(policy_observation or {}).get("decision_id") if isinstance(policy_observation, dict) else None,
         )
-        evidence = collect_review_evidence(
-            intent=intent,
-            edit_plan=plan,
-            patch=patch,
-            validation=validation,
-            code_impact=code_impact,
-            test_impact=test_impact,
-            policy_observation=policy_observation,
-            trace_summary=trace_summary,
+        return self._run_stage_review(
+            target=target,
+            context=context,
+            evidence_inputs={
+                "intent": intent,
+                "edit_plan": plan,
+                "patch": patch,
+                "validation": validation,
+                "code_impact": code_impact,
+                "test_impact": test_impact,
+                "policy_observation": policy_observation,
+                "trace_summary": trace_summary,
+            },
         )
-        return self._review(target=target, evidence=evidence, context=context)
 
     def post_patch_review(
         self,
@@ -127,16 +130,19 @@ class ReviewPipeline:
             transaction_id=edit_payload.get("transaction_id"),
             policy_decision_id=(policy_observation or {}).get("decision_id") if isinstance(policy_observation, dict) else None,
         )
-        evidence = collect_review_evidence(
-            edit_result=edit_result,
-            mutation_result=mutation_result,
-            verification_plan=verification_plan,
-            code_impact=code_impact,
-            test_impact=test_impact,
-            policy_observation=policy_observation,
-            trace_summary=trace_summary,
+        return self._run_stage_review(
+            target=target,
+            context=context,
+            evidence_inputs={
+                "edit_result": edit_result,
+                "mutation_result": mutation_result,
+                "verification_plan": verification_plan,
+                "code_impact": code_impact,
+                "test_impact": test_impact,
+                "policy_observation": policy_observation,
+                "trace_summary": trace_summary,
+            },
         )
-        return self._review(target=target, evidence=evidence, context=context)
 
     def post_verification_review(
         self,
@@ -169,12 +175,15 @@ class ReviewPipeline:
             transaction_id=plan_payload.get("transaction_id"),
             policy_decision_id=(policy_observation or {}).get("decision_id") if isinstance(policy_observation, dict) else None,
         )
-        evidence = collect_review_evidence(
-            verification=verification_payload,
-            policy_observation=policy_observation,
-            trace_summary=trace_summary,
+        return self._run_stage_review(
+            target=target,
+            context=context,
+            evidence_inputs={
+                "verification": verification_payload,
+                "policy_observation": policy_observation,
+                "trace_summary": trace_summary,
+            },
         )
-        return self._review(target=target, evidence=evidence, context=context)
 
     def final_review(
         self,
@@ -200,13 +209,16 @@ class ReviewPipeline:
             task_id=_attr(task_state, "task_id") or _planner_attr(self.planner, "task_id"),
             plan_id=_attr(task_plan, "plan_id"),
         )
-        evidence = collect_review_evidence(
-            task_state=task_state,
-            task_plan=task_plan,
-            evidence_ledger=ledger,
-            trace_summary=trace_summary,
+        return self._run_stage_review(
+            target=target,
+            context=context,
+            evidence_inputs={
+                "task_state": task_state,
+                "task_plan": task_plan,
+                "evidence_ledger": ledger,
+                "trace_summary": trace_summary,
+            },
         )
-        return self._review(target=target, evidence=evidence, context=context)
 
     def health(self) -> dict[str, Any]:
         return {
@@ -215,6 +227,16 @@ class ReviewPipeline:
             "model_critic_enabled": self.enable_model_critic,
             "has_model_runner": self.model_runner is not None,
         }
+
+    def _run_stage_review(
+        self,
+        *,
+        target: ReviewTarget,
+        context: dict[str, Any],
+        evidence_inputs: dict[str, Any],
+    ) -> ReviewReport:
+        evidence = collect_review_evidence(**evidence_inputs)
+        return self._review(target=target, evidence=evidence, context=context)
 
     def _review(
         self,

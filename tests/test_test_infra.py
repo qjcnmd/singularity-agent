@@ -401,40 +401,20 @@ class TestMarkerValidity:
 # ---------------------------------------------------------------------------
 
 class TestMarkerCounts:
-    """Soft check that marker counts are within expected ranges.
+    """Sanity-check marker count diagnostics without enforcing drifting totals."""
 
-    These are approximate — the exact counts change as tests are added or
-    reclassified.  A ±30% tolerance avoids brittle failures while still
-    catching major misconfigurations.
-    """
-
-    def test_marker_counts_reasonable(
+    def test_marker_count_config_is_well_formed(
         self,
         request: pytest.FixtureRequest,
     ) -> None:
-        """Each marker count should be within ±30% of expected."""
+        """Configured marker counters should name known markers and stay non-negative."""
         if not _is_full_collection(request):
             pytest.skip("Requires full test collection")
 
-        from collections import Counter
-
-        counts: Counter[str] = Counter()
         expected, tolerance = _configured_marker_counts()
-        for item in request.session.items:
-            for marker in item.iter_markers():
-                if marker.name in expected:
-                    counts[marker.name] += 1
+        unknown = set(expected) - _KNOWN_MARKERS
+        negative = {marker: count for marker, count in expected.items() if count < 0}
 
-        for marker, expected_count in expected.items():
-            if expected_count == 0:
-                continue  # excluded by addopts, skip
-            actual = counts.get(marker, 0)
-            low = int(expected_count * (1 - tolerance))
-            high = int(expected_count * (1 + tolerance))
-            if actual < low or actual > high:
-                import warnings
-                warnings.warn(
-                    f"Marker '{marker}' count {actual} outside expected "
-                    f"range [{low}, {high}] (expected ~{expected_count})",
-                    stacklevel=2,
-                )
+        assert not unknown, f"Unknown marker count config entries: {sorted(unknown)}"
+        assert not negative, f"Negative marker count config entries: {negative}"
+        assert 0.0 <= tolerance <= 1.0
