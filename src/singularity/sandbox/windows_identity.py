@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import singularity.sandbox.windows as _windows
+import singularity.sandbox.windows_common as _windows
 
 
 def _ensure_sandbox_identity(identity):

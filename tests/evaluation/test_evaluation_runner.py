@@ -1143,6 +1143,28 @@ def test_secret_leak_detection_flags_unredacted_access_token() -> None:
     assert evaluation_runner._secret_leak_detected(events) is True
 
 
+def test_secret_leak_detection_flags_token_like_values_without_secret_key_name() -> None:
+    events = [
+        {
+            "event_type": "command.finished",
+            "stdout": "ghp_abcdefghijklmnopqrstuvwxyz123456",
+        }
+    ]
+
+    assert evaluation_runner._secret_leak_detected(events) is True
+
+
+def test_secret_leak_detection_flags_bare_bearer_value() -> None:
+    events = [
+        {
+            "event_type": "command.finished",
+            "stdout": "provider replied with Bearer raw-token-value",
+        }
+    ]
+
+    assert evaluation_runner._secret_leak_detected(events) is True
+
+
 def test_capability_summary_groups_review_provider_latency_by_stage(tmp_path: Path) -> None:
     trace_dir = tmp_path / "trace"
     trace_dir.mkdir()

@@ -22,6 +22,7 @@ from singularity.command import (
     SemanticStatus,
 )
 from singularity.command.backend import RunningProcess, _reader_thread
+from singularity.command.output import SecretRedactor
 from singularity.context import ContextManager
 from singularity.jsonl_trace import JsonlTraceRecorder
 from singularity.policy import DecisionOutcome, PolicyConfig, PolicyEngine
@@ -99,6 +100,15 @@ def test_command_reader_reads_output_in_chunks() -> None:
     assert b"".join(chunks) == b"x" * 9000
 
 
+def test_secret_redactor_uses_shared_provider_for_token_like_output() -> None:
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+
+    redacted = SecretRedactor().redact(f"Authorization: Bearer {secret}")
+
+    assert secret not in redacted
+    assert "[REDACTED]" in redacted
+
+
 def test_strict_mode_blocks_inline_interpreter_readonly_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -158,7 +168,7 @@ def test_workspace_write_low_risk_verification_runs_through_windows_sandbox(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(
-        "singularity.sandbox.windows._windows_state_dir_path",
+        "singularity.sandbox.windows_common._windows_state_dir_path",
         lambda: tmp_path / "state" / "windows-sandbox",
     )
     class FakeRunner:

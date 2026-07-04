@@ -1,22 +1,19 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
 from singularity.command.models import ResourceLimits
 from singularity.command.policy import is_secret_env_name
-
-SECRET_VALUE_RE = re.compile(
-    r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|DSN|CONN_STR|CONN_STRING|CONNECTION_STRING)|DATABASE_URL|AWS_[A-Z0-9_]+|GITHUB_TOKEN|OPENAI_API_KEY)=([^\s]+)"
-)
+from singularity.redaction import RedactionMarker, RedactionProvider
 
 
 class SecretRedactor:
     def __init__(self) -> None:
         self._literal_values: set[str] = set()
+        self._provider = RedactionProvider(marker=RedactionMarker.BRACKETED)
         self.redaction_count = 0
 
     def add_env_values(self, env: dict[str, str]) -> None:
@@ -35,11 +32,10 @@ class SecretRedactor:
                 redacted = redacted.replace(value, "[REDACTED]")
                 self.redaction_count += 1
 
-        def replace_match(match: re.Match[str]) -> str:
+        provider_redacted = self._provider.redact_text(redacted)
+        if provider_redacted != redacted:
             self.redaction_count += 1
-            return f"{match.group(1)}=[REDACTED]"
-
-        return SECRET_VALUE_RE.sub(replace_match, redacted)
+        return provider_redacted
 
 
 @dataclass(frozen=True)

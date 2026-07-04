@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import singularity.sandbox.windows as _windows
+import singularity.sandbox.windows_common as _windows
 
 
 def _network_state(sid: str):
-    if _windows.os.name != "nt":
+    if not _windows._is_windows():
         return _windows._missing(
             "Network filter requires Windows Firewall.",
             {"group": _windows.FIREWALL_RULE_GROUP},

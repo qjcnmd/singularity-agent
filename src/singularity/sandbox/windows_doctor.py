@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import singularity.sandbox.windows as _windows
+import singularity.sandbox.windows_common as _windows
 
 
 @lru_cache(maxsize=1)

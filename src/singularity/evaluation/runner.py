@@ -68,6 +68,7 @@ from singularity.evaluation.results import (
 )
 from singularity.interaction import InteractionMode
 from singularity.observability.redaction import TraceRedactor
+from singularity.redaction import RedactionProvider
 
 EVALUATION_METRICS_SCHEMA_VERSION = "evaluation.metrics/v1"
 
@@ -2979,7 +2980,10 @@ def _cost_payload(
 
 
 def _secret_leak_detected(events: list[dict[str, Any]]) -> bool:
-    return any(_payload_has_secret_leak(_event_payload(event)) for event in events)
+    return any(
+        _payload_has_secret_leak(_event_payload(event)) or _payload_has_secret_leak(event)
+        for event in events
+    )
 
 
 def _payload_has_secret_leak(value: Any, *, path: tuple[str, ...] = ()) -> bool:
@@ -3002,7 +3006,7 @@ def _payload_has_secret_leak(value: Any, *, path: tuple[str, ...] = ()) -> bool:
         lowered = value.lower()
         if _is_redacted_secret_marker(lowered):
             return False
-        return "sk-" in lowered or "bearer " in lowered
+        return RedactionProvider().contains_secret(value)
     return False
 
 

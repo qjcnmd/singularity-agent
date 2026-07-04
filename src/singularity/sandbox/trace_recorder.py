@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -10,10 +9,6 @@ from singularity.observability.redaction import TraceRedactor
 from singularity.sandbox.models import PreparedSandbox, SandboxCapabilities, SandboxRequest, SandboxResult
 
 _REDACTOR = TraceRedactor()
-_SECRET_CLI_FLAG_RE = re.compile(
-    r"^--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)$",
-    re.IGNORECASE,
-)
 
 
 class SandboxJsonlTraceRecorder:
@@ -80,16 +75,7 @@ def _command_summary(command: list[str] | str | None) -> str | list[str] | None:
 
 
 def _redact_command_parts(parts: list[str]) -> list[str]:
-    redacted: list[str] = []
-    redact_next = False
-    for part in parts:
-        if redact_next:
-            redacted.append("<redacted>")
-            redact_next = False
-            continue
-        redacted.append(_redact_text(part))
-        redact_next = bool(_SECRET_CLI_FLAG_RE.match(part.strip()))
-    return redacted
+    return _REDACTOR.provider.redact_command_parts(parts)
 
 
 def _redact(value: Any) -> Any:

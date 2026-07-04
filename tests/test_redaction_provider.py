@@ -50,3 +50,42 @@ def test_callers_preserve_their_public_redaction_markers() -> None:
     assert "<redacted:" in ContextRedactor().redact_text(text)
     assert TraceRedactor().redact_text(text) == "Authorization: <redacted>"
     assert redact_audit(text) == "Authorization: [REDACTED]"
+
+
+def test_redaction_provider_detects_and_redacts_common_secret_shapes() -> None:
+    provider = RedactionProvider(marker=RedactionMarker.PLAIN)
+    samples = [
+        "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456",
+        "provider replied with Bearer raw-token-value",
+        "Cookie: session=super-secret-cookie",
+        "https://example.test/path?token=raw-token&client_secret=raw-secret",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature",
+        "AKIA1234567890ABCDEF",
+        "xoxb-123456789-abcdefghijklmnop",
+        "sk_live_abcdefghijklmnopqrstuvwxyz",
+        "AIzaSyA1234567890abcdefghijklmnopqrstuvwxyz",
+        "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
+    ]
+
+    for sample in samples:
+        assert provider.contains_secret(sample), sample
+        redacted = provider.redact_text(sample)
+        assert redacted != sample
+        assert "<redacted>" in redacted
+
+
+def test_redaction_provider_does_not_treat_token_words_as_secret_values() -> None:
+    provider = RedactionProvider(marker=RedactionMarker.PLAIN)
+
+    assert not provider.contains_secret("1M tokens")
+    assert not provider.contains_secret("https://token-plan-cn.xiaomimimo.com/v1")
+    assert provider.contains_secret("Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456")
+    assert provider.contains_secret("https://example.test/path?token=raw-token")
+
+
+def test_redaction_provider_redacts_command_parts_with_secret_flags() -> None:
+    provider = RedactionProvider(marker=RedactionMarker.PLAIN)
+
+    redacted = provider.redact_command_parts(["tool", "--token", "plain-secret", "--safe", "value"])
+
+    assert redacted == ["tool", "--token", "<redacted>", "--safe", "value"]

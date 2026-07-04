@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import singularity.sandbox.windows as _windows
+import singularity.sandbox.windows_common as _windows
 
 
 def _apply_sandbox_control_dir_acl(
@@ -11,7 +11,7 @@ def _apply_sandbox_control_dir_acl(
     low_integrity_root=None,
 ):
     account_names = account_names if account_names is not None else _windows.SANDBOX_ACCOUNTS
-    if _windows.os.name != "nt":
+    if not _windows._is_windows():
         return _windows._OperationResult(
             False,
             "Windows sandbox control directory ACL setup requires Windows.",

@@ -50,7 +50,7 @@ TOKEN_VALUE_RE = re.compile(
     r"|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
     r"|xox[baprs]-[A-Za-z0-9-]+"
     r"|sk_live_[A-Za-z0-9]+"
-    r"|AIza[0-9A-Za-z_-]{35}"
+    r"|AIza[0-9A-Za-z_-]{30,45}"
     r")\b"
 )
 CONTEXT_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -124,6 +124,10 @@ class RedactionProvider:
                 lambda match: f"{match.group(1)}: {self._marker(match.group(2))}",
                 redacted,
             )
+            redacted = BEARER_VALUE_RE.sub(
+                lambda match: f"{match.group(1)}{self._marker(match.group(2))}",
+                redacted,
+            )
         redacted = URL_QUERY_SECRET_RE.sub(
             lambda match: f"{match.group(1)}{self._marker(match.group(2))}",
             redacted,
@@ -167,6 +171,18 @@ class RedactionProvider:
             return self.redact_value(value.__dict__)
         return value
 
+    def redact_command_parts(self, parts: list[str]) -> list[str]:
+        redacted: list[str] = []
+        redact_next = False
+        for part in parts:
+            if redact_next:
+                redacted.append(self._marker(part))
+                redact_next = False
+                continue
+            redacted.append(self.redact_text(part))
+            redact_next = bool(_is_secret_cli_flag(part.strip()))
+        return redacted
+
     def redact_path(self, path: str | Path) -> str:
         text = str(path)
         normalized = text.replace("\\", "/")
@@ -184,10 +200,13 @@ class RedactionProvider:
     def contains_secret(self, value: Any) -> bool:
         text = _stringify(value)
         return (
-            bool(SECRET_FIELD_RE.search(text))
-            or bool(ENV_SECRET_RE.search(text))
+            bool(ENV_SECRET_RE.search(text))
             or bool(HEADER_SECRET_RE.search(text))
+            or bool(URL_QUERY_SECRET_RE.search(text))
+            or bool(CLI_SECRET_FLAG_RE.search(text))
+            or bool(JSON_ARG_SECRET_RE.search(text))
             or bool(PRIVATE_KEY_RE.search(text))
+            or bool(BEARER_VALUE_RE.search(text))
             or bool(TOKEN_VALUE_RE.search(text))
         )
 
@@ -222,6 +241,16 @@ def _is_safe_numeric_metric(key: object, value: Any) -> bool:
 
 def _is_safe_boolean_status(key: object, value: Any) -> bool:
     return str(key).lower() in SAFE_BOOLEAN_STATUS_KEYS and isinstance(value, bool)
+
+
+def _is_secret_cli_flag(value: str) -> bool:
+    return bool(
+        re.match(
+            r"^--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)$",
+            value,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _stringify(value: Any) -> str:

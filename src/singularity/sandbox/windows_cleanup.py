@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import singularity.sandbox.windows as _windows
+import singularity.sandbox.windows_common as _windows
 
 
 def cleanup_windows_sandbox_assets():
-    if _windows.os.name != "nt":
+    if not _windows._is_windows():
         return _windows.WindowsSandboxCleanupReport(
             status="not_supported",
             requested_operation="cleanup",

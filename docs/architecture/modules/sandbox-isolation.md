@@ -8,6 +8,8 @@
 - src/singularity/sandbox/backends.py
 - src/singularity/sandbox/filesystem.py
 - src/singularity/sandbox/windows.py
+- src/singularity/sandbox/windows_common.py
+- src/singularity/sandbox/windows_platform.py
 - src/singularity/sandbox/windows_identity.py
 - src/singularity/sandbox/windows_acl.py
 - src/singularity/sandbox/windows_firewall.py
@@ -74,7 +76,9 @@ Windows 当前实现是双 principal 的 account-backed OS sandbox：父进程�
 - `src/singularity/sandbox/manager.py`：backend 选择、capability 校验、protected path preflight、生命周期和 trace。
 - `src/singularity/sandbox/backends.py`：默认 backend 注册；Windows 上注册 `WindowsSandboxBackend`，非 Windows 返回空列表。
 - `src/singularity/sandbox/filesystem.py`：workspace projection、protected glob 排除、变化检测和清理辅助。
-- `src/singularity/sandbox/windows.py`：Windows sandbox backend facade，保留 `WindowsSandboxBackend`、`setup_windows_sandbox()` 和既有测试/内部 helper 的 facade 出口；能力入口由下列 Windows 子模块承接。
+- `src/singularity/sandbox/windows.py`：Windows sandbox public backend facade，定义 `WindowsSandboxBackend`，并只显式导出 doctor/setup/cleanup 报告入口和少量子模块 owner 入口；私有 helper 测试直接绑定 owner module 或 `windows_common.py`，不通过 facade 兼容导出。
+- `src/singularity/sandbox/windows_common.py`：Windows sandbox 共享 helper，包含 setup orchestration、doctor aggregation、diagnostic/hash/path helpers、native account/ACL/firewall/runtime 共用 helper；需要调用 owner module 时使用惰性 wrapper，避免 owner module 回导 public facade。
+- `src/singularity/sandbox/windows_platform.py`：单点 Windows 平台判断 `is_windows()`，生产模块和测试通过该 wrapper 模拟平台，不 patch 全局 `os.name`。
 - `src/singularity/sandbox/windows_identity.py`：sandbox account identity、credential 创建/刷新入口。
 - `src/singularity/sandbox/windows_acl.py`：sandbox control dir / probe root ACL 授权入口。
 - `src/singularity/sandbox/windows_firewall.py`：offline firewall rule 状态探测入口。
@@ -94,7 +98,7 @@ Windows setup按`windows_models._SANDBOX_IDENTITIES`逐个调用`_account_exists
 
 `execution.launcher`不再只检查`CreateProcessWithLogonW` / `CreateProcessAsUserW`符号，而是真实报告account logon rights、window station/desktop、executable、working directory、domain/username form和logon flags。Level-1使用flags=0，不加载普通用户profile；runner使用显式受限环境，不依赖profile，从而减少专用账户对普通用户profile与登录体验的副作用。`launcher.status=available`要求真实interactive logon能力、无deny-interactive且代表性working directory对sandbox账户可访问；若`working_directory.account_has_access=false`，doctor必须把`execution.launchers`记为missing，不得同时报告preconditions satisfied。完整setup还要求RDP/network/service/batch deny且对应allow不存在。
 
-`WindowsSandboxRunner.run`把自包含的`windows_runner.py`物化到ACL授权的run root，并从`PreparedSandbox.baseline`读取选中的`sandbox_account`、`credential_target`和`sandbox_role`。Level-1账户进程由`CreateProcessWithLogonW`以`.\<selected-account>`和flags=0启动（不加载profile），再创建restricted low-integrity token、private desktop、Job Object和Level-2实际命令。runner只把`account_sid_hash`和脱敏后的执行证据写入结果；doctor分别将该hash与offline/online预期SID hash比较，阻止回退到管理员当前用户。
+`WindowsSandboxRunner.run`把自包含的`windows_runner.py`物化到ACL授权的run root，并从`PreparedSandbox.baseline`读取选中的`sandbox_account`、`credential_target`和`sandbox_role`。Level-1账户进程由`CreateProcessWithLogonW`以`.\<selected-account>`和flags=0启动（不加载profile），再创建restricted low-integrity token、private desktop、Job Object和Level-2实际命令。runner只把`account_sid_hash`和脱敏后的执行证据写入结果；doctor分别将该hash与offline/online预期SID hash比较，阻止回退到管理员当前用户。Level-1 account runner timeout 后如果未写 result file，`WindowsRunnerResult.timed_out=true` 且 metadata `error_code="account_runner_timeout"`，不得退化成普通 `runner_result_missing`。
 
 `WindowsSandboxBackend.prepare()`先重新检查doctor可用性，再拒绝当前未实现的workspace外`writable_paths`和path-specific`readonly_paths`，之后在machine state的`runs/<sandbox_id>`短路径下创建COW projection，避免长项目路径触发Win32 process current-directory限制。run root通过control目录ACL helper关闭继承，只保留宿主principal的cleanup所需Full Control和本次选中sandbox账户的Modify；另一个sandbox账户不获授权。runner script、runner spec/result、Level-1 stdout/stderr都位于该run root控制面内，因此`CreateProcessWithLogonW`的`lpCurrentDirectory`、脚本读取和结果写入共享同一窄授权边界。仅`workspace/`projection设置低完整性标签，runner spec/result控制面保持medium integrity。protected paths仍通过projection exclude和manager preflight双重拒绝。
 
@@ -131,7 +135,7 @@ PolicyEngine / ApprovalGate
 -> CommandResult.isolation_report / trace / planner evidence / final report
 ```
 
-`sandbox setup --json`（elevated）配置并验证两个专用账户；`run()`按network mode选择单一sandbox账户并授权本次run root，宿主principal只保留cleanup控制权。setup授予Python runtime targets前会先清理旧的base runtime根目录非递归显式ACE，再只恢复明确runtime target的`RX`/`(OI)(CI)RX`；不会递归授权整个base安装、包缓存、用户目录、profile或配置目录。`WindowsSandboxBackend._runtime_env()`把发现到的Python executable、DLL和`Library/bin`等runtime目录前置到child `PATH`，用于修复DLL search path而不是扩大ACL。`sandbox cleanup --json`先删除current/legacy credential、固定firewall group、登录UI值和security attestation，并在删除账户前移除两个current账户对Python runtime targets的全部显式read/execute ACE；随后恢复并删除machine state dir，再移除账户LSA rights与账户，最后输出按accounts/credentials/firewall_rules/login_ui_entries/security_attestations/state_dirs分类的`residual_audit`。不存在的资产是completed/no-op；任一残留使cleanup失败。
+`sandbox setup --json`（elevated）配置并验证两个专用账户；`run()`按network mode选择单一sandbox账户并授权本次run root，宿主principal只保留cleanup控制权。setup授予Python runtime targets前会先清理旧的base runtime根目录非递归显式ACE，再只恢复明确runtime target的`RX`/`(OI)(CI)RX`；不会递归授权整个base安装、包缓存、用户目录、profile或配置目录。`windows_common._runtime_env()`把发现到的Python executable、DLL和`Library/bin`等runtime目录前置到child `PATH`，用于修复DLL search path而不是扩大ACL。`sandbox cleanup --json`先删除current/legacy credential、固定firewall group、登录UI值和security attestation，并在删除账户前移除两个current账户对Python runtime targets的全部显式read/execute ACE；随后恢复并删除machine state dir，再移除账户LSA rights与账户，最后输出按accounts/credentials/firewall_rules/login_ui_entries/security_attestations/state_dirs分类的`residual_audit`。不存在的资产是completed/no-op；任一残留使cleanup失败。
 
 ## 真实任务中的对象流
 
@@ -301,7 +305,7 @@ class WindowsRunnerResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 ```
 
-`WindowsRunnerSpec.operation` 默认为`command`，表示由Level-1账户进程创建restricted low-integrity Level-2 child执行真实命令；`workspace_cleanup`仅用于run-root cleanup，Level-1账户进程只删除当前run root下的`workspace/` projection，不执行用户命令。`WindowsRunnerResult.metadata` 在成功路径写入 `restricted_token`、`low_integrity`、`private_desktop`、`job_object`、`pid`、`account_name`、`account_sid_hash`（Level-1 账户进程自身 token user SID 的 `sha256[:16]`，供 doctor 校验非 admin 回退）；workspace cleanup metadata写`operation="workspace_cleanup"`且`restricted_token=false`、`low_integrity=false`。`run_spec` 异常路径写入 `error_type`，`WindowsSandboxRunner.run` 在 result 文件缺失时写入 `error_code="runner_result_missing"`。`windows_runner.py` 必须保持 stdlib-only，以便被物化到 run root 后由 sandbox account 自包含执行；其本地 redaction regex 与 `RedactionProvider` plain marker profile 同步，覆盖 env secret、Authorization/Cookie header、URL query secret、JSON/CLI secret flag、private key 和常见 token 值，同时保留 `restricted_token` 等安全状态布尔值和 token usage 数值。
+`WindowsRunnerSpec.operation` 默认为`command`，表示由Level-1账户进程创建restricted low-integrity Level-2 child执行真实命令；`workspace_cleanup`仅用于run-root cleanup，Level-1账户进程只删除当前run root下的`workspace/` projection，不执行用户命令。`WindowsRunnerResult.metadata` 在成功路径写入 `restricted_token`、`low_integrity`、`private_desktop`、`job_object`、`pid`、`account_name`、`account_sid_hash`（Level-1 账户进程自身 token user SID 的 `sha256[:16]`，供 doctor 校验非 admin 回退）；workspace cleanup metadata写`operation="workspace_cleanup"`且`restricted_token=false`、`low_integrity=false`。`run_spec` 异常路径写入 `error_type`；`WindowsSandboxRunner.run` 在 result 文件缺失时写入 `error_code="runner_result_missing"`，但如果缺失发生在 account runner timeout 后，写入 `error_code="account_runner_timeout"` 并保持 `timed_out=true`。`windows_runner.py` 必须保持 stdlib-only，以便被物化到 run root 后由 sandbox account 自包含执行；其本地 redaction regex 与 `RedactionProvider` plain marker profile 同步，覆盖 env secret、Authorization/Cookie header、URL query secret、JSON/CLI secret flag、private key 和常见 token 值，同时保留 `restricted_token` 等安全状态布尔值和 token usage 数值。
 
 ### PreparedSandbox（已准备环境）
 
@@ -386,7 +390,7 @@ class SandboxNetworkMode(str, Enum):
 - `default_sandbox_profile()` 生成基础 profile，`CommandExecutor` 再写入会话权限边界、protected globs、network mode 和 resource limits。
 - `windows_models.py` 定义 Windows sandbox schema 常量、offline/online identity 映射和 doctor/setup/cleanup DTO class。
 - `windows_doctor.py` 中的 `probe_windows_sandbox()` 生成 `WindowsSandboxDoctorReport`，`windows.py` 继续导出同名入口。
-- `windows.py` 中的 `setup_windows_sandbox()`生成`WindowsSandboxSetupReport`，在elevated shell下配置两个账户、独立credential、登录UI、LSA rights、受限组成员、双账户state ACL、offline firewall、ACL/runner/network probes，并迁移固定legacy资产。
+- `windows_common.py` 中的 `setup_windows_sandbox()`生成`WindowsSandboxSetupReport`，`windows.py` 继续导出同名入口；该流程在elevated shell下配置两个账户、独立credential、登录UI、LSA rights、受限组成员、双账户state ACL、offline firewall、ACL/runner/network probes，并迁移固定legacy资产。
 - `windows_cleanup.py` 中的 `cleanup_windows_sandbox_assets()`生成`WindowsSandboxCleanupReport`，删除current/legacy账户、credential、firewall group、登录UI值与machine state dir，执行LSA rights清理和最终residual audit；`windows.py` 继续导出同名入口。
 - `WindowsSandboxBackend.prepare()` 生成 `PreparedSandbox` 与 runner spec；`WindowsSandboxBackend.run()` 生成执行型 `SandboxResult`。
 - `WindowsSandboxRunner.run()` / `run_spec()` 生成 `WindowsRunnerResult`。

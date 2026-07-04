@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import singularity.sandbox.windows as _windows
+import singularity.sandbox.windows_common as _windows
 
 
 def _runner_smoke_state(identity):
-    if _windows.os.name != "nt":
+    if not _windows._is_windows():
         return _windows._missing(
             "Windows runner smoke requires Windows.",
             {"runner": "windows_runner.py"},
@@ -54,7 +54,7 @@ def _runner_smoke_state(identity):
         spec = _windows.WindowsRunnerSpec(
             command=[_windows.sys.executable, "-c", "print('sandbox-smoke')"],
             cwd=str(root),
-            env=_windows.WindowsSandboxBackend._runtime_env({}),
+            env=_windows._runtime_env({}),
             timeout_seconds=5,
             max_output_chars=2000,
             network_mode="allowed",

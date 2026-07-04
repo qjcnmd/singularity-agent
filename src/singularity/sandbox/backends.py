@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Protocol
 
 from singularity.sandbox.models import (
@@ -10,6 +9,7 @@ from singularity.sandbox.models import (
     SandboxResult,
 )
 from singularity.sandbox.windows import WindowsSandboxBackend
+from singularity.sandbox.windows_platform import is_windows
 
 
 class SandboxBackend(Protocol):
@@ -30,6 +30,6 @@ class SandboxBackend(Protocol):
 
 
 def default_sandbox_backends() -> list[SandboxBackend]:
-    if os.name != "nt":
+    if not is_windows():
         return []
     return [WindowsSandboxBackend()]

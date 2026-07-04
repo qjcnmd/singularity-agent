@@ -117,6 +117,10 @@ TOKEN_VALUE_RE = re.compile(
 )
 
 
+def _is_windows() -> bool:
+    return getattr(os, "name", "") == "nt"
+
+
 @dataclass(frozen=True)
 class WindowsRunnerSpec:
     command: list[str] | str
@@ -234,7 +238,7 @@ class WindowsSandboxRunner:
         return dest
 
     def run(self, prepared: Any) -> WindowsRunnerResult:
-        if os.name != "nt":
+        if not _is_windows():
             return run_spec(_spec_from_prepared(prepared))
         spec_path = Path(prepared.baseline["runner_spec"])
         result_path = Path(prepared.baseline["runner_result"])
@@ -246,6 +250,8 @@ class WindowsSandboxRunner:
         account_stdout = ""
         account_stderr = ""
         account_process_spawn_time = 0.0
+        account_timed_out = False
+        process: _WindowsChildProcess | None = None
         try:
             runner_script = self._materialize_runner_script(Path(prepared.sandbox_root))
             phase_started = time.perf_counter()
@@ -271,12 +277,14 @@ class WindowsSandboxRunner:
                 wait_timeout = (float(timeout) + 10) if timeout is not None else 40.0
                 process.wait(timeout=wait_timeout)
             except subprocess.TimeoutExpired:
+                account_timed_out = True
                 process.kill()
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=2)
             account_stdout = _process_stdout_text(process)
             account_stderr = _process_stderr_text(process)
         finally:
+            _close_child_resources(process)
             password = ""
         if not result_path.exists():
             now = _now()
@@ -287,11 +295,15 @@ class WindowsSandboxRunner:
                     "Windows sandbox runner did not write a result file."
                     + (f"\n{account_stderr}" if account_stderr else "")
                 ),
-                timed_out=False,
+                timed_out=account_timed_out,
                 started_at=now,
                 ended_at=now,
                 duration_ms=0,
-                metadata={"error_code": "runner_result_missing"},
+                metadata={
+                    "error_code": "account_runner_timeout"
+                    if account_timed_out
+                    else "runner_result_missing"
+                },
             )
         phase_started = time.perf_counter()
         result = WindowsRunnerResult.from_dict(json.loads(result_path.read_text(encoding="utf-8")))
@@ -381,6 +393,8 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
             network_denied_verified=False,
             metadata={"error_type": type(exc).__name__, "timing": timing},
         )
+    finally:
+        _close_child_resources(process)
 
 
 def _run_workspace_cleanup(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
@@ -451,7 +465,7 @@ def _clear_cleanup_attributes(target: Path) -> None:
 
 
 def _start_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildProcess | subprocess.Popen[bytes]:
-    if os.name == "nt":
+    if _is_windows():
         return _start_windows_restricted_child(spec)
     if isinstance(spec.command, list):
         command: str | list[str] = spec.command
@@ -472,7 +486,7 @@ def _start_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildProcess | s
 
 
 def _assign_to_kill_on_close_job(process_handle: int) -> tuple[int | None, bool]:
-    if os.name != "nt":
+    if not _is_windows():
         return None, False
     kernel32 = _kernel32()
     job = kernel32.CreateJobObjectW(None, None)
@@ -502,10 +516,16 @@ def _terminate_child(process: _WindowsChildProcess | subprocess.Popen[bytes]) ->
     return False
 
 
+def _close_child_resources(process: Any) -> None:
+    close_handles = getattr(process, "_close_handles", None)
+    if callable(close_handles):
+        close_handles()
+
+
 def _verify_network_denied(spec: WindowsRunnerSpec) -> bool:
     if spec.network_mode != "denied":
         return True
-    if os.name == "nt":
+    if _is_windows():
         endpoints = json.dumps(NETWORK_PROBE_ENDPOINTS)
         probe_spec = WindowsRunnerSpec(
             command=[
@@ -542,6 +562,8 @@ def _verify_network_denied(spec: WindowsRunnerSpec) -> bool:
             probe.wait(timeout=1)
         except subprocess.TimeoutExpired:
             _terminate_child(probe)
+        finally:
+            _close_child_resources(probe)
         return probe.returncode == 0
     code = (
         "import socket; "
@@ -571,9 +593,11 @@ def _child_output(
 ) -> tuple[str, str, bool]:
     if process is None:
         return "", "", False
-    if isinstance(process, _WindowsChildProcess):
-        stdout = process.stdout_text()
-        stderr = process.stderr_text()
+    stdout_reader = getattr(process, "stdout_text", None)
+    stderr_reader = getattr(process, "stderr_text", None)
+    if callable(stdout_reader) and callable(stderr_reader):
+        stdout = str(stdout_reader())
+        stderr = str(stderr_reader())
     else:
         try:
             raw_stdout, raw_stderr = process.communicate(timeout=0.1)
@@ -755,6 +779,9 @@ def _start_windows_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildPro
     desktop_name = f"SingularitySandbox-{os.getpid()}-{time.time_ns()}"
     desktop_handle = None
     job_handle = None
+    process_handle = None
+    thread_handle = None
+    child_owns_process_handles = False
     try:
         with ExitStack() as stream_stack:
             stdout_file = stream_stack.enter_context(stdout_path.open("w+b"))
@@ -790,6 +817,8 @@ def _start_windows_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildPro
             )
             if not ok:
                 raise _last_winerror("CreateProcessAsUserW")
+            process_handle = process_info.hProcess
+            thread_handle = process_info.hThread
             job_handle, job_assigned = _assign_to_kill_on_close_job(process_info.hProcess)
             if not job_assigned:
                 raise OSError("AssignProcessToJobObject failed")
@@ -807,9 +836,13 @@ def _start_windows_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildPro
                 stderr_path=stderr_path,
                 streams=streams,
             )
+            child_owns_process_handles = True
             stream_stack.pop_all()
         return child
     except Exception:
+        if not child_owns_process_handles:
+            _close_handle(thread_handle)
+            _close_handle(process_handle)
         if job_handle:
             _close_handle(job_handle)
         if desktop_handle:
@@ -1037,7 +1070,7 @@ def _supports_private_desktop() -> bool:
 
 
 def _has_symbol(library: str, symbol: str) -> bool:
-    if os.name != "nt":
+    if not _is_windows():
         return False
     try:
         return hasattr(ctypes.WinDLL(library, use_last_error=True), symbol)
@@ -1059,7 +1092,7 @@ def _current_process_identity() -> tuple[str, str]:
     the admin current user. Called inside the account-launched runner so the raw
     SID never crosses the process boundary; only its hash is written to disk.
     """
-    if os.name != "nt":
+    if not _is_windows():
         return "", ""
     advapi32 = _advapi32()
     token = wintypes.HANDLE()
@@ -1370,7 +1403,7 @@ def main(argv: list[str] | None = None) -> int:
     # with a restricted low-integrity token) does not pop up "application was
     # unable to start correctly" dialogs when a tool's DLLs fail to initialize
     # under the restricted token. The error mode is inherited by the child.
-    if os.name == "nt":
+    if _is_windows():
         _kernel32().SetErrorMode(CHILD_ERROR_MODE)
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", required=True)

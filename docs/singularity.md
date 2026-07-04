@@ -1737,6 +1737,7 @@
   E1. sandbox doctor / setup / cleanup（CLI 能力诊断，不进入 AgentLoop）
     python -m singularity.cli sandbox doctor --json
     → WindowsSandboxBackend.doctor()
+    → windows.py public backend facade / windows_common shared helpers
     → windows_doctor.probe_windows_sandbox()
     → offline / online 双账户检查：
       1) account / credential / login UI / logon rights / group membership
@@ -1758,6 +1759,7 @@
 
     python -m singularity.cli sandbox setup --json
     → setup_windows_sandbox()
+    → windows_common.setup_windows_sandbox()
     → windows_identity._ensure_sandbox_identity()
     → windows_acl._apply_sandbox_control_dir_acl()
     → windows_firewall._network_state()
@@ -1777,6 +1779,7 @@
     CommandExecutor.run()
     → SandboxManager.run()
     → WindowsSandboxBackend.run(prepared)
+    → 平台判断统一经 windows_platform.is_windows()，测试不 patch 全局 os.name
     → 复用 prepare 阶段写入的 readiness snapshot；
       snapshot 缺失、过期、unavailable 或网络隔离证据不足时再执行
       uncached enforcement probe
@@ -1786,6 +1789,10 @@
          当前角色 ready 时可忽略另一账户瞬时 network_probe 失败。
       否则任一 setup、launcher、ACL、runner smoke、network filter
       或其他 enforcement blocker 仍 fail closed → BACKEND_UNAVAILABLE。
+    → account runner timeout 且未写 result file 时：
+         WindowsRunnerResult.timed_out=true
+         metadata.error_code="account_runner_timeout"
+         不归类为普通 runner_result_missing。
     → WindowsSandboxBackend.cleanup(prepared)
       1) 复用 PreparedSandbox.baseline.sandbox_account / credential_target
          启动同一 sandbox 账户的 Level-1 runner；

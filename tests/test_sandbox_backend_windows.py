@@ -12,7 +12,9 @@ import pytest
 from typer.testing import CliRunner
 
 import singularity.sandbox as sandbox
-import singularity.sandbox.windows as windows
+import singularity.sandbox.windows as windows_backend
+import singularity.sandbox.windows_common as windows
+import singularity.sandbox.windows_runner as windows_runner
 from singularity.cli import app
 from singularity.sandbox import (
     PreparedSandbox,
@@ -227,7 +229,7 @@ def test_windows_setup_rejects_oversized_account_name_before_create(
         attempted.append(name)
         raise AssertionError("setup must reject oversized account names before NetUserAdd")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_create_sandbox_account", fail_create)
     identity = windows._WindowsSandboxIdentity(
         role="offline",
@@ -258,7 +260,7 @@ def test_windows_cleanup_deletes_oversized_legacy_account_without_create_name_va
             deleted.append(name)
             return windows.NERR_SUCCESS
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_account_exists", lambda _name: True)
     monkeypatch.setattr(windows, "_netapi32", lambda: FakeNetApi())
 
@@ -277,7 +279,7 @@ def test_windows_setup_reports_netuseradd_2202_diagnostics(
             parm_err._obj.value = 0
             return 2202
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_account_exists", lambda _name: False)
     monkeypatch.setattr(windows, "_netapi32", lambda: FakeNetApi())
 
@@ -305,7 +307,7 @@ def test_windows_doctor_and_setup_message_report_legacy_artifacts(
         },
     )
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: legacy)
     monkeypatch.setattr(windows, "_primitive", lambda *_args: ready)
     monkeypatch.setattr(windows, "_command_state", lambda *_args: ready)
@@ -360,7 +362,7 @@ def test_windows_doctor_recommended_action_reports_runtime_diagnostics_precisely
 def test_windows_legacy_artifact_diagnostics_report_old_account_credential_and_firewall(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_account_exists",
@@ -397,7 +399,7 @@ def test_windows_legacy_artifact_diagnostics_report_old_account_credential_and_f
 def test_windows_cleanup_requires_elevation_before_destructive_actions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_is_elevated", lambda: False)
     for name in (
         "_delete_sandbox_account",
@@ -431,7 +433,7 @@ def test_windows_cleanup_removes_current_and_legacy_assets_idempotently(
         calls.append((kind, target))
         return windows._OperationResult(True, "removed", {"changed": target == windows.LEGACY_SANDBOX_ACCOUNT})
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_is_elevated", lambda: True)
     monkeypatch.setattr(
         windows,
@@ -517,7 +519,7 @@ def test_windows_cleanup_fails_closed_when_residual_audit_finds_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     no_change = windows._OperationResult(True, "not_present", {"changed": False})
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_is_elevated", lambda: True)
     monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
     monkeypatch.setattr(windows, "_delete_credential", lambda _target: no_change)
@@ -564,7 +566,7 @@ def test_windows_state_dir_cleanup_repairs_acl_integrity_and_attributes_before_d
         commands.append(command)
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
     monkeypatch.setattr(windows.shutil, "which", lambda name: f"{name}.exe")
     monkeypatch.setattr(windows, "_run_command", fake_run)
@@ -594,7 +596,7 @@ def test_windows_run_root_cleanup_repairs_child_acl_before_delete(
         commands.append(command)
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
     monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
     monkeypatch.setattr(windows.shutil, "which", lambda name: f"{name}.exe")
@@ -625,7 +627,7 @@ def test_windows_run_root_cleanup_fails_closed_without_host_sid(
     run_root = state_dir / "runs" / "sandbox_abc123"
     run_root.mkdir(parents=True)
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
     monkeypatch.setattr(windows, "_current_process_sid", lambda: "")
     monkeypatch.setattr(windows.shutil, "which", lambda name: f"{name}.exe")
@@ -644,7 +646,7 @@ def test_windows_run_root_cleanup_refuses_runs_directory(
     runs_dir = state_dir / "runs"
     runs_dir.mkdir(parents=True)
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
 
     result = windows._normalize_run_root_for_cleanup(runs_dir)
@@ -671,7 +673,7 @@ def test_windows_run_root_cleanup_treats_icacls_partial_failure_as_failed(
             )
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
     monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
     monkeypatch.setattr(windows.shutil, "which", lambda name: f"{name}.exe")
@@ -693,7 +695,7 @@ def test_login_ui_visibility_state_requires_hidden_userlist_entry(
         calls.append(command)
         return subprocess.CompletedProcess(["powershell"], 0, "", "")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_run_powershell", fake_powershell)
 
     state = windows._login_ui_visibility_state(windows.OFFLINE_SANDBOX_ACCOUNT)
@@ -721,7 +723,7 @@ def test_hide_account_from_login_ui_preserves_existing_userlist_key(
         calls.append(command)
         return subprocess.CompletedProcess(["powershell"], 0, "", "")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_login_ui_visibility_state", lambda _account: next(states))
     monkeypatch.setattr(windows, "_run_powershell", fake_powershell)
 
@@ -826,7 +828,7 @@ def test_security_attestation_requires_matching_sid_hashes_and_protected_acl(
         },
         "acl_protected": True,
     }
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_run_powershell",
@@ -879,7 +881,7 @@ def test_legacy_cleanup_skips_acl_removal_for_absent_legacy_accounts(
 def test_credential_state_redacts_target_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_credential_exists", lambda _target: True)
 
     identity = windows._sandbox_identity_for_mode(sandbox.SandboxNetworkMode.DENIED)
@@ -895,7 +897,7 @@ def test_credential_state_redacts_target_name(
 def test_network_state_redacts_firewall_rule_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_run_powershell",
@@ -975,7 +977,7 @@ def test_windows_setup_requires_elevation_before_system_mutation(
         "_apply_account_acl",
     ]
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_is_elevated", lambda: False)
     for name in mutations:
         monkeypatch.setattr(
@@ -1022,7 +1024,7 @@ def test_windows_setup_elevated_provisions_and_verifies_both_accounts(
             calls.append(("firewall", "offline"))
         return subprocess.CompletedProcess(["powershell"], 0, "", "")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_is_elevated", lambda: True)
     monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
     monkeypatch.setattr(windows, "_ensure_sandbox_identity", ensure_identity)
@@ -1107,7 +1109,7 @@ def test_windows_setup_failed_probe_steps_include_structured_details(
     )
     ready = sandbox.WindowsCapabilityState("available", True, "ready", {})
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_is_elevated", lambda: True)
     monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
     monkeypatch.setattr(
@@ -1225,7 +1227,7 @@ def test_windows_backend_uses_short_machine_state_run_root(
     tmp_path: Path,
 ) -> None:
     state_dir = tmp_path / "machine-state"
-    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(windows_backend, "_windows_state_dir_path", lambda: state_dir)
     backend = sandbox.WindowsSandboxBackend(
         acl_applier=lambda _path, _account: None,
         doctor_provider=sandbox.WindowsSandboxDoctorReport.ready_for_tests,
@@ -1282,11 +1284,14 @@ def test_windows_backend_applies_run_root_acl_before_workspace_copy(
             grant_workspace_file_existed.append((run_root / "workspace" / "copied.txt").exists())
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
     monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
     monkeypatch.setattr(windows.shutil, "which", lambda name, **_kwargs: f"{name}.exe")
     monkeypatch.setattr(windows, "_run_command", fake_run_command)
+    monkeypatch.setattr(windows_backend, "_is_windows", lambda: True)
+    monkeypatch.setattr(windows_backend.shutil, "which", lambda name, **_kwargs: f"{name}.exe")
+    monkeypatch.setattr(windows_backend, "_run_command", fake_run_command)
     backend = sandbox.WindowsSandboxBackend(
         doctor_provider=sandbox.WindowsSandboxDoctorReport.ready_for_tests,
         run_root_provider=lambda request: run_root,
@@ -1319,7 +1324,7 @@ def test_windows_backend_cleans_stale_run_root_before_acl_grant(
             stale_file_existed_at_grant.append(stale_file.exists())
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
     monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
     monkeypatch.setattr(windows.shutil, "which", lambda name, **_kwargs: f"{name}.exe")
@@ -1342,9 +1347,9 @@ def test_windows_backend_cleanup_uses_sandbox_account_preclean_before_host_delet
     runner = _FakeRunner(stdout="cleanup ok\n")
     cleaned: list[Path] = []
 
-    monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
+    monkeypatch.setattr(windows_backend, "_windows_state_dir_path", lambda: state_dir)
     monkeypatch.setattr(
-        windows,
+        windows_backend,
         "_normalize_run_root_for_cleanup",
         lambda path: windows._OperationResult(True, "normalized", {"path": str(path)}),
     )
@@ -1459,7 +1464,37 @@ def test_windows_backend_records_safe_lifecycle_timing(tmp_path: Path) -> None:
 
 
 @pytest.mark.security
-def test_windows_runner_records_spawn_runtime_and_output_timing(tmp_path: Path) -> None:
+def test_windows_runner_records_spawn_runtime_and_output_timing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started_specs: list[sandbox.WindowsRunnerSpec] = []
+
+    class FakeChild:
+        returncode = 0
+        job_assigned = True
+        private_desktop = True
+        pid = 12345
+
+        def poll(self) -> int | None:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def stdout_text(self) -> str:
+            return "ok\n"
+
+        def stderr_text(self) -> str:
+            return ""
+
+    def fake_start_restricted_child(spec: sandbox.WindowsRunnerSpec) -> FakeChild:
+        started_specs.append(spec)
+        return FakeChild()
+
+    monkeypatch.setattr(windows_runner, "_start_restricted_child", fake_start_restricted_child)
+    monkeypatch.setattr(windows_runner, "_verify_network_denied", lambda _spec: True)
+    monkeypatch.setattr(windows_runner, "_current_process_identity", lambda: ("sandbox", "S-1-5-21"))
     spec = sandbox.WindowsRunnerSpec(
         command=[sys.executable, "-c", "print('ok')"],
         cwd=str(tmp_path),
@@ -1470,7 +1505,9 @@ def test_windows_runner_records_spawn_runtime_and_output_timing(tmp_path: Path) 
 
     result = run_spec(spec)
 
+    assert started_specs == [spec]
     assert result.exit_code == 0
+    assert result.stdout == "ok\n"
     assert result.metadata["timing"]["process_spawn_time_seconds"] >= 0
     assert result.metadata["timing"]["command_runtime_time_seconds"] >= 0
     assert result.metadata["timing"]["output_collection_time_seconds"] >= 0
@@ -1789,7 +1826,7 @@ def test_runner_runtime_access_grants_only_read_execute_to_python_roots(
     scripts.mkdir(parents=True)
     dlls.mkdir(parents=True)
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows.sys, "prefix", str(venv_root))
     monkeypatch.setattr(windows.sys, "base_prefix", str(base_root))
     monkeypatch.setattr(
@@ -1875,7 +1912,7 @@ def test_runner_runtime_access_removes_stale_recursive_base_ace_before_minimal_g
     libssl.parent.mkdir(parents=True)
     libssl.write_bytes(b"")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_runner_runtime_acl_targets",
@@ -1918,7 +1955,7 @@ def test_runner_runtime_cleanup_removes_all_explicit_runtime_aces(
     libssl.parent.mkdir(parents=True)
     libssl.write_bytes(b"")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_runner_runtime_acl_targets",
@@ -2025,7 +2062,7 @@ def test_runtime_env_prepends_discovered_python_dll_directories(
     monkeypatch.setitem(windows.os.environ, "TEMP", "C:\\Temp")
     monkeypatch.setitem(windows.os.environ, "TMP", "C:\\Temp")
 
-    env = windows.WindowsSandboxBackend._runtime_env({"PATH": "C:\\Existing"})
+    env = windows._runtime_env({"PATH": "C:\\Existing"})
 
     path_entries = env["PATH"].split(windows.os.pathsep)
     assert path_entries[:3] == [str(scripts), str(dlls), str(library_bin)]
@@ -2039,7 +2076,7 @@ def test_run_root_acl_removes_inherited_sandbox_accounts_and_preserves_host_clea
     tmp_path: Path,
 ) -> None:
     commands: list[list[str]] = []
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: tmp_path)
     monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
     monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
@@ -2074,7 +2111,7 @@ def test_sandbox_control_dir_acl_refuses_targets_outside_state_dir(
     outside_dir = tmp_path / "repo"
     outside_dir.mkdir(parents=True)
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
     monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
     monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
@@ -2101,7 +2138,7 @@ def test_sandbox_control_dir_acl_success_uses_compact_audit(
     target = state_dir / "runs" / "sandbox_123"
     target.mkdir(parents=True)
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
     monkeypatch.setattr(windows, "_current_process_sid", lambda: "S-1-5-21-host")
     monkeypatch.setattr(windows.shutil, "which", lambda _name: "icacls.exe")
@@ -2196,7 +2233,7 @@ def test_online_network_probe_requires_real_connectivity_from_online_account(
                 metadata={"account_sid_hash": "hash"},
             )
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_host_network_baseline_state", lambda: ready)
     monkeypatch.setattr(windows, "_windows_state_dir", lambda: tmp_path)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: tmp_path)
@@ -2225,7 +2262,7 @@ def test_acl_probe_mkdir_oserror_reports_structured_diagnostics(
 ) -> None:
     probe_root = Path("C:/Users/Lenovo/AppData/Local/Singularity/windows-sandbox/acl-probe")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
     monkeypatch.setattr(
         windows,
@@ -2267,7 +2304,7 @@ def test_runner_smoke_oserror_reports_structured_diagnostics(
 ) -> None:
     probe_root = Path("C:/ProgramData/Singularity/windows-sandbox/runner-smoke")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_runner_state",
@@ -2316,7 +2353,7 @@ def test_python_runtime_smoke_reports_ssl_environment_blocker_diagnostics(
     ready = sandbox.WindowsCapabilityState("available", True, "ready", {})
     runtime_root = Path("C:/ProgramData/Singularity/windows-sandbox/python-runtime-smoke")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
     monkeypatch.setattr(windows, "_state_dir_state", lambda: ready)
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
@@ -2448,7 +2485,7 @@ def test_python_runtime_smoke_applies_acl_to_role_directories_after_creation(
 ) -> None:
     acl_paths: list[Path] = []
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir", lambda: tmp_path)
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
     monkeypatch.setattr(
@@ -2490,7 +2527,7 @@ def test_python_runtime_smoke_acl_failure_reports_failure_type(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir", lambda: tmp_path)
     monkeypatch.setattr(
         windows,
@@ -2764,7 +2801,7 @@ def test_network_probe_oserror_reports_structured_diagnostics(
 ) -> None:
     probe_root = Path("C:/ProgramData/Singularity/windows-sandbox/network-smoke")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_network_state",
@@ -2810,7 +2847,7 @@ def test_runner_smoke_create_process_access_denied_classifies_working_directory(
 ) -> None:
     probe_root = Path("C:/ProgramData/Singularity/windows-sandbox/runner-smoke")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_runner_state",
@@ -2856,7 +2893,7 @@ def test_windows_setup_state_dir_unwritable_fails_closed_with_hash_diagnostics(
 ) -> None:
     state_root = Path("C:/ProgramData/Singularity/windows-sandbox")
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows.os.environ, "get", lambda name, default=None: "C:\\ProgramData" if name == "PROGRAMDATA" else default)
 
     def fail_mkdir(self: Path, *args, **kwargs) -> None:
@@ -2885,7 +2922,7 @@ def test_windows_state_dir_probe_does_not_recreate_missing_cleanup_target(
     state_dir = tmp_path / "Singularity" / "windows-sandbox"
     mkdir_calls: list[Path] = []
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_windows_state_dir_path", lambda: state_dir)
 
     original_mkdir = Path.mkdir
@@ -3112,7 +3149,7 @@ def test_windows_sandbox_runner_removes_account_runner_logs(
         },
     )()
 
-    monkeypatch.setattr(sandbox.windows_runner.os, "name", "nt")
+    monkeypatch.setattr(sandbox.windows_runner, "_is_windows", lambda: True)
     monkeypatch.setattr(
         sandbox.windows_runner,
         "_read_generic_credential",
@@ -3129,6 +3166,68 @@ def test_windows_sandbox_runner_removes_account_runner_logs(
     assert runner_result.exit_code == 0
     assert not stdout_path.exists()
     assert not stderr_path.exists()
+
+
+def test_windows_sandbox_runner_timeout_without_result_keeps_timeout_taxonomy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    result_path = run_root / "runner-result.json"
+
+    class TimeoutAccountProcess:
+        def __init__(self) -> None:
+            self.args = ["python"]
+            self.returncode = None
+            self.killed = False
+
+        def wait(self, timeout=None):
+            if not self.killed:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            self.returncode = 1
+            return 1
+
+        def kill(self):
+            self.killed = True
+
+        def stdout_text(self):
+            return ""
+
+        def stderr_text(self):
+            return ""
+
+    prepared = type(
+        "Prepared",
+        (),
+        {
+            "baseline": {"runner_spec": str(run_root / "runner-spec.json"), "runner_result": str(result_path)},
+            "sandbox_root": run_root,
+            "request": type(
+                "Request",
+                (),
+                {"profile": type("Profile", (), {"resources": type("Resources", (), {"timeout_seconds": 1})()})()},
+            )(),
+        },
+    )()
+
+    monkeypatch.setattr(sandbox.windows_runner, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        sandbox.windows_runner,
+        "_read_generic_credential",
+        lambda _target: (windows.OFFLINE_SANDBOX_ACCOUNT, "secret"),
+    )
+    monkeypatch.setattr(
+        sandbox.windows_runner,
+        "_start_account_process",
+        lambda *args, **kwargs: TimeoutAccountProcess(),
+    )
+
+    runner_result = sandbox.WindowsSandboxRunner().run(prepared)
+
+    assert runner_result.timed_out is True
+    assert runner_result.metadata["error_code"] == "account_runner_timeout"
+    assert "did not write a result file" in runner_result.stderr
 
 
 def test_windows_runner_workspace_cleanup_runs_in_account_process_without_restricted_child(
@@ -3186,7 +3285,7 @@ def test_account_logon_rights_view_classifies_rights() -> None:
 def test_windows_doctor_launcher_reports_logon_rights_and_blocks_when_right_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
     monkeypatch.setattr(
         windows,
@@ -3230,7 +3329,7 @@ def test_windows_doctor_launcher_reports_logon_rights_and_blocks_when_right_miss
 def test_windows_doctor_launcher_available_when_interactive_right_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
     monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "")
 
@@ -3249,7 +3348,7 @@ def test_windows_doctor_launcher_available_when_interactive_right_present(
 def test_windows_doctor_launcher_blocks_when_working_directory_inaccessible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
     monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "")
 
@@ -3271,7 +3370,7 @@ def test_windows_doctor_launcher_blocks_when_working_directory_inaccessible(
 def test_windows_doctor_launcher_blocks_when_deny_interactive_right_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
     monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "")
 
@@ -3296,7 +3395,7 @@ def test_windows_doctor_launcher_defers_when_rights_unverifiable_non_elevated(
     # LsaEnumerateAccountRights may return STATUS_ACCESS_DENIED (0xC0000022)
     # for an account that DOES hold rights. launcher must defer to runner_smoke
     # rather than falsely block the backend after the right was granted.
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_has_windows_symbols", lambda *_args: True)
     monkeypatch.setattr(windows, "_executable_acl_summary", lambda: "")
 
@@ -3317,7 +3416,7 @@ def test_windows_doctor_blocks_launcher_contradiction_when_working_directory_ina
 ) -> None:
     ready = sandbox.WindowsCapabilityState("available", True, "ready", {})
 
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_legacy_artifact_diagnostics", lambda: ())
     monkeypatch.setattr(windows, "_state_dir_state", lambda: ready)
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
@@ -3371,7 +3470,7 @@ def test_runner_smoke_blocks_when_account_identity_mismatches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_runner_state",
@@ -3427,7 +3526,7 @@ def test_runner_smoke_passes_when_account_identity_matches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows,
         "_runner_state",
@@ -3493,7 +3592,7 @@ def _hardened_logon_rights() -> dict[str, object]:
 
 
 def _patch_identity_security_common(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(windows.os, "name", "nt", raising=False)
+    monkeypatch.setattr(windows, "_is_windows", lambda: True)
     monkeypatch.setattr(windows, "_account_sid", lambda _name: "S-1-5-21-123")
     monkeypatch.setattr(
         windows,
@@ -3635,6 +3734,156 @@ def test_windows_child_process_close_handles_is_idempotent() -> None:
     # Second call must be a no-op (the _closed guard short-circuits).
     child._close_handles()
     assert child._closed is True
+
+
+def test_run_spec_closes_windows_child_handles_after_timeout_wait_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import singularity.sandbox.windows_runner as runner
+
+    closed: list[str] = []
+
+    class TimeoutChild:
+        pid = 123
+        returncode = None
+        job_assigned = True
+        private_desktop = True
+
+        def __init__(self) -> None:
+            self.args = ["python"]
+            self._closed = False
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            closed.append("kill")
+
+        def wait(self, timeout: int | float | None = None) -> int:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+        def stdout_text(self) -> str:
+            return ""
+
+        def stderr_text(self) -> str:
+            return ""
+
+        def _close_handles(self) -> None:
+            if not self._closed:
+                closed.append("handles")
+                self._closed = True
+
+        def _close_streams(self) -> None:
+            closed.append("streams")
+
+    child = TimeoutChild()
+    monkeypatch.setattr(runner, "_start_restricted_child", lambda _spec: child)
+    monkeypatch.setattr(runner, "_verify_network_denied", lambda _spec: True)
+    monkeypatch.setattr(runner, "_current_process_identity", lambda: ("", ""))
+
+    result = runner.run_spec(
+        runner.WindowsRunnerSpec(
+            command=[sys.executable],
+            cwd=str(tmp_path),
+            env={},
+            timeout_seconds=0,
+        )
+    )
+
+    assert result.timed_out is True
+    assert "kill" in closed
+    assert "handles" in closed
+
+
+def _patch_windows_restricted_child_api(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    assign_job: bool = True,
+    resume_result: int = 1,
+) -> list[int]:
+    import singularity.sandbox.windows_runner as runner
+
+    closed: list[int] = []
+
+    class FakeAdvapi:
+        def CreateProcessAsUserW(self, *args):
+            process_info = args[-1]._obj
+            process_info.hProcess = 100
+            process_info.hThread = 200
+            process_info.dwProcessId = 300
+            return True
+
+    class FakeKernel:
+        def ResumeThread(self, _thread_handle):
+            return resume_result
+
+    monkeypatch.setattr(runner, "_create_restricted_token", lambda: 10)
+    monkeypatch.setattr(runner, "_create_private_desktop", lambda _name: 20)
+    monkeypatch.setattr(runner, "_advapi32", lambda: FakeAdvapi())
+    monkeypatch.setattr(runner, "_kernel32", lambda: FakeKernel())
+    monkeypatch.setattr(
+        runner,
+        "_assign_to_kill_on_close_job",
+        lambda _process_handle: (30 if assign_job else None, assign_job),
+    )
+    monkeypatch.setattr(runner, "_close_handle", lambda handle: closed.append(handle))
+    monkeypatch.setattr(runner, "_last_winerror", lambda operation: OSError(f"{operation} failed"))
+    monkeypatch.setattr(runner, "_windows_command_line", lambda command: "python")
+    monkeypatch.setattr(runner, "_windows_env_block", lambda env: "\0\0")
+    monkeypatch.setattr(runner, "_windows_extended_path", lambda path: str(path))
+    monkeypatch.setattr(runner.os, "set_handle_inheritable", lambda *_args: None)
+    monkeypatch.setitem(sys.modules, "msvcrt", type("FakeMsvcrt", (), {"get_osfhandle": staticmethod(lambda fileno: fileno)}))
+    monkeypatch.setattr(
+        runner,
+        "_user32",
+        lambda: type("FakeUser32", (), {"CloseDesktop": staticmethod(lambda _handle: True)})(),
+    )
+
+    cwd = tmp_path / "restricted-child"
+    cwd.mkdir()
+    return closed
+
+
+def test_start_windows_restricted_child_closes_process_handles_when_job_assignment_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import singularity.sandbox.windows_runner as runner
+
+    closed = _patch_windows_restricted_child_api(monkeypatch, tmp_path, assign_job=False)
+    spec = runner.WindowsRunnerSpec(command=[sys.executable], cwd=str(tmp_path), env={})
+
+    with pytest.raises(OSError, match="AssignProcessToJobObject failed"):
+        runner._start_windows_restricted_child(spec)
+
+    assert closed.count(100) == 1
+    assert closed.count(200) == 1
+    assert closed.count(10) == 1
+
+
+def test_start_windows_restricted_child_closes_process_handles_when_resume_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import singularity.sandbox.windows_runner as runner
+
+    closed = _patch_windows_restricted_child_api(
+        monkeypatch,
+        tmp_path,
+        assign_job=True,
+        resume_result=0xFFFFFFFF,
+    )
+    spec = runner.WindowsRunnerSpec(command=[sys.executable], cwd=str(tmp_path), env={})
+
+    with pytest.raises(OSError, match="ResumeThread failed"):
+        runner._start_windows_restricted_child(spec)
+
+    assert closed.count(100) == 1
+    assert closed.count(200) == 1
+    assert closed.count(30) == 1
+    assert closed.count(10) == 1
 
 
 def test_windows_extended_path_supports_long_local_and_unc_working_directories() -> None:
