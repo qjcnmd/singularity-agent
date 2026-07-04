@@ -789,7 +789,7 @@ def _start_windows_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildPro
             stdin_file = stream_stack.enter_context(Path(os.devnull).open("rb"))
             streams: list[BinaryIO] = [stdout_file, stderr_file, stdin_file]
             for stream in streams:
-                os.set_handle_inheritable(msvcrt.get_osfhandle(stream.fileno()), True)
+                _set_handle_inheritable(stream)
             desktop_handle = _create_private_desktop(desktop_name)
             startup = STARTUPINFO()
             startup.cb = ctypes.sizeof(STARTUPINFO)
@@ -928,12 +928,20 @@ def _windows_env_block(env: dict[str, str]) -> str:
     return "\0".join(pairs) + "\0\0"
 
 
+def _set_handle_inheritable(stream: BinaryIO) -> None:
+    import msvcrt
+
+    os.set_handle_inheritable(msvcrt.get_osfhandle(stream.fileno()), True)
+
+
 def _windows_extended_path(path: Path) -> str:
     value = str(path)
     if value.startswith("\\\\?\\"):
         return value
     if value.startswith("\\\\"):
         return "\\\\?\\UNC\\" + value[2:]
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        return "\\\\?\\" + value
     if path.is_absolute():
         return "\\\\?\\" + value
     return value
@@ -992,7 +1000,7 @@ def _start_account_process(
             stdin_file = stream_stack.enter_context(Path(os.devnull).open("rb"))
             streams: list[BinaryIO] = [stdout_file, stderr_file, stdin_file]
             for stream in streams:
-                os.set_handle_inheritable(msvcrt.get_osfhandle(stream.fileno()), True)
+                _set_handle_inheritable(stream)
             startup = STARTUPINFO()
             startup.cb = ctypes.sizeof(STARTUPINFO)
             startup.dwFlags = STARTF_USESTDHANDLES

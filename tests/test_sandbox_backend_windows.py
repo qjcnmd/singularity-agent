@@ -7,14 +7,21 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from typer.testing import CliRunner
 
 import singularity.sandbox as sandbox
 import singularity.sandbox.windows as windows_backend
-import singularity.sandbox.windows_common as windows
+import singularity.sandbox.windows_acl as windows_acl
+import singularity.sandbox.windows_cleanup as windows_cleanup
+import singularity.sandbox.windows_common as windows_common
+import singularity.sandbox.windows_doctor as windows_doctor
+import singularity.sandbox.windows_firewall as windows_firewall
+import singularity.sandbox.windows_identity as windows_identity
 import singularity.sandbox.windows_runner as windows_runner
+import singularity.sandbox.windows_runtime as windows_runtime
 from singularity.cli import app
 from singularity.sandbox import (
     PreparedSandbox,
@@ -24,6 +31,62 @@ from singularity.sandbox import (
     SandboxStatus,
 )
 from singularity.sandbox.windows_runner import run_spec
+
+
+class _WindowsTestFacade:
+    _owners: ClassVar[dict[str, object]] = {
+        "_legacy_artifact_diagnostics": windows_doctor,
+        "_security_attestation_exists": windows_doctor,
+        "_login_ui_entry_exists": windows_doctor,
+        "_credential_state": windows_doctor,
+        "_group_membership_state": windows_doctor,
+        "_login_ui_visibility_state": windows_doctor,
+        "_logon_rights_state": windows_doctor,
+        "_runner_state": windows_doctor,
+        "_state_from_bool": windows_doctor,
+    }
+    _modules: ClassVar[tuple[object, ...]] = (
+        windows_common,
+        windows_identity,
+        windows_acl,
+        windows_firewall,
+        windows_runtime,
+        windows_cleanup,
+        windows_doctor,
+    )
+    _runner_modules: ClassVar[tuple[object, ...]] = (
+        windows_common,
+        windows_firewall,
+        windows_runtime,
+    )
+
+    def __getattr__(self, name: str):
+        owner = self._owners.get(name)
+        if owner is not None:
+            return getattr(owner, name)
+        for module in self._modules:
+            if hasattr(module, name):
+                return getattr(module, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value):
+        owner = self._owners.get(name)
+        if owner is not None:
+            setattr(owner, name, value)
+            return
+        targets = [
+            module
+            for module in (self._runner_modules if name == "WindowsSandboxRunner" else self._modules)
+            if hasattr(module, name)
+        ]
+        if not targets:
+            object.__setattr__(self, name, value)
+            return
+        for module in targets:
+            setattr(module, name, value)
+
+
+windows = _WindowsTestFacade()
 
 
 def _request(tmp_path: Path) -> SandboxRequest:
@@ -3833,7 +3896,7 @@ def _patch_windows_restricted_child_api(
     monkeypatch.setattr(runner, "_windows_command_line", lambda command: "python")
     monkeypatch.setattr(runner, "_windows_env_block", lambda env: "\0\0")
     monkeypatch.setattr(runner, "_windows_extended_path", lambda path: str(path))
-    monkeypatch.setattr(runner.os, "set_handle_inheritable", lambda *_args: None)
+    monkeypatch.setattr(runner, "_set_handle_inheritable", lambda *_args: None)
     monkeypatch.setitem(sys.modules, "msvcrt", type("FakeMsvcrt", (), {"get_osfhandle": staticmethod(lambda fileno: fileno)}))
     monkeypatch.setattr(
         runner,

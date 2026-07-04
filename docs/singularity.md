@@ -1743,7 +1743,7 @@
   E1. sandbox doctor / setup / cleanup（CLI 能力诊断，不进入 AgentLoop）
     python -m singularity.cli sandbox doctor --json
     → WindowsSandboxBackend.doctor()
-    → windows.py public backend facade / windows_common shared helpers
+    → windows.py public backend facade / windows_common shared primitives
     → windows_doctor.probe_windows_sandbox()
     → offline / online 双账户检查：
       1) account / credential / login UI / logon rights / group membership
@@ -1765,7 +1765,7 @@
 
     python -m singularity.cli sandbox setup --json
     → setup_windows_sandbox()
-    → windows_common.setup_windows_sandbox()
+    → windows_doctor.setup_windows_sandbox()
     → windows_identity._ensure_sandbox_identity()
     → windows_acl._apply_sandbox_control_dir_acl()
     → windows_firewall._network_state()

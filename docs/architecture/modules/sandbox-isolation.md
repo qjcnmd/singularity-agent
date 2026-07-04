@@ -390,7 +390,7 @@ class SandboxNetworkMode(str, Enum):
 - `default_sandbox_profile()` 生成基础 profile，`CommandExecutor` 再写入会话权限边界、protected globs、network mode 和 resource limits。
 - `windows_models.py` 定义 Windows sandbox schema 常量、offline/online identity 映射和 doctor/setup/cleanup DTO class。
 - `windows_doctor.py` 中的 `probe_windows_sandbox()` 生成 `WindowsSandboxDoctorReport`，`windows.py` 继续导出同名入口。
-- `windows_common.py` 中的 `setup_windows_sandbox()`生成`WindowsSandboxSetupReport`，`windows.py` 继续导出同名入口；该流程在elevated shell下配置两个账户、独立credential、登录UI、LSA rights、受限组成员、双账户state ACL、offline firewall、ACL/runner/network probes，并迁移固定legacy资产。
+- `windows_doctor.py` 中的 `setup_windows_sandbox()` 生成 `WindowsSandboxSetupReport`，`windows.py` 继续导出同名入口；该流程在elevated shell下配置两个账户、独立credential、登录UI、LSA rights、受限组成员、双账户state ACL、offline firewall、ACL/runner/network probes，并迁移固定legacy资产。
 - `windows_cleanup.py` 中的 `cleanup_windows_sandbox_assets()`生成`WindowsSandboxCleanupReport`，删除current/legacy账户、credential、firewall group、登录UI值与machine state dir，执行LSA rights清理和最终residual audit；`windows.py` 继续导出同名入口。
 - `WindowsSandboxBackend.prepare()` 生成 `PreparedSandbox` 与 runner spec；`WindowsSandboxBackend.run()` 生成执行型 `SandboxResult`。
 - `WindowsSandboxRunner.run()` / `run_spec()` 生成 `WindowsRunnerResult`。

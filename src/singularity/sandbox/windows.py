@@ -31,7 +31,11 @@ from singularity.sandbox.models import (
     SandboxViolation,
 )
 from singularity.sandbox.windows_acl import _apply_sandbox_control_dir_acl as _apply_run_root_acl
-from singularity.sandbox.windows_cleanup import cleanup_windows_sandbox_assets
+from singularity.sandbox.windows_cleanup import (
+    _normalize_run_root_for_cleanup,
+    _workspace_cleanup_command,
+    cleanup_windows_sandbox_assets,
+)
 from singularity.sandbox.windows_common import (
     CLEANUP_SCHEMA_VERSION,
     DOCTOR_SCHEMA_VERSION,
@@ -60,29 +64,28 @@ from singularity.sandbox.windows_common import (
     WindowsSandboxPrimitives,
     WindowsSandboxSetup,
     WindowsSandboxSetupReport,
-    _can_ignore_unrelated_network_probe_blocker,
     _external_writable_paths,
     _limit_output,
-    _network_probe_state_for_role,
-    _normalize_run_root_for_cleanup,
     _now,
-    _probe_windows_sandbox_uncached,
-    _python_runtime_path_directories,
-    _resolve_command,
     _run_command,
     _sandbox_identity_for_mode,
     _windows_state_dir_path,
-    _workspace_cleanup_command,
     sandbox_exception_diagnostics,
+)
+from singularity.sandbox.windows_doctor import (
+    _can_ignore_unrelated_network_probe_blocker,
+    _network_probe_state_for_role,
+    _probe_windows_sandbox_uncached,
+    probe_windows_sandbox,
     setup_windows_sandbox,
 )
-from singularity.sandbox.windows_doctor import probe_windows_sandbox
 from singularity.sandbox.windows_platform import is_windows as _is_windows
 from singularity.sandbox.windows_runner import (
     WindowsRunnerResult,
     WindowsRunnerSpec,
     WindowsSandboxRunner,
 )
+from singularity.sandbox.windows_runtime import _python_runtime_path_directories, _resolve_command
 
 __all__ = [
     "CLEANUP_SCHEMA_VERSION",
