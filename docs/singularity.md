@@ -1325,6 +1325,8 @@
 │  │      │       │  ╔══════════════════════════════════╗   │   │
 │  │      │       │  ║  ToolExecutor 当前执行管线          ║   │   │
 │  │      │       │  ║  (tools/executor.py:ToolExecutor) ║   │   │
+│  │      │       │  ║  state/policy/cache/dispatch/trace ║  │   │
+│  │      │       │  ║  分别委托 execution_* 边界类       ║   │   │
 │  │      │       │  ╚══════════════════════════════════╝   │   │
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ① 注册表查询                         │   │
@@ -1353,6 +1355,7 @@
 │  │      │       │  │   └── [通过] → 继续                  │   │
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ⑤ 策略引擎                           │   │
+│  │      │       │  │   ToolExecutionPolicyGate.enforce()│   │
 │  │      │       │  │   _enforce_policy()                  │   │
 │  │      │       │  │   → policy_engine.enforce(PolicyRequest)│
 │  │      │       │  │   → PolicyDecision {                 │   │
@@ -1383,6 +1386,7 @@
 │  │      │       │  │   └── [blocked]   → error             │   │
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ⑧ 结果缓存检查                         │   │
+│  │      │       │  │   ToolExecutionCache.precheck()      │   │
 │  │      │       │  │   ToolResultCache.get(cache_key)       │   │
 │  │      │       │  │   ├── [命中] → 返回缓存 ToolResult      │   │
 │  │      │       │  │   └── [未命中] → 继续                   │   │
@@ -1391,6 +1395,7 @@
 │  │      │       │  │   _delegated_backend_error()           │   │
 │  │      │       │  │                                      │   │
 │  │      │       │  ├── ⑩ 工具处理器调用                       │   │
+│  │      │       │  │   ToolExecutionDispatcher.dispatch()  │   │
 │  │      │       │  │   result = _execute_handler(spec, validated)│
 │  │      │       │  │   │                                  │   │
 │  │      │       │  │   ├── [命令工具]                       │   │
@@ -1464,6 +1469,7 @@
 │  │      │       │  │   _remember_replay()                  │   │
 │  │      │       │  │                                      │   │
 │  │      │       │  └── ⑭ Trace 记录与 metadata 标注            │   │
+│  │      │       │      ToolExecutionTraceRecorder.finalize()│  │
 │  │      │       │      _record_trace() / _emit_trace()      │   │
 │  │      │       │                                         │   │
 │  │      │       │  ↓ 回到 ToolProtocolEngine                │   │

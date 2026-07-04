@@ -25,6 +25,11 @@ from singularity.tools import (
     ToolSpec,
 )
 from singularity.tools.edit import register_edit_tools
+from singularity.tools.execution_cache import ToolExecutionCache
+from singularity.tools.execution_dispatch import ToolExecutionDispatcher
+from singularity.tools.execution_pipeline import ToolExecutionPipelineState
+from singularity.tools.execution_policy import ToolExecutionPolicyGate
+from singularity.tools.execution_trace import ToolExecutionTraceRecorder
 from singularity.workspace import WorkspaceMutationManager
 from tests.tool_executor_helpers import default_policy_engine, make_test_policy_engine
 
@@ -57,6 +62,16 @@ def make_component(tmp_path: Path) -> ToolExecutor:
         workspace_root=tmp_path,
         policy_engine=make_test_policy_engine(tmp_path),
     )
+
+
+def test_tool_executor_exposes_pipeline_boundary_components(tmp_path: Path) -> None:
+    component = make_component(tmp_path)
+
+    assert isinstance(component.execution_policy, ToolExecutionPolicyGate)
+    assert isinstance(component.execution_cache, ToolExecutionCache)
+    assert isinstance(component.execution_dispatch, ToolExecutionDispatcher)
+    assert isinstance(component.execution_trace, ToolExecutionTraceRecorder)
+    assert component._pipeline_state_type is ToolExecutionPipelineState
 
 
 def test_tool_executor_successfully_calls_registered_read_only_tool(tmp_path: Path) -> None:

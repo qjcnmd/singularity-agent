@@ -8,7 +8,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -40,6 +39,11 @@ from singularity.policy.exceptions import (
     SandboxRequired,
 )
 from singularity.tools.cache import ToolResultCache
+from singularity.tools.execution_cache import ToolExecutionCache
+from singularity.tools.execution_dispatch import ToolExecutionDispatcher
+from singularity.tools.execution_pipeline import ToolExecutionPipelineState
+from singularity.tools.execution_policy import ToolExecutionPolicyGate
+from singularity.tools.execution_trace import ToolExecutionTraceRecorder
 from singularity.tools.idempotency import IdempotencyLedger
 from singularity.tools.models import (
     PermissionLevel,
@@ -107,27 +111,7 @@ class ToolPolicyEngineProtocol(Protocol):
         ...
 
 
-@dataclass
-class _ExecutionPipelineState:
-    request: ToolExecutionRequest
-    started_at: str
-    started: float
-    tool_call_id: str | None
-    tool_name: str
-    spec: ToolSpec | None = None
-    parsed_args: Any | None = None
-    validated: Any | None = None
-    validated_args: dict[str, Any] | None = None
-    args_fingerprint: str | None = None
-    planner_action_id: str | None = None
-    approval_grant_id: str | None = None
-    policy_decision_id: str | None = None
-    cache_key: str | None = None
-    cache_hit: bool = False
-    output_digest: str | None = None
-    result: ToolResult | None = None
-    planner_updated: bool = False
-    remember_replay: bool = False
+_ExecutionPipelineState = ToolExecutionPipelineState
 
 
 class ToolExecutor:
@@ -160,6 +144,11 @@ class ToolExecutor:
         self._cache = ToolResultCache()
         self._ledger = IdempotencyLedger()
         self._redactor = TraceRedactor()
+        self.execution_policy = ToolExecutionPolicyGate(self)
+        self.execution_cache = ToolExecutionCache(self, self._cache)
+        self.execution_dispatch = ToolExecutionDispatcher(self)
+        self.execution_trace = ToolExecutionTraceRecorder(self)
+        self._pipeline_state_type = ToolExecutionPipelineState
         self.cancellation_token: Any | None = None
 
     def execute_tool_call(self, tool_call: dict[str, Any]) -> ToolResult:
@@ -167,7 +156,7 @@ class ToolExecutor:
 
     def execute_request(self, request: ToolExecutionRequest | dict[str, Any]) -> ToolResult:
         request = self._normalize_execution_request(request)
-        state = _ExecutionPipelineState(
+        state = self._pipeline_state_type(
             request=request,
             started_at=datetime.now(UTC).isoformat(),
             started=time.perf_counter(),
@@ -309,25 +298,7 @@ class ToolExecutor:
         return None
 
     def _stage_enforce_policy(self, state: _ExecutionPipelineState) -> ToolResult | None:
-        assert state.spec is not None
-        assert state.validated_args is not None
-        policy_result, approval_grant_id, policy_decision_id = self._enforce_policy(
-            tool_name=state.tool_name,
-            spec=state.spec,
-            validated_args=state.validated_args,
-            tool_call_id=state.tool_call_id,
-        )
-        state.approval_grant_id = approval_grant_id
-        state.policy_decision_id = policy_decision_id
-        if (
-            policy_result is not None
-            and self._delegates_policy_decision(state.spec, policy_result)
-        ):
-            return None
-        if policy_result is not None:
-            state.remember_replay = True
-            return policy_result
-        return None
+        return self.execution_policy.enforce(state)
 
     def _stage_authorize_with_planner(self, state: _ExecutionPipelineState) -> ToolResult | None:
         assert state.spec is not None
@@ -355,92 +326,10 @@ class ToolExecutor:
         return None
 
     def _stage_cache_precheck(self, state: _ExecutionPipelineState) -> ToolResult | None:
-        assert state.spec is not None
-        assert state.validated_args is not None
-        self._throw_if_cancelled()
-        state.cache_key = self._cache_key(state.spec, state.validated_args)
-        cache_policy = state.spec.cache_policy
-        if self._should_cache(state.spec):
-            cached = self._cache.get(
-                state.cache_key,
-                ttl_seconds=cache_policy.ttl_seconds if cache_policy else None,
-            )
-            if cached is not None:
-                state.cache_hit = True
-                cached.metadata["cache_hit"] = True
-                if state.approval_grant_id:
-                    cached.metadata["approval_grant_id"] = state.approval_grant_id
-                if state.policy_decision_id:
-                    cached.metadata["policy_decision_id"] = state.policy_decision_id
-                state.output_digest = cached.metadata.get("output_digest") or self._result_digest(cached)
-                state.remember_replay = True
-                return cached
-
-        delegated_error = self._delegated_backend_error(state.spec)
-        if delegated_error is not None:
-            state.remember_replay = True
-            return delegated_error
-        return None
+        return self.execution_cache.precheck(state)
 
     def _stage_dispatch(self, state: _ExecutionPipelineState) -> ToolResult:
-        assert state.spec is not None
-        assert state.validated is not None
-        assert state.validated_args is not None
-        self._emit_trace(
-            TraceEventType.TOOL_DISPATCH_STARTED,
-            summary=f"Dispatching tool {state.tool_name}.",
-            payload={
-                "tool_name": state.tool_name,
-                "tool_call_id": state.tool_call_id,
-                "permission_level": state.spec.permission_level.value,
-                "risk_tags": list(state.spec.risk_tags),
-                "backend": state.spec.execution_backend.value,
-                "batch_id": state.request.batch_id,
-                "argument_digest": state.request.argument_digest,
-                "arguments": self._argument_trace_summary(state.validated_args),
-            },
-            ids=self._request_trace_ids(
-                state.request,
-                action_id=state.planner_action_id or state.tool_call_id,
-            ),
-        )
-        self._throw_if_cancelled()
-        result, state.output_digest = self._execute_handler(state.spec, state.validated)
-        self._throw_if_cancelled()
-        if state.approval_grant_id:
-            result.metadata["approval_grant_id"] = state.approval_grant_id
-        if state.policy_decision_id:
-            result.metadata["policy_decision_id"] = state.policy_decision_id
-        self._update_planner(
-            tool_call_id=state.tool_call_id,
-            tool_name=state.tool_name,
-            result=result,
-            action_id=state.planner_action_id,
-        )
-        state.planner_updated = True
-        if (
-            self._should_cache(state.spec)
-            and result.ok
-            and not self._is_sensitive_result(state.spec, result)
-        ):
-            assert state.cache_key is not None
-            touched_paths = self._touched_paths(state.spec, state.validated_args)
-            self._cache.set(
-                state.cache_key,
-                result,
-                max_entries=state.spec.cache_policy.max_entries
-                if state.spec.cache_policy
-                else 128,
-                touched_paths=touched_paths,
-            )
-        if state.spec.permission_level != PermissionLevel.READ_ONLY:
-            # Incremental invalidation: evict only cache entries whose touched
-            # paths overlap the mutated paths, instead of clearing the whole
-            # cache. This preserves unrelated read-only results across a
-            # targeted write.
-            self._invalidate_after_write(state.spec, state.validated_args, result)
-        state.remember_replay = True
-        return result
+        return self.execution_dispatch.dispatch(state)
 
     def _finish_pipeline_result(
         self,
@@ -464,6 +353,9 @@ class ToolExecutor:
         return result
 
     def _finalize_pipeline_state(self, state: _ExecutionPipelineState) -> None:
+        self.execution_trace.finalize(state)
+
+    def _finalize_pipeline_state_impl(self, state: _ExecutionPipelineState) -> None:
         result = state.result
         if result is None:
             return
