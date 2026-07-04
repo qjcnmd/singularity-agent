@@ -8,6 +8,13 @@ from singularity.verification.models import (
     VerificationResult,
 )
 
+REQUIRED_FAILURE_CONFIDENCE_PENALTY = 0.3
+REQUIRED_BLOCKED_CONFIDENCE_PENALTY = 0.25
+REQUIRED_FLAKY_CONFIDENCE_PENALTY = 0.15
+OPTIONAL_FAILURE_CONFIDENCE_PENALTY = 0.1
+REQUIRED_MISSING_CONFIDENCE_PENALTY = 0.1
+MANUAL_REVIEW_CONFIDENCE_PENALTY = 0.2
+
 
 class CompletionAssessor:
     def assess(
@@ -76,13 +83,13 @@ class CompletionAssessor:
             status = CompletionStatus.READY
 
         confidence = 1.0
-        confidence -= 0.3 * len(required_failed)
-        confidence -= 0.25 * len(required_blocked)
-        confidence -= 0.15 * len(required_flaky)
-        confidence -= 0.1 * len([check_id for check_id in failed if check_id in optional_ids])
-        confidence -= 0.1 * len(required_missing)
+        confidence -= REQUIRED_FAILURE_CONFIDENCE_PENALTY * len(required_failed)
+        confidence -= REQUIRED_BLOCKED_CONFIDENCE_PENALTY * len(required_blocked)
+        confidence -= REQUIRED_FLAKY_CONFIDENCE_PENALTY * len(required_flaky)
+        confidence -= OPTIONAL_FAILURE_CONFIDENCE_PENALTY * len([check_id for check_id in failed if check_id in optional_ids])
+        confidence -= REQUIRED_MISSING_CONFIDENCE_PENALTY * len(required_missing)
         if plan.impact_analysis.requires_manual_review:
-            confidence -= 0.2
+            confidence -= MANUAL_REVIEW_CONFIDENCE_PENALTY
         confidence = max(0.0, min(1.0, confidence))
 
         return CompletionAssessment(

@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-import time
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from singularity.atomic_io import atomic_write_text, file_lock
 from singularity.planner.models import (
     EvidenceLedger,
     ExecutionBudget,
@@ -95,7 +94,7 @@ class PlannerStore:
         payload.update(extra or {})
         path = self.session_dir(session_id) / "planner_events.jsonl"
         line = json.dumps(payload, ensure_ascii=False, default=str) + "\n"
-        with _file_lock(path) as handle:
+        with file_lock(path) as handle:
             handle.seek(0, os.SEEK_END)
             handle.write(line.encode("utf-8"))
             handle.flush()
@@ -103,76 +102,8 @@ class PlannerStore:
     @staticmethod
     def _write_json(path: Path, payload: dict[str, Any]) -> None:
         text = json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n"
-        _atomic_write(path, text)
+        atomic_write_text(path, text)
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
-
-
-@contextmanager
-def _file_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as handle:
-        _lock_file(handle)
-        try:
-            yield handle
-        finally:
-            _unlock_file(handle)
-
-
-def _lock_file(handle: Any) -> None:
-    if os.name == "nt":
-        import msvcrt
-
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-
-
-def _unlock_file(handle: Any) -> None:
-    if os.name == "nt":
-        import msvcrt
-
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    _replace_with_retry(tmp, path)
-    try:
-        directory_fd = os.open(str(path.parent), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(directory_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(directory_fd)
-
-
-def _replace_with_retry(tmp: Path, path: Path) -> None:
-    last_error: PermissionError | None = None
-    for attempt in range(8):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError as exc:
-            last_error = exc
-            time.sleep(0.05 * (attempt + 1))
-    if last_error is not None:
-        raise last_error
