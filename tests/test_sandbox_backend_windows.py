@@ -44,6 +44,12 @@ class _WindowsTestFacade:
         "_logon_rights_state": windows_doctor,
         "_runner_state": windows_doctor,
         "_state_from_bool": windows_doctor,
+        "_ensure_state_dir_acl": windows_acl,
+        "_normalize_run_root_for_cleanup": windows_cleanup,
+        "_apply_probe_root_acl": windows_acl,
+        "_python_runtime_smoke_diagnostics": windows_runtime,
+        "_account_python_smoke": windows_runtime,
+        "_cleanup_probe_root": windows_runtime,
     }
     _modules: ClassVar[tuple[object, ...]] = (
         windows_common,
