@@ -13,7 +13,9 @@ from singularity.error_mapping import (
 from singularity.model import ModelCapabilities, ModelRole, ModelTurnResult
 from singularity.observability.models import TraceSeverity
 from singularity.planner import Planner
+from singularity.tool_protocol.binding import ToolProtocolResultBinder
 from singularity.tool_protocol.context_projection import ToolProtocolContextProjector
+from singularity.tool_protocol.executor import ToolProtocolPlanExecutor
 from singularity.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
@@ -33,6 +35,7 @@ from singularity.tool_protocol.scheduler import ToolProtocolScheduler
 from singularity.tool_protocol.state import ToolProtocolStateStore
 from singularity.tool_protocol.synthetic_result import ToolProtocolSyntheticResultFactory
 from singularity.tool_protocol.trace import ToolProtocolTrace
+from singularity.tool_protocol.transitions import ToolProtocolStateTransitioner
 from singularity.tool_protocol.validator import ToolProtocolValidator
 from singularity.tools import ToolExecutionRequest, ToolExecutor, ToolRegistry
 
@@ -73,7 +76,10 @@ class ToolProtocolEngine:
         self.result_builder = result_builder or ToolProtocolResultBuilder()
         self.synthetic_results = ToolProtocolSyntheticResultFactory()
         self.context_projector = ToolProtocolContextProjector(self.state_store)
+        self.state_transitions = ToolProtocolStateTransitioner(self.state_store)
+        self.result_binder = ToolProtocolResultBinder(self.state_store, self.context_projector)
         self.parallel_executor = parallel_executor or ParallelToolExecutor()
+        self.plan_executor = ToolProtocolPlanExecutor(self)
         self.recovery_manager = ToolProtocolRecoveryManager(self.state_store)
         self.workspace_state_hook = workspace_state_hook
         self.cancellation_token: Any | None = None
@@ -237,6 +243,23 @@ class ToolProtocolEngine:
         planner: Planner | None,
         turn: int = 0,
     ) -> ToolProtocolTurnResult:
+        return self.plan_executor.execute(
+            plan,
+            context=context,
+            tool_executor=tool_executor,
+            planner=planner,
+            turn=turn,
+        )
+
+    def _execute_plan_impl(
+        self,
+        plan: ToolExecutionPlan,
+        *,
+        context: ContextManager,
+        tool_executor: ToolExecutor,
+        planner: Planner | None,
+        turn: int = 0,
+    ) -> ToolProtocolTurnResult:
         self._throw_if_cancelled()
         _ = planner
         counters = _ToolExecutionCounters()
@@ -379,11 +402,7 @@ class ToolProtocolEngine:
         counters.last_tool_call_id = call.tool_call_id
         call.metadata = dict(call.metadata)
         call.metadata.setdefault("batch_id", batch.batch_id)
-        record = self.state_store.upsert_record(
-            call,
-            batch_id=batch.batch_id,
-            phase=ToolCallPhase.VALIDATED,
-        )
+        record = self.state_transitions.validated(call, batch_id=batch.batch_id)
         self._emit_call_validated(batch, call)
 
         if call.validation_errors:
@@ -467,17 +486,8 @@ class ToolProtocolEngine:
             return None
         replay = replay_decision.previous_result
         if replay is not None:
-            self.state_store.transition(
-                call.tool_call_id,
-                ToolCallPhase.RECOVERED,
-                tool_result_digest=replay.content_digest,
-                error_kind=replay.error_kind,
-            )
-            self.state_store.bind_result(
-                record.record_id,
-                result=replay,
-                raw_result_ref=replay.raw_result_ref,
-            )
+            self.state_transitions.replay_recovered(call, replay)
+            self.result_binder.bind(record=record, result=replay)
             observation_id = self._append_result(context, record, replay, turn=turn)
             counters.appended_tool_message_count += 1 if observation_id else 0
             self.trace.emit(
@@ -493,7 +503,7 @@ class ToolProtocolEngine:
             )
             return None
 
-        self.state_store.transition(call.tool_call_id, ToolCallPhase.SCHEDULED)
+        self.state_transitions.scheduled(call)
         self.trace.emit(
             "tool_protocol.call_scheduled",
             summary="Tool call scheduled.",
@@ -504,7 +514,7 @@ class ToolProtocolEngine:
             },
             ids=self._trace_ids(batch, call=call),
         )
-        self.state_store.transition(call.tool_call_id, ToolCallPhase.RUNNING)
+        self.state_transitions.running(call)
         self.trace.emit(
             "tool_protocol.call_started",
             summary="Tool call started.",
@@ -530,18 +540,13 @@ class ToolProtocolEngine:
         counters: _ToolExecutionCounters,
         turn: int,
     ) -> None:
-        self.state_store.transition(
-            call.tool_call_id,
-            phase,
-            error_kind=result.error_kind,
-            error_message=error_message,
-            tool_result_digest=result.content_digest,
-        )
-        self.state_store.bind_result(
-            record.record_id,
+        self.state_transitions.synthetic_result(
+            call,
+            phase=phase,
             result=result,
-            raw_result_ref=result.raw_result_ref,
+            error_message=error_message,
         )
+        self.result_binder.bind(record=record, result=result)
         observation_id = self._append_result(context, record, result, turn=turn)
         counters.appended_tool_message_count += 1 if observation_id else 0
         self.trace.emit(
@@ -575,11 +580,7 @@ class ToolProtocolEngine:
             policy_decision_id=tool_result.metadata.get("policy_decision_id"),
             approval_grant_id=tool_result.metadata.get("approval_grant_id"),
         )
-        self.state_store.bind_result(
-            record.record_id,
-            result=protocol_result,
-            raw_result_ref=protocol_result.raw_result_ref,
-        )
+        self.result_binder.bind(record=record, result=protocol_result)
         phase = (
             ToolCallPhase.SUCCEEDED
             if protocol_result.ok
@@ -589,15 +590,7 @@ class ToolProtocolEngine:
                 else ToolCallPhase.FAILED
             )
         )
-        self.state_store.transition(
-            call.tool_call_id,
-            phase,
-            policy_decision_id=protocol_result.policy_decision_id,
-            approval_grant_id=protocol_result.approval_grant_id,
-            error_kind=protocol_result.error_kind,
-            error_message=protocol_result.error_code,
-            tool_result_digest=protocol_result.content_digest,
-        )
+        self.state_transitions.completed(call, result=protocol_result, phase=phase)
         counters.executed_count += 1
         if not protocol_result.ok and protocol_result.error_code == "approval_required":
             counters.pending_approval_count += 1

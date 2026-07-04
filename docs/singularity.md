@@ -1225,6 +1225,13 @@
 │                                                              │
 │  ⑧ 执行计划 (shared lifecycle core + scheduling strategy)       │
 │                                                              │
+│  execute_plan() facade                                       │
+│  → ToolProtocolPlanExecutor.execute()                        │
+│  → _execute_plan_impl()                                      │
+│  state transition 由 ToolProtocolStateTransitioner 集中写入    │
+│  result binding / context append 由 ToolProtocolResultBinder  │
+│  委托 ToolProtocolContextProjector 完成                        │
+│                                                              │
 │  batch = _batch_for_plan(plan, context)                       │
 │  counters = _ToolExecutionCounters()                          │
 │  ★ serial 与 parallel_readonly 共用同一组 call lifecycle helper：│

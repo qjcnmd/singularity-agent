@@ -5,6 +5,9 @@
 源码证据路径:
 - src/singularity/tool_protocol/models.py
 - src/singularity/tool_protocol/engine.py
+- src/singularity/tool_protocol/executor.py
+- src/singularity/tool_protocol/transitions.py
+- src/singularity/tool_protocol/binding.py
 - src/singularity/tool_protocol/state.py
 - src/singularity/tool_protocol/validator.py
 - src/singularity/tool_protocol/scheduler.py
@@ -25,6 +28,9 @@
 - ToolProtocolResultEnvelope
 - ToolProtocolTurnResult
 - ToolProtocolEngine
+- ToolProtocolPlanExecutor
+- ToolProtocolStateTransitioner
+- ToolProtocolResultBinder
 - ToolProtocolValidator
 - ToolProtocolScheduler
 - ToolProtocolResultBuilder
@@ -57,6 +63,9 @@
 
 - src/singularity/tool_protocol/models.py
 - src/singularity/tool_protocol/engine.py
+- src/singularity/tool_protocol/executor.py
+- src/singularity/tool_protocol/transitions.py
+- src/singularity/tool_protocol/binding.py
 - src/singularity/tool_protocol/state.py
 - src/singularity/tool_protocol/validator.py
 - src/singularity/tool_protocol/scheduler.py
@@ -81,7 +90,7 @@
 
 以用户要求修复 `quicksort.py` 为例：`ToolProtocolEngine.process_model_turn()` -> `ToolProtocolValidator.validate_assistant_message()` 先把 `ModelTurnResult.tool_calls` 生成对象 `ToolCallEnvelope` 和 `ToolCallBatch`，再由 `ToolProtocolScheduler.schedule()` 生成 `ToolExecutionPlan`。调度语义仍由 scheduler 决定：side-effect 或不安全调用走 sequential，read-only 且并行安全调用可走 parallel_readonly，blocked call 不执行。`ToolExecutor.execute_request()` 消费 `ToolExecutionRequest` 并返回 `ToolResult`；内部用 `_ExecutionPipelineState` 串联固定 pipeline：`_stage_load_spec()`、`_stage_validate_arguments()`、`_stage_replay_precheck()`、`_stage_pre_policy_preflight()`、`_stage_enforce_policy()`、`_stage_authorize_with_planner()`、`_stage_cache_precheck()`、`_stage_dispatch()`，最后由 `_finish_pipeline_result()` 和 `_finalize_pipeline_state()` 统一补 metadata、planner observation 和 trace。安全顺序固定为 replay/idempotency precheck -> execution-boundary/dry-run/delegated preflight -> policy enforce/approval gate -> planner authorization -> cache lookup -> dispatch handler -> planner update/cache write/replay record；policy 或 planner 拒绝不会执行 handler，也不会按已执行工具写 planner update。其中 read-only 且可缓存的结果由 `ToolResultCache` 按参数、schema、workspace 与 touched paths 指纹保存，重复 `tool_call_id` 由 `IdempotencyLedger` 做冲突检测或安全 replay。ToolExecutor 的错误、policy detail 和 trace payload redaction 仍通过 `TraceRedactor` 执行，`TraceRedactor` 内部委托统一 `RedactionProvider` 的 plain profile；这不改变 `ToolResult` 或 `ToolProtocolResultEnvelope.redacted` 字段语义。`ToolCallEnvelope.to_provider_tool_call()` 只在需要把 envelope 投影回 provider tool-call 形状时使用，并复用模型层 `provider_tool_call_dict()`；它不参与执行调度。`ToolProtocolResultBuilder.build()` 生成真实执行的 `ToolProtocolResultEnvelope`，`ToolProtocolSyntheticResultFactory.create()` 生成 validation/replay 等未执行 handler 的 synthetic envelope；`ToolProtocolStateStore.upsert_record()`、`transition()`、`append_event()` 和 `bind_result()` 把 batch、record、event、binding 写入 `tool_protocol.sqlite3`。`ToolProtocolContextProjector.append_result()` 先检查 context 中是否已有同 `tool_call_id` 与 digest 的 tool message，避免重复 append，再调用 `ContextManager.add_tool_protocol_result()` 把安全 tool message 写入 `context.sqlite3`；raw result 只通过 artifact ref/digest 进入 trace。
 
-`ToolProtocolEngine.execute_plan()` 与 `_execute_parallel_readonly_plan()` 共用同一批 call lifecycle helper：`_batch_for_plan()` 取得 batch，`_prepare_call()` 统一执行 validation trace、record upsert、synthetic result、replay/idempotency check、scheduled/running transition，`_synthetic_result()` 是 facade wrapper，实际委托 `ToolProtocolSyntheticResultFactory.create()`；`_bind_synthetic_result()` 统一绑定 rejected/replay-blocked synthetic result，`_append_result()` / `_append_result_for_envelope()` 是 facade wrapper，实际委托 `ToolProtocolContextProjector.append_result()` 完成 context append 与重复 tool message 检测；`_complete_call()` 统一 result builder、state transition、context append、trace emit 和 counters，`_turn_result()` 统一 turn status/metadata。serial 与 parallel readonly 的差异只在 scheduling strategy：serial 逐个调用 `ToolExecutor.execute_request()`，parallel readonly 先按 group 调用 `_prepare_call()`，再把 prepared read-only calls 交给 `ParallelToolExecutor.execute()` 并发执行，group start/completed trace 只记录调度组边界。
+`ToolProtocolEngine.execute_plan()` 是 facade，委托 `ToolProtocolPlanExecutor.execute()` 进入当前 engine 的计划执行实现；engine 仍保留 serial 和 parallel readonly 的 orchestration。`ToolProtocolStateTransitioner` 统一包装 validated、scheduled、running、recovered、synthetic result 和 completed transition，保证 `ToolProtocolStateStore.transition()` 的字段写入集中在一个边界内。`ToolProtocolResultBinder` 统一执行 result binding 与 context append，内部仍使用 `ToolProtocolContextProjector.append_result()` 完成重复 tool message 检测。`_execute_plan_impl()` 与 `_execute_parallel_readonly_plan()` 共用同一批 call lifecycle helper：`_batch_for_plan()` 取得 batch，`_prepare_call()` 统一执行 validation trace、record upsert、synthetic result、replay/idempotency check、scheduled/running transition，`_synthetic_result()` 是 facade wrapper，实际委托 `ToolProtocolSyntheticResultFactory.create()`；`_bind_synthetic_result()` 统一绑定 rejected/replay-blocked synthetic result，`_append_result()` / `_append_result_for_envelope()` 是 facade wrapper，实际委托 `ToolProtocolContextProjector.append_result()` 完成 context append 与重复 tool message 检测；`_complete_call()` 统一 result builder、state transition、context append、trace emit 和 counters，`_turn_result()` 统一 turn status/metadata。serial 与 parallel readonly 的差异只在 scheduling strategy：serial 逐个调用 `ToolExecutor.execute_request()`，parallel readonly 先按 group 调用 `_prepare_call()`，再把 prepared read-only calls 交给 `ParallelToolExecutor.execute()` 并发执行，group start/completed trace 只记录调度组边界。
 
 ## 真实对象完整结构
 

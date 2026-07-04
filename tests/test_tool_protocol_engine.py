@@ -22,7 +22,9 @@ from singularity.model import (
     ModelTurnStatus,
 )
 from singularity.policy import DecisionOutcome
+from singularity.tool_protocol.binding import ToolProtocolResultBinder
 from singularity.tool_protocol.engine import ToolProtocolEngine
+from singularity.tool_protocol.executor import ToolProtocolPlanExecutor
 from singularity.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
@@ -32,6 +34,7 @@ from singularity.tool_protocol.models import (
     ToolProtocolTurnStatus,
 )
 from singularity.tool_protocol.state import ToolProtocolStateStore
+from singularity.tool_protocol.transitions import ToolProtocolStateTransitioner
 from singularity.tools import ToolExecutionRequest, ToolExecutor, ToolPolicy, ToolRegistry, ToolResult
 from singularity.tools.command import register_command_tools
 from singularity.tools.models import PermissionLevel, ToolExecutionFailure, ToolSideEffectKind, ToolSpec
@@ -799,6 +802,20 @@ def test_tool_protocol_marks_existing_context_tool_message_as_appended(tmp_path:
     assert observation_id is None
     assert binding is not None
     assert binding.appended is True
+
+
+def test_tool_protocol_engine_delegates_execution_state_and_binding_boundaries(
+    tmp_path: Path,
+) -> None:
+    tool_protocol = ToolProtocolEngine(
+        registry=ToolRegistry(tmp_path),
+        trace=None,
+        state_store=ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3"),
+    )
+
+    assert isinstance(tool_protocol.plan_executor, ToolProtocolPlanExecutor)
+    assert isinstance(tool_protocol.state_transitions, ToolProtocolStateTransitioner)
+    assert isinstance(tool_protocol.result_binder, ToolProtocolResultBinder)
 
 
 def test_tool_protocol_blocks_side_effect_replay_without_calling_handler(tmp_path: Path) -> None:
