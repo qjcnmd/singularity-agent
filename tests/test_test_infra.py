@@ -13,8 +13,8 @@ for complete validation including slow/external lists.
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
-from typing import ClassVar
 
 import pytest
 
@@ -34,6 +34,10 @@ from tests.conftest import (
 # ---------------------------------------------------------------------------
 
 _FULL_SUITE_THRESHOLD = 100  # minimum items to consider collection complete
+_MARKER_COUNT_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "pyproject.toml"
+)
 
 
 def _is_full_collection(request: pytest.FixtureRequest) -> bool:
@@ -64,6 +68,23 @@ def _is_filter_active(pytestconfig: pytest.Config, *markers: str) -> bool:
         sources.append(override)
     combined = " ".join(sources)
     return any(f"not {marker}" in combined for marker in markers)
+
+
+def _configured_marker_counts() -> tuple[dict[str, int], float]:
+    payload = tomllib.loads(_MARKER_COUNT_CONFIG.read_text(encoding="utf-8"))
+    marker_counts = (
+        payload.get("tool", {})
+        .get("singularity", {})
+        .get("test_infra", {})
+        .get("marker_counts", {})
+    )
+    expected = {
+        str(marker): int(count)
+        for marker, count in marker_counts.items()
+        if marker != "tolerance"
+    }
+    tolerance = float(marker_counts.get("tolerance", 0.3))
+    return expected, tolerance
 
 
 # ---------------------------------------------------------------------------
@@ -387,20 +408,6 @@ class TestMarkerCounts:
     catching major misconfigurations.
     """
 
-    # Expected counts (approximate, used for soft validation).
-    # Lists filtered by default addopts have expected count 0.
-    _EXPECTED: ClassVar[dict[str, int]] = {
-        "smoke": 27,
-        "unit": 260,
-        "integration": 762,
-        "regression": 68,
-        "security": 54,
-        "flaky": 4,
-        "evaluation": 0,   # excluded by default addopts
-        "slow": 0,         # excluded by default addopts
-        "external": 0,     # excluded by default addopts
-    }
-
     def test_marker_counts_reasonable(
         self,
         request: pytest.FixtureRequest,
@@ -412,21 +419,22 @@ class TestMarkerCounts:
         from collections import Counter
 
         counts: Counter[str] = Counter()
+        expected, tolerance = _configured_marker_counts()
         for item in request.session.items:
             for marker in item.iter_markers():
-                if marker.name in self._EXPECTED:
+                if marker.name in expected:
                     counts[marker.name] += 1
 
-        for marker, expected in self._EXPECTED.items():
-            if expected == 0:
+        for marker, expected_count in expected.items():
+            if expected_count == 0:
                 continue  # excluded by addopts, skip
             actual = counts.get(marker, 0)
-            low = int(expected * 0.7)
-            high = int(expected * 1.3)
+            low = int(expected_count * (1 - tolerance))
+            high = int(expected_count * (1 + tolerance))
             if actual < low or actual > high:
                 import warnings
                 warnings.warn(
                     f"Marker '{marker}' count {actual} outside expected "
-                    f"range [{low}, {high}] (expected ~{expected})",
+                    f"range [{low}, {high}] (expected ~{expected_count})",
                     stacklevel=2,
                 )

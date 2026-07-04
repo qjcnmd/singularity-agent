@@ -133,6 +133,19 @@ files = [
     "src/singularity/tools/executor.py",
 ]
 
+[tool.singularity.test_infra.marker_counts]
+tolerance = 0.3
+smoke = 34
+unit = 452
+integration = 742
+regression = 83
+security = 72
+flaky = 4
+evaluation = 0
+provider_eval = 0
+slow = 0
+external = 0
+
 [tool.singularity.test_impact]
 capability_triggers = [
     { area = "AgentLoop", prefix = "src/singularity/agent_loop.py" },
