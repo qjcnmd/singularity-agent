@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from singularity.observability.redaction import TraceRedactor
 from singularity.sandbox.models import PreparedSandbox, SandboxCapabilities, SandboxRequest, SandboxResult
+
+_REDACTOR = TraceRedactor()
+_SECRET_CLI_FLAG_RE = re.compile(
+    r"^--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)$",
+    re.IGNORECASE,
+)
 
 
 class SandboxJsonlTraceRecorder:
@@ -67,31 +75,29 @@ def _command_summary(command: list[str] | str | None) -> str | list[str] | None:
     if command is None:
         return None
     if isinstance(command, list):
-        return [_redact_text(str(part)) for part in command[:20]]
+        return _redact_command_parts([str(part) for part in command[:20]])
     return _redact_text(command)
 
 
+def _redact_command_parts(parts: list[str]) -> list[str]:
+    redacted: list[str] = []
+    redact_next = False
+    for part in parts:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        redacted.append(_redact_text(part))
+        redact_next = bool(_SECRET_CLI_FLAG_RE.match(part.strip()))
+    return redacted
+
+
 def _redact(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: _redact_text(str(item)) if _secret_key(str(key)) else _redact(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact(item) for item in value]
-    if isinstance(value, str):
-        return _redact_text(value)
-    return value
-
-
-def _secret_key(key: str) -> bool:
-    upper = key.upper()
-    return any(token in upper for token in ("TOKEN", "KEY", "SECRET", "PASSWORD", "COOKIE", "AUTHORIZATION"))
+    return _REDACTOR.redact_value(value)
 
 
 def _redact_text(text: str) -> str:
-    redacted = text
-    for marker in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "NPM_TOKEN", "PASSWORD", "SECRET", "TOKEN", "COOKIE", "AUTHORIZATION"):
-        if marker.lower() in redacted.lower():
-            return "[REDACTED]"
-    return redacted
+    return _REDACTOR.redact_text(text)
 
 
 def _relative_handle(path: Path, root: Path) -> str:

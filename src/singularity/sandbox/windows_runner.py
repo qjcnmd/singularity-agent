@@ -66,10 +66,43 @@ DEFAULT_ACCOUNT_NAME = "SingularityOffline"
 DEFAULT_CREDENTIAL_TARGET = "SingularityOffline"
 NETWORK_PROBE_ENDPOINTS = (("1.1.1.1", 53), ("1.1.1.1", 443), ("8.8.8.8", 53))
 SECRET_KEY_RE = re.compile(
-    r"(authorization|cookie|token|api[_-]?key|secret|password|private[_-]?key|database[_-]?url|dsn)",
+    r"(authorization|cookie|token|api[_-]?key|secret|password|private[_-]?key|"
+    r"credential|passphrase|access[_-]?token|refresh[_-]?token|client[_-]?secret|"
+    r"database[_-]?url|dsn|conn(?:ection)?[_-]?(?:str|string)|openai_api_key|"
+    r"anthropic_api_key|github_token|npm_token)",
     re.IGNORECASE,
 )
 SAFE_BOOLEAN_STATUS_KEYS = {"restricted_token"}
+SAFE_NUMERIC_METRIC_KEYS = {
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_input_tokens",
+    "reasoning_tokens",
+    "prompt_tokens",
+    "completion_tokens",
+}
+ENV_SECRET_RE = re.compile(
+    r"(?im)^([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|DSN|CONN_STR|CONN_STRING|CONNECTION_STRING)|"
+    r"DATABASE_URL|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|NPM_TOKEN)\s*=\s*([^\r\n]+)"
+)
+HEADER_SECRET_RE = re.compile(r"(?im)\b(Authorization|Cookie)\s*:\s*([^\r\n,\]]+)")
+CLI_SECRET_FLAG_RE = re.compile(
+    r"(?i)(--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)(?:=|\s+))"
+    r"('[^']*'|\"[^\"]*\"|[^\s,\]\}]+)"
+)
+URL_QUERY_SECRET_RE = re.compile(
+    r"(?i)([?&](?:access[_-]?token|api[_-]?key|token|secret|password|signature|sig|auth|key)=)"
+    r"([^&#\s,\]\}]+)"
+)
+JSON_ARG_SECRET_RE = re.compile(
+    r"(?i)(\"--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)\"\s*,\s*)"
+    r"\"[^\"]*\""
+)
+PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.IGNORECASE | re.DOTALL,
+)
 TOKEN_VALUE_RE = re.compile(
     r"\b("
     r"sk-[A-Za-z0-9._\-]+"
@@ -590,7 +623,7 @@ def _redact_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: item
-            if str(key).lower() in SAFE_BOOLEAN_STATUS_KEYS and isinstance(item, bool)
+            if _is_safe_redaction_value(key, item)
             else "<redacted>"
             if SECRET_KEY_RE.search(str(key))
             else _redact_value(item)
@@ -606,19 +639,21 @@ def _redact_value(value: Any) -> Any:
 
 
 def _redact_text(text: str) -> str:
-    redacted = TOKEN_VALUE_RE.sub("<redacted>", text)
-    redacted = re.sub(
-        r"(?im)^([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|DSN|CONN_STR|CONN_STRING|CONNECTION_STRING))\s*=\s*([^\r\n]+)",
-        lambda match: f"{match.group(1)}=<redacted>",
-        redacted,
-    )
-    redacted = re.sub(
-        r"(?i)(--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)(?:=|\s+))"
-        r"('[^']*'|\"[^\"]*\"|[^\s,\]\}]+)",
-        lambda match: f"{match.group(1)}<redacted>",
-        redacted,
-    )
+    redacted = PRIVATE_KEY_RE.sub("<redacted>", text)
+    redacted = ENV_SECRET_RE.sub(lambda match: f"{match.group(1)}=<redacted>", redacted)
+    redacted = HEADER_SECRET_RE.sub(lambda match: f"{match.group(1)}: <redacted>", redacted)
+    redacted = URL_QUERY_SECRET_RE.sub(lambda match: f"{match.group(1)}<redacted>", redacted)
+    redacted = JSON_ARG_SECRET_RE.sub(lambda match: f'{match.group(1)}"<redacted>"', redacted)
+    redacted = CLI_SECRET_FLAG_RE.sub(lambda match: f"{match.group(1)}<redacted>", redacted)
+    redacted = TOKEN_VALUE_RE.sub("<redacted>", redacted)
     return redacted
+
+
+def _is_safe_redaction_value(key: object, value: Any) -> bool:
+    key_text = str(key).lower()
+    if key_text in SAFE_BOOLEAN_STATUS_KEYS and isinstance(value, bool):
+        return True
+    return key_text in SAFE_NUMERIC_METRIC_KEYS and isinstance(value, int | float) and not isinstance(value, bool)
 
 
 class _WindowsChildProcess:

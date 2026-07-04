@@ -2936,6 +2936,37 @@ def test_windows_runner_result_serialization_redacts_output() -> None:
     assert payload["metadata"]["restricted_token"] is True
 
 
+def test_windows_runner_redaction_matches_provider_rules() -> None:
+    secret = "sk-test-secret-value"
+    result = sandbox.WindowsRunnerResult(
+        exit_code=0,
+        stdout=(
+            f"Authorization: Bearer {secret}\n"
+            f"DATABASE_URL=postgres://user:{secret}@db.example/app\n"
+            f'["--api-key", "{secret}"]\n'
+        ),
+        stderr=f"https://example.test/path?api_key={secret}\n",
+        timed_out=False,
+        started_at="2026-06-27T00:00:00+00:00",
+        ended_at="2026-06-27T00:00:01+00:00",
+        duration_ms=1,
+        metadata={
+            "authorization": f"Bearer {secret}",
+            "restricted_token": True,
+            "input_tokens": 12,
+        },
+    )
+
+    payload = result.to_dict()
+
+    encoded = json.dumps(payload, sort_keys=True)
+    assert secret not in encoded
+    assert "DATABASE_URL=<redacted>" in payload["stdout"]
+    assert payload["metadata"]["authorization"] == "<redacted>"
+    assert payload["metadata"]["restricted_token"] is True
+    assert payload["metadata"]["input_tokens"] == 12
+
+
 def test_child_output_removes_raw_temp_files(tmp_path: Path) -> None:
     stdout_path = tmp_path / "child.stdout"
     stderr_path = tmp_path / "child.stderr"

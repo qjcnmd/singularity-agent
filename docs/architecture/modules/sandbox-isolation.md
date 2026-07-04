@@ -15,6 +15,7 @@
 - src/singularity/sandbox/windows_doctor.py
 - src/singularity/sandbox/windows_cleanup.py
 - src/singularity/sandbox/windows_models.py
+- src/singularity/sandbox/trace_recorder.py
 - src/singularity/sandbox/windows_runner.py
 - src/singularity/command/executor.py
 
@@ -81,6 +82,7 @@ Windows 当前实现是双 principal 的 account-backed OS sandbox：父进程�
 - `src/singularity/sandbox/windows_doctor.py`：`probe_windows_sandbox()` doctor facade 和缓存入口。
 - `src/singularity/sandbox/windows_cleanup.py`：`cleanup_windows_sandbox_assets()` cleanup 流程入口。
 - `src/singularity/sandbox/windows_models.py`：Windows sandbox schema 常量、双账户 identity 映射、doctor/setup/cleanup DTO 和 `to_dict()` wire projection。
+- `src/singularity/sandbox/trace_recorder.py`：默认 sandbox JSONL trace writer，使用 `TraceRedactor` 脱敏 command summary、timing 和 violation 投影。
 - `src/singularity/sandbox/windows_runner.py`：sandbox account runner、restricted token child、private desktop、Job Object、timeout/output/network probe/result JSON。
 - `src/singularity/command/executor.py`：依据会话级 `PermissionProfile` 构造完整 `SandboxRequest`，并把 `SandboxResult` 投影成 command evidence。
 
@@ -299,7 +301,7 @@ class WindowsRunnerResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 ```
 
-`WindowsRunnerSpec.operation` 默认为`command`，表示由Level-1账户进程创建restricted low-integrity Level-2 child执行真实命令；`workspace_cleanup`仅用于run-root cleanup，Level-1账户进程只删除当前run root下的`workspace/` projection，不执行用户命令。`WindowsRunnerResult.metadata` 在成功路径写入 `restricted_token`、`low_integrity`、`private_desktop`、`job_object`、`pid`、`account_name`、`account_sid_hash`（Level-1 账户进程自身 token user SID 的 `sha256[:16]`，供 doctor 校验非 admin 回退）；workspace cleanup metadata写`operation="workspace_cleanup"`且`restricted_token=false`、`low_integrity=false`。`run_spec` 异常路径写入 `error_type`，`WindowsSandboxRunner.run` 在 result 文件缺失时写入 `error_code="runner_result_missing"`。
+`WindowsRunnerSpec.operation` 默认为`command`，表示由Level-1账户进程创建restricted low-integrity Level-2 child执行真实命令；`workspace_cleanup`仅用于run-root cleanup，Level-1账户进程只删除当前run root下的`workspace/` projection，不执行用户命令。`WindowsRunnerResult.metadata` 在成功路径写入 `restricted_token`、`low_integrity`、`private_desktop`、`job_object`、`pid`、`account_name`、`account_sid_hash`（Level-1 账户进程自身 token user SID 的 `sha256[:16]`，供 doctor 校验非 admin 回退）；workspace cleanup metadata写`operation="workspace_cleanup"`且`restricted_token=false`、`low_integrity=false`。`run_spec` 异常路径写入 `error_type`，`WindowsSandboxRunner.run` 在 result 文件缺失时写入 `error_code="runner_result_missing"`。`windows_runner.py` 必须保持 stdlib-only，以便被物化到 run root 后由 sandbox account 自包含执行；其本地 redaction regex 与 `RedactionProvider` plain marker profile 同步，覆盖 env secret、Authorization/Cookie header、URL query secret、JSON/CLI secret flag、private key 和常见 token 值，同时保留 `restricted_token` 等安全状态布尔值和 token usage 数值。
 
 ### PreparedSandbox（已准备环境）
 
@@ -406,7 +408,7 @@ Windows凭据分别写入Credential Manager target`SingularityOffline`与`Singul
 
 ## 是否进入 trace / audit
 
-`SandboxManager` 可发出 `sandbox.requested`、`sandbox.prepared`、`sandbox.started`、`sandbox.cleaned`、`sandbox.capability_failed`、`sandbox.violation` 和 `sandbox.completed`。`sandbox.prepared` 与 terminal payload 只增加数值 timing，不写 argv、credential 或路径正文；分段包括 doctor/readiness、account selection、ACL grant、process spawn、command runtime、output collection、artifact collection 和当前 run-root cleanup。`SandboxJsonlTraceRecorder.append()` 写相同的 result timing 安全投影，并使用 manager 选择阶段已经取得的同次 `SandboxCapabilities` 快照，避免为 trace 再次触发普通 capability probe。sandbox result 不直接写 policy audit；关联的 policy decision 由 Policy 层记录。
+`SandboxManager` 可发出 `sandbox.requested`、`sandbox.prepared`、`sandbox.started`、`sandbox.cleaned`、`sandbox.capability_failed`、`sandbox.violation` 和 `sandbox.completed`。`sandbox.prepared` 与 terminal payload 只增加数值 timing，不写 argv、credential 或路径正文；分段包括 doctor/readiness、account selection、ACL grant、process spawn、command runtime、output collection、artifact collection 和当前 run-root cleanup。`SandboxJsonlTraceRecorder.append()` 写相同的 result timing 安全投影，并使用 manager 选择阶段已经取得的同次 `SandboxCapabilities` 快照，避免为 trace 再次触发普通 capability probe；JSONL payload 通过 `TraceRedactor` 委托统一 `RedactionProvider` plain profile，list command 中的 secret flag 后续参数也会被替换为 `<redacted>`。sandbox result 不直接写 policy audit；关联的 policy decision 由 Policy 层记录。
 
 `CommandExecutor._result_from_sandbox()` 会把 selected backend、enforcement status、execution backend、network denied proof、Job Object/timeout 状态、artifact refs、changed files 和 violations 放入 `CommandResult.isolation_report["sandbox"]`。Planner 和 final report 从这里聚合 `sandbox_isolation_summary`。
 
@@ -451,5 +453,5 @@ Windows凭据分别写入Credential Manager target`SingularityOffline`与`Singul
 
 - 新 backend 必须以真实 OS enforcement 和 external smoke 证明 capability；workspace copy、chmod 或普通子进程不能注册为 sandbox backend。
 - capability 或 setup 缺失必须返回 `backend_unavailable`，不得静默本地执行。
-- Windows setup、doctor、cleanup、account/ACL/firewall、restricted token、Job Object、private desktop、runner result metadata 或 network proof 变化时同步本文件；登录 UI visibility、LSA logon right（`SeInteractiveLogonRight`、RDP/network/service/batch deny rights 及对应 allow right 清理）、`Users` 组成员、state dir ACL、Python runtime read/execute ACL生命周期、Python runtime module smoke diagnostics、成功/失败 diagnostics 展开策略、manager 同次 capabilities 快照复用、per-account network recheck语义、run-root cleanup同账户Level-1 workspace pre-cleanup、owner/ACL/host SID/integrity/attribute normalization、runner-script 物化、`SetErrorMode` 子进程弹窗抑制、有限默认 wait、`account_sid_hash` 身份证明同属本文件维护范围。
+- Windows setup、doctor、cleanup、account/ACL/firewall、restricted token、Job Object、private desktop、runner result metadata 或 network proof 变化时同步本文件；登录 UI visibility、LSA logon right（`SeInteractiveLogonRight`、RDP/network/service/batch deny rights 及对应 allow right 清理）、`Users` 组成员、state dir ACL、Python runtime read/execute ACL生命周期、Python runtime module smoke diagnostics、成功/失败 diagnostics 展开策略、manager 同次 capabilities 快照复用、per-account network recheck语义、run-root cleanup同账户Level-1 workspace pre-cleanup、owner/ACL/host SID/integrity/attribute normalization、runner-script 物化、`SetErrorMode` 子进程弹窗抑制、有限默认 wait、`account_sid_hash` 身份证明、sandbox JSONL trace redaction 与 self-contained runner redaction 规则同属本文件维护范围。
 - 修改本模块对象字段、调用链、CLI、trace 或 report schema 后运行 `python scripts/verify_runtime_docs.py`；展示对象时必须列完整字段。
