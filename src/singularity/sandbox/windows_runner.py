@@ -856,6 +856,8 @@ def _start_windows_restricted_child(spec: WindowsRunnerSpec) -> _WindowsChildPro
 def _create_restricted_token() -> int:
     token = wintypes.HANDLE()
     restricted = wintypes.HANDLE()
+    restricted_handle = None
+    restricted_released = False
     access = (
         TOKEN_ASSIGN_PRIMARY
         | TOKEN_DUPLICATE
@@ -884,8 +886,11 @@ def _create_restricted_token() -> int:
         if not restricted_handle:
             raise OSError("CreateRestrictedToken returned an empty token handle.")
         _set_low_integrity(restricted_handle)
+        restricted_released = True
         return restricted_handle
     finally:
+        if restricted_handle is not None and not restricted_released:
+            _close_handle(restricted_handle)
         _close_handle(token.value)
 
 

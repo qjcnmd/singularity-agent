@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from singularity.execution_outcome import ExecutionOutcome
+from singularity.kernel.cancellation import throw_if_cancelled
 from singularity.observability.protocols import TraceRecorderProtocol
 from singularity.planner.budget import BudgetController
 from singularity.planner.context import PlannerContextRenderer
@@ -157,7 +158,7 @@ class Planner:
         constraints: list[str] | None = None,
         assumptions: list[str] | None = None,
     ) -> TaskState:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         normalized_goal = " ".join(user_goal.split())
         context_payload = self._producer_context()
         contract = self.producers.task_contract.produce(
@@ -216,7 +217,7 @@ class Planner:
         return self.state
 
     def apply_benchmark_constraints(self, constraints: dict[str, Any]) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         allowed_tools = sorted(
             dict.fromkeys(str(item) for item in constraints.get("allowed_tools") or [])
         )
@@ -255,7 +256,7 @@ class Planner:
         return contract.smoke_commands() if contract is not None else []
 
     def record_clarification_answer(self, request: Any, answer: Any) -> TaskState:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         request_payload = request.to_dict() if hasattr(request, "to_dict") else dict(request)
         answer_payload = answer.to_dict() if hasattr(answer, "to_dict") else dict(answer)
@@ -297,7 +298,7 @@ class Planner:
         )
 
     def step(self) -> AgentAction:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         plan = self._plan()
         self._auto_advance_before_step()
@@ -330,7 +331,7 @@ class Planner:
         spec: ToolSpec,
         arguments: dict[str, Any] | None = None,
     ) -> AuthorizationDecision:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         plan = self._plan()
         phase = plan.phase(state.current_phase)
@@ -537,7 +538,7 @@ class Planner:
         result: ToolResult | dict[str, Any],
         action_id: str | None = None,
     ) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         BudgetController(self.budget).record_tool_call()
         payload = result.model_dump(mode="json") if isinstance(result, ToolResult) else result
@@ -628,7 +629,7 @@ class Planner:
     def update_from_mutation(
         self, result: Any, *, tool_call_id: str | None = None
     ) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         payload = self._content_payload(result)
         if payload.get("mutation_status") not in {None, "preview"}:
             changed_files = list(payload.get("changed_files") or [])
@@ -664,7 +665,7 @@ class Planner:
     def update_from_command(
         self, result: Any, *, tool_call_id: str | None = None
     ) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         payload = self._content_payload(result)
         command = payload.get("command_result") if isinstance(payload.get("command_result"), dict) else payload
         if isinstance(command, dict):
@@ -688,7 +689,7 @@ class Planner:
     def update_from_verification(
         self, result: Any, *, tool_call_id: str | None = None
     ) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         payload = self._content_payload(result)
         verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else payload
         if not isinstance(verification, dict):
@@ -852,7 +853,7 @@ class Planner:
         return f"[sandbox] {prefix} under native OS sandbox enforcement via {backend}, exit_code={exit_code}."
 
     def record_sandbox_capability(self, snapshot: dict[str, Any]) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         state.sandbox_capability = dict(snapshot)
         self._persist()
@@ -863,7 +864,7 @@ class Planner:
         )
 
     def record_policy_observation(self, observation: dict[str, Any]) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         payload = {
             "outcome": observation.get("outcome"),
@@ -888,7 +889,7 @@ class Planner:
         )
 
     def record_instruction_prompt_observation(self, observation: dict[str, Any]) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         prompt_hash_references = self._string_list(observation.get("prompt_hash_references"))
         payload: dict[str, Any] = {
             "prompt_bundles_compiled_count": int(observation.get("prompt_bundles_compiled_count") or 0),
@@ -910,7 +911,7 @@ class Planner:
         )
 
     def record_execution_outcome(self, outcome: ExecutionOutcome | dict[str, Any]) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         payload = outcome.to_dict() if hasattr(outcome, "to_dict") else dict(outcome)
         self.evidence.add_task_outcome(payload)
         for item in payload.get("missing_evidence") or []:
@@ -947,7 +948,7 @@ class Planner:
         *,
         replan_signal: Any | None = None,
     ) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         analysis_payload = analysis.to_dict() if hasattr(analysis, "to_dict") else dict(analysis)
         repair_payload = repair_plan.to_dict() if hasattr(repair_plan, "to_dict") else dict(repair_plan)
         replan_payload = _dict_like(replan_signal)
@@ -1047,7 +1048,7 @@ class Planner:
             plan.current_phase = "running_verification"
 
     def record_project_index_observation(self, observation: dict[str, Any]) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         relevant_files = self._dict_list(observation.get("relevant_files"))[:20]
         payload: dict[str, Any] = {
             "index_id": observation.get("index_id"),
@@ -1081,7 +1082,7 @@ class Planner:
         *,
         tool_call_id: str | None = None,
     ) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         changed_files = self._string_list(observation.get("changed_files"))
         payload: dict[str, Any] = {
             "tool_call_id": tool_call_id,
@@ -1107,7 +1108,7 @@ class Planner:
     def update_from_edit(
         self, result: Any, *, tool_call_id: str | None = None
     ) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         payload = self._content_payload(result)
         edit = payload.get("edit") if isinstance(payload.get("edit"), dict) else payload
         if not isinstance(edit, dict):
@@ -1158,7 +1159,7 @@ class Planner:
         )
 
     def record_review_observation(self, observation: dict[str, Any]) -> None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         if not isinstance(observation, dict):
             return
         decision = self._dict_payload(observation.get("decision"))
@@ -1209,7 +1210,7 @@ class Planner:
         )
 
     def replan(self, signal: Any) -> ReplanDecision:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         signal_payload = _dict_like(signal)
         state = self._state()
         repair_contract = _repair_contract_payload(signal_payload)
@@ -1315,7 +1316,7 @@ class Planner:
         return decision
 
     def assess_completion(self, *, mark_blocked: bool = True) -> dict[str, Any]:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         unmet: list[str] = []
         if state.completion_criteria.required_files_inspected and not self.evidence.inspected_files:
@@ -1401,7 +1402,7 @@ class Planner:
         return bool(value)
 
     def finalize(self) -> FinalReport:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         trace_summary = (
             self.trace.final_report_summary(task_id=self.task_id)
             if self.trace is not None and hasattr(self.trace, "final_report_summary")
@@ -1583,7 +1584,7 @@ class Planner:
         *,
         workspace_health: dict[str, Any] | None = None,
     ) -> Planner:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state, plan, evidence, budget, final_report = self.store.load(session_id)
         self.session_id = session_id
         self.task_id = state.task_id
@@ -1608,7 +1609,7 @@ class Planner:
         return self
 
     def continue_with_instruction(self, instruction: str) -> TaskState:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         normalized = " ".join(instruction.split())
         revision = {
@@ -1634,7 +1635,7 @@ class Planner:
         return state
 
     def abort(self, reason: str = "aborted") -> TaskState:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         state.status = TaskStatus.FAILED
         state.blocked_reasons.append(reason)
@@ -1662,7 +1663,7 @@ class Planner:
         workspace_state: dict[str, Any] | None = None,
         action_id: str | None = None,
     ) -> ToolExposureDecision:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state = self._state()
         phase = self._plan().phase(state.current_phase)
         allowed = self._active_tool_scope(
@@ -1713,7 +1714,7 @@ class Planner:
         workspace_state: dict[str, Any] | None = None,
         action_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         if tool_specs is not None:
             allowed = set(
                 self.decide_tool_exposure(
@@ -2425,11 +2426,6 @@ class Planner:
             else:
                 self._append_unique(constraints, item)
         return constraints
-
-    def _throw_if_cancelled(self) -> None:
-        token = getattr(self, "cancellation_token", None)
-        if token is not None and hasattr(token, "throw_if_cancelled"):
-            token.throw_if_cancelled()
 
     def _plan(self) -> TaskPlan:
         if self.plan is None:

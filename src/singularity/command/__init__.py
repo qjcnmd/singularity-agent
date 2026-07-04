@@ -1,7 +1,6 @@
 from singularity.command.backend import (
     ExecutionBackend,
     LocalProcessBackend,
-    SandboxBackend,
 )
 from singularity.command.errors import COMMAND_ERROR_CODES
 from singularity.command.executor import CommandExecutor
@@ -44,6 +43,5 @@ __all__ = [
     "ProcessSession",
     "ProcessStopResult",
     "ResourceLimits",
-    "SandboxBackend",
     "SemanticStatus",
 ]

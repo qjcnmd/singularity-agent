@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -271,3 +272,17 @@ def test_state_store_close_releases_sqlite_connection(tmp_path: Path) -> None:
 
     with pytest.raises(sqlite3.ProgrammingError):
         store.connection.execute("select 1")
+
+
+def test_state_store_supports_cross_thread_public_reads(tmp_path: Path) -> None:
+    store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
+    batch = store.create_batch(make_batch())
+    record = store.upsert_record(batch.tool_calls[0], phase=ToolCallPhase.VALIDATED)
+
+    def read_record_id() -> str:
+        return store.get_record(record.record_id).record_id
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(read_record_id).result()
+
+    assert result == record.record_id

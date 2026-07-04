@@ -211,19 +211,11 @@ class ToolProtocolRecoveryManager:
         session_id: str | None = None,
         task_id: str | None = None,
     ) -> list[Any]:
-        clauses = ["run_id = ?"]
-        params: list[Any] = [run_id]
-        if session_id is not None:
-            clauses.append("session_id = ?")
-            params.append(session_id)
-        if task_id is not None:
-            clauses.append("task_id = ?")
-            params.append(task_id)
-        rows = self.store.connection.execute(
-            f"select * from tool_call_batches where {' and '.join(clauses)} order by created_at, batch_id",
-            tuple(params),
-        ).fetchall()
-        return [self.store._batch_from_row(row) for row in rows]
+        return self.store.batches_for_run(
+            run_id,
+            session_id=session_id,
+            task_id=task_id,
+        )
 
     def _is_pending_approval(self, record: Any) -> bool:
         if record.phase == ToolCallPhase.WAITING_APPROVAL:

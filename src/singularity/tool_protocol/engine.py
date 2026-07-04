@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from singularity.context import ContextManager
+from singularity.kernel.cancellation import throw_if_cancelled
 from singularity.model import ModelCapabilities, ModelRole, ModelTurnResult
 from singularity.planner import Planner
 from singularity.tool_protocol.binding import ToolProtocolResultBinder
@@ -70,7 +71,7 @@ class ToolProtocolEngine:
             turn_result_factory=build_tool_protocol_turn_result,
             trace_ids_factory=self._trace_ids,
             call_trace_ids_factory=self._call_trace_ids,
-            throw_if_cancelled=self._throw_if_cancelled,
+            throw_if_cancelled=lambda: throw_if_cancelled(self),
         )
         self.recovery_manager = ToolProtocolRecoveryManager(self.state_store)
         self.workspace_state_hook = workspace_state_hook
@@ -108,7 +109,7 @@ class ToolProtocolEngine:
         tool_executor: ToolExecutor,
         planner: Planner | None,
     ) -> ToolProtocolTurnResult:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         assistant_message = self._assistant_message_from_model_result(model_result)
         if assistant_message is None:
             return ToolProtocolTurnResult(
@@ -134,7 +135,7 @@ class ToolProtocolEngine:
             )
 
         self.state_store.save_batch(batch)
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         self.trace.emit(
             "tool_protocol.batch_created",
             summary="Tool protocol batch created.",
@@ -160,7 +161,7 @@ class ToolProtocolEngine:
             )
 
         plan = self.build_execution_plan(batch, validation=validation)
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         self.trace.emit(
             "tool_protocol.plan_built",
             summary="Tool protocol execution plan built.",
@@ -181,7 +182,7 @@ class ToolProtocolEngine:
             planner=planner,
             turn=turn,
         )
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         if self.workspace_state_hook is not None:
             self._inject_workspace_state(
                 context,
@@ -259,11 +260,6 @@ class ToolProtocolEngine:
             assistant_message={"role": "assistant", "content": None, "tool_calls": []},
         )
 
-    def _throw_if_cancelled(self) -> None:
-        token = getattr(self, "cancellation_token", None)
-        if token is not None and hasattr(token, "throw_if_cancelled"):
-            token.throw_if_cancelled()
-
     def append_results_to_context(
         self,
         context: ContextManager,
@@ -275,21 +271,6 @@ class ToolProtocolEngine:
         return self.context_projector.append_result(
             context,
             envelope=envelope,
-            result=result,
-            turn=turn,
-        )
-
-    def _append_result(
-        self,
-        context: ContextManager,
-        record: Any,
-        result: ToolProtocolResultEnvelope,
-        *,
-        turn: int = 0,
-    ) -> str | None:
-        return self.append_results_to_context(
-            context,
-            envelope=record.envelope,
             result=result,
             turn=turn,
         )
@@ -348,19 +329,6 @@ class ToolProtocolEngine:
     def _assistant_message_dict(self, model_result: ModelTurnResult) -> dict[str, Any]:
         assistant_message = self._assistant_message_from_model_result(model_result)
         return assistant_message or {"role": "assistant", "content": None, "tool_calls": []}
-
-    def _context_has_tool_message(
-        self,
-        context: ContextManager,
-        tool_call_id: str,
-        *,
-        content_digest: str | None = None,
-    ) -> bool:
-        return ToolProtocolContextProjector.has_tool_message(
-            context,
-            tool_call_id,
-            content_digest=content_digest,
-        )
 
     def _synthetic_result(
         self,

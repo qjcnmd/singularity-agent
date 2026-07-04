@@ -82,3 +82,17 @@ class CancellationManager:
 
     def child_token(self) -> CancellationToken:
         return self.token.child_token()
+
+
+def throw_if_cancelled(source: object | None) -> None:
+    token = getattr(source, "cancellation_token", source)
+    if token is not None and hasattr(token, "throw_if_cancelled"):
+        token.throw_if_cancelled()
+
+
+def is_cancellation_error(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, CancellationError)
+        or getattr(exc, "code", None) == "cancelled"
+        or exc.__class__.__name__ == "CancellationError"
+    )

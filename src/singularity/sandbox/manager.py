@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from singularity.kernel.cancellation import is_cancellation_error, throw_if_cancelled
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.observability.redaction import TraceRedactor
@@ -77,7 +78,7 @@ class SandboxManager:
         )
 
     def run(self, request: SandboxRequest) -> SandboxResult:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         started = time.perf_counter()
         backend: SandboxBackend | None = None
         backend_capabilities = None
@@ -127,9 +128,9 @@ class SandboxManager:
                 reduced_enforcement_allowed=backend.name()
                 == _WINDOWS_UNELEVATED_BACKEND_NAME,
             )
-            self._throw_if_cancelled()
+            throw_if_cancelled(self)
             prepared = backend.prepare(request)
-            self._throw_if_cancelled()
+            throw_if_cancelled(self)
             self._emit_trace(
                 TraceEventType.SANDBOX_PREPARED,
                 request=request,
@@ -149,7 +150,7 @@ class SandboxManager:
                 summary=f"Sandbox command started in {prepared.sandbox_id}.",
             )
             result = backend.run(prepared)
-            self._throw_if_cancelled()
+            throw_if_cancelled(self)
             try:
                 cleanup_started = time.perf_counter()
                 backend.cleanup(prepared)
@@ -220,7 +221,7 @@ class SandboxManager:
             )
             return result
         except Exception as exc:
-            if _is_cancellation_error(exc):
+            if is_cancellation_error(exc):
                 if prepared is not None and backend is not None:
                     with suppress(Exception):
                         backend.cleanup(prepared)
@@ -506,7 +507,7 @@ class SandboxManager:
                 prepared=prepared,
             )
         except Exception as exc:
-            if _is_cancellation_error(exc):
+            if is_cancellation_error(exc):
                 if prepared is not None:
                     with suppress(Exception):
                         backend.cleanup(prepared)
@@ -954,18 +955,8 @@ class SandboxManager:
             artifact_refs=[artifact.artifact_id for artifact in result.artifacts] if result else [],
         )
 
-    def _throw_if_cancelled(self) -> None:
-        token = getattr(self, "cancellation_token", None)
-        if token is not None and hasattr(token, "throw_if_cancelled"):
-            token.throw_if_cancelled()
-
-
 def _now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def _is_cancellation_error(exc: BaseException) -> bool:
-    return type(exc).__name__ == "CancellationError" and getattr(exc, "code", None) == "cancelled"
 
 
 def _relative_handle(path: Path, root: Path) -> str:

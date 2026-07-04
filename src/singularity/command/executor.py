@@ -35,6 +35,7 @@ from singularity.command.models import (
 from singularity.command.output import OutputCollector, OutputSnapshot, SecretRedactor
 from singularity.command.policy import CommandPolicy
 from singularity.error_codes import ErrorCode
+from singularity.kernel.cancellation import throw_if_cancelled
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.policy import (
@@ -201,7 +202,7 @@ class CommandExecutor:
         tool_call_id: str | None = None,
         transaction_id: str | None = None,
     ) -> CommandResult:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         self._emit_trace(
             TraceEventType.COMMAND_REQUESTED,
             request,
@@ -370,7 +371,7 @@ class CommandExecutor:
         tool_call_id: str | None = None,
         transaction_id: str | None = None,
     ) -> ProcessSession:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         started_at = _now()
         if self.policy.requires_verification_runner(request):
             return ProcessSession(
@@ -481,7 +482,7 @@ class CommandExecutor:
         return session
 
     def read_process_output(self, process_id: str) -> ProcessOutput:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         record = self._sessions.get(process_id)
         if record is None:
             return ProcessOutput(
@@ -653,11 +654,6 @@ class CommandExecutor:
             collector=collector,
             cancellation_token=getattr(self, "cancellation_token", None),
         )
-
-    def _throw_if_cancelled(self) -> None:
-        token = getattr(self, "cancellation_token", None)
-        if token is not None and hasattr(token, "throw_if_cancelled"):
-            token.throw_if_cancelled()
 
     def _completed_result(
         self,

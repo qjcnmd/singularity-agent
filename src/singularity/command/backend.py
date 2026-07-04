@@ -13,8 +13,13 @@ from uuid import uuid4
 
 from singularity.command.models import CommandRequest, ResourceLimits
 from singularity.command.output import OutputCollector
+from singularity.kernel.cancellation import throw_if_cancelled
 
 _PIPE_READ_CHUNK_SIZE = 8192
+PROCESS_POLL_INTERVAL_SECONDS = 0.02
+READER_DRAIN_TIMEOUT_SECONDS = 1.0
+READER_DRAIN_POLL_INTERVAL_SECONDS = 0.01
+READER_JOIN_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -67,26 +72,6 @@ class ExecutionBackend:
         owner_transaction: str | None = None,
     ) -> RunningProcess:
         raise NotImplementedError
-
-
-class SandboxBackend(ExecutionBackend):
-    name = "sandbox"
-
-    def execute(
-        self,
-        *,
-        request: CommandRequest,
-        cwd: Path,
-        env: dict[str, str],
-        collector: OutputCollector,
-        cancellation_token: object | None = None,
-    ) -> BackendRunResult:
-        return BackendRunResult(
-            exit_code=None,
-            signal=None,
-            error_code="sandbox_unavailable",
-            error_message="Sandbox backend interface is reserved but not implemented.",
-        )
 
 
 class LocalProcessBackend(ExecutionBackend):
@@ -243,7 +228,7 @@ class LocalProcessBackend(ExecutionBackend):
 
         while True:
             try:
-                _throw_if_cancelled(cancellation_token)
+                throw_if_cancelled(cancellation_token)
             except Exception:
                 killed_reason = "cancelled"
                 self.supervisor.kill_process_tree(process, reason=killed_reason)
@@ -268,7 +253,7 @@ class LocalProcessBackend(ExecutionBackend):
                 killed_reason = "idle_timeout"
                 self.supervisor.kill_process_tree(process, reason=killed_reason)
                 break
-            time.sleep(0.02)
+            time.sleep(PROCESS_POLL_INTERVAL_SECONDS)
 
         if process.poll() is None:
             killed_reason = killed_reason or "force_kill"
@@ -302,12 +287,12 @@ class LocalProcessBackend(ExecutionBackend):
         return saw_output
 
     def _drain_until_threads_quiet(self, running: RunningProcess) -> None:
-        deadline = time.perf_counter() + 1
+        deadline = time.perf_counter() + READER_DRAIN_TIMEOUT_SECONDS
         while time.perf_counter() < deadline:
             self._drain_available_output(running)
             if not any(thread.is_alive() for thread in running.reader_threads):
                 break
-            time.sleep(0.01)
+            time.sleep(READER_DRAIN_POLL_INTERVAL_SECONDS)
         self._drain_available_output(running)
         self._join_reader_threads(running)
 
@@ -322,7 +307,7 @@ class LocalProcessBackend(ExecutionBackend):
 
     @staticmethod
     def _join_reader_threads(running: RunningProcess) -> None:
-        deadline = time.perf_counter() + 1
+        deadline = time.perf_counter() + READER_JOIN_TIMEOUT_SECONDS
         for thread in list(running.reader_threads):
             remaining = max(0.0, deadline - time.perf_counter())
             thread.join(timeout=remaining)
@@ -454,8 +439,3 @@ def _reader_thread(
     thread = threading.Thread(target=run, name=f"command-{stream_name}-reader", daemon=True)
     thread.start()
     return thread
-
-
-def _throw_if_cancelled(cancellation_token: object | None) -> None:
-    if cancellation_token is not None and hasattr(cancellation_token, "throw_if_cancelled"):
-        cancellation_token.throw_if_cancelled()

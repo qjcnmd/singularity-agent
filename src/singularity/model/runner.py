@@ -7,6 +7,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from singularity.kernel.cancellation import is_cancellation_error, throw_if_cancelled
 from singularity.model.budget import ModelBudgetManager
 from singularity.model.config import ModelRunnerConfig
 from singularity.model.errors import (
@@ -179,7 +180,7 @@ class ModelRunner:
         return mode == "rule_only"
 
     def run_turn(self, request: ModelTurnRequest) -> ModelTurnResult:
-        _throw_if_cancelled(self)
+        throw_if_cancelled(self)
         self.turn_count += 1
         started = time.perf_counter()
         request = self._normalize_request(request)
@@ -335,7 +336,7 @@ class ModelRunner:
             event_ids.extend(self._emit_request_failed(request, error))
             return self._failed_result(request, status=ModelTurnStatus.FAILED, error=error, event_ids=event_ids, started=started)
         except Exception as exc:
-            if _is_cancellation_error(exc):
+            if is_cancellation_error(exc):
                 raise
             error = ModelError(
                 kind=ModelErrorKind.UNKNOWN_PROVIDER_ERROR,
@@ -352,7 +353,7 @@ class ModelRunner:
         provider: ModelProvider,
         request: ModelTurnRequest,
     ) -> ProviderResponse:
-        _throw_if_cancelled(self)
+        throw_if_cancelled(self)
         policy = RetryPolicy(
             max_attempts=max(1, request.budget.max_retries + 1),
             backoff_seconds=float(self.config.retry_policy.get("backoff_seconds", 0.25)),
@@ -364,7 +365,7 @@ class ModelRunner:
         controller = ModelRetryController(policy)
 
         def operation(model_name: str | None) -> ProviderResponse:
-            _throw_if_cancelled(self)
+            throw_if_cancelled(self)
             preferences = request.model_preferences
             if model_name is not None:
                 preferences = preferences.__class__.from_dict(
@@ -508,7 +509,7 @@ class ModelRunner:
         finish_reason = "stop"
         usage = ModelUsage()
         for event in provider.stream(provider_request):
-            _throw_if_cancelled(self)
+            throw_if_cancelled(self)
             if event.type == ProviderStreamEventType.ERROR:
                 if isinstance(event.error, ModelError):
                     raise event.error
@@ -1014,13 +1015,3 @@ def _cache_ratio(cached_tokens: int, input_tokens: int) -> float:
     if input_tokens <= 0:
         return 0.0
     return round(cached_tokens / input_tokens, 4)
-
-
-def _throw_if_cancelled(component: Any) -> None:
-    token = getattr(component, "cancellation_token", None)
-    if token is not None and hasattr(token, "throw_if_cancelled"):
-        token.throw_if_cancelled()
-
-
-def _is_cancellation_error(exc: BaseException) -> bool:
-    return type(exc).__name__ == "CancellationError" and getattr(exc, "code", None) == "cancelled"

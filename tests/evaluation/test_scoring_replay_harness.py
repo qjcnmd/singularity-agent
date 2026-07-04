@@ -119,6 +119,28 @@ def test_patch_quality_evaluator_penalizes_large_and_redundant_diffs() -> None:
     assert "large_diff" in large.warnings
 
 
+@pytest.mark.parametrize("status", ["success", "ready_with_warnings"])
+def test_executor_patch_quality_heuristic_reuses_patch_quality_evaluator(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    diff_summary = [{"path": "app.py", "added_lines": 3, "removed_lines": 1}]
+    verification = {"status": status}
+    expected = PatchQualityEvaluator().evaluate(
+        diff_summary=diff_summary,
+        verification=verification,
+    )
+    executor = BenchmarkTaskExecutor(project_root=tmp_path)
+
+    heuristics = executor.evaluate_heuristics(
+        [ExpectedOutcome(kind=ExpectedOutcomeKind.HEURISTIC, heuristic="patch_quality")],
+        verification=verification,
+        diff_summary=diff_summary,
+    )
+
+    assert heuristics["patch_quality"] == expected.score
+
+
 def test_benchmark_executor_diff_summary_reports_real_complexity_and_redundancy() -> None:
     summary = BenchmarkTaskExecutor.diff_summary_from_snapshots(
         {"app.py": "def run():\n    return 1\n"},

@@ -16,6 +16,7 @@ from singularity.edit.patch import PatchBuilder, PatchBuildError
 from singularity.edit.planner import EditPlanBuilder
 from singularity.edit.repair import EditRepairController
 from singularity.edit.validation import PatchValidator
+from singularity.kernel.cancellation import throw_if_cancelled
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.review.models import ReviewDecisionAction
 from singularity.workspace import MutationError, WorkspaceMutationManager
@@ -53,7 +54,7 @@ class EditExecutor:
         self.applier = EditApplier(self.mutation_manager)
 
     def plan_intent(self, intent: EditIntent) -> EditResult:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         plan = self.plan_builder.build(intent)
         self._emit(
             TraceEventType.EDIT_PLAN_CREATED,
@@ -95,7 +96,7 @@ class EditExecutor:
         reason: str | None = None,
         tool_call_id: str | None = None,
     ) -> Any:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         if encoding.lower().replace("_", "-") != "utf-8":
             raise MutationError(
                 "unsupported_operation",
@@ -153,7 +154,7 @@ class EditExecutor:
         allow_new_files: bool = True,
         tool_call_id: str | None = None,
     ) -> Any:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         operations = self.mutation_manager.operations_from_unified_diff(
             patch,
             expected_files=expected_files,
@@ -186,7 +187,7 @@ class EditExecutor:
         tool_call_id: str | None,
         repair: bool,
     ) -> EditResult:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         attempts = 0
         candidates_used = 0
         repair_attempts = []
@@ -542,8 +543,3 @@ class EditExecutor:
             )
         elif hasattr(self.trace, "record"):
             self.trace.record("edit", {"event_type": event_type.value, "summary": summary, **payload})
-
-    def _throw_if_cancelled(self) -> None:
-        token = getattr(self, "cancellation_token", None)
-        if token is not None and hasattr(token, "throw_if_cancelled"):
-            token.throw_if_cancelled()

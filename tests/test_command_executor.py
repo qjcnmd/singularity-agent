@@ -36,6 +36,13 @@ from tests.test_tool_executor_policy_approval import SequencedPolicyEngine
 from tests.tool_executor_helpers import default_policy_engine
 
 
+def test_command_package_does_not_export_reserved_sandbox_backend_placeholder() -> None:
+    import singularity.command as command
+
+    assert "SandboxBackend" not in command.__all__
+    assert not hasattr(command, "SandboxBackend")
+
+
 class SimpleTokenCounter:
     def count_text(self, text: str) -> int:
         return len(text.split())

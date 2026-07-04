@@ -1162,7 +1162,7 @@
 │                                                              │
 │  ⑥ 验证与批次创建 (handle_model_turn_result:97-188)            │
 │                                                              │
-│  _throw_if_cancelled()    ← cancellation token 检查            │
+│  throw_if_cancelled(...)  ← cancellation token 检查            │
 │                                                              │
 │  assistant_message = _assistant_message_from_model_result()  │
 │  │                                                           │
@@ -1193,7 +1193,7 @@
 │      │                                                       │
 │      └── [有效 batch]                                        │
 │          ├── state_store.save_batch(batch)  → SQLite         │
-│          ├── _throw_if_cancelled()                            │
+│          ├── throw_if_cancelled(engine)                       │
 │          ├── trace.emit("tool_protocol.batch_created", …)    │
 │          └── context.add_assistant_message(assistant_message)│
 │                                                              │
@@ -1270,7 +1270,7 @@
 │  │  for each call in ordered_calls:                       │   │
 │  │      │                                                 │   │
 │  │      ├── prepared = _prepare_call(batch, context, call)│   │
-│  │      │   ├── _throw_if_cancelled()                      │   │
+│  │      │   ├── throw_if_cancelled(engine)                 │   │
 │  │      │   ├── state_store.upsert_record(VALIDATED)       │   │
 │  │      │   └── trace.emit("tool_protocol.call_validated") │   │
 │  │      │                                                 │   │
@@ -1286,8 +1286,8 @@
 │  │      │   │       (synthetic, 非真实执行)              │   │   │
 │  │      │   ├── state_store.transition(REJECTED, …)     │   │   │
 │  │      │   ├── state_store.bind_result(result)          │   │   │
-│  │      │   ├── _append_result(context, record,          │   │   │
-│  │      │   │       synthetic, turn)                    │   │   │
+│  │      │   ├── result_binder.append_result(            │   │   │
+│  │      │   │       context, record, synthetic, turn)   │   │   │
 │  │      │   │   → ToolProtocolContextProjector.append_result()│
 │  │      │   │   → ContextManager.add_tool_protocol_result()│  │   │
 │  │      │   ├── appended_tool_message_count++            │   │   │
@@ -1308,8 +1308,8 @@
 │  │      │   │                                             │   │
 │  │      │   ├── [idempotent replay → 复用缓存]             │   │
 │  │      │   │   ├── state_store.transition(RECOVERED)     │   │
-│  │      │   │   ├── _append_result(context, record,       │   │
-│  │      │   │   │       cached_result, turn)              │   │
+│  │      │   │   ├── result_binder.append_result(          │   │
+│  │      │   │   │       context, record, cached_result, turn)│ │
 │  │      │   │   │   → ToolProtocolContextProjector 去重/append│
 │  │      │   │   ├── trace.emit("tool_protocol.replay_detected")│
 │  │      │   │   └── continue → next call                  │   │

@@ -12,6 +12,11 @@ from typing import Any
 
 from singularity.kernel.exceptions import WorkspaceLockError
 
+GUARD_ACQUIRE_TIMEOUT_SECONDS = 5.0
+GUARD_RETRY_INTERVAL_SECONDS = 0.01
+GUARD_RELEASE_TIMEOUT_SECONDS = 1.0
+STALE_GUARD_AGE_SECONDS = 30
+
 
 @dataclass(frozen=True)
 class WorkspaceLockHandle:
@@ -162,7 +167,7 @@ class WorkspaceLockManager:
     @contextmanager
     def _guard(self):
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + GUARD_ACQUIRE_TIMEOUT_SECONDS
         fd: int | None = None
         while fd is None:
             try:
@@ -174,14 +179,13 @@ class WorkspaceLockManager:
                 if self._guard_is_stale():
                     with suppress(PermissionError):
                         self.guard_path.unlink(missing_ok=True)
-                    continue
                 if time.monotonic() >= deadline:
                     raise WorkspaceLockError(
                         "Workspace lock guard is busy.",
                         code="workspace_lock_busy",
                         details={"guard_path": str(self.guard_path)},
                     ) from None
-                time.sleep(0.01)
+                time.sleep(GUARD_RETRY_INTERVAL_SECONDS)
         try:
             os.write(
                 fd,
@@ -212,10 +216,10 @@ class WorkspaceLockManager:
             age = datetime.now(UTC) - datetime.fromisoformat(str(created_at))
         except (TypeError, ValueError):
             return True
-        return age.total_seconds() > 30 and not _pid_exists(pid)
+        return age.total_seconds() > STALE_GUARD_AGE_SECONDS and not _pid_exists(pid)
 
     def _release_guard(self) -> None:
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + GUARD_RELEASE_TIMEOUT_SECONDS
         while True:
             try:
                 self.guard_path.unlink(missing_ok=True)
@@ -223,7 +227,7 @@ class WorkspaceLockManager:
             except PermissionError:
                 if time.monotonic() >= deadline:
                     return
-                time.sleep(0.01)
+                time.sleep(GUARD_RETRY_INTERVAL_SECONDS)
 
 
 def _pid_exists(pid: Any) -> bool:

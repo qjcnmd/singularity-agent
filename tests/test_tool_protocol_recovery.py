@@ -17,6 +17,12 @@ from singularity.tool_protocol.state import ToolProtocolStateStore
 from singularity.tools.models import ToolResult
 
 
+class PublicApiOnlyToolProtocolStateStore(ToolProtocolStateStore):
+    @property
+    def connection(self):  # type: ignore[no-untyped-def]
+        raise AssertionError("recovery must use ToolProtocolStateStore public query APIs")
+
+
 def _envelope(assistant_message_id: str = "assistant_1") -> ToolCallEnvelope:
     return ToolCallEnvelope(
         protocol_version="1.0",
@@ -139,3 +145,13 @@ def test_recovery_filters_by_session_and_task_scope(tmp_path: Path) -> None:
     )
 
     assert report.recovery_report["pending_call_ids"] == ["call_b"]
+
+
+def test_recovery_uses_state_store_public_batch_query(tmp_path: Path) -> None:
+    store = PublicApiOnlyToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
+    batch = store.create_batch(_batch())
+    store.upsert_record(batch.tool_calls[0], phase=ToolCallPhase.PROPOSED)
+
+    report = ToolProtocolRecoveryManager(store).recover(run_id="run_1")
+
+    assert report.recovery_report["pending_call_ids"] == ["call_1"]

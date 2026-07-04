@@ -4014,6 +4014,39 @@ def test_start_windows_restricted_child_closes_process_handles_when_resume_fails
     assert closed.count(10) == 1
 
 
+def test_create_restricted_token_closes_restricted_handle_when_low_integrity_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import singularity.sandbox.windows_runner as runner
+
+    closed: list[int] = []
+
+    class FakeAdvapi:
+        def OpenProcessToken(self, _process, _access, token_out):
+            token_out._obj.value = 10
+            return True
+
+        def CreateRestrictedToken(self, *_args):
+            restricted_out = _args[-1]
+            restricted_out._obj.value = 20
+            return True
+
+    class FakeKernel:
+        def GetCurrentProcess(self):
+            return 99
+
+    monkeypatch.setattr(runner, "_advapi32", lambda: FakeAdvapi())
+    monkeypatch.setattr(runner, "_kernel32", lambda: FakeKernel())
+    monkeypatch.setattr(runner, "_close_handle", lambda handle: closed.append(handle))
+    monkeypatch.setattr(runner, "_set_low_integrity", lambda _handle: (_ for _ in ()).throw(OSError("low integrity failed")))
+
+    with pytest.raises(OSError, match="low integrity failed"):
+        runner._create_restricted_token()
+
+    assert closed.count(20) == 1
+    assert closed.count(10) == 1
+
+
 def test_windows_extended_path_supports_long_local_and_unc_working_directories() -> None:
     import singularity.sandbox.windows_runner as runner
 

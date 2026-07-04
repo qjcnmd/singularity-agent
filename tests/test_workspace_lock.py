@@ -119,6 +119,49 @@ def test_workspace_lock_allows_only_one_writer_across_processes(tmp_path: Path) 
     assert results.count("acquired") == 1
 
 
+def test_workspace_lock_stale_guard_unlink_failure_waits_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import singularity.kernel.locks as locks
+
+    manager = WorkspaceLockManager(tmp_path)
+    manager.guard_path.parent.mkdir(parents=True, exist_ok=True)
+    manager.guard_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999999,
+                "hostname": "stale",
+                "created_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_results = iter([True, True, False])
+    sleeps: list[float] = []
+    open_attempts = 0
+
+    def fake_open(*_args, **_kwargs) -> int:
+        nonlocal open_attempts
+        open_attempts += 1
+        if open_attempts <= 2:
+            raise FileExistsError()
+        return 123
+
+    monkeypatch.setattr(locks.os, "open", fake_open)
+    monkeypatch.setattr(locks.os, "write", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(locks.os, "close", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(manager, "_guard_is_stale", lambda: next(stale_results))
+    monkeypatch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr(locks.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(manager, "_release_guard", lambda: None)
+
+    with manager._guard():
+        pass
+
+    assert sleeps == [0.01, 0.01]
+
+
 def _try_acquire_writer(path: Path, run_id: str, queue: Queue[str]) -> None:
     try:
         WorkspaceLockManager(path).acquire_lock(run_id=run_id, read_only=False)

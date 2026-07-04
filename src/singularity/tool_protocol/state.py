@@ -45,9 +45,9 @@ class ToolProtocolStateStore:
         self.db_path = db_path
         if db_path is not None:
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._connection = sqlite3.connect(str(db_path))
+            self._connection = sqlite3.connect(str(db_path), check_same_thread=False)
         else:
-            self._connection = sqlite3.connect(":memory:")
+            self._connection = sqlite3.connect(":memory:", check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._lock = RLock()
         self._init_schema()
@@ -128,39 +128,39 @@ class ToolProtocolStateStore:
         attempts: int = 1,
     ) -> ToolCallRecord:
         call = envelope if isinstance(envelope, ToolCallEnvelope) else ToolCallEnvelope.from_dict(envelope)
-        batch_row = self._batch_row_for_call(call, batch_id=batch_id)
-        if batch_row is None:
-            raise ToolProtocolStateError(f"unknown_batch_for_call: {call.tool_call_id}")
-        resolved_batch_id = str(batch_row["batch_id"])
-        existing_row = self._record_row(call.run_id, call.tool_call_id)
-        record = ToolCallRecord(
-            record_id=str(existing_row["record_id"]) if existing_row else _record_id(call.tool_call_id),
-            envelope=call,
-            phase=phase,
-            previous_phase=previous_phase
-            or (
-                ToolCallPhase(existing_row["phase"])
-                if existing_row and existing_row["phase"]
-                else None
-            ),
-            policy_decision_id=policy_decision_id or _row_value(existing_row, "policy_decision_id"),
-            approval_grant_id=approval_grant_id or _row_value(existing_row, "approval_grant_id"),
-            execution_started_at=execution_started_at or _row_value(existing_row, "execution_started_at"),
-            execution_finished_at=execution_finished_at or _row_value(existing_row, "execution_finished_at"),
-            tool_result_digest=tool_result_digest or _row_value(existing_row, "tool_result_digest"),
-            context_message_id=context_message_id or _row_value(existing_row, "context_message_id"),
-            error_kind=error_kind
-            or (
-                ToolCallFailureKind(existing_row["error_kind"])
-                if existing_row and existing_row["error_kind"]
-                else None
-            ),
-            error_message=error_message or _row_value(existing_row, "error_message"),
-            attempts=max(int(attempts), int(existing_row["attempts"]) + 1 if existing_row else 1),
-            created_at=_row_value(existing_row, "created_at") or call.proposed_at,
-            updated_at=call.proposed_at,
-        )
         with self._lock:
+            batch_row = self._batch_row_for_call(call, batch_id=batch_id)
+            if batch_row is None:
+                raise ToolProtocolStateError(f"unknown_batch_for_call: {call.tool_call_id}")
+            resolved_batch_id = str(batch_row["batch_id"])
+            existing_row = self._record_row(call.run_id, call.tool_call_id)
+            record = ToolCallRecord(
+                record_id=str(existing_row["record_id"]) if existing_row else _record_id(call.tool_call_id),
+                envelope=call,
+                phase=phase,
+                previous_phase=previous_phase
+                or (
+                    ToolCallPhase(existing_row["phase"])
+                    if existing_row and existing_row["phase"]
+                    else None
+                ),
+                policy_decision_id=policy_decision_id or _row_value(existing_row, "policy_decision_id"),
+                approval_grant_id=approval_grant_id or _row_value(existing_row, "approval_grant_id"),
+                execution_started_at=execution_started_at or _row_value(existing_row, "execution_started_at"),
+                execution_finished_at=execution_finished_at or _row_value(existing_row, "execution_finished_at"),
+                tool_result_digest=tool_result_digest or _row_value(existing_row, "tool_result_digest"),
+                context_message_id=context_message_id or _row_value(existing_row, "context_message_id"),
+                error_kind=error_kind
+                or (
+                    ToolCallFailureKind(existing_row["error_kind"])
+                    if existing_row and existing_row["error_kind"]
+                    else None
+                ),
+                error_message=error_message or _row_value(existing_row, "error_message"),
+                attempts=max(int(attempts), int(existing_row["attempts"]) + 1 if existing_row else 1),
+                created_at=_row_value(existing_row, "created_at") or call.proposed_at,
+                updated_at=call.proposed_at,
+            )
             if existing_row is None:
                 self._connection.execute(
                     """
@@ -212,36 +212,37 @@ class ToolProtocolStateStore:
         error_message: str | None = None,
         tool_result_digest: str | None = None,
     ) -> ToolCallRecord:
-        record = self._record_by_tool_call_id(tool_call_id)
-        if record is None:
-            batch_row = self._batch_row_for_tool_call_id(tool_call_id)
-            if batch_row is None:
-                raise ToolProtocolStateError(f"unknown_tool_call_id: {tool_call_id}")
-            call = self._tool_call_from_batch(batch_row, tool_call_id)
+        with self._lock:
+            record = self._record_by_tool_call_id(tool_call_id)
+            if record is None:
+                batch_row = self._batch_row_for_tool_call_id(tool_call_id)
+                if batch_row is None:
+                    raise ToolProtocolStateError(f"unknown_tool_call_id: {tool_call_id}")
+                call = self._tool_call_from_batch(batch_row, tool_call_id)
+                return self.upsert_record(
+                    call,
+                    batch_id=str(batch_row["batch_id"]),
+                    phase=phase,
+                    policy_decision_id=policy_decision_id,
+                    approval_grant_id=approval_grant_id,
+                    error_kind=error_kind,
+                    error_message=error_message,
+                    tool_result_digest=tool_result_digest,
+                )
+            record_row = self._record_row_by_id(record.record_id)
+            if record_row is None:
+                raise ToolProtocolStateError(f"unknown_record_id: {record.record_id}")
             return self.upsert_record(
-                call,
-                batch_id=str(batch_row["batch_id"]),
+                record.envelope,
+                batch_id=str(record_row["batch_id"]),
                 phase=phase,
+                previous_phase=record.phase,
                 policy_decision_id=policy_decision_id,
                 approval_grant_id=approval_grant_id,
                 error_kind=error_kind,
                 error_message=error_message,
                 tool_result_digest=tool_result_digest,
             )
-        record_row = self._record_row_by_id(record.record_id)
-        if record_row is None:
-            raise ToolProtocolStateError(f"unknown_record_id: {record.record_id}")
-        return self.upsert_record(
-            record.envelope,
-            batch_id=str(record_row["batch_id"]),
-            phase=phase,
-            previous_phase=record.phase,
-            policy_decision_id=policy_decision_id,
-            approval_grant_id=approval_grant_id,
-            error_kind=error_kind,
-            error_message=error_message,
-            tool_result_digest=tool_result_digest,
-        )
 
     def bind_result(
         self,
@@ -251,17 +252,17 @@ class ToolProtocolStateStore:
         result: ToolProtocolResultEnvelope,
         raw_result_ref: str | None = None,
     ) -> ToolProtocolResultBinding:
-        if record_id is None:
-            if tool_call_id is None:
-                raise ToolProtocolStateError("missing_record_or_tool_call_id")
-            record = self.record_by_tool_call_id(tool_call_id)
-            record_id = record.record_id
-        else:
-            record = self.get_record(record_id)
-        row = self._record_row_by_id(record_id)
-        if row is None:
-            raise ToolProtocolStateError(f"unknown_record_id: {record_id}")
         with self._lock:
+            if record_id is None:
+                if tool_call_id is None:
+                    raise ToolProtocolStateError("missing_record_or_tool_call_id")
+                record = self.record_by_tool_call_id(tool_call_id)
+                record_id = record.record_id
+            else:
+                self.get_record(record_id)
+            row = self._record_row_by_id(record_id)
+            if row is None:
+                raise ToolProtocolStateError(f"unknown_record_id: {record_id}")
             existing = self._binding_row(record_id)
             binding = ToolProtocolResultBinding(
                 binding_id=str(existing["binding_id"]) if existing else _binding_id(record_id),
@@ -354,10 +355,10 @@ class ToolProtocolStateStore:
         observation_id: str | None = None,
         context_message_id: str | None = None,
     ) -> None:
-        row = self._record_row_by_id(record_id)
-        if row is None:
-            raise ToolProtocolStateError(f"unknown_record_id: {record_id}")
         with self._lock:
+            row = self._record_row_by_id(record_id)
+            if row is None:
+                raise ToolProtocolStateError(f"unknown_record_id: {record_id}")
             self._connection.execute(
                 """
                 update tool_call_records
@@ -408,15 +409,16 @@ class ToolProtocolStateStore:
         event_type: str,
         payload: dict[str, Any],
     ) -> ToolProtocolEvent:
-        event = ToolProtocolEvent(
-            event_id="",
-            run_id=run_id,
-            batch_id=batch_id,
-            tool_call_id=tool_call_id or self._tool_call_id_for_record(record_id),
-            event_type=event_type,
-            payload=_state_safe_event_payload(payload),
-        )
         with self._lock:
+            resolved_tool_call_id = tool_call_id or self._tool_call_id_for_record(record_id)
+            event = ToolProtocolEvent(
+                event_id="",
+                run_id=run_id,
+                batch_id=batch_id,
+                tool_call_id=resolved_tool_call_id,
+                event_type=event_type,
+                payload=_state_safe_event_payload(payload),
+            )
             self._connection.execute(
                 """
                 insert into tool_protocol_events(
@@ -440,48 +442,75 @@ class ToolProtocolStateStore:
             event_id=str(event_id),
             run_id=run_id,
             batch_id=batch_id,
-            tool_call_id=tool_call_id or self._tool_call_id_for_record(record_id),
+            tool_call_id=resolved_tool_call_id,
             event_type=event_type,
             payload=dict(event.payload),
             created_at=event.created_at,
         )
 
     def get_batch(self, batch_id: str) -> ToolCallBatch:
-        row = self._connection.execute(
-            "select * from tool_call_batches where batch_id = ?",
-            (batch_id,),
-        ).fetchone()
-        if row is None:
-            raise ToolProtocolStateError(f"unknown_batch_id: {batch_id}")
-        return self._batch_from_row(row)
+        with self._lock:
+            row = self._connection.execute(
+                "select * from tool_call_batches where batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolProtocolStateError(f"unknown_batch_id: {batch_id}")
+            return self._batch_from_row(row)
+
+    def batches_for_run(
+        self,
+        run_id: str,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[ToolCallBatch]:
+        with self._lock:
+            clauses = ["run_id = ?"]
+            params: list[Any] = [run_id]
+            if session_id is not None:
+                clauses.append("session_id = ?")
+                params.append(session_id)
+            if task_id is not None:
+                clauses.append("task_id = ?")
+                params.append(task_id)
+            rows = self._connection.execute(
+                f"select * from tool_call_batches where {' and '.join(clauses)} order by created_at, batch_id",
+                tuple(params),
+            ).fetchall()
+            return [self._batch_from_row(row) for row in rows]
 
     def get_record(self, record_id: str) -> ToolCallRecord:
-        row = self._record_row_by_id(record_id)
-        if row is None:
-            raise ToolProtocolStateError(f"unknown_record_id: {record_id}")
-        return self._record_from_row(row)
+        with self._lock:
+            row = self._record_row_by_id(record_id)
+            if row is None:
+                raise ToolProtocolStateError(f"unknown_record_id: {record_id}")
+            return self._record_from_row(row)
 
     def record_by_tool_call_id(self, tool_call_id: str) -> ToolCallRecord:
-        row = self._connection.execute(
-            "select * from tool_call_records where tool_call_id = ? order by created_at desc limit 1",
-            (tool_call_id,),
-        ).fetchone()
-        if row is None:
-            raise ToolProtocolStateError(f"unknown_tool_call_id: {tool_call_id}")
-        return self._record_from_row(row)
+        with self._lock:
+            row = self._connection.execute(
+                "select * from tool_call_records where tool_call_id = ? order by created_at desc limit 1",
+                (tool_call_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolProtocolStateError(f"unknown_tool_call_id: {tool_call_id}")
+            return self._record_from_row(row)
 
     def get_record_by_call_id(self, run_id: str, tool_call_id: str) -> ToolCallRecord:
-        row = self._record_row(run_id, tool_call_id)
-        if row is None:
-            raise ToolProtocolStateError(f"unknown_tool_call_id: {tool_call_id}")
-        return self._record_from_row(row)
+        with self._lock:
+            row = self._record_row(run_id, tool_call_id)
+            if row is None:
+                raise ToolProtocolStateError(f"unknown_tool_call_id: {tool_call_id}")
+            return self._record_from_row(row)
 
     def records_for_batch(self, batch_id: str) -> list[ToolCallRecord]:
-        rows = self._connection.execute(
-            "select * from tool_call_records where batch_id = ? order by created_at, record_id",
-            (batch_id,),
-        ).fetchall()
-        return [self._record_from_row(row) for row in rows]
+        with self._lock:
+            rows = self._connection.execute(
+                "select * from tool_call_records where batch_id = ? order by created_at, record_id",
+                (batch_id,),
+            ).fetchall()
+            return [self._record_from_row(row) for row in rows]
 
     def pending_records(self, *, batch_id: str | None = None) -> list[ToolCallRecord]:
         return self._records_for_states(
@@ -530,36 +559,40 @@ class ToolProtocolStateStore:
         )
 
     def events_for_batch(self, batch_id: str) -> list[ToolProtocolEvent]:
-        rows = self._connection.execute(
-            "select * from tool_protocol_events where batch_id = ? order by event_id",
-            (batch_id,),
-        ).fetchall()
-        return [self._event_from_row(row) for row in rows]
+        with self._lock:
+            rows = self._connection.execute(
+                "select * from tool_protocol_events where batch_id = ? order by event_id",
+                (batch_id,),
+            ).fetchall()
+            return [self._event_from_row(row) for row in rows]
 
     def events_for_run(self, run_id: str) -> list[ToolProtocolEvent]:
-        rows = self._connection.execute(
-            "select * from tool_protocol_events where run_id = ? order by event_id",
-            (run_id,),
-        ).fetchall()
-        return [self._event_from_row(row) for row in rows]
+        with self._lock:
+            rows = self._connection.execute(
+                "select * from tool_protocol_events where run_id = ? order by event_id",
+                (run_id,),
+            ).fetchall()
+            return [self._event_from_row(row) for row in rows]
 
     def result_binding(self, record_id: str) -> ToolProtocolResultBinding | None:
-        row = self._binding_row(record_id)
-        return self._binding_from_row(row) if row else None
+        with self._lock:
+            row = self._binding_row(record_id)
+            return self._binding_from_row(row) if row else None
 
     def result_binding_by_tool_call_id(self, tool_call_id: str) -> ToolProtocolResultBinding | None:
-        row = self._connection.execute(
-            """
-            select b.*
-            from tool_result_bindings b
-            join tool_call_records r on r.record_id = b.record_id
-            where r.tool_call_id = ?
-            order by b.created_at desc
-            limit 1
-            """,
-            (tool_call_id,),
-        ).fetchone()
-        return self._binding_from_row(row) if row else None
+        with self._lock:
+            row = self._connection.execute(
+                """
+                select b.*
+                from tool_result_bindings b
+                join tool_call_records r on r.record_id = b.record_id
+                where r.tool_call_id = ?
+                order by b.created_at desc
+                limit 1
+                """,
+                (tool_call_id,),
+            ).fetchone()
+            return self._binding_from_row(row) if row else None
 
     def resolve_replay(
         self,
@@ -584,54 +617,55 @@ class ToolProtocolStateStore:
         idempotent: bool | None = None,
     ) -> ToolProtocolReplayDecision:
         call = envelope if isinstance(envelope, ToolCallEnvelope) else ToolCallEnvelope.from_dict(envelope)
-        spec = registry.get(call.tool_name) if registry is not None and hasattr(registry, "get") else None
-        resolved_side_effects = side_effects
-        resolved_idempotent = idempotent
-        if spec is not None:
-            resolved_side_effects = resolved_side_effects or getattr(spec, "side_effects", None)
+        with self._lock:
+            spec = registry.get(call.tool_name) if registry is not None and hasattr(registry, "get") else None
+            resolved_side_effects = side_effects
+            resolved_idempotent = idempotent
+            if spec is not None:
+                resolved_side_effects = resolved_side_effects or getattr(spec, "side_effects", None)
+                if resolved_idempotent is None:
+                    idempotency = getattr(spec, "idempotency_policy", None)
+                    resolved_idempotent = bool(
+                        getattr(idempotency, "idempotent", getattr(spec, "idempotent", True))
+                    )
             if resolved_idempotent is None:
-                idempotency = getattr(spec, "idempotency_policy", None)
-                resolved_idempotent = bool(
-                    getattr(idempotency, "idempotent", getattr(spec, "idempotent", True))
+                resolved_idempotent = True
+            row = self._record_row(call.run_id, call.tool_call_id)
+            if row is None:
+                return ToolProtocolReplayDecision(
+                    status="miss",
+                    allowed=False,
+                    previous_result=None,
+                    message="no_previous_result",
                 )
-        if resolved_idempotent is None:
-            resolved_idempotent = True
-        row = self._record_row(call.run_id, call.tool_call_id)
-        if row is None:
+            binding = self._binding_row(row["record_id"])
+            if binding is None:
+                return ToolProtocolReplayDecision(
+                    status="miss",
+                    allowed=False,
+                    previous_result=None,
+                    message="no_previous_result",
+                )
+            if not resolved_idempotent or _is_side_effectful(resolved_side_effects):
+                return ToolProtocolReplayDecision(
+                    status="side_effect_replay",
+                    allowed=False,
+                    previous_result=None,
+                    message="side_effect_replay",
+                )
+            if str(row["argument_digest"]) != call.argument_digest:
+                return ToolProtocolReplayDecision(
+                    status=ToolCallFailureKind.conflicting_replay.value,
+                    allowed=False,
+                    previous_result=None,
+                    message=ToolCallFailureKind.conflicting_replay.value,
+                )
             return ToolProtocolReplayDecision(
-                status="miss",
-                allowed=False,
-                previous_result=None,
-                message="no_previous_result",
+                status="read_only_replay",
+                allowed=True,
+                previous_result=self._binding_from_row(binding).result,
+                message="read_only_replay",
             )
-        binding = self._binding_row(row["record_id"])
-        if binding is None:
-            return ToolProtocolReplayDecision(
-                status="miss",
-                allowed=False,
-                previous_result=None,
-                message="no_previous_result",
-            )
-        if not resolved_idempotent or _is_side_effectful(resolved_side_effects):
-            return ToolProtocolReplayDecision(
-                status="side_effect_replay",
-                allowed=False,
-                previous_result=None,
-                message="side_effect_replay",
-            )
-        if str(row["argument_digest"]) != call.argument_digest:
-            return ToolProtocolReplayDecision(
-                status=ToolCallFailureKind.conflicting_replay.value,
-                allowed=False,
-                previous_result=None,
-                message=ToolCallFailureKind.conflicting_replay.value,
-            )
-        return ToolProtocolReplayDecision(
-            status="read_only_replay",
-            allowed=True,
-            previous_result=self._binding_from_row(binding).result,
-            message="read_only_replay",
-        )
 
     def append_recovered(
         self,
@@ -747,25 +781,26 @@ class ToolProtocolStateStore:
         session_id: str | None = None,
         task_id: str | None = None,
     ) -> list[ToolCallRecord]:
-        params: list[Any] = [state.value for state in states]
-        clauses = ["phase in (" + ",".join("?" for _ in states) + ")"]
-        if batch_id is not None:
-            clauses.append("batch_id = ?")
-            params.append(batch_id)
-        if run_id is not None:
-            clauses.append("run_id = ?")
-            params.append(run_id)
-        if session_id is not None:
-            clauses.append("session_id = ?")
-            params.append(session_id)
-        if task_id is not None:
-            clauses.append("task_id = ?")
-            params.append(task_id)
-        rows = self._connection.execute(
-            "select * from tool_call_records where " + " and ".join(clauses) + " order by created_at, record_id",
-            params,
-        ).fetchall()
-        return [self._record_from_row(row) for row in rows]
+        with self._lock:
+            params: list[Any] = [state.value for state in states]
+            clauses = ["phase in (" + ",".join("?" for _ in states) + ")"]
+            if batch_id is not None:
+                clauses.append("batch_id = ?")
+                params.append(batch_id)
+            if run_id is not None:
+                clauses.append("run_id = ?")
+                params.append(run_id)
+            if session_id is not None:
+                clauses.append("session_id = ?")
+                params.append(session_id)
+            if task_id is not None:
+                clauses.append("task_id = ?")
+                params.append(task_id)
+            rows = self._connection.execute(
+                "select * from tool_call_records where " + " and ".join(clauses) + " order by created_at, record_id",
+                params,
+            ).fetchall()
+            return [self._record_from_row(row) for row in rows]
 
     def _record_row(self, run_id: str, tool_call_id: str) -> sqlite3.Row | None:
         return self._connection.execute(
@@ -845,23 +880,24 @@ class ToolProtocolStateStore:
         raise ToolProtocolStateError(f"unknown_tool_call_id: {tool_call_id}")
 
     def batch_by_assistant_message_id(self, batch_id: str) -> ToolCallBatch | None:
-        row = self._connection.execute(
-            "select * from tool_call_batches where batch_id = ?",
-            (batch_id,),
-        ).fetchone()
-        if row:
-            return self._batch_from_row(row)
-        rows = self._connection.execute(
-            "select * from tool_call_batches order by created_at desc, batch_id desc",
-        ).fetchall()
-        for candidate in rows:
-            assistant_message = json.loads(candidate["assistant_message"] or "{}")
-            if str(assistant_message.get("id") or "") == batch_id:
-                return self._batch_from_row(candidate)
-            for call in json.loads(candidate["tool_calls"] or "[]"):
-                if str(call.get("assistant_message_id") or "") == batch_id:
+        with self._lock:
+            row = self._connection.execute(
+                "select * from tool_call_batches where batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if row:
+                return self._batch_from_row(row)
+            rows = self._connection.execute(
+                "select * from tool_call_batches order by created_at desc, batch_id desc",
+            ).fetchall()
+            for candidate in rows:
+                assistant_message = json.loads(candidate["assistant_message"] or "{}")
+                if str(assistant_message.get("id") or "") == batch_id:
                     return self._batch_from_row(candidate)
-        return None
+                for call in json.loads(candidate["tool_calls"] or "[]"):
+                    if str(call.get("assistant_message_id") or "") == batch_id:
+                        return self._batch_from_row(candidate)
+            return None
 
     def _batch_from_row(self, row: sqlite3.Row) -> ToolCallBatch:
         return ToolCallBatch(

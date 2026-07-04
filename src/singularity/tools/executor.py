@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from singularity.kernel.cancellation import is_cancellation_error, throw_if_cancelled
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.observability.protocols import TraceEmitterProtocol
 from singularity.observability.redaction import TraceRedactor
@@ -85,7 +86,7 @@ class ToolExecutor:
             redactor=self._redactor,
             result_digest=self._result_digest,
             output_text=self._output_text,
-            throw_if_cancelled=self._throw_if_cancelled,
+            throw_if_cancelled=lambda: throw_if_cancelled(self),
             standalone_can_execute=self.standalone_can_execute,
         )
         self.execution_dispatch = ToolExecutionDispatcher(
@@ -97,7 +98,7 @@ class ToolExecutor:
             argument_summary=self._argument_trace_summary,
             result_digest=self._result_digest,
             limit_output=self._limit_output,
-            throw_if_cancelled=self._throw_if_cancelled,
+            throw_if_cancelled=lambda: throw_if_cancelled(self),
             update_planner=self._update_planner,
         )
         self.execution_trace = ToolExecutionTraceRecorder(
@@ -141,7 +142,7 @@ class ToolExecutor:
                     return self._finish_pipeline_result(state, result)
             return self._finish_pipeline_result(state, self._stage_dispatch(state))
         except Exception as exc:
-            if _is_cancellation_error(exc):
+            if is_cancellation_error(exc):
                 raise
             result = ToolResult.failure(
                 code="internal_error",
@@ -153,7 +154,7 @@ class ToolExecutor:
             self._finalize_pipeline_state(state)
 
     def _stage_load_spec(self, state: _ExecutionPipelineState) -> ToolResult | None:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         state.spec = self.registry.get(state.tool_name)
         if state.spec is None or not state.spec.enabled:
             return ToolResult.failure(
@@ -370,11 +371,6 @@ class ToolExecutor:
             value = getattr(request, key)
             if value:
                 result.metadata.setdefault(key, value)
-
-    def _throw_if_cancelled(self) -> None:
-        token = getattr(self, "cancellation_token", None)
-        if token is not None and hasattr(token, "throw_if_cancelled"):
-            token.throw_if_cancelled()
 
     def _authorize_with_planner(
         self,
@@ -635,10 +631,3 @@ class ToolExecutor:
                 and spec.idempotency_policy.replay_returns_previous
             ),
         )
-
-
-def _is_cancellation_error(exc: BaseException) -> bool:
-    return (
-        getattr(exc, "code", None) == "cancelled"
-        or exc.__class__.__name__ == "CancellationError"
-    )

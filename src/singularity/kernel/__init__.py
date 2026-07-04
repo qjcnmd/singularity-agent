@@ -1,28 +1,6 @@
-from singularity.kernel.agent_kernel import AgentKernel, RunResult
-from singularity.kernel.bootstrap import KernelBootstrap
-from singularity.kernel.cancellation import CancellationManager, CancellationToken
-from singularity.kernel.exceptions import CancellationError, KernelError
-from singularity.kernel.finalization import FinalReport, KernelFinalizer, PartialFinalReport
-from singularity.kernel.graph import AgentGraph, AgentGraphBuilder
-from singularity.kernel.health import ComponentHealthChecker, ComponentHealthReport
-from singularity.kernel.lifecycle import RunLifecycleManager
-from singularity.kernel.locks import WorkspaceLockManager
-from singularity.kernel.models import (
-    AgentRun,
-    AgentSession,
-    CancellationReason,
-    ComponentName,
-    ComponentState,
-    KernelContext,
-    KernelStatus,
-    LifecycleEvent,
-    RunIdentity,
-    RunStatus,
-    SessionStatus,
-    ShutdownReason,
-)
-from singularity.kernel.recovery import CrashRecoveryManager, RecoveryReport
-from singularity.kernel.shutdown import ShutdownManager, ShutdownSummary
+from __future__ import annotations
+
+from typing import Any
 
 __all__ = [
     "AgentGraph",
@@ -58,3 +36,48 @@ __all__ = [
     "ShutdownSummary",
     "WorkspaceLockManager",
 ]
+
+_EXPORT_MODULES = {
+    "AgentKernel": "singularity.kernel.agent_kernel",
+    "RunResult": "singularity.kernel.agent_kernel",
+    "KernelBootstrap": "singularity.kernel.bootstrap",
+    "CancellationManager": "singularity.kernel.cancellation",
+    "CancellationToken": "singularity.kernel.cancellation",
+    "CancellationError": "singularity.kernel.exceptions",
+    "KernelError": "singularity.kernel.exceptions",
+    "FinalReport": "singularity.kernel.finalization",
+    "KernelFinalizer": "singularity.kernel.finalization",
+    "PartialFinalReport": "singularity.kernel.finalization",
+    "AgentGraph": "singularity.kernel.graph",
+    "AgentGraphBuilder": "singularity.kernel.graph",
+    "ComponentHealthChecker": "singularity.kernel.health",
+    "ComponentHealthReport": "singularity.kernel.health",
+    "RunLifecycleManager": "singularity.kernel.lifecycle",
+    "WorkspaceLockManager": "singularity.kernel.locks",
+    "AgentRun": "singularity.kernel.models",
+    "AgentSession": "singularity.kernel.models",
+    "CancellationReason": "singularity.kernel.models",
+    "ComponentName": "singularity.kernel.models",
+    "ComponentState": "singularity.kernel.models",
+    "KernelContext": "singularity.kernel.models",
+    "KernelStatus": "singularity.kernel.models",
+    "LifecycleEvent": "singularity.kernel.models",
+    "RunIdentity": "singularity.kernel.models",
+    "RunStatus": "singularity.kernel.models",
+    "SessionStatus": "singularity.kernel.models",
+    "ShutdownReason": "singularity.kernel.models",
+    "CrashRecoveryManager": "singularity.kernel.recovery",
+    "RecoveryReport": "singularity.kernel.recovery",
+    "ShutdownManager": "singularity.kernel.shutdown",
+    "ShutdownSummary": "singularity.kernel.shutdown",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = __import__(module_name, fromlist=[name])
+    value = getattr(module, name)
+    globals()[name] = value
+    return value

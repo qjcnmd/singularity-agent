@@ -8,7 +8,12 @@ from pydantic import BaseModel
 
 from singularity.command import CommandExecutor, CommandPurpose, CommandRequest
 from singularity.context import ContextManager
-from singularity.kernel.cancellation import CancellationManager, CancellationToken
+from singularity.kernel.cancellation import (
+    CancellationManager,
+    CancellationToken,
+    is_cancellation_error,
+    throw_if_cancelled,
+)
 from singularity.kernel.exceptions import CancellationError
 from singularity.kernel.models import CancellationReason
 from singularity.model import (
@@ -67,6 +72,20 @@ def test_cancellation_manager_cancels_root_and_children() -> None:
     assert manager.token.cancelled
     assert child.cancelled
     assert child.reason == CancellationReason.POLICY_ABORT
+
+
+def test_cancellation_helpers_classify_standard_and_wrapped_cancellation() -> None:
+    token = _cancelled_token()
+
+    with pytest.raises(CancellationError) as exc_info:
+        throw_if_cancelled(token)
+
+    class WrappedCancellation(RuntimeError):
+        code = "cancelled"
+
+    assert is_cancellation_error(exc_info.value) is True
+    assert is_cancellation_error(WrappedCancellation("cancelled")) is True
+    assert is_cancellation_error(RuntimeError("other")) is False
 
 
 def test_model_runner_checks_cancellation_before_provider_call(tmp_path: Path) -> None:

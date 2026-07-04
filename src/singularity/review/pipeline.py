@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from singularity.kernel.cancellation import throw_if_cancelled
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.review.critic import ModelCritic
 from singularity.review.decision import ReviewDecisionEngine
@@ -245,11 +246,11 @@ class ReviewPipeline:
         evidence: list[ReviewEvidence],
         context: dict[str, Any],
     ) -> ReviewReport:
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         started = time.perf_counter()
         critic_duration_ms = 0
         started_ids = self._emit_started(target=target, evidence=evidence)
-        self._throw_if_cancelled()
+        throw_if_cancelled(self)
         findings = self.finding_collector.collect(target=target, evidence=evidence, context=context)
         rule_decision = self.decision_engine.decide(target=target, findings=findings, context=context)
         report = ReviewReport(
@@ -300,7 +301,7 @@ class ReviewPipeline:
                 context=context,
                 rule_decision=rule_decision,
             )
-            self._throw_if_cancelled()
+            throw_if_cancelled(self)
             critic = ModelCritic(self.model_runner)
             critic_started = time.perf_counter()
             outcome = critic.review(
@@ -309,7 +310,7 @@ class ReviewPipeline:
                 request_context=self._critic_request_context(target),
             )
             critic_duration_ms = int((time.perf_counter() - critic_started) * 1000)
-            self._throw_if_cancelled()
+            throw_if_cancelled(self)
             report.model_critic_status = outcome.status
             report.model_critic_error = outcome.error
             report.metadata.update(_review_output_metadata(outcome.metadata))
@@ -779,11 +780,6 @@ class ReviewPipeline:
         if cached.get("verification_digest") != digest:
             return "post_verification_evidence_changed"
         return "cache_key_miss"
-
-    def _throw_if_cancelled(self) -> None:
-        token = getattr(self, "cancellation_token", None)
-        if token is not None and hasattr(token, "throw_if_cancelled"):
-            token.throw_if_cancelled()
 
     def _critic_request_context(self, target: ReviewTarget) -> dict[str, Any]:
         return {

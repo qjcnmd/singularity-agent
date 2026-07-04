@@ -23,6 +23,7 @@ from singularity.evaluation.models import (
     ExpectedOutcomeKind,
     WorkspaceSnapshotKind,
 )
+from singularity.evaluation.patch_quality import PatchQualityEvaluator
 from singularity.observability.models import TraceArtifactKind, TraceEventType
 from singularity.verification.models import CheckKind, VerificationCheck
 from singularity.verification.runner import VerificationRunner
@@ -324,7 +325,10 @@ class BenchmarkTaskExecutor:
                 continue
             name = outcome.heuristic or "patch_quality"
             if name == "patch_quality":
-                heuristics[name] = _patch_quality_proxy(diff_summary, verification)
+                heuristics[name] = PatchQualityEvaluator().evaluate(
+                    diff_summary=diff_summary,
+                    verification=verification,
+                ).score
             elif name == "planner_completion":
                 heuristics[name] = 1.0 if verification.get("status") in {"ready", "passed"} else 0.0
             else:
@@ -901,13 +905,3 @@ def _hook_args_to_argv(args: dict[str, Any]) -> list[str]:
             continue
         argv.extend([flag, str(value)])
     return argv
-
-
-def _patch_quality_proxy(diff_summary: list[dict[str, Any]], verification: dict[str, Any]) -> float:
-    changed = sum(int(item.get("added_lines", 0)) + int(item.get("removed_lines", 0)) for item in diff_summary)
-    score = 1.0
-    if changed > 80:
-        score -= 0.25
-    if verification.get("status") not in {"ready", "passed", "not_required"}:
-        score -= 0.25
-    return max(0.0, min(1.0, score))
