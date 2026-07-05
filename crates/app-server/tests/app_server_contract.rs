@@ -263,7 +263,11 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
 fn app_server_can_translate_python_sidecar_completion_when_enabled() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let python_path = std::env::current_dir().expect("cwd").join("src");
+    let python_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root")
+        .join("src");
     let config = PythonSidecarConfig {
         python_bin: "python".to_string(),
         module: "singularity.agent_host.sidecar".to_string(),

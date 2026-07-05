@@ -17,7 +17,7 @@ from singularity.command.models import (
     ExecutionStatus,
     SemanticStatus,
 )
-from singularity.context.models import PlannerState
+from singularity.context.models import ContextBudgetPlan, ContextBundle, PlannerState
 from singularity.model.models import (
     ContentBlock,
     ModelMessage,
@@ -148,6 +148,37 @@ def build_fixtures() -> dict[str, object]:
         risk_escalations=[],
         evidence_refs=["obs_1"],
     )
+    context_bundle = ContextBundle(
+        bundle_id="bundle_1",
+        run_id="run_1",
+        task_id="task_1",
+        phase_id="running_verification",
+        model="mimo-v2.5",
+        provider="openai-compatible",
+        messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "fix tests"},
+        ],
+        included_item_ids=["item_goal", "item_plan"],
+        excluded_item_ids=["item_raw_tool"],
+        budget=ContextBudgetPlan(
+            model_context_window=128000,
+            output_token_reserve=4096,
+            reasoning_token_reserve=0,
+            tool_schema_tokens=12,
+            system_tokens=5,
+            pinned_tokens=10,
+            evidence_tokens=20,
+            recent_dialogue_tokens=8,
+            summary_tokens=7,
+            message_tokens=62,
+        ),
+        compression_snapshot_id="snapshot_1",
+        retrieval_query=None,
+        created_at="2026-01-01T00:00:00+00:00",
+        bundle_digest="bundle_digest_1",
+        metadata={"source": "python_oracle"},
+    )
     return {
         "tool_observation_model_payload": tool_result.to_observation_view().to_model_payload(),
         "tool_protocol_result_envelope": tool_result.to_dict(),
@@ -160,6 +191,7 @@ def build_fixtures() -> dict[str, object]:
         "model_turn_request": model_request.to_dict(),
         "model_turn_response": model_response.to_dict(),
         "planner_state": planner_state.__dict__.copy(),
+        "context_bundle": context_bundle.to_dict(),
     }
 
 

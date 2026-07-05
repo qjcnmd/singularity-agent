@@ -1,6 +1,7 @@
 use singularity_agent::{
-    AgentHostStatus, AgentLoopStatusBridge, PlannerStateBoundary, PythonSidecarClient,
-    PythonSidecarConfig, PythonSidecarRunResult, SidecarRunEvent, sidecar_trace_summary,
+    AgentHostStatus, AgentLoopStatusBridge, ContextAssemblyBoundary, PlannerStateBoundary,
+    PythonSidecarClient, PythonSidecarConfig, PythonSidecarRunResult, SidecarRunEvent,
+    sidecar_trace_summary,
 };
 
 #[test]
@@ -93,5 +94,33 @@ fn planner_state_boundary_round_trips_python_oracle() {
         )
         .expect("deserialize planner"),
         planner
+    );
+}
+
+#[test]
+fn context_assembly_boundary_round_trips_python_oracle() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/rust_parity/python_oracle.json"
+    ))
+    .expect("parse python oracle fixture");
+
+    let context: ContextAssemblyBoundary =
+        serde_json::from_value(fixture["context_bundle"].clone()).expect("context boundary");
+
+    assert_eq!(context.bundle_id, "bundle_1");
+    assert_eq!(context.phase_id, "running_verification");
+    assert_eq!(context.included_item_ids, vec!["item_goal", "item_plan"]);
+    assert_eq!(context.excluded_item_ids, vec!["item_raw_tool"]);
+    assert_eq!(context.budget["model_context_window"], 128000);
+    assert_eq!(context.budget["message_tokens"], 62);
+    assert_eq!(context.render_policy["include_raw_tool_outputs"], false);
+    assert_eq!(context.metadata["source"], "python_oracle");
+
+    assert_eq!(
+        serde_json::from_value::<ContextAssemblyBoundary>(
+            serde_json::to_value(&context).expect("serialize context")
+        )
+        .expect("deserialize context"),
+        context
     );
 }

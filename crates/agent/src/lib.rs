@@ -170,6 +170,26 @@ pub struct PlannerStateBoundary {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ContextAssemblyBoundary {
+    pub bundle_id: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub phase_id: String,
+    pub model: String,
+    pub provider: String,
+    pub messages: Vec<Value>,
+    pub included_item_ids: Vec<String>,
+    pub excluded_item_ids: Vec<String>,
+    pub budget: Value,
+    pub compression_snapshot_id: Option<String>,
+    pub retrieval_query: Option<String>,
+    pub render_policy: Value,
+    pub created_at: String,
+    pub bundle_digest: String,
+    pub metadata: Value,
+}
+
 #[derive(Debug)]
 pub struct PythonSidecarClient {
     child: Child,
