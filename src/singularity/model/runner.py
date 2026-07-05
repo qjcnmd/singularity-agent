@@ -54,11 +54,35 @@ from singularity.observability.models import (
 )
 from singularity.tools.registry import ToolRegistry
 
-SECRET_PATTERNS = (
-    re.compile(r"\b[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=", re.IGNORECASE),
+SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}\b"),
+    re.compile(r"\bgh[opusr]_[A-Za-z0-9_]{8,}\b"),
 )
-ENV_ASSIGNMENT_PATTERN = re.compile(r"(?im)^\s*(?:export\s+)?[A-Z_][A-Z0-9_]{1,}\s*=")
+ENV_ASSIGNMENT_PATTERN = re.compile(
+    r"(?im)^\s*(?:export\s+)?(?P<name>[A-Z_][A-Z0-9_]{1,})\s*=\s*(?P<value>[^\r\n]*)",
+    re.IGNORECASE,
+)
+KEY_VALUE_PATTERN = re.compile(
+    r"\b(?P<name>[A-Z_][A-Z0-9_]{1,})\s*=\s*(?P<value>[^\s\r\n]*)",
+    re.IGNORECASE,
+)
+REDACTED_ENV_VALUE_MARKERS = {
+    "<redacted>",
+    "[redacted]",
+    "present(redacted)",
+    "present_redacted",
+    "redacted",
+}
+PLACEHOLDER_ENV_VALUE_MARKERS = {
+    "...",
+    "<your-api-key>",
+    "<your-token>",
+    "example-token",
+    "placeholder",
+    "your-api-key",
+    "your-token",
+}
+SENSITIVE_ENV_NAME_PARTS = ("api_key", "authorization", "password", "secret", "token")
 
 
 class ModelRunner:
@@ -664,18 +688,18 @@ class ModelRunner:
         for index, message in enumerate(request.messages):
             text = message.text
             if policy.deny_secret_like_content:
-                for pattern in SECRET_PATTERNS:
-                    if pattern.search(text):
-                        return {
-                            "code": "context_export_policy_secret_like_content",
-                            "diagnostics": _export_diagnostics(
-                                message,
-                                message_index=index,
-                                rule="secret_like_content",
-                                pattern=pattern,
-                            ),
-                        }
-            if policy.deny_env_content and ENV_ASSIGNMENT_PATTERN.search(text):
+                secret_pattern = _secret_like_pattern(text)
+                if secret_pattern is not None:
+                    return {
+                        "code": "context_export_policy_secret_like_content",
+                        "diagnostics": _export_diagnostics(
+                            message,
+                            message_index=index,
+                            rule="secret_like_content",
+                            pattern=secret_pattern,
+                        ),
+                    }
+            if policy.deny_env_content and _contains_unsafe_env_assignment(text):
                 return {
                     "code": "context_export_policy_env_content",
                     "diagnostics": _export_diagnostics(
@@ -988,6 +1012,44 @@ def _latency_ms(started: float) -> int:
 
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _secret_like_pattern(text: str) -> re.Pattern[str] | None:
+    for pattern in SECRET_PATTERNS:
+        if pattern.search(text):
+            return pattern
+    for match in KEY_VALUE_PATTERN.finditer(text):
+        name = match.group("name")
+        value = _normalized_env_value(match.group("value"))
+        if _is_sensitive_env_name(name) and not _is_safe_env_assignment_value(name, value):
+            return KEY_VALUE_PATTERN
+    return None
+
+
+def _contains_unsafe_env_assignment(text: str) -> bool:
+    for match in ENV_ASSIGNMENT_PATTERN.finditer(text):
+        name = match.group("name")
+        value = _normalized_env_value(match.group("value"))
+        if _is_safe_env_assignment_value(name, value):
+            continue
+        return True
+    return False
+
+
+def _normalized_env_value(value: str) -> str:
+    normalized = value.strip().strip("'\"").strip()
+    return normalized.lower()
+
+
+def _is_safe_env_assignment_value(name: str, value: str) -> bool:
+    if value in REDACTED_ENV_VALUE_MARKERS or value in PLACEHOLDER_ENV_VALUE_MARKERS:
+        return True
+    return value == "present" and not _is_sensitive_env_name(name)
+
+
+def _is_sensitive_env_name(name: str) -> bool:
+    normalized = name.lower()
+    return any(part in normalized for part in SENSITIVE_ENV_NAME_PARTS)
 
 
 def _export_diagnostics(

@@ -198,6 +198,201 @@ def test_model_runner_allows_structured_redacted_env_status(tmp_path: Path) -> N
     assert provider.complete_calls == 1
 
 
+def test_model_runner_allows_redacted_env_assignment_status(tmp_path: Path) -> None:
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRunnerConfig(allow_remote_provider=True),
+    )
+
+    result = component.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="understanding_task",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "SINGULARITY_API_KEY=present(redacted)\n"
+                        "SINGULARITY_MODEL=present"
+                    ),
+                }
+            ],
+        )
+    )
+
+    assert result.status == ModelTurnStatus.SUCCESS
+    assert provider.complete_calls == 1
+
+
+def test_model_runner_allows_placeholder_env_assignment_examples(tmp_path: Path) -> None:
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRunnerConfig(allow_remote_provider=True),
+    )
+
+    result = component.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="understanding_task",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "SINGULARITY_API_KEY=your-api-key\n"
+                        "export SINGULARITY_TOKEN=<your-token>"
+                    ),
+                }
+            ],
+        )
+    )
+
+    assert result.status == ModelTurnStatus.SUCCESS
+    assert provider.complete_calls == 1
+
+
+def test_model_runner_blocks_unredacted_env_assignment(tmp_path: Path) -> None:
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRunnerConfig(allow_remote_provider=True),
+    )
+
+    result = component.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="understanding_task",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[{"role": "user", "content": "FOO=bar"}],
+        )
+    )
+
+    assert result.status == ModelTurnStatus.INVALID
+    assert provider.complete_calls == 0
+    assert result.validation is not None
+    assert "context_export_policy_env_content" in result.validation.errors
+
+
+def test_model_runner_blocks_high_entropy_env_token_without_leaking_trace(
+    tmp_path: Path,
+) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRunnerConfig(allow_remote_provider=True),
+        trace=trace,
+    )
+
+    result = component.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="understanding_task",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "TOKEN=ghp_abcdefghijklmnopqrstuvwxyz123456",
+                }
+            ],
+        )
+    )
+
+    failed = next(
+        event
+        for event in trace.store.query_events()
+        if event.event_type.value == "model.request.failed"
+    )
+
+    assert result.status == ModelTurnStatus.INVALID
+    assert provider.complete_calls == 0
+    assert result.validation is not None
+    assert "context_export_policy_secret_like_content" in result.validation.errors
+    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in str(failed.to_dict())
+
+
+def test_model_runner_blocks_lowercase_secret_assignment(tmp_path: Path) -> None:
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRunnerConfig(allow_remote_provider=True),
+    )
+
+    result = component.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="understanding_task",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[{"role": "user", "content": "password=raw-secret-value"}],
+        )
+    )
+
+    assert result.status == ModelTurnStatus.INVALID
+    assert provider.complete_calls == 0
+    assert result.validation is not None
+    assert "context_export_policy_secret_like_content" in result.validation.errors
+
+
+def test_model_runner_blocks_inline_unredacted_secret_assignment(tmp_path: Path) -> None:
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRunnerConfig(allow_remote_provider=True),
+    )
+
+    result = component.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="understanding_task",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Provider config says OPENAI_API_KEY=abc123.",
+                }
+            ],
+        )
+    )
+
+    assert result.status == ModelTurnStatus.INVALID
+    assert provider.complete_calls == 0
+    assert result.validation is not None
+    assert "context_export_policy_secret_like_content" in result.validation.errors
+
+
 def test_model_runner_reports_redacted_export_policy_diagnostics(tmp_path: Path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_1", session_id="session_1")
     provider = MockModelProvider(text="ok")
