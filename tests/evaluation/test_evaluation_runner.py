@@ -25,9 +25,11 @@ from singularity.evaluation.runner import (
     _apply_test_patch,
     _build_capability_sla,
     _build_capability_summary,
+    _changed_files,
     _command_failure_category,
     _expected_file_changes_satisfied,
     _failure_category,
+    _policy_blocks,
     _provider_time_seconds,
     _result_status,
     _task_goal,
@@ -94,6 +96,72 @@ def test_evaluation_git_commands_enable_windows_long_paths(
     evaluation_runner._run_git(["status"], cwd=tmp_path)
 
     assert calls == [["git", "-c", "core.longpaths=true", "status"]]
+
+
+def test_evaluation_changed_files_git_status_enables_windows_long_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    calls: list[list[str]] = []
+
+    class Completed:
+        returncode = 0
+        stdout = " M src/sqlfluff/rules/L060.py\n?? work/traces/events.jsonl\n"
+        stderr = ""
+
+    def fake_run(args: list[str], **kwargs: Any) -> Completed:
+        calls.append(args)
+        return Completed()
+
+    monkeypatch.setattr(evaluation_runner.subprocess, "run", fake_run)
+
+    assert _changed_files(tmp_path, before_snapshot={}) == ["src/sqlfluff/rules/L060.py"]
+    assert calls == [
+        ["git", "-c", "core.longpaths=true", "status", "--short", "--untracked-files=all"]
+    ]
+
+
+def test_evaluation_policy_blocks_ignores_sandbox_required_policy_summary() -> None:
+    payload = {
+        "planner_summary": {
+            "execution_trace_summary": {
+                "policy_denials": 2,
+            }
+        },
+        "policy_summary": {
+            "denied_actions_count": 0,
+            "sandbox_required_actions_count": 1,
+            "skipped_actions_due_to_policy": 1,
+        },
+    }
+
+    assert _policy_blocks(payload, {}) == 0
+
+
+def test_evaluation_policy_blocks_counts_non_sandbox_policy_skips() -> None:
+    payload = {
+        "policy_summary": {
+            "denied_actions_count": 0,
+            "sandbox_required_actions_count": 1,
+            "skipped_actions_due_to_policy": 2,
+        },
+    }
+
+    assert _policy_blocks(payload, {}) == 1
+
+
+def test_evaluation_policy_blocks_falls_back_to_planner_denials() -> None:
+    payload = {
+        "planner_summary": {
+            "execution_trace_summary": {
+                "policy_denials": 2,
+            }
+        },
+        "policy_summary": {},
+    }
+
+    assert _policy_blocks(payload, {}) == 2
 
 
 def test_load_public_representative_task_manifest_is_public_swe_bench() -> None:

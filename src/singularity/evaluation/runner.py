@@ -2009,18 +2009,22 @@ def _policy_blocks(payload: dict[str, Any], trace_summary: dict[str, Any]) -> in
     planner = payload.get("planner_summary") if isinstance(payload, dict) else {}
     policy = payload.get("policy_summary") if isinstance(payload, dict) else {}
     shutdown = payload.get("shutdown_summary") if isinstance(payload, dict) else {}
+    if isinstance(policy, dict):
+        policy_count_fields = {
+            "denied_actions_count",
+            "skipped_actions_due_to_policy",
+            "sandbox_required_actions_count",
+        }
+        if any(key in policy for key in policy_count_fields):
+            denied = _safe_int(policy.get("denied_actions_count"))
+            skipped = _safe_int(policy.get("skipped_actions_due_to_policy"))
+            sandbox_required = _safe_int(policy.get("sandbox_required_actions_count"))
+            non_sandbox_skipped = max(skipped - sandbox_required, 0)
+            return max(denied, non_sandbox_skipped)
     if isinstance(planner, dict):
         execution = planner.get("execution_trace_summary")
         if isinstance(execution, dict) and execution.get("policy_denials") is not None:
             return _safe_int(execution.get("policy_denials"))
-    if isinstance(policy, dict):
-        value = (
-            policy.get("denied_actions_count")
-            or policy.get("skipped_actions_due_to_policy")
-            or policy.get("sandbox_required_actions_count")
-        )
-        if value is not None:
-            return _safe_int(value)
     if isinstance(shutdown, dict):
         failures = shutdown.get("component_failures") or shutdown.get("policy_failures") or []
         if isinstance(failures, list):
@@ -4856,7 +4860,7 @@ def _run_git(args: list[str], *, cwd: Path) -> None:
 def _changed_files(workspace: Path, *, before_snapshot: dict[str, str]) -> list[str]:
     if _is_git_repo(workspace):
         completed = subprocess.run(
-            ["git", "status", "--short", "--untracked-files=all"],
+            ["git", "-c", "core.longpaths=true", "status", "--short", "--untracked-files=all"],
             cwd=workspace,
             text=True,
             capture_output=True,
