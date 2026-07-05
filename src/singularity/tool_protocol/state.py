@@ -7,6 +7,7 @@ from threading import RLock
 from typing import Any
 
 from singularity.context.redaction import ContextRedactor
+from singularity.runtime.defaults import SQLITE_BUSY_TIMEOUT_MS
 from singularity.tool_protocol.errors import ToolProtocolStateError
 from singularity.tool_protocol.models import (
     ToolCallBatch,
@@ -48,6 +49,7 @@ class ToolProtocolStateStore:
             self._connection = sqlite3.connect(str(db_path), check_same_thread=False)
         else:
             self._connection = sqlite3.connect(":memory:", check_same_thread=False)
+        self._connection.execute(f"pragma busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         self._connection.row_factory = sqlite3.Row
         self._lock = RLock()
         self._init_schema()

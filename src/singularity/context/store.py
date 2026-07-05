@@ -21,6 +21,7 @@ from singularity.context.models import (
     digest_value,
 )
 from singularity.context.redaction import ContextRedactor, SensitivityClassifier
+from singularity.runtime.defaults import SQLITE_BUSY_TIMEOUT_MS
 from singularity.utils.serialization import utc_iso_timestamp
 
 _RAW_OBSERVATION_KEYS = {"raw_result", "raw_args", "raw_arguments", "result"}
@@ -49,6 +50,7 @@ class ObservationStore:
             self._connection = sqlite3.connect(str(db_path), check_same_thread=False)
         else:
             self._connection = sqlite3.connect(":memory:", check_same_thread=False)
+        self._connection.execute(f"pragma busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         self._connection.row_factory = sqlite3.Row
         self._lock = RLock()
         self._init_schema()

@@ -8,6 +8,13 @@ from uuid import uuid4
 
 from singularity.utils.serialization import coerce_enum, stable_hash_text, to_plain_data, utc_iso_timestamp
 
+EDIT_SCOPE_DEFAULT_MAX_FILES = 20
+EDIT_SCOPE_DEFAULT_TARGETED_MAX_CHANGED_LINES = 120
+EDIT_SCOPE_DEFAULT_TARGETED_MAX_FILE_CHANGE_RATIO = 0.25
+EDIT_SCOPE_DEFAULT_REWRITE_MAX_CHANGED_LINES = 500
+EDIT_SCOPE_DEFAULT_MAX_REPAIR_ATTEMPTS = 2
+EDIT_SCOPE_DEFAULT_MAX_CANDIDATES = 3
+
 
 class EditStrategyKind(StrEnum):
     TARGETED_PATCH = "targeted_patch"
@@ -56,12 +63,12 @@ class EditScope:
     paths: list[str] = field(default_factory=list)
     exclude_paths: list[str] = field(default_factory=list)
     expected_hashes: dict[str, str] = field(default_factory=dict)
-    max_files: int = 20
-    targeted_max_changed_lines: int = 120
-    targeted_max_file_change_ratio: float = 0.25
-    rewrite_max_changed_lines: int = 500
-    max_repair_attempts: int = 2
-    max_candidates: int = 3
+    max_files: int = EDIT_SCOPE_DEFAULT_MAX_FILES
+    targeted_max_changed_lines: int = EDIT_SCOPE_DEFAULT_TARGETED_MAX_CHANGED_LINES
+    targeted_max_file_change_ratio: float = EDIT_SCOPE_DEFAULT_TARGETED_MAX_FILE_CHANGE_RATIO
+    rewrite_max_changed_lines: int = EDIT_SCOPE_DEFAULT_REWRITE_MAX_CHANGED_LINES
+    max_repair_attempts: int = EDIT_SCOPE_DEFAULT_MAX_REPAIR_ATTEMPTS
+    max_candidates: int = EDIT_SCOPE_DEFAULT_MAX_CANDIDATES
     allow_create: bool = True
     allow_delete: bool = False
     allow_move: bool = False

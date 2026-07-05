@@ -10,6 +10,8 @@ from singularity.verification.models import (
     ParsedFailure,
 )
 
+MAX_PARSED_FAILURES = 20
+
 
 class FailureParser(ABC):
     @abstractmethod
@@ -301,4 +303,4 @@ def _dedupe_failures(failures: list[ParsedFailure]) -> list[ParsedFailure]:
             continue
         seen.add(key)
         deduped.append(failure)
-    return deduped[:20]
+    return deduped[:MAX_PARSED_FAILURES]

@@ -6,6 +6,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from singularity.edit import EditExecutor, EditIntent, EditOperation, EditScope
+from singularity.edit.models import (
+    EDIT_SCOPE_DEFAULT_MAX_CANDIDATES,
+    EDIT_SCOPE_DEFAULT_MAX_FILES,
+    EDIT_SCOPE_DEFAULT_MAX_REPAIR_ATTEMPTS,
+    EDIT_SCOPE_DEFAULT_REWRITE_MAX_CHANGED_LINES,
+    EDIT_SCOPE_DEFAULT_TARGETED_MAX_CHANGED_LINES,
+    EDIT_SCOPE_DEFAULT_TARGETED_MAX_FILE_CHANGE_RATIO,
+)
 from singularity.policy import Capability, OperationKind, ResourceRef
 from singularity.tools.models import (
     PermissionLevel,
@@ -18,6 +26,9 @@ from singularity.tools.models import (
 from singularity.workspace import MutationError, MutationResult
 
 EDIT_APPLY_TIMEOUT_SECONDS = 90.0
+EDIT_SCOPE_INPUT_MAX_FILES_LIMIT = 200
+EDIT_SCOPE_INPUT_MAX_REPAIR_ATTEMPTS_LIMIT = 5
+EDIT_SCOPE_INPUT_MAX_CANDIDATES_LIMIT = 10
 
 
 class EditScopeInput(BaseModel):
@@ -26,12 +37,16 @@ class EditScopeInput(BaseModel):
     paths: list[str] = Field(default_factory=list)
     exclude_paths: list[str] = Field(default_factory=list)
     expected_hashes: dict[str, str] = Field(default_factory=dict)
-    max_files: int = Field(20, ge=1, le=200)
-    targeted_max_changed_lines: int = Field(120, ge=1)
-    targeted_max_file_change_ratio: float = Field(0.25, gt=0, le=1)
-    rewrite_max_changed_lines: int = Field(500, ge=1)
-    max_repair_attempts: int = Field(2, ge=0, le=5)
-    max_candidates: int = Field(3, ge=1, le=10)
+    max_files: int = Field(EDIT_SCOPE_DEFAULT_MAX_FILES, ge=1, le=EDIT_SCOPE_INPUT_MAX_FILES_LIMIT)
+    targeted_max_changed_lines: int = Field(EDIT_SCOPE_DEFAULT_TARGETED_MAX_CHANGED_LINES, ge=1)
+    targeted_max_file_change_ratio: float = Field(EDIT_SCOPE_DEFAULT_TARGETED_MAX_FILE_CHANGE_RATIO, gt=0, le=1)
+    rewrite_max_changed_lines: int = Field(EDIT_SCOPE_DEFAULT_REWRITE_MAX_CHANGED_LINES, ge=1)
+    max_repair_attempts: int = Field(
+        EDIT_SCOPE_DEFAULT_MAX_REPAIR_ATTEMPTS,
+        ge=0,
+        le=EDIT_SCOPE_INPUT_MAX_REPAIR_ATTEMPTS_LIMIT,
+    )
+    max_candidates: int = Field(EDIT_SCOPE_DEFAULT_MAX_CANDIDATES, ge=1, le=EDIT_SCOPE_INPUT_MAX_CANDIDATES_LIMIT)
     allow_create: bool = True
     allow_delete: bool = False
     allow_move: bool = False

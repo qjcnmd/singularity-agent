@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import ast
+import errno
 import importlib
 from pathlib import Path
 
 import singularity.sandbox.windows as windows
+from singularity.sandbox.windows_common import (
+    ACCESS_DENIED_ERRNO_VALUES,
+    WINDOWS_ERROR_ACCESS_DENIED,
+    _is_create_process_with_logon_access_denied,
+)
 
 
 def test_windows_sandbox_capability_modules_own_private_helpers() -> None:
@@ -108,3 +114,29 @@ def test_windows_sandbox_facade_is_thin() -> None:
     common_tree = ast.parse(common_text)
     common_classes = {node.name for node in common_tree.body if isinstance(node, ast.ClassDef)}
     assert "WindowsSandboxBackend" not in common_classes
+
+
+def test_create_process_with_logon_access_denied_detection_uses_named_constants() -> None:
+    assert WINDOWS_ERROR_ACCESS_DENIED == 5
+    assert errno.EACCES in ACCESS_DENIED_ERRNO_VALUES
+
+    access_denied = OSError("CreateProcessWithLogonW failed")
+    access_denied.winerror = WINDOWS_ERROR_ACCESS_DENIED  # type: ignore[attr-defined]
+    assert _is_create_process_with_logon_access_denied(access_denied) is True
+
+    errno_denied = OSError("CreateProcessWithLogonW failed")
+    errno_denied.errno = errno.EACCES  # type: ignore[attr-defined]
+    assert _is_create_process_with_logon_access_denied(errno_denied) is True
+
+    english_denied = OSError("CreateProcessWithLogonW failed: access is denied")
+    assert _is_create_process_with_logon_access_denied(english_denied) is True
+
+    chinese_denied = OSError("CreateProcessWithLogonW failed: 拒绝访问")
+    assert _is_create_process_with_logon_access_denied(chinese_denied) is True
+
+
+def test_windows_common_source_avoids_bare_access_denied_literals() -> None:
+    common_text = Path("src/singularity/sandbox/windows_common.py").read_text(encoding="utf-8")
+
+    assert 'getattr(exc, "winerror", None) == 5' not in common_text
+    assert 'getattr(exc, "errno", None) in {5, 13}' not in common_text

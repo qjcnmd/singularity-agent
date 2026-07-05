@@ -15,6 +15,7 @@ from singularity.context.models import (
     ContextSnapshot,
     ContextSource,
 )
+from singularity.runtime.defaults import SQLITE_BUSY_TIMEOUT_MS
 
 
 def make_item(
@@ -255,6 +256,17 @@ def test_store_close_releases_sqlite_connection(tmp_path: Path) -> None:
 
     with pytest.raises(sqlite3.ProgrammingError):
         store.connection.execute("select 1")
+
+
+def test_store_sets_busy_timeout_from_runtime_default_for_file_and_memory_db(tmp_path: Path) -> None:
+    file_store = ObservationStore(tmp_path / "context.sqlite3")
+    memory_store = ObservationStore()
+
+    assert file_store.connection.execute("pragma busy_timeout").fetchone()[0] == SQLITE_BUSY_TIMEOUT_MS
+    assert memory_store.connection.execute("pragma busy_timeout").fetchone()[0] == SQLITE_BUSY_TIMEOUT_MS
+
+    file_store.close()
+    memory_store.close()
 
 
 def test_store_supports_concurrent_reads_and_writes_without_error(tmp_path: Path) -> None:

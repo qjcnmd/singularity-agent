@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from singularity.runtime.defaults import SQLITE_BUSY_TIMEOUT_MS
 from singularity.tool_protocol.models import (
     ToolCallBatch,
     ToolCallEnvelope,
@@ -272,6 +273,17 @@ def test_state_store_close_releases_sqlite_connection(tmp_path: Path) -> None:
 
     with pytest.raises(sqlite3.ProgrammingError):
         store.connection.execute("select 1")
+
+
+def test_state_store_sets_busy_timeout_from_runtime_default_for_file_and_memory_db(tmp_path: Path) -> None:
+    file_store = ToolProtocolStateStore(tmp_path / "tool_protocol.sqlite3")
+    memory_store = ToolProtocolStateStore()
+
+    assert file_store.connection.execute("pragma busy_timeout").fetchone()[0] == SQLITE_BUSY_TIMEOUT_MS
+    assert memory_store.connection.execute("pragma busy_timeout").fetchone()[0] == SQLITE_BUSY_TIMEOUT_MS
+
+    file_store.close()
+    memory_store.close()
 
 
 def test_state_store_supports_cross_thread_public_reads(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ from singularity.code_index import (
     WorkspaceScanner,
 )
 from singularity.code_index.models import Evidence, FreshnessStatus, SymbolKind, SymbolRecord
+from singularity.runtime.defaults import SQLITE_BUSY_TIMEOUT_MS
 
 
 def test_store_upsert_query_stale_and_delete(tmp_path: Path) -> None:
@@ -37,6 +38,15 @@ def test_store_upsert_query_stale_and_delete(tmp_path: Path) -> None:
 
     store.delete_by_path("src/app.py")
     assert store.files_by_path(["src/app.py"]) == {}
+
+
+def test_project_index_store_sets_busy_timeout_from_runtime_default(tmp_path: Path) -> None:
+    store = ProjectIndexStore(tmp_path / ".singularity" / "index.sqlite")
+
+    with store._connect() as connection:
+        busy_timeout = connection.execute("pragma busy_timeout").fetchone()[0]
+
+    assert busy_timeout == SQLITE_BUSY_TIMEOUT_MS
 
 
 def test_project_index_incremental_query_and_impact_use_structured_facts(tmp_path: Path) -> None:

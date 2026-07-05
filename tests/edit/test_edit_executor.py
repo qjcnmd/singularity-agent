@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from singularity.edit import (
-    EditExecutor,
-    EditIntent,
-    EditOperation,
-    EditScope,
-    EditStrategyKind,
+from singularity.edit import EditExecutor, EditIntent, EditOperation, EditScope, EditStrategyKind
+from singularity.edit.models import (
+    EDIT_SCOPE_DEFAULT_MAX_CANDIDATES,
+    EDIT_SCOPE_DEFAULT_MAX_FILES,
+    EDIT_SCOPE_DEFAULT_MAX_REPAIR_ATTEMPTS,
+    EDIT_SCOPE_DEFAULT_REWRITE_MAX_CHANGED_LINES,
+    EDIT_SCOPE_DEFAULT_TARGETED_MAX_CHANGED_LINES,
+    EDIT_SCOPE_DEFAULT_TARGETED_MAX_FILE_CHANGE_RATIO,
 )
 from singularity.review import (
     ReviewDecision,
@@ -16,6 +18,12 @@ from singularity.review import (
     ReviewReport,
     ReviewStage,
     ReviewTarget,
+)
+from singularity.tools.edit import (
+    EDIT_SCOPE_INPUT_MAX_CANDIDATES_LIMIT,
+    EDIT_SCOPE_INPUT_MAX_FILES_LIMIT,
+    EDIT_SCOPE_INPUT_MAX_REPAIR_ATTEMPTS_LIMIT,
+    EditScopeInput,
 )
 from singularity.workspace import WorkspaceMutationManager
 
@@ -103,6 +111,33 @@ def _component(tmp_path: Path, *, index=None, verification=None, review=None) ->
         verification_runner=verification,
         review_pipeline=review,
     )
+
+
+def test_edit_scope_defaults_are_shared_with_input_model_constants() -> None:
+    scope = EditScope()
+    scope_input = EditScopeInput()
+    model_fields = EditScopeInput.model_fields
+
+    assert scope.max_files == EDIT_SCOPE_DEFAULT_MAX_FILES
+    assert scope.targeted_max_changed_lines == EDIT_SCOPE_DEFAULT_TARGETED_MAX_CHANGED_LINES
+    assert scope.targeted_max_file_change_ratio == EDIT_SCOPE_DEFAULT_TARGETED_MAX_FILE_CHANGE_RATIO
+    assert scope.rewrite_max_changed_lines == EDIT_SCOPE_DEFAULT_REWRITE_MAX_CHANGED_LINES
+    assert scope.max_repair_attempts == EDIT_SCOPE_DEFAULT_MAX_REPAIR_ATTEMPTS
+    assert scope.max_candidates == EDIT_SCOPE_DEFAULT_MAX_CANDIDATES
+
+    assert scope_input.max_files == EDIT_SCOPE_DEFAULT_MAX_FILES
+    assert scope_input.targeted_max_changed_lines == EDIT_SCOPE_DEFAULT_TARGETED_MAX_CHANGED_LINES
+    assert scope_input.targeted_max_file_change_ratio == EDIT_SCOPE_DEFAULT_TARGETED_MAX_FILE_CHANGE_RATIO
+    assert scope_input.rewrite_max_changed_lines == EDIT_SCOPE_DEFAULT_REWRITE_MAX_CHANGED_LINES
+    assert scope_input.max_repair_attempts == EDIT_SCOPE_DEFAULT_MAX_REPAIR_ATTEMPTS
+    assert scope_input.max_candidates == EDIT_SCOPE_DEFAULT_MAX_CANDIDATES
+
+    assert model_fields["max_files"].default == EDIT_SCOPE_DEFAULT_MAX_FILES
+    assert model_fields["max_files"].metadata[-1].le == EDIT_SCOPE_INPUT_MAX_FILES_LIMIT
+    assert model_fields["max_repair_attempts"].default == EDIT_SCOPE_DEFAULT_MAX_REPAIR_ATTEMPTS
+    assert model_fields["max_repair_attempts"].metadata[-1].le == EDIT_SCOPE_INPUT_MAX_REPAIR_ATTEMPTS_LIMIT
+    assert model_fields["max_candidates"].default == EDIT_SCOPE_DEFAULT_MAX_CANDIDATES
+    assert model_fields["max_candidates"].metadata[-1].le == EDIT_SCOPE_INPUT_MAX_CANDIDATES_LIMIT
 
 
 def test_targeted_patch_unique_context_replacement(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import json
 import os
 import re
@@ -140,6 +141,8 @@ ERROR_MEMBER_IN_ALIAS = 1378
 ERROR_NOT_FOUND = 1168
 STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
 WINDOWS_PATH_SEPARATOR = ";"
+WINDOWS_ERROR_ACCESS_DENIED = 5
+ACCESS_DENIED_ERRNO_VALUES = {WINDOWS_ERROR_ACCESS_DENIED, errno.EACCES}
 
 
 
@@ -789,8 +792,8 @@ def _runner_result_operation(prefix: str, result: WindowsRunnerResult) -> str:
 def _is_create_process_with_logon_access_denied(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "createprocesswithlogonw" in text and (
-        getattr(exc, "winerror", None) == 5
-        or getattr(exc, "errno", None) in {5, 13}
+        getattr(exc, "winerror", None) == WINDOWS_ERROR_ACCESS_DENIED
+        or getattr(exc, "errno", None) in ACCESS_DENIED_ERRNO_VALUES
         or "access is denied" in text
         or "拒绝访问" in text
     )

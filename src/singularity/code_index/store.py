@@ -26,6 +26,7 @@ from singularity.code_index.models import (
     TestMappingRecord,
     stable_id,
 )
+from singularity.runtime.defaults import SQLITE_BUSY_TIMEOUT_MS
 
 T = TypeVar("T", bound=IndexFact)
 
@@ -553,6 +554,7 @@ class ProjectIndexStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         try:
             db = sqlite3.connect(self.path)
+            db.execute(f"pragma busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             db.row_factory = sqlite3.Row
         except sqlite3.Error as exc:
             raise IndexStoreError(str(exc), code="index_store_connect_failed") from exc

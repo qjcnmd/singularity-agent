@@ -13,6 +13,7 @@ HIGH_RISK_PATH_PARTS = {
     "yarn.lock",
     "uv.lock",
 }
+LARGE_CHANGED_FILE_SCOPE_THRESHOLD = 20
 
 
 class RiskEscalator:
@@ -54,7 +55,7 @@ class RiskEscalator:
 
         if tool_name in {"workspace_delete_file", "workspace_move_file"}:
             reasons.append(f"high-risk mutation tool: {tool_name}")
-        if len(set(candidate_paths)) > 20:
+        if len(set(candidate_paths)) > LARGE_CHANGED_FILE_SCOPE_THRESHOLD:
             reasons.append("large changed-file scope")
 
         if reasons:
