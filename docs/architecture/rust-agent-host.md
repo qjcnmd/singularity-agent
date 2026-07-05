@@ -20,7 +20,7 @@
 
 `crates/store` 是 SQLite-backed persistence boundary。它持久化 thread、turn、item、trace event、artifact reference、pending approval、approval decision ledger 和 `schema_migrations`；`SessionStoreDescriptor` 负责可序列化 store schema 描述，真实 `SessionStore` 持有 SQLite connection。会一次创建多行 durable state 的 app-server 动作通过 store 事务提交，例如 thread + trace、turn + input item + trace、approval request + trace、approval decision + ledger + trace。
 
-`crates/app-server` 实现 `initialize` / `initialized` handshake、thread list/read/start/resume/fork/archive/delete、turn start/interrupt/status、approval list/request/decision、trace list/show/tail 和 `server/shutdown`。`turn/start` 明确写入 `agent_loop_status = "not_migrated"`，不伪装 Python AgentLoop 已完成迁移；item streaming 使用 `item/agentMessage/delta` 和 `item/commandExecution/outputDelta` 这类 typed delta，不再使用 generic `item/delta`。
+`crates/app-server` 实现 `initialize` / `initialized` handshake、thread list/read/start/resume/fork/archive/delete、turn start/interrupt/status、approval list/request/decision、trace list/show/tail 和 `server/shutdown`。默认 `turn/start` 明确写入 `agent_loop_status = "not_migrated"`，不伪装 Python AgentLoop 已完成迁移；显式设置 `SINGULARITY_PYTHON_SIDECAR=1` 时，app-server 才通过 `PythonSidecarClient` 启动 `python -m singularity.agent_host.sidecar`，由 sidecar 调用现有 `AgentHost -> KernelBootstrap -> AgentKernel -> AgentLoop` 并把安全状态摘要翻译成 Rust turn/item/trace。item streaming 使用 `item/agentMessage/delta` 和 `item/commandExecution/outputDelta` 这类 typed delta，不再使用 generic `item/delta`。
 
 `crates/cli` 提供 `sg` CLI。`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` / `sg config doctor` 会启动或调用 stdio app-server，并只通过 JSON-RPC protocol 交换 initialize、thread、turn、trace 和 approval 请求；`sg daemon` 启动 app-server stdio 进程。CLI 不直接依赖 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
@@ -36,7 +36,7 @@
 - verification / review / final report。
 - tool protocol / tool executor / command executor / policy approval 主链路。
 
-允许在 Python 侧新增的内容仅限 fixture export、schema/parity check、文档校验和迁移期测试。新增核心能力必须进入 Rust boundary，不能继续扩展 Python 主干。
+允许在 Python 侧新增的内容仅限 sidecar adapter、fixture export、schema/parity check、文档校验和迁移期测试。新增核心能力必须进入 Rust boundary，不能继续扩展 Python 主干。
 
 ## 当前验证边界
 

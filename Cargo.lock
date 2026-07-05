@@ -574,7 +574,7 @@ version = "0.1.0"
 dependencies = [
  "schemars",
  "serde",
- "singularity_core",
+ "serde_json",
 ]
 
 [[package]]

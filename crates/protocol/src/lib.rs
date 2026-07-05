@@ -284,6 +284,7 @@ pub struct Turn {
 pub enum TurnStatus {
     Running,
     Completed,
+    Blocked,
     Failed,
     Interrupted,
 }

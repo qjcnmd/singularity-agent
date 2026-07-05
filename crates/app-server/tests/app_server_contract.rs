@@ -1,3 +1,4 @@
+use singularity_agent::PythonSidecarConfig;
 use singularity_app_server::AppServer;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_store::SessionStore;
@@ -256,4 +257,57 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
 
     assert_eq!(duplicate[0]["error"]["code"], -32600);
     assert_eq!(duplicate[0]["error"]["message"], "Approval already exists");
+}
+
+#[test]
+fn app_server_can_translate_python_sidecar_completion_when_enabled() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let python_path = std::env::current_dir().expect("cwd").join("src");
+    let config = PythonSidecarConfig {
+        python_bin: "python".to_string(),
+        module: "singularity.agent_host.sidecar".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(python_path),
+        env: vec![(
+            "SINGULARITY_SIDECAR_TEST_MODE".to_string(),
+            "completed".to_string(),
+        )],
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = thread[0]["result"]["thread"]["thread_id"].as_str().unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"complete through sidecar"}}]}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(turn[0]["result"]["turn"]["agent_loop_status"], "completed");
+    assert_eq!(turn[0]["result"]["turn"]["status"], "completed");
+    assert!(
+        turn.iter()
+            .any(|message| message["method"] == "item/agentMessage/delta")
+    );
+    let trace = server
+        .handle_json(&format!(
+            r#"{{"method":"trace/tail","id":4,"params":{{"runId":"{thread_id}","limit":5}}}}"#
+        ))
+        .unwrap();
+    assert!(
+        trace[0]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["component"] == "python_sidecar")
+    );
 }

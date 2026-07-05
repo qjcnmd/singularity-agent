@@ -1,15 +1,17 @@
 #![forbid(unsafe_code)]
 
 use serde_json::{Value, json};
-use singularity_agent::AgentLoopBridge;
+use singularity_agent::{
+    AgentLoopStatusBridge, PythonSidecarClient, PythonSidecarConfig, sidecar_trace_summary,
+};
 use singularity_core::ErrorCode;
 use singularity_policy::{ApprovalDecision, ApprovalRequest};
 use singularity_protocol::{
     AppEvent, ApprovalListResult, InitializeParams, InitializeResult, JsonRpcMessage, Method,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
-    ThreadResult, ThreadStartParams, ThreadStartResult, TraceListParams, TraceListResult,
-    TraceShowParams, TraceTailParams, TurnIdParams, TurnInterruptResult, TurnResult,
-    TurnStartParams, TurnStartResult,
+    ThreadResult, ThreadStartParams, ThreadStartResult, TraceEvent, TraceListParams,
+    TraceListResult, TraceShowParams, TraceTailParams, Turn, TurnIdParams, TurnInterruptResult,
+    TurnResult, TurnStartParams, TurnStartResult,
 };
 use singularity_store::{SessionStore, StoreError};
 use thiserror::Error;
@@ -35,6 +37,7 @@ pub struct AppServer {
     store: SessionStore,
     initialized: bool,
     initialized_acknowledged: bool,
+    python_sidecar: Option<PythonSidecarConfig>,
 }
 
 impl AppServer {
@@ -43,7 +46,13 @@ impl AppServer {
             store,
             initialized: false,
             initialized_acknowledged: false,
+            python_sidecar: None,
         }
+    }
+
+    pub fn with_python_sidecar(mut self, config: PythonSidecarConfig) -> Self {
+        self.python_sidecar = Some(config);
+        self
     }
 
     pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {
@@ -216,7 +225,7 @@ impl AppServer {
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnStartParams = message.params_as()?;
-        let bridge = AgentLoopBridge::not_migrated();
+        let bridge = self.run_python_sidecar_if_enabled(&params);
         let payload = serde_json::to_value(&params.input)?;
         let (turn, item, _trace) = match self.store.create_turn_with_input_and_trace(
             &params.thread_id,
@@ -231,6 +240,13 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
+        self.append_sidecar_trace(&params.thread_id, &turn.turn_id, &bridge)?;
+        let turn = self.update_turn_from_bridge(turn, &bridge)?;
+        let agent_delta = bridge
+            .final_answer
+            .as_deref()
+            .or(bridge.error.as_deref())
+            .unwrap_or("input accepted");
 
         Ok(vec![
             JsonRpcMessage::response(
@@ -244,13 +260,100 @@ impl AppServer {
             AppEvent::item_started(item.item_id.clone())
                 .to_notification()
                 .to_wire_value(),
-            AppEvent::item_agent_message_delta(item.item_id.clone(), "input accepted")
+            AppEvent::item_agent_message_delta(item.item_id.clone(), agent_delta)
                 .to_notification()
                 .to_wire_value(),
             AppEvent::item_completed(item.item_id)
                 .to_notification()
                 .to_wire_value(),
         ])
+    }
+
+    fn run_python_sidecar_if_enabled(&self, params: &TurnStartParams) -> AgentLoopStatusBridge {
+        let Some(config) = &self.python_sidecar else {
+            return AgentLoopStatusBridge::not_migrated();
+        };
+        let goal = params
+            .input
+            .iter()
+            .map(|item| match item {
+                singularity_protocol::InputItem::Text { text } => text.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        match PythonSidecarClient::spawn(config).and_then(|mut client| client.run_agent(&goal)) {
+            Ok(result) => AgentLoopStatusBridge::from_sidecar(result),
+            Err(error) => AgentLoopStatusBridge::failed(error),
+        }
+    }
+
+    fn update_turn_from_bridge(
+        &self,
+        turn: Turn,
+        bridge: &AgentLoopStatusBridge,
+    ) -> AppServerResult<Turn> {
+        let status = match bridge.status {
+            singularity_agent::AgentHostStatus::Completed => {
+                Some(singularity_protocol::TurnStatus::Completed)
+            }
+            singularity_agent::AgentHostStatus::Blocked => {
+                Some(singularity_protocol::TurnStatus::Blocked)
+            }
+            singularity_agent::AgentHostStatus::Failed => {
+                Some(singularity_protocol::TurnStatus::Failed)
+            }
+            singularity_agent::AgentHostStatus::Cancelled => {
+                Some(singularity_protocol::TurnStatus::Interrupted)
+            }
+            singularity_agent::AgentHostStatus::NotMigrated
+            | singularity_agent::AgentHostStatus::Running => None,
+        };
+        let Some(status) = status else {
+            return Ok(turn);
+        };
+        self.store
+            .update_turn_status(&turn.turn_id, status)
+            .map_err(Into::into)
+    }
+
+    fn append_sidecar_trace(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        bridge: &AgentLoopStatusBridge,
+    ) -> AppServerResult<()> {
+        if matches!(
+            bridge.status,
+            singularity_agent::AgentHostStatus::NotMigrated
+        ) {
+            return Ok(());
+        }
+        let mut summary = TraceEvent::new(
+            format!("trace_{turn_id}_python_sidecar"),
+            thread_id,
+            turn_id,
+            "python_sidecar",
+            "Python sidecar result translated",
+        );
+        summary.payload = sidecar_trace_summary(bridge);
+        self.store.append_trace(&summary)?;
+        for event in &bridge.events {
+            let mut translated = TraceEvent::new(
+                format!("trace_{turn_id}_{}", event.event_id),
+                thread_id,
+                turn_id,
+                "python_sidecar",
+                event.summary.clone(),
+            );
+            translated.event_type = event.event_type.clone();
+            translated.severity = event.severity.clone();
+            translated.payload = serde_json::json!({
+                "component": event.component,
+                "sequence": event.sequence,
+            });
+            self.store.append_trace(&translated)?;
+        }
+        Ok(())
     }
 
     fn turn_interrupt(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {

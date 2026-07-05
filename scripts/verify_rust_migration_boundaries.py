@@ -59,7 +59,7 @@ ALLOWED_CRATE_DEPENDENCIES = {
         "dev-dependencies": set(),
     },
     "crates/agent/Cargo.toml": {
-        "dependencies": {"schemars", "serde", "singularity_core"},
+        "dependencies": {"schemars", "serde", "serde_json"},
         "dev-dependencies": set(),
     },
     "crates/app-server/Cargo.toml": {
@@ -260,7 +260,7 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
     app_server = repo_root / "crates" / "app-server" / "src" / "lib.rs"
     protocol = repo_root / "crates" / "protocol" / "src" / "lib.rs"
     text = app_server.read_text(encoding="utf-8")
-    if "AgentLoopBridge::not_migrated()" not in text:
+    if "AgentLoopStatusBridge::not_migrated()" not in text:
         return [
             Violation(
                 "agent-loop-status-drift",
