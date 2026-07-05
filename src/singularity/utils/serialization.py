@@ -135,3 +135,25 @@ def coerce_dict(
     if not isinstance(value, dict):
         raise ValueError(error_message or f"{field_name} must be an object.")
     return dict(value)
+
+
+def coerce_evaluation_dict(
+    value: Any,
+    field_name: str,
+    *,
+    allow_none: bool = False,
+) -> dict[str, Any]:
+    return coerce_dict(
+        value,
+        field_name,
+        allow_none=allow_none,
+        error_message=f"evaluation {field_name} must be an object.",
+    )
+
+
+def coerce_object_mapping(value: Any) -> dict[str, Any]:
+    return coerce_dict(
+        value,
+        allow_none=True,
+        error_message="Expected object mapping.",
+    )

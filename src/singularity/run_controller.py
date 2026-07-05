@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, TypeVar
+from typing import Any
 
 from singularity.context.models import ToolObservation
 from singularity.error_codes import (
@@ -303,9 +303,6 @@ class RunCheckpointStore:
         return self.store.load(session_id)
 
 
-T = TypeVar("T")
-
-
 class RunController:
     def __init__(
         self,
@@ -409,9 +406,9 @@ class RunController:
         user_goal: str,
         *,
         max_turns: int,
-        run_turn: Callable[[int], T | None],
-        on_max_turns: Callable[[int], T],
-    ) -> T:
+        run_turn: Callable[[int], Any | None],
+        on_max_turns: Callable[[int], Any],
+    ) -> Any:
         if self.planner.state is None:
             self.start(user_goal)
         else:

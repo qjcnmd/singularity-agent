@@ -6,6 +6,7 @@ from pathlib import Path
 
 from singularity.utils.serialization import (
     coerce_dict,
+    coerce_evaluation_dict,
     coerce_float,
     coerce_int,
     enum_value,
@@ -61,3 +62,17 @@ def test_enum_value_and_coercion_helpers_preserve_existing_defaults() -> None:
     assert coerce_int("bad") == 0
     assert coerce_float("bad") == 0.0
     assert coerce_dict({"a": 1}, "payload") == {"a": 1}
+
+
+def test_evaluation_dict_helper_preserves_error_message_and_mapping_copy() -> None:
+    source = {"a": 1}
+
+    assert coerce_evaluation_dict(source, "summary") == {"a": 1}
+    assert coerce_evaluation_dict(None, "summary", allow_none=True) == {}
+
+    try:
+        coerce_evaluation_dict("bad", "summary")
+    except ValueError as exc:
+        assert str(exc) == "evaluation summary must be an object."
+    else:
+        raise AssertionError("Expected ValueError for non-dict evaluation payload.")

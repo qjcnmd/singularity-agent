@@ -17,9 +17,9 @@ from singularity.tool_protocol.models import (
     ToolProtocolEvent,
     ToolProtocolResultBinding,
     ToolProtocolResultEnvelope,
-    _now,
 )
 from singularity.tools.models import ToolSideEffectKind
+from singularity.utils.serialization import utc_iso_timestamp
 
 _STATE_REDACTOR = ContextRedactor()
 _RAW_RESULT_KEYS = {"raw_result", "raw_args", "result"}
@@ -274,7 +274,7 @@ class ToolProtocolStateStore:
                 context_message_id=_row_value(existing, "context_message_id"),
                 result_digest=result.content_digest,
                 appended=bool(existing["appended"]) if existing else False,
-                created_at=_row_value(existing, "created_at") or _now(),
+                created_at=_row_value(existing, "created_at") or utc_iso_timestamp(),
                 metadata=dict(result.metadata),
             )
             self._connection.execute(
@@ -301,7 +301,7 @@ class ToolProtocolStateStore:
                     binding.result_digest,
                     1 if binding.appended else 0,
                     binding.created_at,
-                    _now(),
+                    utc_iso_timestamp(),
                     json.dumps(
                         _state_safe_event_payload(binding.metadata),
                         ensure_ascii=False,
@@ -320,8 +320,8 @@ class ToolProtocolStateStore:
                 (
                     result_phase.value,
                     result.content_digest,
-                    _now(),
-                    _now(),
+                    utc_iso_timestamp(),
+                    utc_iso_timestamp(),
                     record_id,
                 ),
             )
@@ -378,7 +378,7 @@ class ToolProtocolStateStore:
                         else row["phase"]
                     ),
                     context_message_id,
-                    _now(),
+                    utc_iso_timestamp(),
                     record_id,
                 ),
             )
@@ -388,7 +388,7 @@ class ToolProtocolStateStore:
                 set appended = 1, context_message_id = coalesce(?, context_message_id), updated_at = ?
                 where record_id = ?
                 """,
-                (context_message_id, _now(), record_id),
+                (context_message_id, utc_iso_timestamp(), record_id),
             )
             self.append_event(
                 batch_id=row["batch_id"],

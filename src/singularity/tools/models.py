@@ -11,6 +11,13 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from singularity.policy import Capability, OperationKind, ResourceRef
+from singularity.runtime.defaults import (
+    DEFAULT_REGISTERED_TOOL_TIMEOUT_SECONDS,
+    DEFAULT_TOOL_CACHE_MAX_ENTRIES,
+    DEFAULT_TOOL_MAX_OUTPUT_CHARS,
+    DEFAULT_TOOL_RETRY_MAX_ATTEMPTS,
+    MAX_TOOL_RETRY_ATTEMPTS,
+)
 
 
 class PermissionLevel(StrEnum):
@@ -47,7 +54,6 @@ class ToolExecutionBackendKind(StrEnum):
 class ToolOriginKind(StrEnum):
     BUILTIN = "builtin"
     PLUGIN = "plugin"
-    FUTURE_MCP = "future_mcp"
 
 
 class ToolCachePolicy(BaseModel):
@@ -55,7 +61,7 @@ class ToolCachePolicy(BaseModel):
 
     cacheable: bool = False
     ttl_seconds: float | None = Field(None, gt=0)
-    max_entries: int = Field(128, gt=0)
+    max_entries: int = Field(DEFAULT_TOOL_CACHE_MAX_ENTRIES, gt=0)
 
 
 class ToolIdempotencyPolicy(BaseModel):
@@ -68,7 +74,11 @@ class ToolIdempotencyPolicy(BaseModel):
 class ToolRetryPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    max_attempts: int = Field(1, ge=1, le=5)
+    max_attempts: int = Field(
+        DEFAULT_TOOL_RETRY_MAX_ATTEMPTS,
+        ge=DEFAULT_TOOL_RETRY_MAX_ATTEMPTS,
+        le=MAX_TOOL_RETRY_ATTEMPTS,
+    )
 
 
 class ToolOutputEnvelope(BaseModel):
@@ -275,8 +285,8 @@ class ToolSpec(BaseModel):
     handler: Callable[[Any], Any] = Field(exclude=True)
     permission_level: PermissionLevel = PermissionLevel.READ_ONLY
     risk_tags: tuple[str, ...] = ()
-    timeout_seconds: float = Field(5.0, gt=0)
-    max_output_chars: int = Field(20000, gt=0)
+    timeout_seconds: float = Field(DEFAULT_REGISTERED_TOOL_TIMEOUT_SECONDS, gt=0)
+    max_output_chars: int = Field(DEFAULT_TOOL_MAX_OUTPUT_CHARS, gt=0)
     cacheable: bool = False
     idempotent: bool = True
     uses_edit_executor: bool = False
@@ -297,7 +307,6 @@ class ToolSpec(BaseModel):
     execution_backend: ToolExecutionBackendKind = ToolExecutionBackendKind.IN_PROCESS
     approval_profile: dict[str, Any] = Field(default_factory=dict)
     artifact_policy: dict[str, Any] = Field(default_factory=dict)
-    streamable: bool = False
     enabled: bool = True
 
     @field_validator("capabilities", mode="before")

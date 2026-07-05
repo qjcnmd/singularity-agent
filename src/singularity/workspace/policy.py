@@ -3,20 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import ClassVar
 
-from singularity.workspace.pathing import ResolvedWorkspacePath
-
-PUBLIC_SOURCE = "PUBLIC_SOURCE"
-PROJECT_CONFIG = "PROJECT_CONFIG"
-TEST = "TEST"
-DOCUMENTATION = "DOCUMENTATION"
-BUILD_SCRIPT = "BUILD_SCRIPT"
-DEPENDENCY_LOCK = "DEPENDENCY_LOCK"
-SECRET = "SECRET"
-VCS_INTERNAL = "VCS_INTERNAL"
-GENERATED = "GENERATED"
-BINARY = "BINARY"
-LARGE_ARTIFACT = "LARGE_ARTIFACT"
-UNKNOWN = "UNKNOWN"
+from singularity.runtime.defaults import (
+    WORKSPACE_MEDIUM_DIFF_LINE_THRESHOLD,
+    WORKSPACE_REVIEW_DIFF_LINE_THRESHOLD,
+)
+from singularity.workspace_core import (
+    BINARY,
+    BUILD_SCRIPT,
+    DEPENDENCY_LOCK,
+    LARGE_ARTIFACT,
+    PROJECT_CONFIG,
+    SECRET,
+    VCS_INTERNAL,
+    FileClassifier,
+    ResolvedWorkspacePath,
+)
 
 ALLOW = "allow"
 DENY = "deny"
@@ -30,137 +31,6 @@ class PolicyDecision:
     reasons: list[str] = field(default_factory=list)
     risk_tags: list[str] = field(default_factory=list)
     error_code: str | None = None
-
-
-class FileClassifier:
-    binary_extensions: ClassVar[set[str]] = {
-        ".7z",
-        ".avif",
-        ".bin",
-        ".bmp",
-        ".class",
-        ".dll",
-        ".exe",
-        ".gif",
-        ".ico",
-        ".jar",
-        ".jpeg",
-        ".jpg",
-        ".pdf",
-        ".png",
-        ".pyc",
-        ".so",
-        ".webp",
-        ".zip",
-    }
-    source_extensions: ClassVar[set[str]] = {
-        ".c",
-        ".cpp",
-        ".cs",
-        ".css",
-        ".go",
-        ".html",
-        ".java",
-        ".js",
-        ".jsx",
-        ".json",
-        ".mdx",
-        ".py",
-        ".rs",
-        ".sh",
-        ".sql",
-        ".ts",
-        ".tsx",
-    }
-    docs_extensions: ClassVar[set[str]] = {".adoc", ".md", ".rst", ".txt"}
-    config_names: ClassVar[set[str]] = {
-        ".editorconfig",
-        ".flake8",
-        ".gitignore",
-        ".pre-commit-config.yaml",
-        "hatch.toml",
-        "mypy.ini",
-        "pyproject.toml",
-        "pytest.ini",
-        "ruff.toml",
-        "setup.cfg",
-        "setup.py",
-        "tox.ini",
-        "tsconfig.json",
-    }
-    lock_names: ClassVar[set[str]] = {
-        "cargo.lock",
-        "go.sum",
-        "package-lock.json",
-        "pnpm-lock.yaml",
-        "poetry.lock",
-        "requirements.txt",
-        "uv.lock",
-        "yarn.lock",
-    }
-    build_names: ClassVar[set[str]] = {"dockerfile", "makefile", "justfile"}
-    generated_dirs: ClassVar[set[str]] = {
-        ".coverage",
-        ".deepeval",
-        ".singularity",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        "__pycache__",
-        "build",
-        "coverage",
-        "dist",
-        "outputs",
-    }
-
-    def __init__(self, *, large_file_bytes: int = 1_000_000) -> None:
-        self.large_file_bytes = large_file_bytes
-
-    def classify(
-        self,
-        resolved: ResolvedWorkspacePath,
-        *,
-        size: int | None = None,
-        is_binary: bool | None = None,
-    ) -> str:
-        path = resolved.relative_path
-        parts = tuple(part.lower() for part in path.parts)
-        name = path.name
-        lower_name = name.lower()
-        suffix = path.suffix.lower()
-
-        if ".git" in parts:
-            return VCS_INTERNAL
-        if self._is_secret_name(name):
-            return SECRET
-        if is_binary or suffix in self.binary_extensions:
-            return BINARY
-        if size is not None and size > self.large_file_bytes:
-            return LARGE_ARTIFACT
-        if any(part in self.generated_dirs for part in parts):
-            return GENERATED
-        if lower_name in self.lock_names:
-            return DEPENDENCY_LOCK
-        if lower_name in self.build_names or suffix in {".ps1", ".bat", ".cmd"}:
-            return BUILD_SCRIPT
-        if lower_name in self.config_names or suffix in {".ini", ".cfg", ".toml", ".yaml", ".yml"}:
-            return PROJECT_CONFIG
-        if "tests" in parts or "test" in parts or lower_name.startswith("test_"):
-            return TEST
-        if "docs" in parts or suffix in self.docs_extensions:
-            return DOCUMENTATION
-        if suffix in self.source_extensions:
-            return PUBLIC_SOURCE
-        return UNKNOWN
-
-    @staticmethod
-    def _is_secret_name(name: str) -> bool:
-        lower = name.lower()
-        if lower == ".env":
-            return True
-        if lower.startswith(".env.") and lower != ".env.example":
-            return True
-        return lower.endswith((".pem", ".key", ".p12", ".pfx"))
 
 
 class WorkspacePolicy:
@@ -239,7 +109,7 @@ class WorkspacePolicy:
                 risk_tags,
                 "review_required",
             )
-        if added_lines + removed_lines > 500:
+        if added_lines + removed_lines > WORKSPACE_REVIEW_DIFF_LINE_THRESHOLD:
             return PolicyDecision(
                 REQUIRE_REVIEW,
                 file_class,
@@ -262,7 +132,7 @@ class WorkspacePolicy:
         tags = {"mutation", operation_type, file_class, f"trust:{workspace_trust}"}
         if added_lines or removed_lines:
             tags.add("diff")
-        if added_lines + removed_lines > 100:
+        if added_lines + removed_lines > WORKSPACE_MEDIUM_DIFF_LINE_THRESHOLD:
             tags.add("large_diff")
         if task_intent:
             tags.add("task_intent")

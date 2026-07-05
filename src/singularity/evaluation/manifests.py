@@ -15,7 +15,7 @@ from singularity.evaluation.models import (
 from singularity.evaluation.store import GoldenTaskStore
 from singularity.policy.permissions import ApprovalPolicy, NetworkAccess, PermissionProfileName
 from singularity.utils.attributes import nested_getattr
-from singularity.utils.serialization import coerce_dict
+from singularity.utils.serialization import coerce_evaluation_dict
 
 EVALUATION_TASK_SET_SCHEMA_VERSION = "evaluation.task_set/v1"
 
@@ -104,12 +104,12 @@ class EvaluationTask:
             user_task=str(payload.get("user_task") or payload.get("prompt") or "").strip(),
             allowed_paths=[str(item) for item in payload.get("allowed_paths") or []],
             verification_command=str(payload.get("verification_command") or "").strip(),
-            success=_dict(payload.get("success"), "success"),
+            success=coerce_evaluation_dict(payload.get("success"), "success"),
             task_type=str(payload.get("task_type") or "").strip(),
             description=str(payload.get("description") or "").strip(),
             allowed_tools=[str(item) for item in payload.get("allowed_tools") or []],
             tool_policy=str(payload.get("tool_policy") or "read_write").strip(),
-            strategy=_dict(payload.get("strategy") or {}, "strategy"),
+            strategy=coerce_evaluation_dict(payload.get("strategy") or {}, "strategy"),
             expected_file_changes=[
                 str(item) for item in payload.get("expected_file_changes") or []
             ],
@@ -121,8 +121,14 @@ class EvaluationTask:
             verification_prepare_commands=[str(item) for item in verification_prepare_commands if str(item).strip()],
             verification_timeout_seconds=int(payload.get("verification_timeout_seconds") or 120),
             model_visible_verification_command=str(payload.get("model_visible_verification_command") or "").strip(),
-            fixture_metadata=_dict(payload.get("fixture_metadata") or {}, "fixture_metadata"),
-            hidden_test_patch=_dict(payload.get("hidden_test_patch") or {}, "hidden_test_patch"),
+            fixture_metadata=coerce_evaluation_dict(
+                payload.get("fixture_metadata") or {},
+                "fixture_metadata",
+            ),
+            hidden_test_patch=coerce_evaluation_dict(
+                payload.get("hidden_test_patch") or {},
+                "hidden_test_patch",
+            ),
             test_patch=str(payload.get("test_patch") or ""),
         )
         task._validate()
@@ -284,7 +290,10 @@ def _workspace_payload(payload: dict[str, Any]) -> dict[str, Any]:
             workspace = {**workspace, "start_commit": payload["start_commit"]}
         return workspace
     if "fixture_workspace" in payload:
-        fixture = _dict(payload.get("fixture_workspace"), "fixture_workspace")
+        fixture = coerce_evaluation_dict(
+            payload.get("fixture_workspace"),
+            "fixture_workspace",
+        )
         return {"type": "fixture", "files": fixture.get("files") or fixture}
     repo_path = payload.get("repo_path") or payload.get("path")
     if repo_path:
@@ -427,11 +436,3 @@ def _allowed_paths_for_task(task: BenchmarkTask, metadata: dict[str, Any]) -> li
     for outcome in task.expected_outcomes:
         paths.extend(str(path) for path in outcome.expected_diff.get("paths", []) or [])
     return sorted(dict.fromkeys(paths)) or ["."]
-
-
-def _dict(value: Any, field_name: str) -> dict[str, Any]:
-    return coerce_dict(
-        value,
-        field_name,
-        error_message=f"evaluation {field_name} must be an object.",
-    )

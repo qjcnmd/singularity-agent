@@ -37,3 +37,33 @@ def test_workspace_mutation_manager_does_not_runtime_import_workspace_state() ->
     source = Path("src/singularity/workspace/mutation_manager.py").read_text(encoding="utf-8")
 
     assert "from singularity.workspace_state import WorkspaceStateManager" not in source
+
+
+def test_workspace_state_manager_does_not_runtime_import_workspace_package() -> None:
+    imports = _imports_from(Path("src/singularity/workspace_state/manager.py"))
+
+    assert "singularity.workspace" not in imports
+    assert not any(name.startswith("singularity.workspace.") for name in imports)
+
+
+def test_kernel_graph_does_not_runtime_import_evaluation_harness() -> None:
+    imports = _imports_from(Path("src/singularity/kernel/graph.py"))
+
+    assert "singularity.evaluation.harness" not in imports
+
+
+def test_model_layer_does_not_runtime_import_tool_registry() -> None:
+    for path in (
+        Path("src/singularity/model/runner.py"),
+        Path("src/singularity/model/tools.py"),
+        Path("src/singularity/model/validation.py"),
+    ):
+        imports = _imports_from(path)
+
+        assert "singularity.tools.registry" not in imports
+
+
+def test_context_manager_does_not_runtime_import_session_models() -> None:
+    imports = _imports_from(Path("src/singularity/context/manager.py"))
+
+    assert "singularity.session.models" not in imports

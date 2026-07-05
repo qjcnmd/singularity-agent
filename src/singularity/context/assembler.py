@@ -23,6 +23,7 @@ from singularity.context.models import (
 from singularity.context.ranking import authority_weight, layer_order, layer_weight
 from singularity.context.redaction import ContextRedactor
 from singularity.context.tokens import TokenCounter
+from singularity.runtime.defaults import CONTEXT_SUMMARY_MAX_TOKENS
 
 MAX_CONTEXT_FRAGMENT_TOKENS = 1000
 MAX_CONTEXT_FRAGMENT_BYTES = 12000
@@ -325,7 +326,7 @@ class ContextAssembler:
         elif item.layer == ContextLayer.COMPRESSED_HISTORY and item.item_type == ContextItemType.SUMMARY:
             content = (
                 "Context summary:\n"
-                f"{self._bounded_text(str(item.content), max_tokens=160)}"
+                f"{self._bounded_text(str(item.content), max_tokens=CONTEXT_SUMMARY_MAX_TOKENS)}"
             )
         elif item.layer not in {ContextLayer.SYSTEM, ContextLayer.USER_GOAL}:
             refs = [ref.ref_id for ref in item.references]

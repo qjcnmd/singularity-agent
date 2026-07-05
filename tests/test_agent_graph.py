@@ -101,9 +101,11 @@ def test_agent_graph_exposes_stable_health_components_without_forcing_lazy_evalu
             constructed.append(kwargs)
             self.__dict__.update(kwargs)
 
-    monkeypatch.setattr("singularity.kernel.graph.EvaluationHarness", FakeEvaluationHarness)
-
-    graph = _build_graph(tmp_path, monkeypatch)
+    graph = _build_graph(
+        tmp_path,
+        monkeypatch,
+        evaluation_harness_cls=FakeEvaluationHarness,
+    )
     health_components = graph.components_for_health()
 
     assert set(health_components) == {component.value for component in ComponentName}
@@ -187,9 +189,11 @@ def test_agent_graph_installs_cancellation_tokens_without_forcing_lazy_evaluatio
             constructed.append(kwargs)
             self.__dict__.update(kwargs)
 
-    monkeypatch.setattr("singularity.kernel.graph.EvaluationHarness", FakeEvaluationHarness)
-
-    graph = _build_graph(tmp_path, monkeypatch)
+    graph = _build_graph(
+        tmp_path,
+        monkeypatch,
+        evaluation_harness_cls=FakeEvaluationHarness,
+    )
     tokens: list[object] = []
 
     def make_token() -> object:
@@ -219,9 +223,12 @@ def test_agent_graph_defers_evaluation_harness_until_used(tmp_path: Path, monkey
             constructed.append(kwargs)
             self.__dict__.update(kwargs)
 
-    monkeypatch.setattr("singularity.kernel.graph.EvaluationHarness", FakeEvaluationHarness)
-
-    graph = _build_graph(tmp_path, monkeypatch, user_goal="Implement kernel")
+    graph = _build_graph(
+        tmp_path,
+        monkeypatch,
+        user_goal="Implement kernel",
+        evaluation_harness_cls=FakeEvaluationHarness,
+    )
 
     assert constructed == []
     assert graph.components_for_health()["evaluation"] is not None
@@ -383,6 +390,7 @@ def _build_graph(
     monkeypatch,
     *,
     user_goal: str = "Implement kernel",
+    evaluation_harness_cls=None,
 ) -> AgentGraph:
     monkeypatch.setenv("SINGULARITY_API_KEY", "test")
     monkeypatch.setenv("SINGULARITY_BASE_URL", "http://localhost/v1")
@@ -393,7 +401,12 @@ def _build_graph(
         approval_policy=ApprovalPolicy.NEVER,
     )
     trace = TraceRecorder.create(tmp_path, trace_dir=tmp_path / "traces")
-    return AgentGraphBuilder().build(
+    builder = AgentGraphBuilder(
+        evaluation_harness_factory_builder=_evaluation_harness_factory_builder(
+            evaluation_harness_cls
+        ),
+    )
+    return builder.build(
         project_root=tmp_path,
         config=config,
         trace=trace,
@@ -404,3 +417,27 @@ def _build_graph(
         ),
         user_goal=user_goal,
     )
+
+
+def _evaluation_harness_factory_builder(evaluation_harness_cls=None):
+    from singularity.evaluation.factory import build_evaluation_harness_factory
+
+    if evaluation_harness_cls is None:
+        return build_evaluation_harness_factory
+
+    def build_factory(**kwargs):
+        def build_harness():
+            return evaluation_harness_cls(
+                project_root=kwargs["project_root"],
+                trace_recorder=kwargs["trace"],
+                verification_runner=kwargs["verification_review"].verification_runner,
+                memory_pipeline=kwargs["infra"].memory_pipeline,
+                planner=kwargs["planner"],
+                tool_executor=kwargs["tool_protocol"].tool_executor,
+                command_executor=kwargs["execution_core"].command_executor,
+                mutation_manager=kwargs["execution_core"].mutation_manager,
+            )
+
+        return build_harness
+
+    return build_factory

@@ -25,6 +25,7 @@ from singularity.evaluation.models import (
 )
 from singularity.evaluation.patch_quality import PatchQualityEvaluator
 from singularity.observability.models import TraceArtifactKind, TraceEventType
+from singularity.runtime.defaults import BENCHMARK_VERIFICATION_TIMEOUT_SECONDS
 from singularity.verification.models import CheckKind, VerificationCheck
 from singularity.verification.runner import VerificationRunner
 from singularity.workspace import WorkspaceMutationManager
@@ -462,11 +463,11 @@ class BenchmarkTaskExecutor:
                 cwd=".",
                 purpose=CommandPurpose.PROJECT_VERIFICATION,
                 filesystem_mode=FilesystemMode.READ_WRITE_WORKSPACE,
-                timeout_seconds=120,
+                timeout_seconds=BENCHMARK_VERIFICATION_TIMEOUT_SECONDS,
             ),
             scope="benchmark_expected_outcome",
             required=True,
-            timeout=120,
+            timeout=BENCHMARK_VERIFICATION_TIMEOUT_SECONDS,
             risk_tags=["benchmark"],
             failure_policy="fail",
             source="benchmark_task",

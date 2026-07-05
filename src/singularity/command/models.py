@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field, replace
-from enum import Enum, StrEnum
-from typing import Any, TypeVar
+from enum import StrEnum
+from typing import Any
 from uuid import uuid4
 
 from singularity.observability.redaction import shared_trace_redactor
@@ -15,9 +15,6 @@ _SECRET_ARG_FLAG_RE = re.compile(
     r"^--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)$",
     re.IGNORECASE,
 )
-
-EnumT = TypeVar("EnumT", bound=Enum)
-
 
 class CommandPurpose(StrEnum):
     READ_ONLY_COMMAND = "READ_ONLY_COMMAND"
@@ -165,12 +162,16 @@ class CommandRequest:
     command_id: str = field(default_factory=lambda: uuid4().hex)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "purpose", _enum(CommandPurpose, self.purpose))
+        object.__setattr__(self, "purpose", coerce_enum(CommandPurpose, self.purpose, allow_name=True))
         object.__setattr__(
-            self, "network_mode", _enum(NetworkMode, self.network_mode)
+            self,
+            "network_mode",
+            coerce_enum(NetworkMode, self.network_mode, allow_name=True),
         )
         object.__setattr__(
-            self, "filesystem_mode", _enum(FilesystemMode, self.filesystem_mode)
+            self,
+            "filesystem_mode",
+            coerce_enum(FilesystemMode, self.filesystem_mode, allow_name=True),
         )
         object.__setattr__(
             self,
@@ -497,13 +498,6 @@ class ProcessStopResult:
             "artifact_path": self.artifact_path,
             "error_code": self.error_code,
         }
-
-
-def _enum(enum_type: type[EnumT], value: EnumT | str) -> EnumT:
-    try:
-        return coerce_enum(enum_type, value, allow_name=True)
-    except ValueError:
-        return enum_type(str(value))
 
 
 _hash_text = stable_hash_text

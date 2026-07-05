@@ -11,12 +11,14 @@ from uuid import uuid4
 
 from singularity.observability.protocols import TraceRecorderProtocol
 from singularity.utils.serialization import enum_value_str, utc_iso_timestamp
-from singularity.workspace.pathing import (
+from singularity.workspace_core import (
+    FileClassifier,
     ResolvedWorkspacePath,
     WorkspacePathResolver,
+    detect_line_ending,
+    hash_bytes,
+    looks_binary,
 )
-from singularity.workspace.policy import FileClassifier
-from singularity.workspace.snapshot import detect_line_ending, hash_bytes, looks_binary
 from singularity.workspace_state.models import (
     ArtifactRecord,
     ChangeDetectionResult,

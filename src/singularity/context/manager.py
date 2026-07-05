@@ -46,7 +46,7 @@ from singularity.context.redaction import ContextRedactor, SensitivityClassifier
 from singularity.context.store import ObservationStore
 from singularity.context.tokens import TokenCounter
 from singularity.context.usage import ContextUsageReporter
-from singularity.session.models import SessionResumeContext
+from singularity.recovery_context import SessionResumeContext
 from singularity.utils.attributes import nested_getattr
 from singularity.utils.serialization import utc_iso_timestamp
 

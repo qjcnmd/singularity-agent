@@ -1,3 +1,4 @@
+import io
 import json
 import queue
 import sys
@@ -801,6 +802,17 @@ def test_stopped_long_running_session_releases_process_resources(tmp_path: Path)
     ]
     assert "ready" in output_after_stop.combined_output
     assert component.stop_process(session.process_id).status == "stopped"
+
+
+def test_command_reader_threads_are_not_daemonized() -> None:
+    from singularity.command.backend import _reader_thread
+
+    output_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
+    thread = _reader_thread("stdout", io.BytesIO(b"ready\n"), output_queue)
+    thread.join(timeout=1)
+
+    assert thread.daemon is False
+    assert output_queue.get_nowait() == ("stdout", b"ready\n")
 
 
 def test_start_process_tracks_files_written_immediately_after_spawn(tmp_path: Path) -> None:

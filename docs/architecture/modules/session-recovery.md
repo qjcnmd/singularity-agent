@@ -3,6 +3,7 @@
 模块数据流文档 ID: session-recovery
 
 源码证据路径:
+- src/singularity/recovery_context.py
 - src/singularity/session/models.py
 - src/singularity/session/store.py
 - src/singularity/session/history.py
@@ -50,6 +51,7 @@ Session Recovery 层把一次用户可打开的历史会话和每次执行尝试
 
 ## 当前源码位置
 
+- src/singularity/recovery_context.py
 - src/singularity/session/models.py
 - src/singularity/session/store.py
 - src/singularity/session/history.py

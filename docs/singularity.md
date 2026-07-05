@@ -63,6 +63,8 @@
 │                                      (user_goal, recovery_gate_decision,     │
 │                                       project_index, memory_pipeline,        │
 │                                       context_manager)                       │
+│      EvaluationHarness 由 bootstrap 装配层注入 lazy factory；graph 不顶层导入 │
+│      evaluation harness，主 AgentLoop 顺序不变。                             │
 │                                                                             │
 │  输出：AgentGraph（22+ 组件完整 wiring）                                     │
 └──────────────────────────────────┬──────────────────────────────────────────┘

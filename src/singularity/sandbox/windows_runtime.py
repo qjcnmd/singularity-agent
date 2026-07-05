@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from singularity.runtime.defaults import WINDOWS_SANDBOX_ACL_COMMAND_TIMEOUT_SECONDS
 from singularity.sandbox.models import SandboxResourceLimits
 from singularity.sandbox.windows_common import (
     SANDBOX_ACCOUNTS,
@@ -782,7 +783,7 @@ def _ensure_runner_runtime_access(
         command = [icacls, str(path), "/grant:r"]
         command.extend(f"{account}:{permission}" for account in account_names)
         command.extend(("/C", "/Q"))
-        result = _run_command(command, timeout_seconds=120)
+        result = _run_command(command, timeout_seconds=WINDOWS_SANDBOX_ACL_COMMAND_TIMEOUT_SECONDS)
         if result.returncode != 0:
             return _OperationResult(
                 False,
@@ -810,7 +811,7 @@ def _remove_stale_runner_runtime_base_access(
     del targets
     for path in _runner_runtime_stale_acl_targets():
         command = [icacls, str(path), "/remove:g", *account_names, "/C", "/Q"]
-        result = _run_command(command, timeout_seconds=120)
+        result = _run_command(command, timeout_seconds=WINDOWS_SANDBOX_ACL_COMMAND_TIMEOUT_SECONDS)
         if result.returncode != 0:
             return _OperationResult(
                 False,
@@ -841,7 +842,7 @@ def _remove_runner_runtime_access(account_names: tuple[str, ...]) -> _OperationR
     cleanup_targets = tuple(dict.fromkeys((*_runner_runtime_stale_acl_targets(), *(path for path, _permission in targets))))
     for path in cleanup_targets:
         command = [icacls, str(path), "/remove:g", *account_names, "/C", "/Q"]
-        result = _run_command(command, timeout_seconds=120)
+        result = _run_command(command, timeout_seconds=WINDOWS_SANDBOX_ACL_COMMAND_TIMEOUT_SECONDS)
         if result.returncode != 0:
             return _OperationResult(
                 False,

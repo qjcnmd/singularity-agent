@@ -8,6 +8,7 @@ from rich.console import Console
 from singularity.config import ProductionConfig
 from singularity.context import RecoveryManager
 from singularity.context.models import RecoveredContext
+from singularity.evaluation.factory import build_evaluation_harness_factory
 from singularity.interaction import (
     InteractionController,
     InteractionMode,
@@ -54,7 +55,9 @@ class KernelBootstrap:
         self.config = config
         self.trace = trace
         self.console = console or Console()
-        self.component_factory = component_factory or AgentGraphBuilder()
+        self.component_factory = component_factory or AgentGraphBuilder(
+            evaluation_harness_factory_builder=build_evaluation_harness_factory,
+        )
         self.workspace_lock = workspace_lock or WorkspaceLockManager(self.project_root)
 
     def boot(self, user_goal: str) -> AgentKernel:

@@ -64,6 +64,92 @@ class TurnCoordinator:
         planner.step()
         effective_goal = getattr(planner.state, "effective_goal", None) or user_goal
         context.set_user_goal(effective_goal)
+        request = self._build_request(
+            turn=turn,
+            effective_goal=effective_goal,
+            planner=planner,
+            context=context,
+            tool_schemas=tool_schemas,
+        )
+        planner.record_instruction_prompt_observation(dict(self.prompt_assembly.summary()))
+        result = self.dependencies.model_runner.run_turn(request)
+        context.record_model_usage(result)
+        if result.status != ModelTurnStatus.SUCCESS:
+            return self._handle_model_failure(
+                result=result,
+                turn=turn,
+                planner=planner,
+                controller=controller,
+                context=context,
+            )
+
+        assistant_message = self.callbacks.assistant_message_from_result(result)
+        if not result.tool_calls:
+            context.add_assistant_message(assistant_message)
+            return self._attempt_finalize(
+                assistant_message=assistant_message,
+                turn=turn,
+                planner=planner,
+                controller=controller,
+                context=context,
+            )
+
+        observation_start = len(context.tool_observations)
+        protocol_result = self.dependencies.tool_protocol.process_model_turn(
+            request=request,
+            result=result,
+            turn=turn,
+            context=context,
+            tool_executor=self.dependencies.tool_executor,
+            planner=planner,
+        )
+        if protocol_result.next_action == "finalize":
+            return self._attempt_finalize(
+                assistant_message=assistant_message,
+                turn=turn,
+                planner=planner,
+                controller=controller,
+                context=context,
+            )
+
+        observations = context.tool_observations[observation_start:]
+        terminal = self._handle_protocol_result(
+            protocol_result=protocol_result,
+            observations=observations,
+            turn=turn,
+            planner=planner,
+            controller=controller,
+            context=context,
+        )
+        if terminal is not None:
+            return terminal
+        terminal = self._handle_verification_failure(
+            turn=turn,
+            planner=planner,
+            controller=controller,
+            context=context,
+        )
+        if terminal is not None:
+            return terminal
+        if self.callbacks.should_auto_finalize_after_tools(planner, protocol_result):
+            return self._attempt_finalize(
+                assistant_message=assistant_message,
+                turn=turn,
+                planner=planner,
+                controller=controller,
+                context=context,
+            )
+        return None
+
+    def _build_request(
+        self,
+        *,
+        turn: int,
+        effective_goal: str,
+        planner: Planner,
+        context: ContextManager,
+        tool_schemas: list[dict[str, Any]],
+    ) -> Any:
         turn_action_id = f"turn_{turn}"
         active_tool_schemas = planner.filtered_tools(
             tool_schemas,
@@ -75,7 +161,7 @@ class TurnCoordinator:
             for tool in active_tool_schemas
             if tool.get("function", {}).get("name")
         ]
-        request = self.dependencies.model_runner.build_request_from_context(
+        return self.dependencies.model_runner.build_request_from_context(
             context,
             run_id=self.trace.run_id,
             session_id=getattr(planner, "session_id", self.trace.run_id),
@@ -89,83 +175,46 @@ class TurnCoordinator:
             user_task=effective_goal,
             strict_tools=self.strict,
         )
-        planner.record_instruction_prompt_observation(dict(self.prompt_assembly.summary()))
-        result = self.dependencies.model_runner.run_turn(request)
-        context.record_model_usage(result)
-        if result.status != ModelTurnStatus.SUCCESS:
-            self.callbacks.record_model_failure(planner, result, turn=turn)
-            outcome = self.callbacks.outcome_from_model_failure(result)
-            controller.apply_outcome(outcome)
-            self.callbacks.record_outcome_context(context, planner, outcome)
-            terminal = self.callbacks.terminal_result_from_outcome(outcome, turn=turn)
-            if terminal is not None:
-                return terminal
-            return None
 
-        assistant_message = self.callbacks.assistant_message_from_result(result)
-        if not result.tool_calls:
-            context.add_assistant_message(assistant_message)
-            final = self.callbacks.attempt_finalize(
-                planner,
-                controller=controller,
-                context=context,
-                turn=turn,
-                model_answer=assistant_message.get("content") or "",
-            )
-            if final is not None:
-                return final
-            return None
+    def _handle_model_failure(
+        self,
+        *,
+        result: Any,
+        turn: int,
+        planner: Planner,
+        controller: RunController,
+        context: ContextManager,
+    ) -> Any | None:
+        self.callbacks.record_model_failure(planner, result, turn=turn)
+        outcome = self.callbacks.outcome_from_model_failure(result)
+        controller.apply_outcome(outcome)
+        self.callbacks.record_outcome_context(context, planner, outcome)
+        return self.callbacks.terminal_result_from_outcome(outcome, turn=turn)
 
-        observation_start = len(context.tool_observations)
-        protocol_result = self.dependencies.tool_protocol.process_model_turn(
-            request=request,
-            result=result,
-            turn=turn,
-            context=context,
-            tool_executor=self.dependencies.tool_executor,
-            planner=planner,
-        )
-        if protocol_result.next_action == "finalize":
-            final = self.callbacks.attempt_finalize(
-                planner,
-                controller=controller,
-                context=context,
-                turn=turn,
-                model_answer=assistant_message.get("content") or "",
-            )
-            if final is not None:
-                return final
-            return None
-
-        observations = context.tool_observations[observation_start:]
+    def _handle_protocol_result(
+        self,
+        *,
+        protocol_result: Any,
+        observations: list[Any],
+        turn: int,
+        planner: Planner,
+        controller: RunController,
+        context: ContextManager,
+    ) -> Any | None:
         controller.apply_protocol_result(protocol_result, observations=observations)
         reduced_outcome = controller.reduce_protocol_result(
             protocol_result,
             observations=observations,
         )
-        if reduced_outcome is not None:
-            controller.apply_outcome(reduced_outcome)
-            self.callbacks.record_outcome_context(context, planner, reduced_outcome)
-            blocked = self.callbacks.maybe_analyze_failure(
-                planner,
-                context,
-                outcome=reduced_outcome,
-                failure_source="tool",
-                turn=turn,
-            )
-            if blocked is not None:
-                controller.apply_outcome(blocked)
-                self.callbacks.record_outcome_context(context, planner, blocked)
-                terminal = self.callbacks.terminal_result_from_outcome(blocked, turn=turn)
-                if terminal is not None:
-                    return terminal
-            terminal = self.callbacks.terminal_result_from_outcome(reduced_outcome, turn=turn)
-            if terminal is not None:
-                return terminal
+        if reduced_outcome is None:
+            return None
+        controller.apply_outcome(reduced_outcome)
+        self.callbacks.record_outcome_context(context, planner, reduced_outcome)
         blocked = self.callbacks.maybe_analyze_failure(
             planner,
             context,
-            failure_source="verification",
+            outcome=reduced_outcome,
+            failure_source="tool",
             turn=turn,
         )
         if blocked is not None:
@@ -174,14 +223,41 @@ class TurnCoordinator:
             terminal = self.callbacks.terminal_result_from_outcome(blocked, turn=turn)
             if terminal is not None:
                 return terminal
-        if self.callbacks.should_auto_finalize_after_tools(planner, protocol_result):
-            final = self.callbacks.attempt_finalize(
-                planner,
-                controller=controller,
-                context=context,
-                turn=turn,
-                model_answer=assistant_message.get("content") or "",
-            )
-            if final is not None:
-                return final
-        return None
+        return self.callbacks.terminal_result_from_outcome(reduced_outcome, turn=turn)
+
+    def _handle_verification_failure(
+        self,
+        *,
+        turn: int,
+        planner: Planner,
+        controller: RunController,
+        context: ContextManager,
+    ) -> Any | None:
+        blocked = self.callbacks.maybe_analyze_failure(
+            planner,
+            context,
+            failure_source="verification",
+            turn=turn,
+        )
+        if blocked is None:
+            return None
+        controller.apply_outcome(blocked)
+        self.callbacks.record_outcome_context(context, planner, blocked)
+        return self.callbacks.terminal_result_from_outcome(blocked, turn=turn)
+
+    def _attempt_finalize(
+        self,
+        *,
+        assistant_message: dict[str, Any],
+        turn: int,
+        planner: Planner,
+        controller: RunController,
+        context: ContextManager,
+    ) -> Any | None:
+        return self.callbacks.attempt_finalize(
+            planner,
+            controller=controller,
+            context=context,
+            turn=turn,
+            model_answer=assistant_message.get("content") or "",
+        )

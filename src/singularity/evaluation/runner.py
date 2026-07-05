@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -48,8 +49,6 @@ from singularity.evaluation.results import (
     _average_rate,
     _float_map,
     _rate,
-    _safe_float,
-    _safe_int,
     _safe_str,
     compare_evaluation_results,
     evaluation_regression_markdown,
@@ -62,10 +61,17 @@ from singularity.evaluation.results import (
 from singularity.interaction import InteractionMode
 from singularity.observability.redaction import TraceRedactor, shared_trace_redactor
 from singularity.redaction import RedactionProvider
+from singularity.runtime.defaults import (
+    CAPABILITY_SLA_OPTIONAL_THRESHOLDS_SECONDS,
+    CAPABILITY_SLA_REQUIRED_THRESHOLDS_SECONDS,
+    EVALUATION_PREPARE_TIMEOUT_SECONDS,
+)
 from singularity.runtime.resources import close_runtime_resources
 from singularity.utils.attributes import nested_getattr
 from singularity.utils.serialization import (
-    coerce_dict,
+    coerce_evaluation_dict,
+    coerce_float,
+    coerce_int,
     stable_hash_bytes,
     stable_hash_payload,
     stable_hash_text,
@@ -73,6 +79,8 @@ from singularity.utils.serialization import (
 )
 
 EVALUATION_METRICS_SCHEMA_VERSION = "evaluation.metrics/v1"
+_safe_float = coerce_float
+_safe_int = coerce_int
 
 _PATCH_REDACTOR = ContextRedactor()
 _MIMO_PRICING_SOURCE_URL = "https://platform.xiaomimimo.com/docs/pricing"
@@ -87,6 +95,50 @@ _TOKEN_PRICING_PER_1M: dict[str, dict[str, Any]] = {
         "retrieved_at": _MIMO_PRICING_RETRIEVED_AT,
     }
 }
+
+
+@dataclass(frozen=True)
+class _TaskRunPaths:
+    task_dir: Path
+    workspace: Path
+    baseline_workspace: Path
+    verification_workspace: Path
+    baseline_verification_workspace: Path
+
+
+@dataclass
+class _TaskRunState:
+    started: float
+    timing: dict[str, Any] = field(default_factory=dict)
+    trace_path: str = ""
+    verification: CommandEvalResult | None = None
+    public_verification: CommandEvalResult | None = None
+    hidden_verification: CommandEvalResult | None = None
+    files_changed: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    usage: dict[str, Any] = field(default_factory=dict)
+    tool_calls: int = 0
+    success_ok: bool = False
+    tests_passed: bool = False
+    kernel: Any | None = None
+    agent_result: Any | None = None
+    before_snapshot: dict[str, str] = field(default_factory=dict)
+    before_text_snapshot: dict[str, str] = field(default_factory=dict)
+    patch_payload: dict[str, Any] = field(default_factory=dict)
+    checks: dict[str, Any] = field(default_factory=dict)
+    agent_status: str = ""
+    final_report_payload: dict[str, Any] = field(default_factory=dict)
+    trace_summary: dict[str, Any] = field(default_factory=dict)
+    turn_count: int = 0
+    policy_blocks: int = 0
+    trace_artifact_refs: list[str] = field(default_factory=list)
+    contract_satisfaction: dict[str, Any] = field(default_factory=dict)
+    reproducible_environment: dict[str, Any] = field(default_factory=dict)
+    baseline_checks: dict[str, Any] = field(default_factory=dict)
+    baseline_failed: bool = False
+    patch_applied: bool = False
+    fail_to_pass_satisfied: bool = False
+    verification_misconfiguration_reason: str = ""
 
 
 class EvaluationRunner:
@@ -204,483 +256,491 @@ class EvaluationRunner:
         return regression_path
 
     def run_task(self, task: EvaluationTask, *, manifest_base: Path) -> EvaluationTaskResult:
-        started = time.perf_counter()
-        evaluation_timing: dict[str, Any] = {}
-        task_dir = self.run_dir / _safe_name(task.task_id)
-        workspace = task_dir / "workspace"
-        trace_path = ""
-        verification: CommandEvalResult | None = None
-        public_verification: CommandEvalResult | None = None
-        hidden_verification: CommandEvalResult | None = None
-        files_changed: list[str] = []
-        errors: list[str] = []
-        usage: dict[str, Any] = {}
-        tool_calls = 0
-        success_ok = False
-        tests_passed = False
-        kernel = None
-        before_snapshot: dict[str, str] = {}
-        before_text_snapshot: dict[str, str] = {}
-        baseline_workspace = task_dir / "baseline-workspace"
-        verification_workspace = task_dir / "verification-workspace"
-        patch_payload: dict[str, Any] = {}
-        checks: dict[str, Any] = {}
-        agent_status = ""
-        final_report_payload: dict[str, Any] = {}
-        trace_summary: dict[str, Any] = {}
-        turn_count = 0
-        policy_blocks = 0
-        trace_artifact_refs: list[str] = []
-        contract_satisfaction: dict[str, Any] = {}
-        reproducible_environment: dict[str, Any] = {}
-        baseline_checks: dict[str, Any] = {}
-        baseline_failed = False
-        baseline_verification_workspace = task_dir / "baseline-verification-workspace"
-        patch_applied = False
-        fail_to_pass_satisfied = False
-        verification_misconfiguration_reason = ""
+        paths = self._task_paths(task)
+        state = _TaskRunState(started=time.perf_counter())
         try:
-            try:
-                self._prepare_task_workspace(
-                    task,
-                    task_dir=task_dir,
-                    workspace=workspace,
-                    manifest_base=manifest_base,
-                    timing=evaluation_timing,
-                )
-            except EvaluationSetupError as exc:
-                errors.append(str(exc))
-                return self._task_result(
-                    task=task,
-                    workspace=workspace,
-                    trace=trace_path,
-                    started=started,
-                    verification=None,
-                    verification_workspace=verification_workspace,
-                    files_changed=[],
-                    usage={},
-                    tool_calls=0,
-                    errors=errors,
-                    patch={},
-                    checks=_checks_payload(None, None),
-                    success=False,
-                    tests_passed=False,
-                    infrastructure_blocked=exc.environment_blocker,
-                    agent_status="",
-                    final_report_payload={},
-                    trace_summary={},
-                    turn_count=0,
-                    policy_blocks=0,
-                    trace_artifact_refs=[],
-                    contract_satisfaction={},
-                    reproducible_environment=_setup_environment(task, manifest_base=manifest_base),
-                    baseline_checks={},
-                    evaluation_timing=evaluation_timing,
-                )
-            config = ProductionConfig.from_cli(
-                project_root=workspace,
-                max_turns=self.max_turns or _strategy_max_turns_for_task(task) or adaptive_default_max_turns(task.user_task),
-                model=self.model,
-                base_url=self.base_url,
-                env_root=self.env_root,
-                permission_profile=_permission_profile_for_task(task),
-                approval_policy=_approval_policy_for_task(task),
-                network_access=_network_access_for_task(task),
-                interaction_mode=InteractionMode.NON_INTERACTIVE,
-                raw_artifacts=False,
-                profile=f"evaluation:{task.task_id}:{task.tool_policy}",
-                cli_overrides={
-                    "max_turns",
-                    "model",
-                    "base_url",
-                    "permission_profile",
-                    "approval_policy",
-                    "network_access",
-                    "interaction_mode",
-                    "raw_artifacts",
-                    "profile",
-                },
-            )
-            reproducible_environment = _reproducible_environment(
+            prepared = self._prepare_task_run(
                 task,
-                workspace=workspace,
                 manifest_base=manifest_base,
-                output_root=self.output_root,
-                baseline_result_path=self.baseline_result_path,
-                config=config,
-                max_turns=config.max_turns,
+                paths=paths,
+                state=state,
             )
-            dependency_setup_started = time.perf_counter()
-            dependency_cache_env, dependency_cache = _dependency_setup_cache(
-                task,
-                workspace=workspace,
-                output_root=self.output_root,
-            )
-            reproducible_environment["dependency_setup_cache"] = dependency_cache
-            if dependency_cache.get("hit") is not True:
-                for command in task.prepare_commands:
-                    prepared = _run_shell(
-                        command,
-                        cwd=workspace,
-                        timeout_seconds=120,
-                        redactor=self.redactor,
-                        env_overrides=dependency_cache_env,
-                    )
-                    if not prepared.passed:
-                        errors.append(f"prepare failed: {prepared.error_summary or command}")
-                        return self._task_result(
-                            task=task,
-                            workspace=workspace,
-                            trace=trace_path,
-                            started=started,
-                            verification=prepared,
-                            verification_workspace=verification_workspace,
-                            files_changed=[],
-                            usage={},
-                            tool_calls=0,
-                            errors=errors,
-                            patch={},
-                            checks=_checks_payload(None, prepared),
-                            success=False,
-                            tests_passed=False,
-                            infrastructure_blocked=False,
-                            reproducible_environment=reproducible_environment,
-                            evaluation_timing={
-                                **evaluation_timing,
-                                "dependency_setup_time_seconds": time.perf_counter()
-                                - dependency_setup_started,
-                            },
-                        )
-                _finalize_dependency_setup_cache(
-                    dependency_cache,
-                    workspace=workspace,
-                )
-            evaluation_timing["dependency_setup_time_seconds"] = (
-                time.perf_counter() - dependency_setup_started
-            )
-            before_snapshot = _snapshot_files(workspace)
-            before_text_snapshot = _read_text_files(workspace)
-            phase_started = time.perf_counter()
-            shutil.copytree(workspace, baseline_workspace, ignore=_copy_ignore)
-            evaluation_timing["baseline_workspace_copy_time_seconds"] = (
-                time.perf_counter() - phase_started
-            )
-            if _requires_baseline_verification(task):
+            if isinstance(prepared, EvaluationTaskResult):
+                return prepared
+            baseline_result = self._run_baseline_stage(task, paths=paths, state=state)
+            if baseline_result is not None:
+                return baseline_result
+            agent_result = self._run_agent_stage(task, paths=paths, state=state, config=prepared)
+            if agent_result is not None:
+                return agent_result
+            verification_result = self._run_verification_stage(task, paths=paths, state=state)
+            if verification_result is not None:
+                return verification_result
+            self._evaluate_task_success(task, paths=paths, state=state)
+        except Exception as exc:
+            state.errors.append(self.redactor.redact_text(str(exc)) or type(exc).__name__)
+            if state.kernel is not None:
+                state.trace_path = state.trace_path or _trace_path(state.kernel)
+                state.trace_summary = state.trace_summary or _trace_summary_from_kernel(state.kernel)
+                trace = Path(state.trace_path) if state.trace_path else None
+                if not state.agent_status:
+                    state.agent_status = _agent_status_from_trace(trace)
+                state.usage = state.usage or dict(state.trace_summary.get("model_usage_summary") or {})
+                if not state.tool_calls:
+                    state.tool_calls = _tool_calls_from_trace(trace, state.trace_summary)
+                if not state.turn_count:
+                    state.turn_count = _turn_count_from_trace(trace, state.usage)
+        finally:
+            if state.kernel is not None:
                 phase_started = time.perf_counter()
-                baseline_verification = _run_baseline_verification(
-                    task,
-                    baseline_workspace=baseline_workspace,
-                    baseline_verification_workspace=baseline_verification_workspace,
-                    root=task_dir,
-                    redactor=self.redactor,
-                )
-                evaluation_timing["baseline_verification_time_seconds"] = (
+                close_runtime_resources(state.kernel)
+                state.timing["resource_cleanup_time_seconds"] = (
                     time.perf_counter() - phase_started
                 )
-                baseline_checks = baseline_verification["checks"]
-                baseline_failed = bool(baseline_verification["baseline_failed"])
-                verification_misconfiguration_reason = str(
-                    baseline_verification.get("verification_misconfiguration_reason") or ""
-                )
-                if baseline_verification["status"] == "baseline_already_passing":
-                    errors.append("baseline already passing before agent changes")
-                    return self._task_result(
-                        task=task,
-                        workspace=workspace,
-                        trace=trace_path,
-                        started=started,
-                        verification=None,
-                        verification_workspace=verification_workspace,
-                        files_changed=[],
-                        usage={},
-                        tool_calls=0,
-                        errors=errors,
-                        patch={},
-                        checks=_checks_payload(None, None),
-                        success=False,
-                        tests_passed=False,
-                        infrastructure_blocked=False,
-                        final_report_payload={},
-                        trace_summary={},
-                        turn_count=0,
-                        policy_blocks=0,
-                        trace_artifact_refs=[],
-                        contract_satisfaction={},
-                        reproducible_environment=reproducible_environment,
-                        baseline_failed=False,
-                        baseline_checks=baseline_checks,
-                        status_override="invalid_public_task",
-                        failure_category_override="baseline_already_passing",
-                        evaluation_timing=evaluation_timing,
-                    )
-                if baseline_verification["status"] == "verification_misconfigured":
-                    errors.append(f"verification misconfigured: {verification_misconfiguration_reason}")
-                    return self._task_result(
-                        task=task,
-                        workspace=workspace,
-                        trace=trace_path,
-                        started=started,
-                        verification=None,
-                        verification_workspace=verification_workspace,
-                        files_changed=[],
-                        usage={},
-                        tool_calls=0,
-                        errors=errors,
-                        patch={},
-                        checks=_checks_payload(None, None),
-                        success=False,
-                        tests_passed=False,
-                        infrastructure_blocked=False,
-                        final_report_payload={},
-                        trace_summary={},
-                        turn_count=0,
-                        policy_blocks=0,
-                        trace_artifact_refs=[],
-                        contract_satisfaction={},
-                        reproducible_environment=reproducible_environment,
-                        baseline_failed=False,
-                        baseline_checks=baseline_checks,
-                        verification_misconfiguration_reason=verification_misconfiguration_reason,
-                        status_override="verification_misconfigured",
-                        failure_category_override="verification_misconfigured",
-                        evaluation_timing=evaluation_timing,
-                    )
-            goal = _task_goal(task)
-            agent_run = self._run_agent_task(task, workspace=workspace, config=config, goal=goal, timing=evaluation_timing)
-            kernel = agent_run["kernel"]
-            agent_result = agent_run["agent_result"]
-            trace_path = agent_run["trace_path"]
-            trace_summary = agent_run["trace_summary"]
-            final_report_payload = agent_run["final_report_payload"]
-            usage = agent_run["usage"]
-            tool_calls = agent_run["tool_calls"]
-            turn_count = agent_run["turn_count"]
-            policy_blocks = agent_run["policy_blocks"]
-            trace_artifact_refs = agent_run["trace_artifact_refs"]
-            agent_status = agent_run["agent_status"]
-            environment_blocker_reason = agent_run["environment_blocker_reason"]
-            if environment_blocker_reason:
-                errors.append(f"environment blocker: {environment_blocker_reason}")
-                files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
-                patch_payload = _patch_payload(before_text_snapshot, workspace)
-                contract_satisfaction = _contract_satisfaction(
-                    task,
-                    files_changed=files_changed,
-                    allowed_scope=True,
-                    verification=None,
-                    public_verification=None,
-                    agent_status=agent_status,
-                    final_report_status=_final_report_status(final_report_payload, agent_status=agent_status),
-                    policy_blocks=policy_blocks,
-                    patch=patch_payload,
-                    final_report_payload=final_report_payload,
-                )
-                return self._task_result(
-                    task=task,
-                    workspace=workspace,
-                    trace=trace_path,
-                    started=started,
-                    verification=None,
-                    verification_workspace=verification_workspace,
-                    files_changed=files_changed,
-                    usage=usage,
-                    tool_calls=tool_calls,
-                    errors=errors,
-                    patch=patch_payload,
-                    checks=_checks_payload(None, None),
-                    success=False,
-                    tests_passed=False,
-                    infrastructure_blocked=True,
-                    agent_status=agent_status,
-                    final_report_payload=final_report_payload,
-                    trace_summary=trace_summary,
-                    turn_count=turn_count,
-                    policy_blocks=policy_blocks,
-                    trace_artifact_refs=trace_artifact_refs,
-                    contract_satisfaction=contract_satisfaction,
-                    reproducible_environment=reproducible_environment,
-                    baseline_failed=baseline_failed,
-                    baseline_checks=baseline_checks,
-                    evaluation_timing=evaluation_timing,
-                )
-            files_changed = _changed_files(workspace, before_snapshot=before_snapshot)
-            patch_payload = _patch_payload(before_text_snapshot, workspace)
-            phase_started = time.perf_counter()
-            applicable = _prepare_verification_workspace(
-                source_workspace=workspace,
-                verification_workspace=verification_workspace,
-                baseline_workspace=baseline_workspace,
-                before_snapshot=before_text_snapshot,
-                root=task_dir,
-                test_patch=task.test_patch,
-            )
-            evaluation_timing["verification_workspace_copy_time_seconds"] = (
-                time.perf_counter() - phase_started
-            )
-            patch_payload["applicable"] = applicable
-            patch_applied = applicable
-            verification_run = self._run_task_verification(
+        return self._task_result_from_state(task, paths, state)
+
+    def _task_paths(self, task: EvaluationTask) -> _TaskRunPaths:
+        task_dir = self.run_dir / _safe_name(task.task_id)
+        return _TaskRunPaths(
+            task_dir=task_dir,
+            workspace=task_dir / "workspace",
+            baseline_workspace=task_dir / "baseline-workspace",
+            verification_workspace=task_dir / "verification-workspace",
+            baseline_verification_workspace=task_dir / "baseline-verification-workspace",
+        )
+
+    def _prepare_task_run(
+        self,
+        task: EvaluationTask,
+        *,
+        manifest_base: Path,
+        paths: _TaskRunPaths,
+        state: _TaskRunState,
+    ) -> ProductionConfig | EvaluationTaskResult:
+        try:
+            self._prepare_task_workspace(
                 task,
-                verification_workspace=verification_workspace,
-                timing=evaluation_timing,
+                task_dir=paths.task_dir,
+                workspace=paths.workspace,
+                manifest_base=manifest_base,
+                timing=state.timing,
             )
-            public_verification = verification_run["public_verification"]
-            hidden_verification = verification_run["hidden_verification"]
-            verification = verification_run["verification"]
-            checks = verification_run["checks"]
-            failed_prepare_command = verification_run["failed_prepare_command"]
-            if failed_prepare_command:
-                prepared = verification
-                errors.append(f"verification prepare failed: {prepared.error_summary or failed_prepare_command}")
-                allowed_ok = _allowed_scope_ok(files_changed, task.allowed_paths)
-                contract_satisfaction = _contract_satisfaction(
-                    task,
-                    files_changed=files_changed,
-                    allowed_scope=allowed_ok,
-                    verification=prepared,
-                    public_verification=public_verification,
-                    agent_status=agent_status,
-                    final_report_status=_final_report_status(final_report_payload, agent_status=agent_status),
-                    policy_blocks=policy_blocks,
-                    patch=patch_payload,
-                    final_report_payload=final_report_payload,
-                )
-                return self._task_result(
-                    task=task,
-                    workspace=workspace,
-                    trace=trace_path,
-                    started=started,
-                    verification=prepared,
-                    verification_workspace=verification_workspace,
-                    files_changed=files_changed,
-                    usage=usage,
-                    tool_calls=tool_calls,
-                    errors=errors,
-                    patch=patch_payload,
-                    checks=checks,
-                    success=False,
-                    tests_passed=False,
-                    infrastructure_blocked=False,
-                    agent_status=agent_status,
-                    final_report_payload=final_report_payload,
-                    trace_summary=trace_summary,
-                    turn_count=turn_count,
-                    policy_blocks=policy_blocks,
-                    trace_artifact_refs=trace_artifact_refs,
-                    contract_satisfaction=contract_satisfaction,
-                    reproducible_environment=reproducible_environment,
-                    public_verification=public_verification,
-                    hidden_verification=prepared,
-                    evaluation_timing=evaluation_timing,
-                )
-            tests_passed = verification.passed
-            allowed_ok = _allowed_scope_ok(files_changed, task.allowed_paths)
-            criterion_ok = _success_criterion_ok(
-                task.success,
-                verification=verification,
-                workspace=verification_workspace,
-                agent_status=agent_status,
-                policy_blocks=policy_blocks,
-            )
-            agent_completed = agent_status == "completed"
-            if not agent_completed:
-                errors.append(f"agent status: {getattr(agent_result.status, 'value', agent_result.status)}")
-            if not tests_passed:
-                errors.append(f"verification failed: {verification.error_summary or verification.command}")
-            if not public_verification.passed:
-                errors.append(f"public verification failed: {public_verification.error_summary or public_verification.command}")
-            patch_ok = _patch_applicable_for_task(task, patch=patch_payload, files_changed=files_changed)
-            if not patch_ok:
-                if not files_changed and not agent_completed:
-                    errors.append("agent blocked before target file changes")
-                else:
-                    errors.append("patch could not be applied to clean verification workspace")
-            if not allowed_ok:
-                errors.append("changed files outside allowed_paths")
-            if not criterion_ok:
-                errors.append("success criterion failed")
-            fail_to_pass_satisfied = bool(baseline_failed and tests_passed and public_verification.passed)
-            contract_satisfaction = _contract_satisfaction(
+        except EvaluationSetupError as exc:
+            state.errors.append(str(exc))
+            state.checks = _checks_payload(None, None)
+            state.reproducible_environment = _setup_environment(task, manifest_base=manifest_base)
+            return self._task_result_from_state(
                 task,
-                files_changed=files_changed,
-                allowed_scope=allowed_ok,
-                verification=verification,
-                public_verification=public_verification,
-                agent_status=agent_status,
-                final_report_status=_final_report_status(final_report_payload, agent_status=agent_status),
-                policy_blocks=policy_blocks,
-                patch=patch_payload,
-                final_report_payload=final_report_payload,
+                paths,
+                state,
+                infrastructure_blocked=exc.environment_blocker,
             )
-            success_ok = bool(
-                agent_completed
-                and (not _requires_baseline_verification(task) or baseline_failed)
-                and tests_passed
-                and public_verification.passed
+        config = ProductionConfig.from_cli(
+            project_root=paths.workspace,
+            max_turns=self.max_turns or _strategy_max_turns_for_task(task) or adaptive_default_max_turns(task.user_task),
+            model=self.model,
+            base_url=self.base_url,
+            env_root=self.env_root,
+            permission_profile=_permission_profile_for_task(task),
+            approval_policy=_approval_policy_for_task(task),
+            network_access=_network_access_for_task(task),
+            interaction_mode=InteractionMode.NON_INTERACTIVE,
+            raw_artifacts=False,
+            profile=f"evaluation:{task.task_id}:{task.tool_policy}",
+            cli_overrides={
+                "max_turns",
+                "model",
+                "base_url",
+                "permission_profile",
+                "approval_policy",
+                "network_access",
+                "interaction_mode",
+                "raw_artifacts",
+                "profile",
+            },
+        )
+        state.reproducible_environment = _reproducible_environment(
+            task,
+            workspace=paths.workspace,
+            manifest_base=manifest_base,
+            output_root=self.output_root,
+            baseline_result_path=self.baseline_result_path,
+            config=config,
+            max_turns=config.max_turns,
+        )
+        prepare_result = self._run_dependency_setup(task, paths=paths, state=state)
+        if prepare_result is not None:
+            return prepare_result
+        state.before_snapshot = _snapshot_files(paths.workspace)
+        state.before_text_snapshot = _read_text_files(paths.workspace)
+        phase_started = time.perf_counter()
+        shutil.copytree(paths.workspace, paths.baseline_workspace, ignore=_copy_ignore)
+        state.timing["baseline_workspace_copy_time_seconds"] = (
+            time.perf_counter() - phase_started
+        )
+        return config
+
+    def _run_dependency_setup(
+        self,
+        task: EvaluationTask,
+        *,
+        paths: _TaskRunPaths,
+        state: _TaskRunState,
+    ) -> EvaluationTaskResult | None:
+        dependency_setup_started = time.perf_counter()
+        dependency_cache_env, dependency_cache = _dependency_setup_cache(
+            task,
+            workspace=paths.workspace,
+            output_root=self.output_root,
+        )
+        state.reproducible_environment["dependency_setup_cache"] = dependency_cache
+        if dependency_cache.get("hit") is not True:
+            for command in task.prepare_commands:
+                prepared = _run_shell(
+                    command,
+                    cwd=paths.workspace,
+                    timeout_seconds=EVALUATION_PREPARE_TIMEOUT_SECONDS,
+                    redactor=self.redactor,
+                    env_overrides=dependency_cache_env,
+                )
+                if not prepared.passed:
+                    state.errors.append(f"prepare failed: {prepared.error_summary or command}")
+                    state.verification = prepared
+                    state.checks = _checks_payload(None, prepared)
+                    state.timing["dependency_setup_time_seconds"] = (
+                        time.perf_counter() - dependency_setup_started
+                    )
+                    return self._task_result_from_state(task, paths, state)
+            _finalize_dependency_setup_cache(
+                dependency_cache,
+                workspace=paths.workspace,
+            )
+        state.timing["dependency_setup_time_seconds"] = (
+            time.perf_counter() - dependency_setup_started
+        )
+        return None
+
+    def _run_baseline_stage(
+        self,
+        task: EvaluationTask,
+        *,
+        paths: _TaskRunPaths,
+        state: _TaskRunState,
+    ) -> EvaluationTaskResult | None:
+        if not _requires_baseline_verification(task):
+            return None
+        phase_started = time.perf_counter()
+        baseline_verification = _run_baseline_verification(
+            task,
+            baseline_workspace=paths.baseline_workspace,
+            baseline_verification_workspace=paths.baseline_verification_workspace,
+            root=paths.task_dir,
+            redactor=self.redactor,
+        )
+        state.timing["baseline_verification_time_seconds"] = (
+            time.perf_counter() - phase_started
+        )
+        state.baseline_checks = baseline_verification["checks"]
+        state.baseline_failed = bool(baseline_verification["baseline_failed"])
+        state.verification_misconfiguration_reason = str(
+            baseline_verification.get("verification_misconfiguration_reason") or ""
+        )
+        if baseline_verification["status"] == "baseline_already_passing":
+            state.errors.append("baseline already passing before agent changes")
+            state.baseline_failed = False
+            return self._task_result_from_state(
+                task,
+                paths,
+                state,
+                status_override="invalid_public_task",
+                failure_category_override="baseline_already_passing",
+            )
+        if baseline_verification["status"] == "verification_misconfigured":
+            state.errors.append(
+                f"verification misconfigured: {state.verification_misconfiguration_reason}"
+            )
+            state.baseline_failed = False
+            return self._task_result_from_state(
+                task,
+                paths,
+                state,
+                status_override="verification_misconfigured",
+                failure_category_override="verification_misconfigured",
+            )
+        return None
+
+    def _run_agent_stage(
+        self,
+        task: EvaluationTask,
+        *,
+        paths: _TaskRunPaths,
+        state: _TaskRunState,
+        config: ProductionConfig,
+    ) -> EvaluationTaskResult | None:
+        goal = _task_goal(task)
+        agent_run = self._run_agent_task(
+            task,
+            workspace=paths.workspace,
+            config=config,
+            goal=goal,
+            timing=state.timing,
+        )
+        state.kernel = agent_run["kernel"]
+        state.agent_result = agent_run["agent_result"]
+        state.trace_path = agent_run["trace_path"]
+        state.trace_summary = agent_run["trace_summary"]
+        state.final_report_payload = agent_run["final_report_payload"]
+        state.usage = agent_run["usage"]
+        state.tool_calls = agent_run["tool_calls"]
+        state.turn_count = agent_run["turn_count"]
+        state.policy_blocks = agent_run["policy_blocks"]
+        state.trace_artifact_refs = agent_run["trace_artifact_refs"]
+        state.agent_status = agent_run["agent_status"]
+        environment_blocker_reason = agent_run["environment_blocker_reason"]
+        if not environment_blocker_reason:
+            return None
+        state.errors.append(f"environment blocker: {environment_blocker_reason}")
+        self._capture_workspace_delta(paths, state)
+        state.contract_satisfaction = _contract_satisfaction(
+            task,
+            files_changed=state.files_changed,
+            allowed_scope=True,
+            verification=None,
+            public_verification=None,
+            agent_status=state.agent_status,
+            final_report_status=_final_report_status(
+                state.final_report_payload,
+                agent_status=state.agent_status,
+            ),
+            policy_blocks=state.policy_blocks,
+            patch=state.patch_payload,
+            final_report_payload=state.final_report_payload,
+        )
+        state.checks = _checks_payload(None, None)
+        return self._task_result_from_state(
+            task,
+            paths,
+            state,
+            infrastructure_blocked=True,
+        )
+
+    def _run_verification_stage(
+        self,
+        task: EvaluationTask,
+        *,
+        paths: _TaskRunPaths,
+        state: _TaskRunState,
+    ) -> EvaluationTaskResult | None:
+        self._capture_workspace_delta(paths, state)
+        phase_started = time.perf_counter()
+        applicable = _prepare_verification_workspace(
+            source_workspace=paths.workspace,
+            verification_workspace=paths.verification_workspace,
+            baseline_workspace=paths.baseline_workspace,
+            before_snapshot=state.before_text_snapshot,
+            root=paths.task_dir,
+            test_patch=task.test_patch,
+        )
+        state.timing["verification_workspace_copy_time_seconds"] = (
+            time.perf_counter() - phase_started
+        )
+        state.patch_payload["applicable"] = applicable
+        state.patch_applied = applicable
+        verification_run = self._run_task_verification(
+            task,
+            verification_workspace=paths.verification_workspace,
+            timing=state.timing,
+        )
+        state.public_verification = verification_run["public_verification"]
+        state.hidden_verification = verification_run["hidden_verification"]
+        state.verification = verification_run["verification"]
+        state.checks = verification_run["checks"]
+        failed_prepare_command = verification_run["failed_prepare_command"]
+        if not failed_prepare_command:
+            return None
+        prepared = state.verification
+        assert prepared is not None
+        state.errors.append(
+            f"verification prepare failed: {prepared.error_summary or failed_prepare_command}"
+        )
+        allowed_ok = _allowed_scope_ok(state.files_changed, task.allowed_paths)
+        state.contract_satisfaction = _contract_satisfaction(
+            task,
+            files_changed=state.files_changed,
+            allowed_scope=allowed_ok,
+            verification=prepared,
+            public_verification=state.public_verification,
+            agent_status=state.agent_status,
+            final_report_status=_final_report_status(
+                state.final_report_payload,
+                agent_status=state.agent_status,
+            ),
+            policy_blocks=state.policy_blocks,
+            patch=state.patch_payload,
+            final_report_payload=state.final_report_payload,
+        )
+        return self._task_result_from_state(task, paths, state)
+
+    def _evaluate_task_success(
+        self,
+        task: EvaluationTask,
+        *,
+        paths: _TaskRunPaths,
+        state: _TaskRunState,
+    ) -> None:
+        if state.verification is None or state.public_verification is None:
+            raise RuntimeError("evaluation verification did not produce required checks")
+        state.tests_passed = state.verification.passed
+        allowed_ok = _allowed_scope_ok(state.files_changed, task.allowed_paths)
+        criterion_ok = _success_criterion_ok(
+            task.success,
+            verification=state.verification,
+            workspace=paths.verification_workspace,
+            agent_status=state.agent_status,
+            policy_blocks=state.policy_blocks,
+        )
+        agent_completed = state.agent_status == "completed"
+        if not agent_completed:
+            agent_status = (
+                getattr(state.agent_result.status, "value", state.agent_result.status)
+                if state.agent_result is not None
+                else state.agent_status
+            )
+            state.errors.append(f"agent status: {agent_status}")
+        if not state.tests_passed:
+            state.errors.append(
+                f"verification failed: {state.verification.error_summary or state.verification.command}"
+            )
+        if not state.public_verification.passed:
+            state.errors.append(
+                "public verification failed: "
+                f"{state.public_verification.error_summary or state.public_verification.command}"
+            )
+        patch_ok = _patch_applicable_for_task(
+            task,
+            patch=state.patch_payload,
+            files_changed=state.files_changed,
+        )
+        if not patch_ok:
+            if not state.files_changed and not agent_completed:
+                state.errors.append("agent blocked before target file changes")
+            else:
+                state.errors.append("patch could not be applied to clean verification workspace")
+        if not allowed_ok:
+            state.errors.append("changed files outside allowed_paths")
+        if not criterion_ok:
+            state.errors.append("success criterion failed")
+        state.fail_to_pass_satisfied = bool(
+            state.baseline_failed
+            and state.tests_passed
+            and state.public_verification.passed
+        )
+        state.contract_satisfaction = _contract_satisfaction(
+            task,
+            files_changed=state.files_changed,
+            allowed_scope=allowed_ok,
+            verification=state.verification,
+            public_verification=state.public_verification,
+            agent_status=state.agent_status,
+            final_report_status=_final_report_status(
+                state.final_report_payload,
+                agent_status=state.agent_status,
+            ),
+            policy_blocks=state.policy_blocks,
+            patch=state.patch_payload,
+            final_report_payload=state.final_report_payload,
+        )
+        state.success_ok = bool(
+            agent_completed
+            and (not _requires_baseline_verification(task) or state.baseline_failed)
+            and state.tests_passed
+            and state.public_verification.passed
+            and patch_ok
+            and allowed_ok
+            and criterion_ok
+        )
+        if _expected_blocked_success(task.success):
+            state.success_ok = bool(
+                state.agent_status in {"blocked", "failed"}
+                and state.tests_passed
+                and state.public_verification.passed
                 and patch_ok
                 and allowed_ok
                 and criterion_ok
             )
-            if _expected_blocked_success(task.success):
-                success_ok = bool(
-                    agent_status in {"blocked", "failed"}
-                    and tests_passed
-                    and public_verification.passed
-                    and patch_ok
-                    and allowed_ok
-                    and criterion_ok
-                )
-        except Exception as exc:
-            errors.append(self.redactor.redact_text(str(exc)) or type(exc).__name__)
-            if kernel is not None:
-                trace_path = trace_path or _trace_path(kernel)
-                trace_summary = trace_summary or _trace_summary_from_kernel(kernel)
-                if not agent_status:
-                    agent_status = _agent_status_from_trace(Path(trace_path) if trace_path else None)
-                usage = usage or dict(trace_summary.get("model_usage_summary") or {})
-                if not tool_calls:
-                    tool_calls = _tool_calls_from_trace(Path(trace_path) if trace_path else None, trace_summary)
-                if not turn_count:
-                    turn_count = _turn_count_from_trace(Path(trace_path) if trace_path else None, usage)
-        finally:
-            if kernel is not None:
-                phase_started = time.perf_counter()
-                close_runtime_resources(kernel)
-                evaluation_timing["resource_cleanup_time_seconds"] = (
-                    time.perf_counter() - phase_started
-                )
+
+    def _capture_workspace_delta(self, paths: _TaskRunPaths, state: _TaskRunState) -> None:
+        state.files_changed = _changed_files(paths.workspace, before_snapshot=state.before_snapshot)
+        state.patch_payload = _patch_payload(state.before_text_snapshot, paths.workspace)
+
+    def _task_result_from_state(
+        self,
+        task: EvaluationTask,
+        paths: _TaskRunPaths,
+        state: _TaskRunState,
+        *,
+        infrastructure_blocked: bool = False,
+        status_override: str = "",
+        failure_category_override: str = "",
+    ) -> EvaluationTaskResult:
         return self._task_result(
             task=task,
-            workspace=workspace,
-            trace=trace_path,
-            started=started,
-            verification=verification,
-            verification_workspace=verification_workspace,
-            files_changed=files_changed,
-            usage=usage,
-            tool_calls=tool_calls,
-            errors=errors,
-            patch=patch_payload,
-            checks=checks,
-            success=success_ok,
+            workspace=paths.workspace,
+            trace=state.trace_path,
+            started=state.started,
+            verification=state.verification,
+            verification_workspace=paths.verification_workspace,
+            files_changed=state.files_changed,
+            usage=state.usage,
+            tool_calls=state.tool_calls,
+            errors=state.errors,
+            patch=state.patch_payload,
+            checks=state.checks,
+            success=state.success_ok,
+            tests_passed=state.tests_passed,
+            infrastructure_blocked=infrastructure_blocked,
+            agent_status=state.agent_status,
+            final_report_payload=state.final_report_payload,
+            trace_summary=state.trace_summary,
+            turn_count=state.turn_count,
+            policy_blocks=state.policy_blocks,
+            trace_artifact_refs=state.trace_artifact_refs,
+            contract_satisfaction=state.contract_satisfaction,
+            reproducible_environment=state.reproducible_environment,
+            public_verification=state.public_verification,
+            hidden_verification=state.hidden_verification,
+            baseline_failed=state.baseline_failed,
+            baseline_checks=state.baseline_checks,
+            patch_applied=state.patch_applied,
+            fail_to_pass_satisfied=state.fail_to_pass_satisfied,
+            verification_misconfiguration_reason=state.verification_misconfiguration_reason,
+            status_override=status_override,
+            failure_category_override=failure_category_override,
+            evaluation_timing=state.timing,
+        )
+
+    @staticmethod
+    def _task_status(
+        *,
+        status_override: str,
+        success: bool,
+        tests_passed: bool,
+        infrastructure_blocked: bool,
+        agent_status: str,
+        verification: CommandEvalResult | None,
+        policy_blocks: int,
+        errors: list[str],
+    ) -> str:
+        if status_override:
+            return status_override
+        return _result_status(
+            success=success,
             tests_passed=tests_passed,
-            infrastructure_blocked=False,
+            infrastructure_blocked=infrastructure_blocked,
             agent_status=agent_status,
-            final_report_payload=final_report_payload,
-            trace_summary=trace_summary,
-            turn_count=turn_count,
+            verification=verification,
             policy_blocks=policy_blocks,
-            trace_artifact_refs=trace_artifact_refs,
-            contract_satisfaction=contract_satisfaction,
-            reproducible_environment=reproducible_environment,
-            public_verification=public_verification,
-            hidden_verification=hidden_verification,
-            baseline_failed=baseline_failed,
-            baseline_checks=baseline_checks,
-            patch_applied=patch_applied,
-            fail_to_pass_satisfied=fail_to_pass_satisfied,
-            verification_misconfiguration_reason=verification_misconfiguration_reason,
-            evaluation_timing=evaluation_timing,
+            errors=errors,
         )
 
     def _prepare_task_workspace(
@@ -762,7 +822,12 @@ class EvaluationRunner:
         )
         verification_prepare_started = time.perf_counter()
         for command in task.verification_prepare_commands:
-            prepared = _run_shell(command, cwd=verification_workspace, timeout_seconds=120, redactor=self.redactor)
+            prepared = _run_shell(
+                command,
+                cwd=verification_workspace,
+                timeout_seconds=EVALUATION_PREPARE_TIMEOUT_SECONDS,
+                redactor=self.redactor,
+            )
             if not prepared.passed:
                 return {
                     "public_verification": public_verification,
@@ -917,7 +982,6 @@ class EvaluationRunner:
         failure_category_override: str = "",
         evaluation_timing: dict[str, Any] | None = None,
     ) -> EvaluationTaskResult:
-        request_rates = _float_map(usage.get("request_cache_hit_rates") or {})
         final_report_payload = final_report_payload or {}
         trace_summary = trace_summary or {}
         trace_path = Path(trace) if trace else None
@@ -929,7 +993,8 @@ class EvaluationRunner:
         if success and not visibility_audit["passed"]:
             errors.append(str(visibility_audit["reason"]))
         success = bool(success and sandbox_audit["passed"] and visibility_audit["passed"])
-        status = status_override or _result_status(
+        status = self._task_status(
+            status_override=status_override,
             success=success,
             tests_passed=tests_passed,
             infrastructure_blocked=infrastructure_blocked,
@@ -938,29 +1003,14 @@ class EvaluationRunner:
             policy_blocks=policy_blocks,
             errors=errors,
         )
-        verification_result = {
-            "status": "passed" if verification and verification.passed else "failed" if verification else "not_run",
-            "command": verification.command if verification else task.verification_command,
-            "checks": checks or _checks_payload(None, verification),
-        }
+        verification_result = _verification_result_payload(task, verification=verification, checks=checks)
         final_report_status = _final_report_status(
             final_report_payload,
             agent_status=agent_status,
         )
-        token_usage = {
-            "input_tokens": _safe_int(usage.get("input_tokens")),
-            "output_tokens": _safe_int(usage.get("output_tokens")),
-            "total_tokens": _safe_int(usage.get("total_tokens")),
-            "cached_input_tokens": _safe_int(usage.get("cached_input_tokens")),
-            "reasoning_tokens": _safe_int(usage.get("reasoning_tokens")),
-        }
-        cache_usage = {
-            "request_cache_hit_rate": _average_rate(request_rates),
-            "run_cache_hit_rate": _safe_float(usage.get("run_cache_hit_rate")),
-            "request_cache_hit_rates": request_rates,
-            "cache_miss_reasons": dict(usage.get("cache_miss_reasons") or {}),
-            "cache_attribution_sources": dict(usage.get("cache_attribution_sources") or {}),
-        }
+        token_usage = _token_usage_payload(usage)
+        cache_usage = _cache_usage_payload(usage)
+        request_rates = cache_usage["request_cache_hit_rates"]
         report_status = final_report_status or agent_status
         agent_completed = _agent_completed(report_status, agent_status=agent_status)
         evaluation_passed = success
@@ -985,24 +1035,20 @@ class EvaluationRunner:
             policy_blocks=policy_blocks,
             errors=errors,
         )
-        capability_summary = _build_capability_summary(
+        capability_summary = _capability_summary_payload(
             trace=trace_path,
             trace_summary=trace_summary,
-            checks=checks or _checks_payload(None, verification),
+            checks=checks,
             verification=verification,
-            public_verification=public_verification or verification,
-            hidden_verification=hidden_verification or verification,
+            public_verification=public_verification,
+            hidden_verification=hidden_verification,
             final_report_status=final_report_status,
             agent_status=agent_status,
             wall_time_seconds=round(time.perf_counter() - started, 3),
             evaluation_timing=evaluation_timing,
+            sandbox_audit=sandbox_audit,
+            visibility_audit=visibility_audit,
         )
-        capability_summary["sandbox_enforcement"] = sandbox_audit
-        capability_summary["reduced_backend_count"] = sandbox_audit[
-            "reduced_backend_count"
-        ]
-        capability_summary["reduced_backends"] = list(sandbox_audit["reduced_backends"])
-        capability_summary["evaluator_visibility_audit"] = visibility_audit
         capability_sla = _build_capability_sla(capability_summary)
         result_patch = patch or {"diff": "", "applicable": False, "changed_files": []}
         result_checks = checks or _checks_payload(None, verification)
@@ -1147,6 +1193,74 @@ def _previous_evaluation_result(
 
 def _is_supported_evaluation_result(payload: dict[str, Any]) -> bool:
     return payload.get("schema_version") == EVALUATION_RESULT_SCHEMA_VERSION
+
+
+def _verification_result_payload(
+    task: EvaluationTask,
+    *,
+    verification: CommandEvalResult | None,
+    checks: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "status": "passed" if verification and verification.passed else "failed" if verification else "not_run",
+        "command": verification.command if verification else task.verification_command,
+        "checks": checks or _checks_payload(None, verification),
+    }
+
+
+def _token_usage_payload(usage: dict[str, Any]) -> dict[str, int]:
+    return {
+        "input_tokens": _safe_int(usage.get("input_tokens")),
+        "output_tokens": _safe_int(usage.get("output_tokens")),
+        "total_tokens": _safe_int(usage.get("total_tokens")),
+        "cached_input_tokens": _safe_int(usage.get("cached_input_tokens")),
+        "reasoning_tokens": _safe_int(usage.get("reasoning_tokens")),
+    }
+
+
+def _cache_usage_payload(usage: dict[str, Any]) -> dict[str, Any]:
+    request_rates = _float_map(usage.get("request_cache_hit_rates") or {})
+    return {
+        "request_cache_hit_rate": _average_rate(request_rates),
+        "run_cache_hit_rate": _safe_float(usage.get("run_cache_hit_rate")),
+        "request_cache_hit_rates": request_rates,
+        "cache_miss_reasons": dict(usage.get("cache_miss_reasons") or {}),
+        "cache_attribution_sources": dict(usage.get("cache_attribution_sources") or {}),
+    }
+
+
+def _capability_summary_payload(
+    *,
+    trace: Path | None,
+    trace_summary: dict[str, Any],
+    checks: dict[str, Any],
+    verification: CommandEvalResult | None,
+    public_verification: CommandEvalResult | None,
+    hidden_verification: CommandEvalResult | None,
+    final_report_status: str,
+    agent_status: str,
+    wall_time_seconds: float,
+    evaluation_timing: dict[str, Any] | None,
+    sandbox_audit: dict[str, Any],
+    visibility_audit: dict[str, Any],
+) -> dict[str, Any]:
+    capability_summary = _build_capability_summary(
+        trace=trace,
+        trace_summary=trace_summary,
+        checks=checks or _checks_payload(None, verification),
+        verification=verification,
+        public_verification=public_verification or verification,
+        hidden_verification=hidden_verification or verification,
+        final_report_status=final_report_status,
+        agent_status=agent_status,
+        wall_time_seconds=wall_time_seconds,
+        evaluation_timing=evaluation_timing,
+    )
+    capability_summary["sandbox_enforcement"] = sandbox_audit
+    capability_summary["reduced_backend_count"] = sandbox_audit["reduced_backend_count"]
+    capability_summary["reduced_backends"] = list(sandbox_audit["reduced_backends"])
+    capability_summary["evaluator_visibility_audit"] = visibility_audit
+    return capability_summary
 
 
 def _reproducible_environment(
@@ -2038,40 +2152,152 @@ def _build_latency_attribution(
     unattributed_time_seconds: float,
     evaluation_timing: dict[str, Any],
 ) -> dict[str, Any]:
-    provider_seconds = _safe_optional_timing(timing.get("provider_time_seconds"))
-    tool_seconds = _sum_optional_timings(
-        timing,
-        (
-            "edit_apply_total_time_seconds",
-            "command_runtime_time_seconds",
-            "process_spawn_time_seconds",
-            "output_collection_time_seconds",
-        ),
+    items = _latency_attribution_items(
+        events=events,
+        timing=timing,
+        wall_phases=wall_phases,
+        unattributed_time_seconds=unattributed_time_seconds,
+        evaluation_timing=evaluation_timing,
     )
-    review_seconds = _safe_optional_timing(timing.get("edit_apply_review_time_seconds"))
-    finalization_seconds = _event_duration_total(
-        events,
-        (
-            "finalization.",
-            "final_report.",
-            "final_reviewer.",
-        ),
+    safe_items = _mark_latency_critical_path(items)
+    return {
+        "schema_version": "evaluation.latency_attribution/v1",
+        "items": safe_items,
+        "total_accounted_seconds": round(sum(item["actual_seconds"] for item in safe_items.values()), 3),
+        "notes": "diagnostic-only latency attribution for critical path analysis, repeated-run timing comparison, and performance regression analysis; component seconds are not a mutually exclusive sum",
+    }
+
+
+def _latency_attribution_items(
+    *,
+    events: list[dict[str, Any]],
+    timing: dict[str, Any],
+    wall_phases: dict[str, float],
+    unattributed_time_seconds: float,
+    evaluation_timing: dict[str, Any],
+) -> list[dict[str, Any]]:
+    timings = _latency_component_timings(
+        events=events,
+        timing=timing,
+        wall_phases=wall_phases,
+        evaluation_timing=evaluation_timing,
     )
-    context_seconds = _sum_optional_timings(
-        timing,
-        (
-            "context_assembly_time_seconds",
-            "retrieval_time_seconds",
-            "compaction_decision_time_seconds",
+    return [
+        _latency_item(
+            "agent_loop",
+            timings["agent_loop"],
+            source="capability_summary.wall_phases",
+            kind="agent_loop",
+            status="measured" if timings["agent_loop"] else "unavailable",
+            notes="wall phase; overlaps provider/tool/review components in critical path analysis",
         ),
-    )
-    trace_audit_seconds = _event_duration_total(
-        events,
-        (
-            "trace.",
-            "audit.",
+        _latency_item(
+            "provider_latency",
+            timings["provider"],
+            source="trace.model_turns",
+            kind="model_provider",
+            status="measured" if timings["provider"] else "unavailable",
+            notes="component attribution may overlap agent_loop wall phase",
         ),
-    )
+        _latency_item(
+            "tool_execution_latency",
+            timings["tool"],
+            source="tool_trace",
+            kind="tool_execution",
+            status="measured" if timings["tool"] else "unavailable",
+            notes="component attribution may overlap agent_loop wall phase",
+        ),
+        _latency_item(
+            "model_assisted_review_latency",
+            timings["review"],
+            source="review_trace",
+            kind="model_assisted_review",
+            status="measured" if timings["review"] else "unavailable",
+            notes="Structured Outputs / tool calling review latency; diagnostic only; may overlap agent_loop wall phase",
+        ),
+        _latency_item(
+            "finalization_latency",
+            timings["finalization"],
+            source="trace.finalization",
+            kind="finalization",
+            status="measured" if timings["finalization"] else "unavailable",
+            notes="component attribution may overlap agent_loop wall phase",
+        ),
+        _latency_item(
+            "context_assembly_latency",
+            timings["context"],
+            source="context_trace",
+            kind="context_assembly",
+            status="measured" if timings["context"] else "unavailable",
+            notes="component attribution may overlap agent_loop wall phase",
+        ),
+        _latency_item(
+            "trace_audit_overhead",
+            timings["trace_audit"],
+            source="trace.audit_events",
+            kind="trace_audit",
+            status="measured" if timings["trace_audit"] else "unavailable",
+        ),
+        _latency_item(
+            "artifact_writes",
+            timings["artifact"],
+            source="evaluation_runner.artifacts",
+            kind="artifact_write",
+            status="measured" if timings["artifact"] else "unavailable",
+        ),
+        _latency_item(
+            "summary_aggregation",
+            timings["summary"],
+            source="evaluation_runner.summary",
+            kind="summary_aggregation",
+            status="measured" if timings["summary"] else "unavailable",
+        ),
+        _latency_item(
+            "sandbox",
+            timings["sandbox"],
+            source="sandbox_trace",
+            kind="sandbox_execution",
+            status="measured" if timings["sandbox"] else "unavailable",
+        ),
+        _latency_item(
+            "verification",
+            timings["verification"],
+            source="evaluation_runner.verification",
+            kind="verification",
+            status="measured" if timings["verification"] else "unavailable",
+        ),
+        _latency_item(
+            "dependency_setup",
+            timings["dependency"],
+            source="evaluation_runner.dependency_setup",
+            kind="dependency_setup",
+            status="measured" if timings["dependency"] else "unavailable",
+        ),
+        _latency_item(
+            "workspace_materialization",
+            timings["workspace"],
+            source="evaluation_runner.workspace",
+            kind="workspace_materialization",
+            status="measured" if timings["workspace"] else "unavailable",
+        ),
+        _latency_item(
+            "unattributed_time",
+            unattributed_time_seconds,
+            source="capability_summary.unattributed_time_seconds",
+            kind="timing_gap",
+            status="diagnostic",
+            notes="diagnostic only; does not affect evaluation_passed",
+        ),
+    ]
+
+
+def _latency_component_timings(
+    *,
+    events: list[dict[str, Any]],
+    timing: dict[str, Any],
+    wall_phases: dict[str, float],
+    evaluation_timing: dict[str, Any],
+) -> dict[str, float]:
     artifact_seconds = _event_duration_total(
         events,
         (
@@ -2090,119 +2316,52 @@ def _build_latency_attribution(
         ),
     )
     summary_seconds += _safe_optional_timing(evaluation_timing.get("summary_aggregation_time_seconds"))
-    sandbox_seconds = _safe_optional_timing(timing.get("sandbox_time_seconds"))
-    verification_seconds = _safe_optional_timing(timing.get("verification_time_seconds"))
-    dependency_seconds = _safe_optional_timing(timing.get("dependency_setup_time_seconds"))
-    workspace_seconds = _safe_optional_timing(timing.get("workspace_materialization_time_seconds"))
-    agent_loop_seconds = _safe_optional_timing(wall_phases.get("agent_loop_time_seconds"))
+    return {
+        "agent_loop": _safe_optional_timing(wall_phases.get("agent_loop_time_seconds")),
+        "provider": _safe_optional_timing(timing.get("provider_time_seconds")),
+        "tool": _sum_optional_timings(
+            timing,
+            (
+                "edit_apply_total_time_seconds",
+                "command_runtime_time_seconds",
+                "process_spawn_time_seconds",
+                "output_collection_time_seconds",
+            ),
+        ),
+        "review": _safe_optional_timing(timing.get("edit_apply_review_time_seconds")),
+        "finalization": _event_duration_total(
+            events,
+            (
+                "finalization.",
+                "final_report.",
+                "final_reviewer.",
+            ),
+        ),
+        "context": _sum_optional_timings(
+            timing,
+            (
+                "context_assembly_time_seconds",
+                "retrieval_time_seconds",
+                "compaction_decision_time_seconds",
+            ),
+        ),
+        "trace_audit": _event_duration_total(
+            events,
+            (
+                "trace.",
+                "audit.",
+            ),
+        ),
+        "artifact": artifact_seconds,
+        "summary": summary_seconds,
+        "sandbox": _safe_optional_timing(timing.get("sandbox_time_seconds")),
+        "verification": _safe_optional_timing(timing.get("verification_time_seconds")),
+        "dependency": _safe_optional_timing(timing.get("dependency_setup_time_seconds")),
+        "workspace": _safe_optional_timing(timing.get("workspace_materialization_time_seconds")),
+    }
 
-    items = [
-        _latency_item(
-            "agent_loop",
-            agent_loop_seconds,
-            source="capability_summary.wall_phases",
-            kind="agent_loop",
-            status="measured" if agent_loop_seconds else "unavailable",
-            notes="wall phase; overlaps provider/tool/review components in critical path analysis",
-        ),
-        _latency_item(
-            "provider_latency",
-            provider_seconds,
-            source="trace.model_turns",
-            kind="model_provider",
-            status="measured" if provider_seconds else "unavailable",
-            notes="component attribution may overlap agent_loop wall phase",
-        ),
-        _latency_item(
-            "tool_execution_latency",
-            tool_seconds,
-            source="tool_trace",
-            kind="tool_execution",
-            status="measured" if tool_seconds else "unavailable",
-            notes="component attribution may overlap agent_loop wall phase",
-        ),
-        _latency_item(
-            "model_assisted_review_latency",
-            review_seconds,
-            source="review_trace",
-            kind="model_assisted_review",
-            status="measured" if review_seconds else "unavailable",
-            notes="Structured Outputs / tool calling review latency; diagnostic only; may overlap agent_loop wall phase",
-        ),
-        _latency_item(
-            "finalization_latency",
-            finalization_seconds,
-            source="trace.finalization",
-            kind="finalization",
-            status="measured" if finalization_seconds else "unavailable",
-            notes="component attribution may overlap agent_loop wall phase",
-        ),
-        _latency_item(
-            "context_assembly_latency",
-            context_seconds,
-            source="context_trace",
-            kind="context_assembly",
-            status="measured" if context_seconds else "unavailable",
-            notes="component attribution may overlap agent_loop wall phase",
-        ),
-        _latency_item(
-            "trace_audit_overhead",
-            trace_audit_seconds,
-            source="trace.audit_events",
-            kind="trace_audit",
-            status="measured" if trace_audit_seconds else "unavailable",
-        ),
-        _latency_item(
-            "artifact_writes",
-            artifact_seconds,
-            source="evaluation_runner.artifacts",
-            kind="artifact_write",
-            status="measured" if artifact_seconds else "unavailable",
-        ),
-        _latency_item(
-            "summary_aggregation",
-            summary_seconds,
-            source="evaluation_runner.summary",
-            kind="summary_aggregation",
-            status="measured" if summary_seconds else "unavailable",
-        ),
-        _latency_item(
-            "sandbox",
-            sandbox_seconds,
-            source="sandbox_trace",
-            kind="sandbox_execution",
-            status="measured" if sandbox_seconds else "unavailable",
-        ),
-        _latency_item(
-            "verification",
-            verification_seconds,
-            source="evaluation_runner.verification",
-            kind="verification",
-            status="measured" if verification_seconds else "unavailable",
-        ),
-        _latency_item(
-            "dependency_setup",
-            dependency_seconds,
-            source="evaluation_runner.dependency_setup",
-            kind="dependency_setup",
-            status="measured" if dependency_seconds else "unavailable",
-        ),
-        _latency_item(
-            "workspace_materialization",
-            workspace_seconds,
-            source="evaluation_runner.workspace",
-            kind="workspace_materialization",
-            status="measured" if workspace_seconds else "unavailable",
-        ),
-        _latency_item(
-            "unattributed_time",
-            unattributed_time_seconds,
-            source="capability_summary.unattributed_time_seconds",
-            kind="timing_gap",
-            status="diagnostic",
-            notes="diagnostic only; does not affect evaluation_passed",
-        ),
-    ]
+
+def _mark_latency_critical_path(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     positive_items = [item for item in items if item["actual_seconds"] > 0]
     top_components = {
         item["component"]
@@ -2216,12 +2375,7 @@ def _build_latency_attribution(
     for item in items:
         item["critical_path"] = bool(item["component"] in top_components)
         safe_items[item["component"]] = item
-    return {
-        "schema_version": "evaluation.latency_attribution/v1",
-        "items": safe_items,
-        "total_accounted_seconds": round(sum(item["actual_seconds"] for item in safe_items.values()), 3),
-        "notes": "diagnostic-only latency attribution for critical path analysis, repeated-run timing comparison, and performance regression analysis; component seconds are not a mutually exclusive sum",
-    }
+    return safe_items
 
 
 def _latency_item(
@@ -2297,19 +2451,6 @@ def _event_duration_total(events: list[dict[str, Any]], prefixes: tuple[str, ...
     return round(total, 3)
 
 
-_CAPABILITY_SLA_THRESHOLDS_SECONDS = {
-    "wall": 300.0,
-    "agent_loop": 210.0,
-    "provider": 55.0,
-    "sandbox": 50.0,
-    "dependency_setup": 35.0,
-}
-_CAPABILITY_SLA_OPTIONAL_THRESHOLDS_SECONDS = {
-    "verification": 10.0,
-    "unattributed_time": 15.0,
-}
-
-
 def _build_capability_sla(capability_summary: dict[str, Any]) -> dict[str, Any]:
     timing = capability_summary.get("timing") if isinstance(capability_summary, dict) else {}
     timing = timing if isinstance(timing, dict) else {}
@@ -2318,37 +2459,37 @@ def _build_capability_sla(capability_summary: dict[str, Any]) -> dict[str, Any]:
     items: dict[str, dict[str, Any]] = {
         "wall": _duration_sla_item(
             timing.get("wall_time_seconds"),
-            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["wall"],
+            target_seconds=CAPABILITY_SLA_REQUIRED_THRESHOLDS_SECONDS["wall"],
             source="capability_summary.timing.wall_time_seconds",
         ),
         "agent_loop": _duration_sla_item(
             wall_phases.get("agent_loop_time_seconds"),
-            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["agent_loop"],
+            target_seconds=CAPABILITY_SLA_REQUIRED_THRESHOLDS_SECONDS["agent_loop"],
             source="capability_summary.wall_phases.agent_loop_time_seconds",
         ),
         "provider": _duration_sla_item(
             timing.get("provider_time_seconds"),
-            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["provider"],
+            target_seconds=CAPABILITY_SLA_REQUIRED_THRESHOLDS_SECONDS["provider"],
             source="capability_summary.timing.provider_time_seconds",
         ),
         "sandbox": _duration_sla_item(
             timing.get("sandbox_time_seconds"),
-            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["sandbox"],
+            target_seconds=CAPABILITY_SLA_REQUIRED_THRESHOLDS_SECONDS["sandbox"],
             source="capability_summary.timing.sandbox_time_seconds",
         ),
         "dependency_setup": _duration_sla_item(
             timing.get("dependency_setup_time_seconds"),
-            target_seconds=_CAPABILITY_SLA_THRESHOLDS_SECONDS["dependency_setup"],
+            target_seconds=CAPABILITY_SLA_REQUIRED_THRESHOLDS_SECONDS["dependency_setup"],
             source="capability_summary.timing.dependency_setup_time_seconds",
         ),
         "verification": _duration_sla_item(
             timing.get("verification_time_seconds"),
-            target_seconds=_CAPABILITY_SLA_OPTIONAL_THRESHOLDS_SECONDS["verification"],
+            target_seconds=CAPABILITY_SLA_OPTIONAL_THRESHOLDS_SECONDS["verification"],
             source="capability_summary.timing.verification_time_seconds",
         ),
         "unattributed_time": _duration_sla_item(
             capability_summary.get("unattributed_time_seconds"),
-            target_seconds=_CAPABILITY_SLA_OPTIONAL_THRESHOLDS_SECONDS["unattributed_time"],
+            target_seconds=CAPABILITY_SLA_OPTIONAL_THRESHOLDS_SECONDS["unattributed_time"],
             source="capability_summary.unattributed_time_seconds",
         ),
         "local_fallback": _count_sla_item(
@@ -3156,10 +3297,6 @@ def _event_type(event: dict[str, Any]) -> str:
 
 def _count_events(events: list[dict[str, Any]], event_type: str) -> int:
     return sum(1 for event in events if _event_type(event) == event_type)
-
-
-def _count_events_with_prefix(events: list[dict[str, Any]], prefixes: tuple[str, ...]) -> int:
-    return sum(1 for event in events if _event_type(event).startswith(prefixes))
 
 
 def _count_events_with_contains(events: list[dict[str, Any]], needles: tuple[str, ...]) -> int:
@@ -4239,7 +4376,7 @@ def _success_criterion_ok(
         criteria = success.get("criteria") or []
         return bool(criteria) and all(
             _success_criterion_ok(
-                _dict(item, "success.criteria"),
+                coerce_evaluation_dict(item, "success.criteria"),
                 verification=verification,
                 workspace=workspace,
                 agent_status=agent_status,
@@ -4251,7 +4388,7 @@ def _success_criterion_ok(
         criteria = success.get("criteria") or []
         return bool(criteria) and any(
             _success_criterion_ok(
-                _dict(item, "success.criteria"),
+                coerce_evaluation_dict(item, "success.criteria"),
                 verification=verification,
                 workspace=workspace,
                 agent_status=agent_status,
@@ -4870,13 +5007,5 @@ def _safe_name(value: str) -> str:
 def _normalize_allowed(path: str) -> str:
     normalized = path.replace("\\", "/").strip().strip("/")
     return normalized or "."
-
-
-def _dict(value: Any, field_name: str) -> dict[str, Any]:
-    return coerce_dict(
-        value,
-        field_name,
-        error_message=f"evaluation {field_name} must be an object.",
-    )
 
 

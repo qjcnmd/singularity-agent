@@ -12,6 +12,11 @@ from singularity.command import (
     CommandRequest,
     FilesystemMode,
 )
+from singularity.runtime.defaults import (
+    PYTHON_MYPY_TIMEOUT_SECONDS,
+    PYTHON_PYTEST_TIMEOUT_SECONDS,
+    PYTHON_RUFF_TIMEOUT_SECONDS,
+)
 from singularity.verification.models import (
     CheckKind,
     DiscoveredCommand,
@@ -397,7 +402,7 @@ class CommandDiscovery:
                         ],
                         cwd=".",
                         purpose=CommandPurpose.PROJECT_VERIFICATION,
-                        timeout_seconds=180,
+                        timeout_seconds=PYTHON_PYTEST_TIMEOUT_SECONDS,
                     ),
                     source="python:pytest",
                     confidence=0.9,
@@ -413,7 +418,7 @@ class CommandDiscovery:
                         argv=[sys.executable, "-m", "ruff", "check", "."],
                         cwd=".",
                         purpose=CommandPurpose.LINT,
-                        timeout_seconds=120,
+                        timeout_seconds=PYTHON_RUFF_TIMEOUT_SECONDS,
                     ),
                     source="python:ruff",
                     confidence=0.75,
@@ -429,7 +434,7 @@ class CommandDiscovery:
                         argv=[sys.executable, "-m", "mypy", "."],
                         cwd=".",
                         purpose=CommandPurpose.TYPECHECK,
-                        timeout_seconds=180,
+                        timeout_seconds=PYTHON_MYPY_TIMEOUT_SECONDS,
                     ),
                     source="python:mypy",
                     confidence=0.75,

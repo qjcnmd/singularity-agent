@@ -13,28 +13,35 @@ from singularity.redaction import RedactionMarker, RedactionProvider
 class SecretRedactor:
     def __init__(self) -> None:
         self._literal_values: set[str] = set()
+        self._lock = Lock()
         self._provider = RedactionProvider(marker=RedactionMarker.BRACKETED)
         self.redaction_count = 0
 
     def add_env_values(self, env: dict[str, str]) -> None:
-        for name, value in env.items():
-            if value and is_secret_env_name(name):
-                self._literal_values.add(value)
+        with self._lock:
+            for name, value in env.items():
+                if value and is_secret_env_name(name):
+                    self._literal_values.add(value)
 
     def add_literal(self, value: str | None) -> None:
         if value:
-            self._literal_values.add(value)
+            with self._lock:
+                self._literal_values.add(value)
 
     def redact(self, text: str) -> str:
         redacted = text
-        for value in sorted(self._literal_values, key=len, reverse=True):
+        with self._lock:
+            literal_values = tuple(self._literal_values)
+        for value in sorted(literal_values, key=len, reverse=True):
             if value and value in redacted:
                 redacted = redacted.replace(value, "[REDACTED]")
-                self.redaction_count += 1
+                with self._lock:
+                    self.redaction_count += 1
 
         provider_redacted = self._provider.redact_text(redacted)
         if provider_redacted != redacted:
-            self.redaction_count += 1
+            with self._lock:
+                self.redaction_count += 1
         return provider_redacted
 
 

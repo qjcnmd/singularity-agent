@@ -17,6 +17,7 @@ from singularity.planner import (
     RiskLevel,
     TaskStatus,
 )
+from singularity.runtime.defaults import DEFAULT_TOOL_EXECUTION_TIMEOUT_SECONDS
 from singularity.tools import (
     PermissionLevel,
     ToolExecutionRequest,
@@ -90,6 +91,14 @@ def test_tool_executor_pipeline_collaborators_do_not_call_executor_private_metho
         source = inspect.getsource(collaborator)
         assert "self.executor" not in source
         assert "executor._" not in source
+
+
+def test_execution_dispatch_never_uses_unbounded_handler_timeouts() -> None:
+    source = inspect.getsource(ToolExecutionDispatcher)
+
+    assert "process.join(spec.timeout_seconds)" not in source
+    assert "future.result(timeout=spec.timeout_seconds)" not in source
+    assert str(DEFAULT_TOOL_EXECUTION_TIMEOUT_SECONDS) == "120.0"
 
 
 def test_tool_executor_file_stays_under_pipeline_orchestration_size() -> None:

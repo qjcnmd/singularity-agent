@@ -8,6 +8,17 @@ from typing import Any
 from uuid import uuid4
 
 from singularity.policy.models import PolicyConstraints
+from singularity.runtime.defaults import (
+    SANDBOX_GENERATED_CODE_TIMEOUT_SECONDS,
+    SANDBOX_ISOLATED_VERIFICATION_TIMEOUT_SECONDS,
+    SANDBOX_LONG_RUNNING_SERVICE_TIMEOUT_SECONDS,
+    SANDBOX_PACKAGE_OPERATION_TIMEOUT_SECONDS,
+    SANDBOX_PACKAGE_OUTPUT_CHARS,
+    SANDBOX_READONLY_ANALYSIS_TIMEOUT_SECONDS,
+    SANDBOX_STANDARD_OUTPUT_CHARS,
+    SANDBOX_VERIFICATION_MAX_ARTIFACT_BYTES,
+    SANDBOX_VERIFICATION_OUTPUT_CHARS,
+)
 
 
 class SandboxStatus(StrEnum):
@@ -411,7 +422,10 @@ def default_sandbox_profile(
             ),
             network=SandboxNetworkPolicy(mode=SandboxNetworkMode.DENIED),
             env=SandboxEnvPolicy(),
-            resources=SandboxResourceLimits(timeout_seconds=30, max_output_chars=20000),
+            resources=SandboxResourceLimits(
+                timeout_seconds=SANDBOX_READONLY_ANALYSIS_TIMEOUT_SECONDS,
+                max_output_chars=SANDBOX_STANDARD_OUTPUT_CHARS,
+            ),
             description="Read-only analysis enforced by the native OS sandbox.",
         )
     if resolved == SandboxProfileName.GENERATED_CODE:
@@ -424,7 +438,10 @@ def default_sandbox_profile(
             ),
             network=SandboxNetworkPolicy(mode=SandboxNetworkMode.DENIED),
             env=SandboxEnvPolicy(),
-            resources=SandboxResourceLimits(timeout_seconds=30, max_output_chars=20000),
+            resources=SandboxResourceLimits(
+                timeout_seconds=SANDBOX_GENERATED_CODE_TIMEOUT_SECONDS,
+                max_output_chars=SANDBOX_STANDARD_OUTPUT_CHARS,
+            ),
             description="Generated code execution in an empty temp workspace.",
         )
     if resolved == SandboxProfileName.PACKAGE_OPERATION:
@@ -437,7 +454,10 @@ def default_sandbox_profile(
             ),
             network=SandboxNetworkPolicy(mode=SandboxNetworkMode.ALLOWED),
             env=SandboxEnvPolicy(),
-            resources=SandboxResourceLimits(timeout_seconds=180, max_output_chars=30000),
+            resources=SandboxResourceLimits(
+                timeout_seconds=SANDBOX_PACKAGE_OPERATION_TIMEOUT_SECONDS,
+                max_output_chars=SANDBOX_PACKAGE_OUTPUT_CHARS,
+            ),
             description="Package operation under native OS sandbox enforcement.",
         )
     if resolved == SandboxProfileName.LONG_RUNNING_SERVICE:
@@ -450,7 +470,10 @@ def default_sandbox_profile(
             ),
             network=SandboxNetworkPolicy(mode=SandboxNetworkMode.DENIED),
             env=SandboxEnvPolicy(),
-            resources=SandboxResourceLimits(timeout_seconds=300, max_output_chars=30000),
+            resources=SandboxResourceLimits(
+                timeout_seconds=SANDBOX_LONG_RUNNING_SERVICE_TIMEOUT_SECONDS,
+                max_output_chars=SANDBOX_PACKAGE_OUTPUT_CHARS,
+            ),
             description="Long-running service in a temporary workspace lease.",
         )
     return SandboxProfile(
@@ -463,9 +486,9 @@ def default_sandbox_profile(
         network=SandboxNetworkPolicy(mode=SandboxNetworkMode.DENIED),
         env=SandboxEnvPolicy(),
         resources=SandboxResourceLimits(
-            timeout_seconds=120,
-            max_output_chars=40000,
-            max_artifact_bytes=20 * 1024 * 1024,
+            timeout_seconds=SANDBOX_ISOLATED_VERIFICATION_TIMEOUT_SECONDS,
+            max_output_chars=SANDBOX_VERIFICATION_OUTPUT_CHARS,
+            max_artifact_bytes=SANDBOX_VERIFICATION_MAX_ARTIFACT_BYTES,
         ),
         description="Verification under native OS sandbox enforcement.",
     )

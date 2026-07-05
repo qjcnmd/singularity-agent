@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from singularity.workspace_state import (
     WorkspaceHealthStatus,
     WorkspaceStateManager,
 )
+from singularity.workspace_state.store import WorkspaceStateStore
 
 
 class SimpleTokenCounter:
@@ -69,6 +71,31 @@ def test_session_start_creates_persistent_baseline_and_skips_protected_dirs(tmp_
     assert "work/pytest-output.txt" not in baseline.snapshots
     assert (tmp_path / ".singularity" / "sessions" / "session_1" / "journal.jsonl").exists()
     assert (tmp_path / ".singularity" / "workspace_state.sqlite3").exists()
+
+
+def test_workspace_state_store_sets_busy_timeout_and_locks_public_reads(tmp_path: Path) -> None:
+    store = WorkspaceStateStore(tmp_path)
+    store.save_session(
+        session_id="session_1",
+        task_id="task_1",
+        workspace_root=str(tmp_path),
+        status="open",
+        created_at="2026-07-05T00:00:00+00:00",
+    )
+
+    def read_session() -> str:
+        row = store.load_session("session_1")
+        assert row is not None
+        return str(row["session_id"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert [future.result() for future in [executor.submit(read_session), executor.submit(read_session)]] == [
+            "session_1",
+            "session_1",
+        ]
+
+    busy_timeout = store.connection.execute("pragma busy_timeout").fetchone()[0]
+    assert busy_timeout >= 5000
 
 
 def test_file_snapshot_records_hash_metadata_encoding_line_endings_symlink_and_class(

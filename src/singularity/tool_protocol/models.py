@@ -20,21 +20,15 @@ from singularity.utils.serialization import (
     utc_iso_timestamp,
 )
 
-_now = utc_iso_timestamp
-
 
 def _digest(value: Any) -> str:
-    text = json.dumps(_to_plain(value), ensure_ascii=False, sort_keys=True, default=str)
+    text = json.dumps(to_plain_data(value), ensure_ascii=False, sort_keys=True, default=str)
     return stable_hash_text(text)
-
-
-_to_plain = to_plain_data
-_enum = coerce_optional_enum
 
 
 class SerializableDataclass:
     def to_dict(self) -> dict[str, Any]:
-        return _to_plain(self)
+        return to_plain_data(self)
 
 
 @dataclass
@@ -95,7 +89,7 @@ class ToolCallEnvelope(SerializableDataclass):
     argument_digest: str = ""
     tool_schema_hash: str = ""
     allowed_tool_names: list[str] = field(default_factory=list)
-    proposed_at: str = field(default_factory=_now)
+    proposed_at: str = field(default_factory=utc_iso_timestamp)
     proposed_by_model: bool = True
     parse_status: ModelToolParseStatus = ModelToolParseStatus.VALID
     validation_errors: list[str] = field(default_factory=list)
@@ -103,8 +97,8 @@ class ToolCallEnvelope(SerializableDataclass):
     phase: ToolCallPhase = ToolCallPhase.PROPOSED
 
     def __post_init__(self) -> None:
-        self.parse_status = _enum(ModelToolParseStatus, self.parse_status)
-        self.phase = _enum(ToolCallPhase, self.phase)
+        self.parse_status = coerce_optional_enum(ModelToolParseStatus, self.parse_status)
+        self.phase = coerce_optional_enum(ToolCallPhase, self.phase)
         self.allowed_tool_names = list(self.allowed_tool_names)
         self.validation_errors = list(self.validation_errors)
         self.metadata = dict(self.metadata)
@@ -139,7 +133,7 @@ class ToolCallEnvelope(SerializableDataclass):
             argument_digest=str(payload.get("argument_digest") or ""),
             tool_schema_hash=str(payload.get("tool_schema_hash") or ""),
             allowed_tool_names=list(payload.get("allowed_tool_names") or []),
-            proposed_at=str(payload.get("proposed_at") or _now()),
+            proposed_at=str(payload.get("proposed_at") or utc_iso_timestamp()),
             proposed_by_model=bool(payload.get("proposed_by_model", True)),
             parse_status=payload.get("parse_status") or ModelToolParseStatus.VALID,
             validation_errors=list(payload.get("validation_errors") or []),
@@ -161,7 +155,7 @@ class ToolCallBatch(SerializableDataclass):
     tool_calls: list[ToolCallEnvelope] = field(default_factory=list)
     supports_parallel_execution: bool = False
     max_tool_calls: int = 0
-    created_at: str = field(default_factory=_now)
+    created_at: str = field(default_factory=utc_iso_timestamp)
     batch_digest: str = ""
 
     def __post_init__(self) -> None:
@@ -193,7 +187,7 @@ class ToolCallBatch(SerializableDataclass):
             tool_calls=[ToolCallEnvelope.from_dict(item) for item in payload.get("tool_calls") or []],
             supports_parallel_execution=bool(payload.get("supports_parallel_execution")),
             max_tool_calls=int(payload.get("max_tool_calls") or 0),
-            created_at=str(payload.get("created_at") or _now()),
+            created_at=str(payload.get("created_at") or utc_iso_timestamp()),
             batch_digest=str(payload.get("batch_digest") or ""),
         )
 
@@ -211,7 +205,7 @@ class ToolExecutionPlan(SerializableDataclass):
     side_effect_count: int = 0
 
     def __post_init__(self) -> None:
-        self.execution_mode = _enum(ToolExecutionMode, self.execution_mode)
+        self.execution_mode = coerce_optional_enum(ToolExecutionMode, self.execution_mode)
         self.ordered_calls = [
             call if isinstance(call, ToolCallEnvelope) else ToolCallEnvelope.from_dict(call)
             for call in self.ordered_calls
@@ -268,13 +262,21 @@ class ToolCallRecord(SerializableDataclass):
     error_kind: ToolCallFailureKind | None = None
     error_message: str | None = None
     attempts: int = 1
-    created_at: str = field(default_factory=_now)
-    updated_at: str = field(default_factory=_now)
+    created_at: str = field(default_factory=utc_iso_timestamp)
+    updated_at: str = field(default_factory=utc_iso_timestamp)
 
     def __post_init__(self) -> None:
-        self.phase = _enum(ToolCallPhase, self.phase)
-        self.previous_phase = _enum(ToolCallPhase, self.previous_phase) if self.previous_phase is not None else None
-        self.error_kind = _enum(ToolCallFailureKind, self.error_kind) if self.error_kind is not None else None
+        self.phase = coerce_optional_enum(ToolCallPhase, self.phase)
+        self.previous_phase = (
+            coerce_optional_enum(ToolCallPhase, self.previous_phase)
+            if self.previous_phase is not None
+            else None
+        )
+        self.error_kind = (
+            coerce_optional_enum(ToolCallFailureKind, self.error_kind)
+            if self.error_kind is not None
+            else None
+        )
         self.envelope = self.envelope if isinstance(self.envelope, ToolCallEnvelope) else ToolCallEnvelope.from_dict(self.envelope)
         self.attempts = max(1, int(self.attempts))
 
@@ -298,8 +300,8 @@ class ToolCallRecord(SerializableDataclass):
             error_kind=payload.get("error_kind"),
             error_message=payload.get("error_message"),
             attempts=int(payload.get("attempts") or 1),
-            created_at=str(payload.get("created_at") or _now()),
-            updated_at=str(payload.get("updated_at") or _now()),
+            created_at=str(payload.get("created_at") or utc_iso_timestamp()),
+            updated_at=str(payload.get("updated_at") or utc_iso_timestamp()),
         )
 
 
@@ -376,7 +378,7 @@ class ToolObservationView(SerializableDataclass):
     redacted: bool = False
 
     def __post_init__(self) -> None:
-        self.visibility = _enum(ToolObservationVisibility, self.visibility)
+        self.visibility = coerce_optional_enum(ToolObservationVisibility, self.visibility)
         if isinstance(self.error_kind, str):
             self.error_kind = ToolCallFailureKind(self.error_kind)
         self.reference_ids = list(self.reference_ids)
@@ -393,7 +395,7 @@ class ToolObservationView(SerializableDataclass):
             tool_name=envelope.tool_name,
             ok=envelope.ok,
             status=envelope.status,
-            visibility=_enum(ToolObservationVisibility, visibility),
+            visibility=coerce_optional_enum(ToolObservationVisibility, visibility),
             content_preview=envelope.content_preview,
             content_digest=envelope.content_digest,
             result_ref=envelope.raw_result_ref,
@@ -503,7 +505,7 @@ class ToolProtocolTurnResult(SerializableDataclass):
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.status = _enum(ToolProtocolTurnStatus, self.status)
+        self.status = coerce_optional_enum(ToolProtocolTurnStatus, self.status)
         self.metadata = dict(self.metadata)
         self.recovery_report = dict(self.recovery_report)
 
@@ -551,7 +553,7 @@ class ToolProtocolEvent(SerializableDataclass):
     tool_call_id: str | None
     event_type: str
     payload: dict[str, Any] = field(default_factory=dict)
-    created_at: str = field(default_factory=_now)
+    created_at: str = field(default_factory=utc_iso_timestamp)
 
     def __post_init__(self) -> None:
         self.payload = dict(self.payload)
@@ -565,7 +567,7 @@ class ToolProtocolEvent(SerializableDataclass):
             tool_call_id=payload.get("tool_call_id"),
             event_type=str(payload.get("event_type") or ""),
             payload=dict(payload.get("payload") or {}),
-            created_at=str(payload.get("created_at") or _now()),
+            created_at=str(payload.get("created_at") or utc_iso_timestamp()),
         )
 
 
@@ -580,7 +582,7 @@ class ToolProtocolResultBinding(SerializableDataclass):
     context_message_id: str | None = None
     result_digest: str | None = None
     appended: bool = False
-    created_at: str = field(default_factory=_now)
+    created_at: str = field(default_factory=utc_iso_timestamp)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -600,7 +602,7 @@ class ToolProtocolResultBinding(SerializableDataclass):
             context_message_id=payload.get("context_message_id"),
             result_digest=payload.get("result_digest"),
             appended=bool(payload.get("appended")),
-            created_at=str(payload.get("created_at") or _now()),
+            created_at=str(payload.get("created_at") or utc_iso_timestamp()),
             metadata=dict(payload.get("metadata") or {}),
         )
 

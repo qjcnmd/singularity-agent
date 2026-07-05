@@ -29,6 +29,7 @@ from singularity.policy import (
     ResourceRef,
 )
 from singularity.policy.audit import redact
+from singularity.runtime.defaults import WORKSPACE_MEDIUM_DIFF_LINE_THRESHOLD
 from singularity.utils.attributes import nested_getattr
 from singularity.utils.serialization import utc_iso_timestamp
 from singularity.workspace.diff import (
@@ -1571,7 +1572,10 @@ class WorkspaceMutationManager:
             return "denied"
         if any(decision.decision == REQUIRE_REVIEW for decision in decisions):
             return "high"
-        if any(diff.added_lines + diff.removed_lines > 100 for diff in diffs):
+        if any(
+            diff.added_lines + diff.removed_lines > WORKSPACE_MEDIUM_DIFF_LINE_THRESHOLD
+            for diff in diffs
+        ):
             return "medium"
         return "low"
 

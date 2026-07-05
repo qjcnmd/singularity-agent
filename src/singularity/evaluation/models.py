@@ -6,13 +6,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any
 
-from singularity.utils.serialization import coerce_dict, coerce_enum
+from singularity.utils.serialization import coerce_enum, coerce_object_mapping
 
 SCHEMA_VERSION = "evaluation.benchmark_task/v1"
 FAILURE_CASE_RECORD_SCHEMA_VERSION = "evaluation.failure_case_record/v1"
-EnumT = TypeVar("EnumT", bound=Enum)
 
 
 class TaskDifficulty(StrEnum):
@@ -748,16 +747,8 @@ def _golden_contract(
     return GoldenTaskContract.from_dict(value)
 
 
-def _enum(enum_type: type[EnumT], value: EnumT | str) -> EnumT:
-    return cast(EnumT, coerce_enum(enum_type, value))
-
-
-def _dict(value: Any) -> dict[str, Any]:
-    return coerce_dict(
-        value,
-        allow_none=True,
-        error_message="Expected object mapping.",
-    )
+_enum = coerce_enum
+_dict = coerce_object_mapping
 
 
 def _copy_jsonish(value: Any) -> Any:

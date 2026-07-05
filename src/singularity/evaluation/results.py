@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from singularity.utils.serialization import coerce_dict, coerce_float, coerce_int
+from singularity.utils.serialization import coerce_evaluation_dict, coerce_float, coerce_int
 
 EVALUATION_RESULT_SCHEMA_VERSION = "evaluation.result/v1"
 
@@ -621,9 +621,4 @@ def _float_delta(current: dict[str, Any], previous: dict[str, Any], key: str) ->
     return round(float(current.get(key, 0.0) or 0.0) - float(previous.get(key, 0.0) or 0.0), 6)
 
 
-def _dict(value: Any, field_name: str) -> dict[str, Any]:
-    return coerce_dict(
-        value,
-        field_name,
-        error_message=f"evaluation {field_name} must be an object.",
-    )
+_dict = coerce_evaluation_dict

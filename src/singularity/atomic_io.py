@@ -6,6 +6,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from singularity.runtime.defaults import (
+    ATOMIC_WRITE_REPLACE_RETRY_ATTEMPTS,
+    ATOMIC_WRITE_REPLACE_RETRY_BASE_SECONDS,
+)
+
 
 @contextmanager
 def file_lock(path: Path):
@@ -40,13 +45,13 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 def replace_with_retry(tmp: Path, path: Path) -> None:
     last_error: PermissionError | None = None
-    for attempt in range(8):
+    for attempt in range(ATOMIC_WRITE_REPLACE_RETRY_ATTEMPTS):
         try:
             os.replace(tmp, path)
             return
         except PermissionError as exc:
             last_error = exc
-            time.sleep(0.05 * (attempt + 1))
+            time.sleep(ATOMIC_WRITE_REPLACE_RETRY_BASE_SECONDS * (attempt + 1))
     if last_error is not None:
         raise last_error
 

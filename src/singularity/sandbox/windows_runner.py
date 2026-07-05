@@ -15,6 +15,11 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar
 
+from singularity.runtime.defaults import (
+    PROCESS_TERMINATION_GRACE_SECONDS,
+    WINDOWS_RUNNER_DEFAULT_TIMEOUT_SECONDS,
+    WINDOWS_RUNNER_PROCESS_POLL_INTERVAL_SECONDS,
+)
 from singularity.utils.serialization import stable_short_hash_text, utc_iso_timestamp
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -324,6 +329,9 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
         return _run_workspace_cleanup(spec)
     started = time.perf_counter()
     started_at = _now()
+    timeout_seconds = spec.timeout_seconds
+    if timeout_seconds is None:
+        timeout_seconds = WINDOWS_RUNNER_DEFAULT_TIMEOUT_SECONDS
     output_truncated = False
     process: _WindowsChildProcess | subprocess.Popen[bytes] | None = None
     timed_out = False
@@ -337,13 +345,13 @@ def run_spec(spec: WindowsRunnerSpec) -> WindowsRunnerResult:
         while True:
             if process.poll() is not None:
                 break
-            if spec.timeout_seconds is not None and time.perf_counter() - started > spec.timeout_seconds:
+            if time.perf_counter() - started > timeout_seconds:
                 timed_out = True
                 job_killed = _terminate_child(process)
                 break
-            time.sleep(0.02)
+            time.sleep(WINDOWS_RUNNER_PROCESS_POLL_INTERVAL_SECONDS)
         try:
-            process.wait(timeout=1)
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             job_killed = _terminate_child(process) or job_killed
         timing["command_runtime_time_seconds"] = time.perf_counter() - phase_started

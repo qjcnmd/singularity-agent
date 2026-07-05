@@ -11,7 +11,6 @@ from singularity.command import CommandExecutor
 from singularity.config import ProductionConfig
 from singularity.context import ContextManager
 from singularity.edit import EditExecutor
-from singularity.evaluation.harness import EvaluationHarness
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.interaction import InteractionController
 from singularity.kernel.exceptions import AgentGraphInitializationError
@@ -45,6 +44,9 @@ from singularity.tools.workspace_state import register_workspace_state_tools
 from singularity.verification.runner import VerificationRunner
 from singularity.workspace import WorkspaceMutationManager
 from singularity.workspace_state import WorkspaceHealthReport, WorkspaceStateManager
+
+EvaluationHarnessFactory = Callable[[], Any]
+EvaluationHarnessFactoryBuilder = Callable[..., EvaluationHarnessFactory | None]
 
 AGENT_COMPONENT_INITIALIZATION_ORDER = [
     ComponentName.CONFIGURATION,
@@ -157,8 +159,8 @@ class AgentGraph:
         default_factory=lambda: list(AGENT_COMPONENT_INITIALIZATION_ORDER)
     )
     components: dict[ComponentName, ComponentState] = field(default_factory=dict)
-    _evaluation_harness: EvaluationHarness | None = field(default=None, repr=False)
-    _evaluation_harness_factory: Callable[[], EvaluationHarness] | None = field(
+    _evaluation_harness: Any | None = field(default=None, repr=False)
+    _evaluation_harness_factory: EvaluationHarnessFactory | None = field(
         default=None,
         repr=False,
     )
@@ -175,7 +177,7 @@ class AgentGraph:
         return self.components.get(component, ComponentState.PENDING)
 
     @property
-    def evaluation_harness(self) -> EvaluationHarness:
+    def evaluation_harness(self) -> Any:
         if self._evaluation_harness is not None:
             return self._evaluation_harness
         if self._evaluation_harness_factory is None:
@@ -256,6 +258,13 @@ class AgentGraph:
 
 
 class AgentGraphBuilder:
+    def __init__(
+        self,
+        *,
+        evaluation_harness_factory_builder: EvaluationHarnessFactoryBuilder | None = None,
+    ) -> None:
+        self._evaluation_harness_factory_builder = evaluation_harness_factory_builder
+
     def build(
         self,
         *,
@@ -384,7 +393,7 @@ class AgentGraphBuilder:
                 planner=planner,
                 recovery_gate_decision=recovery_gate_decision,
                 components=components,
-                _evaluation_harness_factory=self._evaluation_harness_factory(
+                _evaluation_harness_factory=self._build_evaluation_harness_factory(
                     project_root=project_root,
                     trace=trace,
                     infra=infra,
@@ -786,8 +795,8 @@ class AgentGraphBuilder:
         if memory_block.items:
             context_manager.add_memory_context_block(memory_block)
 
-    @staticmethod
-    def _evaluation_harness_factory(
+    def _build_evaluation_harness_factory(
+        self,
         *,
         project_root: Path,
         trace: TraceRecorder,
@@ -796,20 +805,18 @@ class AgentGraphBuilder:
         tool_protocol: _ToolProtocolEngines,
         verification_review: _VerificationReviewPipelines,
         planner: Planner,
-    ) -> Callable[[], EvaluationHarness]:
-        def build_evaluation_harness() -> EvaluationHarness:
-            return EvaluationHarness(
-                project_root=project_root,
-                trace_recorder=trace,
-                verification_runner=verification_review.verification_runner,
-                memory_pipeline=infra.memory_pipeline,
-                planner=planner,
-                tool_executor=tool_protocol.tool_executor,
-                command_executor=execution_core.command_executor,
-                mutation_manager=execution_core.mutation_manager,
-            )
-
-        return build_evaluation_harness
+    ) -> EvaluationHarnessFactory | None:
+        if self._evaluation_harness_factory_builder is None:
+            return None
+        return self._evaluation_harness_factory_builder(
+            project_root=project_root,
+            trace=trace,
+            infra=infra,
+            execution_core=execution_core,
+            tool_protocol=tool_protocol,
+            verification_review=verification_review,
+            planner=planner,
+        )
 
     @staticmethod
     def _mark_first_pending_failed(

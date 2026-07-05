@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from singularity.runtime.defaults import SQLITE_BUSY_TIMEOUT_MS
 from singularity.workspace_state.models import (
     ArtifactRecord,
     ChangeOwnership,
@@ -35,6 +36,7 @@ class WorkspaceStateStore:
         self.state_root.mkdir(parents=True, exist_ok=True)
         self.sessions_root.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._connection.execute(f"pragma busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         self._connection.row_factory = sqlite3.Row
         self._lock = RLock()
         self._init_schema()
@@ -128,27 +130,30 @@ class WorkspaceStateStore:
             self._connection.commit()
 
     def load_session(self, session_id: str) -> dict[str, Any] | None:
-        row = self._connection.execute(
-            "select * from sessions where session_id = ?",
-            (session_id,),
-        ).fetchone()
-        return _row_to_dict(row) if row else None
+        with self._lock:
+            row = self._connection.execute(
+                "select * from sessions where session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return _row_to_dict(row) if row else None
 
     def latest_session(self) -> dict[str, Any] | None:
-        row = self._connection.execute(
-            "select * from sessions order by created_at desc, session_id desc limit 1"
-        ).fetchone()
-        return _row_to_dict(row) if row else None
+        with self._lock:
+            row = self._connection.execute(
+                "select * from sessions order by created_at desc, session_id desc limit 1"
+            ).fetchone()
+            return _row_to_dict(row) if row else None
 
     def open_sessions(self) -> list[dict[str, Any]]:
-        rows = self._connection.execute(
-            """
-            select * from sessions
-            where status not in ('closed')
-            order by created_at desc, session_id desc
-            """
-        ).fetchall()
-        return [_row_to_dict(row) for row in rows]
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                select * from sessions
+                where status not in ('closed')
+                order by created_at desc, session_id desc
+                """
+            ).fetchall()
+            return [_row_to_dict(row) for row in rows]
 
     def save_baseline(self, baseline: WorkspaceBaseline) -> None:
         payload = baseline.to_dict()
@@ -179,13 +184,14 @@ class WorkspaceStateStore:
             self._connection.commit()
 
     def load_baseline(self, session_id: str) -> WorkspaceBaseline | None:
-        row = self._connection.execute(
-            "select payload from baselines where session_id = ? order by created_at desc limit 1",
-            (session_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return WorkspaceBaseline.from_dict(json.loads(row["payload"]))
+        with self._lock:
+            row = self._connection.execute(
+                "select payload from baselines where session_id = ? order by created_at desc limit 1",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return WorkspaceBaseline.from_dict(json.loads(row["payload"]))
 
     def append_event(self, event: JournalEvent) -> None:
         self.journal(event.session_id).append(event)
@@ -273,11 +279,12 @@ class WorkspaceStateStore:
             self._connection.commit()
 
     def file_states(self, session_id: str) -> list[dict[str, Any]]:
-        rows = self._connection.execute(
-            "select * from file_state where session_id = ? order by path",
-            (session_id,),
-        ).fetchall()
-        return [_decode_file_state(row) for row in rows]
+        with self._lock:
+            rows = self._connection.execute(
+                "select * from file_state where session_id = ? order by path",
+                (session_id,),
+            ).fetchall()
+            return [_decode_file_state(row) for row in rows]
 
     def rollback_items(
         self,

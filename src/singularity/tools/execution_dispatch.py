@@ -11,6 +11,11 @@ from pydantic import ValidationError
 
 from singularity.observability.models import TraceEventType
 from singularity.observability.redaction import TraceRedactor
+from singularity.runtime.defaults import (
+    DEFAULT_TOOL_CACHE_MAX_ENTRIES,
+    DEFAULT_TOOL_EXECUTION_TIMEOUT_SECONDS,
+    PROCESS_TERMINATION_GRACE_SECONDS,
+)
 from singularity.tools.execution_cache import ToolExecutionCache
 from singularity.tools.execution_pipeline import (
     PLANNER_ACTION_ID_METADATA_KEY,
@@ -123,7 +128,7 @@ class ToolExecutionDispatcher:
                 result,
                 max_entries=state.spec.cache_policy.max_entries
                 if state.spec.cache_policy
-                else 128,
+                else DEFAULT_TOOL_CACHE_MAX_ENTRIES,
                 touched_paths=self.cache.touched_paths(state.spec, state.validated_args),
             )
         if state.spec.permission_level != PermissionLevel.READ_ONLY:
@@ -140,6 +145,12 @@ class ToolExecutionDispatcher:
         ):
             return self.execute_handler_in_process(spec, validated_args)
         return self.execute_handler_in_thread(spec, validated_args)
+
+    @staticmethod
+    def _timeout_seconds(spec: ToolSpec) -> float:
+        if spec.timeout_seconds is None:
+            return DEFAULT_TOOL_EXECUTION_TIMEOUT_SECONDS
+        return float(spec.timeout_seconds)
 
     def execute_handler_in_process(
         self, spec: ToolSpec, validated_args: Any
@@ -168,21 +179,22 @@ class ToolExecutionDispatcher:
         child_conn.close()
 
         try:
-            process.join(spec.timeout_seconds)
+            timeout_seconds = self._timeout_seconds(spec)
+            process.join(timeout_seconds)
             if process.is_alive():
                 process.terminate()
-                process.join(1)
+                process.join(PROCESS_TERMINATION_GRACE_SECONDS)
                 killed = False
                 if process.is_alive():
                     kill = getattr(process, "kill", None)
                     if kill is not None:
                         kill()
                         killed = True
-                        process.join(1)
+                        process.join(PROCESS_TERMINATION_GRACE_SECONDS)
                 still_alive = process.is_alive()
                 result = ToolResult.failure(
                     code="timeout",
-                    message=f"Tool timed out after {spec.timeout_seconds} seconds.",
+                    message=f"Tool timed out after {timeout_seconds} seconds.",
                     metadata={
                         "backend": spec.execution_backend.value,
                         "handler_isolation": "process",
@@ -221,15 +233,16 @@ class ToolExecutionDispatcher:
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(spec.handler, validated_args)
         shutdown_wait = True
+        timeout_seconds = self._timeout_seconds(spec)
         try:
-            output = future.result(timeout=spec.timeout_seconds)
+            output = future.result(timeout=timeout_seconds)
         except FutureTimeout:
             future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
             shutdown_wait = False
             result = ToolResult.failure(
-                code="timeout",
-                message=f"Tool timed out after {spec.timeout_seconds} seconds.",
+                    code="timeout",
+                    message=f"Tool timed out after {timeout_seconds} seconds.",
                 metadata={
                     "backend": spec.execution_backend.value,
                     "handler_isolation": "thread",

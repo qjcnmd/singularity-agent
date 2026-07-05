@@ -19,7 +19,7 @@
 - tool_schema_to_openai
 
 字段清单:
-- ToolSpec: name, version, description, input_model, output_model, handler, permission_level, risk_tags, timeout_seconds, max_output_chars, cacheable, idempotent, uses_edit_executor, uses_mutation_manager, uses_command_executor, delegates_policy_constraints, capabilities, operation, resource_resolver, side_effects, sensitivity, cache_policy, idempotency_policy, retry_policy, execution_backend, approval_profile, artifact_policy, streamable, enabled
+- ToolSpec: name, version, description, input_model, output_model, handler, permission_level, risk_tags, timeout_seconds, max_output_chars, cacheable, idempotent, uses_edit_executor, uses_mutation_manager, uses_command_executor, delegates_policy_constraints, capabilities, operation, resource_resolver, side_effects, sensitivity, cache_policy, idempotency_policy, retry_policy, execution_backend, approval_profile, artifact_policy, enabled
 - ToolResult: ok, content, error_code, error, truncated, metadata
 - ToolExecutionRequest: tool_call_id, tool_name, raw_arguments, normalized_arguments, batch_id, run_id, session_id, task_id, phase_id, model_request_id, model_response_id, argument_digest, metadata
 - RegisteredToolRecord: spec, origin, admitted, admission_reason, diagnostics, metadata
@@ -86,7 +86,6 @@ class ToolSpec(BaseModel):
     execution_backend: ToolExecutionBackendKind = ToolExecutionBackendKind.IN_PROCESS
     approval_profile: dict[str, Any] = Field(default_factory=dict)
     artifact_policy: dict[str, Any] = Field(default_factory=dict)
-    streamable: bool = False
     enabled: bool = True
 ```
 
@@ -155,7 +154,6 @@ class ToolExecutionBackendKind(str, Enum): # ToolSpec.execution_backend
 class ToolOriginKind(str, Enum):     # ToolOrigin.kind
     BUILTIN = "builtin"
     PLUGIN = "plugin"
-    FUTURE_MCP = "future_mcp"
 ```
 
 ### 数据流概述

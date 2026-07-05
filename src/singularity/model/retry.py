@@ -8,13 +8,18 @@ from typing import Any, ClassVar
 
 from singularity.model.errors import ModelRetryExhausted
 from singularity.model.models import ModelError, ModelErrorKind
+from singularity.runtime.defaults import (
+    MODEL_RETRY_BACKOFF_SECONDS,
+    MODEL_RETRY_JITTER_RATIO,
+    MODEL_RETRY_MAX_ATTEMPTS,
+)
 
 
 @dataclass
 class RetryPolicy:
-    max_attempts: int = 3
-    backoff_seconds: float = 0.25
-    jitter_ratio: float = 0.2
+    max_attempts: int = MODEL_RETRY_MAX_ATTEMPTS
+    backoff_seconds: float = MODEL_RETRY_BACKOFF_SECONDS
+    jitter_ratio: float = MODEL_RETRY_JITTER_RATIO
     fallback_models: list[str] = field(default_factory=list)
 
 

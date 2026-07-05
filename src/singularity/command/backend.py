@@ -436,6 +436,6 @@ def _reader_thread(
                 return
             output_queue.put((stream_name, chunk))
 
-    thread = threading.Thread(target=run, name=f"command-{stream_name}-reader", daemon=True)
+    thread = threading.Thread(target=run, name=f"command-{stream_name}-reader")
     thread.start()
     return thread

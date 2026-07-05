@@ -7,6 +7,7 @@
 - src/singularity/kernel/graph.py
 - src/singularity/kernel/agent_kernel.py
 - src/singularity/kernel/models.py
+- src/singularity/evaluation/factory.py
 - src/singularity/session/models.py
 - src/singularity/session/recovery.py
 
@@ -44,6 +45,7 @@ Kernel 层负责启动配置、trace、workspace lock、组件图、健康检查
 - src/singularity/kernel/graph.py
 - src/singularity/kernel/agent_kernel.py
 - src/singularity/kernel/models.py
+- src/singularity/evaluation/factory.py
 
 ## 关键类、函数、字段
 
@@ -51,7 +53,7 @@ Kernel 层负责启动配置、trace、workspace lock、组件图、健康检查
 
 ## 真实运行时调用链
 
-`KernelBootstrap.boot()` -> `SessionStore.prepare_launch()` -> `TraceRecorder.create()` -> `CrashRecoveryManager.inspect()` -> `SessionHistoryReader.tool_protocol_report()` / `RecoveryManager.recover(previous context.sqlite3)` -> `SessionHistoryReader.build_resume_context()` -> `SessionRecoveryGate.evaluate()` -> `AgentGraphBuilder.build()`（内部：`_build_infra` -> `_build_policy_sandbox` -> `_build_execution_core` -> `_build_tools_protocol` -> `_build_verification_review` -> `_build_model_context` -> `_create_planner` -> `_wire_planner` -> `_prime_planner_context`）-> `AgentKernel.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()`。失败时 `KernelBootstrapError` 或 `KernelError` 携带 final report / diagnostics。
+`KernelBootstrap.boot()` -> `SessionStore.prepare_launch()` -> `TraceRecorder.create()` -> `CrashRecoveryManager.inspect()` -> `SessionHistoryReader.tool_protocol_report()` / `RecoveryManager.recover(previous context.sqlite3)` -> `SessionHistoryReader.build_resume_context()` -> `SessionRecoveryGate.evaluate()` -> `AgentGraphBuilder.build()`（内部：`_build_infra` -> `_build_policy_sandbox` -> `_build_execution_core` -> `_build_tools_protocol` -> `_build_verification_review` -> `_build_model_context` -> `_create_planner` -> `_wire_planner` -> `_prime_planner_context`）-> `AgentKernel.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()`。`KernelBootstrap` 在装配层把 `evaluation.factory.build_evaluation_harness_factory()` 注入 `AgentGraphBuilder`，`kernel.graph` 只保存 lazy factory，不顶层导入 evaluation harness。失败时 `KernelBootstrapError` 或 `KernelError` 携带 final report / diagnostics。
 
 ## 真实任务中的对象流
 

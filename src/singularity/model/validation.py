@@ -10,11 +10,11 @@ from singularity.model.models import (
     ToolChoiceMode,
     ToolChoicePolicy,
 )
-from singularity.tools.registry import ToolRegistry
+from singularity.model.tool_registry_protocol import ModelToolRegistryProtocol
 
 
 class ModelResponseValidator:
-    def __init__(self, registry: ToolRegistry) -> None:
+    def __init__(self, registry: ModelToolRegistryProtocol) -> None:
         self.registry = registry
 
     def validate(

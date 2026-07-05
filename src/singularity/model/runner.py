@@ -44,6 +44,7 @@ from singularity.model.registry import ModelProviderRegistry
 from singularity.model.request_builder import ModelTurnRequestBuilder
 from singularity.model.retry import ModelRetryController, RetryPolicy
 from singularity.model.streaming import ProviderStreamEventType, StreamingAccumulator
+from singularity.model.tool_registry_protocol import ModelToolRegistryProtocol
 from singularity.model.tools import ModelToolRenderer, ToolCallNormalizer
 from singularity.model.validation import ModelResponseValidator
 from singularity.observability.models import (
@@ -51,7 +52,6 @@ from singularity.observability.models import (
     TraceEventType,
     TraceSeverity,
 )
-from singularity.tools.registry import ToolRegistry
 from singularity.utils.serialization import stable_hash_text
 
 SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -90,7 +90,7 @@ class ModelRunner:
         self,
         *,
         registry: ModelProviderRegistry,
-        tool_registry: ToolRegistry,
+        tool_registry: ModelToolRegistryProtocol,
         config: ModelRunnerConfig | None = None,
         trace: Any | None = None,
     ) -> None:
@@ -115,7 +115,7 @@ class ModelRunner:
         cls,
         provider: MockModelProvider,
         *,
-        tool_registry: ToolRegistry,
+        tool_registry: ModelToolRegistryProtocol,
         config: ModelRunnerConfig | None = None,
         trace: Any | None = None,
     ) -> ModelRunner:
@@ -133,7 +133,7 @@ class ModelRunner:
         cls,
         provider: Any,
         *,
-        tool_registry: ToolRegistry,
+        tool_registry: ModelToolRegistryProtocol,
         config: ModelRunnerConfig | None = None,
         trace: Any | None = None,
         provider_name: str = "legacy_chat",
