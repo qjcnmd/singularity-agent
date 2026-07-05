@@ -1,7 +1,8 @@
 use schemars::schema_for;
 use singularity_sandbox::{
-    CommandRequest, CommandResult, SandboxBackend, SandboxBackendDescriptor, SandboxCapabilities,
-    SandboxPolicy,
+    CommandExecutionStatus, CommandExecutor, CommandRequest, CommandResult, CommandSemanticStatus,
+    PatchChange, PatchExecutor, SandboxBackend, SandboxBackendDescriptor, SandboxCapabilities,
+    SandboxPolicy, git_diff_request, git_status_request,
 };
 
 struct TestBackend;
@@ -43,6 +44,7 @@ fn command_request_and_result_are_schema_backed_boundaries() {
     assert_eq!(request_value["purpose"], "project_verification");
     assert_eq!(request_value["network"]["mode"], "denied");
     assert_eq!(result_value["semantic_status"], "succeeded");
+    assert_eq!(request.permission_resource(), "python -m pytest");
     assert_eq!(
         schema_for!(CommandRequest)
             .schema
@@ -60,6 +62,190 @@ fn command_request_and_result_are_schema_backed_boundaries() {
             .title
             .unwrap(),
         "CommandResult"
+    );
+}
+
+#[test]
+fn command_resource_normalization_belongs_to_command_boundary() {
+    let request = CommandRequest::project_verification(
+        "command_1",
+        vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "python".to_string(),
+            "-m".to_string(),
+            "pytest".to_string(),
+        ],
+        ".",
+        "C:/repo",
+    );
+
+    assert_eq!(request.permission_resource(), "python -m pytest");
+}
+
+#[test]
+fn command_executor_fails_closed_when_sandbox_is_required_without_backend() {
+    let request =
+        CommandRequest::project_verification("command_1", vec!["git".to_string()], ".", "C:/repo");
+
+    let result = CommandExecutor::new().run_local(&request);
+
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::BackendError
+    );
+    assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
+    assert!(result.stderr_preview.contains("sandbox-required"));
+}
+
+#[test]
+fn git_helpers_create_sandboxed_command_requests_not_git_execution_wrappers() {
+    let status = git_status_request("git_status", ".", "C:/repo");
+    let diff = git_diff_request("git_diff", ".", "C:/repo");
+
+    assert_eq!(status.permission_resource(), "git status --porcelain=v1");
+    assert_eq!(diff.permission_resource(), "git diff --");
+    assert!(status.requires_sandbox());
+    assert!(diff.requires_sandbox());
+}
+
+#[test]
+fn command_policy_denied_result_does_not_require_process_or_backend_execution() {
+    let result = CommandResult::policy_denied("command_1", "policy denied command execution");
+
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::PolicyDenied
+    );
+    assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
+    assert!(result.stderr_preview.contains("policy denied"));
+}
+
+#[test]
+fn process_manager_times_out_and_redacts_secret_like_output() {
+    let request = CommandRequest::local_process(
+        "command_timeout",
+        vec![
+            "python".to_string(),
+            "-c".to_string(),
+            "import time; print('token=abc', flush=True); time.sleep(5)".to_string(),
+        ],
+        ".",
+    );
+    let mut request = request;
+    request.timeout_seconds = 1;
+
+    let result = CommandExecutor::new().run_local(&request);
+
+    assert_eq!(result.execution_status, CommandExecutionStatus::TimedOut);
+    assert_eq!(result.semantic_status, CommandSemanticStatus::TimedOut);
+    assert!(result.timed_out);
+    assert!(result.redacted);
+    assert!(!result.stdout_preview.contains("abc"));
+}
+
+#[test]
+fn patch_executor_rolls_back_when_later_change_fails() {
+    let tmp_path = tempfile::tempdir().expect("create temp dir");
+    let root = tmp_path.path();
+    let existing = root.join("src.txt");
+    std::fs::write(&existing, "before").expect("write fixture");
+    let executor = PatchExecutor::new(root);
+    let changes = vec![
+        PatchChange::replace("src.txt", "before", "after"),
+        PatchChange::replace("missing.txt", "before", "after"),
+    ];
+
+    let result = executor.apply(&changes);
+
+    assert!(!result.applied);
+    assert!(result.rolled_back);
+    assert_eq!(std::fs::read_to_string(existing).unwrap(), "before");
+}
+
+#[test]
+fn patch_executor_rejects_paths_outside_workspace() {
+    let tmp_path = tempfile::tempdir().expect("create temp dir");
+    let executor = PatchExecutor::new(tmp_path.path());
+
+    let result = executor.apply(&[PatchChange::create("../escape.txt", "nope")]);
+
+    assert!(!result.applied);
+    assert!(result.error.unwrap().contains("inside workspace"));
+}
+
+#[test]
+fn patch_executor_rolls_back_when_later_path_escapes_workspace() {
+    let tmp_path = tempfile::tempdir().expect("create temp dir");
+    let root = tmp_path.path();
+    let existing = root.join("src.txt");
+    std::fs::write(&existing, "before").expect("write fixture");
+    let executor = PatchExecutor::new(root);
+
+    let result = executor.apply(&[
+        PatchChange::replace("src.txt", "before", "after"),
+        PatchChange::create("../escape.txt", "nope"),
+    ]);
+
+    assert!(!result.applied);
+    assert!(result.rolled_back);
+    assert_eq!(std::fs::read_to_string(existing).unwrap(), "before");
+}
+
+#[cfg(unix)]
+#[test]
+fn patch_executor_rejects_symlink_escape() {
+    let tmp_path = tempfile::tempdir().expect("create temp dir");
+    let outside_path = tempfile::tempdir().expect("create outside temp dir");
+    let link_path = tmp_path.path().join("link.txt");
+    std::os::unix::fs::symlink(outside_path.path().join("outside.txt"), &link_path)
+        .expect("create symlink");
+    let executor = PatchExecutor::new(tmp_path.path());
+
+    let result = executor.apply(&[PatchChange::replace("link.txt", "before", "after")]);
+
+    assert!(!result.applied);
+    assert!(result.error.unwrap().contains("inside workspace"));
+}
+
+#[cfg(windows)]
+#[test]
+fn patch_executor_rejects_symlink_escape() {
+    let tmp_path = tempfile::tempdir().expect("create temp dir");
+    let outside_path = tempfile::tempdir().expect("create outside temp dir");
+    let link_path = tmp_path.path().join("link.txt");
+    if std::os::windows::fs::symlink_file(outside_path.path().join("outside.txt"), &link_path)
+        .is_err()
+    {
+        return;
+    }
+    let executor = PatchExecutor::new(tmp_path.path());
+
+    let result = executor.apply(&[PatchChange::replace("link.txt", "before", "after")]);
+
+    assert!(!result.applied);
+    assert!(result.error.unwrap().contains("inside workspace"));
+}
+
+#[test]
+fn patch_schema_objects_are_snapshotted() {
+    assert_eq!(
+        schema_for!(singularity_sandbox::PatchChange)
+            .schema
+            .metadata
+            .unwrap()
+            .title
+            .unwrap(),
+        "PatchChange"
+    );
+    assert_eq!(
+        schema_for!(singularity_sandbox::PatchResult)
+            .schema
+            .metadata
+            .unwrap()
+            .title
+            .unwrap(),
+        "PatchResult"
     );
 }
 

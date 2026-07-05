@@ -660,6 +660,7 @@ dependencies = [
  "serde",
  "serde_json",
  "singularity_core",
+ "tempfile",
 ]
 
 [[package]]

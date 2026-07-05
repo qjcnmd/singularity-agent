@@ -64,6 +64,10 @@
 - SandboxBackendDescriptor
 - CommandRequest
 - CommandResult
+- CommandExecutor
+- PatchChange
+- PatchResult
+- PatchExecutor
 - ModelTurnRequest
 - ModelTurnResponse
 - AgentLoopStatusBridge
@@ -123,7 +127,11 @@
 - SandboxPolicy: profile, filesystem, network, resources
 - SandboxBackendDescriptor: backend, enforcement, capabilities
 - CommandRequest: command_id, argv, cwd, purpose, timeout_seconds, network, filesystem
-- CommandResult: command_id, execution_status, semantic_status, exit_code, duration_ms, timed_out, stdout_preview, stderr_preview, output_truncated, changed_files
+- CommandResult: command_id, execution_status, semantic_status, exit_code, duration_ms, timed_out, stdout_preview, stderr_preview, output_truncated, redacted, changed_files
+- CommandExecutor: process_manager
+- PatchChange: path, expected, replacement
+- PatchResult: applied, changed_files, rolled_back, error
+- PatchExecutor: workspace_root
 - ModelTurnRequest: request_id, run_id, session_id, task_id, phase_id, action_id, purpose, messages, tools, tool_choice, model_preferences, budget, context_metadata, policy_metadata, trace_metadata
 - ModelTurnResponse: request_id, response_id, status, assistant_message, tool_calls, usage, finish_reason, validation, error, provider_name, model_name, latency_ms, trace_event_ids, raw_response_ref, metadata
 - AgentLoopStatusBridge: status, completed, final_answer, run_id, session_id, task_id, events, trace_path, error
@@ -149,7 +157,7 @@ Rust App Server Protocol 层建立第一阶段迁移的硬边界：客户端只�
 
 ## 关键类、函数、字段
 
-`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item`、`TraceEvent` 和 `ArtifactRef` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolRegistry`、`ToolBroker`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`PermissionRequest`、`PermissionRule`、`PermissionDecision`、`PreToolUseHook`、`PolicyEngine`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AgentLoopStatusBridge` 表示 Rust host 对 AgentLoop 状态的显式理解：默认 `not_migrated`，或由 Python sidecar 返回 completed/blocked/cancelled/failed。`PythonSidecarClient` 是 Rust host 到 Python migration sidecar 的 stdio JSON-RPC client。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。`AppServerClient` 是 `sg` 内部 stdio JSON-RPC client，不暴露 store 或 agent internals。
+`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item`、`TraceEvent` 和 `ArtifactRef` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolRegistry`、`ToolBroker`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`PermissionRequest`、`PermissionRule`、`PermissionDecision`、`PreToolUseHook`、`PolicyEngine`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`CommandExecutor`、`PatchChange`、`PatchResult`、`PatchExecutor`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object 与最小执行边界。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AgentLoopStatusBridge` 表示 Rust host 对 AgentLoop 状态的显式理解：默认 `not_migrated`，或由 Python sidecar 返回 completed/blocked/cancelled/failed。`PythonSidecarClient` 是 Rust host 到 Python migration sidecar 的 stdio JSON-RPC client。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。`AppServerClient` 是 `sg` 内部 stdio JSON-RPC client，不暴露 store 或 agent internals。
 
 ## 真实运行时调用链
 
@@ -348,10 +356,45 @@ pub struct CommandRequest {
     pub filesystem: SandboxFilesystemPolicy,
 }
 
+pub struct CommandResult {
+    pub command_id: String,
+    pub execution_status: CommandExecutionStatus,
+    pub semantic_status: CommandSemanticStatus,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
+    pub stdout_preview: String,
+    pub stderr_preview: String,
+    pub output_truncated: bool,
+    pub redacted: bool,
+    pub changed_files: Vec<String>,
+}
+
+pub struct CommandExecutor {
+    process_manager: ProcessManager,
+}
+
 pub struct SandboxBackendDescriptor {
     pub backend: String,
     pub enforcement: SandboxBackendEnforcement,
     pub capabilities: SandboxCapabilities,
+}
+
+pub struct PatchChange {
+    pub path: String,
+    pub expected: Option<String>,
+    pub replacement: String,
+}
+
+pub struct PatchResult {
+    pub applied: bool,
+    pub changed_files: Vec<String>,
+    pub rolled_back: bool,
+    pub error: Option<String>,
+}
+
+pub struct PatchExecutor {
+    workspace_root: PathBuf,
 }
 
 pub struct ModelTurnRequest {
@@ -419,27 +462,27 @@ pub struct PythonSidecarConfig {
 
 ## 谁生成这些对象
 
-`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` / `create_thread_with_trace()` 生成 `Thread`；`SessionStore.create_turn()` / `create_turn_with_input_and_trace()` 生成 `Turn`；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`SessionStore.register_artifact_ref()` 生成 `ArtifactRef`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`PermissionRequest::new()` 生成路径大小写 / 分隔符规范化后的 request resource，`PermissionRule::new()` 生成 declarative rule，`PermissionDecision::new()` 或 `PolicyEngine.evaluate()` 生成决策结果；`PythonSidecarClient.run_agent()` 从 Python sidecar 的 `agent/run` response 生成 `PythonSidecarRunResult`，再由 `AgentLoopStatusBridge::from_sidecar()` 生成 Rust host-facing status；`ToolSpec::new()`、`ToolBroker::register()`、`ToolCallEnvelope::new()`、`ToolResult::success()` / `failure()`、`ToolObservation::summary()` / `failed()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()`、`CommandResult::completed()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object。`ToolRegistry.register()` 只接受 `builtin.*`、`mcp.<server>.<tool>` 和 `python.<plugin>.<tool>` 命名空间，并拒绝重复 name。
+`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` / `create_thread_with_trace()` 生成 `Thread`；`SessionStore.create_turn()` / `create_turn_with_input_and_trace()` 生成 `Turn`；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`SessionStore.register_artifact_ref()` 生成 `ArtifactRef`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`PermissionRequest::new()` 生成路径大小写 / 分隔符规范化后的 request resource，`PermissionRule::new()` 生成 declarative rule，`PermissionDecision::new()` 或 `PolicyEngine.evaluate()` 生成决策结果；`PythonSidecarClient.run_agent()` 从 Python sidecar 的 `agent/run` response 生成 `PythonSidecarRunResult`，再由 `AgentLoopStatusBridge::from_sidecar()` 生成 Rust host-facing status；`ToolSpec::new()`、`ToolBroker::register()`、`ToolCallEnvelope::new()`、`ToolResult::success()` / `failure()`、`ToolObservation::summary()` / `failed()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()` / `local_process()`、`git_status_request()` / `git_diff_request()`、`CommandResult::completed()` / `policy_denied()`、`CommandExecutor::new()`、`PatchChange::replace()` / `create()`、`PatchExecutor::new()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object 或最小执行边界对象。`ToolRegistry.register()` 只接受 `builtin.*`、`mcp.<server>.<tool>` 和 `python.<plugin>.<tool>` 命名空间，并拒绝重复 name。
 
 ## 谁消费这些对象
 
-`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、thread、turn、approval、trace handler；`AppServer.run_python_sidecar_if_enabled()` 在显式 sidecar 配置存在时消费 `TurnStartParams` 并调用 `PythonSidecarClient`；`SessionStore.create_thread_with_trace()`、`create_turn_with_input_and_trace()`、`create_approval_with_trace()`、`record_approval_decision_with_trace()`、`append_trace()` 和 `register_artifact_ref()` 消费 protocol object 写 SQLite；`PolicyEngine.evaluate()` 消费 `PermissionRequest`，按 hook、deny、protected file path、defer、ask、permission mode、allow、fallback ask 顺序返回 `PermissionDecision`，且 `approval_policy=never` 会把 ask 投影为 deny；`ToolBroker.model_visible_tools()` 消费 `ToolRegistry` 并只投影 name、redacted description 和 input schema 给模型；`ToolBroker.execute()` 消费 `ToolCallEnvelope` 与外部 policy decision，未知或 denied tool 不调用 executor；`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification。`sg` 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
+`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、thread、turn、approval、trace handler；`AppServer.run_python_sidecar_if_enabled()` 在显式 sidecar 配置存在时消费 `TurnStartParams` 并调用 `PythonSidecarClient`；`SessionStore.create_thread_with_trace()`、`create_turn_with_input_and_trace()`、`create_approval_with_trace()`、`record_approval_decision_with_trace()`、`append_trace()` 和 `register_artifact_ref()` 消费 protocol object 写 SQLite；`PolicyEngine.evaluate()` 消费 `PermissionRequest`，按 hook、deny、protected file path、defer、ask、permission mode、allow、fallback ask 顺序返回 `PermissionDecision`，且 `approval_policy=never` 会把 ask 投影为 deny；`ToolBroker.model_visible_tools()` 消费 `ToolRegistry` 并只投影 name、redacted description 和 input schema 给模型；`ToolBroker.execute()` 消费 `ToolCallEnvelope` 与外部 policy decision，未知或 denied tool 不调用 executor；`CommandRequest.permission_resource()` 把 shell wrapper / argv 规范化为 policy 可消费的 command resource；`CommandExecutor.run_local()` 只消费显式 `HostWorkspace` request，遇到 read-only、copy-on-write、empty temp 或 hard-isolation request 时返回 backend error 而不是 local fallback；git status/diff 只生成 sandbox-required `CommandRequest`，不绕过 command/sandbox 边界执行 git；`PatchExecutor.apply()` 消费 `PatchChange` 并在后续 change 失败时回滚前序写入。`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification。`sg` 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
 ## 是否落盘
 
-`SessionStore.open()` 初始化 SQLite 文件并确保 `schema_migrations` 记录 `0001_initial_session_store` 和 `0002_durable_ledger`；`threads`、`turns`、`items`、`trace_events`、`artifact_refs`、`approvals` 和 `approval_decisions` 表是真实落盘点。thread read/list/resume/archive/delete 和 turn status/interrupt 读取或更新这些现有表；`approval/request` 写 pending approval，`approval/list` 读取未决 approval，`approval/decision` 更新同一 row 的 decision fields 并写 `approval_decisions` ledger；trace/list 支持 `limit` / `offset` 分页，trace/show 和 trace/tail 都从 SQLite `trace_events` 查询真实 events。`target/` 是 Rust build output，被 `.gitignore` 排除。
+`SessionStore.open()` 初始化 SQLite 文件并确保 `schema_migrations` 记录 `0001_initial_session_store` 和 `0002_durable_ledger`；`threads`、`turns`、`items`、`trace_events`、`artifact_refs`、`approvals` 和 `approval_decisions` 表是真实落盘点。thread read/list/resume/archive/delete 和 turn status/interrupt 读取或更新这些现有表；`approval/request` 写 pending approval，`approval/list` 读取未决 approval，`approval/decision` 更新同一 row 的 decision fields 并写 `approval_decisions` ledger；trace/list 支持 `limit` / `offset` 分页，trace/show 和 trace/tail 都从 SQLite `trace_events` 查询真实 events。Rust `CommandExecutor` / `PatchExecutor` 当前不直接写 SQLite、trace 或 artifact store；它们只返回 bounded result object，后续接入 app-server 或 AgentLoop 时必须由上层负责审计落盘。`target/` 是 Rust build output，被 `.gitignore` 排除。
 
 ## 是否进入 trace / audit
 
-`thread/start`、`turn/start`、`approval/request` 和 `approval/decision` 都写 `TraceEvent`，且由 store transaction 把对应业务 row 与 trace 一起提交或回滚。显式 Python sidecar 路径会追加 `component="python_sidecar"` 的 trace summary 和 sidecar event 摘要；这些 payload 只包含 sidecar status、safe IDs、trace path handle 和 event sequence/component，不包含 raw prompt、raw trace payload、raw tool arguments 或 provider response。`ArtifactRef` 的 `summary` / `metadata` / `uri` 会对 secret-like marker 做本地 redaction 后落盘。Rust `PolicyEngine.evaluate()` 当前不写 trace/audit，只返回纯 `PermissionDecision`；完整运行时 policy audit writer 仍由 Python `src/singularity/policy/audit.py` 保持 oracle，后续执行集成必须只写脱敏资源 handle。`ToolBroker` 的 model-visible spec 不输出 permission/risk/internal metadata，并会 redaction 恶意 MCP 描述中的 prompt-injection/secret-like 文本；`ToolObservation.to_model_payload()` 明确不输出 `policy_decision_id`、`approval_grant_id`、raw arguments、internal metadata 或 reference-only content。
+`thread/start`、`turn/start`、`approval/request` 和 `approval/decision` 都写 `TraceEvent`，且由 store transaction 把对应业务 row 与 trace 一起提交或回滚。显式 Python sidecar 路径会追加 `component="python_sidecar"` 的 trace summary 和 sidecar event 摘要；这些 payload 只包含 sidecar status、safe IDs、trace path handle 和 event sequence/component，不包含 raw prompt、raw trace payload、raw tool arguments 或 provider response。`ArtifactRef` 的 `summary` / `metadata` / `uri` 会对 secret-like marker 做本地 redaction 后落盘。Rust `PolicyEngine.evaluate()` 当前不写 trace/audit，只返回纯 `PermissionDecision`；完整运行时 policy audit writer 仍由 Python `src/singularity/policy/audit.py` 保持 oracle，后续执行集成必须只写脱敏资源 handle。Rust `CommandExecutor` 的 stdout/stderr preview 有上限并会对 secret-like marker redaction，但当前没有生成 trace event；后续接入必须只写 bounded/redacted command evidence。`ToolBroker` 的 model-visible spec 不输出 permission/risk/internal metadata，并会 redaction 恶意 MCP 描述中的 prompt-injection/secret-like 文本；`ToolObservation.to_model_payload()` 明确不输出 `policy_decision_id`、`approval_grant_id`、raw arguments、internal metadata 或 reference-only content。
 
 ## 失败路径
 
-连接未完成 `initialize` 或未收到 `initialized` notification 前，业务 request 返回 `Not initialized`。同一连接重复 `initialize` 返回 `Already initialized`。未知 thread / turn / trace run / trace event 分别返回 `Thread not found`、`Turn not found`、`Trace run not found`、`Trace event not found`。approval request 重复返回 `Approval already exists`；approval decision 找不到 pending request 或重复消费时返回 `Pending approval not found`。Python sidecar 启动失败、invalid JSON、AgentLoop blocked 或 sidecar returned error 不会 fallback 到本地 Rust fake completion；app-server 把 sidecar failure 写为 `agent_loop_status="failed"` 并记录 error summary。SQLite 和 JSON 解析错误作为 app-server internal error 返回。
+连接未完成 `initialize` 或未收到 `initialized` notification 前，业务 request 返回 `Not initialized`。同一连接重复 `initialize` 返回 `Already initialized`。未知 thread / turn / trace run / trace event 分别返回 `Thread not found`、`Turn not found`、`Trace run not found`、`Trace event not found`。approval request 重复返回 `Approval already exists`；approval decision 找不到 pending request 或重复消费时返回 `Pending approval not found`。Python sidecar 启动失败、invalid JSON、AgentLoop blocked 或 sidecar returned error 不会 fallback 到本地 Rust fake completion；app-server 把 sidecar failure 写为 `agent_loop_status="failed"` 并记录 error summary。Rust `CommandExecutor.run_local()` 遇到 sandbox-required request 返回 backend error，不启动本地进程；空 argv 或 spawn 失败返回 spawn failed；timeout 会 kill process tree 并返回 timed out；secret-like stdout/stderr 只输出 redacted preview。`PatchExecutor.apply()` 遇到路径逃逸、expected text 缺失、目标已存在或写入失败会回滚已经写入的文件。SQLite 和 JSON 解析错误作为 app-server internal error 返回。
 
 ## 当前结构问题
 
-Phase 1 没有迁移模型 provider、Windows sandbox backend、evaluation runner 或 Rust native AgentLoop；`AgentLoopStatusBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。显式 Python sidecar 可以调用当前 Python AgentLoop 作为 migration reference，但 Rust 只负责 app-server 边界、状态翻译和安全 trace summary。当前 `ToolBroker` 是最小 Rust tool boundary：它验证工具命名、投影模型可见 schema、阻断 denied/unknown tool 执行并生成安全 observation；`PolicyEngine` 已提供 Rust 纯决策、hook 点、deny-first precedence、protected file path deny、network scope 和 approval ask/deny 投影，但还没有接入完整 command/sandbox/patch execution，也不解析 shell wrapper、argv 或 command 等价形式，没有替换 Python policy audit writer。当前 `sg` 是最小 JSON-RPC client：可以启动 app-server 子进程并完成 run/continue/list/trace/approval 查询，但不管理长期后台 daemon 生命周期、PTY TUI 或交互式 approval prompt。Artifact ref 目前只持久化引用和 redacted metadata，不负责 artifact bytes 管理。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
+Phase 1 没有迁移模型 provider、Windows sandbox backend、evaluation runner 或 Rust native AgentLoop；`AgentLoopStatusBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。显式 Python sidecar 可以调用当前 Python AgentLoop 作为 migration reference，但 Rust 只负责 app-server 边界、状态翻译和安全 trace summary。当前 `ToolBroker` 是最小 Rust tool boundary：它验证工具命名、投影模型可见 schema、阻断 denied/unknown tool 执行并生成安全 observation；`PolicyEngine` 已提供 Rust 纯决策、hook 点、deny-first precedence、protected file path deny、network scope 和 approval ask/deny 投影；`CommandExecutor` / `PatchExecutor` 已提供最小 Rust side-effect boundary，但还没有接入 app-server、tool broker、Python AgentLoop 或完整 Windows sandbox backend。command resource normalization 位于 `CommandRequest.permission_resource()`，policy 不解析 shell wrapper；sandbox-required command 没有显式 backend 时 fail closed；git helpers 只生成 command request，不建立第二套 git wrapper。当前 `sg` 是最小 JSON-RPC client：可以启动 app-server 子进程并完成 run/continue/list/trace/approval 查询，但不管理长期后台 daemon 生命周期、PTY TUI 或交互式 approval prompt。Artifact ref 目前只持久化引用和 redacted metadata，不负责 artifact bytes 管理。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
 
 ## 维护规则
 
