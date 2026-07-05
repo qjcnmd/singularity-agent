@@ -44,6 +44,11 @@
 - TraceEvent
 - AppEvent
 - PermissionProfile
+- PermissionRequest
+- PermissionRule
+- PermissionDecision
+- PreToolUseHook
+- PolicyEngine
 - ApprovalRequest
 - ApprovalDecision
 - SessionStore
@@ -100,6 +105,11 @@
 - TraceEvent: event_id, event_type, run_id, session_id, task_id, phase_id, action_id, parent_event_id, timestamp, monotonic_ms, component, severity, summary, payload, artifact_refs, policy_decision_id, approval_grant_id, sandbox_id, command_id, transaction_id, verification_id, span_id, redaction_applied, payload_hash
 - AppEvent: method, params
 - PermissionProfile: profile, workspace_roots, additional_writable_directories, network_access, approval_policy, protected_paths_enforced
+- PermissionRequest: tool_name, operation, resource
+- PermissionRule: rule_id, scope, outcome, operation, resource_pattern
+- PermissionDecision: outcome, reason, rule_id, scope
+- PreToolUseHook: hook_id, decision
+- PolicyEngine: profile, rules, hooks
 - ApprovalRequest: request_id, session_id, task_id, action, reason
 - ApprovalDecision: request_id, decision_id, outcome, reason
 - SessionStore: connection, descriptor
@@ -139,7 +149,7 @@ Rust App Server Protocol 层建立第一阶段迁移的硬边界：客户端只�
 
 ## 关键类、函数、字段
 
-`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item`、`TraceEvent` 和 `ArtifactRef` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolRegistry`、`ToolBroker`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AgentLoopStatusBridge` 表示 Rust host 对 AgentLoop 状态的显式理解：默认 `not_migrated`，或由 Python sidecar 返回 completed/blocked/cancelled/failed。`PythonSidecarClient` 是 Rust host 到 Python migration sidecar 的 stdio JSON-RPC client。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。`AppServerClient` 是 `sg` 内部 stdio JSON-RPC client，不暴露 store 或 agent internals。
+`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item`、`TraceEvent` 和 `ArtifactRef` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolRegistry`、`ToolBroker`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`PermissionRequest`、`PermissionRule`、`PermissionDecision`、`PreToolUseHook`、`PolicyEngine`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AgentLoopStatusBridge` 表示 Rust host 对 AgentLoop 状态的显式理解：默认 `not_migrated`，或由 Python sidecar 返回 completed/blocked/cancelled/failed。`PythonSidecarClient` 是 Rust host 到 Python migration sidecar 的 stdio JSON-RPC client。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。`AppServerClient` 是 `sg` 内部 stdio JSON-RPC client，不暴露 store 或 agent internals。
 
 ## 真实运行时调用链
 
@@ -190,7 +200,7 @@ pub struct Item {
 
 ### store / approval / trace
 
-`SessionStore` 持有真实 SQLite connection，不参与 JSON 序列化；`SessionStoreDescriptor` 是 schema object，用于记录 store backend、path 和 schema version。
+`SessionStore` 持有真实 SQLite connection，不参与 JSON 序列化；`SessionStoreDescriptor` 是 schema object，用于记录 store backend、path 和 schema version。Rust `PolicyEngine` 当前是纯决策对象，不直接写 SQLite；approval request / decision ledger 仍由 app-server 通过 `SessionStore` 落盘。
 
 ```rust
 pub struct SessionStoreDescriptor {
@@ -224,6 +234,38 @@ pub struct ApprovalDecision {
     pub decision_id: String,
     pub outcome: ApprovalOutcome,
     pub reason: String,
+}
+
+pub struct PermissionRequest {
+    pub tool_name: String,
+    pub operation: PermissionOperation,
+    pub resource: String,
+}
+
+pub struct PermissionRule {
+    pub rule_id: String,
+    pub scope: SettingsScope,
+    pub outcome: PermissionDecisionOutcome,
+    pub operation: Option<PermissionOperation>,
+    pub resource_pattern: Option<String>,
+}
+
+pub struct PermissionDecision {
+    pub outcome: PermissionDecisionOutcome,
+    pub reason: String,
+    pub rule_id: Option<String>,
+    pub scope: Option<SettingsScope>,
+}
+
+pub struct PreToolUseHook {
+    pub hook_id: String,
+    pub decision: PermissionDecision,
+}
+
+pub struct PolicyEngine {
+    pub profile: PermissionProfile,
+    pub rules: Vec<PermissionRule>,
+    pub hooks: Vec<PreToolUseHook>,
 }
 
 pub struct TraceEvent {
@@ -377,11 +419,11 @@ pub struct PythonSidecarConfig {
 
 ## 谁生成这些对象
 
-`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` / `create_thread_with_trace()` 生成 `Thread`；`SessionStore.create_turn()` / `create_turn_with_input_and_trace()` 生成 `Turn`；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`SessionStore.register_artifact_ref()` 生成 `ArtifactRef`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`PythonSidecarClient.run_agent()` 从 Python sidecar 的 `agent/run` response 生成 `PythonSidecarRunResult`，再由 `AgentLoopStatusBridge::from_sidecar()` 生成 Rust host-facing status；`ToolSpec::new()`、`ToolBroker::register()`、`ToolCallEnvelope::new()`、`ToolResult::success()` / `failure()`、`ToolObservation::summary()` / `failed()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()`、`CommandResult::completed()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object。`ToolRegistry.register()` 只接受 `builtin.*`、`mcp.<server>.<tool>` 和 `python.<plugin>.<tool>` 命名空间，并拒绝重复 name。
+`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` / `create_thread_with_trace()` 生成 `Thread`；`SessionStore.create_turn()` / `create_turn_with_input_and_trace()` 生成 `Turn`；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`SessionStore.register_artifact_ref()` 生成 `ArtifactRef`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`PermissionRequest::new()` 生成路径大小写 / 分隔符规范化后的 request resource，`PermissionRule::new()` 生成 declarative rule，`PermissionDecision::new()` 或 `PolicyEngine.evaluate()` 生成决策结果；`PythonSidecarClient.run_agent()` 从 Python sidecar 的 `agent/run` response 生成 `PythonSidecarRunResult`，再由 `AgentLoopStatusBridge::from_sidecar()` 生成 Rust host-facing status；`ToolSpec::new()`、`ToolBroker::register()`、`ToolCallEnvelope::new()`、`ToolResult::success()` / `failure()`、`ToolObservation::summary()` / `failed()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()`、`CommandResult::completed()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object。`ToolRegistry.register()` 只接受 `builtin.*`、`mcp.<server>.<tool>` 和 `python.<plugin>.<tool>` 命名空间，并拒绝重复 name。
 
 ## 谁消费这些对象
 
-`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、thread、turn、approval、trace handler；`AppServer.run_python_sidecar_if_enabled()` 在显式 sidecar 配置存在时消费 `TurnStartParams` 并调用 `PythonSidecarClient`；`SessionStore.create_thread_with_trace()`、`create_turn_with_input_and_trace()`、`create_approval_with_trace()`、`record_approval_decision_with_trace()`、`append_trace()` 和 `register_artifact_ref()` 消费 protocol object 写 SQLite；`ToolBroker.model_visible_tools()` 消费 `ToolRegistry` 并只投影 name、redacted description 和 input schema 给模型；`ToolBroker.execute()` 消费 `ToolCallEnvelope` 与外部 policy decision，未知或 denied tool 不调用 executor；`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification。`sg` 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
+`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、thread、turn、approval、trace handler；`AppServer.run_python_sidecar_if_enabled()` 在显式 sidecar 配置存在时消费 `TurnStartParams` 并调用 `PythonSidecarClient`；`SessionStore.create_thread_with_trace()`、`create_turn_with_input_and_trace()`、`create_approval_with_trace()`、`record_approval_decision_with_trace()`、`append_trace()` 和 `register_artifact_ref()` 消费 protocol object 写 SQLite；`PolicyEngine.evaluate()` 消费 `PermissionRequest`，按 hook、deny、protected file path、defer、ask、permission mode、allow、fallback ask 顺序返回 `PermissionDecision`，且 `approval_policy=never` 会把 ask 投影为 deny；`ToolBroker.model_visible_tools()` 消费 `ToolRegistry` 并只投影 name、redacted description 和 input schema 给模型；`ToolBroker.execute()` 消费 `ToolCallEnvelope` 与外部 policy decision，未知或 denied tool 不调用 executor；`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification。`sg` 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
 ## 是否落盘
 
@@ -389,7 +431,7 @@ pub struct PythonSidecarConfig {
 
 ## 是否进入 trace / audit
 
-`thread/start`、`turn/start`、`approval/request` 和 `approval/decision` 都写 `TraceEvent`，且由 store transaction 把对应业务 row 与 trace 一起提交或回滚。显式 Python sidecar 路径会追加 `component="python_sidecar"` 的 trace summary 和 sidecar event 摘要；这些 payload 只包含 sidecar status、safe IDs、trace path handle 和 event sequence/component，不包含 raw prompt、raw trace payload、raw tool arguments 或 provider response。`ArtifactRef` 的 `summary` / `metadata` / `uri` 会对 secret-like marker 做本地 redaction 后落盘。Phase 1 Rust 层还没有 policy audit writer；完整 policy audit 仍由 Python `src/singularity/policy/audit.py` 保持 oracle。`ToolBroker` 的 model-visible spec 不输出 permission/risk/internal metadata，并会 redaction 恶意 MCP 描述中的 prompt-injection/secret-like 文本；`ToolObservation.to_model_payload()` 明确不输出 `policy_decision_id`、`approval_grant_id`、raw arguments、internal metadata 或 reference-only content。
+`thread/start`、`turn/start`、`approval/request` 和 `approval/decision` 都写 `TraceEvent`，且由 store transaction 把对应业务 row 与 trace 一起提交或回滚。显式 Python sidecar 路径会追加 `component="python_sidecar"` 的 trace summary 和 sidecar event 摘要；这些 payload 只包含 sidecar status、safe IDs、trace path handle 和 event sequence/component，不包含 raw prompt、raw trace payload、raw tool arguments 或 provider response。`ArtifactRef` 的 `summary` / `metadata` / `uri` 会对 secret-like marker 做本地 redaction 后落盘。Rust `PolicyEngine.evaluate()` 当前不写 trace/audit，只返回纯 `PermissionDecision`；完整运行时 policy audit writer 仍由 Python `src/singularity/policy/audit.py` 保持 oracle，后续执行集成必须只写脱敏资源 handle。`ToolBroker` 的 model-visible spec 不输出 permission/risk/internal metadata，并会 redaction 恶意 MCP 描述中的 prompt-injection/secret-like 文本；`ToolObservation.to_model_payload()` 明确不输出 `policy_decision_id`、`approval_grant_id`、raw arguments、internal metadata 或 reference-only content。
 
 ## 失败路径
 
@@ -397,7 +439,7 @@ pub struct PythonSidecarConfig {
 
 ## 当前结构问题
 
-Phase 1 没有迁移模型 provider、Windows sandbox backend、evaluation runner 或 Rust native AgentLoop；`AgentLoopStatusBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。显式 Python sidecar 可以调用当前 Python AgentLoop 作为 migration reference，但 Rust 只负责 app-server 边界、状态翻译和安全 trace summary。当前 `ToolBroker` 是最小 Rust tool boundary：它验证工具命名、投影模型可见 schema、阻断 denied/unknown tool 执行并生成安全 observation；完整 hooks、policy precedence、sandbox execution 和 patch/git mutation 仍在后续 M6/M7。当前 `sg` 是最小 JSON-RPC client：可以启动 app-server 子进程并完成 run/continue/list/trace/approval 查询，但不管理长期后台 daemon 生命周期、PTY TUI 或交互式 approval prompt。Artifact ref 目前只持久化引用和 redacted metadata，不负责 artifact bytes 管理。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
+Phase 1 没有迁移模型 provider、Windows sandbox backend、evaluation runner 或 Rust native AgentLoop；`AgentLoopStatusBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。显式 Python sidecar 可以调用当前 Python AgentLoop 作为 migration reference，但 Rust 只负责 app-server 边界、状态翻译和安全 trace summary。当前 `ToolBroker` 是最小 Rust tool boundary：它验证工具命名、投影模型可见 schema、阻断 denied/unknown tool 执行并生成安全 observation；`PolicyEngine` 已提供 Rust 纯决策、hook 点、deny-first precedence、protected file path deny、network scope 和 approval ask/deny 投影，但还没有接入完整 command/sandbox/patch execution，也不解析 shell wrapper、argv 或 command 等价形式，没有替换 Python policy audit writer。当前 `sg` 是最小 JSON-RPC client：可以启动 app-server 子进程并完成 run/continue/list/trace/approval 查询，但不管理长期后台 daemon 生命周期、PTY TUI 或交互式 approval prompt。Artifact ref 目前只持久化引用和 redacted metadata，不负责 artifact bytes 管理。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
 
 ## 维护规则
 
