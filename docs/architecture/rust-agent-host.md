@@ -30,6 +30,8 @@
 
 `crates/model` 提供 Rust model boundary schema 和纯验证函数。它对齐现有 Python `singularity.model` 的 `ModelTurnRequest`、`ModelTurnResponse`、tool schema、tool call、capability metadata、provider config presence、stream event、validation result 和 model error object；`validate_provider_config()`、`validate_stream_events()`、`validate_model_response()` 和 `classify_model_error()` 只做边界验证与分类，不发起 HTTP provider call、不重试、不执行工具、不做 planner repair，也不迁移 AgentLoop。
 
+`crates/agent` 当前除 Python sidecar bridge 外，只持有 M9 第一切片 `PlannerStateBoundary`。该对象只从 Python oracle fixture 做 planner state JSON roundtrip，不调用 provider、不执行工具、不写 workspace，也不让 Rust `turn/start` 声称 native AgentLoop completed。context bundle、compaction summary、repair verification contract、max-turns 和 finalization 映射仍是后续独立切片，不能和 planner state 一起重写。
+
 ## Python 冻结范围
 
 以下 Python 模块在迁移期作为只读 oracle / parity reference：
@@ -71,8 +73,9 @@ python -m singularity.cli eval run docs/evaluation/public-representative-task.js
 1. tool registry / tool observation / safe model payload。
 2. command request/result 与 sandbox capability contract。
 3. model turn request/response adapter。
-4. 更完整的 TUI 渲染和长期 app-server lifecycle 管理。
-5. 最后才迁移 AgentLoop orchestration。
+4. planner / context / repair / finalization parity contract 继续按一个行为切片一组 fixture 推进。
+5. 更完整的 TUI 渲染和长期 app-server lifecycle 管理。
+6. 最后才迁移 AgentLoop orchestration。
 
 ## 维护规则
 

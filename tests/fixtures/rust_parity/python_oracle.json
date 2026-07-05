@@ -191,6 +191,25 @@
       "C:\\repo"
     ]
   },
+  "planner_state": {
+    "blocked_actions": [],
+    "completion_criteria": {
+      "required_verifications_passed": false
+    },
+    "current_phase": "running_verification",
+    "current_plan": [
+      "run verification"
+    ],
+    "evidence_refs": [
+      "obs_1"
+    ],
+    "open_actions": [
+      "repair failed test"
+    ],
+    "risk_escalations": [],
+    "status": "repairing_failures",
+    "task_id": "task_1"
+  },
   "sandbox_policy": {
     "description": "Verification under native OS sandbox enforcement.",
     "env": {

@@ -157,6 +157,19 @@ pub struct SidecarRunEvent {
     pub sequence: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PlannerStateBoundary {
+    pub task_id: String,
+    pub current_phase: String,
+    pub status: String,
+    pub current_plan: Vec<Value>,
+    pub completion_criteria: Value,
+    pub open_actions: Vec<Value>,
+    pub blocked_actions: Vec<Value>,
+    pub risk_escalations: Vec<Value>,
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct PythonSidecarClient {
     child: Child,

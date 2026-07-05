@@ -17,6 +17,7 @@ from singularity.command.models import (
     ExecutionStatus,
     SemanticStatus,
 )
+from singularity.context.models import PlannerState
 from singularity.model.models import (
     ContentBlock,
     ModelMessage,
@@ -136,6 +137,17 @@ def build_fixtures() -> dict[str, object]:
         SandboxProfileName.ISOLATED_VERIFICATION,
         workspace_root=Path("C:/repo"),
     )
+    planner_state = PlannerState(
+        task_id="task_1",
+        current_phase="running_verification",
+        status="repairing_failures",
+        current_plan=["run verification"],
+        completion_criteria={"required_verifications_passed": False},
+        open_actions=["repair failed test"],
+        blocked_actions=[],
+        risk_escalations=[],
+        evidence_refs=["obs_1"],
+    )
     return {
         "tool_observation_model_payload": tool_result.to_observation_view().to_model_payload(),
         "tool_protocol_result_envelope": tool_result.to_dict(),
@@ -147,6 +159,7 @@ def build_fixtures() -> dict[str, object]:
         "sandbox_policy": sandbox_policy.to_dict(),
         "model_turn_request": model_request.to_dict(),
         "model_turn_response": model_response.to_dict(),
+        "planner_state": planner_state.__dict__.copy(),
     }
 
 

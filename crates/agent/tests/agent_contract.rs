@@ -1,6 +1,6 @@
 use singularity_agent::{
-    AgentHostStatus, AgentLoopStatusBridge, PythonSidecarClient, PythonSidecarConfig,
-    PythonSidecarRunResult, SidecarRunEvent, sidecar_trace_summary,
+    AgentHostStatus, AgentLoopStatusBridge, PlannerStateBoundary, PythonSidecarClient,
+    PythonSidecarConfig, PythonSidecarRunResult, SidecarRunEvent, sidecar_trace_summary,
 };
 
 #[test]
@@ -70,4 +70,28 @@ fn sidecar_startup_failure_is_reported_without_fallback() {
     let error = PythonSidecarClient::spawn(&config).expect_err("sidecar spawn should fail");
 
     assert!(error.contains("failed to start Python sidecar"));
+}
+
+#[test]
+fn planner_state_boundary_round_trips_python_oracle() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/rust_parity/python_oracle.json"
+    ))
+    .expect("parse python oracle fixture");
+
+    let planner: PlannerStateBoundary =
+        serde_json::from_value(fixture["planner_state"].clone()).expect("planner boundary");
+
+    assert_eq!(planner.task_id, "task_1");
+    assert_eq!(planner.current_phase, "running_verification");
+    assert_eq!(planner.status, "repairing_failures");
+    assert_eq!(planner.evidence_refs, vec!["obs_1"]);
+
+    assert_eq!(
+        serde_json::from_value::<PlannerStateBoundary>(
+            serde_json::to_value(&planner).expect("serialize planner")
+        )
+        .expect("deserialize planner"),
+        planner
+    );
 }
