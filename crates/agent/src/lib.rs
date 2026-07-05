@@ -190,6 +190,20 @@ pub struct ContextAssemblyBoundary {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ContextSummaryEnvelopeBoundary {
+    pub version: u32,
+    pub summary_id: String,
+    pub summary_payload: Value,
+    pub source_item_ids: Vec<String>,
+    pub cache_attribution: Value,
+    pub previous_summary_digest: Option<String>,
+    pub summary_digest: String,
+    pub rendered_summary: String,
+    pub created_at: String,
+    pub metadata: Value,
+}
+
 #[derive(Debug)]
 pub struct PythonSidecarClient {
     child: Child,

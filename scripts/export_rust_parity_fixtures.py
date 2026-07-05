@@ -17,7 +17,15 @@ from singularity.command.models import (
     ExecutionStatus,
     SemanticStatus,
 )
-from singularity.context.models import ContextBudgetPlan, ContextBundle, PlannerState
+from singularity.context.models import (
+    CacheAttribution,
+    CacheAttributionSource,
+    ContextBudgetPlan,
+    ContextBundle,
+    ContextSummaryEnvelope,
+    ContextSummaryPayload,
+    PlannerState,
+)
 from singularity.model.models import (
     ContentBlock,
     ModelMessage,
@@ -179,6 +187,42 @@ def build_fixtures() -> dict[str, object]:
         bundle_digest="bundle_digest_1",
         metadata={"source": "python_oracle"},
     )
+    context_summary = ContextSummaryPayload(
+        goal="fix tests",
+        current_state="Context compacted after verification.",
+        completed_actions=["ran public verification"],
+        pending_actions=[],
+        verified_facts=[
+            {
+                "fact": "public verification passed",
+                "reference_ids": ["obs_1"],
+            }
+        ],
+        failed_attempts=[],
+        policy_constraints=["do not expose raw tool output"],
+        workspace_changes=[],
+        verification_status="passed",
+        open_questions=[],
+        reference_ids=["obs_1"],
+        omitted_item_ids=["item_raw_tool"],
+        confidence=0.91,
+    )
+    context_summary_envelope = ContextSummaryEnvelope(
+        version=1,
+        summary_id="summary_1",
+        summary_payload=context_summary,
+        source_item_ids=["item_raw_tool"],
+        cache_attribution=CacheAttribution(
+            source=CacheAttributionSource.COMPONENT_INFERRED,
+            confidence=1.0,
+            reasons=["deterministic compaction fixture"],
+            evidence=["obs_1"],
+        ),
+        previous_summary_digest=None,
+        rendered_summary="Context compacted after verification. | verification=passed | refs=obs_1",
+        created_at="2026-01-01T00:00:00+00:00",
+        metadata={"source": "python_oracle"},
+    )
     return {
         "tool_observation_model_payload": tool_result.to_observation_view().to_model_payload(),
         "tool_protocol_result_envelope": tool_result.to_dict(),
@@ -192,6 +236,7 @@ def build_fixtures() -> dict[str, object]:
         "model_turn_response": model_response.to_dict(),
         "planner_state": planner_state.__dict__.copy(),
         "context_bundle": context_bundle.to_dict(),
+        "context_summary_envelope": context_summary_envelope.to_dict(),
     }
 
 

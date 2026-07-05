@@ -1,7 +1,7 @@
 use singularity_agent::{
-    AgentHostStatus, AgentLoopStatusBridge, ContextAssemblyBoundary, PlannerStateBoundary,
-    PythonSidecarClient, PythonSidecarConfig, PythonSidecarRunResult, SidecarRunEvent,
-    sidecar_trace_summary,
+    AgentHostStatus, AgentLoopStatusBridge, ContextAssemblyBoundary,
+    ContextSummaryEnvelopeBoundary, PlannerStateBoundary, PythonSidecarClient, PythonSidecarConfig,
+    PythonSidecarRunResult, SidecarRunEvent, sidecar_trace_summary,
 };
 
 #[test]
@@ -122,5 +122,37 @@ fn context_assembly_boundary_round_trips_python_oracle() {
         )
         .expect("deserialize context"),
         context
+    );
+}
+
+#[test]
+fn context_summary_envelope_boundary_round_trips_python_oracle() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/rust_parity/python_oracle.json"
+    ))
+    .expect("parse python oracle fixture");
+
+    let summary: ContextSummaryEnvelopeBoundary =
+        serde_json::from_value(fixture["context_summary_envelope"].clone())
+            .expect("context summary boundary");
+
+    assert_eq!(summary.version, 1);
+    assert_eq!(summary.summary_id, "summary_1");
+    assert_eq!(summary.source_item_ids, vec!["item_raw_tool"]);
+    assert_eq!(summary.summary_payload["verification_status"], "passed");
+    assert_eq!(
+        summary.summary_payload["omitted_item_ids"],
+        serde_json::json!(["item_raw_tool"])
+    );
+    assert_eq!(summary.cache_attribution["source"], "component_inferred");
+    assert_eq!(summary.metadata["source"], "python_oracle");
+    assert!(summary.rendered_summary.contains("verification=passed"));
+
+    assert_eq!(
+        serde_json::from_value::<ContextSummaryEnvelopeBoundary>(
+            serde_json::to_value(&summary).expect("serialize context summary")
+        )
+        .expect("deserialize context summary"),
+        summary
     );
 }

@@ -153,6 +153,62 @@
     "run_id": "run_1",
     "task_id": "task_1"
   },
+  "context_summary_envelope": {
+    "cache_attribution": {
+      "confidence": 1.0,
+      "evidence": [
+        "obs_1"
+      ],
+      "model_name": null,
+      "provider_name": null,
+      "reasons": [
+        "deterministic compaction fixture"
+      ],
+      "source": "component_inferred"
+    },
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "metadata": {
+      "source": "python_oracle"
+    },
+    "previous_summary_digest": null,
+    "rendered_summary": "Context compacted after verification. | verification=passed | refs=obs_1",
+    "source_item_ids": [
+      "item_raw_tool"
+    ],
+    "summary_digest": "19c47935aa2f3f719973060dbf2b4003e0af9c637c6c627fbf726906cb2fe12b",
+    "summary_id": "summary_1",
+    "summary_payload": {
+      "completed_actions": [
+        "ran public verification"
+      ],
+      "confidence": 0.91,
+      "current_state": "Context compacted after verification.",
+      "failed_attempts": [],
+      "goal": "fix tests",
+      "omitted_item_ids": [
+        "item_raw_tool"
+      ],
+      "open_questions": [],
+      "pending_actions": [],
+      "policy_constraints": [
+        "do not expose raw tool output"
+      ],
+      "reference_ids": [
+        "obs_1"
+      ],
+      "verification_status": "passed",
+      "verified_facts": [
+        {
+          "fact": "public verification passed",
+          "reference_ids": [
+            "obs_1"
+          ]
+        }
+      ],
+      "workspace_changes": []
+    },
+    "version": 1
+  },
   "model_turn_request": {
     "action_id": "action_1",
     "budget": {
