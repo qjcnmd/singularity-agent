@@ -79,7 +79,7 @@ ALLOWED_CRATE_DEPENDENCIES = {
     },
     "crates/cli/Cargo.toml": {
         "dependencies": {"clap", "serde_json", "singularity_core", "singularity_protocol", "tokio"},
-        "dev-dependencies": {"assert_cmd"},
+        "dev-dependencies": {"assert_cmd", "tempfile"},
     },
 }
 

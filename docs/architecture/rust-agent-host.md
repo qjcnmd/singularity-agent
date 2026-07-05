@@ -22,7 +22,7 @@
 
 `crates/app-server` 实现 `initialize` / `initialized` handshake、thread list/read/start/resume/fork/archive/delete、turn start/interrupt/status、approval list/request/decision、trace list/show/tail 和 `server/shutdown`。`turn/start` 明确写入 `agent_loop_status = "not_migrated"`，不伪装 Python AgentLoop 已完成迁移；item streaming 使用 `item/agentMessage/delta` 和 `item/commandExecution/outputDelta` 这类 typed delta，不再使用 generic `item/delta`。
 
-`crates/cli` 只通过 app-server protocol 生成 JSON-RPC request。它不直接依赖 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
+`crates/cli` 提供 `sg` CLI。`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` / `sg config doctor` 会启动或调用 stdio app-server，并只通过 JSON-RPC protocol 交换 initialize、thread、turn、trace 和 approval 请求；`sg daemon` 启动 app-server stdio 进程。CLI 不直接依赖 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
 ## Python 冻结范围
 
@@ -65,7 +65,7 @@ python -m singularity.cli eval run docs/evaluation/public-representative-task.js
 1. tool registry / tool observation / safe model payload。
 2. command request/result 与 sandbox capability contract。
 3. model turn request/response adapter。
-4. app-server client lifecycle 和 CLI/TUI 子进程管理。
+4. 更完整的 TUI 渲染和长期 app-server lifecycle 管理。
 5. 最后才迁移 AgentLoop orchestration。
 
 ## 维护规则

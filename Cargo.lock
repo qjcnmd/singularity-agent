@@ -603,6 +603,7 @@ dependencies = [
  "serde_json",
  "singularity_core",
  "singularity_protocol",
+ "tempfile",
  "tokio",
 ]
 

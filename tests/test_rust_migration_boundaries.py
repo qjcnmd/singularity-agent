@@ -79,6 +79,7 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "crates/app-server/src/lib.rs",
         "crates/protocol/src/lib.rs",
         "crates/tools/src/lib.rs",
+        "crates/cli/Cargo.toml",
     ):
         source = Path(relative)
         target = repo / relative

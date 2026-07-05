@@ -9,7 +9,7 @@
 
 长期架构为 `Rust Core + App Server + CLI/TUI first`：`crates/core`、`protocol`、`store`、`policy`、`sandbox`、`tools`、`model`、`agent`、`app-server`、`cli` 已作为 workspace 边界存在；Rust package / library 名使用 `singularity_*`，避免与 Rust 标准库 `core` 等名称冲突。`crates/app-server` 通过 JSON-RPC over stdio JSONL 暴露 `initialize`、`initialized`、thread list/read/start/resume/fork/archive/delete、turn start/interrupt/status、approval list/request/decision、trace list/show/tail 和 `server/shutdown`；`turn/start` 写入 `agent_loop_status = "not_migrated"`，明确不伪装 AgentLoop 已迁移，item streaming 使用 typed delta（例如 `item/agentMessage/delta`）而不是 generic `item/delta`。`crates/store` 当前以 SQLite 持久化 thread、turn、item、trace event、artifact ref、pending approval、approval decision ledger 和 `schema_migrations`；thread/start、turn/start、approval/request、approval/decision 这些会产生多行 durable state 的 app-server 操作通过 store 事务一次提交或整体回滚。`scripts/verify_rust_migration_boundaries.py` 是 M0 后的迁移漂移检查入口，用于阻断 CLI 绕过 app-server、Python RuntimeHost 过渡层、desktop/Web 抢跑、未登记 Rust 依赖和 ToolObservation 模型可见泄漏。
 
-`crates/cli` 是第一个 app-server protocol client；未来 desktop 必须复用同一 protocol，不单独设计第二套 core。Python 当前实现冻结为 migration oracle / parity reference：允许新增 fixture export、parity check 和文档校验，不在 Python 主干继续新增核心 agent host 能力。
+`crates/cli` 的 `sg` 是第一个 app-server protocol client；`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` / `sg config doctor` 通过 stdio JSON-RPC 启动并调用同一个 app-server，不直接依赖 store、agent、model 或工具内部 crate。未来 desktop 必须复用同一 protocol，不单独设计第二套 core。Python 当前实现冻结为 migration oracle / parity reference：允许新增 fixture export、parity check 和文档校验，不在 Python 主干继续新增核心 agent host 能力。
 
 ---
 
