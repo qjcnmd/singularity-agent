@@ -64,7 +64,6 @@ pub enum PermissionDecisionOutcome {
     Allow,
     Deny,
     Ask,
-    Defer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -225,12 +224,11 @@ impl PolicyEngine {
     }
 
     pub fn evaluate(&self, request: &PermissionRequest) -> PermissionDecision {
-        if let Some(hook) = self.hooks.iter().find(|hook| {
-            !matches!(
-                hook.decision.outcome,
-                PermissionDecisionOutcome::Allow | PermissionDecisionOutcome::Defer
-            )
-        }) {
+        if let Some(hook) = self
+            .hooks
+            .iter()
+            .find(|hook| !matches!(hook.decision.outcome, PermissionDecisionOutcome::Allow))
+        {
             return self.apply_approval_policy(hook.decision.clone());
         }
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Deny) {
@@ -241,10 +239,6 @@ impl PolicyEngine {
                 PermissionDecisionOutcome::Deny,
                 REASON_PROTECTED_RESOURCE_DENIED,
             );
-        }
-        if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Defer)
-        {
-            return decision;
         }
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Ask) {
             return self.apply_approval_policy(decision);
