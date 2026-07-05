@@ -20,12 +20,17 @@ MODULE_DOCS = {
     "planner-replanner-failure-recovery.md",
     "plugin-tools-registry.md",
     "policy-approval-gates.md",
+    "rust-app-server-protocol.md",
     "sandbox-isolation.md",
     "session-recovery.md",
     "tool-execution.md",
     "tool-registry-exposure.md",
     "trace-observation-audit-events.md",
     "verification-contract-satisfaction.md",
+}
+
+ARCHITECTURE_DOCS = {
+    "rust-agent-host.md",
 }
 
 REQUIRED_SCHEMAS = [
@@ -56,7 +61,7 @@ def test_only_module_architecture_docs_remain() -> None:
         for path in architecture_root.rglob("*.md")
     }
 
-    assert files == {f"modules/{name}" for name in MODULE_DOCS}
+    assert files == ARCHITECTURE_DOCS | {f"modules/{name}" for name in MODULE_DOCS}
 
 
 def test_module_docs_are_chinese_data_flow_docs() -> None:

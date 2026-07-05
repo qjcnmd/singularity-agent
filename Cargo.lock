@@ -635,7 +635,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "singularity_core",
 ]
 
 [[package]]

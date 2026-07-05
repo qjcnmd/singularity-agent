@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_PROTECTED_PATTERNS: [&str; 8] = [
+const DEFAULT_PROTECTED_RESOURCE_MARKERS: [&str; 8] = [
     ".env",
     ".env.",
     ".ssh",
@@ -15,18 +15,10 @@ const DEFAULT_PROTECTED_PATTERNS: [&str; 8] = [
 ];
 const REASON_APPROVAL_POLICY_NEVER: &str = "approval policy forbids approval requests";
 const REASON_MATCHED_PERMISSION_RULE: &str = "matched permission rule";
-const REASON_NETWORK_DENIED: &str = "network access is denied by profile";
-const REASON_PERMISSION_MODE_ALLOWS: &str = "permission mode allows";
-const REASON_PROTECTED_PATH_DENIED: &str = "protected path is denied by default";
-const REASON_READ_ONLY_ALLOWS_READ: &str = "read-only mode allows read";
-const REASON_READ_ONLY_REQUIRES_APPROVAL: &str = "read-only mode requires approval";
-const REASON_SCOPED_WRITE_ALLOWED: &str = "workspace-write mode allows scoped write";
-const REASON_UNSCOPED_WRITE_REQUIRES_APPROVAL: &str = "write outside workspace requires approval";
-const REASON_PERMISSION_MODE_DEFERS: &str = "permission mode defers to rules or approval";
-const REASON_NO_ALLOW_RULE: &str = "no allow rule matched; approval required";
-const REASON_WORKSPACE_WRITE_ALLOWS_READ: &str = "workspace-write mode allows read";
+const REASON_NO_RULE: &str = "no permission rule matched; approval required";
+const REASON_PROTECTED_RESOURCE_DENIED: &str = "protected resource is denied by default";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionProfileName {
     ReadOnly,
@@ -34,29 +26,21 @@ pub enum PermissionProfileName {
     DangerFullAccess,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkAccess {
     Denied,
     Allowed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalPolicy {
     OnRequest,
     Never,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum PermissionMode {
-    ReadOnly,
-    WorkspaceWrite,
-    BypassPermissions,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingsScope {
     Managed,
@@ -65,7 +49,7 @@ pub enum SettingsScope {
     Local,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionOperation {
     Read,
@@ -74,7 +58,7 @@ pub enum PermissionOperation {
     Network,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecisionOutcome {
     Allow,
@@ -104,14 +88,6 @@ impl PermissionProfile {
             protected_paths_enforced: true,
         }
     }
-
-    pub fn permission_mode(&self) -> PermissionMode {
-        match self.profile {
-            PermissionProfileName::ReadOnly => PermissionMode::ReadOnly,
-            PermissionProfileName::WorkspaceWrite => PermissionMode::WorkspaceWrite,
-            PermissionProfileName::DangerFullAccess => PermissionMode::BypassPermissions,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -130,7 +106,7 @@ impl PermissionRequest {
         Self {
             tool_name: tool_name.into(),
             operation,
-            resource: normalize_resource(resource.into()),
+            resource: resource.into(),
         }
     }
 }
@@ -165,18 +141,17 @@ impl PermissionRule {
     }
 
     pub fn for_resource(mut self, pattern: impl Into<String>) -> Self {
-        self.resource_pattern = Some(normalize_resource(pattern.into()));
+        self.resource_pattern = Some(pattern.into());
         self
     }
 
     pub fn matches(&self, request: &PermissionRequest) -> bool {
         self.operation
-            .as_ref()
-            .is_none_or(|operation| operation == &request.operation)
+            .is_none_or(|operation| operation == request.operation)
             && self
                 .resource_pattern
                 .as_ref()
-                .is_none_or(|pattern| resource_matches(&request.resource, pattern))
+                .is_none_or(|pattern| request.resource == *pattern)
     }
 }
 
@@ -200,10 +175,10 @@ impl PermissionDecision {
 
     fn from_rule(rule: &PermissionRule) -> Self {
         Self {
-            outcome: rule.outcome.clone(),
+            outcome: rule.outcome,
             reason: REASON_MATCHED_PERMISSION_RULE.to_string(),
             rule_id: Some(rule.rule_id.clone()),
-            scope: Some(rule.scope.clone()),
+            scope: Some(rule.scope),
         }
     }
 }
@@ -256,27 +231,16 @@ impl PolicyEngine {
                 PermissionDecisionOutcome::Allow | PermissionDecisionOutcome::Defer
             )
         }) {
-            return hook.decision.clone();
+            return self.apply_approval_policy(hook.decision.clone());
         }
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Deny) {
             return decision;
         }
-        if self.profile.protected_paths_enforced
-            && matches!(
-                request.operation,
-                PermissionOperation::Read | PermissionOperation::Write
-            )
-            && protected_resource(&request.resource)
-        {
+        if self.profile.protected_paths_enforced && protected_resource(&request.resource) {
             return PermissionDecision::new(
                 PermissionDecisionOutcome::Deny,
-                REASON_PROTECTED_PATH_DENIED,
+                REASON_PROTECTED_RESOURCE_DENIED,
             );
-        }
-        if matches!(request.operation, PermissionOperation::Network)
-            && matches!(self.profile.network_access, NetworkAccess::Denied)
-        {
-            return PermissionDecision::new(PermissionDecisionOutcome::Deny, REASON_NETWORK_DENIED);
         }
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Defer)
         {
@@ -285,15 +249,14 @@ impl PolicyEngine {
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Ask) {
             return self.apply_approval_policy(decision);
         }
-        let mode_decision = self.evaluate_permission_mode(request);
-        if !matches!(mode_decision.outcome, PermissionDecisionOutcome::Defer) {
-            return self.apply_approval_policy(mode_decision);
-        }
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Allow)
         {
             return decision;
         }
-        self.approval_or_deny(REASON_NO_ALLOW_RULE)
+        self.apply_approval_policy(PermissionDecision::new(
+            PermissionDecisionOutcome::Ask,
+            REASON_NO_RULE,
+        ))
     }
 
     fn first_matching_rule(
@@ -301,59 +264,16 @@ impl PolicyEngine {
         request: &PermissionRequest,
         outcome: PermissionDecisionOutcome,
     ) -> Option<PermissionDecision> {
-        let mut rules = self
-            .rules
+        self.rules
             .iter()
             .filter(|rule| rule.outcome == outcome && rule.matches(request))
-            .collect::<Vec<_>>();
-        rules.sort_by_key(|rule| scope_precedence(&rule.scope));
-        rules.into_iter().next().map(PermissionDecision::from_rule)
-    }
-
-    fn evaluate_permission_mode(&self, request: &PermissionRequest) -> PermissionDecision {
-        match self.profile.permission_mode() {
-            PermissionMode::BypassPermissions => PermissionDecision::new(
-                PermissionDecisionOutcome::Allow,
-                REASON_PERMISSION_MODE_ALLOWS,
-            ),
-            PermissionMode::ReadOnly => {
-                if matches!(request.operation, PermissionOperation::Read) {
-                    PermissionDecision::new(
-                        PermissionDecisionOutcome::Allow,
-                        REASON_READ_ONLY_ALLOWS_READ,
-                    )
-                } else {
-                    self.approval_or_deny(REASON_READ_ONLY_REQUIRES_APPROVAL)
-                }
-            }
-            PermissionMode::WorkspaceWrite => match request.operation {
-                PermissionOperation::Read => PermissionDecision::new(
-                    PermissionDecisionOutcome::Allow,
-                    REASON_WORKSPACE_WRITE_ALLOWS_READ,
-                ),
-                PermissionOperation::Write => {
-                    if self.resource_in_writable_scope(&request.resource) {
-                        PermissionDecision::new(
-                            PermissionDecisionOutcome::Allow,
-                            REASON_SCOPED_WRITE_ALLOWED,
-                        )
-                    } else {
-                        self.approval_or_deny(REASON_UNSCOPED_WRITE_REQUIRES_APPROVAL)
-                    }
-                }
-                PermissionOperation::Execute | PermissionOperation::Network => {
-                    PermissionDecision::new(
-                        PermissionDecisionOutcome::Defer,
-                        REASON_PERMISSION_MODE_DEFERS,
-                    )
-                }
-            },
-        }
+            .min_by_key(|rule| scope_precedence(rule.scope))
+            .map(PermissionDecision::from_rule)
     }
 
     fn apply_approval_policy(&self, decision: PermissionDecision) -> PermissionDecision {
-        if !matches!(decision.outcome, PermissionDecisionOutcome::Ask)
-            || matches!(self.profile.approval_policy, ApprovalPolicy::OnRequest)
+        if decision.outcome != PermissionDecisionOutcome::Ask
+            || self.profile.approval_policy == ApprovalPolicy::OnRequest
         {
             return decision;
         }
@@ -364,25 +284,9 @@ impl PolicyEngine {
             scope: decision.scope,
         }
     }
-
-    fn approval_or_deny(&self, reason: &'static str) -> PermissionDecision {
-        self.apply_approval_policy(PermissionDecision::new(
-            PermissionDecisionOutcome::Ask,
-            reason,
-        ))
-    }
-
-    fn resource_in_writable_scope(&self, resource: &str) -> bool {
-        self.profile
-            .workspace_roots
-            .iter()
-            .chain(self.profile.additional_writable_directories.iter())
-            .map(normalize_resource)
-            .any(|root| resource_matches(resource, &root))
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalOutcome {
     Allow,
@@ -440,7 +344,7 @@ impl ApprovalDecision {
     }
 }
 
-fn scope_precedence(scope: &SettingsScope) -> u8 {
+fn scope_precedence(scope: SettingsScope) -> u8 {
     match scope {
         SettingsScope::Managed => 0,
         SettingsScope::User => 1,
@@ -449,16 +353,9 @@ fn scope_precedence(scope: &SettingsScope) -> u8 {
     }
 }
 
-fn normalize_resource(value: impl AsRef<str>) -> String {
-    value.as_ref().replace('\\', "/").to_ascii_lowercase()
-}
-
-fn resource_matches(resource: &str, pattern: &str) -> bool {
-    resource == pattern || resource.starts_with(&format!("{}/", pattern.trim_end_matches('/')))
-}
-
 fn protected_resource(resource: &str) -> bool {
-    DEFAULT_PROTECTED_PATTERNS
+    let resource = resource.to_ascii_lowercase();
+    DEFAULT_PROTECTED_RESOURCE_MARKERS
         .iter()
-        .any(|pattern| resource.contains(pattern))
+        .any(|marker| resource.contains(marker))
 }
