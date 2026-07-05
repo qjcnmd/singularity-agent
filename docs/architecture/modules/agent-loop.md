@@ -20,11 +20,13 @@
 - FailureRecoveryCoordinator
 - TurnCoordinator
 - TurnCoordinatorCallbacks
+- TurnRuntimeDependencies
 - ProtocolOutcomeMapping
 
 字段清单:
 - AgentLoopResult: status, final_answer, turn, error_code, diagnostics
 - TurnCoordinatorCallbacks: publish_progress, record_model_failure, outcome_from_model_failure, terminal_result_from_outcome, record_outcome_context, assistant_message_from_result, attempt_finalize, maybe_analyze_failure, should_auto_finalize_after_tools
+- TurnRuntimeDependencies: model_runner, tools, tool_executor, tool_protocol
 
 ## 这一层解决什么问题
 
@@ -46,7 +48,7 @@ AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型�
 
 ## 真实运行时调用链
 
-`AgentKernel.run_task()` 构造 `AgentLoop` -> `AgentLoop.run()` 创建 `RunController` 并启动 planner 状态；`AgentLoop._turn_coordinator()` 把进度发布、模型失败记录、outcome 归约、终止结果构造、completion gate 和 failure analysis 回调收进 `TurnCoordinatorCallbacks`，再委托 `TurnCoordinator.run_turn()` 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion/final review 由 `CompletionGate.attempt_finalize()` 调用 `Planner.finalize()` 或生成 completion outcome；工具、验证和 completion 失败的 repair/replan 由 `FailureRecoveryCoordinator.maybe_analyze_failure()` 协调。
+`AgentKernel.run_task()` 构造 `AgentLoop` -> `AgentLoop.run()` 创建 `RunController` 并启动 planner 状态；`AgentLoop._turn_coordinator()` 把模型、工具注册表、工具执行器和工具协议引擎收进 `TurnRuntimeDependencies`，把进度发布、模型失败记录、outcome 归约、终止结果构造、completion gate 和 failure analysis 回调收进 `TurnCoordinatorCallbacks`，再委托 `TurnCoordinator.run_turn()` 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion/final review 由 `CompletionGate.attempt_finalize()` 调用 `Planner.finalize()` 或生成 completion outcome；工具、验证和 completion 失败的 repair/replan 由 `FailureRecoveryCoordinator.maybe_analyze_failure()` 协调。
 
 ## 真实任务中的对象流
 
@@ -116,15 +118,28 @@ class TurnCoordinatorCallbacks:
     should_auto_finalize_after_tools: Callable[[Planner, Any], bool]
 ```
 
+### TurnRuntimeDependencies（单 turn 运行时依赖集合）
+
+`TurnCoordinator` 接收的运行时依赖集合。**边界**：内部依赖传递对象，不落盘，不进入模型请求；由 `AgentLoop._turn_coordinator()` 从 `AgentLoop.__init__()` 保留的公开构造依赖组装，目的是让 coordinator 内部只接收一个 runtime dependency bundle，而不改变 `AgentLoop` 对外构造签名。
+
+```python
+@dataclass(frozen=True)
+class TurnRuntimeDependencies:
+    model_runner: ModelRunner
+    tools: ToolRegistry
+    tool_executor: ToolExecutor
+    tool_protocol: ToolProtocolEngine
+```
+
 ### 数据流概述
 
-`AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部创建 `RunController`，再通过 `AgentLoop._turn_coordinator()` 组装 `TurnCoordinatorCallbacks` 并委托 `TurnCoordinator.run_turn()`：`planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `CompletionGate.attempt_finalize()` 通过 `AgentLoop` 注入的 result factory 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `AgentLoop._terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
+`AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部创建 `RunController`，再通过 `AgentLoop._turn_coordinator()` 组装 `TurnRuntimeDependencies` 和 `TurnCoordinatorCallbacks` 并委托 `TurnCoordinator.run_turn()`：`planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `CompletionGate.attempt_finalize()` 通过 `AgentLoop` 注入的 result factory 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `AgentLoop._terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
 
 完成判定只消费 AgentLoop 内部 evidence：`Planner.update_from_verification()` 通过 `EvidenceLedger.add_verification_result()` 写入的最新 `completion_assessment.status` 必须为 `ready` 或 `ready_with_warnings`，`Planner.assess_completion()` 必须没有 unmet，`Planner.finalize()` 的 final review 必须没有 blocking finding 且 `FinalReport.status=completed`。`Finalizer.build()` 通过 `latest_verification_result()`、`policy_records()`、`sandbox_records()`、`tool_result_records()` 汇总 completion/report 关键 bucket，避免从裸 dict 随意读取缺字段。 当这些条件满足时，`Planner.finalize()` 会清理已经被最新 final report 解决的 completion blocker（例如 `required_verifications_passed`、`unresolved_failures_empty`、旧的 sandbox backend unavailable 记录），再由 `CompletionGate.attempt_finalize()` 返回 `AgentLoopStatus.COMPLETED`。未被最新证据解决的 policy、approval、workspace conflict、sandbox/backend unavailable 当前失败仍保持 fail-closed，不会被 reducer 或 finalizer 改写成 completed。
 
 ## 谁生成这些对象
 
-- `AgentLoop.run()` 通过 `TurnCoordinatorCallbacks` 把自身回调传给 `TurnCoordinator.run_turn()`；当 completion gate 通过时，`CompletionGate.attempt_finalize()` 通过注入的 result factory 构造 `status=completed` 的 `AgentLoopResult`；`on_max_turns()` 构造 `status=max_turns_exceeded` 的结果。
+- `AgentLoop._turn_coordinator()` 生成 `TurnRuntimeDependencies` 和 `TurnCoordinatorCallbacks` 并传给 `TurnCoordinator.run_turn()`；当 completion gate 通过时，`CompletionGate.attempt_finalize()` 通过注入的 result factory 构造 `status=completed` 的 `AgentLoopResult`；`on_max_turns()` 构造 `status=max_turns_exceeded` 的结果。
 - `_terminal_result_from_outcome()` 把不可重试的 `ExecutionOutcome` 映射成 `blocked` 或 `failed`，同时把 `outcome.to_dict()` 放入 `diagnostics`。`AgentLoopStatus` 由这些构造点直接选择，不存在第二套字符串状态 alias。
 
 ## 谁消费这些对象
@@ -154,7 +169,7 @@ class TurnCoordinatorCallbacks:
 
 ## 当前结构问题
 
-`AgentLoop.run()` 仍是对外 facade，负责 context/controller 生命周期和 max-turn callback；单 turn 编排已由 `TurnCoordinator` 承担，分散回调通过 `TurnCoordinatorCallbacks` 传递，completion/final review 已由 `CompletionGate` 承担，failure-analysis/replan 已由 `FailureRecoveryCoordinator` 承担。新增状态时仍必须同时检查 kernel、evaluation 和 targeted replay 的消费分支，避免状态存在但报告层无法分类。
+`AgentLoop.run()` 仍是对外 facade，负责 context/controller 生命周期和 max-turn callback；单 turn 编排已由 `TurnCoordinator` 承担，runtime dependency 通过 `TurnRuntimeDependencies` 传递，分散回调通过 `TurnCoordinatorCallbacks` 传递，completion/final review 已由 `CompletionGate` 承担，failure-analysis/replan 已由 `FailureRecoveryCoordinator` 承担。新增状态时仍必须同时检查 kernel、evaluation 和 targeted replay 的消费分支，避免状态存在但报告层无法分类。
 
 ## 维护规则
 

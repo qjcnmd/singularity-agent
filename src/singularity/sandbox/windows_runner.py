@@ -12,9 +12,10 @@ import time
 from contextlib import ExitStack, suppress
 from ctypes import wintypes
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar
+
+from singularity.utils.serialization import stable_short_hash_text, utc_iso_timestamp
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NEW_CONSOLE = 0x00000010
@@ -1092,10 +1093,7 @@ def _has_symbol(library: str, symbol: str) -> bool:
         return False
 
 
-def _hash_text(value: str) -> str:
-    import hashlib
-
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+_hash_text = stable_short_hash_text
 
 
 def _current_process_identity() -> tuple[str, str]:
@@ -1146,8 +1144,7 @@ def _current_process_identity() -> tuple[str, str]:
         _close_handle(token.value)
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp
 
 
 class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):

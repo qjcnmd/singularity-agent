@@ -8,6 +8,8 @@ from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
+from singularity.utils.serialization import coerce_dict, coerce_enum
+
 SCHEMA_VERSION = "evaluation.benchmark_task/v1"
 FAILURE_CASE_RECORD_SCHEMA_VERSION = "evaluation.failure_case_record/v1"
 EnumT = TypeVar("EnumT", bound=Enum)
@@ -747,17 +749,15 @@ def _golden_contract(
 
 
 def _enum(enum_type: type[EnumT], value: EnumT | str) -> EnumT:
-    if isinstance(value, enum_type):
-        return cast(EnumT, value)
-    return enum_type(str(value))
+    return cast(EnumT, coerce_enum(enum_type, value))
 
 
 def _dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError("Expected object mapping.")
-    return dict(value)
+    return coerce_dict(
+        value,
+        allow_none=True,
+        error_message="Expected object mapping.",
+    )
 
 
 def _copy_jsonish(value: Any) -> Any:

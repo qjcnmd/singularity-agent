@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, ClassVar
 from uuid import uuid4
+
+from singularity.utils.serialization import utc_iso_timestamp
 
 
 class TaskStatus(StrEnum):
@@ -1071,5 +1072,4 @@ class FinalReport:
         )
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp

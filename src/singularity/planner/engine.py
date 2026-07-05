@@ -333,10 +333,83 @@ class Planner:
     ) -> AuthorizationDecision:
         throw_if_cancelled(self)
         state = self._state()
-        plan = self._plan()
-        phase = plan.phase(state.current_phase)
+        phase = self._plan().phase(state.current_phase)
         normalized_args = self.policy.normalize_arguments(arguments or {})
         tool_scope = self._active_tool_scope()
+        if tool_scope.benchmark_allowed and tool_name not in tool_scope.benchmark_allowed:
+            return self._deny_tool_call(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                error_code="benchmark_tool_not_allowed",
+                reason=f"{tool_name} is not allowed by the active benchmark task.",
+                extra={
+                    "reason_code": "benchmark_tool_not_allowed",
+                    "benchmark_constraints": self._benchmark_constraints,
+                },
+            )
+        denial = self._authorize_tool_scope_constraints(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            spec=spec,
+            phase=phase,
+            tool_scope=tool_scope,
+        )
+        if denial is not None:
+            return denial
+
+        target_paths = target_paths_from_tool_arguments(tool_name, normalized_args)
+        denial = self._authorize_tool_target_constraints(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            spec=spec,
+            normalized_args=normalized_args,
+            tool_scope=tool_scope,
+            target_paths=target_paths,
+        )
+        if denial is not None:
+            return denial
+
+        risk = self.risk.evaluate_action(
+            tool_name=tool_name,
+            arguments=normalized_args,
+            changed_files=self._changed_files(),
+        )
+        denial = self._authorize_tool_risk(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            state=state,
+            risk=risk,
+        )
+        if denial is not None:
+            return denial
+
+        action = AgentAction(
+            kind=self.policy.action_for_tool(tool_name),
+            intent=f"Use {tool_name}",
+            phase_id=phase.phase_id,
+            preconditions=phase.entry_conditions,
+            allowed_tools=[tool_name],
+            expected_evidence=self.policy.expected_evidence(tool_name),
+            risk_level=risk.risk_level,
+            status=ActionStatus.ALLOWED,
+        )
+        self.actions[action.action_id] = action
+        self._record_event(
+            action=action,
+            decision="allow",
+            reason=f"{tool_name} is allowed in phase {phase.phase_id}.",
+        )
+        return AuthorizationDecision(allowed=True, action=action)
+
+    def _authorize_tool_scope_constraints(
+        self,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        spec: ToolSpec,
+        phase: TaskPhase,
+        tool_scope: _ToolScope,
+    ) -> AuthorizationDecision | None:
         if tool_scope.repair_execution_block and tool_name not in tool_scope.repair_evidence_allowed:
             error_code, block_reason = tool_scope.repair_execution_block
             return self._deny_tool_call(
@@ -363,17 +436,6 @@ class Planner:
                     "repair_contract": self._active_repair_contract(),
                 },
             )
-        if tool_scope.benchmark_allowed and tool_name not in tool_scope.benchmark_allowed:
-            return self._deny_tool_call(
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                error_code="benchmark_tool_not_allowed",
-                reason=f"{tool_name} is not allowed by the active benchmark task.",
-                extra={
-                    "reason_code": "benchmark_tool_not_allowed",
-                    "benchmark_constraints": self._benchmark_constraints,
-                },
-            )
         if not self.policy.is_allowed(phase=phase, tool_name=tool_name, spec=spec):
             return self._deny_tool_call(
                 tool_name=tool_name,
@@ -381,8 +443,18 @@ class Planner:
                 error_code="action_not_allowed",
                 reason=f"{tool_name} is not allowed in phase {phase.phase_id}.",
             )
+        return None
 
-        target_paths = target_paths_from_tool_arguments(tool_name, normalized_args)
+    def _authorize_tool_target_constraints(
+        self,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        spec: ToolSpec,
+        normalized_args: dict[str, Any],
+        tool_scope: _ToolScope,
+        target_paths: list[str],
+    ) -> AuthorizationDecision | None:
         repair_targets = self._active_repair_target_files()
         if (
             repair_targets
@@ -406,7 +478,8 @@ class Planner:
                         "repair_contract": self._active_repair_contract(),
                     },
                 )
-        if write_blocked_by_user_constraint(spec, self._active_user_constraints(), target_paths):
+        active_user_constraints = self._active_user_constraints()
+        if write_blocked_by_user_constraint(spec, active_user_constraints, target_paths):
             return self._deny_tool_call(
                 tool_name=tool_name,
                 tool_call_id=tool_call_id,
@@ -415,7 +488,7 @@ class Planner:
                 extra={
                     "reason_code": "user_constraint_blocks_write_path",
                     "blocked_paths": target_paths,
-                    "active_user_constraints": self._active_user_constraints(),
+                    "active_user_constraints": active_user_constraints,
                 },
             )
 
@@ -445,12 +518,16 @@ class Planner:
                             "verification_contract": vcontract.to_dict(),
                         },
                     )
+        return None
 
-        risk = self.risk.evaluate_action(
-            tool_name=tool_name,
-            arguments=normalized_args,
-            changed_files=self._changed_files(),
-        )
+    def _authorize_tool_risk(
+        self,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        state: TaskState,
+        risk: Any,
+    ) -> AuthorizationDecision | None:
         if risk.decision != RiskDecisionKind.CONTINUE:
             state.status = TaskStatus.NEEDS_REVIEW
             state.risk_level = risk.risk_level
@@ -465,24 +542,7 @@ class Planner:
                 risk_decision=risk.decision,
                 decision=risk.decision.value,
             )
-
-        action = AgentAction(
-            kind=self.policy.action_for_tool(tool_name),
-            intent=f"Use {tool_name}",
-            phase_id=phase.phase_id,
-            preconditions=phase.entry_conditions,
-            allowed_tools=[tool_name],
-            expected_evidence=self.policy.expected_evidence(tool_name),
-            risk_level=risk.risk_level,
-            status=ActionStatus.ALLOWED,
-        )
-        self.actions[action.action_id] = action
-        self._record_event(
-            action=action,
-            decision="allow",
-            reason=f"{tool_name} is allowed in phase {phase.phase_id}.",
-        )
-        return AuthorizationDecision(allowed=True, action=action)
+        return None
 
     def _deny_tool_call(
         self,

@@ -11,7 +11,7 @@ from singularity.command import CommandExecutor
 from singularity.config import ProductionConfig
 from singularity.context import ContextManager
 from singularity.edit import EditExecutor
-from singularity.evaluation import EvaluationHarness
+from singularity.evaluation.harness import EvaluationHarness
 from singularity.instructions import PromptAssemblyPipeline
 from singularity.interaction import InteractionController
 from singularity.kernel.exceptions import AgentGraphInitializationError

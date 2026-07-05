@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from dataclasses import dataclass, field, replace
@@ -9,6 +8,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from singularity.observability.redaction import shared_trace_redactor
+from singularity.utils.serialization import coerce_enum, stable_hash_text
 
 _COMMAND_REDACTOR = shared_trace_redactor()
 _SECRET_ARG_FLAG_RE = re.compile(
@@ -457,10 +457,6 @@ def _command_hash(argv: list[str] | None, shell: str | None) -> str:
     return _hash_text(shell or "")
 
 
-def _hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 @dataclass(frozen=True)
 class ProcessOutput:
     process_id: str
@@ -504,9 +500,10 @@ class ProcessStopResult:
 
 
 def _enum(enum_type: type[EnumT], value: EnumT | str) -> EnumT:
-    if isinstance(value, enum_type):
-        return value
     try:
-        return enum_type[str(value)]
-    except KeyError:
+        return coerce_enum(enum_type, value, allow_name=True)
+    except ValueError:
         return enum_type(str(value))
+
+
+_hash_text = stable_hash_text

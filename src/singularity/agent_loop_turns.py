@@ -26,24 +26,26 @@ class TurnCoordinatorCallbacks:
     should_auto_finalize_after_tools: Callable[[Planner, Any], bool]
 
 
+@dataclass(frozen=True)
+class TurnRuntimeDependencies:
+    model_runner: ModelRunner
+    tools: ToolRegistry
+    tool_executor: ToolExecutor
+    tool_protocol: ToolProtocolEngine
+
+
 class TurnCoordinator:
     def __init__(
         self,
         *,
         trace: Any,
-        model_runner: ModelRunner,
-        tools: ToolRegistry,
-        tool_executor: ToolExecutor,
-        tool_protocol: ToolProtocolEngine,
+        dependencies: TurnRuntimeDependencies,
         prompt_assembly: Any,
         strict: bool,
         callbacks: TurnCoordinatorCallbacks,
     ) -> None:
         self.trace = trace
-        self.model_runner = model_runner
-        self.tools = tools
-        self.tool_executor = tool_executor
-        self.tool_protocol = tool_protocol
+        self.dependencies = dependencies
         self.prompt_assembly = prompt_assembly
         self.strict = strict
         self.callbacks = callbacks
@@ -65,7 +67,7 @@ class TurnCoordinator:
         turn_action_id = f"turn_{turn}"
         active_tool_schemas = planner.filtered_tools(
             tool_schemas,
-            tool_specs=self.tools.list(),
+            tool_specs=self.dependencies.tools.list(),
             action_id=turn_action_id,
         )
         allowed_tool_names = [
@@ -73,7 +75,7 @@ class TurnCoordinator:
             for tool in active_tool_schemas
             if tool.get("function", {}).get("name")
         ]
-        request = self.model_runner.build_request_from_context(
+        request = self.dependencies.model_runner.build_request_from_context(
             context,
             run_id=self.trace.run_id,
             session_id=getattr(planner, "session_id", self.trace.run_id),
@@ -88,7 +90,7 @@ class TurnCoordinator:
             strict_tools=self.strict,
         )
         planner.record_instruction_prompt_observation(dict(self.prompt_assembly.summary()))
-        result = self.model_runner.run_turn(request)
+        result = self.dependencies.model_runner.run_turn(request)
         context.record_model_usage(result)
         if result.status != ModelTurnStatus.SUCCESS:
             self.callbacks.record_model_failure(planner, result, turn=turn)
@@ -115,12 +117,12 @@ class TurnCoordinator:
             return None
 
         observation_start = len(context.tool_observations)
-        protocol_result = self.tool_protocol.process_model_turn(
+        protocol_result = self.dependencies.tool_protocol.process_model_turn(
             request=request,
             result=result,
             turn=turn,
             context=context,
-            tool_executor=self.tool_executor,
+            tool_executor=self.dependencies.tool_executor,
             planner=planner,
         )
         if protocol_result.next_action == "finalize":

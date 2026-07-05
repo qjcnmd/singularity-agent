@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
+
+from singularity.utils.serialization import coerce_enum, stable_hash_text, to_plain_data, utc_iso_timestamp
 
 SCHEMA_VERSION = "1.0.0"
 
@@ -366,32 +367,13 @@ class IndexSummary(IndexFact):
 
 
 def stable_id(prefix: str, *parts: object) -> str:
-    import hashlib
-
     payload = json.dumps([str(part) for part in parts], ensure_ascii=False, sort_keys=True)
-    return f"{prefix}_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]}"
+    return f"{prefix}_{stable_hash_text(payload)[:16]}"
 
 
 def _enum(enum_cls: type[Enum], value: Any) -> Any:
-    if isinstance(value, enum_cls):
-        return value
-    text = str(value)
-    if text in enum_cls.__members__:
-        return enum_cls[text]
-    return enum_cls(text)
+    return coerce_enum(enum_cls, value, allow_name=True)
 
 
-def _to_plain(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    if is_dataclass(value):
-        return {key: _to_plain(item) for key, item in asdict(value).items()}
-    if isinstance(value, dict):
-        return {str(key): _to_plain(item) for key, item in value.items()}
-    if isinstance(value, list | tuple | set):
-        return [_to_plain(item) for item in value]
-    return value
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_to_plain = to_plain_data
+_now = utc_iso_timestamp

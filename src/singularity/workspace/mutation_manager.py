@@ -9,7 +9,6 @@ import time
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -30,6 +29,8 @@ from singularity.policy import (
     ResourceRef,
 )
 from singularity.policy.audit import redact
+from singularity.utils.attributes import nested_getattr
+from singularity.utils.serialization import utc_iso_timestamp
 from singularity.workspace.diff import (
     DiffEngine,
     FileDiff,
@@ -62,7 +63,7 @@ from singularity.workspace.policy import ALLOW, DENY, REQUIRE_REVIEW, PolicyDeci
 from singularity.workspace.snapshot import FileSnapshot, WorkspaceIndex, hash_bytes
 
 if TYPE_CHECKING:
-    from singularity.workspace_state import WorkspaceStateManager
+    from singularity.workspace_state.manager import WorkspaceStateManager
 
 
 @dataclass(frozen=True)
@@ -887,7 +888,7 @@ class WorkspaceMutationManager:
         request = PolicyRequest(
             session_id=getattr(self.planner, "session_id", "mutation_session"),
             task_id=getattr(self.planner, "task_id", "mutation_task"),
-            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "mutation"),
+            phase_id=nested_getattr(self.planner, "state.current_phase", default="mutation"),
             action_id=transaction_id,
             component=PolicyComponent.MUTATION,
             operation=OperationKind.ROLLBACK,
@@ -960,7 +961,7 @@ class WorkspaceMutationManager:
         return PolicyRequest(
             session_id=getattr(self.planner, "session_id", "mutation_session"),
             task_id=getattr(self.planner, "task_id", "mutation_task"),
-            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "mutation"),
+            phase_id=nested_getattr(self.planner, "state.current_phase", default="mutation"),
             action_id=transaction_id,
             component=PolicyComponent.MUTATION,
             operation=operation,
@@ -1460,7 +1461,7 @@ class WorkspaceMutationManager:
             ids={
                 "session_id": getattr(self.planner, "session_id", None),
                 "task_id": getattr(self.planner, "task_id", None),
-                "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+                "phase_id": nested_getattr(self.planner, "state.current_phase"),
                 "action_id": action_id,
                 "transaction_id": transaction_id,
             },
@@ -1709,8 +1710,7 @@ def normalize_line_endings(text: str, line_ending: str | None) -> str:
     return normalized
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp
 
 
 def _operation_kind_for_changeset(changeset: ChangeSet) -> OperationKind:

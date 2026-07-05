@@ -7,6 +7,8 @@ from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
 
+from singularity.utils.serialization import coerce_enum, enum_value_str
+
 
 class ControlCommand(StrEnum):
     CANCEL = "cancel"
@@ -364,16 +366,10 @@ class FinalReport:
 
 
 def _enum(enum_type: type[Enum], value: Enum | str) -> Enum:
-    if isinstance(value, enum_type):
-        return value
-    text = str(value)
-    if text in enum_type.__members__:
-        return enum_type[text]
-    return enum_type(text)
+    return coerce_enum(enum_type, value, allow_name=True)
 
 
-def _enum_value(value: Any) -> str:
-    return str(getattr(value, "value", value))
+_enum_value = enum_value_str
 
 
 def _datetime(value: datetime | str) -> datetime:

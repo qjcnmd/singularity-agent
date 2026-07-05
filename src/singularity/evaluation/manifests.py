@@ -14,6 +14,8 @@ from singularity.evaluation.models import (
 )
 from singularity.evaluation.store import GoldenTaskStore
 from singularity.policy.permissions import ApprovalPolicy, NetworkAccess, PermissionProfileName
+from singularity.utils.attributes import nested_getattr
+from singularity.utils.serialization import coerce_dict
 
 EVALUATION_TASK_SET_SCHEMA_VERSION = "evaluation.task_set/v1"
 
@@ -360,7 +362,7 @@ def _strategy_max_turns_for_task(task: EvaluationTask) -> int | None:
 
 
 def _apply_benchmark_constraints(kernel: Any, task: EvaluationTask) -> None:
-    planner = getattr(getattr(kernel, "graph", None), "planner", None)
+    planner = nested_getattr(kernel, "graph.planner")
     apply_constraints = getattr(planner, "apply_benchmark_constraints", None)
     if not callable(apply_constraints):
         return
@@ -428,6 +430,8 @@ def _allowed_paths_for_task(task: BenchmarkTask, metadata: dict[str, Any]) -> li
 
 
 def _dict(value: Any, field_name: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError(f"evaluation {field_name} must be an object.")
-    return dict(value)
+    return coerce_dict(
+        value,
+        field_name,
+        error_message=f"evaluation {field_name} must be an object.",
+    )

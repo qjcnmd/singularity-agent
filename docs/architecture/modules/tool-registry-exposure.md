@@ -5,9 +5,9 @@
 源码证据路径:
 - src/singularity/tools/models.py
 - src/singularity/tools/registry.py
+- src/singularity/tools/openai_schema.py
 - src/singularity/tools/router.py
 - src/singularity/model/tools.py
-- src/singularity/model/openai_format.py
 
 关键符号:
 - ToolSpec
@@ -36,9 +36,9 @@
 
 - src/singularity/tools/models.py
 - src/singularity/tools/registry.py
+- src/singularity/tools/openai_schema.py
 - src/singularity/tools/router.py
 - src/singularity/model/tools.py
-- src/singularity/model/openai_format.py
 
 ## 关键类、函数、字段
 

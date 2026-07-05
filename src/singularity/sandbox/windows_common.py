@@ -11,7 +11,6 @@ import time as _time
 from contextlib import suppress
 from ctypes import wintypes
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -57,6 +56,7 @@ from singularity.sandbox.windows_runner import (
     WindowsRunnerResult,
     WindowsSandboxRunner,
 )
+from singularity.utils.serialization import stable_short_hash_text, utc_iso_timestamp
 
 __all__ = [
     "CLEANUP_SCHEMA_VERSION",
@@ -912,10 +912,7 @@ def _diagnostic_text(
     return sanitized[:500]
 
 
-def _hash_text(value: str) -> str:
-    import hashlib
-
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+_hash_text = stable_short_hash_text
 
 
 def _hash_path(value: Path) -> str:
@@ -964,5 +961,4 @@ def _limit_output(stdout: str, stderr: str, max_chars: int | None) -> tuple[str,
     return stdout[:stdout_budget], stderr[:stderr_budget], True
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp

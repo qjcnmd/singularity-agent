@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum, StrEnum
+from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
 from singularity.model.models import ModelMessage
+from singularity.utils.serialization import to_plain_data
 
 
 class SerializableDataclass:
@@ -242,16 +243,7 @@ def _hash_payload(payload: Any) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _to_plain(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    if is_dataclass(value) and not isinstance(value, type):
-        return {key: _to_plain(item) for key, item in asdict(value).items()}
-    if isinstance(value, list):
-        return [_to_plain(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _to_plain(item) for key, item in value.items()}
-    return value
+_to_plain = to_plain_data
 
 
 def _from_payload(cls: Any, payload: dict[str, Any]) -> Any:

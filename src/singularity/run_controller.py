@@ -17,6 +17,7 @@ from singularity.status_mapping import (
     lifecycle_status_for_protocol_next_action,
     protocol_error_code_to_outcome,
 )
+from singularity.utils.attributes import nested_getattr
 
 
 class RunLifecycleStatus(StrEnum):
@@ -126,7 +127,11 @@ class RunOutcomeReducer:
                 "next_action": next_action,
                 "pending_approval_count": pending,
                 "protocol_status": str(
-                    getattr(getattr(protocol_result, "status", None), "value", getattr(protocol_result, "status", ""))
+                    nested_getattr(
+                        protocol_result,
+                        "status.value",
+                        default=getattr(protocol_result, "status", ""),
+                    )
                 ),
                 "execution_outcome": outcome.to_dict() if outcome is not None else None,
             },

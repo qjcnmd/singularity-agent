@@ -11,6 +11,7 @@ from singularity.observability.models import (
     TraceSpan,
     TraceSummary,
 )
+from singularity.utils.serialization import coerce_int
 
 
 class ModelUsageSummary(TypedDict):
@@ -340,14 +341,7 @@ def _model_usage_summary(events: list[TraceEvent]) -> ModelUsageSummary:
 def _safe_int(value: Any) -> int:
     if isinstance(value, bool) or value is None:
         return 0
-    if isinstance(value, int | float):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(float(value.strip()))
-        except ValueError:
-            return 0
-    return 0
+    return coerce_int(value, bool_default=0)
 
 
 def _cache_rate(cached_tokens: int, input_tokens: int) -> float:

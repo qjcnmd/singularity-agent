@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +14,7 @@ from singularity.memory.models import (
     digest_value,
 )
 from singularity.memory.store import MemoryStore
+from singularity.utils.serialization import utc_iso_timestamp
 
 BUNDLE_SCHEMA = "singularity.memory_sync_bundle/v1"
 
@@ -173,5 +173,4 @@ def _read_bundle(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp

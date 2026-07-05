@@ -19,6 +19,7 @@ from singularity.edit.validation import PatchValidator
 from singularity.kernel.cancellation import throw_if_cancelled
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.review.models import ReviewDecisionAction
+from singularity.utils.attributes import nested_getattr
 from singularity.workspace import MutationError, WorkspaceMutationManager
 
 
@@ -427,7 +428,7 @@ class EditExecutor:
             code_impact=validation.code_impact,
             test_impact=validation.test_impact,
             task_id=getattr(self.planner, "task_id", None),
-            plan_id=getattr(getattr(self.planner, "plan", None), "plan_id", None),
+            plan_id=nested_getattr(self.planner, "plan.plan_id"),
         )
 
     def _post_patch_review(self, result: EditResult) -> Any | None:
@@ -537,7 +538,7 @@ class EditExecutor:
                 ids={
                     "session_id": getattr(self.planner, "session_id", None),
                     "task_id": getattr(self.planner, "task_id", None),
-                    "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+                    "phase_id": nested_getattr(self.planner, "state.current_phase"),
                 },
                 severity=severity,
             )

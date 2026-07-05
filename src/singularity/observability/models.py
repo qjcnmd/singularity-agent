@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from singularity.observability.exceptions import TraceSerializationError
+from singularity.utils.serialization import coerce_enum
 
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
@@ -478,12 +479,7 @@ class TraceSummary:
 
 
 def _enum(enum_type: type[_EnumT], value: _EnumT | str) -> _EnumT:
-    if isinstance(value, enum_type):
-        return value
-    text = str(value)
-    if text in enum_type.__members__:
-        return enum_type[text]
-    return enum_type(text)
+    return coerce_enum(enum_type, value, allow_name=True)
 
 
 def _datetime(value: datetime | str) -> datetime:

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum, StrEnum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from singularity.release.paths import UserDataPaths
+from singularity.utils.serialization import to_plain_data
 
 DIAGNOSTIC_RESULT_SCHEMA = "diagnostic-result/v1"
 DIAGNOSTIC_REPAIR_RESULT_SCHEMA = "repair-plan/v1"
@@ -139,17 +140,7 @@ def _severity(value: DiagnosticSeverity | str) -> DiagnosticSeverity:
 
 
 def _to_plain(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, Path):
-        return str(value)
-    if is_dataclass(value):
-        return {key: _to_plain(item) for key, item in asdict(value).items()}
-    if isinstance(value, dict):
-        return {str(key): _to_plain(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_to_plain(item) for item in value]
-    return value
+    return to_plain_data(value, path_style="str")
 
 
 def _legacy_check(finding: dict[str, Any]) -> dict[str, Any]:

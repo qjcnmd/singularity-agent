@@ -5,12 +5,12 @@ import os
 import stat
 import tempfile
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from singularity.observability.protocols import TraceRecorderProtocol
+from singularity.utils.serialization import enum_value_str, utc_iso_timestamp
 from singularity.workspace.pathing import (
     ResolvedWorkspacePath,
     WorkspacePathResolver,
@@ -993,9 +993,7 @@ def _event_type_for_change(
     return changed_event
 
 
-def _enum_value(value: Any) -> str:
-    raw = getattr(value, "value", value)
-    return str(raw)
+_enum_value = enum_value_str
 
 
 def _lexical_path(workspace_root: Path, user_path: str | Path) -> Path:
@@ -1020,5 +1018,4 @@ def _atomic_write_bytes(path: Path, raw: bytes) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp

@@ -21,6 +21,7 @@ from singularity.context.models import (
     digest_value,
 )
 from singularity.context.redaction import ContextRedactor, SensitivityClassifier
+from singularity.utils.serialization import utc_iso_timestamp
 
 _RAW_OBSERVATION_KEYS = {"raw_result", "raw_args", "raw_arguments", "result"}
 
@@ -1288,9 +1289,7 @@ class ObservationStore:
                 ids={"run_id": payload.get("run_id")},
             )
 
-    @staticmethod
-    def _now() -> str:
-        return datetime.now(UTC).isoformat()
+    _now = staticmethod(utc_iso_timestamp)
 
 
 def _value(value: Any) -> str | None:

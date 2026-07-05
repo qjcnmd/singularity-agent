@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import hashlib
 import json
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum, StrEnum
+from enum import StrEnum
 from typing import Any
 from uuid import uuid4
+
+from singularity.utils.serialization import coerce_enum, stable_hash_text, to_plain_data, utc_iso_timestamp
 
 SCHEMA_VERSION = 1
 
@@ -485,31 +486,7 @@ def new_memory_id(prefix: str = "mem") -> str:
 
 
 def digest_value(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(_to_plain(value), ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
-
-
-def _to_plain(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    if is_dataclass(value):
-        return {key: _to_plain(item) for key, item in asdict(value).items()}
-    if isinstance(value, dict):
-        return {str(key): _to_plain(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_to_plain(item) for item in value]
-    if isinstance(value, tuple):
-        return [_to_plain(item) for item in value]
-    if isinstance(value, set):
-        return sorted(_to_plain(item) for item in value)
-    return value
-
-
-def _enum(enum_cls: type[Enum], value: Any) -> Any:
-    if isinstance(value, enum_cls):
-        return value
-    return enum_cls(str(value))
+    return stable_hash_text(json.dumps(_to_plain(value), ensure_ascii=False, sort_keys=True, default=str))
 
 
 def _parse_dt(value: str) -> datetime:
@@ -519,5 +496,6 @@ def _parse_dt(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_to_plain = to_plain_data
+_enum = coerce_enum
+_now = utc_iso_timestamp

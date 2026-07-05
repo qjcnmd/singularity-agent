@@ -155,6 +155,7 @@ def test_authorize_tool_call_uses_single_deny_helper(tmp_path: Path) -> None:
 
     assert "self._deny_tool_call(" in source
     assert source.count("AuthorizationDecision(\n                allowed=False") == 0
+    assert len(source.splitlines()) <= 95
 
 
 def test_benchmark_expected_file_changes_delay_verification_phase(tmp_path: Path) -> None:

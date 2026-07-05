@@ -4,7 +4,6 @@ import json
 import time
 from contextlib import suppress
 from dataclasses import asdict, is_dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -48,6 +47,8 @@ from singularity.context.store import ObservationStore
 from singularity.context.tokens import TokenCounter
 from singularity.context.usage import ContextUsageReporter
 from singularity.session.models import SessionResumeContext
+from singularity.utils.attributes import nested_getattr
+from singularity.utils.serialization import utc_iso_timestamp
 
 if TYPE_CHECKING:
     from singularity.tool_protocol.models import ToolProtocolResultEnvelope
@@ -281,8 +282,8 @@ class ContextManager:
             run_id=self.run_id,
             task_id=self.task_id,
             phase_id=phase_id or self.phase_id,
-            model=getattr(getattr(self.model_runner, "config", None), "default_model", "") or "",
-            provider=getattr(getattr(self.provider, "settings", None), "base_url", "") or "",
+            model=nested_getattr(self.model_runner, "config.default_model", default="") or "",
+            provider=nested_getattr(self.provider, "settings.base_url", default="") or "",
             tools=tools,
             render_policy=render_policy or self.render_policy,
             compression_snapshot_id=latest_snapshot.snapshot_id if latest_snapshot else None,
@@ -1305,9 +1306,7 @@ class ContextManager:
             return exc
         return None
 
-    @staticmethod
-    def _now() -> str:
-        return datetime.now(UTC).isoformat()
+    _now = staticmethod(utc_iso_timestamp)
 
 
 def _plain(value: Any) -> Any:

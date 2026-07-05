@@ -7,7 +7,6 @@ import subprocess
 import time
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -26,6 +25,7 @@ from singularity.sandbox.models import (
     SandboxStatus,
 )
 from singularity.sandbox.trace_recorder import SandboxJsonlTraceRecorder
+from singularity.utils.serialization import utc_iso_timestamp
 
 _RELAXED_BACKEND_NAME = "local_process"
 _WINDOWS_ELEVATED_BACKEND_NAME = "windows_elevated"
@@ -955,8 +955,7 @@ class SandboxManager:
             artifact_refs=[artifact.artifact_id for artifact in result.artifacts] if result else [],
         )
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp
 
 
 def _relative_handle(path: Path, root: Path) -> str:

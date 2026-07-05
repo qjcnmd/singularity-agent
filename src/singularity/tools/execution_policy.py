@@ -28,6 +28,7 @@ from singularity.policy.exceptions import (
 from singularity.tools.execution_pipeline import ToolExecutionPipelineState
 from singularity.tools.execution_resources import redacted_resource_details, resources_for
 from singularity.tools.models import ToolExecutionBackendKind, ToolResult, ToolSpec
+from singularity.utils.attributes import nested_getattr
 
 
 class ToolPolicyEngineProtocol(Protocol):
@@ -168,7 +169,11 @@ class ToolExecutionPolicyGate:
         return PolicyRequest(
             session_id=getattr(self.planner, "session_id", self.trace.run_id if self.trace else "tool_session"),
             task_id=getattr(self.planner, "task_id", self.trace.run_id if self.trace else "tool_task"),
-            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "tool_dispatch"),
+            phase_id=nested_getattr(
+                self.planner,
+                "state.current_phase",
+                default="tool_dispatch",
+            ),
             action_id=tool_call_id or "tool_dispatch",
             component=PolicyComponent.TOOL,
             operation=operation,

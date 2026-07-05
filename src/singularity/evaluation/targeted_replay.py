@@ -21,6 +21,7 @@ from singularity.tools import ToolExecutor, ToolPolicy, ToolRegistry
 from singularity.tools.edit import register_edit_tools
 from singularity.tools.mutation import register_mutation_tools
 from singularity.tools.verification import register_verification_tools
+from singularity.utils.attributes import nested_getattr
 from singularity.verification import VerificationRunner
 from singularity.verification.contract import VerificationContract
 from singularity.workspace import WorkspaceMutationManager
@@ -226,12 +227,12 @@ class TargetedFailureReplayRunner:
             trace.path,
             planner_status_history=planner_status_history,
             final_phase=getattr(planner.state, "current_phase", ""),
-            final_status=getattr(getattr(planner.state, "status", None), "value", ""),
+            final_status=nested_getattr(planner.state, "status.value", default=""),
         )
         final_report_status = (
             planner.final_report.status.value
             if planner.final_report is not None
-            else getattr(getattr(planner.state, "status", None), "value", "")
+            else nested_getattr(planner.state, "status.value", default="")
         )
         failure_analysis_request_ids = _trace_event_request_ids(trace.path, "failure_analysis_completed")
         failure_analysis_ids = _failure_analysis_ids_for_requests(
@@ -463,7 +464,7 @@ def _planner_status_history(path: Path, planner: Planner) -> list[dict[str, str]
             )
     state = getattr(planner, "state", None)
     if state is not None:
-        status = getattr(getattr(state, "status", None), "value", "")
+        status = nested_getattr(state, "status.value", default="")
         phase = str(getattr(state, "current_phase", "") or "")
         _append_history(
             history,
@@ -628,7 +629,7 @@ def _targeted_replay_markdown(result: TargetedFailureReplayResult) -> str:
 
 
 def _tool_protocol_state_path(workspace: Path, trace: Any) -> Path:
-    run_dir = getattr(getattr(trace, "store", None), "run_dir", None)
+    run_dir = nested_getattr(trace, "store.run_dir")
     if run_dir is not None:
         return Path(run_dir) / "tool_protocol.sqlite3"
     run_id = str(getattr(trace, "run_id", "default"))

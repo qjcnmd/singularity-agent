@@ -10,6 +10,7 @@ from singularity.failure_analysis.analyzer import FailureAnalyzer
 from singularity.failure_analysis.request import FailureAnalysisRequest
 from singularity.planner import Planner
 from singularity.repair import RepairPlanner
+from singularity.utils.attributes import nested_getattr
 
 
 class FailureRecoveryCoordinator:
@@ -88,7 +89,7 @@ class FailureRecoveryCoordinator:
                 return None
             self.failure_analysis_snapshots[request.fingerprint] = snapshot
             decision = planner.replan(signal_payload)
-            if getattr(getattr(decision, "decision", None), "value", "") == "ask_user":
+            if nested_getattr(decision, "decision.value", default="") == "ask_user":
                 return ExecutionOutcome(
                     status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
                     source="failure_analysis",
@@ -126,7 +127,7 @@ class FailureRecoveryCoordinator:
             return self.repair_planner.blocked_outcome(repair_plan)
         self.failure_replan_signals[request.fingerprint] = replan_signal_payload
         decision = planner.replan(replan_signal_payload)
-        if getattr(getattr(decision, "decision", None), "value", "") == "ask_user":
+        if nested_getattr(decision, "decision.value", default="") == "ask_user":
             return ExecutionOutcome(
                 status=ExecutionOutcomeStatus.USER_INPUT_REQUIRED,
                 source="failure_analysis",
@@ -155,7 +156,7 @@ class FailureRecoveryCoordinator:
     ) -> bool:
         missing = sorted(str(item) for item in outcome.missing_evidence)
         key = json.dumps({"missing": missing}, ensure_ascii=False, sort_keys=True)
-        phase = getattr(getattr(planner, "state", None), "current_phase", "")
+        phase = nested_getattr(planner, "state.current_phase", default="")
         snapshot = self.evidence_snapshot(planner)
         previous = self.completion_rejection_state.get("latest")
         if not previous or previous.get("key") != key:

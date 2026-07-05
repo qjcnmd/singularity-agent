@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
 from singularity.kernel.models import (
@@ -11,6 +10,7 @@ from singularity.kernel.models import (
     RunStatus,
     SessionStatus,
 )
+from singularity.utils.serialization import utc_iso_timestamp
 
 
 class RunLifecycleManager:
@@ -116,5 +116,4 @@ class RunLifecycleManager:
         return self.run
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp

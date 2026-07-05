@@ -14,6 +14,7 @@ from singularity.tools.models import (
     ToolSideEffectKind,
     ToolSpec,
 )
+from singularity.tools.openai_schema import tool_schema_to_openai
 
 
 class ToolRegistry:
@@ -97,8 +98,6 @@ class ToolRegistry:
         ]
 
     def to_openai_tools(self, *, strict: bool = False) -> builtins.list[dict[str, Any]]:
-        from singularity.model.openai_format import tool_schema_to_openai
-
         return [
             tool_schema_to_openai(tool, strict=strict)
             for tool in self.schema_export(strict=strict)

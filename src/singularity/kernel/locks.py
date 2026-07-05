@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from singularity.kernel.exceptions import WorkspaceLockError
+from singularity.utils.serialization import utc_iso_timestamp
 
 GUARD_ACQUIRE_TIMEOUT_SECONDS = 5.0
 GUARD_RETRY_INTERVAL_SECONDS = 0.01
@@ -242,5 +243,4 @@ def _pid_exists(pid: Any) -> bool:
     return True
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp

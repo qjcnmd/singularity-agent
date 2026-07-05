@@ -374,6 +374,6 @@ def test_agent_run_does_not_manually_loop_tool_calls() -> None:
     assert "ToolProtocolEngine(" not in source
     assert "PromptAssemblyPipeline(" not in source
     assert "_turn_coordinator()" in source
-    assert "self.tool_protocol" in turn_source
+    assert "self.dependencies.tool_protocol" in turn_source
     assert "process_model_turn" in turn_source
     assert "callbacks=" in inspect.getsource(AgentLoop._turn_coordinator)

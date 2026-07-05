@@ -7,6 +7,8 @@ from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
 
+from singularity.utils.serialization import coerce_enum_name
+
 
 class PermissionProfileName(StrEnum):
     READ_ONLY = "read-only"
@@ -263,13 +265,11 @@ _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
 def _enum(enum_type: type[_EnumT], value: _EnumT | str) -> _EnumT:
-    if isinstance(value, enum_type):
-        return value
-    text = str(value)
-    try:
-        return enum_type[text.upper().replace("-", "_")]
-    except KeyError:
-        return enum_type(text)
+    return coerce_enum_name(
+        enum_type,
+        value,
+        name_normalizer=lambda text: text.upper().replace("-", "_"),
+    )
 
 
 def _normalized_paths(values: tuple[Path | str, ...]) -> tuple[Path, ...]:

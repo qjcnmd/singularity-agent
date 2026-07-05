@@ -9,7 +9,11 @@ from rich.console import Console
 
 from singularity.agent_loop_completion import CompletionGate
 from singularity.agent_loop_failure_recovery import FailureRecoveryCoordinator
-from singularity.agent_loop_turns import TurnCoordinator, TurnCoordinatorCallbacks
+from singularity.agent_loop_turns import (
+    TurnCoordinator,
+    TurnCoordinatorCallbacks,
+    TurnRuntimeDependencies,
+)
 from singularity.context import ContextManager
 from singularity.error_codes import ErrorCode
 from singularity.execution_outcome import ExecutionOutcome, ExecutionOutcomeStatus
@@ -185,10 +189,12 @@ class AgentLoop:
             return coordinator
         coordinator = TurnCoordinator(
             trace=self.trace,
-            model_runner=self.model_runner,
-            tools=self.tools,
-            tool_executor=self.tool_executor,
-            tool_protocol=self.tool_protocol,
+            dependencies=TurnRuntimeDependencies(
+                model_runner=self.model_runner,
+                tools=self.tools,
+                tool_executor=self.tool_executor,
+                tool_protocol=self.tool_protocol,
+            ),
             prompt_assembly=self.prompt_assembly,
             strict=self.strict,
             callbacks=TurnCoordinatorCallbacks(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +33,7 @@ from singularity.policy import (
 from singularity.policy.audit import redact
 from singularity.repair import RepairPlanner
 from singularity.utils.attributes import nested_getattr
+from singularity.utils.serialization import utc_iso_timestamp
 from singularity.verification.assessor import CompletionAssessor
 from singularity.verification.discovery import ProjectDetector
 from singularity.verification.failure_analysis import FailureAnalysisPipeline
@@ -1267,8 +1267,7 @@ def _excerpt(output: str, limit: int = 1200) -> str:
     return f"{output[:head]}{marker}{output[-tail:]}"
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp
 
 
 def _policy_error_code(outcome: DecisionOutcome) -> str:

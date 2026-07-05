@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import time
@@ -53,6 +52,7 @@ from singularity.observability.models import (
     TraceSeverity,
 )
 from singularity.tools.registry import ToolRegistry
+from singularity.utils.serialization import stable_hash_text
 
 SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}\b"),
@@ -1010,8 +1010,7 @@ def _latency_ms(started: float) -> int:
     return max(0, int((time.perf_counter() - started) * 1000))
 
 
-def _hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+_hash_text = stable_hash_text
 
 
 def _secret_like_pattern(text: str) -> re.Pattern[str] | None:

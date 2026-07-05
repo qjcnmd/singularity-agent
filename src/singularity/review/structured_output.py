@@ -30,6 +30,7 @@ from singularity.model.models import (
     ToolChoiceMode,
     ToolChoicePolicy,
 )
+from singularity.utils.attributes import nested_getattr
 
 OUTPUT_MODE_STRUCTURED = "structured_output"
 OUTPUT_MODE_TOOL = "forced_tool_call"
@@ -305,7 +306,7 @@ def _payload_from_result(result: Any, *, mode: str, tool_name: str) -> dict[str,
                 raise ToolCallParseError("forced tool calling arguments were not a JSON object")
             return raw_payload
         return dict(call.arguments)
-    text = getattr(getattr(result, "assistant_message", None), "text", "") or ""
+    text = nested_getattr(result, "assistant_message.text", default="") or ""
     return _load_json_object(text)
 
 

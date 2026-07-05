@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from typing import Any
 
 from singularity.model.messages import MessageConverter
@@ -65,21 +64,6 @@ def model_tool_to_openai(
     }
     strict_value = bool(tool.metadata.get("strict")) if strict is None else strict
     if strict_value:
-        function["strict"] = True
-    return {"type": "function", "function": function}
-
-
-def tool_schema_to_openai(
-    tool: Mapping[str, Any],
-    *,
-    strict: bool = False,
-) -> dict[str, Any]:
-    function: dict[str, Any] = {
-        "name": str(tool["name"]),
-        "description": str(tool.get("description") or ""),
-        "parameters": dict(tool.get("input_schema") or {}),
-    }
-    if strict:
         function["strict"] = True
     return {"type": "function", "function": function}
 

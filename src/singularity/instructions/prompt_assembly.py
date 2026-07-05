@@ -19,6 +19,7 @@ from singularity.instructions.resolver import InstructionResolver
 from singularity.instructions.sources import InstructionSourceCollector
 from singularity.model.models import ModelPurpose
 from singularity.observability.models import TraceArtifactKind, TraceEventType, TraceSeverity, TraceStatus
+from singularity.utils.serialization import stable_hash_text
 
 
 class PromptAssemblySummary(TypedDict):
@@ -251,11 +252,7 @@ class PromptAssemblyPipeline:
                 ),
             )
 
-    @staticmethod
-    def _hash_text(text: str) -> str:
-        import hashlib
-
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    _hash_text = staticmethod(stable_hash_text)
 
     def _emit_bundle_events(
         self,

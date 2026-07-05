@@ -5,10 +5,15 @@ from enum import StrEnum
 from pathlib import Path
 
 from singularity.utils.serialization import (
+    coerce_dict,
+    coerce_float,
+    coerce_int,
+    enum_value,
     stable_hash_bytes,
     stable_hash_text,
     to_plain_data,
-    utc_timestamp,
+    utc_iso_timestamp,
+    utc_z_timestamp,
 )
 
 
@@ -40,10 +45,19 @@ def test_to_plain_data_handles_nested_runtime_values() -> None:
 
 
 def test_utc_timestamp_uses_utc_z_suffix() -> None:
-    assert utc_timestamp().endswith("Z")
+    assert utc_z_timestamp().endswith("Z")
+    assert "+00:00" in utc_iso_timestamp()
 
 
 def test_stable_hash_text_is_deterministic() -> None:
     assert stable_hash_text("same text") == stable_hash_text("same text")
     assert stable_hash_text("same text") != stable_hash_text("other text")
     assert stable_hash_bytes(b"same text") == stable_hash_text("same text")
+
+
+def test_enum_value_and_coercion_helpers_preserve_existing_defaults() -> None:
+    assert enum_value(_Status.READY) == "ready"
+    assert enum_value("ready") == "ready"
+    assert coerce_int("bad") == 0
+    assert coerce_float("bad") == 0.0
+    assert coerce_dict({"a": 1}, "payload") == {"a": 1}

@@ -15,6 +15,7 @@ from singularity.release.models import (
     read_json,
 )
 from singularity.release.paths import UserDataPaths
+from singularity.utils.serialization import utc_iso_timestamp
 
 MigrationFn = Callable[[UserDataPaths], None]
 
@@ -110,5 +111,4 @@ MIGRATIONS = [
 ]
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -28,6 +27,7 @@ from singularity.policy.operator_key import (
     sign_grant,
     verify_grant_signature,
 )
+from singularity.utils.serialization import utc_iso_timestamp
 
 REQUEST_SCHEMA = "singularity.remote_approval_request/v1"
 GRANT_SCHEMA = "singularity.remote_approval_grant/v1"
@@ -433,5 +433,4 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     )
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp

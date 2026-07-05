@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
 from singularity.release.metadata import package_version
@@ -12,6 +11,7 @@ from singularity.release.models import (
     read_json,
 )
 from singularity.release.paths import UserDataPaths
+from singularity.utils.serialization import utc_iso_timestamp
 
 
 def initialize_user_data(paths: UserDataPaths, *, force: bool = False) -> dict[str, Any]:
@@ -83,5 +83,4 @@ def validate_config(payload: dict[str, Any]) -> list[str]:
     return issues
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp

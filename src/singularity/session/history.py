@@ -11,6 +11,7 @@ from singularity.planner.store import PlannerStore
 from singularity.session.models import SessionCheckpointKind, SessionResumeContext
 from singularity.session.store import SessionStore
 from singularity.tool_protocol.recovery import ToolProtocolRecoveryManager
+from singularity.utils.attributes import nested_getattr
 from singularity.workspace_state import WorkspaceHealthReport
 
 
@@ -306,7 +307,11 @@ def _safe_dialogue(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
 def _safe_context_item_dialogue(items: list[Any]) -> list[dict[str, str]]:
     dialogue: list[dict[str, str]] = []
     for item in items:
-        item_type = getattr(getattr(item, "item_type", None), "value", getattr(item, "item_type", ""))
+        item_type = nested_getattr(
+            item,
+            "item_type.value",
+            default=getattr(item, "item_type", ""),
+        )
         content = getattr(item, "content", None)
         if item_type == "user_message":
             text = _content_text(content)

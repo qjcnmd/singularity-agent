@@ -64,7 +64,13 @@ from singularity.observability.redaction import TraceRedactor, shared_trace_reda
 from singularity.redaction import RedactionProvider
 from singularity.runtime.resources import close_runtime_resources
 from singularity.utils.attributes import nested_getattr
-from singularity.utils.serialization import stable_hash_bytes, stable_hash_payload, stable_hash_text, utc_timestamp
+from singularity.utils.serialization import (
+    coerce_dict,
+    stable_hash_bytes,
+    stable_hash_payload,
+    stable_hash_text,
+    utc_timestamp,
+)
 
 EVALUATION_METRICS_SCHEMA_VERSION = "evaluation.metrics/v1"
 
@@ -129,6 +135,21 @@ class EvaluationRunner:
             current_run_id=self.run_id,
             baseline_result_path=self.baseline_result_path,
         )
+        payload = self._run_payload(
+            results=results,
+            started=started,
+            previous=previous,
+        )
+        self._write_run_reports(payload)
+        return payload
+
+    def _run_payload(
+        self,
+        *,
+        results: list[EvaluationTaskResult],
+        started: float,
+        previous: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         payload = {
             "schema_version": EVALUATION_RESULT_SCHEMA_VERSION,
             "run_id": self.run_id,
@@ -139,25 +160,14 @@ class EvaluationRunner:
         }
         if previous:
             payload["regression"] = compare_evaluation_results(previous, payload)
+        return payload
+
+    def _write_run_reports(self, payload: dict[str, Any]) -> None:
         result_path = self.run_dir / "result.json"
         report_path = self.run_dir / "report.json"
         markdown_path = self.run_dir / "report.md"
-        regression = payload.get("regression")
-        regression_artifact_path: Path | None = None
-        if isinstance(regression, dict):
-            regression_path = self.run_dir / "regression.json"
-            regression_artifact_path = regression_path
-            regression_md_path = self.run_dir / "regression.md"
-            regression_path.write_text(
-                json.dumps(regression, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            regression_md_path.write_text(
-                evaluation_regression_markdown(regression),
-                encoding="utf-8",
-            )
-            payload["regression_path"] = str(regression_path)
-            payload["regression_markdown_path"] = str(regression_md_path)
+        regression_artifact_path = self._write_regression_artifacts(payload)
+
         from singularity.evaluation.failure_case_replay import FailureCaseReplayRunner
 
         failure_cases_path = self.run_dir / "failure_cases.json"
@@ -170,16 +180,28 @@ class EvaluationRunner:
         payload["result_path"] = str(result_path)
         payload["report_path"] = str(report_path)
         payload["markdown_path"] = str(markdown_path)
-        result_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        report_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        result_path.write_text(serialized, encoding="utf-8")
+        report_path.write_text(serialized, encoding="utf-8")
         markdown_path.write_text(evaluation_report_markdown(payload), encoding="utf-8")
-        return payload
+
+    def _write_regression_artifacts(self, payload: dict[str, Any]) -> Path | None:
+        regression = payload.get("regression")
+        if not isinstance(regression, dict):
+            return None
+        regression_path = self.run_dir / "regression.json"
+        regression_md_path = self.run_dir / "regression.md"
+        regression_path.write_text(
+            json.dumps(regression, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        regression_md_path.write_text(
+            evaluation_regression_markdown(regression),
+            encoding="utf-8",
+        )
+        payload["regression_path"] = str(regression_path)
+        payload["regression_markdown_path"] = str(regression_md_path)
+        return regression_path
 
     def run_task(self, task: EvaluationTask, *, manifest_base: Path) -> EvaluationTaskResult:
         started = time.perf_counter()
@@ -4851,8 +4873,10 @@ def _normalize_allowed(path: str) -> str:
 
 
 def _dict(value: Any, field_name: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError(f"evaluation {field_name} must be an object.")
-    return dict(value)
+    return coerce_dict(
+        value,
+        field_name,
+        error_message=f"evaluation {field_name} must be an object.",
+    )
 
 

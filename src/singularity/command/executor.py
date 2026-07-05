@@ -4,7 +4,6 @@ import hashlib
 import os
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -67,6 +66,7 @@ from singularity.sandbox import (
 )
 from singularity.sandbox.models import new_sandbox_id
 from singularity.utils.attributes import nested_getattr
+from singularity.utils.serialization import utc_iso_timestamp
 
 if TYPE_CHECKING:
     from singularity.workspace_state import WorkspaceStateManager
@@ -1529,8 +1529,7 @@ class CommandExecutor:
         )
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+_now = utc_iso_timestamp
 
 
 def _relative_or_absolute(path: Path, root: Path) -> str:

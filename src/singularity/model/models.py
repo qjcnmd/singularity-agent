@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, is_dataclass
-from enum import Enum, StrEnum
+from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 from uuid import uuid4
+
+from singularity.utils.serialization import to_plain_data
 
 
 class SerializableDataclass:
@@ -305,16 +307,7 @@ class ModelTurnResult(SerializableDataclass):
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def _to_plain(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    if is_dataclass(value) and not isinstance(value, type):
-        return {key: _to_plain(item) for key, item in asdict(value).items()}
-    if isinstance(value, list):
-        return [_to_plain(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _to_plain(item) for key, item in value.items()}
-    return value
+_to_plain = to_plain_data
 
 
 def _content_blocks_from_payload(content: Any) -> list[ContentBlock]:

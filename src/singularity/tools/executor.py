@@ -37,6 +37,7 @@ from singularity.tools.models import (
 )
 from singularity.tools.policy import ToolPolicy
 from singularity.tools.registry import ToolRegistry
+from singularity.utils.attributes import nested_getattr
 
 _ExecutionPipelineState = ToolExecutionPipelineState
 
@@ -470,7 +471,7 @@ class ToolExecutor:
         resolved_ids = {
             "session_id": getattr(self.planner, "session_id", None),
             "task_id": getattr(self.planner, "task_id", None),
-            "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+            "phase_id": nested_getattr(self.planner, "state.current_phase"),
         }
         resolved_ids.update(ids or {})
         self.trace.emit(

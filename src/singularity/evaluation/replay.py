@@ -11,6 +11,7 @@ from singularity.evaluation.models import (
     canonical_json,
 )
 from singularity.observability.models import TraceEvent, TraceEventType
+from singularity.utils.serialization import coerce_float, coerce_int
 
 SIDE_EFFECT_EVENT_TYPES = {
     TraceEventType.COMMAND_STARTED.value,
@@ -220,15 +221,7 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _safe_int(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
+_safe_int = coerce_int
 
 
-def _safe_float(value: Any) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+_safe_float = coerce_float
