@@ -1,6 +1,6 @@
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AppEvent, InitializeParams, ItemKind, JsonRpcMessage, Method, ThreadIdParams,
+    AppEvent, ArtifactRef, InitializeParams, ItemKind, JsonRpcMessage, Method, ThreadIdParams,
     ThreadStartParams, TraceListParams, TraceShowParams, TraceTailParams, TurnIdParams,
     TurnStartParams,
 };
@@ -110,7 +110,9 @@ fn protocol_v1_id_params_are_camel_case_on_wire() {
     );
     assert_eq!(
         serde_json::to_value(TraceListParams {
-            run_id: "run_1".to_string()
+            run_id: "run_1".to_string(),
+            limit: None,
+            offset: None
         })
         .unwrap(),
         serde_json::json!({"runId": "run_1"})
@@ -142,4 +144,27 @@ fn item_kind_uses_codex_style_wire_names() {
         serde_json::to_value(ItemKind::McpToolCall).unwrap(),
         "mcpToolCall"
     );
+}
+
+#[test]
+fn artifact_ref_uses_camel_case_wire_ids_and_redaction_marker() {
+    let artifact = ArtifactRef {
+        artifact_id: "artifact_1".to_string(),
+        run_id: "run_1".to_string(),
+        item_id: Some("item_1".to_string()),
+        kind: "file".to_string(),
+        uri: "artifact://run_1/result.txt".to_string(),
+        content_digest: "sha256:abc".to_string(),
+        summary: "short result".to_string(),
+        metadata: serde_json::json!({"bytes": 12}),
+        redacted: true,
+    };
+
+    let value = serde_json::to_value(artifact).expect("serialize artifact");
+
+    assert_eq!(value["artifactId"], "artifact_1");
+    assert_eq!(value["runId"], "run_1");
+    assert_eq!(value["itemId"], "item_1");
+    assert_eq!(value["contentDigest"], "sha256:abc");
+    assert!(value.get("artifact_id").is_none());
 }

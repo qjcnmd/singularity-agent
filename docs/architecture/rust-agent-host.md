@@ -18,7 +18,7 @@
 
 `crates/protocol` 定义 JSON-RPC envelope、method params/result、`Thread`、`Turn`、`Item`、`TraceEvent` 和 app-server event。JSON-RPC params 使用 camelCase，例如 `clientInfo`、`threadId`、`turnId`、`runId`、`eventId`；嵌入领域对象继续使用当前 Python parity schema 的 snake_case。
 
-`crates/store` 是 SQLite-backed persistence boundary。它持久化 thread、turn、item、trace event 和 approval pending/decision；`SessionStoreDescriptor` 负责可序列化 store schema 描述，真实 `SessionStore` 持有 SQLite connection。
+`crates/store` 是 SQLite-backed persistence boundary。它持久化 thread、turn、item、trace event、artifact reference、pending approval、approval decision ledger 和 `schema_migrations`；`SessionStoreDescriptor` 负责可序列化 store schema 描述，真实 `SessionStore` 持有 SQLite connection。会一次创建多行 durable state 的 app-server 动作通过 store 事务提交，例如 thread + trace、turn + input item + trace、approval request + trace、approval decision + ledger + trace。
 
 `crates/app-server` 实现 `initialize` / `initialized` handshake、thread list/read/start/resume/fork/archive/delete、turn start/interrupt/status、approval list/request/decision、trace list/show/tail 和 `server/shutdown`。`turn/start` 明确写入 `agent_loop_status = "not_migrated"`，不伪装 Python AgentLoop 已完成迁移；item streaming 使用 `item/agentMessage/delta` 和 `item/commandExecution/outputDelta` 这类 typed delta，不再使用 generic `item/delta`。
 
@@ -62,13 +62,11 @@ python -m singularity.cli eval run docs/evaluation/public-representative-task.js
 
 下一阶段应按风险和边界厚度迁移：
 
-1. trace event append/list/show 与 artifact reference。
-2. approval pending store、decision ledger 和 policy projection。
-3. tool registry / tool observation / safe model payload。
-4. command request/result 与 sandbox capability contract。
-5. model turn request/response adapter。
-6. app-server client lifecycle 和 CLI/TUI 子进程管理。
-7. 最后才迁移 AgentLoop orchestration。
+1. tool registry / tool observation / safe model payload。
+2. command request/result 与 sandbox capability contract。
+3. model turn request/response adapter。
+4. app-server client lifecycle 和 CLI/TUI 子进程管理。
+5. 最后才迁移 AgentLoop orchestration。
 
 ## 维护规则
 

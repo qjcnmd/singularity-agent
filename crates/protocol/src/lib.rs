@@ -348,6 +348,10 @@ pub struct ApprovalListResult {
 pub struct TraceListParams {
     #[serde(rename = "runId")]
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -366,6 +370,23 @@ pub struct TraceTailParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TraceListResult {
     pub events: Vec<TraceEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactRef {
+    #[serde(rename = "artifactId")]
+    pub artifact_id: String,
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    #[serde(rename = "itemId", skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    pub kind: String,
+    pub uri: String,
+    #[serde(rename = "contentDigest")]
+    pub content_digest: String,
+    pub summary: String,
+    pub metadata: Value,
+    pub redacted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

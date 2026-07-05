@@ -129,6 +129,17 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         trace_tail[0]["result"]["events"].as_array().unwrap().len(),
         1
     );
+    let empty_trace_page = server
+        .handle_json(&format!(
+            r#"{{"method":"trace/list","id":81,"params":{{"runId":"{thread_id}","limit":1,"offset":99}}}}"#
+        ))
+        .unwrap();
+    assert!(
+        empty_trace_page[0]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     let archived = server
         .handle_json(&format!(
@@ -208,4 +219,41 @@ fn approval_decisions_consume_pending_requests_once_for_all_outcomes() {
             "Pending approval not found"
         );
     }
+}
+
+#[test]
+fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut server = AppServer::new(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    let missing_turn_thread = server
+        .handle_json(
+            r#"{"method":"turn/start","id":2,"params":{"threadId":"missing","input":[{"type":"text","text":"hello"}]}}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        missing_turn_thread[0]["error"]["message"],
+        "Thread not found"
+    );
+
+    let request = ApprovalRequest::new("approval_duplicate", "session_1", "task_1", "write_file");
+    let request_message = serde_json::json!({
+        "method": "approval/request",
+        "id": 3,
+        "params": request,
+    });
+    server
+        .handle_json(&request_message.to_string())
+        .expect("first approval request");
+    let duplicate = server.handle_json(&request_message.to_string()).unwrap();
+
+    assert_eq!(duplicate[0]["error"]["code"], -32600);
+    assert_eq!(duplicate[0]["error"]["message"], "Approval already exists");
 }

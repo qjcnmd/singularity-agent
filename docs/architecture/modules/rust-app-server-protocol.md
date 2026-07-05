@@ -40,6 +40,7 @@
 - TraceShowParams
 - TraceTailParams
 - TraceListResult
+- ArtifactRef
 - TraceEvent
 - AppEvent
 - PermissionProfile
@@ -85,10 +86,11 @@
 - Item: item_id, turn_id, kind, payload, status
 - TurnResult: turn
 - TurnInterruptResult: turn_id, status
-- TraceListParams: run_id
+- TraceListParams: run_id, limit, offset
 - TraceShowParams: event_id
 - TraceTailParams: run_id, limit
 - TraceListResult: events
+- ArtifactRef: artifact_id, run_id, item_id, kind, uri, content_digest, summary, metadata, redacted
 - TraceEvent: event_id, event_type, run_id, session_id, task_id, phase_id, action_id, parent_event_id, timestamp, monotonic_ms, component, severity, summary, payload, artifact_refs, policy_decision_id, approval_grant_id, sandbox_id, command_id, transaction_id, verification_id, span_id, redaction_applied, payload_hash
 - AppEvent: method, params
 - PermissionProfile: profile, workspace_roots, additional_writable_directories, network_access, approval_policy, protected_paths_enforced
@@ -129,15 +131,15 @@ Rust App Server Protocol 层建立第一阶段迁移的硬边界：客户端只�
 
 ## 关键类、函数、字段
 
-`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item` 和 `TraceEvent` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 M1 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。
+`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item`、`TraceEvent` 和 `ArtifactRef` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。
 
 ## 真实运行时调用链
 
-`singularity-rs protocol-init` / `singularity-rs thread-start` -> `JsonRpcMessage::request()` 生成 JSON-RPC object -> client 通过 stdio JSONL 发送到 `singularity_app_server` -> `AppServer.handle_json()` -> `AppServer.handle()` -> `SessionStore.create_thread()` / `list_threads()` / `get_thread()` / `update_thread_status()` / `delete_thread()` / `create_turn()` / `get_turn()` / `update_turn_status()` / `append_item()` / `append_trace()` / `create_approval()` / `list_pending_approvals()` / `record_approval_decision()` -> `JsonRpcMessage::response()` 或 `AppEvent.to_notification()` 输出 JSONL。`turn/start` 只调用 `AgentLoopBridge::not_migrated()`，不会进入 Python `AgentLoop.run()`，也不会把 turn 伪装成已完成真实 agent loop。
+`singularity-rs protocol-init` / `singularity-rs thread-start` -> `JsonRpcMessage::request()` 生成 JSON-RPC object -> client 通过 stdio JSONL 发送到 `singularity_app_server` -> `AppServer.handle_json()` -> `AppServer.handle()` -> `SessionStore.create_thread_with_trace()` / `create_turn_with_input_and_trace()` / `create_approval_with_trace()` / `record_approval_decision_with_trace()` 或 read/list/update helper -> `JsonRpcMessage::response()` 或 `AppEvent.to_notification()` 输出 JSONL。`turn/start` 只调用 `AgentLoopBridge::not_migrated()`，不会进入 Python `AgentLoop.run()`，也不会把 turn 伪装成已完成真实 agent loop。
 
 ## 真实任务中的对象流
 
-以 CLI client 启动一个 thread 并提交一条用户输入为例：`JsonRpcMessage::request(Method::Initialize, ...)` 生成 initialize 请求；`AppServer.handle_json()` 反序列化为 `JsonRpcMessage`，`InitializeParams` 校验 `clientInfo` 后返回 `InitializeResult`。client 再发送 `initialized` notification，连接进入 ready 状态。随后 `thread/start` 生成对象 `Thread` 并由 `SessionStore.create_thread()` 写入 SQLite `threads` 表，同时 `SessionStore.append_trace()` 写入 `trace_events` 表。`turn/start` 生成对象 `Turn` 和 user message `Item`，写入 `turns` / `items` / `trace_events`，并输出 `turn/started -> item/started -> item/agentMessage/delta -> item/completed` 通知。approval 流由 `approval/request` 写 pending row，`approval/decision` 只能消费 pending approval 一次，allow / deny / defer 都会写 trace；重复 decision 返回 `Pending approval not found`。
+以 CLI client 启动一个 thread 并提交一条用户输入为例：`JsonRpcMessage::request(Method::Initialize, ...)` 生成 initialize 请求；`AppServer.handle_json()` 反序列化为 `JsonRpcMessage`，`InitializeParams` 校验 `clientInfo` 后返回 `InitializeResult`。client 再发送 `initialized` notification，连接进入 ready 状态。随后 `thread/start` 生成对象 `Thread` 并由 `SessionStore.create_thread_with_trace()` 在同一个 SQLite transaction 中写入 `threads` 和 `trace_events`。`turn/start` 生成对象 `Turn` 和 user message `Item`，通过 `SessionStore.create_turn_with_input_and_trace()` 在一个 transaction 中写入 `turns` / `items` / `trace_events`，并输出 `turn/started -> item/started -> item/agentMessage/delta -> item/completed` 通知。approval 流由 `approval/request` 写 pending row 和 trace，`approval/decision` 只能消费 pending approval 一次，并在同一个 transaction 中写 `approvals` decision fields、`approval_decisions` ledger row 和 trace；重复 decision 返回 `Pending approval not found`。
 
 ## 真实对象完整结构
 
@@ -187,6 +189,18 @@ pub struct SessionStoreDescriptor {
     pub backend: String,
     pub path: String,
     pub schema_version: u32,
+}
+
+pub struct ArtifactRef {
+    pub artifact_id: String,
+    pub run_id: String,
+    pub item_id: Option<String>,
+    pub kind: String,
+    pub uri: String,
+    pub content_digest: String,
+    pub summary: String,
+    pub metadata: Value,
+    pub redacted: bool,
 }
 
 pub struct ApprovalRequest {
@@ -320,27 +334,27 @@ pub struct ModelTurnResponse {
 
 ## 谁生成这些对象
 
-`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` 生成 `Thread`；`SessionStore.create_turn()` 生成 `Turn`；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`ToolSpec::new()`、`ToolCallEnvelope::new()`、`ToolResult::success()`、`ToolObservation::summary()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()`、`CommandResult::completed()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object。
+`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` / `create_thread_with_trace()` 生成 `Thread`；`SessionStore.create_turn()` / `create_turn_with_input_and_trace()` 生成 `Turn`；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`SessionStore.register_artifact_ref()` 生成 `ArtifactRef`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`ToolSpec::new()`、`ToolCallEnvelope::new()`、`ToolResult::success()`、`ToolObservation::summary()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()`、`CommandResult::completed()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object。
 
 ## 谁消费这些对象
 
-`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、thread、turn、approval、trace handler；`SessionStore.create_thread()` / `create_turn()` / `append_item()` / `append_trace()` / `create_approval()` / `record_approval_decision()` 消费 protocol object 写 SQLite；`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification。CLI 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
+`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、thread、turn、approval、trace handler；`SessionStore.create_thread_with_trace()`、`create_turn_with_input_and_trace()`、`create_approval_with_trace()`、`record_approval_decision_with_trace()`、`append_trace()` 和 `register_artifact_ref()` 消费 protocol object 写 SQLite；`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification。CLI 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
 ## 是否落盘
 
-`SessionStore.open()` 初始化 SQLite 文件；`threads`、`turns`、`items`、`trace_events` 和 `approvals` 表是真实落盘点。thread read/list/resume/archive/delete 和 turn status/interrupt 读取或更新这些现有表；M1 还没有引入 M2 的 migration table、artifact store 或独立 approval ledger crate。`approval/request` 写 pending approval，`approval/list` 读取未决 approval，`approval/decision` 更新同一 row 的 decision fields；trace/list、trace/show 和 trace/tail 都从 SQLite `trace_events` 查询真实 events。`target/` 是 Rust build output，被 `.gitignore` 排除。
+`SessionStore.open()` 初始化 SQLite 文件并确保 `schema_migrations` 记录 `0001_initial_session_store` 和 `0002_durable_ledger`；`threads`、`turns`、`items`、`trace_events`、`artifact_refs`、`approvals` 和 `approval_decisions` 表是真实落盘点。thread read/list/resume/archive/delete 和 turn status/interrupt 读取或更新这些现有表；`approval/request` 写 pending approval，`approval/list` 读取未决 approval，`approval/decision` 更新同一 row 的 decision fields 并写 `approval_decisions` ledger；trace/list 支持 `limit` / `offset` 分页，trace/show 和 trace/tail 都从 SQLite `trace_events` 查询真实 events。`target/` 是 Rust build output，被 `.gitignore` 排除。
 
 ## 是否进入 trace / audit
 
-`thread/start`、`turn/start`、`approval/request` 和 `approval/decision` 都通过 `SessionStore.append_trace()` 写 `TraceEvent`。Phase 1 Rust 层还没有 policy audit writer；完整 policy audit 仍由 Python `src/singularity/policy/audit.py` 保持 oracle。`ToolObservation.to_model_payload()` 明确不输出 `policy_decision_id`、`approval_grant_id`、raw arguments 或 internal metadata。
+`thread/start`、`turn/start`、`approval/request` 和 `approval/decision` 都写 `TraceEvent`，且由 store transaction 把对应业务 row 与 trace 一起提交或回滚。`ArtifactRef` 的 `summary` / `metadata` / `uri` 会对 secret-like marker 做本地 redaction 后落盘。Phase 1 Rust 层还没有 policy audit writer；完整 policy audit 仍由 Python `src/singularity/policy/audit.py` 保持 oracle。`ToolObservation.to_model_payload()` 明确不输出 `policy_decision_id`、`approval_grant_id`、raw arguments 或 internal metadata。
 
 ## 失败路径
 
-连接未完成 `initialize` 或未收到 `initialized` notification 前，业务 request 返回 `Not initialized`。同一连接重复 `initialize` 返回 `Already initialized`。未知 trace run 返回 `Trace run not found`，未知 event 返回 `Trace event not found`。approval decision 找不到 pending request 或重复消费时返回 `Pending approval not found`。SQLite 和 JSON 解析错误作为 app-server internal error 返回。
+连接未完成 `initialize` 或未收到 `initialized` notification 前，业务 request 返回 `Not initialized`。同一连接重复 `initialize` 返回 `Already initialized`。未知 thread / turn / trace run / trace event 分别返回 `Thread not found`、`Turn not found`、`Trace run not found`、`Trace event not found`。approval request 重复返回 `Approval already exists`；approval decision 找不到 pending request 或重复消费时返回 `Pending approval not found`。SQLite 和 JSON 解析错误作为 app-server internal error 返回。
 
 ## 当前结构问题
 
-Phase 1 没有迁移模型 provider、Windows sandbox backend、evaluation runner 或 Python AgentLoop；`AgentLoopBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。当前 CLI 是最小 JSON-RPC client，只生成 request，不管理长期 app-server 子进程生命周期。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
+Phase 1 没有迁移模型 provider、Windows sandbox backend、evaluation runner 或 Python AgentLoop；`AgentLoopBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。当前 CLI 是最小 JSON-RPC client，只生成 request，不管理长期 app-server 子进程生命周期。Artifact ref 目前只持久化引用和 redacted metadata，不负责 artifact bytes 管理。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
 
 ## 维护规则
 
