@@ -82,6 +82,7 @@
 - ContextAssemblyBoundary
 - ContextSummaryEnvelopeBoundary
 - ToolCallRepairBoundary
+- FinalizationMappingBoundary
 - PythonSidecarClient
 - PythonSidecarConfig
 - AppServer
@@ -157,6 +158,7 @@
 - ContextAssemblyBoundary: bundle_id, run_id, task_id, phase_id, model, provider, messages, included_item_ids, excluded_item_ids, budget, compression_snapshot_id, retrieval_query, render_policy, created_at, bundle_digest, metadata
 - ContextSummaryEnvelopeBoundary: version, summary_id, summary_payload, source_item_ids, cache_attribution, previous_summary_digest, summary_digest, rendered_summary, created_at, metadata
 - ToolCallRepairBoundary: repair_id, run_id, session_id, task_id, phase_id, failed_tool_call_id, failure_kind, next_action, failed_result, recovery_report, repair_contract, created_at, metadata
+- FinalizationMappingBoundary: mapping_id, run_id, session_id, task_id, phase_id, agent_loop_status, run_status, final_report_status, completion_status, final_answer, final_report, completion_assessment, contract_satisfaction, created_at, metadata
 - PythonSidecarConfig: python_bin, module, project_root, python_path, env
 - AppServer: store, initialized, initialized_acknowledged, python_sidecar
 
@@ -179,7 +181,7 @@ Rust App Server Protocol 层建立第一阶段迁移的硬边界：客户端只�
 
 ## 关键类、函数、字段
 
-`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item`、`TraceEvent` 和 `ArtifactRef` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolRegistry`、`ToolBroker`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`PermissionRequest`、`PermissionRule`、`PermissionDecision`、`PreToolUseHook`、`PolicyEngine`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`CommandExecutor`、`PatchChange`、`PatchResult`、`PatchExecutor`、`ModelToolSchema`、`ModelToolCall`、`ModelCapabilities`、`ModelProviderConfig`、`ModelValidationResult`、`ModelError`、`ProviderStreamEvent`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object 与最小执行边界。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AgentLoopStatusBridge` 表示 Rust host 对 AgentLoop 状态的显式理解：默认 `not_migrated`，或由 Python sidecar 返回 completed/blocked/cancelled/failed。`PlannerStateBoundary`、`ContextAssemblyBoundary`、`ContextSummaryEnvelopeBoundary` 和 `ToolCallRepairBoundary` 是 M9 schema/parity contract，只用于 Python oracle JSON roundtrip，不执行 provider、工具、repair planner 或 workspace mutation。repair runtime 和 finalization mapping 仍是后续独立切片。`PythonSidecarClient` 是 Rust host 到 Python migration sidecar 的 stdio JSON-RPC client。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。`AppServerClient` 是 `sg` 内部 stdio JSON-RPC client，不暴露 store 或 agent internals。
+`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item`、`TraceEvent` 和 `ArtifactRef` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolRegistry`、`ToolBroker`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`PermissionRequest`、`PermissionRule`、`PermissionDecision`、`PreToolUseHook`、`PolicyEngine`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`CommandExecutor`、`PatchChange`、`PatchResult`、`PatchExecutor`、`ModelToolSchema`、`ModelToolCall`、`ModelCapabilities`、`ModelProviderConfig`、`ModelValidationResult`、`ModelError`、`ProviderStreamEvent`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object 与最小执行边界。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AgentLoopStatusBridge` 表示 Rust host 对 AgentLoop 状态的显式理解：默认 `not_migrated`，或由 Python sidecar 返回 completed/blocked/cancelled/failed。`PlannerStateBoundary`、`ContextAssemblyBoundary`、`ContextSummaryEnvelopeBoundary`、`ToolCallRepairBoundary` 和 `FinalizationMappingBoundary` 是 M9 schema/parity contract，只用于 Python oracle JSON roundtrip，不执行 provider、工具、repair planner、finalizer 或 workspace mutation。finalization runtime 仍是后续独立切片。`PythonSidecarClient` 是 Rust host 到 Python migration sidecar 的 stdio JSON-RPC client。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。`AppServerClient` 是 `sg` 内部 stdio JSON-RPC client，不暴露 store 或 agent internals。
 
 ## 真实运行时调用链
 
@@ -551,9 +553,9 @@ pub struct PythonSidecarConfig {
 }
 ```
 
-### M9 planner/context/compaction parity contract
+### M9 planner/context/compaction/repair/finalization parity contract
 
-这些对象属于 Rust `crates/agent` 的 schema/parity boundary，不属于 app-server runtime execution。它们只镜像 Python oracle fixture 中已经存在的 planner state、context bundle、context summary envelope 与 tool-call repair contract 安全字段，用于 JSON roundtrip 和 schema generation。默认 `turn/start` 仍使用 `AgentLoopStatusBridge::not_migrated()`。repair planner runtime、execution outcome 和 finalization mapping 不在当前切片内。
+这些对象属于 Rust `crates/agent` 的 schema/parity boundary，不属于 app-server runtime execution。它们只镜像 Python oracle fixture 中已经存在的 planner state、context bundle、context summary envelope、tool-call repair contract 与 finalization mapping 安全字段，用于 JSON roundtrip 和 schema generation。默认 `turn/start` 仍使用 `AgentLoopStatusBridge::not_migrated()`。repair planner runtime、completion gate runtime、finalizer runtime、execution outcome 和完整 AgentLoop 不在当前切片内。
 
 ```rust
 pub struct PlannerStateBoundary {
@@ -615,11 +617,29 @@ pub struct ToolCallRepairBoundary {
     pub created_at: String,
     pub metadata: Value,
 }
+
+pub struct FinalizationMappingBoundary {
+    pub mapping_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub phase_id: String,
+    pub agent_loop_status: String,
+    pub run_status: String,
+    pub final_report_status: String,
+    pub completion_status: String,
+    pub final_answer: String,
+    pub final_report: Value,
+    pub completion_assessment: Value,
+    pub contract_satisfaction: Value,
+    pub created_at: String,
+    pub metadata: Value,
+}
 ```
 
 ## 谁生成这些对象
 
-`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` / `create_thread_with_trace()` 生成 `Thread`；`SessionStore.create_turn()` / `create_turn_with_input_and_trace()` 生成 `Turn`；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`SessionStore.register_artifact_ref()` 生成 `ArtifactRef`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`PermissionRequest::new()` 只封装调用方传入的 resource，路径、命令和 host 归一化由 command/sandbox 或上层 tool boundary 负责；`PermissionRule::new()` 生成 declarative rule，`PermissionDecision::new()` 或 `PolicyEngine.evaluate()` 生成决策结果；`PythonSidecarClient.run_agent()` 从 Python sidecar 的 `agent/run` response 生成 `PythonSidecarRunResult`，再由 `AgentLoopStatusBridge::from_sidecar()` 生成 Rust host-facing status；`scripts/export_rust_parity_fixtures.py` 从 Python `PlannerState`、`ContextBundle`、`ContextSummaryEnvelope`、`ToolProtocolResultEnvelope`、`ToolProtocolRecoveryReport` 和 `RepairContract` 导出 M9 oracle JSON，Rust `PlannerStateBoundary` / `ContextAssemblyBoundary` / `ContextSummaryEnvelopeBoundary` / `ToolCallRepairBoundary` 只反序列化和 roundtrip 这些字段；`ToolSpec::new()`、`ToolBroker::register()`、`ToolCallEnvelope::new()`、`ToolResult::success()` / `failure()`、`ToolObservation::summary()` / `failed()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()` / `local_process()`、`git_status_request()` / `git_diff_request()`、`CommandResult::completed()` / `policy_denied()`、`CommandExecutor::new()`、`PatchChange::replace()` / `create()`、`PatchExecutor::new()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object 或最小执行边界对象。`validate_provider_config()` 只检查 provider/model/base_url/api_key presence；`classify_model_error()` 只把已归一化的 provider failure 映射为 Rust 模型边界 category；`validate_stream_events()` 和 `validate_model_response()` 只验证 streaming envelope、tool choice、tool-call parse status、allowed tool names 和 provider capability metadata，不执行工具或 provider call。`ToolRegistry.register()` 只接受 `builtin.*`、`mcp.<server>.<tool>` 和 `python.<plugin>.<tool>` 命名空间，并拒绝重复 name。
+`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` / `create_thread_with_trace()` 生成 `Thread`；`SessionStore.create_turn()` / `create_turn_with_input_and_trace()` 生成 `Turn`；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`SessionStore.register_artifact_ref()` 生成 `ArtifactRef`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`PermissionRequest::new()` 只封装调用方传入的 resource，路径、命令和 host 归一化由 command/sandbox 或上层 tool boundary 负责；`PermissionRule::new()` 生成 declarative rule，`PermissionDecision::new()` 或 `PolicyEngine.evaluate()` 生成决策结果；`PythonSidecarClient.run_agent()` 从 Python sidecar 的 `agent/run` response 生成 `PythonSidecarRunResult`，再由 `AgentLoopStatusBridge::from_sidecar()` 生成 Rust host-facing status；`scripts/export_rust_parity_fixtures.py` 从 Python `PlannerState`、`ContextBundle`、`ContextSummaryEnvelope`、`ToolProtocolResultEnvelope`、`ToolProtocolRecoveryReport`、`RepairContract`、`AgentLoopResult` 和 `FinalReport` 导出 M9 oracle JSON，Rust `PlannerStateBoundary` / `ContextAssemblyBoundary` / `ContextSummaryEnvelopeBoundary` / `ToolCallRepairBoundary` / `FinalizationMappingBoundary` 只反序列化和 roundtrip 这些字段；`ToolSpec::new()`、`ToolBroker::register()`、`ToolCallEnvelope::new()`、`ToolResult::success()` / `failure()`、`ToolObservation::summary()` / `failed()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()` / `local_process()`、`git_status_request()` / `git_diff_request()`、`CommandResult::completed()` / `policy_denied()`、`CommandExecutor::new()`、`PatchChange::replace()` / `create()`、`PatchExecutor::new()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object 或最小执行边界对象。`validate_provider_config()` 只检查 provider/model/base_url/api_key presence；`classify_model_error()` 只把已归一化的 provider failure 映射为 Rust 模型边界 category；`validate_stream_events()` 和 `validate_model_response()` 只验证 streaming envelope、tool choice、tool-call parse status、allowed tool names 和 provider capability metadata，不执行工具或 provider call。`ToolRegistry.register()` 只接受 `builtin.*`、`mcp.<server>.<tool>` 和 `python.<plugin>.<tool>` 命名空间，并拒绝重复 name。
 
 ## 谁消费这些对象
 
@@ -639,10 +659,10 @@ pub struct ToolCallRepairBoundary {
 
 ## 当前结构问题
 
-Phase 1 没有迁移模型 provider HTTP、Windows sandbox backend、evaluation runner 或 Rust native AgentLoop；`AgentLoopStatusBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。显式 Python sidecar 可以调用当前 Python AgentLoop 作为 migration reference，但 Rust 只负责 app-server 边界、状态翻译和安全 trace summary。M9 当前只加入 planner state、context assembly、compaction summary 与 tool-call repair deterministic boundary schema，尚未迁移 planner step、context assembler、compaction executor、failure analysis、repair planner、finalization mapping 或完整 `AgentLoop.run()`。当前 `ToolBroker` 是最小 Rust tool boundary：它验证工具命名、投影模型可见 schema、阻断 denied/unknown tool 执行并生成安全 observation；`PolicyEngine` 已提供 Rust 纯决策、hook 点、deny-first precedence、protected resource deny 和 approval ask/deny 投影；`PermissionProfile` 仍保留 profile schema 字段，但当前 Rust policy 不根据 workspace roots、network access 或 permission mode 自动推导 allow/deny；`CommandExecutor` / `PatchExecutor` 已提供最小 Rust side-effect boundary，但还没有接入 app-server、tool broker、Python AgentLoop 或完整 Windows sandbox backend。Rust `crates/model` 当前只拥有 model request/response schema、capability metadata、provider config presence check、stream envelope validation、model response/tool-call validation 和 provider failure classification；它没有 HTTP client、provider registry、retry loop、context compaction、planner repair 或 AgentLoop 逻辑。command resource normalization 位于 `CommandRequest.permission_resource()`，policy 不解析 shell wrapper；sandbox-required command 没有显式 backend 时 fail closed；git helpers 只生成 command request，不建立第二套 git wrapper。当前 `sg` 是最小 JSON-RPC client：可以启动 app-server 子进程并完成 run/continue/list/trace/approval 查询，但不管理长期后台 daemon 生命周期、PTY TUI 或交互式 approval prompt。Artifact ref 目前只持久化引用和 redacted metadata，不负责 artifact bytes 管理。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
+Phase 1 没有迁移模型 provider HTTP、Windows sandbox backend、evaluation runner 或 Rust native AgentLoop；`AgentLoopStatusBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。显式 Python sidecar 可以调用当前 Python AgentLoop 作为 migration reference，但 Rust 只负责 app-server 边界、状态翻译和安全 trace summary。M9 当前只加入 planner state、context assembly、compaction summary、tool-call repair 与 finalization mapping deterministic boundary schema，尚未迁移 planner step、context assembler、compaction executor、failure analysis、repair planner、completion gate runtime、finalizer runtime 或完整 `AgentLoop.run()`。当前 `ToolBroker` 是最小 Rust tool boundary：它验证工具命名、投影模型可见 schema、阻断 denied/unknown tool 执行并生成安全 observation；`PolicyEngine` 已提供 Rust 纯决策、hook 点、deny-first precedence、protected resource deny 和 approval ask/deny 投影；`PermissionProfile` 仍保留 profile schema 字段，但当前 Rust policy 不根据 workspace roots、network access 或 permission mode 自动推导 allow/deny；`CommandExecutor` / `PatchExecutor` 已提供最小 Rust side-effect boundary，但还没有接入 app-server、tool broker、Python AgentLoop 或完整 Windows sandbox backend。Rust `crates/model` 当前只拥有 model request/response schema、capability metadata、provider config presence check、stream envelope validation、model response/tool-call validation 和 provider failure classification；它没有 HTTP client、provider registry、retry loop、context compaction、planner repair 或 AgentLoop 逻辑。command resource normalization 位于 `CommandRequest.permission_resource()`，policy 不解析 shell wrapper；sandbox-required command 没有显式 backend 时 fail closed；git helpers 只生成 command request，不建立第二套 git wrapper。当前 `sg` 是最小 JSON-RPC client：可以启动 app-server 子进程并完成 run/continue/list/trace/approval 查询，但不管理长期后台 daemon 生命周期、PTY TUI 或交互式 approval prompt。Artifact ref 目前只持久化引用和 redacted metadata，不负责 artifact bytes 管理。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
 
 ## 维护规则
 
-新增 client 必须只依赖 protocol/core 层，不得直接耦合 agent/model/tools/store。新增 app-server 方法必须先在 `crates/protocol` 定义 request/response/event schema，再由 `crates/app-server` routing 和 `crates/store` persistence 接入。model boundary 只能增加与 Python `singularity.model` 对齐的 request/response/tool/stream/config schema 或纯验证函数；不得在 M8 引入 provider HTTP、provider registry、retry scheduler、planner repair、context manager 或 AgentLoop。M9 boundary 只能一次迁移一个 deterministic slice，并必须先更新 Python oracle fixture 和 Rust parity tests；不得把 `Planner`、`ContextManager`、compaction executor、repair planner runtime 或 tool repair loop runtime 一次性重写进 Rust。任何改变 thread/turn/item/approval/trace/model/agent-boundary wire format 的改动都必须更新 Rust tests、Python oracle fixture、本文档和 `docs/singularity.md` 的长期架构说明。
+新增 client 必须只依赖 protocol/core 层，不得直接耦合 agent/model/tools/store。新增 app-server 方法必须先在 `crates/protocol` 定义 request/response/event schema，再由 `crates/app-server` routing 和 `crates/store` persistence 接入。model boundary 只能增加与 Python `singularity.model` 对齐的 request/response/tool/stream/config schema 或纯验证函数；不得在 M8 引入 provider HTTP、provider registry、retry scheduler、planner repair、context manager 或 AgentLoop。M9 boundary 只能一次迁移一个 deterministic slice，并必须先更新 Python oracle fixture 和 Rust parity tests；不得把 `Planner`、`ContextManager`、compaction executor、repair planner runtime、tool repair loop runtime、completion gate runtime 或 finalizer runtime 一次性重写进 Rust。任何改变 thread/turn/item/approval/trace/model/agent-boundary wire format 的改动都必须更新 Rust tests、Python oracle fixture、本文档和 `docs/singularity.md` 的长期架构说明。
 
 M0 迁移 guardrail 由 `scripts/verify_rust_migration_boundaries.py` 自动检查并进入 CI。该脚本阻断 CLI 直接依赖 agent/model/tools/store、未登记的新 crate 依赖、Python core runtime 非 allowlist 改动、Python RuntimeHost 类过渡实现、desktop/Web 抢跑文件、`turn/start` 伪装 Rust AgentLoop 已迁移，以及 `ToolObservation.to_model_payload()` 泄漏 raw arguments、approval/policy 内部 id、internal metadata 或 secret-like 文本。

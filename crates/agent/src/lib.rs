@@ -221,6 +221,25 @@ pub struct ToolCallRepairBoundary {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct FinalizationMappingBoundary {
+    pub mapping_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub phase_id: String,
+    pub agent_loop_status: String,
+    pub run_status: String,
+    pub final_report_status: String,
+    pub completion_status: String,
+    pub final_answer: String,
+    pub final_report: Value,
+    pub completion_assessment: Value,
+    pub contract_satisfaction: Value,
+    pub created_at: String,
+    pub metadata: Value,
+}
+
 #[derive(Debug)]
 pub struct PythonSidecarClient {
     child: Child,

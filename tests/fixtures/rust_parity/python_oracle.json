@@ -209,6 +209,147 @@
     },
     "version": 1
   },
+  "finalization_mapping_boundary": {
+    "agent_loop_status": "completed",
+    "completion_assessment": {
+      "criteria": {
+        "verification": {
+          "description": "Public verification passed.",
+          "evidence": [
+            "verification_results"
+          ],
+          "missing_evidence": [],
+          "required": true,
+          "satisfied": true
+        }
+      },
+      "status": "completed",
+      "unmet": [],
+      "verification_contract_satisfaction": {
+        "completed_steps": [
+          "vstep_0"
+        ],
+        "contract_id": "verification_contract_1",
+        "failed_steps": [],
+        "reason": null,
+        "satisfied": true,
+        "skipped_steps": [],
+        "step_evidence": [
+          {
+            "artifact_ref": "artifact_verification_1",
+            "check_id": "check_1",
+            "command_id": "command_1",
+            "status": "passed",
+            "step_id": "vstep_0"
+          }
+        ]
+      }
+    },
+    "completion_status": "completed",
+    "contract_satisfaction": {
+      "completed_steps": [
+        "vstep_0"
+      ],
+      "contract_id": "verification_contract_1",
+      "failed_steps": [],
+      "reason": null,
+      "satisfied": true,
+      "skipped_steps": [],
+      "step_evidence": [
+        {
+          "artifact_ref": "artifact_verification_1",
+          "check_id": "check_1",
+          "command_id": "command_1",
+          "status": "passed",
+          "step_id": "vstep_0"
+        }
+      ]
+    },
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "final_answer": "status: completed\nfiles_changed: src/app.py\nverification: ready",
+    "final_report": {
+      "agent_changes": [],
+      "artifacts": [
+        "final_report.md",
+        "artifact_verification_1"
+      ],
+      "command_side_effects": [],
+      "component_health_summary": {},
+      "context_usage_diagnostic": {},
+      "contract_satisfaction": {
+        "completed_steps": [
+          "vstep_0"
+        ],
+        "contract_id": "verification_contract_1",
+        "failed_steps": [],
+        "reason": null,
+        "satisfied": true,
+        "skipped_steps": [],
+        "step_evidence": [
+          {
+            "artifact_ref": "artifact_verification_1",
+            "check_id": "check_1",
+            "command_id": "command_1",
+            "status": "passed",
+            "step_id": "vstep_0"
+          }
+        ]
+      },
+      "execution_trace_summary": {},
+      "failure_repair_summary": {},
+      "files_changed": [
+        "src/app.py"
+      ],
+      "instruction_prompt_summary": {},
+      "lifecycle_summary": {},
+      "model_usage_summary": {},
+      "next_steps": [],
+      "policy_approval_summary": {
+        "approved": 1,
+        "denied": 0
+      },
+      "recovery_summary": {},
+      "review_summary": {},
+      "risks": [],
+      "rollback_status": {
+        "available": true,
+        "changed_files": [
+          "src/app.py"
+        ],
+        "changesets": [
+          "changeset_1"
+        ],
+        "rollback_refs": [
+          "transaction:transaction_1"
+        ],
+        "transactions": [
+          "transaction_1"
+        ],
+        "verification_state": "ready"
+      },
+      "sandbox_isolation_summary": {},
+      "shutdown_summary": {},
+      "status": "completed",
+      "unresolved_issues": [],
+      "user_goal": "fix tests",
+      "verification_summary": {
+        "passed_checks": [
+          "pytest tests/test_app.py"
+        ],
+        "status": "ready"
+      }
+    },
+    "final_report_status": "completed",
+    "mapping_id": "finalization_mapping_1",
+    "metadata": {
+      "source": "python_oracle"
+    },
+    "phase_id": "finalizing",
+    "run_id": "run_1",
+    "run_status": "completed",
+    "session_id": "session_1",
+    "task_id": "task_1"
+  },
   "model_turn_request": {
     "action_id": "action_1",
     "budget": {

@@ -8,6 +8,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+from singularity.agent_loop import AgentLoopResult, AgentLoopStatus
 from singularity.command.models import (
     CommandDecision,
     CommandPolicyResult,
@@ -35,6 +36,7 @@ from singularity.model.models import (
     ModelTurnStatus,
 )
 from singularity.observability.models import TraceEvent, TraceEventType, TraceSeverity
+from singularity.planner.models import FinalReport, TaskStatus
 from singularity.policy.models import ApprovalGrant, ApprovalScope, Capability
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.repair.contract import RepairActionCandidate, RepairContract
@@ -288,6 +290,80 @@ def build_fixtures() -> dict[str, object]:
         "created_at": "2026-01-01T00:00:00+00:00",
         "metadata": {"source": "python_oracle"},
     }
+    completion_assessment = {
+        "status": "completed",
+        "unmet": [],
+        "criteria": {
+            "verification": {
+                "description": "Public verification passed.",
+                "required": True,
+                "evidence": ["verification_results"],
+                "satisfied": True,
+                "missing_evidence": [],
+            }
+        },
+        "verification_contract_satisfaction": {
+            "contract_id": "verification_contract_1",
+            "satisfied": True,
+            "completed_steps": ["vstep_0"],
+            "failed_steps": [],
+            "skipped_steps": [],
+            "reason": None,
+            "step_evidence": [
+                {
+                    "step_id": "vstep_0",
+                    "check_id": "check_1",
+                    "command_id": "command_1",
+                    "status": "passed",
+                    "artifact_ref": "artifact_verification_1",
+                }
+            ],
+        },
+    }
+    final_report = FinalReport(
+        user_goal="fix tests",
+        status=TaskStatus.COMPLETED,
+        files_changed=["src/app.py"],
+        agent_changes=[],
+        command_side_effects=[],
+        verification_summary={"status": "ready", "passed_checks": ["pytest tests/test_app.py"]},
+        unresolved_issues=[],
+        risks=[],
+        rollback_status={
+            "available": True,
+            "transactions": ["transaction_1"],
+            "changesets": ["changeset_1"],
+            "changed_files": ["src/app.py"],
+            "rollback_refs": ["transaction:transaction_1"],
+            "verification_state": "ready",
+        },
+        policy_approval_summary={"approved": 1, "denied": 0},
+        artifacts=["final_report.md", "artifact_verification_1"],
+        next_steps=[],
+        contract_satisfaction=completion_assessment["verification_contract_satisfaction"],
+    )
+    agent_loop_result = AgentLoopResult(
+        status=AgentLoopStatus.COMPLETED,
+        final_answer="status: completed\nfiles_changed: src/app.py\nverification: ready",
+        turn=7,
+    )
+    finalization_mapping_boundary = {
+        "mapping_id": "finalization_mapping_1",
+        "run_id": "run_1",
+        "session_id": "session_1",
+        "task_id": "task_1",
+        "phase_id": "finalizing",
+        "agent_loop_status": agent_loop_result.status.value,
+        "run_status": agent_loop_result.status.value,
+        "final_report_status": final_report.status.value,
+        "completion_status": completion_assessment["status"],
+        "final_answer": agent_loop_result.final_answer,
+        "final_report": final_report.to_dict(),
+        "completion_assessment": completion_assessment,
+        "contract_satisfaction": final_report.contract_satisfaction,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "metadata": {"source": "python_oracle"},
+    }
     return {
         "tool_observation_model_payload": tool_result.to_observation_view().to_model_payload(),
         "tool_protocol_result_envelope": tool_result.to_dict(),
@@ -303,6 +379,7 @@ def build_fixtures() -> dict[str, object]:
         "context_bundle": context_bundle.to_dict(),
         "context_summary_envelope": context_summary_envelope.to_dict(),
         "tool_call_repair_boundary": tool_call_repair_boundary,
+        "finalization_mapping_boundary": finalization_mapping_boundary,
     }
 
 

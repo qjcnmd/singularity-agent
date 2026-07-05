@@ -1,7 +1,8 @@
 use singularity_agent::{
     AgentHostStatus, AgentLoopStatusBridge, ContextAssemblyBoundary,
-    ContextSummaryEnvelopeBoundary, PlannerStateBoundary, PythonSidecarClient, PythonSidecarConfig,
-    PythonSidecarRunResult, SidecarRunEvent, ToolCallRepairBoundary, sidecar_trace_summary,
+    ContextSummaryEnvelopeBoundary, FinalizationMappingBoundary, PlannerStateBoundary,
+    PythonSidecarClient, PythonSidecarConfig, PythonSidecarRunResult, SidecarRunEvent,
+    ToolCallRepairBoundary, sidecar_trace_summary,
 };
 
 #[test]
@@ -193,5 +194,43 @@ fn tool_call_repair_boundary_round_trips_python_oracle() {
         )
         .expect("deserialize tool repair"),
         repair
+    );
+}
+
+#[test]
+fn finalization_mapping_boundary_round_trips_python_oracle() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/rust_parity/python_oracle.json"
+    ))
+    .expect("parse python oracle fixture");
+
+    let mapping: FinalizationMappingBoundary =
+        serde_json::from_value(fixture["finalization_mapping_boundary"].clone())
+            .expect("finalization mapping boundary");
+
+    assert_eq!(mapping.mapping_id, "finalization_mapping_1");
+    assert_eq!(mapping.phase_id, "finalizing");
+    assert_eq!(mapping.agent_loop_status, "completed");
+    assert_eq!(mapping.run_status, "completed");
+    assert_eq!(mapping.final_report_status, "completed");
+    assert_eq!(mapping.completion_status, "completed");
+    assert_eq!(
+        mapping.final_report["verification_summary"]["status"],
+        "ready"
+    );
+    assert_eq!(
+        mapping.completion_assessment["unmet"],
+        serde_json::json!([])
+    );
+    assert_eq!(mapping.contract_satisfaction["satisfied"], true);
+    assert!(mapping.final_answer.contains("verification: ready"));
+    assert_eq!(mapping.metadata["source"], "python_oracle");
+
+    assert_eq!(
+        serde_json::from_value::<FinalizationMappingBoundary>(
+            serde_json::to_value(&mapping).expect("serialize finalization mapping")
+        )
+        .expect("deserialize finalization mapping"),
+        mapping
     );
 }
