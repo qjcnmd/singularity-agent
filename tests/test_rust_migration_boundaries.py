@@ -158,7 +158,10 @@ def test_guard_rejects_tool_observation_model_payload_leaks(tmp_path: Path, mark
     repo = copy_repo_slice(tmp_path)
     tools = repo / "crates/tools/src/lib.rs"
     text = tools.read_text(encoding="utf-8")
-    tools.write_text(text.replace('"redacted": self.redacted,', f'"{marker}": "leak",'), encoding="utf-8")
+    tools.write_text(
+        text.replace('"redacted": self.redacted,', f'"redacted": self.redacted,\n            "{marker}": "leak",'),
+        encoding="utf-8",
+    )
 
     result = run_guard(repo)
 
