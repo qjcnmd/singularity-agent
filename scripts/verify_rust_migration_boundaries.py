@@ -55,7 +55,7 @@ ALLOWED_CRATE_DEPENDENCIES = {
         "dev-dependencies": set(),
     },
     "crates/model/Cargo.toml": {
-        "dependencies": {"schemars", "serde", "serde_json", "singularity_core", "singularity_tools"},
+        "dependencies": {"schemars", "serde", "serde_json"},
         "dev-dependencies": set(),
     },
     "crates/agent/Cargo.toml": {

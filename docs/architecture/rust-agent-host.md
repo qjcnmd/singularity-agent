@@ -28,6 +28,8 @@
 
 `crates/policy` 提供 Rust `PolicyEngine` 纯决策边界。`PermissionProfile` 会投影为 `PermissionMode`，`PermissionRule` 按 `SettingsScope` 的 managed、user、project、local 顺序匹配，并按 hooks -> deny rules -> protected file path deny -> defer rules -> ask rules -> permission mode -> allow rules -> fallback ask 的顺序得到 `PermissionDecision`。默认保护 `.env`、SSH key、credential、secret、token 等文件路径；network/file/command scope 分开处理；`approval_policy = never` 会把 ask 转成 deny。当前 Rust policy 只消费调用方提供的 `PermissionRequest.resource` 并做路径大小写 / 分隔符规范化；shell wrapper、argv 解析和 command 等价化属于后续 command/sandbox 边界，不在 policy 内处理。当前 Rust policy 仍是 app-server/tool boundary 的纯决策对象，完整运行时 policy audit writer 和 Python AgentLoop 执行强制链尚未被 Rust 替换。
 
+`crates/model` 提供 Rust model boundary schema 和纯验证函数。它对齐现有 Python `singularity.model` 的 `ModelTurnRequest`、`ModelTurnResponse`、tool schema、tool call、capability metadata、provider config presence、stream event、validation result 和 model error object；`validate_provider_config()`、`validate_stream_events()`、`validate_model_response()` 和 `classify_model_error()` 只做边界验证与分类，不发起 HTTP provider call、不重试、不执行工具、不做 planner repair，也不迁移 AgentLoop。
+
 ## Python 冻结范围
 
 以下 Python 模块在迁移期作为只读 oracle / parity reference：
