@@ -6,6 +6,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+const REDACTED_TOOL_OUTPUT: &str = "[redacted sensitive tool output]";
+const SENSITIVE_MODEL_PAYLOAD_MARKERS: [&str; 6] = [
+    "api_key",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+    "raw_arguments",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionLevel {
@@ -204,6 +214,7 @@ impl ToolObservation {
     }
 
     pub fn to_model_payload(&self) -> Value {
+        let content_preview = redact_model_visible_text(&self.content_preview);
         let mut payload = json!({
             "ok": self.ok,
             "tool_name": self.tool_name,
@@ -218,9 +229,21 @@ impl ToolObservation {
             "redacted": self.redacted,
         });
         if self.visibility != ToolObservationVisibility::ReferenceOnly {
-            payload["content"] = json!(self.content_preview);
-            payload["content_preview"] = json!(self.content_preview);
+            payload["content"] = json!(content_preview);
+            payload["content_preview"] = json!(content_preview);
         }
         payload
+    }
+}
+
+fn redact_model_visible_text(text: &str) -> String {
+    let lowered = text.to_ascii_lowercase();
+    if SENSITIVE_MODEL_PAYLOAD_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        REDACTED_TOOL_OUTPUT.to_string()
+    } else {
+        text.to_string()
     }
 }

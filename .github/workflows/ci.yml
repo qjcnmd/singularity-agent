@@ -62,6 +62,9 @@ jobs:
       - name: Verify runtime documentation
         run: uv run --no-sync python scripts/verify_runtime_docs.py
 
+      - name: Verify Rust migration boundaries
+        run: uv run --no-sync python scripts/verify_rust_migration_boundaries.py
+
       - name: Rust fmt
         run: cargo fmt --check
 

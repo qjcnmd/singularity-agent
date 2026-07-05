@@ -28,6 +28,21 @@ fn tool_observation_model_payload_hides_internal_metadata() {
 }
 
 #[test]
+fn tool_observation_model_payload_redacts_secret_like_preview() {
+    let observation =
+        ToolObservation::summary("call_1", "builtin.shell", true, "TOKEN=abc123", "digest_1");
+
+    let payload = observation.to_model_payload();
+
+    assert_eq!(payload["content"], "[redacted sensitive tool output]");
+    assert_eq!(
+        payload["content_preview"],
+        "[redacted sensitive tool output]"
+    );
+    assert!(!serde_json::to_string(&payload).unwrap().contains("abc123"));
+}
+
+#[test]
 fn registry_rejects_duplicate_tools() {
     let mut registry = ToolRegistry::default();
     let spec = ToolSpec::new(

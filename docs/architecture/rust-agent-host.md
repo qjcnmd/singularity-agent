@@ -42,6 +42,7 @@
 
 第一阶段必须通过：
 
+- `python scripts/verify_rust_migration_boundaries.py`
 - `cargo fmt --check`
 - `cargo check --workspace --all-targets`
 - `cargo test --workspace`
@@ -72,3 +73,5 @@ python -m singularity.cli eval run docs/evaluation/public-representative-task.js
 ## 维护规则
 
 Rust app-server protocol 是唯一富客户端边界。任何 desktop/TUI 新能力都必须先通过 `crates/protocol` 和 `crates/app-server` 暴露，再由 client 消费；不能绕过 app-server 直接调用 core 或 Python runtime。
+
+M0 之后，`scripts/verify_rust_migration_boundaries.py` 是提交和 CI 的迁移漂移检查入口。它检查 `crates/cli` 不能直接依赖 agent/model/tools/store，crate 依赖必须留在显式 allowlist，Python runtime 改动只能落在 sidecar/oracle/fixture/parity 允许路径，仓库不能提前出现 desktop/Web 启动文件，`turn/start` 在 Rust AgentLoop 迁移前必须保持 `agent_loop_status = "not_migrated"`，并且 Rust `ToolObservation.to_model_payload()` 不得输出 raw arguments、内部 approval/policy id、internal metadata 或明显 secret-like 文本。

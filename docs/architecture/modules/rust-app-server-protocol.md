@@ -319,3 +319,5 @@ Phase 1 没有迁移模型 provider、Windows sandbox backend、evaluation runne
 ## 维护规则
 
 新增 client 必须只依赖 protocol/core 层，不得直接耦合 agent/model/tools/store。新增 app-server 方法必须先在 `crates/protocol` 定义 request/response/event schema，再由 `crates/app-server` routing 和 `crates/store` persistence 接入。任何改变 thread/turn/item/approval/trace wire format 的改动都必须更新 Rust tests、Python oracle fixture、本文档和 `docs/singularity.md` 的长期架构说明。
+
+M0 迁移 guardrail 由 `scripts/verify_rust_migration_boundaries.py` 自动检查并进入 CI。该脚本阻断 CLI 直接依赖 agent/model/tools/store、未登记的新 crate 依赖、Python core runtime 非 allowlist 改动、Python RuntimeHost 类过渡实现、desktop/Web 抢跑文件、`turn/start` 伪装 Rust AgentLoop 已迁移，以及 `ToolObservation.to_model_payload()` 泄漏 raw arguments、approval/policy 内部 id、internal metadata 或 secret-like 文本。
