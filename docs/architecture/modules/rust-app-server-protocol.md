@@ -121,8 +121,8 @@
 - TraceEvent: event_id, event_type, run_id, session_id, task_id, phase_id, action_id, parent_event_id, timestamp, monotonic_ms, component, severity, summary, payload, artifact_refs, policy_decision_id, approval_grant_id, sandbox_id, command_id, transaction_id, verification_id, span_id, redaction_applied, payload_hash
 - AppEvent: method, params
 - PermissionProfile: profile, workspace_roots, additional_writable_directories, network_access, approval_policy, protected_paths_enforced
-- PermissionRequest: tool_name, operation, resource
-- PermissionRule: rule_id, scope, outcome, operation, resource_pattern
+- PermissionRequest: tool_name, operation, resource, resource_sensitive
+- PermissionRule: rule_id, scope, outcome, operation, resource
 - PermissionDecision: outcome, reason, rule_id, scope
 - PreToolUseHook: hook_id, decision
 - PolicyEngine: profile, rules, hooks
@@ -272,6 +272,7 @@ pub struct PermissionRequest {
     pub tool_name: String,
     pub operation: PermissionOperation,
     pub resource: String,
+    pub resource_sensitive: bool,
 }
 
 pub struct PermissionRule {
@@ -279,7 +280,7 @@ pub struct PermissionRule {
     pub scope: SettingsScope,
     pub outcome: PermissionDecisionOutcome,
     pub operation: Option<PermissionOperation>,
-    pub resource_pattern: Option<String>,
+    pub resource: Option<String>,
 }
 
 pub struct PermissionDecision {
@@ -643,7 +644,7 @@ pub struct FinalizationMappingBoundary {
 
 ## 谁消费这些对象
 
-`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、thread、turn、approval、trace handler；`AppServer.run_python_sidecar_if_enabled()` 在显式 sidecar 配置存在时消费 `TurnStartParams` 并调用 `PythonSidecarClient`；`SessionStore.create_thread_with_trace()`、`create_turn_with_input_and_trace()`、`create_approval_with_trace()`、`record_approval_decision_with_trace()`、`append_trace()` 和 `register_artifact_ref()` 消费 protocol object 写 SQLite；`PolicyEngine.evaluate()` 消费 `PermissionRequest`，按 hook、deny、protected resource、ask、allow、fallback ask 顺序返回 `PermissionDecision`，且 `approval_policy=never` 会把 ask 投影为 deny；policy 不解析 shell wrapper、argv、workspace path、network host 或 command 等价形式；Rust M9 boundary tests 消费 Python oracle fixture，校验 planner state、context bundle 和 context summary envelope 字段可被 Rust 解析；app-server runtime 当前不消费这些 M9 boundary object。`ToolBroker.model_visible_tools()` 消费 `ToolRegistry` 并只投影 name、redacted description 和 input schema 给模型；`ToolBroker.execute()` 消费 `ToolCallEnvelope` 与外部 policy decision，未知或 denied tool 不调用 executor；`CommandRequest.permission_resource()` 把 shell wrapper / argv 规范化为 policy 可消费的 command resource；`CommandExecutor.run_local()` 只消费显式 `HostWorkspace` request，遇到 read-only、copy-on-write、empty temp 或 hard-isolation request 时返回 backend error 而不是 local fallback；git status/diff 只生成 sandbox-required `CommandRequest`，不绕过 command/sandbox 边界执行 git；`PatchExecutor.apply()` 消费 `PatchChange` 并在后续 change 失败时回滚前序写入；Rust model validator 消费已经构造好的 model request/response/stream 对象并返回 `ModelValidationResult`，不消费 tool registry、policy engine、sandbox backend 或 HTTP client。`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification。`sg` 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
+`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、thread、turn、approval、trace handler；`AppServer.run_python_sidecar_if_enabled()` 在显式 sidecar 配置存在时消费 `TurnStartParams` 并调用 `PythonSidecarClient`；`SessionStore.create_thread_with_trace()`、`create_turn_with_input_and_trace()`、`create_approval_with_trace()`、`record_approval_decision_with_trace()`、`append_trace()` 和 `register_artifact_ref()` 消费 protocol object 写 SQLite；`PolicyEngine.evaluate()` 消费调用方已归一化的 `PermissionRequest`，按 deny、caller-marked sensitive resource、hook ask、ask、allow、fallback ask 顺序返回 `PermissionDecision`，且 `approval_policy=never` 会把 ask 投影为 deny；policy 不解析 shell wrapper、argv、workspace path、network host、`.env` / SSH key marker 或 command 等价形式；Rust M9 boundary tests 消费 Python oracle fixture，校验 planner state、context bundle 和 context summary envelope 字段可被 Rust 解析；app-server runtime 当前不消费这些 M9 boundary object。`ToolBroker.model_visible_tools()` 消费 `ToolRegistry` 并只投影 name、redacted description 和 input schema 给模型；`ToolBroker.execute()` 消费 `ToolCallEnvelope` 与外部 policy decision，未知或 denied tool 不调用 executor；`CommandRequest.permission_resource()` 把 shell wrapper / argv 规范化为 policy 可消费的 command resource；`CommandExecutor.run_local()` 只消费显式 `HostWorkspace` request，遇到 read-only、copy-on-write、empty temp 或 hard-isolation request 时返回 backend error 而不是 local fallback；git status/diff 只生成 sandbox-required `CommandRequest`，不绕过 command/sandbox 边界执行 git；`PatchExecutor.apply()` 消费 `PatchChange` 并在后续 change 失败时回滚前序写入；Rust model validator 消费已经构造好的 model request/response/stream 对象并返回 `ModelValidationResult`，不消费 tool registry、policy engine、sandbox backend 或 HTTP client。`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification。`sg` 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
 ## 是否落盘
 
@@ -659,7 +660,7 @@ pub struct FinalizationMappingBoundary {
 
 ## 当前结构问题
 
-Phase 1 没有迁移模型 provider HTTP、Windows sandbox backend、evaluation runner 或 Rust native AgentLoop；`AgentLoopStatusBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。显式 Python sidecar 可以调用当前 Python AgentLoop 作为 migration reference，但 Rust 只负责 app-server 边界、状态翻译和安全 trace summary。M9 当前只加入 planner state、context assembly、compaction summary、tool-call repair 与 finalization mapping deterministic boundary schema，尚未迁移 planner step、context assembler、compaction executor、failure analysis、repair planner、completion gate runtime、finalizer runtime 或完整 `AgentLoop.run()`。当前 `ToolBroker` 是最小 Rust tool boundary：它验证工具命名、投影模型可见 schema、阻断 denied/unknown tool 执行并生成安全 observation；`PolicyEngine` 已提供 Rust 纯决策、hook 点、deny-first precedence、protected resource deny 和 approval ask/deny 投影；`PermissionProfile` 仍保留 profile schema 字段，但当前 Rust policy 不根据 workspace roots、network access 或 permission mode 自动推导 allow/deny；`CommandExecutor` / `PatchExecutor` 已提供最小 Rust side-effect boundary，但还没有接入 app-server、tool broker、Python AgentLoop 或完整 Windows sandbox backend。Rust `crates/model` 当前只拥有 model request/response schema、capability metadata、provider config presence check、stream envelope validation、model response/tool-call validation 和 provider failure classification；它没有 HTTP client、provider registry、retry loop、context compaction、planner repair 或 AgentLoop 逻辑。command resource normalization 位于 `CommandRequest.permission_resource()`，policy 不解析 shell wrapper；sandbox-required command 没有显式 backend 时 fail closed；git helpers 只生成 command request，不建立第二套 git wrapper。当前 `sg` 是最小 JSON-RPC client：可以启动 app-server 子进程并完成 run/continue/list/trace/approval 查询，但不管理长期后台 daemon 生命周期、PTY TUI 或交互式 approval prompt。Artifact ref 目前只持久化引用和 redacted metadata，不负责 artifact bytes 管理。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
+Phase 1 没有迁移模型 provider HTTP、Windows sandbox backend、evaluation runner 或 Rust native AgentLoop；`AgentLoopStatusBridge::not_migrated()` 只是 host-facing status，不代表 agent 已完成。显式 Python sidecar 可以调用当前 Python AgentLoop 作为 migration reference，但 Rust 只负责 app-server 边界、状态翻译和安全 trace summary。M9 当前只加入 planner state、context assembly、compaction summary、tool-call repair 与 finalization mapping deterministic boundary schema，尚未迁移 planner step、context assembler、compaction executor、failure analysis、repair planner、completion gate runtime、finalizer runtime 或完整 `AgentLoop.run()`。当前 `ToolBroker` 是最小 Rust tool boundary：它验证工具命名、投影模型可见 schema、阻断 denied/unknown tool 执行并生成安全 observation；`PolicyEngine` 已提供 Rust 纯决策、hook 点、deny-first precedence、caller-marked sensitive resource deny 和 approval ask/deny 投影；`PermissionProfile` 仍保留 profile schema 字段，但当前 Rust policy 不根据 workspace roots、network access、permission mode、resource path marker 或 shell wrapper 自动推导 allow/deny；`CommandExecutor` / `PatchExecutor` 已提供最小 Rust side-effect boundary，但还没有接入 app-server、tool broker、Python AgentLoop 或完整 Windows sandbox backend。Rust `crates/model` 当前只拥有 model request/response schema、capability metadata、provider config presence check、stream envelope validation、model response/tool-call validation 和 provider failure classification；它没有 HTTP client、provider registry、retry loop、context compaction、planner repair 或 AgentLoop 逻辑。command resource normalization 位于 `CommandRequest.permission_resource()`，policy 不解析 shell wrapper；sandbox-required command 没有显式 backend 时 fail closed；git helpers 只生成 command request，不建立第二套 git wrapper。当前 `sg` 是最小 JSON-RPC client：可以启动 app-server 子进程并完成 run/continue/list/trace/approval 查询，但不管理长期后台 daemon 生命周期、PTY TUI 或交互式 approval prompt。Artifact ref 目前只持久化引用和 redacted metadata，不负责 artifact bytes 管理。WebSocket 和 Unix socket 只是后续 transport 方向，当前只实现 stdio JSONL。
 
 ## 维护规则
 

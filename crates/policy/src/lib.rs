@@ -3,16 +3,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_PROTECTED_RESOURCE_MARKERS: [&str; 8] = [
-    ".env",
-    ".env.",
-    ".ssh",
-    "id_ed25519",
-    "id_rsa",
-    "credential",
-    "secret",
-    "token",
-];
 const REASON_APPROVAL_POLICY_NEVER: &str = "approval policy forbids approval requests";
 const REASON_MATCHED_PERMISSION_RULE: &str = "matched permission rule";
 const REASON_NO_RULE: &str = "no permission rule matched; approval required";
@@ -40,7 +30,9 @@ pub enum ApprovalPolicy {
     Never,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingsScope {
     Managed,
@@ -94,6 +86,7 @@ pub struct PermissionRequest {
     pub tool_name: String,
     pub operation: PermissionOperation,
     pub resource: String,
+    pub resource_sensitive: bool,
 }
 
 impl PermissionRequest {
@@ -106,7 +99,13 @@ impl PermissionRequest {
             tool_name: tool_name.into(),
             operation,
             resource: resource.into(),
+            resource_sensitive: false,
         }
+    }
+
+    pub fn with_sensitive_resource(mut self) -> Self {
+        self.resource_sensitive = true;
+        self
     }
 }
 
@@ -116,7 +115,7 @@ pub struct PermissionRule {
     pub scope: SettingsScope,
     pub outcome: PermissionDecisionOutcome,
     pub operation: Option<PermissionOperation>,
-    pub resource_pattern: Option<String>,
+    pub resource: Option<String>,
 }
 
 impl PermissionRule {
@@ -130,7 +129,7 @@ impl PermissionRule {
             scope,
             outcome,
             operation: None,
-            resource_pattern: None,
+            resource: None,
         }
     }
 
@@ -140,7 +139,7 @@ impl PermissionRule {
     }
 
     pub fn for_resource(mut self, pattern: impl Into<String>) -> Self {
-        self.resource_pattern = Some(pattern.into());
+        self.resource = Some(pattern.into());
         self
     }
 
@@ -148,9 +147,9 @@ impl PermissionRule {
         self.operation
             .is_none_or(|operation| operation == request.operation)
             && self
-                .resource_pattern
+                .resource
                 .as_ref()
-                .is_none_or(|pattern| request.resource == *pattern)
+                .is_none_or(|resource| request.resource == *resource)
     }
 }
 
@@ -224,21 +223,23 @@ impl PolicyEngine {
     }
 
     pub fn evaluate(&self, request: &PermissionRequest) -> PermissionDecision {
-        if let Some(hook) = self
+        let hook_decision = self
             .hooks
             .iter()
             .find(|hook| !matches!(hook.decision.outcome, PermissionDecisionOutcome::Allow))
-        {
-            return self.apply_approval_policy(hook.decision.clone());
-        }
+            .map(|hook| hook.decision.clone());
+
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Deny) {
             return decision;
         }
-        if self.profile.protected_paths_enforced && protected_resource(&request.resource) {
+        if self.profile.protected_paths_enforced && request.resource_sensitive {
             return PermissionDecision::new(
                 PermissionDecisionOutcome::Deny,
                 REASON_PROTECTED_RESOURCE_DENIED,
             );
+        }
+        if let Some(decision) = hook_decision {
+            return self.apply_approval_policy(decision);
         }
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Ask) {
             return self.apply_approval_policy(decision);
@@ -261,7 +262,7 @@ impl PolicyEngine {
         self.rules
             .iter()
             .filter(|rule| rule.outcome == outcome && rule.matches(request))
-            .min_by_key(|rule| scope_precedence(rule.scope))
+            .min_by_key(|rule| rule.scope)
             .map(PermissionDecision::from_rule)
     }
 
@@ -336,20 +337,4 @@ impl ApprovalDecision {
             reason: reason.into(),
         }
     }
-}
-
-fn scope_precedence(scope: SettingsScope) -> u8 {
-    match scope {
-        SettingsScope::Managed => 0,
-        SettingsScope::User => 1,
-        SettingsScope::Project => 2,
-        SettingsScope::Local => 3,
-    }
-}
-
-fn protected_resource(resource: &str) -> bool {
-    let resource = resource.to_ascii_lowercase();
-    DEFAULT_PROTECTED_RESOURCE_MARKERS
-        .iter()
-        .any(|marker| resource.contains(marker))
 }
