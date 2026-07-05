@@ -1,6 +1,8 @@
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AppEvent, InitializeParams, JsonRpcMessage, Method, ThreadStartParams, TurnStartParams,
+    AppEvent, InitializeParams, ItemKind, JsonRpcMessage, Method, ThreadIdParams,
+    ThreadStartParams, TraceListParams, TraceShowParams, TraceTailParams, TurnIdParams,
+    TurnStartParams,
 };
 
 #[test]
@@ -34,6 +36,14 @@ fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
         AppEvent::item_completed("item_1").method(),
         "item/completed"
     );
+    assert_eq!(
+        AppEvent::item_agent_message_delta("item_1", "hi").method(),
+        "item/agentMessage/delta"
+    );
+    assert_eq!(
+        AppEvent::item_command_execution_output_delta("item_1", "stdout", "hi").method(),
+        "item/commandExecution/outputDelta"
+    );
 }
 
 #[test]
@@ -49,4 +59,87 @@ fn json_rpc_wire_output_omits_null_jsonrpc_result_and_error_fields() {
     assert!(value.get("jsonrpc").is_none());
     assert!(value.get("result").is_none());
     assert!(value.get("error").is_none());
+}
+
+#[test]
+fn protocol_v1_methods_use_codex_names_without_cancel_or_generic_delta() {
+    for method in [
+        "thread/list",
+        "thread/read",
+        "thread/resume",
+        "thread/fork",
+        "thread/archive",
+        "thread/delete",
+        "turn/start",
+        "turn/interrupt",
+        "turn/status",
+        "approval/list",
+        "approval/request",
+        "approval/decision",
+        "trace/list",
+        "trace/show",
+        "trace/tail",
+        "server/shutdown",
+    ] {
+        let parsed = Method::parse(method).expect("method is registered");
+        assert_eq!(parsed.as_str(), method);
+    }
+
+    assert!(Method::parse("turn/cancel").is_none());
+    assert_ne!(
+        AppEvent::item_agent_message_delta("item_1", "delta").method(),
+        "item/delta"
+    );
+}
+
+#[test]
+fn protocol_v1_id_params_are_camel_case_on_wire() {
+    assert_eq!(
+        serde_json::to_value(ThreadIdParams {
+            thread_id: "thread_1".to_string()
+        })
+        .unwrap(),
+        serde_json::json!({"threadId": "thread_1"})
+    );
+    assert_eq!(
+        serde_json::to_value(TurnIdParams {
+            turn_id: "turn_1".to_string()
+        })
+        .unwrap(),
+        serde_json::json!({"turnId": "turn_1"})
+    );
+    assert_eq!(
+        serde_json::to_value(TraceListParams {
+            run_id: "run_1".to_string()
+        })
+        .unwrap(),
+        serde_json::json!({"runId": "run_1"})
+    );
+    assert_eq!(
+        serde_json::to_value(TraceShowParams {
+            event_id: "event_1".to_string()
+        })
+        .unwrap(),
+        serde_json::json!({"eventId": "event_1"})
+    );
+    assert_eq!(
+        serde_json::to_value(TraceTailParams {
+            run_id: "run_1".to_string(),
+            limit: Some(2)
+        })
+        .unwrap(),
+        serde_json::json!({"runId": "run_1", "limit": 2})
+    );
+}
+
+#[test]
+fn item_kind_uses_codex_style_wire_names() {
+    assert_eq!(
+        serde_json::to_value(ItemKind::CommandExecution).unwrap(),
+        "commandExecution"
+    );
+    assert_eq!(
+        serde_json::to_value(ItemKind::McpToolCall).unwrap(),
+        "mcpToolCall"
+    );
 }

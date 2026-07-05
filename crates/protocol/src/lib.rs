@@ -9,12 +9,23 @@ use singularity_core::{ClientInfo, ErrorCode};
 pub enum Method {
     Initialize,
     Initialized,
+    ThreadList,
+    ThreadRead,
     ThreadStart,
+    ThreadResume,
+    ThreadFork,
+    ThreadArchive,
+    ThreadDelete,
     TurnStart,
+    TurnInterrupt,
+    TurnStatus,
+    ApprovalList,
     ApprovalRequest,
     ApprovalDecision,
     TraceList,
     TraceShow,
+    TraceTail,
+    ServerShutdown,
 }
 
 impl Method {
@@ -22,12 +33,23 @@ impl Method {
         Some(match value {
             "initialize" => Self::Initialize,
             "initialized" => Self::Initialized,
+            "thread/list" => Self::ThreadList,
+            "thread/read" => Self::ThreadRead,
             "thread/start" => Self::ThreadStart,
+            "thread/resume" => Self::ThreadResume,
+            "thread/fork" => Self::ThreadFork,
+            "thread/archive" => Self::ThreadArchive,
+            "thread/delete" => Self::ThreadDelete,
             "turn/start" => Self::TurnStart,
+            "turn/interrupt" => Self::TurnInterrupt,
+            "turn/status" => Self::TurnStatus,
+            "approval/list" => Self::ApprovalList,
             "approval/request" => Self::ApprovalRequest,
             "approval/decision" => Self::ApprovalDecision,
             "trace/list" => Self::TraceList,
             "trace/show" => Self::TraceShow,
+            "trace/tail" => Self::TraceTail,
+            "server/shutdown" => Self::ServerShutdown,
             _ => return None,
         })
     }
@@ -36,12 +58,23 @@ impl Method {
         match self {
             Self::Initialize => "initialize",
             Self::Initialized => "initialized",
+            Self::ThreadList => "thread/list",
+            Self::ThreadRead => "thread/read",
             Self::ThreadStart => "thread/start",
+            Self::ThreadResume => "thread/resume",
+            Self::ThreadFork => "thread/fork",
+            Self::ThreadArchive => "thread/archive",
+            Self::ThreadDelete => "thread/delete",
             Self::TurnStart => "turn/start",
+            Self::TurnInterrupt => "turn/interrupt",
+            Self::TurnStatus => "turn/status",
+            Self::ApprovalList => "approval/list",
             Self::ApprovalRequest => "approval/request",
             Self::ApprovalDecision => "approval/decision",
             Self::TraceList => "trace/list",
             Self::TraceShow => "trace/show",
+            Self::TraceTail => "trace/tail",
+            Self::ServerShutdown => "server/shutdown",
         }
     }
 }
@@ -168,6 +201,20 @@ pub struct ThreadStartParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ThreadIdParams {
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ThreadForkParams {
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    pub model: Option<String>,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Thread {
     pub thread_id: String,
     pub model: Option<String>,
@@ -185,6 +232,30 @@ pub enum ThreadStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ThreadStartResult {
     pub thread: Thread,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ThreadListResult {
+    pub threads: Vec<Thread>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ThreadResult {
+    pub thread: Thread,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ThreadForkResult {
+    #[serde(rename = "sourceThreadId")]
+    pub source_thread_id: String,
+    pub thread: Thread,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ThreadDeleteResult {
+    #[serde(rename = "threadId")]
+    pub thread_id: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -214,15 +285,25 @@ pub enum TurnStatus {
     Running,
     Completed,
     Failed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnIdParams {
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum ItemKind {
-    InputMessage,
+    UserMessage,
     AgentMessage,
-    ToolCall,
-    CommandRun,
+    Reasoning,
+    Plan,
+    CommandExecution,
+    FileChange,
+    McpToolCall,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -247,13 +328,44 @@ pub struct TurnStartResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnResult {
+    pub turn: Turn,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnInterruptResult {
+    #[serde(rename = "turnId")]
+    pub turn_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ApprovalListResult {
+    pub approvals: Vec<singularity_policy::ApprovalRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TraceListParams {
+    #[serde(rename = "runId")]
     pub run_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TraceShowParams {
+    #[serde(rename = "eventId")]
     pub event_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TraceTailParams {
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TraceListResult {
+    pub events: Vec<TraceEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -328,13 +440,48 @@ pub struct AppEvent {
 }
 
 impl AppEvent {
+    pub fn thread_started(thread: &Thread) -> Self {
+        Self {
+            method: "thread/started".to_string(),
+            params: serde_json::json!({"thread": thread}),
+        }
+    }
+
+    pub fn turn_started(turn: &Turn) -> Self {
+        Self {
+            method: "turn/started".to_string(),
+            params: serde_json::json!({"turn": turn}),
+        }
+    }
+
+    pub fn turn_completed(turn: &Turn) -> Self {
+        Self {
+            method: "turn/completed".to_string(),
+            params: serde_json::json!({"turn": turn}),
+        }
+    }
+
+    pub fn turn_plan_updated(turn_id: impl Into<String>, plan: Value) -> Self {
+        Self {
+            method: "turn/plan/updated".to_string(),
+            params: serde_json::json!({"turnId": turn_id.into(), "plan": plan}),
+        }
+    }
+
+    pub fn turn_diff_updated(turn_id: impl Into<String>, diff: Value) -> Self {
+        Self {
+            method: "turn/diff/updated".to_string(),
+            params: serde_json::json!({"turnId": turn_id.into(), "diff": diff}),
+        }
+    }
+
     pub fn item_started(item_id: impl Into<String>) -> Self {
         Self::item_event("item/started", item_id)
     }
 
-    pub fn item_delta(item_id: impl Into<String>, delta: impl Into<String>) -> Self {
+    pub fn item_agent_message_delta(item_id: impl Into<String>, delta: impl Into<String>) -> Self {
         Self {
-            method: "item/delta".to_string(),
+            method: "item/agentMessage/delta".to_string(),
             params: serde_json::json!({
                 "item": {"item_id": item_id.into()},
                 "delta": delta.into(),
@@ -342,8 +489,33 @@ impl AppEvent {
         }
     }
 
+    pub fn item_command_execution_output_delta(
+        item_id: impl Into<String>,
+        stream: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        Self {
+            method: "item/commandExecution/outputDelta".to_string(),
+            params: serde_json::json!({
+                "item": {"item_id": item_id.into()},
+                "stream": stream.into(),
+                "output": output.into(),
+            }),
+        }
+    }
+
     pub fn item_completed(item_id: impl Into<String>) -> Self {
         Self::item_event("item/completed", item_id)
+    }
+
+    pub fn item_failed(item_id: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            method: "item/failed".to_string(),
+            params: serde_json::json!({
+                "item": {"item_id": item_id.into()},
+                "error": error.into(),
+            }),
+        }
     }
 
     fn item_event(method: &'static str, item_id: impl Into<String>) -> Self {

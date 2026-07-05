@@ -76,6 +76,63 @@ impl SessionStore {
         Ok(thread)
     }
 
+    pub fn list_threads(&self) -> StoreResult<Vec<Thread>> {
+        let mut statement = self
+            .connection
+            .prepare("select thread_id, model, cwd, status from threads order by rowid")?;
+        let rows = statement.query_map([], |row| self.thread_from_row(row))?;
+        let mut threads = Vec::new();
+        for row in rows {
+            threads.push(row?);
+        }
+        Ok(threads)
+    }
+
+    pub fn get_thread(&self, thread_id: &str) -> StoreResult<Thread> {
+        self.connection
+            .query_row(
+                "select thread_id, model, cwd, status from threads where thread_id = ?1",
+                params![thread_id],
+                |row| self.thread_from_row(row),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("thread {thread_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })
+    }
+
+    pub fn update_thread_status(
+        &self,
+        thread_id: &str,
+        status: ThreadStatus,
+    ) -> StoreResult<Thread> {
+        let changed = self.connection.execute(
+            "update threads set status = ?1 where thread_id = ?2",
+            params![serde_json::to_string(&status)?, thread_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("thread {thread_id}")));
+        }
+        self.get_thread(thread_id)
+    }
+
+    pub fn delete_thread(&self, thread_id: &str) -> StoreResult<()> {
+        let changed = self.connection.execute(
+            "delete from threads where thread_id = ?1",
+            params![thread_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("thread {thread_id}")));
+        }
+        self.connection.execute(
+            "delete from trace_events where run_id = ?1 or payload like ?2",
+            params![thread_id, format!("%{thread_id}%")],
+        )?;
+        Ok(())
+    }
+
     pub fn create_turn(&self, thread_id: &str, agent_loop_status: &str) -> StoreResult<Turn> {
         if !self.thread_exists(thread_id)? {
             return Err(StoreError::NotFound(format!("thread {thread_id}")));
@@ -96,6 +153,30 @@ impl SessionStore {
             ],
         )?;
         Ok(turn)
+    }
+
+    pub fn get_turn(&self, turn_id: &str) -> StoreResult<Turn> {
+        self.connection
+            .query_row(
+                "select turn_id, thread_id, status, agent_loop_status from turns where turn_id = ?1",
+                params![turn_id],
+                |row| self.turn_from_row(row),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound(format!("turn {turn_id}")),
+                other => StoreError::Sqlite(other),
+            })
+    }
+
+    pub fn update_turn_status(&self, turn_id: &str, status: TurnStatus) -> StoreResult<Turn> {
+        let changed = self.connection.execute(
+            "update turns set status = ?1 where turn_id = ?2",
+            params![serde_json::to_string(&status)?, turn_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("turn {turn_id}")));
+        }
+        self.get_turn(turn_id)
     }
 
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
@@ -145,6 +226,14 @@ impl SessionStore {
         Ok(events)
     }
 
+    pub fn tail_trace(&self, run_id: &str, limit: usize) -> StoreResult<Vec<TraceEvent>> {
+        let mut events = self.list_trace(run_id)?;
+        if events.len() > limit {
+            events = events.split_off(events.len() - limit);
+        }
+        Ok(events)
+    }
+
     pub fn show_trace(&self, event_id: &str) -> StoreResult<TraceEvent> {
         let payload: String = self
             .connection
@@ -170,6 +259,18 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn list_pending_approvals(&self) -> StoreResult<Vec<ApprovalRequest>> {
+        let mut statement = self.connection.prepare(
+            "select payload from approvals where decision_outcome is null order by rowid",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut approvals = Vec::new();
+        for row in rows {
+            approvals.push(serde_json::from_str(&row?)?);
+        }
+        Ok(approvals)
+    }
+
     pub fn record_approval_decision(
         &self,
         request_id: &str,
@@ -188,6 +289,38 @@ impl SessionStore {
 
     fn thread_exists(&self, thread_id: &str) -> StoreResult<bool> {
         self.exists("select 1 from threads where thread_id = ?1", thread_id)
+    }
+
+    fn thread_from_row(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
+        let status: String = row.get(3)?;
+        Ok(Thread {
+            thread_id: row.get(0)?,
+            model: row.get(1)?,
+            cwd: row.get(2)?,
+            status: serde_json::from_str(&status).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        })
+    }
+
+    fn turn_from_row(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
+        let status: String = row.get(2)?;
+        Ok(Turn {
+            turn_id: row.get(0)?,
+            thread_id: row.get(1)?,
+            status: serde_json::from_str(&status).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            agent_loop_status: row.get(3)?,
+        })
     }
 
     fn turn_exists(&self, turn_id: &str) -> StoreResult<bool> {

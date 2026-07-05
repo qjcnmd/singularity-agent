@@ -5,9 +5,11 @@ use singularity_agent::AgentLoopBridge;
 use singularity_core::ErrorCode;
 use singularity_policy::{ApprovalDecision, ApprovalRequest};
 use singularity_protocol::{
-    AppEvent, InitializeParams, InitializeResult, ItemKind, JsonRpcMessage, Method,
-    ThreadStartParams, ThreadStartResult, TraceEvent, TraceListParams, TraceShowParams,
-    TurnStartParams, TurnStartResult,
+    AppEvent, ApprovalListResult, InitializeParams, InitializeResult, ItemKind, JsonRpcMessage,
+    Method, ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams,
+    ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult, TraceEvent,
+    TraceListParams, TraceListResult, TraceShowParams, TraceTailParams, TurnIdParams,
+    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult,
 };
 use singularity_store::{SessionStore, StoreError};
 use thiserror::Error;
@@ -44,10 +46,15 @@ impl AppServer {
 
     pub fn handle(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let id = message.id.clone();
-        let Some(method) = message.method() else {
+        let Some(method_name) = message.method.as_deref() else {
             return Ok(vec![
                 JsonRpcMessage::error(id, ErrorCode::invalid_request("Missing method"))
                     .to_wire_value(),
+            ]);
+        };
+        let Some(method) = Method::parse(method_name) else {
+            return Ok(vec![
+                JsonRpcMessage::error(id, ErrorCode::method_not_found(method_name)).to_wire_value(),
             ]);
         };
 
@@ -70,12 +77,24 @@ impl AppServer {
                 self.initialized_acknowledged = true;
                 Ok(Vec::new())
             }
+            Method::ThreadList => self.thread_list(message),
+            Method::ThreadRead | Method::ThreadResume => self.thread_read(message),
             Method::ThreadStart => self.thread_start(message),
+            Method::ThreadFork => self.thread_fork(message),
+            Method::ThreadArchive => self.thread_archive(message),
+            Method::ThreadDelete => self.thread_delete(message),
             Method::TurnStart => self.turn_start(message),
+            Method::TurnInterrupt => self.turn_interrupt(message),
+            Method::TurnStatus => self.turn_status(message),
+            Method::ApprovalList => self.approval_list(message),
             Method::ApprovalRequest => self.approval_request(message),
             Method::ApprovalDecision => self.approval_decision(message),
             Method::TraceList => self.trace_list(message),
             Method::TraceShow => self.trace_show(message),
+            Method::TraceTail => self.trace_tail(message),
+            Method::ServerShutdown => Ok(vec![
+                JsonRpcMessage::response(message.id, json!({"shutdown": true})).to_wire_value(),
+            ]),
         }
     }
 
@@ -91,6 +110,35 @@ impl AppServer {
             JsonRpcMessage::response(message.id, serde_json::to_value(InitializeResult::local())?)
                 .to_wire_value(),
         ])
+    }
+
+    fn thread_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let threads = self.store.list_threads()?;
+        Ok(vec![
+            JsonRpcMessage::response(
+                message.id,
+                serde_json::to_value(ThreadListResult { threads })?,
+            )
+            .to_wire_value(),
+        ])
+    }
+
+    fn thread_read(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: ThreadIdParams = message.params_as()?;
+        match self.store.get_thread(&params.thread_id) {
+            Ok(thread) => Ok(vec![
+                JsonRpcMessage::response(
+                    message.id,
+                    serde_json::to_value(ThreadResult { thread })?,
+                )
+                .to_wire_value(),
+            ]),
+            Err(StoreError::NotFound(_)) => Ok(vec![
+                JsonRpcMessage::error(message.id, ErrorCode::not_found("Thread not found"))
+                    .to_wire_value(),
+            ]),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn thread_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -109,10 +157,83 @@ impl AppServer {
         Ok(vec![
             JsonRpcMessage::response(
                 message.id,
-                serde_json::to_value(ThreadStartResult { thread })?,
+                serde_json::to_value(ThreadStartResult {
+                    thread: thread.clone(),
+                })?,
+            )
+            .to_wire_value(),
+            AppEvent::thread_started(&thread)
+                .to_notification()
+                .to_wire_value(),
+        ])
+    }
+
+    fn thread_fork(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: ThreadForkParams = message.params_as()?;
+        if let Err(error) = self.store.get_thread(&params.thread_id) {
+            return match error {
+                StoreError::NotFound(_) => Ok(vec![
+                    JsonRpcMessage::error(message.id, ErrorCode::not_found("Thread not found"))
+                        .to_wire_value(),
+                ]),
+                other => Err(other.into()),
+            };
+        }
+        let thread = self
+            .store
+            .create_thread(params.model.as_deref(), params.cwd.as_deref())?;
+        Ok(vec![
+            JsonRpcMessage::response(
+                message.id,
+                serde_json::to_value(ThreadForkResult {
+                    source_thread_id: params.thread_id,
+                    thread,
+                })?,
             )
             .to_wire_value(),
         ])
+    }
+
+    fn thread_archive(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: ThreadIdParams = message.params_as()?;
+        match self.store.update_thread_status(
+            &params.thread_id,
+            singularity_protocol::ThreadStatus::Archived,
+        ) {
+            Ok(thread) => Ok(vec![
+                JsonRpcMessage::response(
+                    message.id,
+                    serde_json::to_value(ThreadResult { thread })?,
+                )
+                .to_wire_value(),
+            ]),
+            Err(StoreError::NotFound(_)) => Ok(vec![
+                JsonRpcMessage::error(message.id, ErrorCode::not_found("Thread not found"))
+                    .to_wire_value(),
+            ]),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn thread_delete(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: ThreadIdParams = message.params_as()?;
+        match self.store.delete_thread(&params.thread_id) {
+            Ok(()) => Ok(vec![
+                JsonRpcMessage::response(
+                    message.id,
+                    serde_json::to_value(ThreadDeleteResult {
+                        thread_id: params.thread_id,
+                        deleted: true,
+                    })?,
+                )
+                .to_wire_value(),
+            ]),
+            Err(StoreError::NotFound(_)) => Ok(vec![
+                JsonRpcMessage::error(message.id, ErrorCode::not_found("Thread not found"))
+                    .to_wire_value(),
+            ]),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -124,7 +245,7 @@ impl AppServer {
         let payload = serde_json::to_value(&params.input)?;
         let item = self
             .store
-            .append_item(&turn.turn_id, ItemKind::InputMessage, payload)?;
+            .append_item(&turn.turn_id, ItemKind::UserMessage, payload)?;
         let trace = TraceEvent::new(
             format!("trace_{}", turn.turn_id),
             params.thread_id,
@@ -135,17 +256,73 @@ impl AppServer {
         self.store.append_trace(&trace)?;
 
         Ok(vec![
-            JsonRpcMessage::response(message.id, serde_json::to_value(TurnStartResult { turn })?)
+            JsonRpcMessage::response(
+                message.id,
+                serde_json::to_value(TurnStartResult { turn: turn.clone() })?,
+            )
+            .to_wire_value(),
+            AppEvent::turn_started(&turn)
+                .to_notification()
                 .to_wire_value(),
             AppEvent::item_started(item.item_id.clone())
                 .to_notification()
                 .to_wire_value(),
-            AppEvent::item_delta(item.item_id.clone(), "input accepted")
+            AppEvent::item_agent_message_delta(item.item_id.clone(), "input accepted")
                 .to_notification()
                 .to_wire_value(),
             AppEvent::item_completed(item.item_id)
                 .to_notification()
                 .to_wire_value(),
+        ])
+    }
+
+    fn turn_interrupt(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: TurnIdParams = message.params_as()?;
+        match self.store.update_turn_status(
+            &params.turn_id,
+            singularity_protocol::TurnStatus::Interrupted,
+        ) {
+            Ok(turn) => Ok(vec![
+                JsonRpcMessage::response(
+                    message.id,
+                    serde_json::to_value(TurnInterruptResult {
+                        turn_id: turn.turn_id,
+                        status: "interrupted".to_string(),
+                    })?,
+                )
+                .to_wire_value(),
+            ]),
+            Err(StoreError::NotFound(_)) => Ok(vec![
+                JsonRpcMessage::error(message.id, ErrorCode::not_found("Turn not found"))
+                    .to_wire_value(),
+            ]),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn turn_status(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: TurnIdParams = message.params_as()?;
+        match self.store.get_turn(&params.turn_id) {
+            Ok(turn) => Ok(vec![
+                JsonRpcMessage::response(message.id, serde_json::to_value(TurnResult { turn })?)
+                    .to_wire_value(),
+            ]),
+            Err(StoreError::NotFound(_)) => Ok(vec![
+                JsonRpcMessage::error(message.id, ErrorCode::not_found("Turn not found"))
+                    .to_wire_value(),
+            ]),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn approval_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let approvals = self.store.list_pending_approvals()?;
+        Ok(vec![
+            JsonRpcMessage::response(
+                message.id,
+                serde_json::to_value(ApprovalListResult { approvals })?,
+            )
+            .to_wire_value(),
         ])
     }
 
@@ -200,7 +377,11 @@ impl AppServer {
         let params: TraceListParams = message.params_as()?;
         match self.store.list_trace(&params.run_id) {
             Ok(events) => Ok(vec![
-                JsonRpcMessage::response(message.id, json!({"events": events})).to_wire_value(),
+                JsonRpcMessage::response(
+                    message.id,
+                    serde_json::to_value(TraceListResult { events })?,
+                )
+                .to_wire_value(),
             ]),
             Err(StoreError::NotFound(_)) => Ok(vec![
                 JsonRpcMessage::error(message.id, ErrorCode::not_found("Trace run not found"))
@@ -218,6 +399,27 @@ impl AppServer {
             ]),
             Err(StoreError::NotFound(_)) => Ok(vec![
                 JsonRpcMessage::error(message.id, ErrorCode::not_found("Trace event not found"))
+                    .to_wire_value(),
+            ]),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn trace_tail(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: TraceTailParams = message.params_as()?;
+        match self
+            .store
+            .tail_trace(&params.run_id, params.limit.unwrap_or(50))
+        {
+            Ok(events) => Ok(vec![
+                JsonRpcMessage::response(
+                    message.id,
+                    serde_json::to_value(TraceListResult { events })?,
+                )
+                .to_wire_value(),
+            ]),
+            Err(StoreError::NotFound(_)) => Ok(vec![
+                JsonRpcMessage::error(message.id, ErrorCode::not_found("Trace run not found"))
                     .to_wire_value(),
             ]),
             Err(error) => Err(error.into()),

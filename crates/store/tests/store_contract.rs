@@ -29,7 +29,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let item = store
         .append_item(
             &turn.turn_id,
-            ItemKind::InputMessage,
+            ItemKind::UserMessage,
             serde_json::json!({"text": "hello"}),
         )
         .expect("item");
@@ -47,7 +47,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
         .record_approval_decision("approval_1", ApprovalOutcome::Allow, "ok")
         .expect("decision");
 
-    assert_eq!(item.kind, ItemKind::InputMessage);
+    assert_eq!(item.kind, ItemKind::UserMessage);
     assert_eq!(store.list_trace("run_1").expect("trace list").len(), 1);
     assert_eq!(
         store.show_trace("trace_1").expect("trace show").summary,

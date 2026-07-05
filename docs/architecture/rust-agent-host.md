@@ -16,11 +16,11 @@
 
 ## 已落地边界
 
-`crates/protocol` 定义 JSON-RPC envelope、method params/result、`Thread`、`Turn`、`Item`、`TraceEvent` 和 app-server event。JSON-RPC params 使用 camelCase，例如 `clientInfo`、`threadId`；嵌入领域对象继续使用当前 Python parity schema 的 snake_case。
+`crates/protocol` 定义 JSON-RPC envelope、method params/result、`Thread`、`Turn`、`Item`、`TraceEvent` 和 app-server event。JSON-RPC params 使用 camelCase，例如 `clientInfo`、`threadId`、`turnId`、`runId`、`eventId`；嵌入领域对象继续使用当前 Python parity schema 的 snake_case。
 
 `crates/store` 是 SQLite-backed persistence boundary。它持久化 thread、turn、item、trace event 和 approval pending/decision；`SessionStoreDescriptor` 负责可序列化 store schema 描述，真实 `SessionStore` 持有 SQLite connection。
 
-`crates/app-server` 实现 `initialize` / `initialized` handshake、`thread/start`、`turn/start`、`approval/request`、`approval/decision`、`trace/list`、`trace/show`。`turn/start` 明确写入 `agent_loop_status = "not_migrated"`，不伪装 Python AgentLoop 已完成迁移。
+`crates/app-server` 实现 `initialize` / `initialized` handshake、thread list/read/start/resume/fork/archive/delete、turn start/interrupt/status、approval list/request/decision、trace list/show/tail 和 `server/shutdown`。`turn/start` 明确写入 `agent_loop_status = "not_migrated"`，不伪装 Python AgentLoop 已完成迁移；item streaming 使用 `item/agentMessage/delta` 和 `item/commandExecution/outputDelta` 这类 typed delta，不再使用 generic `item/delta`。
 
 `crates/cli` 只通过 app-server protocol 生成 JSON-RPC request。它不直接依赖 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
