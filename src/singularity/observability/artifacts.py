@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from singularity.observability.exceptions import TraceArtifactError
 from singularity.observability.models import TraceArtifact, TraceArtifactKind
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import TraceRedactor, shared_trace_redactor
 
 
 class TraceArtifactStore:
@@ -27,7 +27,7 @@ class TraceArtifactStore:
         self.root = Path(root)
         self.run_id = run_id
         self.session_id = session_id
-        self.redactor = redactor or TraceRedactor()
+        self.redactor = redactor or shared_trace_redactor()
         self.max_artifact_bytes = max_artifact_bytes
         self.max_total_bytes = max_total_bytes
         self.run_dir = Path(run_dir).expanduser() if run_dir is not None else (

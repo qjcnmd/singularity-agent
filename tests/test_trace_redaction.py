@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import (
+    DEFAULT_TRACE_REDACTION_OUTPUT_LIMIT_CHARS,
+    TraceRedactor,
+    shared_trace_redactor,
+)
+
+CUSTOM_OUTPUT_LIMIT_CHARS = 1000
+TRUNCATED_OUTPUT_LIMIT_CHARS = 24
 
 
 def test_redacts_secret_keys_recursively_without_preserving_secret_parts() -> None:
-    redactor = TraceRedactor(output_limit_chars=1000)
+    redactor = TraceRedactor(output_limit_chars=CUSTOM_OUTPUT_LIMIT_CHARS)
     payload = {
         "OPENAI_API_KEY": "sk-secret-value",
         "nested": [
@@ -34,7 +41,7 @@ def test_redacts_secret_keys_recursively_without_preserving_secret_parts() -> No
 
 
 def test_redacts_env_style_text_and_auth_headers() -> None:
-    redactor = TraceRedactor(output_limit_chars=1000)
+    redactor = TraceRedactor(output_limit_chars=CUSTOM_OUTPUT_LIMIT_CHARS)
     text = "\n".join(
         [
             "OPENAI_API_KEY=sk-prod-123",
@@ -64,7 +71,7 @@ def test_redacts_env_style_text_and_auth_headers() -> None:
 
 
 def test_redacts_cli_secret_flags_and_json_argv_values() -> None:
-    redactor = TraceRedactor(output_limit_chars=1000)
+    redactor = TraceRedactor(output_limit_chars=CUSTOM_OUTPUT_LIMIT_CHARS)
     text = "\n".join(
         [
             "tool --password hunter2 --token=abc123",
@@ -83,7 +90,7 @@ def test_redacts_cli_secret_flags_and_json_argv_values() -> None:
 
 
 def test_redacts_long_text_and_payload_hash_is_stable() -> None:
-    redactor = TraceRedactor(output_limit_chars=24)
+    redactor = TraceRedactor(output_limit_chars=TRUNCATED_OUTPUT_LIMIT_CHARS)
     payload = {"safe": "x" * 100, "token": "secret-token"}
 
     first = redactor.hash_payload(payload)
@@ -97,7 +104,7 @@ def test_redacts_long_text_and_payload_hash_is_stable() -> None:
 
 
 def test_preserves_safe_numeric_token_usage_metrics() -> None:
-    redactor = TraceRedactor(output_limit_chars=1000)
+    redactor = TraceRedactor(output_limit_chars=CUSTOM_OUTPUT_LIMIT_CHARS)
     payload = {
         "usage": {
             "input_tokens": 12,
@@ -116,7 +123,7 @@ def test_preserves_safe_numeric_token_usage_metrics() -> None:
 
 
 def test_preserves_safe_boolean_token_status_flags() -> None:
-    redactor = TraceRedactor(output_limit_chars=1000)
+    redactor = TraceRedactor(output_limit_chars=CUSTOM_OUTPUT_LIMIT_CHARS)
     payload = {
         "restricted_token": True,
         "token": "secret-token",
@@ -126,3 +133,9 @@ def test_preserves_safe_boolean_token_status_flags() -> None:
 
     assert redacted["restricted_token"] is True
     assert redacted["token"] == "<redacted>"
+
+
+def test_shared_trace_redactor_returns_stable_default_instance() -> None:
+    assert shared_trace_redactor() is shared_trace_redactor()
+    assert shared_trace_redactor().output_limit_chars == DEFAULT_TRACE_REDACTION_OUTPUT_LIMIT_CHARS
+    assert shared_trace_redactor(output_limit_chars=CUSTOM_OUTPUT_LIMIT_CHARS) is not shared_trace_redactor()

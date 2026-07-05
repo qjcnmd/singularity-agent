@@ -8,9 +8,9 @@ from enum import Enum, StrEnum
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 
-_COMMAND_REDACTOR = TraceRedactor()
+_COMMAND_REDACTOR = shared_trace_redactor()
 _SECRET_ARG_FLAG_RE = re.compile(
     r"^--?(?:password|passwd|pwd|token|secret|api[-_]?key|authorization|cookie)$",
     re.IGNORECASE,

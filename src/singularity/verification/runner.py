@@ -33,6 +33,7 @@ from singularity.policy import (
 )
 from singularity.policy.audit import redact
 from singularity.repair import RepairPlanner
+from singularity.utils.attributes import nested_getattr
 from singularity.verification.assessor import CompletionAssessor
 from singularity.verification.discovery import ProjectDetector
 from singularity.verification.failure_analysis import FailureAnalysisPipeline
@@ -740,7 +741,7 @@ class VerificationRunner:
         return PolicyRequest(
             session_id=getattr(self.planner, "session_id", "verification_session"),
             task_id=getattr(self.planner, "task_id", "verification_task"),
-            phase_id=getattr(getattr(self.planner, "state", None), "current_phase", "verification"),
+            phase_id=nested_getattr(self.planner, "state.current_phase", default="verification"),
             action_id=check.id,
             component=PolicyComponent.VERIFICATION,
             operation=OperationKind.VERIFICATION,
@@ -1193,7 +1194,7 @@ class VerificationRunner:
             ids={
                 "session_id": getattr(self.planner, "session_id", None),
                 "task_id": getattr(self.planner, "task_id", None),
-                "phase_id": getattr(getattr(self.planner, "state", None), "current_phase", None),
+                "phase_id": nested_getattr(self.planner, "state.current_phase"),
                 "action_id": check.id,
                 "verification_id": check.id,
                 "command_id": result.evidence.command_id if result else None,

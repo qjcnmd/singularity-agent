@@ -17,6 +17,7 @@ from singularity.kernel.models import CancellationReason, RunIdentity
 from singularity.observability.artifacts import TraceArtifactStore
 from singularity.observability.store import TraceStore
 from singularity.policy import ApprovalGrant
+from singularity.runtime.resources import close_runtime_resources
 
 
 class AgentHostError(RuntimeError):
@@ -73,9 +74,7 @@ class AgentHost:
                 snapshot=snapshot,
             )
         finally:
-            close_resources = getattr(kernel, "close_resources", None)
-            if callable(close_resources):
-                close_resources()
+            close_runtime_resources(kernel)
 
     def resume_run(
         self,

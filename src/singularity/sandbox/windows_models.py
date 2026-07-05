@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 from singularity.sandbox.exceptions import SandboxCapabilityError
 from singularity.sandbox.models import SandboxNetworkMode
 
@@ -95,7 +95,7 @@ class WindowsCapabilityState:
         return self.status == "available"
 
     def to_dict(self) -> dict[str, Any]:
-        redacted = TraceRedactor().redact_value(self.evidence)
+        redacted = shared_trace_redactor().redact_value(self.evidence)
         return {
             "status": self.status,
             "checked": self.checked,

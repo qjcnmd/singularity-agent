@@ -19,7 +19,7 @@ from singularity.observability.models import (
     TraceSpan,
     TraceStatus,
 )
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import TraceRedactor, shared_trace_redactor
 from singularity.observability.spans import SpanManager
 from singularity.observability.store import TraceStore
 from singularity.observability.summary import TraceSummaryBuilder
@@ -41,7 +41,7 @@ class TraceRecorder:
         self.root = Path(root)
         self.run_id = run_id
         self.session_id = session_id
-        self.redactor = redactor or TraceRedactor()
+        self.redactor = redactor or shared_trace_redactor()
         self.store = store or TraceStore(self.root, run_id=run_id, trace_dir=trace_dir)
         self.artifacts = artifacts or TraceArtifactStore(
             self.root,

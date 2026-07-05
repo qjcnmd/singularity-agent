@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import difflib
-import hashlib
 import json
 import os
 import shlex
@@ -61,8 +60,11 @@ from singularity.evaluation.results import (
     _evaluation_passed_from_payload as _evaluation_passed_from_payload,
 )
 from singularity.interaction import InteractionMode
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import TraceRedactor, shared_trace_redactor
 from singularity.redaction import RedactionProvider
+from singularity.runtime.resources import close_runtime_resources
+from singularity.utils.attributes import nested_getattr
+from singularity.utils.serialization import stable_hash_bytes, stable_hash_payload, stable_hash_text, utc_timestamp
 
 EVALUATION_METRICS_SCHEMA_VERSION = "evaluation.metrics/v1"
 
@@ -112,7 +114,7 @@ class EvaluationRunner:
             bootstrap_cls = KernelBootstrap
         self.bootstrap_cls = bootstrap_cls
         self.console = console or Console()
-        self.redactor = TraceRedactor()
+        self.redactor = shared_trace_redactor()
 
     @property
     def run_dir(self) -> Path:
@@ -619,10 +621,9 @@ class EvaluationRunner:
                 if not turn_count:
                     turn_count = _turn_count_from_trace(Path(trace_path) if trace_path else None, usage)
         finally:
-            close_resources = getattr(kernel, "close_resources", None) if kernel is not None else None
-            if callable(close_resources):
+            if kernel is not None:
                 phase_started = time.perf_counter()
-                close_resources()
+                close_runtime_resources(kernel)
                 evaluation_timing["resource_cleanup_time_seconds"] = (
                     time.perf_counter() - phase_started
                 )
@@ -1273,9 +1274,7 @@ def _dependency_setup_cache(
         "prepare_commands": list(task.prepare_commands),
         "dependency_files": dependency_files,
     }
-    cache_key = hashlib.sha256(
-        json.dumps(key_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    cache_key = stable_hash_payload(key_payload)
     cache_dir = cache_root / cache_key[:16]
     pip_cache_dir = cache_dir / "pip"
     wheelhouse_dir = cache_dir / "wheelhouse"
@@ -1337,13 +1336,13 @@ def _dependency_setup_cache(
             "platform": sys.platform,
             "workspace": {
                 "kind": task.workspace.kind,
-                "path_digest": hashlib.sha256(str(task.workspace.path or "").encode("utf-8")).hexdigest(),
+                "path_digest": stable_hash_text(str(task.workspace.path or "")),
                 "start_commit": task.workspace.start_commit,
             },
             "workspace_start_commit": task.workspace.start_commit,
-            "prepare_commands_digest": hashlib.sha256(
-                json.dumps(list(task.prepare_commands), ensure_ascii=False).encode("utf-8")
-            ).hexdigest(),
+            "prepare_commands_digest": stable_hash_text(
+                json.dumps(list(task.prepare_commands), ensure_ascii=False)
+            ),
             "dependency_files": dependency_files,
         },
         "model_visible": False,
@@ -1494,9 +1493,9 @@ def _finalize_dependency_setup_cache(audit: dict[str, Any], *, workspace: Path) 
         "created_at": _utc_timestamp(),
         "strategy": "prepared_venv",
         "source_workspace": str(workspace),
-        "source_workspace_hash": hashlib.sha256(str(workspace).encode("utf-8")).hexdigest(),
+        "source_workspace_hash": stable_hash_text(str(workspace)),
         "source_venv": str(workspace_venv),
-        "source_venv_hash": hashlib.sha256(str(workspace_venv).encode("utf-8")).hexdigest(),
+        "source_venv_hash": stable_hash_text(str(workspace_venv)),
     }
     marker_tmp = ready_marker.with_name(f"{ready_marker.name}.tmp-{os.getpid()}-{time.time_ns()}")
     try:
@@ -1544,12 +1543,12 @@ def _dependency_cache_error(exc: BaseException) -> dict[str, Any]:
     text = f"{type(exc).__name__}:{exc}"
     return {
         "type": type(exc).__name__,
-        "message_hash": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16],
+        "message_hash": stable_hash_bytes(text.encode("utf-8", errors="replace"))[:16],
     }
 
 
 def _utc_timestamp() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return utc_timestamp()
 
 
 def _dependency_file_digests(workspace: Path) -> dict[str, str | None]:
@@ -1560,14 +1559,14 @@ def _dependency_file_digests(workspace: Path) -> dict[str, str | None]:
         if not path.is_file():
             digests[relative] = None
             continue
-        digests[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        digests[relative] = stable_hash_bytes(path.read_bytes())
     return digests
 
 
 def _redacted_url(value: str) -> str | None:
     if not value:
         return None
-    redacted = TraceRedactor().redact_text(value)
+    redacted = shared_trace_redactor().redact_text(value)
     if "@" in redacted:
         scheme, _, rest = redacted.partition("://")
         if rest:
@@ -1577,7 +1576,7 @@ def _redacted_url(value: str) -> str | None:
 
 
 def _trace_path(kernel: Any) -> str:
-    trace = getattr(getattr(kernel, "graph", None), "trace", None)
+    trace = nested_getattr(kernel, "graph.trace")
     store = getattr(trace, "store", None)
     run_dir = getattr(store, "run_dir", None)
     if run_dir:
@@ -1595,9 +1594,9 @@ def _trace_summary(kernel: Any, agent_result: Any) -> dict[str, Any]:
         summary = payload.get("trace_summary")
         if isinstance(summary, dict):
             return summary
-    trace = getattr(getattr(kernel, "graph", None), "trace", None)
+    trace = nested_getattr(kernel, "graph.trace")
     context = getattr(kernel, "context", None)
-    task_id = getattr(getattr(context, "identity", None), "task_id", None)
+    task_id = nested_getattr(context, "identity.task_id")
     if trace is not None and hasattr(trace, "final_report_summary"):
         try:
             return trace.final_report_summary(task_id=task_id)
@@ -1607,9 +1606,9 @@ def _trace_summary(kernel: Any, agent_result: Any) -> dict[str, Any]:
 
 
 def _trace_summary_from_kernel(kernel: Any) -> dict[str, Any]:
-    trace = getattr(getattr(kernel, "graph", None), "trace", None)
+    trace = nested_getattr(kernel, "graph.trace")
     context = getattr(kernel, "context", None)
-    task_id = getattr(getattr(context, "identity", None), "task_id", None)
+    task_id = nested_getattr(context, "identity.task_id")
     if trace is not None and hasattr(trace, "final_report_summary"):
         try:
             return trace.final_report_summary(task_id=task_id)
@@ -1661,7 +1660,7 @@ def _infrastructure_blocked(agent_result: Any, *, usage: dict[str, Any], tool_ca
 def _sandbox_environment_blocked(kernel: Any, *, agent_status: str) -> bool:
     if agent_status not in {"blocked", "failed"}:
         return False
-    planner = getattr(getattr(kernel, "graph", None), "planner", None)
+    planner = nested_getattr(kernel, "graph.planner")
     evidence = getattr(planner, "evidence", None)
     observations = getattr(evidence, "sandbox_observations", None) or []
     for observation in observations:
@@ -1680,7 +1679,7 @@ def _sandbox_environment_blocked(kernel: Any, *, agent_status: str) -> bool:
 
 
 def _sandbox_environment_blocker_reason(kernel: Any) -> str:
-    planner = getattr(getattr(kernel, "graph", None), "planner", None)
+    planner = nested_getattr(kernel, "graph.planner")
     state = getattr(planner, "state", None)
     for reason in getattr(state, "blocked_reasons", None) or []:
         normalized = str(reason).strip().lower()
@@ -1753,7 +1752,7 @@ def _evaluator_visibility_audit(
 
 
 def _agent_status(agent_result: Any) -> str:
-    return str(getattr(getattr(agent_result, "status", None), "value", getattr(agent_result, "status", "")))
+    return str(nested_getattr(agent_result, "status.value", default=getattr(agent_result, "status", "")))
 
 
 def _final_report_payload(agent_result: Any) -> dict[str, Any]:
@@ -4640,7 +4639,7 @@ def _prepare_verification_workspace(
             success={"type": "verification_exit_code", "exit_code": 0},
             test_patch=test_patch,
         )
-        applied = _apply_test_patch(patch_task, workspace=verification_workspace, redactor=TraceRedactor())
+        applied = _apply_test_patch(patch_task, workspace=verification_workspace, redactor=shared_trace_redactor())
         if applied is not None and not applied.passed:
             return False
     elif _read_text_files(verification_workspace) != before_snapshot:

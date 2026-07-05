@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 from singularity.release.paths import resolve_user_data_paths
 from singularity.sandbox.models import (
     SandboxRequest,
@@ -569,7 +569,7 @@ def _run_command(
 
 def _safe_output(result: subprocess.CompletedProcess[str]) -> str:
     text = (result.stderr or result.stdout or "").strip()
-    return TraceRedactor().redact_text(text)[:500] or f"exit {result.returncode}"
+    return shared_trace_redactor().redact_text(text)[:500] or f"exit {result.returncode}"
 
 
 def sandbox_exception_diagnostics(operation: str, exc: BaseException) -> dict[str, Any]:
@@ -889,7 +889,7 @@ def _diagnostic_text(
     probe_root: Path | None = None,
     path: Path | None = None,
 ) -> str:
-    sanitized = TraceRedactor().redact_text(str(text).strip())
+    sanitized = shared_trace_redactor().redact_text(str(text).strip())
     for item in (state_dir, probe_root, path):
         if item is None:
             continue

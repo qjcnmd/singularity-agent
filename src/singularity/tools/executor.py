@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from singularity.kernel.cancellation import is_cancellation_error, throw_if_cancelled
 from singularity.observability.models import TraceEventType, TraceSeverity
 from singularity.observability.protocols import TraceEmitterProtocol
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 from singularity.policy import (
     ApprovalGate,
 )
@@ -70,7 +70,7 @@ class ToolExecutor:
         self.dry_run = dry_run
         self._cache = ToolResultCache()
         self._ledger = IdempotencyLedger()
-        self._redactor = TraceRedactor()
+        self._redactor = shared_trace_redactor()
         self.execution_policy = ToolExecutionPolicyGate(
             policy_engine=self.policy_engine,
             approval_gate=self.approval_gate,

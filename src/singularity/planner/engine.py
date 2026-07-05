@@ -339,72 +339,48 @@ class Planner:
         tool_scope = self._active_tool_scope()
         if tool_scope.repair_execution_block and tool_name not in tool_scope.repair_evidence_allowed:
             error_code, block_reason = tool_scope.repair_execution_block
-            decision = AuthorizationDecision(
-                allowed=False,
+            return self._deny_tool_call(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
                 error_code=error_code,
                 reason=(
                     f"{tool_name} requires an executable repair contract before "
                     f"repair-phase execution: {block_reason}."
                 ),
-            )
-            self._record_event(
-                action_id=tool_call_id,
-                action_kind=self.policy.action_for_tool(tool_name).value,
-                decision="deny",
-                reason=decision.reason,
                 extra={
-                    "reason_code": decision.error_code,
+                    "reason_code": error_code,
                     "repair_contract": self._active_repair_contract(),
                 },
             )
-            return decision
         if tool_scope.repair_allowed and tool_name not in tool_scope.repair_allowed:
-            decision = AuthorizationDecision(
-                allowed=False,
+            return self._deny_tool_call(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
                 error_code="repair_contract_tool_not_allowed",
                 reason=f"{tool_name} is not allowed by the active repair contract.",
-            )
-            self._record_event(
-                action_id=tool_call_id,
-                action_kind=self.policy.action_for_tool(tool_name).value,
-                decision="deny",
-                reason=decision.reason,
                 extra={
-                    "reason_code": decision.error_code,
+                    "reason_code": "repair_contract_tool_not_allowed",
                     "repair_contract": self._active_repair_contract(),
                 },
             )
-            return decision
         if tool_scope.benchmark_allowed and tool_name not in tool_scope.benchmark_allowed:
-            decision = AuthorizationDecision(
-                allowed=False,
+            return self._deny_tool_call(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
                 error_code="benchmark_tool_not_allowed",
                 reason=f"{tool_name} is not allowed by the active benchmark task.",
-            )
-            self._record_event(
-                action_id=tool_call_id,
-                action_kind=self.policy.action_for_tool(tool_name).value,
-                decision="deny",
-                reason=decision.reason,
                 extra={
-                    "reason_code": decision.error_code,
+                    "reason_code": "benchmark_tool_not_allowed",
                     "benchmark_constraints": self._benchmark_constraints,
                 },
             )
-            return decision
         if not self.policy.is_allowed(phase=phase, tool_name=tool_name, spec=spec):
-            decision = AuthorizationDecision(
-                allowed=False,
+            return self._deny_tool_call(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
                 error_code="action_not_allowed",
                 reason=f"{tool_name} is not allowed in phase {phase.phase_id}.",
             )
-            self._record_event(
-                action_id=tool_call_id,
-                action_kind=self.policy.action_for_tool(tool_name).value,
-                decision="deny",
-                reason=decision.reason,
-            )
-            return decision
 
         target_paths = target_paths_from_tool_arguments(tool_name, normalized_args)
         repair_targets = self._active_repair_target_files()
@@ -419,41 +395,29 @@ class Planner:
                 if _normalize_planner_path(path) not in repair_targets
             ]
             if outside_targets:
-                decision = AuthorizationDecision(
-                    allowed=False,
+                return self._deny_tool_call(
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
                     error_code="repair_contract_target_not_allowed",
                     reason="Mutation target is outside the active repair contract.",
-                )
-                self._record_event(
-                    action_id=tool_call_id,
-                    action_kind=self.policy.action_for_tool(tool_name).value,
-                    decision="deny",
-                    reason=decision.reason,
                     extra={
-                        "reason_code": decision.error_code,
+                        "reason_code": "repair_contract_target_not_allowed",
                         "blocked_paths": outside_targets,
                         "repair_contract": self._active_repair_contract(),
                     },
                 )
-                return decision
         if write_blocked_by_user_constraint(spec, self._active_user_constraints(), target_paths):
-            decision = AuthorizationDecision(
-                allowed=False,
+            return self._deny_tool_call(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
                 error_code="user_constraint_blocks_write_path",
                 reason=f"{tool_name} targets a path blocked by active user constraints.",
-            )
-            self._record_event(
-                action_id=tool_call_id,
-                action_kind=self.policy.action_for_tool(tool_name).value,
-                decision="deny",
-                reason=decision.reason,
                 extra={
-                    "reason_code": decision.error_code,
+                    "reason_code": "user_constraint_blocks_write_path",
                     "blocked_paths": target_paths,
                     "active_user_constraints": self._active_user_constraints(),
                 },
             )
-            return decision
 
         # During repair phase, constrain run_verification / rerun_check to the
         # active VerificationContract's allowed commands.
@@ -467,26 +431,20 @@ class Planner:
                     if isinstance(cmd, list) and not vcontract.is_command_allowed(cmd)
                 ]
                 if disallowed:
-                    decision = AuthorizationDecision(
-                        allowed=False,
+                    return self._deny_tool_call(
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
                         error_code="verification_contract_command_not_allowed",
                         reason=(
                             "Verification command is not in the active VerificationContract: "
                             + "; ".join(" ".join(str(c) for c in cmd) for cmd in disallowed[:3])
                         ),
-                    )
-                    self._record_event(
-                        action_id=tool_call_id,
-                        action_kind=self.policy.action_for_tool(tool_name).value,
-                        decision="deny",
-                        reason=decision.reason,
                         extra={
-                            "reason_code": decision.error_code,
+                            "reason_code": "verification_contract_command_not_allowed",
                             "disallowed_commands": disallowed,
                             "verification_contract": vcontract.to_dict(),
                         },
                     )
-                    return decision
 
         risk = self.risk.evaluate_action(
             tool_name=tool_name,
@@ -499,17 +457,13 @@ class Planner:
             state.blocked_reasons.extend(risk.reasons)
             self.evidence.risks.append(risk.to_dict())
             self._persist()
-            self._record_event(
-                action_id=tool_call_id,
-                action_kind=self.policy.action_for_tool(tool_name).value,
-                decision=risk.decision.value,
-                reason="; ".join(risk.reasons),
-            )
-            return AuthorizationDecision(
-                allowed=False,
+            return self._deny_tool_call(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
                 error_code="risk_escalated",
                 reason="; ".join(risk.reasons),
                 risk_decision=risk.decision,
+                decision=risk.decision.value,
             )
 
         action = AgentAction(
@@ -529,6 +483,31 @@ class Planner:
             reason=f"{tool_name} is allowed in phase {phase.phase_id}.",
         )
         return AuthorizationDecision(allowed=True, action=action)
+
+    def _deny_tool_call(
+        self,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        error_code: str,
+        reason: str,
+        extra: dict[str, Any] | None = None,
+        risk_decision: RiskDecisionKind = RiskDecisionKind.CONTINUE,
+        decision: str = "deny",
+    ) -> AuthorizationDecision:
+        self._record_event(
+            action_id=tool_call_id,
+            action_kind=self.policy.action_for_tool(tool_name).value,
+            decision=decision,
+            reason=reason,
+            extra=extra,
+        )
+        return AuthorizationDecision(
+            allowed=False,
+            error_code=error_code,
+            reason=reason,
+            risk_decision=risk_decision,
+        )
 
     def update_from_tool_result(
         self,

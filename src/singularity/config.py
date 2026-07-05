@@ -58,6 +58,11 @@ class Settings(BaseModel):
 BASE_DEFAULT_MAX_TURNS = 8
 MEDIUM_TASK_DEFAULT_MAX_TURNS = 12
 LONG_TASK_DEFAULT_MAX_TURNS = 16
+MEDIUM_TASK_CHAR_THRESHOLD = 120
+LONG_TASK_CHAR_THRESHOLD = 240
+MEDIUM_TASK_MARKER_THRESHOLD = 2
+LONG_TASK_MARKER_THRESHOLD = 5
+MULTILINE_TASK_NEWLINE_THRESHOLD = 2
 
 _LONG_TASK_MARKERS = (
     "refactor",
@@ -101,9 +106,13 @@ def adaptive_default_max_turns(goal: str | None) -> int:
     marker_hits = sum(1 for marker in _LONG_TASK_MARKERS if marker in lowered)
     char_count = len(text)
 
-    if char_count >= 240 or marker_hits >= 5 or text.count("\n") >= 2:
+    if (
+        char_count >= LONG_TASK_CHAR_THRESHOLD
+        or marker_hits >= LONG_TASK_MARKER_THRESHOLD
+        or text.count("\n") >= MULTILINE_TASK_NEWLINE_THRESHOLD
+    ):
         return LONG_TASK_DEFAULT_MAX_TURNS
-    if char_count >= 120 or marker_hits >= 2:
+    if char_count >= MEDIUM_TASK_CHAR_THRESHOLD or marker_hits >= MEDIUM_TASK_MARKER_THRESHOLD:
         return MEDIUM_TASK_DEFAULT_MAX_TURNS
     return BASE_DEFAULT_MAX_TURNS
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from singularity.kernel.models import KernelContext
-from singularity.observability.redaction import TraceRedactor
+from singularity.observability.redaction import shared_trace_redactor
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ PartialFinalReport = FinalReport
 
 class KernelFinalizer:
     def __init__(self) -> None:
-        self.redactor = TraceRedactor()
+        self.redactor = shared_trace_redactor()
 
     def finalize(
         self,

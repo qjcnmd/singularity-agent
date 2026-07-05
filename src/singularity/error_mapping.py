@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from singularity.error_codes import ErrorCode
-from singularity.tool_protocol.models import ToolCallFailureKind
+from singularity.error_kinds import ToolCallFailureKind
 
 TOOL_PROTOCOL_FAILURE_KIND_ERROR_CODE_MAP: dict[ToolCallFailureKind, ErrorCode] = {
     ToolCallFailureKind.missing_tool_call_id: ErrorCode.PROTOCOL_VIOLATION,
