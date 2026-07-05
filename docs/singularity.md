@@ -3,6 +3,14 @@
 > 基于当前源码核对：`agent_loop.py`、`agent_loop_turns.py`、`agent_loop_completion.py`、`agent_loop_failure_recovery.py`、`run_controller.py`、`execution_outcome.py`、`error_codes.py`、`kernel/agent_kernel.py`、`tool_protocol/engine.py`。
 > `[成功]` / `[失败]` / `[阻断]` 为关键分叉点；缩进表示嵌套层级。
 
+## Rust Agent Host 迁移边界
+
+当前 Python 主链路仍是 `CLI -> KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop -> ToolProtocolEngine -> ToolExecutor -> FinalReport`。第一阶段 Rust 迁移只新增长期 host 边界，不替换这条 Python AgentLoop 执行链。
+
+长期架构为 `Rust Core + App Server + CLI/TUI first`：`crates/core`、`protocol`、`store`、`policy`、`sandbox`、`tools`、`model`、`agent`、`app-server`、`cli` 已作为 workspace 边界存在；Rust package / library 名使用 `singularity_*`，避免与 Rust 标准库 `core` 等名称冲突。`crates/app-server` 通过 JSON-RPC over stdio JSONL 暴露 `initialize`、`initialized`、`thread/start`、`turn/start`、`approval/request`、`approval/decision`、`trace/list` 和 `trace/show`；`turn/start` 写入 `agent_loop_status = "not_migrated"`，明确不伪装 AgentLoop 已迁移。
+
+`crates/cli` 是第一个 app-server protocol client；未来 desktop 必须复用同一 protocol，不单独设计第二套 core。Python 当前实现冻结为 migration oracle / parity reference：允许新增 fixture export、parity check 和文档校验，不在 Python 主干继续新增核心 agent host 能力。
+
 ---
 
 ```

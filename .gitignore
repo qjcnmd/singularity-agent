@@ -4,6 +4,7 @@
 outputs/
 work/
 test_run/
+target/
 __pycache__/
 *.py[cod]
 *.egg-info/

@@ -1,0 +1,357 @@
+{
+  "approval_grant": {
+    "approved_at": "2026-01-01T00:00:00+00:00",
+    "approved_by": "operator",
+    "decision_id": "decision_1",
+    "expires_at": null,
+    "grant_id": "grant_1",
+    "operator_signature": null,
+    "reason": "fixture approval",
+    "request_id": "request_1",
+    "scope": {
+      "capabilities": [
+        "EXECUTE_COMMAND"
+      ],
+      "command_patterns": [
+        "pytest"
+      ],
+      "max_duration_seconds": null,
+      "max_files": null,
+      "network_hosts": [],
+      "path_globs": [],
+      "session_only": true,
+      "single_use": true
+    },
+    "session_id": "session_1",
+    "single_use": true
+  },
+  "command_request": {
+    "argv": [
+      "python",
+      "-m",
+      "pytest"
+    ],
+    "command_hash": "bd05162f7ea0d5c6f9dae074bb43fbe1b3fc55864092163037a9747ee75da17c",
+    "command_preview": "[\"python\", \"-m\", \"pytest\"]",
+    "cwd": ".",
+    "filesystem_mode": "READ_ONLY_WORKSPACE",
+    "long_running": false,
+    "network_policy": "DISABLED",
+    "risk_acceptance_reason": null,
+    "shell": null,
+    "timeout": 30.0
+  },
+  "command_result": {
+    "artifact_path": null,
+    "backend": "local_process",
+    "changed_files": [],
+    "combined_output_preview": "passed",
+    "command_id": "command_1",
+    "duration_ms": 10,
+    "ended_at": null,
+    "env_denied": [],
+    "error_code": null,
+    "execution_status": "completed",
+    "exit_code": 0,
+    "git_after": {},
+    "git_before": {},
+    "idle_timed_out": false,
+    "isolation_report": {
+      "sandbox_backend": "windows_unelevated"
+    },
+    "killed_reason": null,
+    "metadata": {},
+    "output_digest": "digest",
+    "output_truncated": false,
+    "policy_decision": {
+      "decision": "allow",
+      "error_code": null,
+      "reasons": [
+        "parity fixture"
+      ],
+      "redaction_rules": [],
+      "required_backend": "local_process",
+      "required_filesystem": "READ_ONLY_WORKSPACE",
+      "required_network": "DISABLED",
+      "risk_tags": [
+        "READ_ONLY_COMMAND"
+      ]
+    },
+    "risk_tags": [
+      "READ_ONLY_COMMAND"
+    ],
+    "secret_redactions": 0,
+    "semantic_status": "succeeded",
+    "side_effects": [],
+    "signal": null,
+    "started_at": null,
+    "stderr_bytes": 0,
+    "stderr_preview": "",
+    "stdout_bytes": 0,
+    "stdout_preview": "passed",
+    "timed_out": false
+  },
+  "model_turn_request": {
+    "action_id": "action_1",
+    "budget": {
+      "max_cost_estimate": null,
+      "max_input_tokens": null,
+      "max_latency_ms": null,
+      "max_output_tokens": null,
+      "max_retries": 2,
+      "max_total_tokens": null
+    },
+    "context_metadata": {},
+    "messages": [
+      {
+        "content": [
+          {
+            "artifact_ref": null,
+            "metadata": {},
+            "text": "hello",
+            "type": "text"
+          }
+        ],
+        "metadata": {},
+        "name": null,
+        "role": "user",
+        "tool_call_id": null
+      }
+    ],
+    "model_preferences": {
+      "fallback_models": [],
+      "json_mode": false,
+      "max_output_tokens": null,
+      "model_name": null,
+      "provider_name": null,
+      "stream": false,
+      "structured_output_schema": null,
+      "temperature": null,
+      "top_p": null
+    },
+    "phase_id": "model",
+    "policy_metadata": {},
+    "purpose": "plan_next_action",
+    "request_id": "model_req_1",
+    "run_id": "run_1",
+    "session_id": "session_1",
+    "task_id": "task_1",
+    "tool_choice": {
+      "allowed_tool_names": [],
+      "max_tool_calls": 8,
+      "mode": "auto",
+      "tool_name": null
+    },
+    "tools": [],
+    "trace_metadata": {}
+  },
+  "model_turn_response": {
+    "assistant_message": {
+      "content": [
+        {
+          "artifact_ref": null,
+          "metadata": {},
+          "text": "done",
+          "type": "text"
+        }
+      ],
+      "metadata": {},
+      "name": null,
+      "role": "assistant",
+      "tool_call_id": null
+    },
+    "error": null,
+    "finish_reason": null,
+    "latency_ms": null,
+    "metadata": {},
+    "model_name": null,
+    "provider_name": null,
+    "raw_response_ref": null,
+    "request_id": "model_req_1",
+    "response_id": "response_1",
+    "status": "success",
+    "tool_calls": [],
+    "trace_event_ids": [],
+    "usage": {
+      "cached_input_tokens": 0,
+      "cost_estimate": null,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "reasoning_tokens": 0,
+      "total_tokens": 0
+    },
+    "validation": null
+  },
+  "permission_profile": {
+    "approval_policy": "on-request",
+    "network_access": "denied",
+    "profile": "workspace-write",
+    "protected_paths_enforced": true,
+    "writable_roots": [
+      "C:\\repo"
+    ]
+  },
+  "sandbox_policy": {
+    "description": "Verification under native OS sandbox enforcement.",
+    "env": {
+      "allowlist": [],
+      "case_insensitive": true,
+      "denylist_patterns": [
+        "*KEY*",
+        "*TOKEN*",
+        "*SECRET*",
+        "*PASSWORD*",
+        "AUTHORIZATION",
+        "COOKIE",
+        "NPM_TOKEN",
+        "GITHUB_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY"
+      ],
+      "extra_env": {},
+      "inherit_env": false,
+      "redacted_patterns": [
+        "*KEY*",
+        "*TOKEN*",
+        "*SECRET*",
+        "*PASSWORD*",
+        "AUTHORIZATION",
+        "COOKIE",
+        "NPM_TOKEN",
+        "GITHUB_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY"
+      ]
+    },
+    "filesystem": {
+      "artifact_paths": [],
+      "detect_changes": true,
+      "exclude_globs": [
+        ".git",
+        ".env",
+        ".env.*",
+        "*.key",
+        "*.pem",
+        "*.pfx",
+        "*.p12",
+        "*credential*",
+        "*credentials*",
+        "*secret*",
+        "*token*",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        ".ssh",
+        ".aws",
+        ".azure",
+        ".gnupg",
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "dist",
+        "build",
+        "coverage",
+        ".coverage",
+        "work/sandboxes",
+        ".singularity/sandboxes"
+      ],
+      "include_globs": [],
+      "mode": "copy_on_write_workspace",
+      "readonly_paths": [],
+      "sandbox_root": null,
+      "workspace_root": "C:\\repo",
+      "writable_paths": []
+    },
+    "name": "isolated_verification",
+    "network": {
+      "allowed_hosts": [],
+      "denied_hosts": [],
+      "mode": "denied",
+      "require_hard_isolation": false
+    },
+    "resources": {
+      "max_artifact_bytes": 20971520,
+      "max_memory_mb": null,
+      "max_output_chars": 40000,
+      "max_processes": null,
+      "memory_limit": null,
+      "pids_limit": null,
+      "timeout_seconds": 120
+    }
+  },
+  "tool_observation_model_payload": {
+    "content": "safe preview",
+    "content_digest": "digest_1",
+    "content_preview": "safe preview",
+    "error_code": null,
+    "error_kind": null,
+    "observation_id": "obs_1",
+    "ok": true,
+    "redacted": false,
+    "reference_ids": [
+      "artifact_1"
+    ],
+    "result_ref": "artifact_1",
+    "status": "ok",
+    "tool_call_id": "call_1",
+    "tool_name": "read_file",
+    "truncated": false
+  },
+  "tool_protocol_result_envelope": {
+    "approval_grant_id": "grant_1",
+    "artifact_refs": [
+      "artifact_1"
+    ],
+    "content_digest": "digest_1",
+    "content_preview": "safe preview",
+    "error_code": null,
+    "error_kind": null,
+    "metadata": {
+      "raw_arguments": {
+        "path": ".env"
+      }
+    },
+    "observation_id": "obs_1",
+    "ok": true,
+    "policy_decision_id": "policy_1",
+    "raw_result_ref": "artifact_1",
+    "redacted": false,
+    "status": "ok",
+    "tool_call_id": "call_1",
+    "tool_name": "read_file",
+    "truncated": false
+  },
+  "trace_event": {
+    "action_id": "action_1",
+    "approval_grant_id": null,
+    "artifact_refs": [],
+    "command_id": null,
+    "component": "tool_protocol",
+    "event_id": "event_1",
+    "event_type": "tool_protocol.call_completed",
+    "monotonic_ms": 1,
+    "parent_event_id": null,
+    "payload": {
+      "tool_call_id": "call_1"
+    },
+    "payload_hash": "",
+    "phase_id": "phase_1",
+    "policy_decision_id": null,
+    "redaction_applied": true,
+    "run_id": "run_1",
+    "sandbox_id": null,
+    "session_id": "session_1",
+    "severity": "info",
+    "span_id": null,
+    "summary": "Tool completed.",
+    "task_id": "task_1",
+    "timestamp": "2026-01-01T00:00:00+00:00",
+    "transaction_id": null,
+    "verification_id": null
+  }
+}

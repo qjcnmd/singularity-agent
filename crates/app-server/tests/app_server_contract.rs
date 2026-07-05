@@ -1,0 +1,122 @@
+use singularity_app_server::AppServer;
+use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
+use singularity_store::SessionStore;
+
+#[test]
+fn app_server_enforces_initialize_and_emits_item_events() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut server = AppServer::new(store);
+
+    let not_initialized = server
+        .handle_json(r#"{"method":"thread/start","id":1,"params":{}}"#)
+        .unwrap();
+    assert_eq!(not_initialized[0]["error"]["message"], "Not initialized");
+
+    let initialized = server
+        .handle_json(r#"{"method":"initialize","id":2,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    assert_eq!(initialized[0]["result"]["platformFamily"], "local");
+
+    let before_initialized = server
+        .handle_json(r#"{"method":"thread/start","id":30,"params":{}}"#)
+        .unwrap();
+    assert_eq!(before_initialized[0]["error"]["message"], "Not initialized");
+
+    let duplicate = server
+        .handle_json(r#"{"method":"initialize","id":3,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    assert_eq!(duplicate[0]["error"]["message"], "Already initialized");
+
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":4,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = thread[0]["result"]["thread"]["thread_id"].as_str().unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":5,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(
+        turn[0]["result"]["turn"]["agent_loop_status"],
+        "not_migrated"
+    );
+    assert!(
+        turn.iter()
+            .any(|message| message["method"] == "item/started")
+    );
+    assert!(turn.iter().any(|message| message["method"] == "item/delta"));
+    assert!(
+        turn.iter()
+            .any(|message| message["method"] == "item/completed")
+    );
+
+    let missing_trace_list = server
+        .handle_json(r#"{"method":"trace/list","id":6,"params":{"run_id":"missing"}}"#)
+        .unwrap();
+    assert_eq!(
+        missing_trace_list[0]["error"]["message"],
+        "Trace run not found"
+    );
+
+    let missing_trace_show = server
+        .handle_json(r#"{"method":"trace/show","id":7,"params":{"event_id":"missing"}}"#)
+        .unwrap();
+    assert_eq!(
+        missing_trace_show[0]["error"]["message"],
+        "Trace event not found"
+    );
+}
+
+#[test]
+fn approval_decisions_consume_pending_requests_once_for_all_outcomes() {
+    for outcome in [
+        ApprovalOutcome::Allow,
+        ApprovalOutcome::Deny,
+        ApprovalOutcome::Defer,
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+        let mut server = AppServer::new(store);
+        server
+            .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+            .unwrap();
+        server
+            .handle_json(r#"{"method":"initialized","params":{}}"#)
+            .unwrap();
+
+        let request = ApprovalRequest::new("approval_1", "session_1", "task_1", "write_file");
+        let request_message = serde_json::json!({
+            "method": "approval/request",
+            "id": 2,
+            "params": request,
+        });
+        let request_result = server.handle_json(&request_message.to_string()).unwrap();
+        assert_eq!(
+            request_result[0]["result"]["approval"]["request_id"],
+            "approval_1"
+        );
+
+        let decision = ApprovalDecision::new("approval_1", outcome.clone(), "operator decision");
+        let decision_message = serde_json::json!({
+            "method": "approval/decision",
+            "id": 3,
+            "params": decision,
+        });
+        let decision_result = server.handle_json(&decision_message.to_string()).unwrap();
+        assert_eq!(
+            decision_result[0]["result"]["decision"]["request_id"],
+            "approval_1"
+        );
+
+        let duplicate = server.handle_json(&decision_message.to_string()).unwrap();
+        assert_eq!(
+            duplicate[0]["error"]["message"],
+            "Pending approval not found"
+        );
+    }
+}

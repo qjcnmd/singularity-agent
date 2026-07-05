@@ -8,6 +8,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCS_DIR = REPO_ROOT / "docs" / "architecture" / "modules"
+ALLOWED_ARCHITECTURE_OVERVIEW_PATHS = {
+    "docs/architecture/rust-agent-host.md",
+}
 
 
 def _ensure_utf8_stdio() -> None:
@@ -562,6 +565,8 @@ def _verify_doc_tree(errors: list[str]) -> None:
 
     if architecture_root.is_dir():
         for path in sorted(architecture_root.rglob("*.md")):
+            if _rel(path) in ALLOWED_ARCHITECTURE_OVERVIEW_PATHS:
+                continue
             try:
                 path.relative_to(modules_root)
             except ValueError:
@@ -680,6 +685,9 @@ def _verify_flow_section(label: str, section: str, errors: list[str]) -> None:
 def _symbols_in_sources(paths: list[Path]) -> set[str]:
     symbols: set[str] = set()
     for path in paths:
+        if path.suffix == ".rs":
+            symbols.update(_rust_symbols(path))
+            continue
         if path.suffix != ".py":
             continue
         try:
@@ -707,9 +715,28 @@ def _symbols_in_sources(paths: list[Path]) -> set[str]:
     return symbols
 
 
+def _rust_symbols(path: Path) -> set[str]:
+    text = path.read_text(encoding="utf-8")
+    symbols: set[str] = set()
+    for match in re.finditer(r"\b(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)", text):
+        symbols.add(match.group(1))
+    for match in re.finditer(
+        r"impl(?:\s*<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{(?P<body>[\s\S]*?)\n\}",
+        text,
+    ):
+        type_name = match.group(1)
+        body = match.group("body")
+        for fn_match in re.finditer(r"\b(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", body):
+            symbols.add(f"{type_name}.{fn_match.group(1)}")
+    return symbols
+
+
 def _class_fields_in_sources(paths: list[Path]) -> dict[str, set[str]]:
     fields_by_class: dict[str, set[str]] = {}
     for path in paths:
+        if path.suffix == ".rs":
+            fields_by_class.update(_rust_class_fields(path))
+            continue
         if path.suffix != ".py":
             continue
         try:
@@ -726,6 +753,29 @@ def _class_fields_in_sources(paths: list[Path]) -> dict[str, set[str]]:
                 if _is_class_var(child.annotation):
                     continue
                 fields.add(child.target.id)
+    return fields_by_class
+
+
+def _rust_class_fields(path: Path) -> dict[str, set[str]]:
+    text = path.read_text(encoding="utf-8")
+    fields_by_class: dict[str, set[str]] = {}
+    for match in re.finditer(
+        r"\bpub\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{(?P<body>[\s\S]*?)\n\}",
+        text,
+    ):
+        class_name = match.group(1)
+        fields = fields_by_class.setdefault(class_name, set())
+        body = match.group("body")
+        for line in body.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#["):
+                continue
+            field_match = re.match(
+                r"(?:pub(?:\([^)]*\))?\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:",
+                stripped,
+            )
+            if field_match:
+                fields.add(field_match.group(1))
     return fields_by_class
 
 
