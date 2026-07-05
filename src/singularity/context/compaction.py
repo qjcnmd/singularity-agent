@@ -20,7 +20,21 @@ from singularity.context.models import (
     PartialCompactionRange,
     digest_value,
 )
-from singularity.context.ranking import authority_weight, layer_weight
+from singularity.context.ranking import (
+    CONTEXT_COMPACTION_PINNED_SCORE_BONUS,
+    CONTEXT_COMPACTION_STALE_FRESHNESS_SCORE_PENALTY,
+    CONTEXT_COMPACTION_WEIGHT_SCALE,
+    CONTEXT_RECENCY_CURRENT,
+    CONTEXT_RECENCY_DEFAULT,
+    CONTEXT_RECENCY_STALE,
+    CONTEXT_REFERENCE_DENSITY_PRECISION,
+    CONTEXT_VOLATILITY_DEFAULT,
+    CONTEXT_VOLATILITY_EVIDENCE,
+    CONTEXT_VOLATILITY_MESSAGE_OR_FAILURE,
+    CONTEXT_VOLATILITY_RECENT_OR_FAILURE,
+    authority_weight,
+    layer_weight,
+)
 
 COMPACTION_RECENT_TAIL_MESSAGES = 8
 COMPACTION_FRAGMENT_LIMIT = 8000
@@ -186,48 +200,48 @@ class ContextCompactionPlanner:
 
     def utility_score(self, item: ContextItem) -> float:
         score = float(item.importance)
-        score += layer_weight(item.layer) / 100.0
-        score += authority_weight(item.authority) / 100.0
+        score += layer_weight(item.layer) / CONTEXT_COMPACTION_WEIGHT_SCALE
+        score += authority_weight(item.authority) / CONTEXT_COMPACTION_WEIGHT_SCALE
         if item.relevance_score is not None:
             score += float(item.relevance_score)
         if item.pinned:
-            score += 10.0
+            score += CONTEXT_COMPACTION_PINNED_SCORE_BONUS
         if item.freshness == ContextFreshness.STALE:
-            score -= 1.0
+            score += CONTEXT_COMPACTION_STALE_FRESHNESS_SCORE_PENALTY
         return score
 
     @staticmethod
     def volatility_score(item: ContextItem) -> float:
         if item.layer in {ContextLayer.RECENT_DIALOGUE, ContextLayer.FAILURE_MEMORY}:
-            return 1.0
+            return CONTEXT_VOLATILITY_RECENT_OR_FAILURE
         if item.item_type in {
             ContextItemType.ASSISTANT_MESSAGE,
             ContextItemType.USER_MESSAGE,
             ContextItemType.FAILURE,
         }:
-            return 0.8
+            return CONTEXT_VOLATILITY_MESSAGE_OR_FAILURE
         if item.item_type in {
             ContextItemType.VERIFICATION_EVIDENCE,
             ContextItemType.MUTATION_EVIDENCE,
             ContextItemType.EDIT_EVIDENCE,
             ContextItemType.COMMAND_OBSERVATION,
         }:
-            return 0.5
-        return 0.2
+            return CONTEXT_VOLATILITY_EVIDENCE
+        return CONTEXT_VOLATILITY_DEFAULT
 
     @staticmethod
     def reference_density(item: ContextItem) -> float:
         refs = max(1, len(item.references))
         tokens = max(1, int(item.token_count or 1))
-        return round(refs / tokens, 4)
+        return round(refs / tokens, CONTEXT_REFERENCE_DENSITY_PRECISION)
 
     @staticmethod
     def recency_score(item: ContextItem) -> float:
         if item.freshness == ContextFreshness.CURRENT:
-            return 1.0
+            return CONTEXT_RECENCY_CURRENT
         if item.freshness == ContextFreshness.STALE:
-            return 0.3
-        return 0.0
+            return CONTEXT_RECENCY_STALE
+        return CONTEXT_RECENCY_DEFAULT
 
     @staticmethod
     def current_summary_item_ids(items: list[ContextItem]) -> list[str]:

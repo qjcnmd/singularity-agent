@@ -20,7 +20,15 @@ from singularity.context.models import (
     ContextSensitivity,
     ContextUsageReport,
 )
-from singularity.context.ranking import authority_weight, layer_order, layer_weight
+from singularity.context.ranking import (
+    CONTEXT_CURRENT_FRESHNESS_SCORE_BONUS,
+    CONTEXT_PHASE_MATCH_SCORE_BONUS,
+    CONTEXT_PINNED_ITEM_SCORE_BONUS,
+    CONTEXT_STALE_FRESHNESS_SCORE_PENALTY,
+    authority_weight,
+    layer_order,
+    layer_weight,
+)
 from singularity.context.redaction import ContextRedactor
 from singularity.context.tokens import TokenCounter
 from singularity.runtime.defaults import CONTEXT_SUMMARY_MAX_TOKENS
@@ -512,13 +520,13 @@ class ContextAssembler:
     def _score_item(self, item: ContextItem, phase_id: str) -> float:
         score = float(item.importance)
         if item.pinned:
-            score += 100
+            score += CONTEXT_PINNED_ITEM_SCORE_BONUS
         if item.phase_id == phase_id:
-            score += 10
+            score += CONTEXT_PHASE_MATCH_SCORE_BONUS
         if item.freshness == ContextFreshness.CURRENT:
-            score += 2
+            score += CONTEXT_CURRENT_FRESHNESS_SCORE_BONUS
         if item.freshness == ContextFreshness.STALE:
-            score -= 2
+            score += CONTEXT_STALE_FRESHNESS_SCORE_PENALTY
         score += layer_weight(item.layer)
         score += authority_weight(item.authority)
         if item.relevance_score is not None:

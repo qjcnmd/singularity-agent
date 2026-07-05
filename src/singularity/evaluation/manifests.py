@@ -14,6 +14,7 @@ from singularity.evaluation.models import (
 )
 from singularity.evaluation.store import GoldenTaskStore
 from singularity.policy.permissions import ApprovalPolicy, NetworkAccess, PermissionProfileName
+from singularity.runtime.defaults import EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
 from singularity.utils.attributes import nested_getattr
 from singularity.utils.serialization import coerce_evaluation_dict
 
@@ -80,7 +81,7 @@ class EvaluationTask:
     public_verification_command: str = ""
     hidden_verification_command: str = ""
     verification_prepare_commands: list[str] = field(default_factory=list)
-    verification_timeout_seconds: int = 120
+    verification_timeout_seconds: int = EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
     model_visible_verification_command: str = ""
     fixture_metadata: dict[str, Any] = field(default_factory=dict)
     hidden_test_patch: dict[str, Any] = field(default_factory=dict)
@@ -119,7 +120,10 @@ class EvaluationTask:
             public_verification_command=str(payload.get("public_verification_command") or "").strip(),
             hidden_verification_command=str(payload.get("hidden_verification_command") or "").strip(),
             verification_prepare_commands=[str(item) for item in verification_prepare_commands if str(item).strip()],
-            verification_timeout_seconds=int(payload.get("verification_timeout_seconds") or 120),
+            verification_timeout_seconds=int(
+                payload.get("verification_timeout_seconds")
+                or EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
+            ),
             model_visible_verification_command=str(payload.get("model_visible_verification_command") or "").strip(),
             fixture_metadata=coerce_evaluation_dict(
                 payload.get("fixture_metadata") or {},

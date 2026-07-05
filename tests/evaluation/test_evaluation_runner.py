@@ -37,6 +37,7 @@ from singularity.evaluation.runner import (
 )
 from singularity.kernel.finalization import FinalReport
 from singularity.kernel.models import RunStatus
+from singularity.runtime.defaults import EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
 from tests.agent_loop_helpers import make_agent_session
 
 
@@ -164,6 +165,24 @@ def test_load_public_representative_task_manifest_is_public_swe_bench() -> None:
     assert "test_patch" not in constraints_json
     assert "FAIL_TO_PASS" not in constraints_json
     assert ".eval-venv" not in constraints_json
+
+
+def test_evaluation_task_default_verification_timeout_uses_runtime_default(
+    tmp_path: Path,
+) -> None:
+    py = json.dumps(sys.executable)
+    task = EvaluationTask.from_dict(
+        {
+            "task_id": "fake.default_timeout",
+            "workspace": {"type": "fixture", "files": {"README.md": "fixture\n"}},
+            "user_task": "Say done.",
+            "allowed_paths": ["README.md"],
+            "verification_command": f"{py} -c \"print('ok')\"",
+            "success": {"type": "verification_exit_code", "exit_code": 0},
+        }
+    )
+
+    assert task.verification_timeout_seconds == EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
 
 
 def test_evaluation_hidden_fixture_metadata_never_enters_goal_or_constraints(tmp_path: Path) -> None:

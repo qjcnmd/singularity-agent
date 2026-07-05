@@ -13,6 +13,9 @@ def test_runtime_defaults_define_shared_limits() -> None:
     assert defaults.DEFAULT_TOOL_CACHE_MAX_ENTRIES == 128
     assert defaults.EVALUATION_PREPARE_TIMEOUT_SECONDS == 120.0
     assert defaults.BENCHMARK_VERIFICATION_TIMEOUT_SECONDS == 120.0
+    assert int(
+        defaults.BENCHMARK_VERIFICATION_TIMEOUT_SECONDS
+    ) == defaults.EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
     assert defaults.WINDOWS_RUNNER_DEFAULT_TIMEOUT_SECONDS == 120.0
     assert defaults.WINDOWS_SANDBOX_ACL_COMMAND_TIMEOUT_SECONDS == 120.0
     assert defaults.SANDBOX_ISOLATED_VERIFICATION_TIMEOUT_SECONDS == 120

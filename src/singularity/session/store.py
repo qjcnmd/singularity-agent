@@ -7,6 +7,7 @@ from threading import RLock
 from typing import Any
 from uuid import uuid4
 
+from singularity.runtime.defaults import SQLITE_BUSY_TIMEOUT_MS
 from singularity.session.models import (
     SessionCheckpoint,
     SessionCheckpointKind,
@@ -42,7 +43,7 @@ class SessionStore:
         try:
             connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self._connection = connection
-            self._connection.execute("pragma busy_timeout = 5000")
+            self._connection.execute(f"pragma busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             self._connection.row_factory = sqlite3.Row
             self._lock = RLock()
             self._verify_integrity()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from singularity.runtime.defaults import SQLITE_BUSY_TIMEOUT_MS
 from singularity.session import (
     SessionCheckpointKind,
     SessionRunMode,
@@ -23,7 +24,7 @@ def test_session_store_initializes_sqlite_recovery_pragmas(tmp_path: Path) -> No
         store.close()
 
     assert user_version == 1
-    assert busy_timeout >= 5000
+    assert busy_timeout >= SQLITE_BUSY_TIMEOUT_MS
     assert journal_mode == "wal"
 
 
