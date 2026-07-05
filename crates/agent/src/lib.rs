@@ -204,6 +204,23 @@ pub struct ContextSummaryEnvelopeBoundary {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ToolCallRepairBoundary {
+    pub repair_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub phase_id: String,
+    pub failed_tool_call_id: String,
+    pub failure_kind: String,
+    pub next_action: String,
+    pub failed_result: Value,
+    pub recovery_report: Value,
+    pub repair_contract: Value,
+    pub created_at: String,
+    pub metadata: Value,
+}
+
 #[derive(Debug)]
 pub struct PythonSidecarClient {
     child: Child,

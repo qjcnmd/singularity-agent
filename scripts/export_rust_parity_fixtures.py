@@ -37,8 +37,13 @@ from singularity.model.models import (
 from singularity.observability.models import TraceEvent, TraceEventType, TraceSeverity
 from singularity.policy.models import ApprovalGrant, ApprovalScope, Capability
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
+from singularity.repair.contract import RepairActionCandidate, RepairContract
 from singularity.sandbox.models import SandboxProfileName, default_sandbox_profile
-from singularity.tool_protocol.models import ToolProtocolResultEnvelope
+from singularity.tool_protocol.models import (
+    ToolProtocolRecoveryReport,
+    ToolProtocolResultEnvelope,
+)
+from singularity.verification.contract import VerificationContract
 
 
 def build_fixtures() -> dict[str, object]:
@@ -87,6 +92,22 @@ def build_fixtures() -> dict[str, object]:
         policy_decision_id="policy_1",
         approval_grant_id="grant_1",
         metadata={"raw_arguments": {"path": ".env"}},
+    )
+    failed_tool_result = ToolProtocolResultEnvelope(
+        tool_call_id="call_failed_1",
+        tool_name="run_verification",
+        ok=False,
+        status="failed",
+        error_code="tool_executor_failed",
+        error_kind="tool_executor_failed",
+        content_preview="pytest failed",
+        content_digest="digest_failed_1",
+        raw_result_ref="artifact_failed_1",
+        artifact_refs=["artifact_failed_1"],
+        observation_id="obs_failed_1",
+        truncated=True,
+        redacted=True,
+        metadata={"exit_code": 1},
     )
     trace_event = TraceEvent(
         event_id="event_1",
@@ -223,6 +244,50 @@ def build_fixtures() -> dict[str, object]:
         created_at="2026-01-01T00:00:00+00:00",
         metadata={"source": "python_oracle"},
     )
+    repair_contract = RepairContract(
+        contract_id="repair_contract_1",
+        analysis_id="analysis_1",
+        failure_category="unit_test_failure",
+        target_files=["src/app.py"],
+        evidence_refs=["obs_failed_1"],
+        action_candidates=[
+            RepairActionCandidate(
+                candidate_id="candidate_1",
+                action_type="edit",
+                target_file="src/app.py",
+                rationale="Fix the failing assertion and rerun pytest.",
+                tool_hints=["read_file", "apply_patch", "run_verification"],
+                verification_ref="pytest tests/test_app.py",
+                confidence=0.82,
+            )
+        ],
+        verification_plan=["pytest tests/test_app.py"],
+        confidence=0.82,
+        allowed_tool_names=["apply_patch", "read_file", "run_verification"],
+        verification_contract=VerificationContract.from_plan_strings(
+            ["pytest tests/test_app.py"],
+            contract_id="verification_contract_1",
+        ),
+    )
+    tool_call_repair_boundary = {
+        "repair_id": "tool_repair_1",
+        "run_id": "run_1",
+        "session_id": "session_1",
+        "task_id": "task_1",
+        "phase_id": "repairing_failures",
+        "failed_tool_call_id": failed_tool_result.tool_call_id,
+        "failure_kind": str(failed_tool_result.error_kind or ""),
+        "next_action": "repair_then_verify",
+        "failed_result": failed_tool_result.to_dict(),
+        "recovery_report": ToolProtocolRecoveryReport(
+            succeeded_but_not_appended_call_ids=[failed_tool_result.tool_call_id],
+            warnings=["tool result failed before repair"],
+            next_action="request_model",
+        ).to_dict(),
+        "repair_contract": repair_contract.to_dict(),
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "metadata": {"source": "python_oracle"},
+    }
     return {
         "tool_observation_model_payload": tool_result.to_observation_view().to_model_payload(),
         "tool_protocol_result_envelope": tool_result.to_dict(),
@@ -237,6 +302,7 @@ def build_fixtures() -> dict[str, object]:
         "planner_state": planner_state.__dict__.copy(),
         "context_bundle": context_bundle.to_dict(),
         "context_summary_envelope": context_summary_envelope.to_dict(),
+        "tool_call_repair_boundary": tool_call_repair_boundary,
     }
 
 

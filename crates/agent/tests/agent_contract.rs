@@ -1,7 +1,7 @@
 use singularity_agent::{
     AgentHostStatus, AgentLoopStatusBridge, ContextAssemblyBoundary,
     ContextSummaryEnvelopeBoundary, PlannerStateBoundary, PythonSidecarClient, PythonSidecarConfig,
-    PythonSidecarRunResult, SidecarRunEvent, sidecar_trace_summary,
+    PythonSidecarRunResult, SidecarRunEvent, ToolCallRepairBoundary, sidecar_trace_summary,
 };
 
 #[test]
@@ -154,5 +154,44 @@ fn context_summary_envelope_boundary_round_trips_python_oracle() {
         )
         .expect("deserialize context summary"),
         summary
+    );
+}
+
+#[test]
+fn tool_call_repair_boundary_round_trips_python_oracle() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/rust_parity/python_oracle.json"
+    ))
+    .expect("parse python oracle fixture");
+
+    let repair: ToolCallRepairBoundary =
+        serde_json::from_value(fixture["tool_call_repair_boundary"].clone())
+            .expect("tool repair boundary");
+
+    assert_eq!(repair.repair_id, "tool_repair_1");
+    assert_eq!(repair.failed_tool_call_id, "call_failed_1");
+    assert_eq!(repair.failure_kind, "tool_executor_failed");
+    assert_eq!(repair.next_action, "repair_then_verify");
+    assert_eq!(repair.failed_result["ok"], false);
+    assert_eq!(
+        repair.recovery_report["succeeded_but_not_appended_call_ids"],
+        serde_json::json!(["call_failed_1"])
+    );
+    assert_eq!(
+        repair.repair_contract["allowed_tool_names"],
+        serde_json::json!(["apply_patch", "read_file", "run_verification"])
+    );
+    assert_eq!(
+        repair.repair_contract["verification_contract"]["contract_id"],
+        "verification_contract_1"
+    );
+    assert_eq!(repair.metadata["source"], "python_oracle");
+
+    assert_eq!(
+        serde_json::from_value::<ToolCallRepairBoundary>(
+            serde_json::to_value(&repair).expect("serialize tool repair")
+        )
+        .expect("deserialize tool repair"),
+        repair
     );
 }
