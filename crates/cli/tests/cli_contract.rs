@@ -94,7 +94,7 @@ fn cli_reports_interrupted_app_server_process() {
         .expect("threads cli");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("app-server closed stdout"));
+    assert_app_server_unavailable_error(&output);
 }
 
 #[test]
@@ -145,11 +145,7 @@ fn cli_reports_app_server_exit_before_response() {
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
-    assert!(
-        stderr.contains("app-server exited before response")
-            || stderr.contains("app-server closed stdout"),
-        "stderr={stderr}"
-    );
+    assert!(is_app_server_unavailable_error(&stderr), "stderr={stderr}");
 }
 
 #[test]
@@ -245,6 +241,16 @@ fn write_fake_app_server(dir: &Path, script: &str) -> PathBuf {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
+}
+
+fn assert_app_server_unavailable_error(output: &std::process::Output) {
+    let stderr = stderr(output);
+    assert!(is_app_server_unavailable_error(&stderr), "stderr={stderr}");
+}
+
+fn is_app_server_unavailable_error(stderr: &str) -> bool {
+    stderr.contains("app-server exited before response")
+        || stderr.contains("app-server closed stdout")
 }
 
 fn stdout(output: &std::process::Output) -> String {
