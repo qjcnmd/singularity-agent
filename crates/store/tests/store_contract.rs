@@ -51,8 +51,9 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     store.append_trace(&trace).expect("trace");
     let approval = ApprovalRequest::new("approval_1", "session_1", "task_1", "write_file");
     store.create_approval(&approval).expect("approval");
+    let decision = ApprovalDecision::new("approval_1", ApprovalOutcome::Allow, "ok");
     store
-        .record_approval_decision("approval_1", ApprovalOutcome::Allow, "ok")
+        .record_approval_decision(&decision, "approval", "approval decision recorded")
         .expect("decision");
 
     assert_eq!(item.kind, ItemKind::UserMessage);
@@ -89,42 +90,51 @@ fn missing_thread_turn_event_and_artifact_refs_fail_closed() {
 
 #[test]
 fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let request = ApprovalRequest::new("approval_1", "session_1", "task_1", "write_file");
-    store.create_approval(&request).expect("approval");
-    let decision = ApprovalDecision::new("approval_1", ApprovalOutcome::Allow, "ok");
+    for outcome in [
+        ApprovalOutcome::Allow,
+        ApprovalOutcome::Deny,
+        ApprovalOutcome::Defer,
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+        let request = ApprovalRequest::new("approval_1", "session_1", "task_1", "write_file");
+        store.create_approval(&request).expect("approval");
+        let decision = ApprovalDecision::new("approval_1", outcome, "operator decision");
 
-    let trace = store
-        .record_approval_decision_with_trace(&decision, "approval", "approval decision recorded")
-        .expect("decision");
+        let trace = store
+            .record_approval_decision(&decision, "approval", "approval decision recorded")
+            .expect("decision");
 
-    assert_eq!(trace.run_id, "session_1");
-    assert_eq!(trace.session_id, "session_1");
-    assert_eq!(trace.task_id.as_deref(), Some("task_1"));
-    assert_eq!(trace.payload["request_id"], "approval_1");
-    assert_eq!(trace.payload["decision_id"], decision.decision_id);
-    assert_eq!(trace.payload["outcome"], "allow");
-    assert_eq!(
-        store.list_trace("session_1").expect("trace list")[0].event_id,
-        trace.event_id
-    );
-    assert_eq!(
-        store
-            .get_approval_decision(&decision.decision_id)
-            .expect("ledger")
-            .outcome,
-        ApprovalOutcome::Allow
-    );
-    assert!(store.list_pending_approvals().expect("pending").is_empty());
-    assert!(matches!(
-        store.record_approval_decision_with_trace(
-            &decision,
-            "approval",
-            "approval decision recorded"
-        ),
-        Err(StoreError::NotFound(message)) if message == "approval approval_1"
-    ));
+        assert_eq!(trace.run_id, "session_1");
+        assert_eq!(trace.session_id, "session_1");
+        assert_eq!(trace.task_id.as_deref(), Some("task_1"));
+        assert_eq!(trace.payload["request_id"], "approval_1");
+        assert_eq!(trace.payload["decision_id"], decision.decision_id);
+        assert_eq!(
+            trace.payload["outcome"],
+            serde_json::to_value(outcome).expect("serialize outcome")
+        );
+        assert_eq!(
+            store.list_trace("session_1").expect("trace list")[0].event_id,
+            trace.event_id
+        );
+        assert_eq!(
+            store
+                .get_approval_decision(&decision.decision_id)
+                .expect("ledger")
+                .outcome,
+            outcome
+        );
+        assert!(store.list_pending_approvals().expect("pending").is_empty());
+        assert!(matches!(
+            store.record_approval_decision(
+                &decision,
+                "approval",
+                "approval decision recorded"
+            ),
+            Err(StoreError::NotFound(message)) if message == "approval approval_1"
+        ));
+    }
 }
 
 #[test]

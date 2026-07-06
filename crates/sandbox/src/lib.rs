@@ -1,15 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::fs;
-use std::path::{Component, Path, PathBuf};
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
 const SANDBOX_BACKEND_UNAVAILABLE: &str = "sandbox-required command has no sandbox backend";
-const PATCH_PATH_OUTSIDE_WORKSPACE: &str = "patch path must stay inside workspace";
 const SHELL_COMMAND_FLAGS: [&str; 3] = ["/c", "-c", "-command"];
 const GIT_STATUS_ARGS: [&str; 3] = ["git", "status", "--porcelain=v1"];
 const GIT_DIFF_ARGS: [&str; 3] = ["git", "diff", "--"];
@@ -27,7 +23,6 @@ pub enum SandboxProfileName {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxFilesystemMode {
-    HostWorkspace,
     ReadOnlyWorkspace,
     CopyOnWriteWorkspace,
     EmptyTempWorkspace,
@@ -167,8 +162,7 @@ impl CommandRequest {
     }
 
     pub fn requires_sandbox(&self) -> bool {
-        self.network.require_hard_isolation
-            || !matches!(self.filesystem.mode, SandboxFilesystemMode::HostWorkspace)
+        true
     }
 
     pub fn permission_resource(&self) -> String {
@@ -309,7 +303,6 @@ pub trait SandboxBackend {
 pub enum SandboxBackendEnforcement {
     Strict,
     Reduced,
-    Relaxed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -366,80 +359,6 @@ pub struct PatchResult {
     pub error: Option<String>,
 }
 
-impl PatchResult {
-    fn applied(changed_files: Vec<String>) -> Self {
-        Self {
-            applied: true,
-            changed_files,
-            rolled_back: false,
-            error: None,
-        }
-    }
-
-    fn failed(error: impl Into<String>, rolled_back: bool) -> Self {
-        Self {
-            applied: false,
-            changed_files: Vec::new(),
-            rolled_back,
-            error: Some(error.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PatchExecutor {
-    workspace_root: PathBuf,
-}
-
-impl PatchExecutor {
-    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self {
-            workspace_root: workspace_root.into(),
-        }
-    }
-
-    pub fn apply(&self, changes: &[PatchChange]) -> PatchResult {
-        let mut snapshots = Vec::new();
-        let mut changed_files = Vec::new();
-
-        for change in changes {
-            let path = match resolve_workspace_path(&self.workspace_root, &change.path) {
-                Ok(path) => path,
-                Err(error) => {
-                    rollback_snapshots(&snapshots);
-                    return PatchResult::failed(error, !snapshots.is_empty());
-                }
-            };
-            let before = fs::read_to_string(&path).ok();
-            snapshots.push((path.clone(), before.clone()));
-            let next_content =
-                match next_file_content(&change.expected, before.as_deref(), &change.replacement) {
-                    Ok(content) => content,
-                    Err(error) => {
-                        rollback_snapshots(&snapshots);
-                        return PatchResult::failed(error, true);
-                    }
-                };
-            if let Some(parent) = path.parent()
-                && let Err(error) = fs::create_dir_all(parent)
-            {
-                rollback_snapshots(&snapshots);
-                return PatchResult::failed(
-                    format!("failed to create parent directory: {error}"),
-                    true,
-                );
-            }
-            if let Err(error) = fs::write(&path, next_content) {
-                rollback_snapshots(&snapshots);
-                return PatchResult::failed(format!("failed to write patch file: {error}"), true);
-            }
-            changed_files.push(change.path.clone());
-        }
-
-        PatchResult::applied(changed_files)
-    }
-}
-
 fn normalize_command_resource(argv: &[String]) -> String {
     if argv.is_empty() {
         return String::new();
@@ -473,75 +392,4 @@ fn project_command_request(
         cwd,
         workspace_root,
     )
-}
-
-fn resolve_workspace_path(workspace_root: &Path, relative: &str) -> Result<PathBuf, String> {
-    let relative = normalized_relative_patch_path(Path::new(relative))?;
-    let root = workspace_root
-        .canonicalize()
-        .map_err(|error| format!("failed to resolve workspace root: {error}"))?;
-    reject_symlink_components(&root, &relative)?;
-    let target = root.join(relative);
-    if let Ok(resolved_target) = target.canonicalize()
-        && !resolved_target.starts_with(&root)
-    {
-        return Err(PATCH_PATH_OUTSIDE_WORKSPACE.to_string());
-    }
-    Ok(target)
-}
-
-fn normalized_relative_patch_path(path: &Path) -> Result<PathBuf, String> {
-    let mut relative = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => relative.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(PATCH_PATH_OUTSIDE_WORKSPACE.to_string());
-            }
-        }
-    }
-    Ok(relative)
-}
-
-fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), String> {
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            return Err(PATCH_PATH_OUTSIDE_WORKSPACE.to_string());
-        };
-        current.push(part);
-        if let Ok(metadata) = fs::symlink_metadata(&current)
-            && metadata.file_type().is_symlink()
-        {
-            return Err(PATCH_PATH_OUTSIDE_WORKSPACE.to_string());
-        }
-    }
-    Ok(())
-}
-
-fn next_file_content(
-    expected: &Option<String>,
-    before: Option<&str>,
-    replacement: &str,
-) -> Result<String, String> {
-    match (expected, before) {
-        (Some(expected), Some(before)) if before.contains(expected) => {
-            Ok(before.replacen(expected, replacement, 1))
-        }
-        (Some(_), Some(_)) => Err("expected patch text was not found".to_string()),
-        (Some(_), None) => Err("cannot replace text in a missing file".to_string()),
-        (None, None) => Ok(replacement.to_string()),
-        (None, Some(_)) => Err("create patch target already exists".to_string()),
-    }
-}
-
-fn rollback_snapshots(snapshots: &[(PathBuf, Option<String>)]) {
-    for (path, before) in snapshots.iter().rev() {
-        if let Some(content) = before {
-            let _ = fs::write(path, content);
-        } else {
-            let _ = fs::remove_file(path);
-        }
-    }
 }

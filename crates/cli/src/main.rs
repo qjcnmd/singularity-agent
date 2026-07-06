@@ -18,7 +18,6 @@ const CLI_CLIENT_TITLE: &str = "Singularity Rust CLI";
 const CLI_CLIENT_VERSION: &str = "0.1.0";
 const DEFAULT_TRACE_TAIL_LIMIT: usize = 20;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-const EVENT_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
@@ -171,7 +170,7 @@ fn run_daemon(db: Option<PathBuf>) -> Result<(), String> {
 
 struct AppServerClient {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: Receiver<Result<String, String>>,
     stdout_reader: Option<JoinHandle<()>>,
     next_id: i64,
@@ -198,7 +197,7 @@ impl AppServerClient {
         let (stdout, stdout_reader) = spawn_stdout_reader(stdout);
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout,
             stdout_reader: Some(stdout_reader),
             next_id: 1,
@@ -308,14 +307,15 @@ impl AppServerClient {
         let mut messages = Vec::new();
         loop {
             let value = self.read_message(RESPONSE_TIMEOUT)?;
-            let is_response = value.get("id") == Some(&id);
-            if value.get("error").is_some() {
-                return Err(format!("app-server error: {}", value["error"]["message"]));
-            }
-            messages.push(value);
-            if is_response {
-                messages.extend(self.drain_notifications()?);
+            if value.get("id") == Some(&id) {
+                if value.get("error").is_some() {
+                    return Err(format!("app-server error: {}", value["error"]["message"]));
+                }
+                messages.push(value);
                 return Ok(messages);
+            }
+            if value.get("method").is_some() {
+                messages.push(value);
             }
         }
     }
@@ -326,9 +326,13 @@ impl AppServerClient {
     }
 
     fn write_message(&mut self, message: &JsonRpcMessage) -> Result<(), String> {
-        writeln!(self.stdin, "{}", message.to_wire_value())
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "app-server stdin unavailable".to_string())?;
+        writeln!(stdin, "{}", message.to_wire_value())
             .map_err(|error| format!("failed to write app-server request: {error}"))?;
-        self.stdin
+        stdin
             .flush()
             .map_err(|error| format!("failed to flush app-server request: {error}"))
     }
@@ -358,18 +362,6 @@ impl AppServerClient {
             .map_err(|error| format!("invalid app-server json: {error}"))
     }
 
-    fn drain_notifications(&mut self) -> Result<Vec<Value>, String> {
-        let mut messages = Vec::new();
-        while let Ok(line) = self.stdout.recv_timeout(EVENT_DRAIN_TIMEOUT) {
-            let value: Value = serde_json::from_str(line?.trim())
-                .map_err(|error| format!("invalid app-server json: {error}"))?;
-            if value.get("method").is_some() {
-                messages.push(value);
-            }
-        }
-        Ok(messages)
-    }
-
     fn next_request_id(&mut self) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -379,9 +371,12 @@ impl AppServerClient {
 
 impl Drop for AppServerClient {
     fn drop(&mut self) {
+        let _ = self.stdin.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = self.stdout_reader.take();
+        if let Some(stdout_reader) = self.stdout_reader.take() {
+            let _ = stdout_reader.join();
+        }
     }
 }
 

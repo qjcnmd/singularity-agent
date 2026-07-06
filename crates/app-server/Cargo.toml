@@ -15,7 +15,6 @@ singularity_policy = { path = "../policy" }
 singularity_protocol = { path = "../protocol" }
 singularity_store = { path = "../store" }
 thiserror.workspace = true
-tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

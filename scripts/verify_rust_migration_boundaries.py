@@ -73,12 +73,11 @@ ALLOWED_CRATE_DEPENDENCIES = {
             "singularity_protocol",
             "singularity_store",
             "thiserror",
-            "tokio",
         },
         "dev-dependencies": {"tempfile"},
     },
     "crates/cli/Cargo.toml": {
-        "dependencies": {"clap", "serde_json", "singularity_core", "singularity_protocol", "tokio"},
+        "dependencies": {"clap", "serde_json", "singularity_core", "singularity_protocol"},
         "dev-dependencies": {"assert_cmd", "tempfile"},
     },
 }
@@ -154,6 +153,8 @@ def main() -> int:
     violations.extend(_check_sandbox_phase1_boundary(repo_root))
     violations.extend(_check_app_server_transport_errors(repo_root))
     violations.extend(_check_cli_protocol_read_loop(repo_root))
+    violations.extend(_check_approval_decision_boundary(repo_root))
+    violations.extend(_check_unused_tokio_dependencies(repo_root))
 
     if violations:
         for violation in violations:
@@ -335,6 +336,8 @@ def _check_sandbox_phase1_boundary(repo_root: Path) -> list[Violation]:
     text = path.read_text(encoding="utf-8")
     relative = _relative(path, repo_root)
     checks = (
+        ("relaxed-sandbox-filesystem-mode", "HostWorkspace", "SandboxFilesystemMode must not expose host-workspace/no-sandbox mode in Phase 1"),
+        ("relaxed-sandbox-backend-enforcement", "Relaxed", "SandboxBackendEnforcement must not expose relaxed backend mode in Phase 1"),
         ("relaxed-sandbox-executor", "pub struct CommandExecutor", "sandbox crate must not expose a local process executor in Phase 1"),
         (
             "relaxed-sandbox-command-request",
@@ -342,6 +345,7 @@ def _check_sandbox_phase1_boundary(repo_root: Path) -> list[Violation]:
             "CommandRequest must not expose a relaxed host local-process constructor",
         ),
         ("relaxed-sandbox-run-local", "pub fn run_local", "sandbox crate must not expose run_local without a strict backend"),
+        ("sandbox-host-patch-executor", "pub struct PatchExecutor", "sandbox crate must not expose host filesystem mutation executor in Phase 1"),
     )
     violations = [
         Violation(code, relative, detail)
@@ -354,6 +358,14 @@ def _check_sandbox_phase1_boundary(repo_root: Path) -> list[Violation]:
                 "direct-sandbox-process-spawn",
                 relative,
                 "sandbox crate must not spawn host processes until a strict backend is implemented",
+            )
+        )
+    if any(marker in text for marker in ("fs::write", "std::fs::write", "fs::remove_file", "std::fs::remove_file")):
+        violations.append(
+            Violation(
+                "direct-sandbox-filesystem-mutation",
+                relative,
+                "sandbox crate must not mutate host filesystem paths in Phase 1",
             )
         )
     return violations
@@ -382,15 +394,100 @@ def _check_app_server_transport_errors(repo_root: Path) -> list[Violation]:
 def _check_cli_protocol_read_loop(repo_root: Path) -> list[Violation]:
     path = repo_root / "crates" / "cli" / "src" / "main.rs"
     text = path.read_text(encoding="utf-8")
-    if "expected_notifications" not in text:
-        return []
-    return [
-        Violation(
-            "fixed-cli-notification-wait",
-            _relative(path, repo_root),
-            "CLI requests must complete on matching response id and drain variable notifications without fixed counts",
+    relative = _relative(path, repo_root)
+    violations: list[Violation] = []
+    if "expected_notifications" in text:
+        violations.append(
+            Violation(
+                "fixed-cli-notification-wait",
+                relative,
+                "CLI requests must complete on matching response id without fixed notification counts",
+            )
         )
-    ]
+    if "drain_notifications" in text or "EVENT_DRAIN_TIMEOUT" in text:
+        violations.append(
+            Violation(
+                "cli-notification-drain",
+                relative,
+                "CLI must not drain post-response messages; it should return on the matching response id",
+            )
+        )
+    return violations
+
+
+def _check_approval_decision_boundary(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "store" / "src" / "lib.rs"
+    text = path.read_text(encoding="utf-8")
+    relative = _relative(path, repo_root)
+    violations: list[Violation] = []
+    if "record_approval_decision_with_trace" in text:
+        violations.append(
+            Violation(
+                "duplicate-approval-decision-api",
+                relative,
+                "approval decisions must have one public durable ledger + trace writer",
+            )
+        )
+    if text.count("pub fn record_approval_decision") != 1:
+        violations.append(
+            Violation(
+                "duplicate-approval-decision-api",
+                relative,
+                "store must expose exactly one public record_approval_decision function",
+            )
+        )
+    body = _extract_rust_function_body(text, "record_approval_decision")
+    if body is None:
+        violations.append(
+            Violation(
+                "missing-approval-decision-api",
+                relative,
+                "record_approval_decision public durable writer not found",
+            )
+        )
+        return violations
+    missing = []
+    if "approval_decisions" not in body:
+        missing.append("approval_decisions insert")
+    if "insert_trace" not in body:
+        missing.append("insert_trace")
+    if missing:
+        violations.append(
+            Violation(
+                "incomplete-approval-decision-ledger",
+                relative,
+                f"record_approval_decision is missing {', '.join(missing)}",
+            )
+        )
+    return violations
+
+
+def _check_unused_tokio_dependencies(repo_root: Path) -> list[Violation]:
+    violations: list[Violation] = []
+    for relative in ("crates/cli/Cargo.toml", "crates/app-server/Cargo.toml"):
+        manifest_path = repo_root / relative
+        manifest = _load_toml(manifest_path)
+        dependencies = set((manifest.get("dependencies") or {}).keys())
+        if "tokio" not in dependencies:
+            continue
+        crate_root = manifest_path.parent / "src"
+        has_usage = any(
+            "tokio::" in source or "#[tokio::" in source
+            for source in _rust_sources(crate_root)
+        )
+        if not has_usage:
+            violations.append(
+                Violation(
+                    "unused-tokio-dependency",
+                    relative,
+                    "tokio dependency is declared without tokio source usage",
+                )
+            )
+    return violations
+
+
+def _rust_sources(root: Path) -> list[str]:
+    return [path.read_text(encoding="utf-8") for path in sorted(root.rglob("*.rs"))]
 
 
 def _extract_rust_function_body(text: str, function_name: str) -> str | None:

@@ -22,7 +22,7 @@
 
 `crates/app-server` 实现 `initialize` / `initialized` handshake、server capabilities、thread list/read/start/resume/fork/archive/delete、turn start/interrupt/status、event subscription、approval list/center/request/decision、artifact fetch、trace list/show/tail 和 `server/shutdown`。默认 `turn/start` 明确写入 `agent_loop_status = "not_migrated"`，不伪装 Python AgentLoop 已完成迁移；`turn/start` 会先校验 Rust store 中的 thread 存在，missing thread 直接返回 `Thread not found`，不会启动 Python sidecar 或写 sidecar trace。显式设置 `SINGULARITY_PYTHON_SIDECAR=1` 且 thread 校验通过后，app-server 才通过 `PythonSidecarClient` 启动 `python -m singularity.agent_host.sidecar`，由 sidecar 调用现有 `AgentHost -> KernelBootstrap -> AgentKernel -> AgentLoop` 并把安全状态摘要翻译成 Rust turn/item/trace。stdio binary transport 的错误行统一通过 `JsonRpcMessage::error()` / `serde_json` 序列化为合法 JSON-RPC error envelope。item streaming 使用 `item/agentMessage/delta` 和 `item/commandExecution/outputDelta` 这类 typed delta，不再使用 generic `item/delta`。当前 `server/capabilities` 只声明 stdio transport 可用，WebSocket token transport 仍是未来 transport，显式返回 unavailable。
 
-`crates/cli` 提供 `sg` CLI。`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` / `sg config doctor` 会启动或调用 stdio app-server，并只通过 JSON-RPC protocol 交换 initialize、thread、turn、trace 和 approval 请求；请求读取以 matching response id 为完成条件，并短暂 drain 已到达 notification，不依赖固定 notification 数量。stdout 关闭、app-server 提前退出或 response timeout 都返回明确错误，不无限等待。`sg daemon` 启动 app-server stdio 进程。CLI 不直接依赖 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
+`crates/cli` 提供 `sg` CLI。`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` / `sg config doctor` 会启动或调用 stdio app-server，并只通过 JSON-RPC protocol 交换 initialize、thread、turn、trace 和 approval 请求；请求读取以 matching response id 为完成条件，保留 matching response 之前到达的 notification，不依赖固定 notification 数量，也不在 response 后 drain 额外消息。stdout 关闭、app-server 提前退出或 response timeout 都返回明确错误，不无限等待。`sg daemon` 启动 app-server stdio 进程。CLI 不直接依赖 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
 `crates/tools` 提供 Rust `ToolBroker`。所有工具在模型可见前必须先注册到 `ToolRegistry`，工具名只能使用 `builtin.*`、`mcp.<server>.<tool>` 或 `python.<plugin>.<tool>`；`ToolBroker.model_visible_tools()` 只投影 name、redacted description 和 input schema；`ToolBroker.execute()` 对 unknown 或 denied tool 不调用 executor，并通过 `ToolObservation.to_model_payload()` 输出安全摘要。
 
@@ -71,7 +71,7 @@ python -m singularity.cli eval run docs/evaluation/public-representative-task.js
 下一阶段应按风险和边界厚度迁移：
 
 1. tool registry / tool observation / safe model payload。
-2. strict sandbox backend execution contract；当前 `crates/sandbox` 只保留 command request/result、backend descriptor、patch executor 和 capability schema，不公开 relaxed local-process executor。
+2. strict sandbox backend execution contract；当前 `crates/sandbox` 只保留 command request/result、backend descriptor、`PatchChange` / `PatchResult` schema contract 和 capability schema，不公开 relaxed local-process executor 或 host filesystem mutation executor。
 3. model turn request/response adapter。
 4. planner / context / repair / finalization parity contract 继续按一个行为切片一组 fixture 推进；repair 和 finalization 已有 schema parity，但 runtime 仍未迁移。
 5. 更完整的 TUI 渲染和长期 app-server lifecycle 管理。
@@ -81,4 +81,4 @@ python -m singularity.cli eval run docs/evaluation/public-representative-task.js
 
 Rust app-server protocol 是唯一富客户端边界。任何 desktop/TUI 新能力都必须先通过 `crates/protocol` 和 `crates/app-server` 暴露，再由 client 消费；不能绕过 app-server 直接调用 core 或 Python runtime。
 
-M0 之后，`scripts/verify_rust_migration_boundaries.py` 是提交和 CI 的迁移漂移检查入口。它检查 `crates/cli` 不能直接依赖 agent/model/tools/store，crate 依赖必须留在显式 allowlist，Python runtime 改动只能落在 sidecar/oracle/fixture/parity 允许路径，仓库不能提前出现 desktop/Web 启动文件，`turn/start` 在 Rust AgentLoop 迁移前必须保持 `agent_loop_status = "not_migrated"`，`crates/sandbox` 不得公开 relaxed local-process executor，app-server stdio error 不得手拼 JSON，CLI 不得恢复固定 notification 等待，并且 Rust `ToolObservation.to_model_payload()` 不得输出 raw arguments、内部 approval/policy id、internal metadata 或明显 secret-like 文本。
+M0 之后，`scripts/verify_rust_migration_boundaries.py` 是提交和 CI 的迁移漂移检查入口。它检查 `crates/cli` 不能直接依赖 agent/model/tools/store，crate 依赖必须留在显式 allowlist，Python runtime 改动只能落在 sidecar/oracle/fixture/parity 允许路径，仓库不能提前出现 desktop/Web 启动文件，`turn/start` 在 Rust AgentLoop 迁移前必须保持 `agent_loop_status = "not_migrated"`，`crates/sandbox` 不得公开 relaxed/no-sandbox contract 或 local-process executor，app-server stdio error 不得手拼 JSON，CLI 不得恢复固定 notification 等待或 post-response drain，store 不得恢复重复 approval decision public API，CLI/app-server 不得声明 unused tokio，并且 Rust `ToolObservation.to_model_payload()` 不得输出 raw arguments、内部 approval/policy id、internal metadata 或明显 secret-like 文本。

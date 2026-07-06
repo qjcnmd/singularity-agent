@@ -6,7 +6,7 @@ use rusqlite::{Connection, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
+use singularity_policy::{ApprovalDecision, ApprovalRequest};
 use singularity_protocol::{
     ArtifactRef, Item, ItemKind, ItemStatus, Thread, ThreadStatus, TraceEvent, Turn, TurnStatus,
 };
@@ -358,22 +358,6 @@ impl SessionStore {
     }
 
     pub fn record_approval_decision(
-        &self,
-        request_id: &str,
-        outcome: ApprovalOutcome,
-        reason: &str,
-    ) -> StoreResult<()> {
-        let changed = self.connection.execute(
-            "update approvals set decision_outcome = ?1, decision_reason = ?2 where request_id = ?3 and decision_outcome is null",
-            params![serde_json::to_string(&outcome)?, reason, request_id],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::NotFound(format!("approval {request_id}")));
-        }
-        Ok(())
-    }
-
-    pub fn record_approval_decision_with_trace(
         &self,
         decision: &ApprovalDecision,
         component: &str,

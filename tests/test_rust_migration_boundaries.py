@@ -81,6 +81,7 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "crates/app-server/src/main.rs",
         "crates/cli/src/main.rs",
         "crates/sandbox/src/lib.rs",
+        "crates/store/src/lib.rs",
         "crates/protocol/src/lib.rs",
         "crates/tools/src/lib.rs",
     ):
@@ -159,10 +160,14 @@ def test_guard_rejects_python_core_changes_outside_allowlist(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     ("marker", "violation"),
     (
+        ("HostWorkspace", "relaxed-sandbox-filesystem-mode"),
+        ("Relaxed", "relaxed-sandbox-backend-enforcement"),
         ("pub struct CommandExecutor;", "relaxed-sandbox-executor"),
+        ("pub struct PatchExecutor;", "sandbox-host-patch-executor"),
         ("pub fn local_process(", "relaxed-sandbox-command-request"),
         ("pub fn run_local(", "relaxed-sandbox-run-local"),
         ("Command::new(\"python\").spawn()", "direct-sandbox-process-spawn"),
+        ("fs::write(\"path\", \"content\")", "direct-sandbox-filesystem-mutation"),
     ),
 )
 def test_guard_rejects_relaxed_sandbox_process_execution(
@@ -206,6 +211,86 @@ def test_guard_rejects_fixed_cli_notification_wait(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "fixed-cli-notification-wait" in result.stderr
+
+
+def test_guard_rejects_cli_notification_drain(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    cli = repo / "crates/cli/src/main.rs"
+    cli.write_text(
+        cli.read_text(encoding="utf-8")
+        + "\nconst EVENT_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);\nfn drain_notifications() {}\n",
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "cli-notification-drain" in result.stderr
+
+
+def test_guard_rejects_duplicate_approval_decision_public_api(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    store = repo / "crates/store/src/lib.rs"
+    store.write_text(
+        store.read_text(encoding="utf-8")
+        + "\npub fn record_approval_decision_with_trace() {}\npub fn record_approval_decision() {}\n",
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "duplicate-approval-decision-api" in result.stderr
+
+
+def test_guard_rejects_approval_decision_without_ledger_or_trace(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    store = repo / "crates/store/src/lib.rs"
+    text = store.read_text(encoding="utf-8")
+    body_start = text.index("    pub fn record_approval_decision")
+    body_end = text.index("    pub fn get_approval_decision", body_start)
+    store.write_text(
+        text[:body_start]
+        + """    pub fn record_approval_decision(
+        &self,
+        request_id: &str,
+        outcome: ApprovalOutcome,
+        reason: &str,
+    ) -> StoreResult<()> {
+        let changed = self.connection.execute(
+            "update approvals set decision_outcome = ?1, decision_reason = ?2 where request_id = ?3 and decision_outcome is null",
+            params![serde_json::to_string(&outcome)?, reason, request_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("approval {request_id}")));
+        }
+        Ok(())
+    }
+
+"""
+        + text[body_end:],
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "incomplete-approval-decision-ledger" in result.stderr
+    assert "insert_trace" in result.stderr
+
+
+@pytest.mark.parametrize("manifest_path", ("crates/cli/Cargo.toml", "crates/app-server/Cargo.toml"))
+def test_guard_rejects_unused_tokio_crate_dependency(tmp_path: Path, manifest_path: str) -> None:
+    repo = copy_repo_slice(tmp_path)
+    manifest = repo / manifest_path
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text(text.replace("\n[dev-dependencies]", "\ntokio.workspace = true\n\n[dev-dependencies]"), encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "unused-tokio-dependency" in result.stderr
+    assert manifest_path in result.stderr
 
 
 @pytest.mark.parametrize(

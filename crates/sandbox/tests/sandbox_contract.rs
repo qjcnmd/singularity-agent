@@ -1,22 +1,26 @@
 use schemars::schema_for;
 use singularity_sandbox::{
-    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, PatchChange,
-    PatchExecutor, SandboxBackend, SandboxBackendDescriptor, SandboxCapabilities, SandboxPolicy,
-    git_diff_request, git_status_request,
+    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
+    SandboxBackendDescriptor, SandboxCapabilities, SandboxPolicy, git_diff_request,
+    git_status_request,
 };
 
 const SANDBOX_SRC: &str = include_str!("../src/lib.rs");
-const FORBIDDEN_LOCAL_PROCESS_SURFACES: [&str; 9] = [
+const FORBIDDEN_LOCAL_PROCESS_SURFACES: [&str; 12] = [
     "CommandExecutor",
+    "PatchExecutor",
     "ProcessManager",
     "local_process",
     "run_local",
     "capture_pipe",
     "kill_process_tree",
+    "fs::write",
+    "fs::remove_file",
     "std::process::Command",
     ".spawn()",
     "taskkill",
 ];
+const FORBIDDEN_RELAXED_SANDBOX_CONTRACTS: [&str; 2] = ["HostWorkspace", "Relaxed"];
 
 struct TestBackend;
 
@@ -114,7 +118,10 @@ fn command_executor_fails_closed_when_sandbox_is_required_without_backend() {
 
 #[test]
 fn command_boundary_does_not_expose_host_workspace_local_process_executor() {
-    for forbidden in FORBIDDEN_LOCAL_PROCESS_SURFACES {
+    for forbidden in FORBIDDEN_LOCAL_PROCESS_SURFACES
+        .iter()
+        .chain(FORBIDDEN_RELAXED_SANDBOX_CONTRACTS.iter())
+    {
         assert!(
             !SANDBOX_SRC.contains(forbidden),
             "forbidden local process surface remains: {forbidden}",
@@ -143,89 +150,6 @@ fn command_policy_denied_result_does_not_require_process_or_backend_execution() 
     );
     assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
     assert!(result.stderr_preview.contains("policy denied"));
-}
-
-#[test]
-fn patch_executor_rolls_back_when_later_change_fails() {
-    let tmp_path = tempfile::tempdir().expect("create temp dir");
-    let root = tmp_path.path();
-    let existing = root.join("src.txt");
-    std::fs::write(&existing, "before").expect("write fixture");
-    let executor = PatchExecutor::new(root);
-    let changes = vec![
-        PatchChange::replace("src.txt", "before", "after"),
-        PatchChange::replace("missing.txt", "before", "after"),
-    ];
-
-    let result = executor.apply(&changes);
-
-    assert!(!result.applied);
-    assert!(result.rolled_back);
-    assert_eq!(std::fs::read_to_string(existing).unwrap(), "before");
-}
-
-#[test]
-fn patch_executor_rejects_paths_outside_workspace() {
-    let tmp_path = tempfile::tempdir().expect("create temp dir");
-    let executor = PatchExecutor::new(tmp_path.path());
-
-    let result = executor.apply(&[PatchChange::create("../escape.txt", "nope")]);
-
-    assert!(!result.applied);
-    assert!(result.error.unwrap().contains("inside workspace"));
-}
-
-#[test]
-fn patch_executor_rolls_back_when_later_path_escapes_workspace() {
-    let tmp_path = tempfile::tempdir().expect("create temp dir");
-    let root = tmp_path.path();
-    let existing = root.join("src.txt");
-    std::fs::write(&existing, "before").expect("write fixture");
-    let executor = PatchExecutor::new(root);
-
-    let result = executor.apply(&[
-        PatchChange::replace("src.txt", "before", "after"),
-        PatchChange::create("../escape.txt", "nope"),
-    ]);
-
-    assert!(!result.applied);
-    assert!(result.rolled_back);
-    assert_eq!(std::fs::read_to_string(existing).unwrap(), "before");
-}
-
-#[cfg(unix)]
-#[test]
-fn patch_executor_rejects_symlink_escape() {
-    let tmp_path = tempfile::tempdir().expect("create temp dir");
-    let outside_path = tempfile::tempdir().expect("create outside temp dir");
-    let link_path = tmp_path.path().join("link.txt");
-    std::os::unix::fs::symlink(outside_path.path().join("outside.txt"), &link_path)
-        .expect("create symlink");
-    let executor = PatchExecutor::new(tmp_path.path());
-
-    let result = executor.apply(&[PatchChange::replace("link.txt", "before", "after")]);
-
-    assert!(!result.applied);
-    assert!(result.error.unwrap().contains("inside workspace"));
-}
-
-#[cfg(windows)]
-#[test]
-fn patch_executor_rejects_symlink_escape() {
-    let tmp_path = tempfile::tempdir().expect("create temp dir");
-    let outside_path = tempfile::tempdir().expect("create outside temp dir");
-    let link_path = tmp_path.path().join("link.txt");
-    if std::os::windows::fs::symlink_file(outside_path.path().join("outside.txt"), &link_path)
-        .is_err()
-    {
-        return;
-    }
-    let executor = PatchExecutor::new(tmp_path.path());
-
-    let result = executor.apply(&[PatchChange::replace("link.txt", "before", "after")]);
-
-    assert!(!result.applied);
-    assert!(result.error.unwrap().contains("inside workspace"));
 }
 
 #[test]

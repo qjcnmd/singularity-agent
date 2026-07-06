@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
@@ -130,6 +131,138 @@ for line in sys.stdin:
 }
 
 #[test]
+fn cli_run_does_not_wait_for_post_response_messages() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+        print(json.dumps({"id": 999, "result": {"late": True}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests"])
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(stdout(&output).contains("thread thread_fake"));
+}
+
+#[test]
+fn cli_reports_json_rpc_error_without_swallowing_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message.get("id")
+    print(json.dumps({"id": request_id, "error": {"code": -32000, "message": "forced failure"}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .arg("threads")
+        .output()
+        .expect("threads cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("forced failure"));
+}
+
+#[test]
+fn cli_ignores_non_matching_response_before_next_matching_response() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+thread_started = False
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start" and not thread_started:
+        thread_started = True
+        print(json.dumps({"id": 999, "result": {"turn": {"turn_id": "wrong_turn", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests"])
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(!stdout(&output).contains("wrong_turn"));
+}
+
+#[test]
+fn cli_ignores_non_matching_error_before_next_matching_response() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+thread_started = False
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start" and not thread_started:
+        thread_started = True
+        print(json.dumps({"id": 999, "error": {"code": -32000, "message": "stale failure"}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests"])
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(!stderr(&output).contains("stale failure"));
+    assert!(stdout(&output).contains("thread thread_fake"));
+}
+
+#[test]
 fn cli_reports_app_server_exit_before_response() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
@@ -243,6 +376,14 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
 }
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
 fn assert_app_server_unavailable_error(output: &std::process::Output) {
     let stderr = stderr(output);
     assert!(is_app_server_unavailable_error(&stderr), "stderr={stderr}");
@@ -263,6 +404,7 @@ fn stderr(output: &std::process::Output) -> String {
 
 fn app_server_bin() -> String {
     std::env::var("CARGO_BIN_EXE_singularity_app_server").unwrap_or_else(|_| {
+        ensure_app_server_binary();
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.pop();
         path.pop();
@@ -274,4 +416,22 @@ fn app_server_bin() -> String {
         ));
         path.to_string_lossy().to_string()
     })
+}
+
+fn ensure_app_server_binary() {
+    static BUILD_APP_SERVER: Once = Once::new();
+    BUILD_APP_SERVER.call_once(|| {
+        let status = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "-p",
+                "singularity_app_server",
+                "--bin",
+                "singularity_app_server",
+            ])
+            .current_dir(workspace_root())
+            .status()
+            .expect("build app-server binary");
+        assert!(status.success(), "failed to build app-server binary");
+    });
 }

@@ -98,7 +98,8 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     let thread = server
         .handle_json(r#"{"method":"thread/start","id":4,"params":{"model":"gpt-test"}}"#)
         .unwrap();
-    let thread_id = thread[0]["result"]["thread"]["thread_id"].as_str().unwrap();
+    let thread_result = result_message(&thread);
+    let thread_id = thread_result["thread"]["thread_id"].as_str().unwrap();
     assert!(
         thread
             .iter()
@@ -122,12 +123,10 @@ fn app_server_enforces_initialize_and_emits_item_events() {
             r#"{{"method":"turn/start","id":5,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
-    let turn_id = turn[0]["result"]["turn"]["turn_id"].as_str().unwrap();
+    let turn_result = result_message(&turn);
+    let turn_id = turn_result["turn"]["turn_id"].as_str().unwrap();
 
-    assert_eq!(
-        turn[0]["result"]["turn"]["agent_loop_status"],
-        "not_migrated"
-    );
+    assert_eq!(turn_result["turn"]["agent_loop_status"], "not_migrated");
     assert!(
         turn.iter()
             .any(|message| message["method"] == "turn/started")
@@ -440,7 +439,8 @@ fn app_server_can_translate_python_sidecar_completion_when_enabled() {
     let thread = server
         .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
         .unwrap();
-    let thread_id = thread[0]["result"]["thread"]["thread_id"].as_str().unwrap();
+    let thread_result = result_message(&thread);
+    let thread_id = thread_result["thread"]["thread_id"].as_str().unwrap();
 
     let turn = server
         .handle_json(&format!(
@@ -448,8 +448,9 @@ fn app_server_can_translate_python_sidecar_completion_when_enabled() {
         ))
         .unwrap();
 
-    assert_eq!(turn[0]["result"]["turn"]["agent_loop_status"], "completed");
-    assert_eq!(turn[0]["result"]["turn"]["status"], "completed");
+    let turn_result = result_message(&turn);
+    assert_eq!(turn_result["turn"]["agent_loop_status"], "completed");
+    assert_eq!(turn_result["turn"]["status"], "completed");
     assert!(
         turn.iter()
             .any(|message| message["method"] == "item/agentMessage/delta")
@@ -510,4 +511,11 @@ fn app_server_bin() -> String {
         ));
         path.to_string_lossy().to_string()
     })
+}
+
+fn result_message(messages: &[serde_json::Value]) -> &serde_json::Value {
+    messages
+        .iter()
+        .find_map(|message| message.get("result"))
+        .expect("json-rpc result")
 }

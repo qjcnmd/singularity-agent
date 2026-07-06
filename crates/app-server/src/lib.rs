@@ -186,7 +186,9 @@ impl AppServer {
             "app_server",
             "thread started",
         )?;
-        let mut messages = vec![
+        let mut messages = Vec::new();
+        messages.extend(self.event_notification(AppEvent::thread_started(&thread)));
+        messages.push(
             JsonRpcMessage::response(
                 message.id,
                 serde_json::to_value(ThreadStartResult {
@@ -194,8 +196,7 @@ impl AppServer {
                 })?,
             )
             .to_wire_value(),
-        ];
-        messages.extend(self.event_notification(AppEvent::thread_started(&thread)));
+        );
         Ok(messages)
     }
 
@@ -283,21 +284,22 @@ impl AppServer {
             .or(bridge.error.as_deref())
             .unwrap_or("input accepted");
 
-        let mut messages = vec![
+        let mut messages = Vec::new();
+        for event in [
+            AppEvent::turn_started(&turn),
+            AppEvent::item_started(item.item_id.clone()),
+            AppEvent::item_agent_message_delta(item.item_id.clone(), agent_delta),
+            AppEvent::item_completed(item.item_id.clone()),
+        ] {
+            messages.extend(self.event_notification(event));
+        }
+        messages.push(
             JsonRpcMessage::response(
                 message.id,
                 serde_json::to_value(TurnStartResult { turn: turn.clone() })?,
             )
             .to_wire_value(),
-        ];
-        for event in [
-            AppEvent::turn_started(&turn),
-            AppEvent::item_started(item.item_id.clone()),
-            AppEvent::item_agent_message_delta(item.item_id.clone(), agent_delta),
-            AppEvent::item_completed(item.item_id),
-        ] {
-            messages.extend(self.event_notification(event));
-        }
+        );
         Ok(messages)
     }
 
@@ -459,11 +461,10 @@ impl AppServer {
 
     fn approval_decision(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let decision: ApprovalDecision = message.params_as()?;
-        if let Err(error) = self.store.record_approval_decision_with_trace(
-            &decision,
-            "approval",
-            "approval decision recorded",
-        ) {
+        if let Err(error) =
+            self.store
+                .record_approval_decision(&decision, "approval", "approval decision recorded")
+        {
             return match error {
                 StoreError::NotFound(_) => {
                     not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND)
