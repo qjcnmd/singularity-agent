@@ -99,7 +99,16 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
         .record_approval_decision_with_trace(&decision, "approval", "approval decision recorded")
         .expect("decision");
 
-    assert_eq!(trace.run_id, "approval_1");
+    assert_eq!(trace.run_id, "session_1");
+    assert_eq!(trace.session_id, "session_1");
+    assert_eq!(trace.task_id.as_deref(), Some("task_1"));
+    assert_eq!(trace.payload["request_id"], "approval_1");
+    assert_eq!(trace.payload["decision_id"], decision.decision_id);
+    assert_eq!(trace.payload["outcome"], "allow");
+    assert_eq!(
+        store.list_trace("session_1").expect("trace list")[0].event_id,
+        trace.event_id
+    );
     assert_eq!(
         store
             .get_approval_decision(&decision.decision_id)

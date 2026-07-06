@@ -151,6 +151,9 @@ def main() -> int:
     violations.extend(_check_forbidden_desktop_paths(repo_root))
     violations.extend(_check_agent_loop_status(repo_root))
     violations.extend(_check_tool_observation_payload(repo_root))
+    violations.extend(_check_sandbox_phase1_boundary(repo_root))
+    violations.extend(_check_app_server_transport_errors(repo_root))
+    violations.extend(_check_cli_protocol_read_loop(repo_root))
 
     if violations:
         for violation in violations:
@@ -325,6 +328,69 @@ def _check_tool_observation_payload(repo_root: Path) -> list[Violation]:
                 )
             )
     return violations
+
+
+def _check_sandbox_phase1_boundary(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "sandbox" / "src" / "lib.rs"
+    text = path.read_text(encoding="utf-8")
+    relative = _relative(path, repo_root)
+    checks = (
+        ("relaxed-sandbox-executor", "pub struct CommandExecutor", "sandbox crate must not expose a local process executor in Phase 1"),
+        (
+            "relaxed-sandbox-command-request",
+            "pub fn local_process",
+            "CommandRequest must not expose a relaxed host local-process constructor",
+        ),
+        ("relaxed-sandbox-run-local", "pub fn run_local", "sandbox crate must not expose run_local without a strict backend"),
+    )
+    violations = [
+        Violation(code, relative, detail)
+        for code, marker, detail in checks
+        if marker in text
+    ]
+    if any(marker in text for marker in ("Command::new", ".spawn()", "std::process::Command", "std::process::{")):
+        violations.append(
+            Violation(
+                "direct-sandbox-process-spawn",
+                relative,
+                "sandbox crate must not spawn host processes until a strict backend is implemented",
+            )
+        )
+    return violations
+
+
+def _check_app_server_transport_errors(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "app-server" / "src" / "main.rs"
+    text = path.read_text(encoding="utf-8")
+    handwritten_error_markers = (
+        '\\"error\\"',
+        '"{{\\"error\\":',
+        '{{"error":',
+        '{"error":',
+    )
+    if not any(marker in text for marker in handwritten_error_markers):
+        return []
+    return [
+        Violation(
+            "handwritten-json-rpc-error",
+            _relative(path, repo_root),
+            "stdio transport errors must be serialized through serde_json/JsonRpcMessage, not hand-written JSON strings",
+        )
+    ]
+
+
+def _check_cli_protocol_read_loop(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "cli" / "src" / "main.rs"
+    text = path.read_text(encoding="utf-8")
+    if "expected_notifications" not in text:
+        return []
+    return [
+        Violation(
+            "fixed-cli-notification-wait",
+            _relative(path, repo_root),
+            "CLI requests must complete on matching response id and drain variable notifications without fixed counts",
+        )
+    ]
 
 
 def _extract_rust_function_body(text: str, function_name: str) -> str | None:

@@ -254,6 +254,12 @@ impl AppServer {
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnStartParams = message.params_as()?;
+        if let Err(error) = self.store.get_thread(&params.thread_id) {
+            return match error {
+                StoreError::NotFound(_) => not_found_response(message.id, THREAD_NOT_FOUND),
+                other => Err(other.into()),
+            };
+        }
         let bridge = self.run_python_sidecar_if_enabled(&params);
         let payload = serde_json::to_value(&params.input)?;
         let (turn, item, _trace) = match self.store.create_turn_with_input_and_trace(

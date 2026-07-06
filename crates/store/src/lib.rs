@@ -380,6 +380,19 @@ impl SessionStore {
         summary: &str,
     ) -> StoreResult<TraceEvent> {
         let transaction = self.connection.unchecked_transaction()?;
+        let request_payload: String = transaction
+            .query_row(
+                "select payload from approvals where request_id = ?1 and decision_outcome is null",
+                params![decision.request_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("approval {}", decision.request_id))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        let request: ApprovalRequest = serde_json::from_str(&request_payload)?;
         let changed = transaction.execute(
             "update approvals set decision_outcome = ?1, decision_reason = ?2 where request_id = ?3 and decision_outcome is null",
             params![
@@ -406,11 +419,20 @@ impl SessionStore {
         )?;
         let trace = TraceEvent::new(
             format!("trace_{}", decision.decision_id),
-            decision.request_id.clone(),
-            decision.request_id.clone(),
+            request.session_id.clone(),
+            request.session_id,
             component,
             summary,
         );
+        let trace = TraceEvent {
+            task_id: Some(request.task_id),
+            payload: serde_json::json!({
+                "request_id": decision.request_id,
+                "decision_id": decision.decision_id,
+                "outcome": decision.outcome,
+            }),
+            ..trace
+        };
         Self::insert_trace(&transaction, &trace)?;
         transaction.commit()?;
         Ok(trace)

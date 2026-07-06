@@ -1,9 +1,22 @@
 use schemars::schema_for;
 use singularity_sandbox::{
-    CommandExecutionStatus, CommandExecutor, CommandRequest, CommandResult, CommandSemanticStatus,
-    PatchChange, PatchExecutor, SandboxBackend, SandboxBackendDescriptor, SandboxCapabilities,
-    SandboxPolicy, git_diff_request, git_status_request,
+    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, PatchChange,
+    PatchExecutor, SandboxBackend, SandboxBackendDescriptor, SandboxCapabilities, SandboxPolicy,
+    git_diff_request, git_status_request,
 };
+
+const SANDBOX_SRC: &str = include_str!("../src/lib.rs");
+const FORBIDDEN_LOCAL_PROCESS_SURFACES: [&str; 9] = [
+    "CommandExecutor",
+    "ProcessManager",
+    "local_process",
+    "run_local",
+    "capture_pipe",
+    "kill_process_tree",
+    "std::process::Command",
+    ".spawn()",
+    "taskkill",
+];
 
 struct TestBackend;
 
@@ -87,8 +100,9 @@ fn command_resource_normalization_belongs_to_command_boundary() {
 fn command_executor_fails_closed_when_sandbox_is_required_without_backend() {
     let request =
         CommandRequest::project_verification("command_1", vec!["git".to_string()], ".", "C:/repo");
+    assert!(request.requires_sandbox());
 
-    let result = CommandExecutor::new().run_local(&request);
+    let result = CommandResult::sandbox_backend_unavailable(&request.command_id);
 
     assert_eq!(
         result.execution_status,
@@ -96,6 +110,16 @@ fn command_executor_fails_closed_when_sandbox_is_required_without_backend() {
     );
     assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
     assert!(result.stderr_preview.contains("sandbox-required"));
+}
+
+#[test]
+fn command_boundary_does_not_expose_host_workspace_local_process_executor() {
+    for forbidden in FORBIDDEN_LOCAL_PROCESS_SURFACES {
+        assert!(
+            !SANDBOX_SRC.contains(forbidden),
+            "forbidden local process surface remains: {forbidden}",
+        );
+    }
 }
 
 #[test]
@@ -119,29 +143,6 @@ fn command_policy_denied_result_does_not_require_process_or_backend_execution() 
     );
     assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
     assert!(result.stderr_preview.contains("policy denied"));
-}
-
-#[test]
-fn process_manager_times_out_and_redacts_secret_like_output() {
-    let request = CommandRequest::local_process(
-        "command_timeout",
-        vec![
-            "python".to_string(),
-            "-c".to_string(),
-            "import time; print('token=abc', flush=True); time.sleep(5)".to_string(),
-        ],
-        ".",
-    );
-    let mut request = request;
-    request.timeout_seconds = 1;
-
-    let result = CommandExecutor::new().run_local(&request);
-
-    assert_eq!(result.execution_status, CommandExecutionStatus::TimedOut);
-    assert_eq!(result.semantic_status, CommandSemanticStatus::TimedOut);
-    assert!(result.timed_out);
-    assert!(result.redacted);
-    assert!(!result.stdout_preview.contains("abc"));
 }
 
 #[test]

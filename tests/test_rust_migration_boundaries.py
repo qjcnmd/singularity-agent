@@ -78,6 +78,9 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "crates/cli/Cargo.toml",
         "crates/agent/src/lib.rs",
         "crates/app-server/src/lib.rs",
+        "crates/app-server/src/main.rs",
+        "crates/cli/src/main.rs",
+        "crates/sandbox/src/lib.rs",
         "crates/protocol/src/lib.rs",
         "crates/tools/src/lib.rs",
     ):
@@ -151,6 +154,58 @@ def test_guard_rejects_python_core_changes_outside_allowlist(tmp_path: Path) -> 
 
     assert result.returncode == 1
     assert "python-core-freeze" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("marker", "violation"),
+    (
+        ("pub struct CommandExecutor;", "relaxed-sandbox-executor"),
+        ("pub fn local_process(", "relaxed-sandbox-command-request"),
+        ("pub fn run_local(", "relaxed-sandbox-run-local"),
+        ("Command::new(\"python\").spawn()", "direct-sandbox-process-spawn"),
+    ),
+)
+def test_guard_rejects_relaxed_sandbox_process_execution(
+    tmp_path: Path, marker: str, violation: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    sandbox = repo / "crates/sandbox/src/lib.rs"
+    sandbox.write_text(sandbox.read_text(encoding="utf-8") + f"\n{marker}\n", encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert violation in result.stderr
+
+
+def test_guard_rejects_handwritten_app_server_json_rpc_errors(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    app_server = repo / "crates/app-server/src/main.rs"
+    app_server.write_text(
+        app_server.read_text(encoding="utf-8")
+        + '\nwriteln!(stdout, "{{\\"error\\":{{\\"message\\":\\"{error}\\"}}}}");\n',
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "handwritten-json-rpc-error" in result.stderr
+
+
+def test_guard_rejects_fixed_cli_notification_wait(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    cli = repo / "crates/cli/src/main.rs"
+    cli.write_text(
+        cli.read_text(encoding="utf-8")
+        + "\nlet expected_notifications = 4;\nif notifications >= expected_notifications {}\n",
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "fixed-cli-notification-wait" in result.stderr
 
 
 @pytest.mark.parametrize(

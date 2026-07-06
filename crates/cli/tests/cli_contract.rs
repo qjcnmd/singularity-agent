@@ -1,7 +1,9 @@
 use assert_cmd::Command;
+use std::path::{Path, PathBuf};
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
+const FAKE_APP_SERVER_EXIT_CODE: i32 = 7;
 
 #[test]
 fn cli_exposes_app_server_protocol_mode_without_direct_core_runtime() {
@@ -96,6 +98,61 @@ fn cli_reports_interrupted_app_server_process() {
 }
 
 #[test]
+fn cli_run_returns_when_turn_response_has_no_notifications() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests"])
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(stdout(&output).contains("thread thread_fake"));
+}
+
+#[test]
+fn cli_reports_app_server_exit_before_response() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        &format!("import sys\nsys.exit({FAKE_APP_SERVER_EXIT_CODE})\n"),
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .arg("threads")
+        .output()
+        .expect("threads cli");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("app-server exited before response")
+            || stderr.contains("app-server closed stdout"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn cli_outputs_json_rpc_initialize_request() {
     let mut command = Command::cargo_bin("sg").expect("binary");
     let output = command.arg("protocol-init").output().expect("run cli");
@@ -149,6 +206,45 @@ fn cli_with_app_server(app_server_bin: &str, db_path: &std::path::Path) -> Comma
     command.env(APP_SERVER_BIN_ENV, app_server_bin);
     command.env(APP_SERVER_DB_ENV, db_path);
     command
+}
+
+fn write_fake_app_server(dir: &Path, script: &str) -> PathBuf {
+    let script_path = dir.join("fake_app_server.py");
+    std::fs::write(&script_path, script).expect("write fake app-server script");
+    if cfg!(windows) {
+        let launcher = dir.join("fake_app_server.cmd");
+        std::fs::write(
+            &launcher,
+            format!(
+                "@echo off\r\npython \"{}\"\r\nexit /b %ERRORLEVEL%\r\n",
+                script_path.display()
+            ),
+        )
+        .expect("write fake app-server launcher");
+        launcher
+    } else {
+        let launcher = dir.join("fake_app_server");
+        std::fs::write(
+            &launcher,
+            format!("#!/bin/sh\nexec python3 '{}' \n", script_path.display()),
+        )
+        .expect("write fake app-server launcher");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&launcher)
+                .expect("fake launcher metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&launcher, permissions).expect("fake launcher executable");
+        }
+        launcher
+    }
+}
+
+fn path_str(path: &Path) -> &str {
+    path.to_str().expect("utf8 path")
 }
 
 fn stdout(output: &std::process::Output) -> String {

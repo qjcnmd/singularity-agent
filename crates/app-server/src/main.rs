@@ -1,8 +1,10 @@
 use std::io::{self, BufRead, Write};
 
+use serde_json::Value;
 use singularity_agent::PythonSidecarConfig;
 use singularity_app_server::AppServer;
-use singularity_core::JSON_RPC_INTERNAL_ERROR;
+use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
+use singularity_protocol::JsonRpcMessage;
 use singularity_store::SessionStore;
 
 const PYTHON_SIDECAR_ENV: &str = "SINGULARITY_PYTHON_SIDECAR";
@@ -33,20 +35,40 @@ fn main() {
         match server.handle_json(&line) {
             Ok(messages) => {
                 for message in messages {
-                    writeln!(stdout, "{message}").expect("write response");
+                    write_json_line(&mut stdout, &message).expect("write response");
                 }
                 stdout.flush().expect("flush response");
             }
             Err(error) => {
-                writeln!(
-                    stdout,
-                    "{{\"error\":{{\"code\":{JSON_RPC_INTERNAL_ERROR},\"message\":\"{error}\"}}}}"
-                )
-                .expect("write error");
+                write_transport_error(&mut stdout, recover_request_id(&line), &error)
+                    .expect("write error");
                 stdout.flush().expect("flush error");
             }
         }
     }
+}
+
+fn write_json_line(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *stdout, value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    stdout.write_all(b"\n")
+}
+
+fn write_transport_error(
+    stdout: &mut impl Write,
+    id: Option<Value>,
+    error: &singularity_app_server::AppServerError,
+) -> io::Result<()> {
+    let message = JsonRpcMessage::error(
+        id,
+        ErrorCode::new(JSON_RPC_INTERNAL_ERROR, error.to_string()),
+    );
+    write_json_line(stdout, &message.to_wire_value())
+}
+
+fn recover_request_id(line: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    value.get("id").cloned()
 }
 
 fn python_sidecar_config() -> Option<PythonSidecarConfig> {

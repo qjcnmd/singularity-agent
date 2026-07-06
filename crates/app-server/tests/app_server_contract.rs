@@ -2,6 +2,8 @@ use singularity_agent::PythonSidecarConfig;
 use singularity_app_server::AppServer;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_store::SessionStore;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -371,6 +373,49 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
 }
 
 #[test]
+fn turn_start_missing_thread_does_not_spawn_python_sidecar() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_probe.py"),
+        "import os, pathlib\npathlib.Path(os.environ['SIDECAR_MARKER']).write_text('spawned')\n",
+    )
+    .expect("sidecar probe");
+    let marker = dir.path().join("sidecar_spawned.txt");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_probe".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: vec![(
+            "SIDECAR_MARKER".to_string(),
+            marker.to_string_lossy().into_owned(),
+        )],
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    let missing_thread = server
+        .handle_json(
+            r#"{"method":"turn/start","id":2,"params":{"threadId":"missing","input":[{"type":"text","text":"hello"}]}}"#,
+        )
+        .unwrap();
+
+    assert_eq!(missing_thread[0]["error"]["message"], "Thread not found");
+    assert!(
+        !marker.exists(),
+        "sidecar marker should not be written for a missing Rust thread"
+    );
+}
+
+#[test]
 fn app_server_can_translate_python_sidecar_completion_when_enabled() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
@@ -421,4 +466,48 @@ fn app_server_can_translate_python_sidecar_completion_when_enabled() {
             .iter()
             .any(|event| event["component"] == "python_sidecar")
     );
+}
+
+#[test]
+fn app_server_binary_errors_are_valid_json_rpc_lines() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let mut child = Command::new(app_server_bin())
+        .env("SINGULARITY_APP_SERVER_DB", &db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn app-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(b"{\"method\":\"initialize\",\"id\":\"quoted-id\",\"params\":\"bad\"}\n")
+        .expect("write invalid params");
+    drop(stdin);
+    let output = child.wait_with_output().expect("app-server output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let first_line = stdout.lines().next().expect("error line");
+    let value: serde_json::Value = serde_json::from_str(first_line).expect("valid json error");
+
+    assert_eq!(value["id"], "quoted-id");
+    assert_eq!(value["error"]["code"], -32603);
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid type")
+    );
+}
+
+fn app_server_bin() -> String {
+    std::env::var("CARGO_BIN_EXE_singularity_app_server").unwrap_or_else(|_| {
+        let mut path = workspace_root();
+        path.push("target");
+        path.push("debug");
+        path.push(format!(
+            "singularity_app_server{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        path.to_string_lossy().to_string()
+    })
 }
