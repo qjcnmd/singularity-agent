@@ -78,6 +78,7 @@
 - ModelTurnRequest
 - ModelTurnResponse
 - AgentLoopStatusBridge
+- NativeAgentLoopCapability
 - PlannerStateBoundary
 - ContextAssemblyBoundary
 - ContextSummaryEnvelopeBoundary
@@ -154,6 +155,7 @@
 - ModelTurnRequest: request_id, run_id, session_id, task_id, phase_id, action_id, purpose, messages, tools, tool_choice, model_preferences, budget, context_metadata, policy_metadata, trace_metadata
 - ModelTurnResponse: request_id, response_id, status, assistant_message, tool_calls, usage, finish_reason, validation, error, provider_name, model_name, latency_ms, trace_event_ids, raw_response_ref, metadata
 - AgentLoopStatusBridge: status, completed, final_answer, run_id, session_id, task_id, events, trace_path, error
+- NativeAgentLoopCapability: available, status, reason, missing_boundaries
 - PlannerStateBoundary: task_id, current_phase, status, current_plan, completion_criteria, open_actions, blocked_actions, risk_escalations, evidence_refs
 - ContextAssemblyBoundary: bundle_id, run_id, task_id, phase_id, model, provider, messages, included_item_ids, excluded_item_ids, budget, compression_snapshot_id, retrieval_query, render_policy, created_at, bundle_digest, metadata
 - ContextSummaryEnvelopeBoundary: version, summary_id, summary_payload, source_item_ids, cache_attribution, previous_summary_digest, summary_digest, rendered_summary, created_at, metadata
@@ -181,7 +183,7 @@ Rust App Server Protocol 层建立第一阶段迁移的硬边界：客户端只�
 
 ## 关键类、函数、字段
 
-`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item`、`TraceEvent` 和 `ArtifactRef` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolRegistry`、`ToolBroker`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`PermissionRequest`、`PermissionRule`、`PermissionDecision`、`PreToolUseHook`、`PolicyEngine`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`CommandExecutor`、`PatchChange`、`PatchResult`、`PatchExecutor`、`ModelToolSchema`、`ModelToolCall`、`ModelCapabilities`、`ModelProviderConfig`、`ModelValidationResult`、`ModelError`、`ProviderStreamEvent`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object 与最小执行边界。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AgentLoopStatusBridge` 表示 Rust host 对 AgentLoop 状态的显式理解：默认 `not_migrated`，或由 Python sidecar 返回 completed/blocked/cancelled/failed。`PlannerStateBoundary`、`ContextAssemblyBoundary`、`ContextSummaryEnvelopeBoundary`、`ToolCallRepairBoundary` 和 `FinalizationMappingBoundary` 是 M9 schema/parity contract，只用于 Python oracle JSON roundtrip，不执行 provider、工具、repair planner、finalizer 或 workspace mutation。finalization runtime 仍是后续独立切片。`PythonSidecarClient` 是 Rust host 到 Python migration sidecar 的 stdio JSON-RPC client。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。`AppServerClient` 是 `sg` 内部 stdio JSON-RPC client，不暴露 store 或 agent internals。
+`JsonRpcMessage` 是 wire envelope；`Thread`、`Turn`、`Item`、`TraceEvent` 和 `ArtifactRef` 是 app-server 的 durable protocol object；`ThreadIdParams`、`ThreadForkParams`、`TurnIdParams`、`TraceListParams`、`TraceShowParams`、`TraceTailParams` 和对应 result object 是 CLI agent protocol 的 request/response schema；`ToolSpec`、`ToolRegistry`、`ToolBroker`、`ToolCallEnvelope`、`ToolResult`、`ToolObservation`、`PermissionProfile`、`PermissionRequest`、`PermissionRule`、`PermissionDecision`、`PreToolUseHook`、`PolicyEngine`、`ApprovalRequest`、`ApprovalDecision`、`SandboxPolicy`、`CommandRequest`、`CommandResult`、`CommandExecutor`、`PatchChange`、`PatchResult`、`PatchExecutor`、`ModelToolSchema`、`ModelToolCall`、`ModelCapabilities`、`ModelProviderConfig`、`ModelValidationResult`、`ModelError`、`ProviderStreamEvent`、`ModelTurnRequest` 和 `ModelTurnResponse` 是第一阶段先迁移的 schema object 与最小执行边界。`SessionStore` 是 SQLite-backed persistence boundary，`SessionStoreDescriptor` 是可序列化的 store schema descriptor。`AgentLoopStatusBridge` 表示 Rust host 对 AgentLoop 状态的显式理解：默认 `not_migrated`，或由 Python sidecar 返回 completed/blocked/cancelled/failed。`NativeAgentLoopCapability` 表示当前 Rust native AgentLoop 显式不可用，列出缺失的 deterministic runtime boundary，不执行 provider、工具、planner、finalizer 或 workspace mutation。`PlannerStateBoundary`、`ContextAssemblyBoundary`、`ContextSummaryEnvelopeBoundary`、`ToolCallRepairBoundary` 和 `FinalizationMappingBoundary` 是 M9 schema/parity contract，只用于 Python oracle JSON roundtrip，不执行 provider、工具、repair planner、finalizer 或 workspace mutation。finalization runtime 仍是后续独立切片。`PythonSidecarClient` 是 Rust host 到 Python migration sidecar 的 stdio JSON-RPC client。`AppServer.handle_json()` 是 stdio JSONL transport 的入口。`AppServerClient` 是 `sg` 内部 stdio JSON-RPC client，不暴露 store 或 agent internals。
 
 ## 真实运行时调用链
 
@@ -545,6 +547,13 @@ pub struct AgentLoopStatusBridge {
     pub error: Option<String>,
 }
 
+pub struct NativeAgentLoopCapability {
+    pub available: bool,
+    pub status: AgentHostStatus,
+    pub reason: String,
+    pub missing_boundaries: Vec<String>,
+}
+
 pub struct PythonSidecarConfig {
     pub python_bin: String,
     pub module: String,
@@ -556,7 +565,7 @@ pub struct PythonSidecarConfig {
 
 ### M9 planner/context/compaction/repair/finalization parity contract
 
-这些对象属于 Rust `crates/agent` 的 schema/parity boundary，不属于 app-server runtime execution。它们只镜像 Python oracle fixture 中已经存在的 planner state、context bundle、context summary envelope、tool-call repair contract 与 finalization mapping 安全字段，用于 JSON roundtrip 和 schema generation。默认 `turn/start` 仍使用 `AgentLoopStatusBridge::not_migrated()`。repair planner runtime、completion gate runtime、finalizer runtime、execution outcome 和完整 AgentLoop 不在当前切片内。
+这些对象属于 Rust `crates/agent` 的 schema/parity boundary，不属于 app-server runtime execution。它们只镜像 Python oracle fixture 中已经存在的 planner state、context bundle、context summary envelope、tool-call repair contract 与 finalization mapping 安全字段，用于 JSON roundtrip 和 schema generation。`NativeAgentLoopCapability::current()` 只声明 Rust native AgentLoop 仍不可用，并列出 planner step、context assembler、compaction executor、tool repair runtime、completion gate 和 finalizer runtime 尚未迁移。默认 `turn/start` 仍使用 `AgentLoopStatusBridge::not_migrated()`。repair planner runtime、completion gate runtime、finalizer runtime、execution outcome 和完整 AgentLoop 不在当前切片内。
 
 ```rust
 pub struct PlannerStateBoundary {

@@ -30,7 +30,7 @@
 
 `crates/model` 提供 Rust model boundary schema 和纯验证函数。它对齐现有 Python `singularity.model` 的 `ModelTurnRequest`、`ModelTurnResponse`、tool schema、tool call、capability metadata、provider config presence、stream event、validation result 和 model error object；`validate_provider_config()`、`validate_stream_events()`、`validate_model_response()` 和 `classify_model_error()` 只做边界验证与分类，不发起 HTTP provider call、不重试、不执行工具、不做 planner repair，也不迁移 AgentLoop。
 
-`crates/agent` 当前除 Python sidecar bridge 外，只持有 M9 的 schema/parity 切片 `PlannerStateBoundary`、`ContextAssemblyBoundary`、`ContextSummaryEnvelopeBoundary`、`ToolCallRepairBoundary` 和 `FinalizationMappingBoundary`。这些对象只从 Python oracle fixture 做 planner state、context bundle、compaction summary envelope、tool-call repair contract 与 finalization mapping JSON roundtrip，不调用 provider、不执行工具、不写 workspace，也不让 Rust `turn/start` 声称 native AgentLoop completed。repair planner runtime、completion gate runtime、finalizer runtime 和 max-turns loop 仍是后续独立切片，不能和当前切片一起重写。
+`crates/agent` 当前除 Python sidecar bridge 外，只持有 M9 的 schema/parity 切片 `PlannerStateBoundary`、`ContextAssemblyBoundary`、`ContextSummaryEnvelopeBoundary`、`ToolCallRepairBoundary`、`FinalizationMappingBoundary` 和 `NativeAgentLoopCapability`。这些对象只从 Python oracle fixture 做 planner state、context bundle、compaction summary envelope、tool-call repair contract 与 finalization mapping JSON roundtrip，或显式声明 native Rust AgentLoop 尚不可用；它们不调用 provider、不执行工具、不写 workspace，也不让 Rust `turn/start` 声称 native AgentLoop completed。repair planner runtime、completion gate runtime、finalizer runtime 和 max-turns loop 仍是后续独立切片，不能和当前切片一起重写。
 
 ## Python 冻结范围
 

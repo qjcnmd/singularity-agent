@@ -1,8 +1,8 @@
 use singularity_agent::{
     AgentHostStatus, AgentLoopStatusBridge, ContextAssemblyBoundary,
-    ContextSummaryEnvelopeBoundary, FinalizationMappingBoundary, PlannerStateBoundary,
-    PythonSidecarClient, PythonSidecarConfig, PythonSidecarRunResult, SidecarRunEvent,
-    ToolCallRepairBoundary, sidecar_trace_summary,
+    ContextSummaryEnvelopeBoundary, FinalizationMappingBoundary, NativeAgentLoopCapability,
+    PlannerStateBoundary, PythonSidecarClient, PythonSidecarConfig, PythonSidecarRunResult,
+    SidecarRunEvent, ToolCallRepairBoundary, sidecar_trace_summary,
 };
 
 #[test]
@@ -13,6 +13,28 @@ fn agent_boundary_reports_not_migrated_without_claiming_completion() {
     assert!(!bridge.completed);
     assert_eq!(bridge.status.as_str(), "not_migrated");
     assert!(bridge.final_answer.is_none());
+}
+
+#[test]
+fn native_agent_loop_capability_is_explicitly_not_available() {
+    let capability = NativeAgentLoopCapability::current();
+    let bridge = capability.status_bridge();
+
+    assert!(!capability.available);
+    assert_eq!(capability.status, AgentHostStatus::NotMigrated);
+    assert!(capability.reason.contains("not migrated"));
+    assert!(
+        capability
+            .missing_boundaries
+            .contains(&"planner_step".to_string())
+    );
+    assert!(
+        capability
+            .missing_boundaries
+            .contains(&"finalizer_runtime".to_string())
+    );
+    assert_eq!(bridge.status, AgentHostStatus::NotMigrated);
+    assert!(!bridge.completed);
 }
 
 #[test]

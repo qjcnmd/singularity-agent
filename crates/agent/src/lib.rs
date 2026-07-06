@@ -15,6 +15,16 @@ const SIDECAR_METHOD_HEALTH: &str = "agent/health";
 const SIDECAR_COMPONENT: &str = "python_sidecar";
 const DEFAULT_PYTHON_BIN: &str = "python";
 const DEFAULT_SIDECAR_MODULE: &str = "singularity.agent_host.sidecar";
+const NATIVE_AGENT_LOOP_UNAVAILABLE_REASON: &str =
+    "native Rust AgentLoop is not migrated; use Python sidecar as migration oracle";
+const NATIVE_AGENT_LOOP_MISSING_BOUNDARIES: [&str; 6] = [
+    "planner_step",
+    "context_assembler",
+    "compaction_executor",
+    "tool_repair_runtime",
+    "completion_gate",
+    "finalizer_runtime",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +119,32 @@ impl AgentLoopStatusBridge {
             trace_path: None,
             error: Some(message.into()),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeAgentLoopCapability {
+    pub available: bool,
+    pub status: AgentHostStatus,
+    pub reason: String,
+    pub missing_boundaries: Vec<String>,
+}
+
+impl NativeAgentLoopCapability {
+    pub fn current() -> Self {
+        Self {
+            available: false,
+            status: AgentHostStatus::NotMigrated,
+            reason: NATIVE_AGENT_LOOP_UNAVAILABLE_REASON.to_string(),
+            missing_boundaries: NATIVE_AGENT_LOOP_MISSING_BOUNDARIES
+                .iter()
+                .map(|boundary| (*boundary).to_string())
+                .collect(),
+        }
+    }
+
+    pub fn status_bridge(&self) -> AgentLoopStatusBridge {
+        AgentLoopStatusBridge::not_migrated()
     }
 }
 
