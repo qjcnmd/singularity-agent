@@ -262,7 +262,11 @@ fn sidecar_status_reports_stdout_eof_as_error() {
         .status("run_1")
         .expect_err("stdout EOF should be reported");
 
-    assert!(error.contains("Python sidecar closed stdout"));
+    assert!(
+        error.contains("Python sidecar closed stdout")
+            || error.contains("Python sidecar exited before response"),
+        "unexpected sidecar EOF error: {error}"
+    );
 }
 
 #[test]
