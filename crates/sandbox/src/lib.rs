@@ -14,6 +14,7 @@ pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
 const COMMAND_POLL_INTERVAL_MILLIS: u64 = 10;
 const REDACTED_COMMAND_OUTPUT: &str = "[redacted sensitive command output]";
+const PATCH_PATH_OUTSIDE_WORKSPACE: &str = "patch path must stay inside workspace";
 const SECRET_OUTPUT_MARKERS: [&str; 5] =
     ["api_key", "authorization", "password", "secret", "token"];
 const SHELL_COMMAND_FLAGS: [&str; 3] = ["/c", "-c", "-command"];
@@ -746,24 +747,48 @@ fn duration_millis(duration: Duration) -> u64 {
 }
 
 fn resolve_workspace_path(workspace_root: &Path, relative: &str) -> Result<PathBuf, String> {
-    let path = Path::new(relative);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err("patch path must stay inside workspace".to_string());
-    }
+    let relative = normalized_relative_patch_path(Path::new(relative))?;
     let root = workspace_root
         .canonicalize()
         .map_err(|error| format!("failed to resolve workspace root: {error}"))?;
-    let target = root.join(path);
+    reject_symlink_components(&root, &relative)?;
+    let target = root.join(relative);
     if let Ok(resolved_target) = target.canonicalize()
         && !resolved_target.starts_with(&root)
     {
-        return Err("patch path must stay inside workspace".to_string());
+        return Err(PATCH_PATH_OUTSIDE_WORKSPACE.to_string());
     }
     Ok(target)
+}
+
+fn normalized_relative_patch_path(path: &Path) -> Result<PathBuf, String> {
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(PATCH_PATH_OUTSIDE_WORKSPACE.to_string());
+            }
+        }
+    }
+    Ok(relative)
+}
+
+fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), String> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(PATCH_PATH_OUTSIDE_WORKSPACE.to_string());
+        };
+        current.push(part);
+        if let Ok(metadata) = fs::symlink_metadata(&current)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(PATCH_PATH_OUTSIDE_WORKSPACE.to_string());
+        }
+    }
+    Ok(())
 }
 
 fn next_file_content(
