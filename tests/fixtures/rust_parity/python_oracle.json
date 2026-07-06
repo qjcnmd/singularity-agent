@@ -447,7 +447,7 @@
     "profile": "workspace-write",
     "protected_paths_enforced": true,
     "writable_roots": [
-      "C:\\repo"
+      "/workspace/repo"
     ]
   },
   "planner_state": {
@@ -542,7 +542,7 @@
       "mode": "copy_on_write_workspace",
       "readonly_paths": [],
       "sandbox_root": null,
-      "workspace_root": "C:\\repo",
+      "workspace_root": "/workspace/repo",
       "writable_paths": []
     },
     "name": "isolated_verification",

@@ -7,6 +7,7 @@ import argparse
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from singularity.agent_loop import AgentLoopResult, AgentLoopStatus
 from singularity.command.models import (
@@ -40,12 +41,14 @@ from singularity.planner.models import FinalReport, TaskStatus
 from singularity.policy.models import ApprovalGrant, ApprovalScope, Capability
 from singularity.policy.permissions import PermissionProfile, PermissionProfileName
 from singularity.repair.contract import RepairActionCandidate, RepairContract
-from singularity.sandbox.models import SandboxProfileName, default_sandbox_profile
+from singularity.sandbox.models import SandboxProfile, SandboxProfileName, default_sandbox_profile
 from singularity.tool_protocol.models import (
     ToolProtocolRecoveryReport,
     ToolProtocolResultEnvelope,
 )
 from singularity.verification.contract import VerificationContract
+
+FIXTURE_WORKSPACE_ROOT = "/workspace/repo"
 
 
 def build_fixtures() -> dict[str, object]:
@@ -370,9 +373,9 @@ def build_fixtures() -> dict[str, object]:
         "trace_event": trace_event.to_dict(),
         "command_request": command_request.safe_metadata(),
         "command_result": command_result.to_dict(),
-        "permission_profile": profile.summary().to_dict(),
+        "permission_profile": _stable_permission_summary(profile),
         "approval_grant": approval.to_dict(),
-        "sandbox_policy": sandbox_policy.to_dict(),
+        "sandbox_policy": _stable_sandbox_policy(sandbox_policy),
         "model_turn_request": model_request.to_dict(),
         "model_turn_response": model_response.to_dict(),
         "planner_state": planner_state.__dict__.copy(),
@@ -381,6 +384,20 @@ def build_fixtures() -> dict[str, object]:
         "tool_call_repair_boundary": tool_call_repair_boundary,
         "finalization_mapping_boundary": finalization_mapping_boundary,
     }
+
+
+def _stable_permission_summary(profile: PermissionProfile) -> dict[str, Any]:
+    payload = profile.summary().to_dict()
+    if payload["writable_roots"]:
+        payload["writable_roots"] = [FIXTURE_WORKSPACE_ROOT]
+    return payload
+
+
+def _stable_sandbox_policy(profile: SandboxProfile) -> dict[str, Any]:
+    payload = profile.to_dict()
+    filesystem = payload["filesystem"]
+    filesystem["workspace_root"] = FIXTURE_WORKSPACE_ROOT
+    return payload
 
 
 def main() -> int:
