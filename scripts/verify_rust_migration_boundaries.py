@@ -258,6 +258,7 @@ def _check_forbidden_desktop_paths(repo_root: Path) -> list[Violation]:
 
 def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
     app_server = repo_root / "crates" / "app-server" / "src" / "lib.rs"
+    agent = repo_root / "crates" / "agent" / "src" / "lib.rs"
     protocol = repo_root / "crates" / "protocol" / "src" / "lib.rs"
     text = app_server.read_text(encoding="utf-8")
     if "AgentLoopStatusBridge::not_migrated()" not in text:
@@ -266,6 +267,23 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
                 "agent-loop-status-drift",
                 _relative(app_server, repo_root),
                 'turn/start must keep explicit not_migrated status until the Rust AgentLoop milestone',
+            )
+        ]
+    agent_text = agent.read_text(encoding="utf-8")
+    if "pub struct NativeAgentLoopCapability" not in agent_text or "available: false" not in agent_text:
+        return [
+            Violation(
+                "native-agent-loop-capability-drift",
+                _relative(agent, repo_root),
+                "NativeAgentLoopCapability must stay explicitly unavailable until Rust AgentLoop is migrated",
+            )
+        ]
+    if "status: AgentHostStatus::NotMigrated" not in agent_text:
+        return [
+            Violation(
+                "native-agent-loop-status-drift",
+                _relative(agent, repo_root),
+                "NativeAgentLoopCapability must report NotMigrated until full Rust AgentLoop is implemented",
             )
         ]
     protocol_text = protocol.read_text(encoding="utf-8")

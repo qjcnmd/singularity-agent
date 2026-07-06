@@ -76,10 +76,10 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "crates/agent/Cargo.toml",
         "crates/app-server/Cargo.toml",
         "crates/cli/Cargo.toml",
+        "crates/agent/src/lib.rs",
         "crates/app-server/src/lib.rs",
         "crates/protocol/src/lib.rs",
         "crates/tools/src/lib.rs",
-        "crates/cli/Cargo.toml",
     ):
         source = Path(relative)
         target = repo / relative
@@ -151,6 +151,30 @@ def test_guard_rejects_python_core_changes_outside_allowlist(tmp_path: Path) -> 
 
     assert result.returncode == 1
     assert "python-core-freeze" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "violation"),
+    (
+        ("available: false", "available: true", "native-agent-loop-capability-drift"),
+        (
+            "status: AgentHostStatus::NotMigrated",
+            "status: AgentHostStatus::Completed",
+            "native-agent-loop-status-drift",
+        ),
+    ),
+)
+def test_guard_rejects_native_agent_loop_drift_before_migration(
+    tmp_path: Path, old: str, new: str, violation: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    agent = repo / "crates/agent/src/lib.rs"
+    agent.write_text(agent.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert violation in result.stderr
 
 
 @pytest.mark.parametrize("marker", FORBIDDEN_TOOL_OBSERVATION_PAYLOAD_MARKERS)
