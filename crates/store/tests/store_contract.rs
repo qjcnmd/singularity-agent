@@ -188,8 +188,12 @@ fn trace_list_supports_pagination_and_tail() {
             .is_empty()
     );
     assert_eq!(
-        store.tail_trace("run_1", 2).expect("tail")[0].event_id,
+        store.tail_trace("run_1", 2, None).expect("tail")[0].event_id,
         "trace_1"
+    );
+    assert_eq!(
+        store.tail_trace("run_1", 2, Some(1)).expect("offset tail")[0].event_id,
+        "trace_0"
     );
 }
 

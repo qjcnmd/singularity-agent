@@ -9,6 +9,7 @@ use singularity_core::{ClientInfo, ErrorCode};
 pub enum Method {
     Initialize,
     Initialized,
+    ServerCapabilities,
     ThreadList,
     ThreadRead,
     ThreadStart,
@@ -20,8 +21,11 @@ pub enum Method {
     TurnInterrupt,
     TurnStatus,
     ApprovalList,
+    ApprovalCenter,
     ApprovalRequest,
     ApprovalDecision,
+    EventSubscribe,
+    ArtifactFetch,
     TraceList,
     TraceShow,
     TraceTail,
@@ -33,6 +37,7 @@ impl Method {
         Some(match value {
             "initialize" => Self::Initialize,
             "initialized" => Self::Initialized,
+            "server/capabilities" => Self::ServerCapabilities,
             "thread/list" => Self::ThreadList,
             "thread/read" => Self::ThreadRead,
             "thread/start" => Self::ThreadStart,
@@ -44,8 +49,11 @@ impl Method {
             "turn/interrupt" => Self::TurnInterrupt,
             "turn/status" => Self::TurnStatus,
             "approval/list" => Self::ApprovalList,
+            "approval/center" => Self::ApprovalCenter,
             "approval/request" => Self::ApprovalRequest,
             "approval/decision" => Self::ApprovalDecision,
+            "event/subscribe" => Self::EventSubscribe,
+            "artifact/fetch" => Self::ArtifactFetch,
             "trace/list" => Self::TraceList,
             "trace/show" => Self::TraceShow,
             "trace/tail" => Self::TraceTail,
@@ -58,6 +66,7 @@ impl Method {
         match self {
             Self::Initialize => "initialize",
             Self::Initialized => "initialized",
+            Self::ServerCapabilities => "server/capabilities",
             Self::ThreadList => "thread/list",
             Self::ThreadRead => "thread/read",
             Self::ThreadStart => "thread/start",
@@ -69,8 +78,11 @@ impl Method {
             Self::TurnInterrupt => "turn/interrupt",
             Self::TurnStatus => "turn/status",
             Self::ApprovalList => "approval/list",
+            Self::ApprovalCenter => "approval/center",
             Self::ApprovalRequest => "approval/request",
             Self::ApprovalDecision => "approval/decision",
+            Self::EventSubscribe => "event/subscribe",
+            Self::ArtifactFetch => "artifact/fetch",
             Self::TraceList => "trace/list",
             Self::TraceShow => "trace/show",
             Self::TraceTail => "trace/tail",
@@ -192,6 +204,19 @@ impl InitializeResult {
             platform_os: std::env::consts::OS.to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ServerCapabilitiesResult {
+    pub transports: Vec<TransportCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TransportCapability {
+    pub transport: String,
+    pub available: bool,
+    #[serde(rename = "authTokenRequired")]
+    pub auth_token_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -346,6 +371,38 @@ pub struct ApprovalListResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ApprovalCenterResult {
+    #[serde(rename = "pendingApprovals")]
+    pub pending_approvals: Vec<singularity_policy::ApprovalRequest>,
+    pub decisions: Vec<singularity_policy::ApprovalDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EventSubscribeParams {
+    #[serde(rename = "eventTypes")]
+    pub event_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EventSubscribeResult {
+    #[serde(rename = "subscriptionId")]
+    pub subscription_id: String,
+    #[serde(rename = "eventTypes")]
+    pub event_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactFetchParams {
+    #[serde(rename = "artifactId")]
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactFetchResult {
+    pub artifact: ArtifactRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TraceListParams {
     #[serde(rename = "runId")]
     pub run_id: String,
@@ -366,6 +423,8 @@ pub struct TraceTailParams {
     #[serde(rename = "runId")]
     pub run_id: String,
     pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

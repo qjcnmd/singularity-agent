@@ -1,8 +1,8 @@
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AppEvent, ArtifactRef, InitializeParams, ItemKind, JsonRpcMessage, Method, ThreadIdParams,
-    ThreadStartParams, TraceListParams, TraceShowParams, TraceTailParams, TurnIdParams,
-    TurnStartParams,
+    AppEvent, ArtifactFetchParams, ArtifactRef, EventSubscribeParams, InitializeParams, ItemKind,
+    JsonRpcMessage, Method, ThreadIdParams, ThreadStartParams, TraceListParams, TraceShowParams,
+    TraceTailParams, TurnIdParams, TurnStartParams,
 };
 
 #[test]
@@ -74,8 +74,11 @@ fn protocol_v1_methods_use_codex_names_without_cancel_or_generic_delta() {
         "turn/interrupt",
         "turn/status",
         "approval/list",
+        "approval/center",
         "approval/request",
         "approval/decision",
+        "event/subscribe",
+        "artifact/fetch",
         "trace/list",
         "trace/show",
         "trace/tail",
@@ -127,10 +130,25 @@ fn protocol_v1_id_params_are_camel_case_on_wire() {
     assert_eq!(
         serde_json::to_value(TraceTailParams {
             run_id: "run_1".to_string(),
-            limit: Some(2)
+            limit: Some(2),
+            offset: Some(1)
         })
         .unwrap(),
-        serde_json::json!({"runId": "run_1", "limit": 2})
+        serde_json::json!({"runId": "run_1", "limit": 2, "offset": 1})
+    );
+    assert_eq!(
+        serde_json::to_value(EventSubscribeParams {
+            event_types: vec!["turn/started".to_string()]
+        })
+        .unwrap(),
+        serde_json::json!({"eventTypes": ["turn/started"]})
+    );
+    assert_eq!(
+        serde_json::to_value(ArtifactFetchParams {
+            artifact_id: "artifact_1".to_string()
+        })
+        .unwrap(),
+        serde_json::json!({"artifactId": "artifact_1"})
     );
 }
 

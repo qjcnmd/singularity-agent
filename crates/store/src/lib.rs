@@ -274,8 +274,17 @@ impl SessionStore {
         Ok(events)
     }
 
-    pub fn tail_trace(&self, run_id: &str, limit: usize) -> StoreResult<Vec<TraceEvent>> {
+    pub fn tail_trace(
+        &self,
+        run_id: &str,
+        limit: usize,
+        offset: Option<usize>,
+    ) -> StoreResult<Vec<TraceEvent>> {
         let mut events = self.list_trace(run_id)?;
+        if let Some(offset) = offset {
+            let keep = events.len().saturating_sub(offset);
+            events.truncate(keep);
+        }
         if events.len() > limit {
             events = events.split_off(events.len() - limit);
         }
@@ -334,6 +343,18 @@ impl SessionStore {
             approvals.push(serde_json::from_str(&row?)?);
         }
         Ok(approvals)
+    }
+
+    pub fn list_approval_decisions(&self) -> StoreResult<Vec<ApprovalDecision>> {
+        let mut statement = self
+            .connection
+            .prepare("select payload from approval_decisions order by rowid")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut decisions = Vec::new();
+        for row in rows {
+            decisions.push(serde_json::from_str(&row?)?);
+        }
+        Ok(decisions)
     }
 
     pub fn record_approval_decision(

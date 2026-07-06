@@ -7,11 +7,13 @@ use singularity_agent::{
 use singularity_core::ErrorCode;
 use singularity_policy::{ApprovalDecision, ApprovalRequest};
 use singularity_protocol::{
-    AppEvent, ApprovalListResult, InitializeParams, InitializeResult, JsonRpcMessage, Method,
-    ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
-    ThreadResult, ThreadStartParams, ThreadStartResult, TraceEvent, TraceListParams,
-    TraceListResult, TraceShowParams, TraceTailParams, Turn, TurnIdParams, TurnInterruptResult,
-    TurnResult, TurnStartParams, TurnStartResult,
+    AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams, ArtifactFetchResult,
+    EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult, JsonRpcMessage,
+    Method, ServerCapabilitiesResult, ThreadDeleteResult, ThreadForkParams, ThreadForkResult,
+    ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult,
+    TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceTailParams,
+    TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
+    TurnStartResult,
 };
 use singularity_store::{SessionStore, StoreError};
 use thiserror::Error;
@@ -22,6 +24,8 @@ const TRACE_RUN_NOT_FOUND: &str = "Trace run not found";
 const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
 const PENDING_APPROVAL_NOT_FOUND: &str = "Pending approval not found";
 const APPROVAL_ALREADY_EXISTS: &str = "Approval already exists";
+const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
+const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
 
 #[derive(Debug, Error)]
 pub enum AppServerError {
@@ -38,6 +42,7 @@ pub struct AppServer {
     initialized: bool,
     initialized_acknowledged: bool,
     python_sidecar: Option<PythonSidecarConfig>,
+    event_filter: Option<Vec<String>>,
 }
 
 impl AppServer {
@@ -47,6 +52,7 @@ impl AppServer {
             initialized: false,
             initialized_acknowledged: false,
             python_sidecar: None,
+            event_filter: None,
         }
     }
 
@@ -93,6 +99,7 @@ impl AppServer {
                 self.initialized_acknowledged = true;
                 Ok(Vec::new())
             }
+            Method::ServerCapabilities => self.server_capabilities(message),
             Method::ThreadList => self.thread_list(message),
             Method::ThreadRead | Method::ThreadResume => self.thread_read(message),
             Method::ThreadStart => self.thread_start(message),
@@ -103,8 +110,11 @@ impl AppServer {
             Method::TurnInterrupt => self.turn_interrupt(message),
             Method::TurnStatus => self.turn_status(message),
             Method::ApprovalList => self.approval_list(message),
+            Method::ApprovalCenter => self.approval_center(message),
             Method::ApprovalRequest => self.approval_request(message),
             Method::ApprovalDecision => self.approval_decision(message),
+            Method::EventSubscribe => self.event_subscribe(message),
+            Method::ArtifactFetch => self.artifact_fetch(message),
             Method::TraceList => self.trace_list(message),
             Method::TraceShow => self.trace_show(message),
             Method::TraceTail => self.trace_tail(message),
@@ -126,6 +136,26 @@ impl AppServer {
             JsonRpcMessage::response(message.id, serde_json::to_value(InitializeResult::local())?)
                 .to_wire_value(),
         ])
+    }
+
+    fn server_capabilities(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        json_response(
+            message.id,
+            ServerCapabilitiesResult {
+                transports: vec![
+                    TransportCapability {
+                        transport: "stdio".to_string(),
+                        available: true,
+                        auth_token_required: false,
+                    },
+                    TransportCapability {
+                        transport: "websocket".to_string(),
+                        available: false,
+                        auth_token_required: true,
+                    },
+                ],
+            },
+        )
     }
 
     fn thread_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -156,7 +186,7 @@ impl AppServer {
             "app_server",
             "thread started",
         )?;
-        Ok(vec![
+        let mut messages = vec![
             JsonRpcMessage::response(
                 message.id,
                 serde_json::to_value(ThreadStartResult {
@@ -164,10 +194,9 @@ impl AppServer {
                 })?,
             )
             .to_wire_value(),
-            AppEvent::thread_started(&thread)
-                .to_notification()
-                .to_wire_value(),
-        ])
+        ];
+        messages.extend(self.event_notification(AppEvent::thread_started(&thread)));
+        Ok(messages)
     }
 
     fn thread_fork(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -248,25 +277,22 @@ impl AppServer {
             .or(bridge.error.as_deref())
             .unwrap_or("input accepted");
 
-        Ok(vec![
+        let mut messages = vec![
             JsonRpcMessage::response(
                 message.id,
                 serde_json::to_value(TurnStartResult { turn: turn.clone() })?,
             )
             .to_wire_value(),
-            AppEvent::turn_started(&turn)
-                .to_notification()
-                .to_wire_value(),
-            AppEvent::item_started(item.item_id.clone())
-                .to_notification()
-                .to_wire_value(),
-            AppEvent::item_agent_message_delta(item.item_id.clone(), agent_delta)
-                .to_notification()
-                .to_wire_value(),
-            AppEvent::item_completed(item.item_id)
-                .to_notification()
-                .to_wire_value(),
-        ])
+        ];
+        for event in [
+            AppEvent::turn_started(&turn),
+            AppEvent::item_started(item.item_id.clone()),
+            AppEvent::item_agent_message_delta(item.item_id.clone(), agent_delta),
+            AppEvent::item_completed(item.item_id),
+        ] {
+            messages.extend(self.event_notification(event));
+        }
+        Ok(messages)
     }
 
     fn run_python_sidecar_if_enabled(&self, params: &TurnStartParams) -> AgentLoopStatusBridge {
@@ -397,6 +423,16 @@ impl AppServer {
         ])
     }
 
+    fn approval_center(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        json_response(
+            message.id,
+            ApprovalCenterResult {
+                pending_approvals: self.store.list_pending_approvals()?,
+                decisions: self.store.list_approval_decisions()?,
+            },
+        )
+    }
+
     fn approval_request(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let request: ApprovalRequest = message.params_as()?;
         if let Err(error) =
@@ -434,6 +470,38 @@ impl AppServer {
         ])
     }
 
+    fn event_subscribe(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: EventSubscribeParams = message.params_as()?;
+        self.event_filter = Some(params.event_types.clone());
+        json_response(
+            message.id,
+            EventSubscribeResult {
+                subscription_id: EVENT_SUBSCRIPTION_ID.to_string(),
+                event_types: params.event_types,
+            },
+        )
+    }
+
+    fn artifact_fetch(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: ArtifactFetchParams = message.params_as()?;
+        match self.store.get_artifact_ref(&params.artifact_id) {
+            Ok(artifact) => json_response(message.id, ArtifactFetchResult { artifact }),
+            Err(StoreError::NotFound(_)) => not_found_response(message.id, ARTIFACT_NOT_FOUND),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn event_notification(&self, event: AppEvent) -> Option<Value> {
+        if self
+            .event_filter
+            .as_ref()
+            .is_some_and(|event_types| !event_types.iter().any(|method| method == event.method()))
+        {
+            return None;
+        }
+        Some(event.to_notification().to_wire_value())
+    }
+
     fn trace_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TraceListParams = message.params_as()?;
         match self
@@ -461,7 +529,7 @@ impl AppServer {
         let params: TraceTailParams = message.params_as()?;
         match self
             .store
-            .tail_trace(&params.run_id, params.limit.unwrap_or(50))
+            .tail_trace(&params.run_id, params.limit.unwrap_or(50), params.offset)
         {
             Ok(events) => Ok(vec![
                 JsonRpcMessage::response(
