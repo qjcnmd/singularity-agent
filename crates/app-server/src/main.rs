@@ -38,6 +38,9 @@ fn main() {
                     write_json_line(&mut stdout, &message).expect("write response");
                 }
                 stdout.flush().expect("flush response");
+                if server.shutdown_requested() {
+                    break;
+                }
             }
             Err(error) => {
                 write_transport_error(&mut stdout, recover_request_id(&line), &error)

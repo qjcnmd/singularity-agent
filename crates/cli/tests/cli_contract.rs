@@ -161,6 +161,7 @@ fn cli_renders_agent_host_status_and_sidecar_answer() {
         temp.path(),
         r#"
 import json
+import os
 import sys
 
 for line in sys.stdin:
@@ -199,6 +200,7 @@ fn cli_exits_nonzero_for_sidecar_failed_turn_without_raw_payload() {
         temp.path(),
         r#"
 import json
+import os
 import sys
 
 for line in sys.stdin:
@@ -226,6 +228,16 @@ for line in sys.stdin:
 }
 
 #[test]
+fn cli_exits_nonzero_for_immediate_blocked_turn() {
+    assert_immediate_terminal_turn_exits_nonzero("blocked", "blocked");
+}
+
+#[test]
+fn cli_exits_nonzero_for_immediate_interrupted_turn() {
+    assert_immediate_terminal_turn_exits_nonzero("interrupted", "cancelled");
+}
+
+#[test]
 fn cli_turn_status_interrupt_approval_decision_and_trace_show_use_protocol() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
@@ -233,6 +245,7 @@ fn cli_turn_status_interrupt_approval_decision_and_trace_show_use_protocol() {
         temp.path(),
         r#"
 import json
+import os
 import sys
 
 for line in sys.stdin:
@@ -290,6 +303,121 @@ for line in sys.stdin:
         stderr(&trace_show)
     );
     assert!(stdout(&trace_show).contains("trace event_fake python_sidecar sidecar trace"));
+}
+
+#[test]
+fn cli_turn_lifecycle_status_and_interrupt_render_agent_loop_status() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "turn/status":
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": message["params"]["turnId"], "thread_id": "thread_fake", "status": "running", "agent_loop_status": "running"}}}), flush=True)
+    elif method == "turn/interrupt":
+        print(json.dumps({"id": request_id, "result": {"turnId": message["params"]["turnId"], "status": "interrupted", "agent_loop_status": "cancel_requested"}}), flush=True)
+"#,
+    );
+
+    let status = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["turn", "status", "turn_fake"])
+        .output()
+        .expect("turn status cli");
+    assert!(status.status.success(), "stderr={}", stderr(&status));
+    assert!(stdout(&status).contains("turn turn_fake running agent_loop_status=running"));
+
+    let interrupt = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["turn", "interrupt", "turn_fake"])
+        .output()
+        .expect("turn interrupt cli");
+    assert!(interrupt.status.success(), "stderr={}", stderr(&interrupt));
+    assert!(
+        stdout(&interrupt)
+            .contains("turn turn_fake interrupted agent_loop_status=cancel_requested")
+    );
+}
+
+#[test]
+fn cli_turn_interrupt_error_exits_nonzero() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message.get("id")
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "turn/interrupt":
+        print(json.dumps({"id": request_id, "error": {"code": -32000, "message": "cancel failed"}}), flush=True)
+"#,
+    );
+
+    let interrupt = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["turn", "interrupt", "turn_fake"])
+        .output()
+        .expect("turn interrupt cli");
+
+    assert!(!interrupt.status.success());
+    assert!(stderr(&interrupt).contains("cancel failed"));
+}
+
+#[test]
+fn cli_requests_server_shutdown_before_process_teardown() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let shutdown_log = temp.path().join("shutdown.log");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        &format!(
+            r#"
+import json
+import pathlib
+import sys
+
+log_path = pathlib.Path(r"{}")
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({{"id": request_id, "result": {{"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}}}), flush=True)
+    elif method == "thread/list":
+        print(json.dumps({{"id": request_id, "result": {{"threads": []}}}}), flush=True)
+    elif method == "server/shutdown":
+        log_path.write_text("shutdown", encoding="utf-8")
+        print(json.dumps({{"id": request_id, "result": {{"shutdown": True}}}}), flush=True)
+        break
+"#,
+            shutdown_log.display()
+        ),
+    );
+
+    let threads = cli_with_app_server(path_str(&fake_server), &db_path)
+        .arg("threads")
+        .output()
+        .expect("threads cli");
+
+    assert!(threads.status.success(), "stderr={}", stderr(&threads));
+    assert_eq!(
+        std::fs::read_to_string(shutdown_log).expect("shutdown log"),
+        "shutdown"
+    );
 }
 
 #[test]
@@ -385,6 +513,84 @@ for line in sys.stdin:
 
     assert!(output.status.success(), "stderr={}", stderr(&output));
     assert!(stdout(&output).contains("thread thread_fake"));
+}
+
+#[test]
+fn cli_run_polls_active_sidecar_turn_before_shutdown() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+status_calls = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_active", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "running"}}}), flush=True)
+    elif method == "turn/status":
+        status_calls += 1
+        status = "completed" if status_calls >= 2 else "running"
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_active", "thread_id": "thread_fake", "status": status, "agent_loop_status": status}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "python"])
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(stdout(&output).contains("turn turn_active completed agent_loop_status=completed"));
+}
+
+#[test]
+fn cli_run_polling_exits_nonzero_for_interrupted_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_active", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "running"}}}), flush=True)
+    elif method == "turn/status":
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_active", "thread_id": "thread_fake", "status": "interrupted", "agent_loop_status": "cancelled"}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "python"])
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains("turn turn_active interrupted agent_loop_status=cancelled"));
+    assert!(stderr(&output).contains("turn turn_active interrupted"));
 }
 
 #[test]
@@ -559,6 +765,45 @@ fn cli_with_app_server(app_server_bin: &str, db_path: &std::path::Path) -> Comma
     command.env(APP_SERVER_BIN_ENV, app_server_bin);
     command.env(APP_SERVER_DB_ENV, db_path);
     command
+}
+
+fn assert_immediate_terminal_turn_exits_nonzero(status: &str, agent_loop_status: &str) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        &format!(
+            r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({{"id": request_id, "result": {{"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({{"id": request_id, "result": {{"thread": {{"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({{"id": request_id, "result": {{"turn": {{"turn_id": "turn_terminal", "thread_id": "thread_fake", "status": "{status}", "agent_loop_status": "{agent_loop_status}"}}}}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({{"id": request_id, "result": {{"shutdown": True}}}}), flush=True)
+        break
+"#
+        ),
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "python"])
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains(&format!(
+        "turn turn_terminal {status} agent_loop_status={agent_loop_status}"
+    )));
+    assert!(stderr(&output).contains(&format!("turn {status}")));
 }
 
 fn write_fake_app_server(dir: &Path, script: &str) -> PathBuf {

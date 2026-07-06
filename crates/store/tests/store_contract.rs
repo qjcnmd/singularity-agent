@@ -1,7 +1,7 @@
 use schemars::schema_for;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_protocol::{ItemKind, TraceEvent};
-use singularity_store::{SessionStore, SessionStoreDescriptor, StoreError};
+use singularity_store::{ActiveSidecarRun, SessionStore, SessionStoreDescriptor, StoreError};
 
 #[test]
 fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
@@ -10,12 +10,13 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let descriptor = store.descriptor();
 
     assert_eq!(descriptor.backend, "sqlite");
-    assert_eq!(descriptor.schema_version, 2);
+    assert_eq!(descriptor.schema_version, 3);
     assert_eq!(
         store.applied_migrations().expect("migrations"),
         vec![
             "0001_initial_session_store".to_string(),
-            "0002_durable_ledger".to_string()
+            "0002_durable_ledger".to_string(),
+            "0003_active_sidecar_runs".to_string()
         ]
     );
     assert_eq!(
@@ -249,4 +250,92 @@ fn artifact_refs_are_durable_and_redact_secret_like_metadata() {
         store.list_artifact_refs("run_1").expect("list")[0].artifact_id,
         artifact.artifact_id
     );
+}
+
+#[test]
+fn active_sidecar_run_register_read_clear_and_missing_status() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+
+    let active = store
+        .register_active_sidecar_run(&turn.turn_id, "run_1", "session_1", "task_1", "running")
+        .expect("register active run");
+
+    assert_eq!(
+        active,
+        ActiveSidecarRun {
+            turn_id: turn.turn_id.clone(),
+            thread_id: thread.thread_id,
+            run_id: "run_1".to_string(),
+            session_id: "session_1".to_string(),
+            task_id: "task_1".to_string(),
+            status: "running".to_string(),
+            created_at: active.created_at.clone(),
+            updated_at: active.updated_at.clone(),
+        }
+    );
+    assert_eq!(
+        store
+            .get_active_sidecar_run(&turn.turn_id)
+            .expect("read active run"),
+        active
+    );
+
+    store
+        .clear_active_sidecar_run(&turn.turn_id, "completed")
+        .expect("clear active run");
+    assert!(matches!(
+        store.get_active_sidecar_run(&turn.turn_id),
+        Err(StoreError::NotFound(message)) if message == format!("active sidecar run {}", turn.turn_id)
+    ));
+}
+
+#[test]
+fn active_sidecar_run_duplicate_replaces_single_active_record() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+
+    store
+        .register_active_sidecar_run(&turn.turn_id, "run_1", "session_1", "task_1", "running")
+        .expect("first active run");
+    let replaced = store
+        .register_active_sidecar_run(&turn.turn_id, "run_2", "session_2", "task_2", "running")
+        .expect("replace active run");
+
+    assert_eq!(replaced.run_id, "run_2");
+    assert_eq!(replaced.session_id, "session_2");
+    assert_eq!(
+        store
+            .list_active_sidecar_runs()
+            .expect("list active runs")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn delete_thread_clears_active_sidecar_runs_for_thread() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    store
+        .register_active_sidecar_run(&turn.turn_id, "run_1", "session_1", "task_1", "running")
+        .expect("active run");
+
+    store
+        .delete_thread(&thread.thread_id)
+        .expect("delete thread");
+
+    assert!(store.get_active_sidecar_run(&turn.turn_id).is_err());
 }

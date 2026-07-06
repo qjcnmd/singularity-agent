@@ -122,7 +122,7 @@
 - Turn: turn_id, thread_id, status, agent_loop_status
 - Item: item_id, turn_id, kind, payload, status
 - TurnResult: turn
-- TurnInterruptResult: turn_id, status
+- TurnInterruptResult: turn_id, status, agent_loop_status
 - ApprovalListResult: approvals
 - ApprovalCenterResult: pending_approvals, decisions
 - EventSubscribeParams: event_types
@@ -175,7 +175,7 @@
 - ToolCallRepairBoundary: repair_id, run_id, session_id, task_id, phase_id, failed_tool_call_id, failure_kind, next_action, failed_result, recovery_report, repair_contract, created_at, metadata
 - FinalizationMappingBoundary: mapping_id, run_id, session_id, task_id, phase_id, agent_loop_status, run_status, final_report_status, completion_status, final_answer, final_report, completion_assessment, contract_satisfaction, created_at, metadata
 - PythonSidecarConfig: python_bin, module, project_root, python_path, env
-- AppServer: store, initialized, initialized_acknowledged, python_sidecar, event_filter
+- AppServer: store, initialized, initialized_acknowledged, python_sidecar, event_filter, sidecar_runs, shutdown_requested
 
 ## 这一层解决什么问题
 
@@ -189,7 +189,7 @@ Rust App Server Protocol 层建立第一阶段迁移的硬边界：客户端只�
 | Thread/session identity | `KernelBootstrap.prepare_launch` | `AppServer::thread_start` | `thread/start`, `ThreadStartParams`, `ThreadStartResult` | `SessionStore.create_thread_with_trace()` | Durable thread id is available before a turn | Python `run_id/session_id/task_id` remain sidecar internals |
 | Turn creation | `AgentKernel.run_task` launch path | `AppServer::turn_start` | `turn/start`, `TurnStartParams`, `TurnStartResult` | `SessionStore.create_turn_with_input_and_trace()` | One Rust turn per submitted instruction | Default turn can be `running/not_migrated` |
 | Input item persistence | Python context/session history | `SessionStore.create_turn_with_input_and_trace` | `InputItem::Text` | Writes user item payload | Input is durable and trace-linked | Does not mirror Python context DB items |
-| AgentLoop execution | `AgentLoop.run` | Python sidecar bridge only | `PythonSidecarClient::run_agent` / `agent/run`; `PythonSidecarClient::resume_agent` / `agent/resume` | Appends safe `python_sidecar` trace | Existing Python AgentLoop remains authoritative | Native Rust AgentLoop unavailable; M1 sidecar turn is synchronous |
+| AgentLoop execution | `AgentLoop.run` | Python sidecar bridge only | `PythonSidecarClient::run_agent` / `agent/run`; `PythonSidecarClient::resume_agent` / `agent/resume`; `PythonSidecarClient::status` / `agent/status`; `PythonSidecarClient::cancel` / `agent/cancel` | Running sidecar stores active run safe IDs; terminal sidecar appends safe `python_sidecar` trace | Existing Python AgentLoop remains authoritative | Native Rust AgentLoop unavailable; Rust owns lifecycle envelope only |
 | Tool protocol execution | `ToolProtocolEngine` | Python sidecar owns it for real runs | Sidecar event safe subset | Safe event id/type/component/summary/sequence only | Tool behavior is Python oracle behavior | No Rust tool execution through CLI claim |
 | Provider/model call | Python `ModelRunner` | Python sidecar path | Rust thread `model` forwarded as sidecar `model` | No raw provider payload in Rust trace | Provider behavior remains Python | Rust model crate is schema/validation-only |
 | Approval request | Python approval gate; Rust protocol ledger for app-server requests | `AppServer::approval_request` | `approval/request` | `create_approval_with_trace()` | Pending request is durable | Does not inject Python approval grant |
@@ -208,12 +208,63 @@ Rust App Server Protocol 层建立第一阶段迁移的硬边界：客户端只�
 | `completed` | `completed` | `completed` | `turn <id> completed agent_loop_status=completed`; `assistant <final_answer>` | `component/status/run_id/session_id/task_id/trace_path` |
 | `blocked` | `blocked` | `blocked` | `turn <id> blocked agent_loop_status=blocked` | Same safe keys |
 | `failed` / `max_turns_exceeded` | `failed` | `failed` | Non-zero CLI exit with failed status | Same safe keys; no raw prompt/provider/tool payload |
+| `cancel_requested` | `cancel_requested` | `interrupted` | `turn <id> interrupted agent_loop_status=cancel_requested` | app-server lifecycle event with safe IDs |
 | `cancelled` / `canceled` | `cancelled` | `interrupted` | `turn <id> interrupted agent_loop_status=cancelled` | Same safe keys |
 | Missing Rust thread | No sidecar call | No new turn | JSON-RPC `Thread not found` | No sidecar trace |
 | Sidecar process/config/runtime error | `failed` | `failed` | Non-zero CLI exit and redacted summary | Safe `python_sidecar` failure summary |
 | Approval required | Pending approval row | Existing turn status | `approval <request_id> <action>` then `approval <request_id> <outcome>` | Request/decision trace via store |
 
 Intentional divergence table: Rust owns protocol routing, store writes, and safe projection; Python owns AgentLoop semantics. The divergence is required because planner, context assembly, tool protocol execution, provider calls, sandbox backend, completion gate, finalizer, and evaluation runner are not native Rust components in this stage.
+
+### Turn lifecycle and cancel boundary
+
+The turn lifecycle is the app-server status machine for one submitted user turn:
+
+```text
+accepted -> running -> completed
+accepted -> running -> failed
+accepted -> running -> interrupted
+accepted -> failed
+running -> interrupted_requested -> interrupted
+```
+
+| Status | Rust owner | Python owner | SQLite fields | trace event | CLI rendering | sidecar process status | retry/resume implication |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `accepted` | `AppServer::turn_start` after protocol validation | None | current protocol creates `turns.status="running"` / `agent_loop_status="not_migrated"`; accepted is a lifecycle edge, not a persisted TurnStatus | app-server lifecycle event | running turn line only | not started or starting | retry only if no active run exists |
+| `running` | `AppServer`, `SessionStore`, active run record | Python `AgentHost` / `AgentLoop` after sidecar start | `turns.status="running"`, `agent_loop_status`, active run `turn_id/thread_id/run_id/session_id/task_id/status` | app-server lifecycle event and safe `python_sidecar` trace event | `turn <id> running` | active | do not start a duplicate run; resume uses Python `session_id` |
+| `completed` | `AppServer::update_turn_from_bridge`, `SessionStore` | Python `AgentLoop` finalization | `turns.status="completed"`, `agent_loop_status="completed"`, active run cleared | safe completion trace event | completed line plus bounded assistant summary | exited | terminal; next work starts a new turn |
+| `failed` | app-server projection and store | Python `AgentHost` / `AgentLoop` for sidecar failures | `turns.status="failed"`, `agent_loop_status="failed"` when reported, active run cleared | redacted failure trace event | non-zero failed line | failed or not started | retry creates a new turn or uses recovery |
+| `interrupted_requested` | Rust app-server | Python receives cancel transport but does not own durable status | `turns.status="interrupted"`, `agent_loop_status="cancel_requested"`, active run retained | interrupt requested trace event | `turn <id> interrupted agent_loop_status=cancel_requested` | cancel requested | wait for terminal cleanup |
+| `interrupted` | `AppServer`, `SessionStore` | Python AgentHost/AgentLoop cancel semantics | `turns.status="interrupted"`, `agent_loop_status="cancelled"` when reported, active run cleared | safe cancel result trace event | `turn <id> interrupted agent_loop_status=cancelled` | cancelled/exited | later work may resume from Python session recovery |
+
+Cancel ownership map:
+
+| Concern | Owner |
+| --- | --- |
+| turn/interrupt request owner | Rust app-server |
+| sidecar cancel transport | `PythonSidecarClient::cancel(run_id)` |
+| AgentLoop cancel semantics | Python AgentHost/AgentLoop |
+| durable status owner | SessionStore |
+| trace owner | app-server |
+| CLI owner | protocol renderer |
+
+Non-goals: no OS kill primary cancel, no direct CLI-to-Python cancel, no native Rust AgentLoop cancel, no local-process sandbox fallback.
+
+Approved vocabulary:
+
+| Concept | Required name |
+| --- | --- |
+| user submitted unit | turn |
+| sidecar execution identity | run |
+| Python recovery identity | session |
+| lifecycle status | status |
+| cancel action | cancel |
+| interrupt protocol method | interrupt |
+| stored lifecycle record | active run |
+| state transition event | lifecycle event |
+| sidecar process wrapper | sidecar |
+
+Use short protocol names only: `cancel` for sidecar/AgentLoop cancel, `interrupt` for the JSON-RPC method and CLI command, `status` for public lifecycle output, `run` for an active sidecar run, and `session` only for Python resume identity.
 
 ## 当前源码位置
 
@@ -234,11 +285,11 @@ Intentional divergence table: Rust owns protocol routing, store writes, and safe
 
 ## 真实运行时调用链
 
-`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` -> `AppServerClient::spawn()` 启动 `singularity_app_server` stdio process -> `initialize` request -> `initialized` notification -> 对应 server/thread/turn/event/trace/approval/artifact request -> `AppServer.handle_json()` -> `AppServer.handle()` -> `SessionStore.create_thread_with_trace()` / `create_turn_with_input_and_trace()` / `create_approval_with_trace()` / `record_approval_decision()` 或 read/list/update helper -> `JsonRpcMessage::response()` 或 `AppEvent.to_notification()` 输出 JSONL -> `sg` 渲染 thread、turn、item、trace 或 approval 行。CLI request loop 以 matching response id 结束请求，只收集 matching response 之前到达的 notification，不在 response 后 drain 额外消息；JSON-RPC error、stdout EOF、child exit 或 read timeout 都不会无限等待。默认 `turn/start` 调用 `AgentLoopStatusBridge::not_migrated()`，不会进入 Python `AgentLoop.run()`，不会输出 assistant delta，也不会把 turn 伪装成已完成真实 agent loop。`turn/start` 先通过 `SessionStore.get_thread()` 校验 thread 存在，missing thread 返回 `Thread not found`，不会启动 Python sidecar。显式设置 `SINGULARITY_PYTHON_SIDECAR=1` 且 thread 有效后，`singularity_app_server` 创建 `PythonSidecarConfig`，app-server 先持久化 Rust turn/user item/turn trace，再由 `AppServer.run_python_sidecar_if_enabled()` 通过 `PythonSidecarClient` 发送 `agent/run` 或 `agent/resume`；当同一 Rust thread 的历史 `python_sidecar` trace summary 中存在 `session_id` 时使用 `agent/resume`，否则使用 `agent/run`。Python `singularity.agent_host.sidecar` 分别调用 `AgentHost.start_run()` 或 `AgentHost.resume_run()`，再进入现有 `KernelBootstrap -> AgentKernel -> AgentLoop`；Rust 只消费 sidecar 返回的 status/final_answer/events/trace_path 安全子集。M1 sidecar turn 是同步 request，CLI 为 `--agent-host python` 使用 agent 级 response timeout；长期后台 turn runner、真正中途 interrupt 和 status streaming 属于后续 lifecycle 切片。
+`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` -> `AppServerClient::spawn()` 启动 `singularity_app_server` stdio process -> `initialize` request -> `initialized` notification -> 对应 server/thread/turn/event/trace/approval/artifact request -> `AppServer.handle_json()` -> `AppServer.handle()` -> `SessionStore.create_thread_with_trace()` / `create_turn_with_input_and_trace()` / `create_approval_with_trace()` / `record_approval_decision()` 或 read/list/update helper -> `JsonRpcMessage::response()` 或 `AppEvent.to_notification()` 输出 JSONL -> `sg` 渲染 thread、turn、item、trace 或 approval 行。CLI request loop 以 matching response id 结束请求，只收集 matching response 之前到达的 notification，不在 response 后 drain 额外消息；JSON-RPC error、stdout EOF、child exit 或 read timeout 都不会无限等待。CLI drop 先发送 `server/shutdown`，让 app-server 清理当前进程持有的 active run；如果短等待后 app-server 仍未退出，CLI 才 kill child。默认 `turn/start` 调用 `AgentLoopStatusBridge::not_migrated()`，不会进入 Python `AgentLoop.run()`，不会输出 assistant delta，也不会把 turn 伪装成已完成真实 agent loop。`turn/start` 先通过 `SessionStore.get_thread()` 校验 thread 存在，missing thread 返回 `Thread not found`，不会启动 Python sidecar。显式设置 `SINGULARITY_PYTHON_SIDECAR=1` 且 thread 有效后，`singularity_app_server` 创建 `PythonSidecarConfig`，app-server 先持久化 Rust turn/user item/turn trace，再由 `AppServer.run_python_sidecar_if_enabled()` 通过 `PythonSidecarClient` 发送 `agent/run` 或 `agent/resume`；当同一 Rust thread 的历史 `python_sidecar` trace summary 中存在 `session_id` 时使用 `agent/resume`，否则使用 `agent/run`。Python `singularity.agent_host.sidecar` 分别调用 `AgentHost.start_run()` 或 `AgentHost.resume_run()`，再进入现有 `KernelBootstrap -> AgentKernel -> AgentLoop`；Rust 只消费 sidecar 返回的 status/final_answer/events/trace_path 安全子集。sidecar 返回 `running` 时，app-server 写 `active_sidecar_runs` row 并在当前 app-server 进程保留 sidecar handle；持有该 handle 的 `turn/status` 通过 `agent/status` 更新 turn，`turn/interrupt` 通过 `agent/cancel` 请求 cancel 并写 lifecycle trace；只有 durable active row 但没有 handle 的短生命周期进程只返回 durable turn status 和 active row status，不伪造 sidecar 查询或取消。CLI 仍只通过 app-server protocol，不直接调用 Python sidecar。
 
 ## 真实任务中的对象流
 
-以 `sg run "goal"` 为例：CLI 启动 app-server 子进程，发送 `JsonRpcMessage::request(Method::Initialize, ...)`；`AppServer.handle_json()` 反序列化为 `JsonRpcMessage`，`InitializeParams` 校验 `clientInfo` 后返回 `InitializeResult`。CLI 再发送 `initialized` notification，连接进入 ready 状态。随后 `thread/start` 生成对象 `Thread` 并由 `SessionStore.create_thread_with_trace()` 在同一个 SQLite transaction 中写入 `threads` 和 `trace_events`。`turn/start` 先读取 thread；thread 缺失时直接返回 JSON-RPC error，thread 存在时生成对象 `Turn` 和 user message `Item`，通过 `SessionStore.create_turn_with_input_and_trace()` 在一个 transaction 中写入 `turns` / `items` / `trace_events`，然后才允许 sidecar 调用。默认路径写 `agent_loop_status="not_migrated"` 且 turn 仍为 running，只输出 `turn/started` 和 final response，不输出 `item/agentMessage/delta`。显式 sidecar 路径在同步 sidecar response 后，把 completed/blocked/failed/cancelled/running 映射成 `TurnStatus::Completed` / `Blocked` / `Failed` / `Interrupted` / `Running`，同时用 `SessionStore.update_turn_state()` 更新 durable `agent_loop_status`，并追加 `component="python_sidecar"` 的安全 trace event；有 final answer 或 error summary 时才输出 `item/started -> item/agentMessage/delta -> item/completed`。`sg continue <thread-id> "instruction"` 先通过 `thread/read` 验证 thread 存在，再发送新的 `turn/start`；sidecar 模式下 app-server 从当前 Rust thread 的最新 `python_sidecar` trace summary 读取 `session_id` 并调用 `agent/resume`，如果没有历史 sidecar session 则调用 `agent/run`。approval 流由 `approval/request` 写 pending row 和 trace，`approval/center` 读取 pending approval 与已记录 decision ledger，`approval/decision` 只能消费 pending approval 一次，并在同一个 transaction 中写 `approvals` decision fields、`approval_decisions` ledger row 和 trace；decision trace 的 `run_id` / `session_id` 使用原 request 的 `session_id`，`task_id` 使用原 request 的 `task_id`，payload 只包含 request/decision/outcome 安全摘要。重复 decision 返回 `Pending approval not found`。`artifact/fetch` 只从 `artifact_refs` 读取 redacted reference object，不返回文件内容。
+以 `sg run "goal"` 为例：CLI 启动 app-server 子进程，发送 `JsonRpcMessage::request(Method::Initialize, ...)`；`AppServer.handle_json()` 反序列化为 `JsonRpcMessage`，`InitializeParams` 校验 `clientInfo` 后返回 `InitializeResult`。CLI 再发送 `initialized` notification，连接进入 ready 状态。随后 `thread/start` 生成对象 `Thread` 并由 `SessionStore.create_thread_with_trace()` 在同一个 SQLite transaction 中写入 `threads` 和 `trace_events`。`turn/start` 先读取 thread；thread 缺失时直接返回 JSON-RPC error，thread 存在时生成对象 `Turn` 和 user message `Item`，通过 `SessionStore.create_turn_with_input_and_trace()` 在一个 transaction 中写入 `turns` / `items` / `trace_events`，然后才允许 sidecar 调用。默认路径写 `agent_loop_status="not_migrated"` 且 turn 仍为 running，只输出 `turn/started` 和 final response，不输出 `item/agentMessage/delta`。显式 sidecar 路径把 completed/blocked/failed/cancelled/running/cancel_requested 映射成 `TurnStatus::Completed` / `Blocked` / `Failed` / `Interrupted` / `Running` / `Interrupted`，同时用 `SessionStore.update_turn_state()` 更新 durable `agent_loop_status`。running sidecar 先注册 active run；terminal sidecar 追加 `component="python_sidecar"` 的安全 trace event 并清 active run；cancel request 追加 app-server lifecycle event 且保留 active run 直到后续 status/cleanup；如果请求进入没有 sidecar handle 的 app-server 进程，则只返回 durable turn status 和 active row status，保持 durable turn 原状。没有 active run 的 `turn/interrupt` 只会把 non-terminal running turn 标记 interrupted；completed/blocked/failed/interrupted turn 原样返回，避免覆盖终态。`server/shutdown` 会先清理当前 app-server 进程持有的 active sidecar runs，设置 `shutdown_requested=true`，binary 主循环写出 shutdown response 后退出；`AppServer::drop()` 也会写 cleanup lifecycle event 并清 active run row。未取消的 active run 标记 failed，已 cancel_requested / cancelled / interrupted 的 run 保持 interrupted 并投影为 `agent_loop_status="cancelled"`，避免短生命周期 stdio 进程退出后留下永久 running row 或把已取消 turn 误标失败。有 final answer 或 error summary 时才输出 `item/started -> item/agentMessage/delta -> item/completed`。`sg continue <thread-id> "instruction"` 先通过 `thread/read` 验证 thread 存在，再发送新的 `turn/start`；sidecar 模式下 app-server 从当前 Rust thread 的最新 `python_sidecar` trace summary 读取 `session_id` 并调用 `agent/resume`，如果没有历史 sidecar session 则调用 `agent/run`。approval 流由 `approval/request` 写 pending row 和 trace，`approval/center` 读取 pending approval 与已记录 decision ledger，`approval/decision` 只能消费 pending approval 一次，并在同一个 transaction 中写 `approvals` decision fields、`approval_decisions` ledger row 和 trace；decision trace 的 `run_id` / `session_id` 使用原 request 的 `session_id`，`task_id` 使用原 request 的 `task_id`，payload 只包含 request/decision/outcome 安全摘要。重复 decision 返回 `Pending approval not found`。`artifact/fetch` 只从 `artifact_refs` 读取 redacted reference object，不返回文件内容。
 
 ## 真实对象完整结构
 
@@ -586,6 +637,16 @@ pub struct AgentLoopStatusBridge {
     pub error: Option<String>,
 }
 
+pub struct PythonSidecarStatus {
+    pub run_id: String,
+    pub status: String,
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub final_answer: Option<String>,
+    pub trace_path: Option<String>,
+    pub events: Vec<SidecarRunEvent>,
+}
+
 pub struct NativeAgentLoopCapability {
     pub available: bool,
     pub status: AgentHostStatus,
@@ -599,6 +660,17 @@ pub struct PythonSidecarConfig {
     pub project_root: PathBuf,
     pub python_path: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+}
+
+pub struct ActiveSidecarRun {
+    pub turn_id: String,
+    pub thread_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 ```
 
@@ -688,11 +760,11 @@ pub struct FinalizationMappingBoundary {
 
 ## 谁生成这些对象
 
-`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` / `create_thread_with_trace()` 生成 `Thread`；`SessionStore.create_turn()` / `create_turn_with_input_and_trace()` 生成 `Turn`，`SessionStore.update_turn_state()` 更新 sidecar result 对应的 durable `status` 和 `agent_loop_status`；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`SessionStore.register_artifact_ref()` 生成 `ArtifactRef`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`PermissionRequest::new()` 只封装调用方传入的 resource，路径、命令和 host 归一化由 command/sandbox 或上层 tool boundary 负责；`PermissionRule::new()` 生成 declarative rule，`PermissionDecision::new()` 或 `PolicyEngine.evaluate()` 生成决策结果；`PythonSidecarClient.run_agent()` 从 Python sidecar 的 `agent/run` response 生成 `PythonSidecarRunResult`，`PythonSidecarClient.resume_agent()` 从 sidecar `agent/resume` response 生成同一安全结果，再由 `AgentLoopStatusBridge::from_sidecar()` 生成 Rust host-facing status；`scripts/export_rust_parity_fixtures.py` 从 Python `PlannerState`、`ContextBundle`、`ContextSummaryEnvelope`、`ToolProtocolResultEnvelope`、`ToolProtocolRecoveryReport`、`RepairContract`、`AgentLoopResult` 和 `FinalReport` 导出 M9 oracle JSON，Rust `PlannerStateBoundary` / `ContextAssemblyBoundary` / `ContextSummaryEnvelopeBoundary` / `ToolCallRepairBoundary` / `FinalizationMappingBoundary` 只反序列化和 roundtrip 这些字段；`ToolSpec::new()`、`ToolBroker::register()`、`ToolCallEnvelope::new()`、`ToolResult::success()` / `failure()`、`ToolObservation::summary()` / `failed()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()`、`git_status_request()` / `git_diff_request()`、`CommandResult::completed()` / `policy_denied()` / `sandbox_backend_unavailable()`、`PatchChange::replace()` / `create()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object 或最小执行边界对象。`validate_provider_config()` 只检查 provider/model/base_url/api_key presence；`classify_model_error()` 只把已归一化的 provider failure 映射为 Rust 模型边界 category；`validate_stream_events()` 和 `validate_model_response()` 只验证 streaming envelope、tool choice、tool-call parse status、allowed tool names 和 provider capability metadata，不执行工具或 provider call。`ToolRegistry.register()` 只接受 `builtin.*`、`mcp.<server>.<tool>` 和 `python.<plugin>.<tool>` 命名空间，并拒绝重复 name。
+`JsonRpcMessage::request()` 和 `JsonRpcMessage::notification()` 生成 wire message；`SessionStore.create_thread()` / `create_thread_with_trace()` 生成 `Thread`；`SessionStore.create_turn()` / `create_turn_with_input_and_trace()` 生成 `Turn`，`SessionStore.update_turn_state()` 更新 sidecar result 对应的 durable `status` 和 `agent_loop_status`；`SessionStore.register_active_sidecar_run()` / `get_active_sidecar_run()` / `clear_active_sidecar_run()` 生成、读取、清理 active run safe metadata；`SessionStore.append_item()` 生成 `Item`；`TraceEvent::new()` 生成 `TraceEvent`；`SessionStore.register_artifact_ref()` 生成 `ArtifactRef`；`ApprovalRequest::new()` 和 `ApprovalDecision::new()` 生成 approval object；`PermissionRequest::new()` 只封装调用方传入的 resource，路径、命令和 host 归一化由 command/sandbox 或上层 tool boundary 负责；`PermissionRule::new()` 生成 declarative rule，`PermissionDecision::new()` 或 `PolicyEngine.evaluate()` 生成决策结果；`PythonSidecarClient.run_agent()` 从 Python sidecar 的 `agent/run` response 生成 `PythonSidecarRunResult`，`PythonSidecarClient.resume_agent()` 从 sidecar `agent/resume` response 生成同一安全结果，`PythonSidecarClient.status()` / `cancel()` 从 `agent/status` / `agent/cancel` response 生成 `PythonSidecarStatus`，再由 app-server 生成 Rust host-facing status；`scripts/export_rust_parity_fixtures.py` 从 Python `PlannerState`、`ContextBundle`、`ContextSummaryEnvelope`、`ToolProtocolResultEnvelope`、`ToolProtocolRecoveryReport`、`RepairContract`、`AgentLoopResult` 和 `FinalReport` 导出 M9 oracle JSON，Rust `PlannerStateBoundary` / `ContextAssemblyBoundary` / `ContextSummaryEnvelopeBoundary` / `ToolCallRepairBoundary` / `FinalizationMappingBoundary` 只反序列化和 roundtrip 这些字段；`ToolSpec::new()`、`ToolBroker::register()`、`ToolCallEnvelope::new()`、`ToolResult::success()` / `failure()`、`ToolObservation::summary()` / `failed()`、`SandboxPolicy::isolated_verification()`、`CommandRequest::project_verification()`、`git_status_request()` / `git_diff_request()`、`CommandResult::completed()` / `policy_denied()` / `sandbox_backend_unavailable()`、`PatchChange::replace()` / `create()`、`ModelTurnRequest::new()` 和 `ModelTurnResponse::completed()` 生成各自 schema object 或最小执行边界对象。`validate_provider_config()` 只检查 provider/model/base_url/api_key presence；`classify_model_error()` 只把已归一化的 provider failure 映射为 Rust 模型边界 category；`validate_stream_events()` 和 `validate_model_response()` 只验证 streaming envelope、tool choice、tool-call parse status、allowed tool names 和 provider capability metadata，不执行工具或 provider call。`ToolRegistry.register()` 只接受 `builtin.*`、`mcp.<server>.<tool>` 和 `python.<plugin>.<tool>` 命名空间，并拒绝重复 name。
 
 ## 谁消费这些对象
 
-`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、server capabilities、thread、turn、event subscription、approval、artifact、trace handler；`AppServer.run_python_sidecar_if_enabled()` 只在显式 sidecar 配置存在且 `turn/start` 已通过 thread 校验和 durable turn 创建后消费 `TurnStartParams`、thread `model` 和上一条安全 sidecar `session_id`，并调用 `PythonSidecarClient`；`SessionStore.create_thread_with_trace()`、`create_turn_with_input_and_trace()`、`update_turn_state()`、`create_approval_with_trace()`、`record_approval_decision()`、`append_trace()` 和 `register_artifact_ref()` 消费 protocol object 写 SQLite；`approval/center` 消费 `SessionStore.list_pending_approvals()` 与 `list_approval_decisions()`；`artifact/fetch` 消费 `SessionStore.get_artifact_ref()` 并只返回 reference。`PolicyEngine.evaluate()` 消费调用方已归一化的 `PermissionRequest`，按 deny、caller-marked sensitive resource、hook ask、ask、allow、fallback ask 顺序返回 `PermissionDecision`，且 `approval_policy=never` 会把 ask 投影为 deny；policy 不解析 shell wrapper、argv、workspace path、network host、`.env` / SSH key marker 或 command 等价形式；Rust M9 boundary tests 消费 Python oracle fixture，校验 planner state、context bundle 和 context summary envelope 字段可被 Rust 解析；app-server runtime 当前不消费这些 M9 boundary object。`ToolBroker.model_visible_tools()` 消费 `ToolRegistry` 并只投影 name、redacted description 和 input schema 给模型；`ToolBroker.execute()` 消费 `ToolCallEnvelope` 与外部 policy decision，未知或 denied tool 不调用 executor；`CommandRequest.permission_resource()` 把 shell wrapper / argv 规范化为 policy 可消费的 command resource；git status/diff 只生成 sandbox-required `CommandRequest`，不绕过 command/sandbox 边界执行 git；当前 `crates/sandbox` 不公开本机进程 executor或 host filesystem mutation executor，缺少 strict backend 时只能由调用方使用 `CommandResult::sandbox_backend_unavailable()` 表达 fail-closed 状态；Rust model validator 消费已经构造好的 model request/response/stream 对象并返回 `ModelValidationResult`，不消费 tool registry、policy engine、sandbox backend 或 HTTP client。`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification，`event/subscribe` 设置后由 `AppServer.event_notification()` 过滤当前连接后续通知。`sg` 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
+`AppServer.handle()` 消费 `JsonRpcMessage` 并分派到 initialize、server capabilities、thread、turn、event subscription、approval、artifact、trace handler；`AppServer.run_python_sidecar_if_enabled()` 只在显式 sidecar 配置存在且 `turn/start` 已通过 thread 校验和 durable turn 创建后消费 `TurnStartParams`、thread `model` 和上一条安全 sidecar `session_id`，并调用 `PythonSidecarClient`；`server/shutdown` 和 `thread/delete` 消费当前进程 active run metadata，先调用 cleanup/finalize 路径，再退出或删除 durable thread rows；`SessionStore.create_thread_with_trace()`、`create_turn_with_input_and_trace()`、`update_turn_state()`、`create_approval_with_trace()`、`record_approval_decision()`、`append_trace()` 和 `register_artifact_ref()` 消费 protocol object 写 SQLite；`approval/center` 消费 `SessionStore.list_pending_approvals()` 与 `list_approval_decisions()`；`artifact/fetch` 消费 `SessionStore.get_artifact_ref()` 并只返回 reference。`PolicyEngine.evaluate()` 消费调用方已归一化的 `PermissionRequest`，按 deny、caller-marked sensitive resource、hook ask、ask、allow、fallback ask 顺序返回 `PermissionDecision`，且 `approval_policy=never` 会把 ask 投影为 deny；policy 不解析 shell wrapper、argv、workspace path、network host、`.env` / SSH key marker 或 command 等价形式；Rust M9 boundary tests 消费 Python oracle fixture，校验 planner state、context bundle 和 context summary envelope 字段可被 Rust 解析；app-server runtime 当前不消费这些 M9 boundary object。`ToolBroker.model_visible_tools()` 消费 `ToolRegistry` 并只投影 name、redacted description 和 input schema 给模型；`ToolBroker.execute()` 消费 `ToolCallEnvelope` 与外部 policy decision，未知或 denied tool 不调用 executor；`CommandRequest.permission_resource()` 把 shell wrapper / argv 规范化为 policy 可消费的 command resource；git status/diff 只生成 sandbox-required `CommandRequest`，不绕过 command/sandbox 边界执行 git；当前 `crates/sandbox` 不公开本机进程 executor或 host filesystem mutation executor，缺少 strict backend 时只能由调用方使用 `CommandResult::sandbox_backend_unavailable()` 表达 fail-closed 状态；Rust model validator 消费已经构造好的 model request/response/stream 对象并返回 `ModelValidationResult`，不消费 tool registry、policy engine、sandbox backend 或 HTTP client。`ToolObservation.to_model_payload()` 消费 tool observation 并生成模型可见安全 payload；`AppEvent.to_notification()` 消费 event 并输出 JSON-RPC notification，`event/subscribe` 设置后由 `AppServer.event_notification()` 过滤当前连接后续通知。`sg` 只消费 `singularity_protocol` 和 `singularity_core`，不消费 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
 ## 是否落盘
 

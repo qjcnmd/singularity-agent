@@ -60,7 +60,7 @@ ALLOWED_CRATE_DEPENDENCIES = {
     },
     "crates/agent/Cargo.toml": {
         "dependencies": {"schemars", "serde", "serde_json"},
-        "dev-dependencies": set(),
+        "dev-dependencies": {"tempfile"},
     },
     "crates/app-server/Cargo.toml": {
         "dependencies": {
@@ -133,6 +133,38 @@ RUST_AGENT_HOST_DOC_MARKERS = {
     "SessionStore.create_turn_with_input_and_trace",
 }
 
+TURN_LIFECYCLE_DOC_MARKERS = {
+    "turn lifecycle",
+    "interrupted_requested",
+    "PythonSidecarClient::cancel",
+    "AgentLoop cancel semantics",
+    "SessionStore",
+    "trace event",
+}
+
+FORBIDDEN_LIFECYCLE_NAMES = {
+    "RuntimeControlManager",
+    "SidecarLifecycleManager",
+    "SidecarProcessManager",
+    "TransitionRuntime",
+    "DesktopTransitionRuntime",
+    "LocalDaemonRuntime",
+    "MagicBridge",
+    "CancellationLifecycleController",
+    "ActiveSidecarExecution",
+    "SidecarExecutionState",
+}
+
+LIFECYCLE_NAME_TARGETS = (
+    "docs/singularity.md",
+    "docs/architecture/modules/rust-app-server-protocol.md",
+    "docs/architecture/rust-agent-host.md",
+    "crates/app-server/src/lib.rs",
+    "crates/agent/src/lib.rs",
+    "crates/cli/src/main.rs",
+    "crates/store/src/lib.rs",
+)
+
 SIDECAR_TRACE_PROJECTION_FORBIDDEN = {
     "raw_response",
     "raw_prompt",
@@ -176,9 +208,14 @@ def main() -> int:
     violations.extend(_check_forbidden_desktop_paths(repo_root))
     violations.extend(_check_agent_loop_status(repo_root))
     violations.extend(_check_rust_agent_host_docs(repo_root))
+    violations.extend(_check_turn_lifecycle_docs(repo_root))
+    violations.extend(_check_forbidden_lifecycle_names(repo_root))
     violations.extend(_check_cli_sidecar_surface(repo_root))
+    violations.extend(_check_cli_direct_sidecar_invocation(repo_root))
     violations.extend(_check_sidecar_resume_and_model(repo_root))
     violations.extend(_check_no_fake_agent_delta(repo_root))
+    violations.extend(_check_turn_interrupt_cancel_boundary(repo_root, changed_files))
+    violations.extend(_check_active_sidecar_run_persistence(repo_root))
     violations.extend(_check_rust_cli_smoke_env(repo_root))
     violations.extend(_check_sidecar_trace_projection(repo_root))
     violations.extend(_check_tool_observation_payload(repo_root))
@@ -351,6 +388,49 @@ def _check_rust_agent_host_docs(repo_root: Path) -> list[Violation]:
     ]
 
 
+def _check_turn_lifecycle_docs(repo_root: Path) -> list[Violation]:
+    docs = [
+        repo_root / "docs" / "singularity.md",
+        repo_root / "docs" / "architecture" / "modules" / "rust-app-server-protocol.md",
+        repo_root / "docs" / "architecture" / "rust-agent-host.md",
+    ]
+    violations: list[Violation] = []
+    for path in docs:
+        text = path.read_text(encoding="utf-8")
+        lowered = text.lower()
+        if "turn lifecycle" not in lowered and "lifecycle migration" not in lowered:
+            continue
+        violations.extend(
+            Violation(
+                "turn-lifecycle-docs-incomplete",
+                _relative(path, repo_root),
+                f"turn lifecycle migration docs must include marker: {marker}",
+            )
+            for marker in sorted(TURN_LIFECYCLE_DOC_MARKERS)
+            if marker not in text
+        )
+    return violations
+
+
+def _check_forbidden_lifecycle_names(repo_root: Path) -> list[Violation]:
+    violations: list[Violation] = []
+    for relative in LIFECYCLE_NAME_TARGETS:
+        path = repo_root / relative
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for name in sorted(FORBIDDEN_LIFECYCLE_NAMES):
+            if name in text:
+                violations.append(
+                    Violation(
+                        "forbidden-lifecycle-name",
+                        relative,
+                        f"{name} is a verbose or invented lifecycle name; use approved vocabulary",
+                    )
+                )
+    return violations
+
+
 def _check_cli_sidecar_surface(repo_root: Path) -> list[Violation]:
     path = repo_root / "crates" / "cli" / "src" / "main.rs"
     text = path.read_text(encoding="utf-8")
@@ -361,6 +441,20 @@ def _check_cli_sidecar_surface(repo_root: Path) -> list[Violation]:
             "raw-sidecar-env-user-setup",
             _relative(path, repo_root),
             "CLI must expose a user-facing Python agent-host option instead of requiring raw SINGULARITY_PYTHON_SIDECAR setup",
+        )
+    ]
+
+
+def _check_cli_direct_sidecar_invocation(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "cli" / "src" / "main.rs"
+    text = path.read_text(encoding="utf-8")
+    if "singularity.agent_host.sidecar" not in text and "python -m singularity.agent_host.sidecar" not in text:
+        return []
+    return [
+        Violation(
+            "cli-direct-sidecar-invocation",
+            _relative(path, repo_root),
+            "CLI must reach Python sidecar only through app-server agent-host protocol",
         )
     ]
 
@@ -397,7 +491,7 @@ def _check_sidecar_resume_and_model(repo_root: Path) -> list[Violation]:
         (
             app_server_path,
             app_server_text,
-            "client.resume_agent(session_id, &goal, model)",
+            ".resume_agent(session_id, &goal, model)",
             "sidecar-resume-call-missing",
             "app-server continue path must call Python sidecar agent/resume",
         ),
@@ -435,6 +529,46 @@ def _check_no_fake_agent_delta(repo_root: Path) -> list[Violation]:
             "no-sidecar turn/start must not emit a fake assistant delta such as input accepted",
         )
     ]
+
+
+def _check_turn_interrupt_cancel_boundary(repo_root: Path, changed_files: list[str]) -> list[Violation]:
+    if "crates/app-server/src/lib.rs" not in changed_files:
+        return []
+    path = repo_root / "crates" / "app-server" / "src" / "lib.rs"
+    text = path.read_text(encoding="utf-8")
+    if not any(marker in text for marker in ("list_active_sidecar_runs", "get_active_sidecar_run", "register_active_sidecar_run")):
+        return []
+    body = _extract_rust_function_body(text, "turn_interrupt")
+    if body is None:
+        return []
+    if ".cancel(" in body:
+        return []
+    return [
+        Violation(
+            "turn-interrupt-missing-sidecar-cancel",
+            _relative(path, repo_root),
+            "turn/interrupt must not only update_turn_status; it must route active sidecar cancel through PythonSidecarClient::cancel(run_id)",
+        )
+    ]
+
+
+def _check_active_sidecar_run_persistence(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "store" / "src" / "lib.rs"
+    text = path.read_text(encoding="utf-8")
+    relative = _relative(path, repo_root)
+    violations: list[Violation] = []
+    for table_body in _extract_sql_table_bodies(text, "active_sidecar_runs"):
+        lowered = table_body.lower()
+        for marker in ("prompt", "provider", "tool", "env"):
+            if marker in lowered:
+                violations.append(
+                    Violation(
+                        "active-sidecar-raw-persistence",
+                        relative,
+                        f"active sidecar run persistence must not store raw {marker} fields",
+                    )
+                )
+    return violations
 
 
 def _check_rust_cli_smoke_env(repo_root: Path) -> list[Violation]:
@@ -682,8 +816,12 @@ def _rust_sources(root: Path) -> list[str]:
 
 
 def _extract_rust_function_body(text: str, function_name: str) -> str | None:
-    needle = f"pub fn {function_name}"
-    start = text.find(needle)
+    needles = (f"pub fn {function_name}", f"fn {function_name}")
+    start = -1
+    for needle in needles:
+        start = text.find(needle)
+        if start != -1:
+            break
     if start == -1:
         return None
     opening = text.find("{", start)
@@ -699,6 +837,35 @@ def _extract_rust_function_body(text: str, function_name: str) -> str | None:
             if depth == 0:
                 return text[opening + 1 : index]
     return None
+
+
+def _extract_sql_table_bodies(text: str, table_name: str) -> list[str]:
+    bodies: list[str] = []
+    needle = "create table"
+    search_from = 0
+    lowered = text.lower()
+    while True:
+        start = lowered.find(needle, search_from)
+        if start == -1:
+            return bodies
+        table_start = lowered.find(table_name.lower(), start)
+        open_paren = text.find("(", start)
+        if table_start == -1 or open_paren == -1 or table_start > open_paren:
+            search_from = start + len(needle)
+            continue
+        depth = 0
+        for index in range(open_paren, len(text)):
+            char = text[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    bodies.append(text[open_paren + 1 : index])
+                    search_from = index + 1
+                    break
+        else:
+            return bodies
 
 
 def _is_allowed_python_migration_path(path: str) -> bool:

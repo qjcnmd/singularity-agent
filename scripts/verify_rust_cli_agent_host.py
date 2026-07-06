@@ -52,6 +52,46 @@ def main() -> int:
         return build.returncode
 
     with tempfile.TemporaryDirectory(prefix="rust-cli-agent-host-") as tmp:
+        fake_app_server = _write_fake_lifecycle_app_server(Path(tmp))
+        fake_db_path = Path(tmp) / "fake-lifecycle.sqlite3"
+        fake_env = _safe_smoke_env()
+        fake_env["SINGULARITY_APP_SERVER_BIN"] = str(fake_app_server)
+        fake_env["SINGULARITY_APP_SERVER_DB"] = str(fake_db_path)
+        fake_env["PYTHONPATH"] = _prepend_path(REPO_ROOT / "src", fake_env.get("PYTHONPATH"))
+        for args, required in (
+            (
+                ["run", "verify lifecycle", "--agent-host", "python"],
+                ("thread thread_fake", "turn turn_fake running agent_loop_status=running"),
+            ),
+            (
+                ["continue", "thread_fake", "resume lifecycle", "--agent-host", "python"],
+                ("thread thread_fake", "turn turn_continue completed agent_loop_status=completed"),
+            ),
+            (
+                ["turn", "status", "turn_fake"],
+                ("turn turn_fake running agent_loop_status=running",),
+            ),
+            (
+                ["turn", "interrupt", "turn_fake"],
+                ("turn turn_fake interrupted agent_loop_status=cancel_requested",),
+            ),
+            (
+                ["trace", "thread_fake", "--limit", "20"],
+                ("turn lifecycle cancel_requested", "python_sidecar"),
+            ),
+        ):
+            smoke = _run_sg(args, fake_env)
+            if smoke.returncode != 0:
+                sys.stderr.write(smoke.stderr)
+                sys.stderr.write(smoke.stdout)
+                return smoke.returncode
+            missing = [marker for marker in required if marker not in smoke.stdout]
+            if missing:
+                sys.stderr.write(
+                    f"missing lifecycle smoke markers for {args}: {missing}\n{smoke.stdout}\n"
+                )
+                return 1
+
         db_path = Path(tmp) / "sessions.sqlite3"
         env = _safe_smoke_env()
         env["SINGULARITY_APP_SERVER_BIN"] = str(APP_SERVER_BINARY)
@@ -63,26 +103,12 @@ def main() -> int:
             env["SINGULARITY_PYTHON_SIDECAR_BIN"] = str(python_bin)
 
         command = [
-            "cargo",
-            "run",
-            "-p",
-            "singularity_cli",
-            "--bin",
-            "sg",
-            "--",
             "run",
             "verify Rust CLI Python sidecar route",
             "--agent-host",
             "python",
         ]
-        completed = subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            env=env,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        completed = _run_sg(command, env)
         if completed.returncode != 0:
             sys.stderr.write(completed.stderr)
             sys.stderr.write(completed.stdout)
@@ -103,26 +129,7 @@ def main() -> int:
             sys.stderr.write(f"could not parse thread id\n{stdout}\n")
             return 1
 
-        trace = subprocess.run(
-            [
-                "cargo",
-                "run",
-                "-p",
-                "singularity_cli",
-                "--bin",
-                "sg",
-                "--",
-                "trace",
-                thread_id,
-                "--limit",
-                "20",
-            ],
-            cwd=REPO_ROOT,
-            env=env,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        trace = _run_sg(["trace", thread_id, "--limit", "20"], env)
         if trace.returncode != 0:
             sys.stderr.write(trace.stderr)
             sys.stderr.write(trace.stdout)
@@ -133,6 +140,80 @@ def main() -> int:
 
     print("rust CLI agent host smoke verified")
     return 0
+
+
+def _run_sg(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-p",
+            "singularity_cli",
+            "--bin",
+            "sg",
+            "--",
+            *args,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+
+
+def _write_fake_lifecycle_app_server(directory: Path) -> Path:
+    script_path = directory / "fake_lifecycle_app_server.py"
+    script_path.write_text(
+        r'''
+import json
+import sys
+
+status_calls = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "initialized":
+        continue
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "thread/read":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": message["params"]["threadId"], "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        turn_id = "turn_continue" if message["params"].get("threadId") == "thread_fake" and "resume lifecycle" in str(message["params"].get("input")) else "turn_fake"
+        status = "completed" if turn_id == "turn_continue" else "running"
+        print(json.dumps({"method": "turn/started", "params": {"turn": {"turn_id": turn_id, "thread_id": "thread_fake", "status": "running", "agent_loop_status": "running"}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": turn_id, "thread_id": "thread_fake", "status": status, "agent_loop_status": status}}}), flush=True)
+    elif method == "turn/status":
+        status_calls += 1
+        status = "completed" if status_calls >= 2 else "running"
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": message["params"]["turnId"], "thread_id": "thread_fake", "status": status, "agent_loop_status": status}}}), flush=True)
+    elif method == "turn/interrupt":
+        print(json.dumps({"id": request_id, "result": {"turnId": message["params"]["turnId"], "status": "interrupted", "agent_loop_status": "cancel_requested"}}), flush=True)
+    elif method == "trace/tail":
+        print(json.dumps({"id": request_id, "result": {"events": [
+            {"event_id": "trace_cancel", "component": "app_server", "summary": "turn lifecycle cancel_requested"},
+            {"event_id": "trace_sidecar", "component": "python_sidecar", "summary": "Python sidecar result translated"}
+        ]}}), flush=True)
+''',
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        launcher = directory / "fake_lifecycle_app_server.cmd"
+        launcher.write_text(
+            f'@echo off\r\npython "{script_path}"\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="utf-8",
+        )
+        return launcher
+    launcher = directory / "fake_lifecycle_app_server"
+    launcher.write_text(f"#!/bin/sh\nexec python3 '{script_path}'\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    return launcher
 
 
 def _workspace_python() -> Path | None:

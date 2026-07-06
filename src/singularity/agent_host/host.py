@@ -102,7 +102,7 @@ class AgentHost:
         kernel.cancel(CancellationReason.USER_INTERRUPTED, message)
         session = self._sessions.get(run_id)
         if session is not None:
-            session.status = "cancelled"
+            session.status = "cancel_requested"
         return self.snapshot(run_id)
 
     def submit_approval(self, run_id: str, grant: ApprovalGrant | dict[str, Any]) -> ApprovalEvent:

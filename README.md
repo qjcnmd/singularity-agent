@@ -104,7 +104,7 @@ cargo run -p singularity_cli --bin sg -- approvals
 cargo run -p singularity_cli --bin sg -- approve <request-id> --decision allow --reason "operator approved"
 ```
 
-M1 的 Python sidecar 调用是同步 app-server request：`turn/start` 会先把 Rust turn、user item 和 turn trace 写入 SQLite，再调用 `agent/run`；同一 Rust thread 上已有 `python_sidecar` trace 的 `session_id` 时，后续 `sg continue --agent-host python` 调用 `agent/resume`。`--model` 写入 Rust thread，并作为 sidecar `model` 参数进入 Python `ProductionConfig`。默认 no-sidecar 路径只显示 `not_migrated` turn，不输出伪 assistant delta。
+Python sidecar lifecycle 由 Rust app-server 包一层 durable turn envelope：`turn/start` 会先把 Rust turn、user item 和 turn trace 写入 SQLite，再调用 `agent/run` 或 `agent/resume`；sidecar 返回 `running` 时，app-server 记录 active run 的安全 ID 字段并允许持有该 sidecar handle 的同一 app-server 进程通过 `turn/status` 查询、通过 `turn/interrupt` 调用 `PythonSidecarClient::cancel(run_id)` 请求取消。`turn/interrupt` 的 durable turn status 为 `interrupted`，`agent_loop_status=cancel_requested` 表示 Python AgentLoop 已收到取消请求但可能仍在 unwind；后续 status/cleanup 会保持 interrupted，不用 completed/failed 覆盖取消结果。CLI 进程退出前会先发送 `server/shutdown`，让 app-server 清理当前进程持有的 active run；`thread/delete` 也会先清理该 thread 的 active run 元数据。新的短生命周期 CLI 进程只能读取 durable status，不能重连已经运行的 sidecar handle。同一 Rust thread 上已有 `python_sidecar` trace 的 `session_id` 时，后续 `sg continue --agent-host python` 调用 `agent/resume`。`--model` 写入 Rust thread，并作为 sidecar `model` 参数进入 Python `ProductionConfig`。默认 no-sidecar 路径只显示 `not_migrated` turn，不输出伪 assistant delta。
 
 Python legacy/oracle 路径仍用于迁移期对照和真实 evaluation。运行一次 Python agent：
 

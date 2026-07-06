@@ -66,6 +66,28 @@ RUST_AGENT_HOST_DOC_MARKERS = (
     "SessionStore.create_turn_with_input_and_trace",
 )
 
+TURN_LIFECYCLE_DOC_MARKERS = (
+    "turn lifecycle",
+    "interrupted_requested",
+    "PythonSidecarClient::cancel",
+    "AgentLoop cancel semantics",
+    "SessionStore",
+    "trace event",
+)
+
+FORBIDDEN_LIFECYCLE_NAMES = (
+    "RuntimeControlManager",
+    "SidecarLifecycleManager",
+    "SidecarProcessManager",
+    "TransitionRuntime",
+    "DesktopTransitionRuntime",
+    "LocalDaemonRuntime",
+    "MagicBridge",
+    "CancellationLifecycleController",
+    "ActiveSidecarExecution",
+    "SidecarExecutionState",
+)
+
 FORBIDDEN_SIDECAR_TRACE_MARKERS = (
     "raw_response",
     "raw_prompt",
@@ -113,6 +135,7 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "src/singularity/agent_host/sidecar.py",
         "docs/singularity.md",
         "docs/architecture/modules/rust-app-server-protocol.md",
+        "docs/architecture/rust-agent-host.md",
         "scripts/verify_rust_cli_agent_host.py",
     ):
         source = Path(relative)
@@ -137,11 +160,65 @@ def test_guard_rejects_rust_agent_host_docs_without_logic_map_marker(tmp_path: P
         path = repo / relative
         path.write_text(path.read_text(encoding="utf-8").replace(marker, ""), encoding="utf-8")
 
-    result = run_guard(repo)
+    result = run_guard(repo, "--changed-file", "crates/app-server/src/lib.rs")
 
     assert result.returncode == 1
     assert "rust-agent-host-docs-incomplete" in result.stderr
     assert marker in result.stderr
+
+
+@pytest.mark.parametrize("marker", TURN_LIFECYCLE_DOC_MARKERS)
+def test_guard_rejects_turn_lifecycle_docs_without_required_marker(tmp_path: Path, marker: str) -> None:
+    repo = copy_repo_slice(tmp_path)
+    docs = repo / "docs/singularity.md"
+    docs.write_text(
+        "\n".join(item for item in TURN_LIFECYCLE_DOC_MARKERS if item != marker)
+        + "\nlifecycle migration\n",
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo, "--changed-file", "crates/app-server/src/lib.rs")
+
+    assert result.returncode == 1
+    assert "turn-lifecycle-docs-incomplete" in result.stderr
+    assert marker in result.stderr
+
+
+@pytest.mark.parametrize("name", FORBIDDEN_LIFECYCLE_NAMES)
+def test_guard_rejects_forbidden_lifecycle_names_in_targeted_files(tmp_path: Path, name: str) -> None:
+    repo = copy_repo_slice(tmp_path)
+    app_server = repo / "crates/app-server/src/lib.rs"
+    app_server.write_text(app_server.read_text(encoding="utf-8") + f"\nstruct {name};\n", encoding="utf-8")
+
+    result = run_guard(repo, "--changed-file", "crates/app-server/src/lib.rs")
+
+    assert result.returncode == 1
+    assert "forbidden-lifecycle-name" in result.stderr
+    assert name in result.stderr
+
+
+def test_guard_allows_approved_short_lifecycle_names(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    app_server = repo / "crates/app-server/src/lib.rs"
+    app_server.write_text(
+        app_server.read_text(encoding="utf-8")
+        + "\nstruct TurnRunner;\nstruct SidecarRun;\nstruct RunStatus;\nstruct LifecycleEvent;\n",
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_guard_does_not_reject_unrelated_python_domain_forbidden_name(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    python_file = repo / "src/singularity/domain_terms.py"
+    python_file.write_text("NAME = 'MagicBridge'\n", encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("dependency", FORBIDDEN_CLI_DEPENDENCIES)
@@ -285,6 +362,17 @@ def test_guard_rejects_cli_requiring_raw_sidecar_env_as_user_setup(tmp_path: Pat
     assert "raw-sidecar-env-user-setup" in result.stderr
 
 
+def test_guard_rejects_cli_direct_python_sidecar_invocation(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    cli = repo / "crates/cli/src/main.rs"
+    cli.write_text(cli.read_text(encoding="utf-8") + '\nCommand::new("python").arg("-m").arg("singularity.agent_host.sidecar");\n', encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "cli-direct-sidecar-invocation" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("relative", "old", "new", "violation"),
     (
@@ -308,7 +396,7 @@ def test_guard_rejects_cli_requiring_raw_sidecar_env_as_user_setup(tmp_path: Pat
         ),
         (
             "crates/app-server/src/lib.rs",
-            "client.resume_agent(session_id, &goal, model)",
+            ".resume_agent(session_id, &goal, model)",
             "client.run_agent(&goal, model)",
             "sidecar-resume-call-missing",
         ),
@@ -336,6 +424,37 @@ def test_guard_rejects_no_sidecar_fake_agent_delta(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "fake-agent-delta" in result.stderr
+
+
+def test_guard_rejects_interrupt_that_updates_status_without_sidecar_cancel(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    app_server = repo / "crates/app-server/src/lib.rs"
+    text = app_server.read_text(encoding="utf-8")
+    turn_interrupt_start = text.index("    fn turn_interrupt")
+    text = text[:turn_interrupt_start] + text[turn_interrupt_start:].replace(".cancel(", ".request_cancel(")
+    app_server.write_text(text, encoding="utf-8")
+
+    result = run_guard(repo, "--changed-file", "crates/app-server/src/lib.rs")
+
+    assert result.returncode == 1
+    assert "turn-interrupt-missing-sidecar-cancel" in result.stderr
+
+
+@pytest.mark.parametrize("marker", ("prompt", "provider", "tool", "env"))
+def test_guard_rejects_active_sidecar_run_raw_persistence_fields(tmp_path: Path, marker: str) -> None:
+    repo = copy_repo_slice(tmp_path)
+    store = repo / "crates/store/src/lib.rs"
+    store.write_text(
+        store.read_text(encoding="utf-8")
+        + f"\ncreate table active_sidecar_runs_extra({marker} text not null);\n",
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "active-sidecar-raw-persistence" in result.stderr
+    assert marker in result.stderr
 
 
 def test_guard_rejects_rust_cli_smoke_copying_full_environment(tmp_path: Path) -> None:

@@ -363,6 +363,8 @@ pub struct TurnInterruptResult {
     #[serde(rename = "turnId")]
     pub turn_id: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_loop_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

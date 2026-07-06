@@ -4,6 +4,9 @@ use singularity_agent::{
     PlannerStateBoundary, PythonSidecarClient, PythonSidecarConfig, PythonSidecarRunResult,
     SidecarRunEvent, ToolCallRepairBoundary, sidecar_trace_summary,
 };
+use std::time::Duration;
+
+const TEST_SIDECAR_RESPONSE_TIMEOUT_MS: u64 = 100;
 
 #[test]
 fn agent_boundary_reports_not_migrated_without_claiming_completion() {
@@ -150,6 +153,154 @@ fn sidecar_startup_failure_is_reported_without_fallback() {
     let error = PythonSidecarClient::spawn(&config).expect_err("sidecar spawn should fail");
 
     assert!(error.contains("failed to start Python sidecar"));
+}
+
+#[test]
+fn sidecar_cancel_and_status_return_typed_safe_envelopes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_cancel_status.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    if method == "agent/cancel":
+        result = {
+            "run_id": params["runId"],
+            "status": "cancel_requested",
+            "raw_prompt": "do not project",
+        }
+    elif method == "agent/status":
+        result = {
+            "run_id": params["runId"],
+            "status": "running",
+            "raw_response": "do not project",
+        }
+    else:
+        result = {"run_id": "unexpected", "status": "failed"}
+    print(json.dumps({"id": message["id"], "result": result}), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: "python".to_string(),
+        module: "sidecar_cancel_status".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut client = PythonSidecarClient::spawn(&config).expect("spawn sidecar");
+
+    let cancel = client.cancel("run_1").expect("cancel");
+    let status = client.status("run_1").expect("status");
+
+    assert_eq!(cancel.run_id, "run_1");
+    assert_eq!(cancel.status, "cancel_requested");
+    assert_eq!(status.run_id, "run_1");
+    assert_eq!(status.status, "running");
+}
+
+#[test]
+fn sidecar_cancel_status_reject_malformed_response() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_malformed_cancel.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({"id": message["id"], "result": {"status": "running"}}), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: "python".to_string(),
+        module: "sidecar_malformed_cancel".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut client = PythonSidecarClient::spawn(&config).expect("spawn sidecar");
+
+    let error = client
+        .cancel("run_1")
+        .expect_err("missing run_id should be invalid");
+
+    assert!(error.contains("invalid sidecar cancel result"));
+}
+
+#[test]
+fn sidecar_status_reports_stdout_eof_as_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_eof.py"),
+        "import sys\nsys.exit(0)\n",
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: "python".to_string(),
+        module: "sidecar_eof".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut client = PythonSidecarClient::spawn(&config).expect("spawn sidecar");
+
+    let error = client
+        .status("run_1")
+        .expect_err("stdout EOF should be reported");
+
+    assert!(error.contains("Python sidecar closed stdout"));
+}
+
+#[test]
+fn sidecar_status_times_out_and_terminates_hung_sidecar() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_hang.py"),
+        r#"
+import json
+import sys
+import threading
+
+for line in sys.stdin:
+    json.loads(line)
+    threading.Event().wait()
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: "python".to_string(),
+        module: "sidecar_hang".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut client = PythonSidecarClient::spawn_with_response_timeout(
+        &config,
+        Duration::from_millis(TEST_SIDECAR_RESPONSE_TIMEOUT_MS),
+    )
+    .expect("spawn sidecar");
+
+    let error = client
+        .status("run_1")
+        .expect_err("hung sidecar should time out");
+
+    assert!(error.contains("timed out waiting for Python sidecar response"));
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
@@ -21,6 +21,8 @@ const CLI_CLIENT_VERSION: &str = "0.1.0";
 const DEFAULT_TRACE_TAIL_LIMIT: usize = 20;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
+const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
@@ -353,7 +355,52 @@ impl AppServerClient {
             render_turn(&turn["turn"]);
         }
         fail_for_failed_turn(&turn["turn"])?;
+        if should_poll_running_turn(&turn["turn"]) {
+            self.wait_for_turn_terminal(required_str(&turn["turn"], &["turn_id"])?)?;
+        }
         Ok(())
+    }
+
+    fn wait_for_turn_terminal(&mut self, turn_id: &str) -> Result<(), String> {
+        loop {
+            thread::sleep(TURN_STATUS_POLL_INTERVAL);
+            let turn = self.fetch_turn_status(turn_id)?;
+            if turn.status != "running" {
+                println!(
+                    "turn {} {}{}",
+                    turn.turn_id,
+                    turn.status,
+                    turn.agent_loop_status
+                        .as_deref()
+                        .map(|status| format!(" agent_loop_status={status}"))
+                        .unwrap_or_default()
+                );
+                if turn.status != "completed"
+                    || matches!(
+                        turn.agent_loop_status.as_deref(),
+                        Some("failed" | "blocked")
+                    )
+                {
+                    return Err(format!("turn {} {}", turn.turn_id, turn.status));
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    fn fetch_turn_status(&mut self, turn_id: &str) -> Result<TurnView, String> {
+        let id = self.next_request_id();
+        let result = first_result(self.request(JsonRpcMessage::request(
+            Method::TurnStatus,
+            json!(id),
+            json!({"turnId": turn_id}),
+        ))?)?;
+        let turn = &result["turn"];
+        Ok(TurnView {
+            turn_id: required_str(turn, &["turn_id"])?.to_string(),
+            status: required_str(turn, &["status"])?.to_string(),
+            agent_loop_status: turn["agent_loop_status"].as_str().map(str::to_string),
+        })
     }
 
     fn thread_list(&mut self) -> Result<(), String> {
@@ -394,9 +441,10 @@ impl AppServerClient {
             json!({"turnId": turn_id}),
         ))?)?;
         println!(
-            "turn {} {}",
+            "turn {} {}{}",
             result["turnId"].as_str().unwrap_or(turn_id),
-            result["status"].as_str().unwrap_or("")
+            result["status"].as_str().unwrap_or(""),
+            agent_loop_status_suffix(&result)
         );
         Ok(())
     }
@@ -546,8 +594,28 @@ impl AppServerClient {
 
 impl Drop for AppServerClient {
     fn drop(&mut self) {
+        if self.stdin.is_some() {
+            let id = self.next_request_id();
+            let _ = self.write_message(&JsonRpcMessage::request(
+                Method::ServerShutdown,
+                json!(id),
+                json!({}),
+            ));
+        }
         let _ = self.stdin.take();
-        let _ = self.child.kill();
+        let deadline = Instant::now() + SHUTDOWN_WAIT_TIMEOUT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = self.child.kill();
+                    break;
+                }
+            }
+        }
         let _ = self.child.wait();
         if let Some(stdout_reader) = self.stdout_reader.take() {
             let _ = stdout_reader.join();
@@ -659,6 +727,14 @@ fn should_render_response_turn(messages: &[Value], turn: &Value) -> bool {
     turn["agent_loop_status"].as_str() != Some("not_migrated")
 }
 
+fn should_poll_running_turn(turn: &Value) -> bool {
+    turn["status"].as_str() == Some("running")
+        && matches!(
+            turn["agent_loop_status"].as_str(),
+            Some("running" | "cancel_requested")
+        )
+}
+
 fn render_turn(turn: &Value) {
     let turn_id = turn["turn_id"].as_str().unwrap_or("");
     if turn_id.is_empty() {
@@ -670,6 +746,13 @@ fn render_turn(turn: &Value) {
         turn["status"].as_str().unwrap_or(""),
         turn["agent_loop_status"].as_str().unwrap_or("")
     );
+}
+
+fn agent_loop_status_suffix(value: &Value) -> String {
+    value["agent_loop_status"]
+        .as_str()
+        .map(|status| format!(" agent_loop_status={status}"))
+        .unwrap_or_default()
 }
 
 fn render_trace_event(event: &Value) {
@@ -684,10 +767,19 @@ fn render_trace_event(event: &Value) {
 fn fail_for_failed_turn(turn: &Value) -> Result<(), String> {
     let status = turn["status"].as_str().unwrap_or("");
     let agent_loop_status = turn["agent_loop_status"].as_str().unwrap_or("");
-    if status == "failed" || agent_loop_status == "failed" {
-        return Err("error failed: turn failed".to_string());
+    if matches!(status, "failed" | "blocked" | "interrupted")
+        || matches!(agent_loop_status, "failed" | "blocked")
+    {
+        return Err(format!("error {status}: turn {status}"));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct TurnView {
+    turn_id: String,
+    status: String,
+    agent_loop_status: Option<String>,
 }
 
 fn required_str<'a>(value: &'a Value, path: &[&str]) -> Result<&'a str, String> {

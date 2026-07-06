@@ -105,6 +105,24 @@ def test_agent_host_registers_approval_grants_through_approval_gate(tmp_path: Pa
     assert host.events("run_approval")[-1].event_type == "approval.granted"
 
 
+def test_agent_host_cancel_run_reports_cancel_requested(tmp_path: Path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_cancel", session_id="session_cancel")
+    approval_gate = _ApprovalGate()
+    kernel = _Kernel(trace=trace, approval_gate=approval_gate)
+    host = AgentHost(tmp_path, bootstrap_factory=lambda **_kwargs: _Bootstrap(kernel))
+    config = ProductionConfig.from_cli(
+        project_root=tmp_path,
+        approval_policy=ApprovalPolicy.NEVER,
+        dry_run=True,
+    )
+    host.start_run("wait for cancel", config=config)
+
+    snapshot = host.cancel_run("run_cancel")
+
+    assert kernel.cancelled
+    assert snapshot.status == "cancel_requested"
+
+
 def test_tool_call_event_projects_from_run_event() -> None:
     event = RunEvent(
         event_id="event_1",

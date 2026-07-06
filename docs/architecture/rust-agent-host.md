@@ -1,4 +1,4 @@
-# Rust Agent Host 第一阶段架构
+# Rust Agent Host 架构
 
 本文描述当前源码树已经落地的迁移边界，不描述未实现的 transport 或完整 AgentLoop 重写。
 
@@ -6,7 +6,7 @@
 
 长期架构是 `Rust Core + App Server + CLI/TUI first`。CLI/TUI 是第一个 client；未来 desktop 复用同一 app-server protocol，不单独设计第二套 core。
 
-当前第一阶段只迁移硬边界和协议对象：
+当前阶段只迁移硬边界、协议对象和 Python sidecar turn lifecycle envelope：
 
 - Rust workspace 位于 `crates/`。
 - 目录使用短名称：`core`、`protocol`、`store`、`policy`、`sandbox`、`tools`、`model`、`agent`、`app-server`、`cli`。
@@ -14,17 +14,17 @@
 - app-server 使用 JSON-RPC over stdio JSONL。
 - Python 当前实现保留为 migration oracle / parity reference，不删除、不重写。
 
-当前 M1 方向是 Rust CLI-first：开发者优先使用 Cargo/build artifact 中的 Rust `sg` 进入 `crates/app-server`；Python `sg` console script 仍保留为 legacy/oracle path，用于迁移期对照、真实 evaluation 和现有生产 AgentLoop 验证。Rust CLI 通过 `--agent-host python` 选择 Python sidecar，不要求用户直接设置 `SINGULARITY_PYTHON_SIDECAR=1` 作为正常使用步骤。
+当前方向是 Rust CLI-first：开发者优先使用 Cargo/build artifact 中的 Rust `sg` 进入 `crates/app-server`；Python `sg` console script 仍保留为 legacy/oracle path，用于迁移期对照、真实 evaluation 和现有生产 AgentLoop 验证。Rust CLI 通过 `--agent-host python` 选择 Python sidecar，不要求用户直接设置 `SINGULARITY_PYTHON_SIDECAR=1` 作为正常使用步骤。
 
 ## 已落地边界
 
 `crates/protocol` 定义 JSON-RPC envelope、method params/result、`Thread`、`Turn`、`Item`、`TraceEvent`、`ArtifactRef` 和 app-server event。JSON-RPC params 使用 camelCase，例如 `clientInfo`、`threadId`、`turnId`、`runId`、`eventId`、`artifactId`、`eventTypes`；嵌入领域对象继续使用当前 Python parity schema 的 snake_case。
 
-`crates/store` 是 SQLite-backed persistence boundary。它持久化 thread、turn、item、trace event、artifact reference、pending approval、approval decision ledger 和 `schema_migrations`；`SessionStoreDescriptor` 负责可序列化 store schema 描述，真实 `SessionStore` 持有 SQLite connection。会一次创建多行 durable state 的 app-server 动作通过 store 事务提交，例如 thread + trace、turn + input item + trace、approval request + trace、approval decision + ledger + trace。approval decision trace 使用原 approval request 的 `session_id` / `task_id` 做关联，不用 `request_id` 冒充 session。
+`crates/store` 是 SQLite-backed persistence boundary。它持久化 thread、turn、item、trace event、artifact reference、pending approval、approval decision ledger、active sidecar run 和 `schema_migrations`；`SessionStoreDescriptor` 负责可序列化 store schema 描述，真实 `SessionStore` 持有 SQLite connection。会一次创建多行 durable state 的 app-server 动作通过 store 事务提交，例如 thread + trace、turn + input item + trace、approval request + trace、approval decision + ledger + trace。active sidecar run 只保存 `turn_id/thread_id/run_id/session_id/task_id/status/created_at/updated_at`，不保存 raw prompt、provider payload、tool args 或 env。approval decision trace 使用原 approval request 的 `session_id` / `task_id` 做关联，不用 `request_id` 冒充 session。
 
-`crates/app-server` 实现 `initialize` / `initialized` handshake、server capabilities、thread list/read/start/resume/fork/archive/delete、turn start/interrupt/status、event subscription、approval list/center/request/decision、artifact fetch、trace list/show/tail 和 `server/shutdown`。默认 `turn/start` 明确写入 `agent_loop_status = "not_migrated"`，不伪装 Python AgentLoop 已完成迁移；`turn/start` 会先校验 Rust store 中的 thread 存在，missing thread 直接返回 `Thread not found`，不会启动 Python sidecar 或写 sidecar trace。显式设置 `SINGULARITY_PYTHON_SIDECAR=1` 且 thread 校验通过后，app-server 先持久化 Rust turn/user item/turn trace，再通过 `PythonSidecarClient` 启动 `python -m singularity.agent_host.sidecar`；首个 sidecar turn 调 `agent/run`，后续 turn 通过上一条 `python_sidecar` trace 的 `session_id` 调 `agent/resume`，thread 的 `model` 会转发为 sidecar `model` 参数。sidecar 调用现有 `AgentHost -> KernelBootstrap -> AgentKernel -> AgentLoop` 并把安全状态摘要翻译成 Rust turn/item/trace。M1 sidecar turn 是同步 app-server request，不是后台 turn runner；`turn/status` 和 `turn/interrupt` 已走协议，但不能中断已经退出的一次性 sidecar 子进程。stdio binary transport 的错误行统一通过 `JsonRpcMessage::error()` / `serde_json` 序列化为合法 JSON-RPC error envelope。item streaming 使用 `item/agentMessage/delta` 和 `item/commandExecution/outputDelta` 这类 typed delta，不再使用 generic `item/delta`；默认 no-sidecar path 不输出伪 assistant delta。当前 `server/capabilities` 只声明 stdio transport 可用，WebSocket token transport 仍是未来 transport，显式返回 unavailable。
+`crates/app-server` 实现 `initialize` / `initialized` handshake、server capabilities、thread list/read/start/resume/fork/archive/delete、turn start/interrupt/status、event subscription、approval list/center/request/decision、artifact fetch、trace list/show/tail 和 `server/shutdown`。默认 `turn/start` 明确写入 `agent_loop_status = "not_migrated"`，不伪装 Python AgentLoop 已完成迁移；`turn/start` 会先校验 Rust store 中的 thread 存在，missing thread 直接返回 `Thread not found`，不会启动 Python sidecar 或写 sidecar trace。显式设置 `SINGULARITY_PYTHON_SIDECAR=1` 且 thread 校验通过后，app-server 先持久化 Rust turn/user item/turn trace，再通过 `PythonSidecarClient` 启动 `python -m singularity.agent_host.sidecar`；首个 sidecar turn 调 `agent/run`，后续 turn 通过上一条 `python_sidecar` trace 的 `session_id` 调 `agent/resume`，thread 的 `model` 会转发为 sidecar `model` 参数。sidecar 调用现有 `AgentHost -> KernelBootstrap -> AgentKernel -> AgentLoop`；Python 仍拥有 AgentLoop 语义，Rust 只把安全状态摘要翻译成 turn/item/trace。sidecar 返回 `running` 时，app-server 写 active run row 并保留当前进程内 sidecar handle；持有该 handle 的进程内 `turn/status` 通过 `agent/status` 刷新 durable status，`turn/interrupt` 通过 `PythonSidecarClient::cancel(run_id)` 请求 cancel 并写 `agent_loop_status="cancel_requested"`。如果另一个短生命周期 app-server 进程只看到 active run row 但没有 sidecar handle，`turn/status` / `turn/interrupt` 只返回 durable turn status 和 active row status，不伪造 sidecar 查询或取消。`server/shutdown` 会清理当前进程持有的 active run，设置 shutdown_requested，并让 binary 主循环在写出响应后退出；CLI drop 会先发送 `server/shutdown`，再等待短窗口，只有 app-server 未退出时才 kill child；app-server drop 或 stdio 进程退出时也会写 cleanup lifecycle event 并清 active run row。`thread/delete` 会先清理同一 thread 的 active run，再删除 thread/turn/item/trace/artifact row。未取消的 active run 标记为 failed，已经 cancel_requested / cancelled / interrupted 的 run 保持 interrupted 并投影为 `agent_loop_status="cancelled"`，避免 SQLite 永久保留 running row 或把已取消 turn 误标失败。stdio binary transport 的错误行统一通过 `JsonRpcMessage::error()` / `serde_json` 序列化为合法 JSON-RPC error envelope。item streaming 使用 `item/agentMessage/delta` 和 `item/commandExecution/outputDelta` 这类 typed delta，不再使用 generic `item/delta`；默认 no-sidecar path 不输出伪 assistant delta。当前 `server/capabilities` 只声明 stdio transport 可用，WebSocket token transport 仍是未来 transport，显式返回 unavailable。
 
-`crates/cli` 提供 `sg` CLI。`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` / `sg config doctor` 会启动或调用 stdio app-server，并只通过 JSON-RPC protocol 交换 initialize、thread、turn、trace 和 approval 请求；请求读取以 matching response id 为完成条件，保留 matching response 之前到达的 notification，不依赖固定 notification 数量，也不在 response 后 drain 额外消息。stdout 关闭、app-server 提前退出或 response timeout 都返回明确错误，不无限等待。`sg daemon` 启动 app-server stdio 进程。CLI 不直接依赖 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
+`crates/cli` 提供 `sg` CLI。`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` / `sg config doctor` 会启动或调用 stdio app-server，并只通过 JSON-RPC protocol 交换 initialize、thread、turn、trace 和 approval 请求；请求读取以 matching response id 为完成条件，保留 matching response 之前到达的 notification，不依赖固定 notification 数量，也不在 response 后 drain 额外消息。stdout 关闭、app-server 提前退出或 response timeout 都返回明确错误，不无限等待；CLI 退出前会发送 `server/shutdown`，使 app-server 有机会按协议清理 active sidecar run。`sg daemon` 启动 app-server stdio 进程。CLI 不直接依赖 `singularity_agent`、`singularity_model`、`singularity_tools` 或 `singularity_store`。
 
 `crates/tools` 提供 Rust `ToolBroker`。所有工具在模型可见前必须先注册到 `ToolRegistry`，工具名只能使用 `builtin.*`、`mcp.<server>.<tool>` 或 `python.<plugin>.<tool>`；`ToolBroker.model_visible_tools()` 只投影 name、redacted description 和 input schema；`ToolBroker.execute()` 对 unknown 或 denied tool 不调用 executor，并通过 `ToolObservation.to_model_payload()` 输出安全摘要。
 
@@ -33,6 +33,40 @@
 `crates/model` 提供 Rust model boundary schema 和纯验证函数。它对齐现有 Python `singularity.model` 的 `ModelTurnRequest`、`ModelTurnResponse`、tool schema、tool call、capability metadata、provider config presence、stream event、validation result 和 model error object；`validate_provider_config()`、`validate_stream_events()`、`validate_model_response()` 和 `classify_model_error()` 只做边界验证与分类，不发起 HTTP provider call、不重试、不执行工具、不做 planner repair，也不迁移 AgentLoop。
 
 `crates/agent` 当前除 Python sidecar bridge 外，只持有 M9 的 schema/parity 切片 `PlannerStateBoundary`、`ContextAssemblyBoundary`、`ContextSummaryEnvelopeBoundary`、`ToolCallRepairBoundary`、`FinalizationMappingBoundary` 和 `NativeAgentLoopCapability`。这些对象只从 Python oracle fixture 做 planner state、context bundle、compaction summary envelope、tool-call repair contract 与 finalization mapping JSON roundtrip，或显式声明 native Rust AgentLoop 尚不可用；它们不调用 provider、不执行工具、不写 workspace，也不让 Rust `turn/start` 声称 native AgentLoop completed。repair planner runtime、completion gate runtime、finalizer runtime 和 max-turns loop 仍是后续独立切片，不能和当前切片一起重写。
+
+## Turn lifecycle 与 cancel 边界
+
+Rust app-server 拥有 turn lifecycle 的 durable status machine：
+
+```text
+accepted -> running -> completed
+accepted -> running -> failed
+accepted -> running -> interrupted
+accepted -> failed
+running -> interrupted_requested -> interrupted
+```
+
+| Status | Rust owner | Python owner | SQLite fields | trace event | CLI rendering | sidecar process status | retry/resume implication |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `accepted` | `AppServer::turn_start` | None | current protocol creates `turns.status="running"` / `agent_loop_status="not_migrated"`; accepted is a lifecycle edge, not a persisted TurnStatus | app-server lifecycle event | running turn line | not started or starting | retry only before active run exists |
+| `running` | `AppServer` + `SessionStore` | Python AgentHost/AgentLoop | `turns.status="running"`, `agent_loop_status`, active run safe IDs | app-server lifecycle event and `python_sidecar` trace event | running status line | active | resume uses Python `session_id`; no duplicate run |
+| `completed` | `AppServer::update_turn_from_bridge` | Python AgentLoop finalization | `turns.status="completed"`, `agent_loop_status="completed"` | completion trace event | completed plus summary | exited | terminal |
+| `failed` | app-server projection | Python sidecar when applicable | `turns.status="failed"`, `agent_loop_status="failed"` | redacted failure trace event | failed non-zero output | failed/not started | new turn or recovery path |
+| `interrupted_requested` | Rust app-server | Python receives cancel only | `turns.status="interrupted"`, `agent_loop_status="cancel_requested"`, active run retained | interrupt requested trace event | interrupted with cancel_requested | cancel requested | wait for terminal cleanup |
+| `interrupted` | `SessionStore` durable status | AgentLoop cancel semantics | `turns.status="interrupted"`, `agent_loop_status="cancelled"` | cancel result trace event | interrupted line | cancelled/exited | future turn may resume through Python session recovery |
+
+Cancel ownership map:
+
+| Concern | Owner |
+| --- | --- |
+| turn/interrupt request owner | Rust app-server |
+| sidecar cancel transport | `PythonSidecarClient::cancel(run_id)` |
+| AgentLoop cancel semantics | Python AgentHost/AgentLoop |
+| durable status owner | SessionStore |
+| trace owner | app-server |
+| CLI owner | protocol renderer |
+
+非目标：no OS kill primary cancel、no CLI-to-Python cancel、no native Rust AgentLoop cancel、no local-process sandbox fallback。批准词表：user submitted unit = `turn`，sidecar execution identity = `run`，Python recovery identity = `session`，lifecycle status = `status`，cancel action = `cancel`，interrupt protocol method = `interrupt`，stored lifecycle record = `active run`，state transition event = `lifecycle event`，sidecar process wrapper = `sidecar`。不要引入 verbose invented lifecycle names。
 
 ## Python 冻结范围
 
@@ -68,7 +102,7 @@ python -m singularity.cli eval run docs/evaluation/public-representative-task.js
 
 该 evaluation 仍通过 `KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop.run`，用于证明 Python oracle 仍可运行；它不是 Rust AgentLoop 迁移完成证明。
 
-本阶段已完成两类验证。Rust CLI sidecar smoke 使用 `python scripts/verify_rust_cli_agent_host.py`，通过 `SINGULARITY_SIDECAR_TEST_MODE=completed` 证明 `cargo run -p singularity_cli --bin sg -- run ... --agent-host python` 能启动 app-server、Python sidecar，并在 `sg trace <thread-id>` 中看到 `python_sidecar` trace。真实 provider evaluation 使用 `python -m singularity.cli eval run docs/evaluation/public-representative-task.json --run-id rust-cli-agent-host-m1 --json`，provider 配置状态为 `SINGULARITY_API_KEY=present(redacted)`、`SINGULARITY_BASE_URL=present(redacted)`、`SINGULARITY_MODEL=present`；它进入 `KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop.run`，不是 fake/mock/scripted/fallback。artifact 路径为 `work/evaluations/rust-cli-agent-host-m1/result.json`、`work/evaluations/rust-cli-agent-host-m1/report.json` 和 `work/evaluations/rust-cli-agent-host-m1/sqlfluff__sqlfluff-2419/workspace/work/traces/runs/run_6bcca335e773`。结果为 `status=success`、`evaluation_passed=true`、`tests_passed=true`、`public_verification_passed=true`、`hidden_verification_passed=true`、`evaluator_visibility_audit_passed=true`、`failure_category=none`、`local_process_fallback_count=0`、`turn_count=10`、`tool_calls=6`。当前 remaining diagnostics 是非阻断 `capability_sla.status=over_sla`，原因来自 provider 与 unattributed time 诊断层，不改变 evaluation/test pass 语义。
+本阶段已完成两类验证。Rust CLI sidecar smoke 使用 `python scripts/verify_rust_cli_agent_host.py`，通过 `SINGULARITY_SIDECAR_TEST_MODE=completed` 证明 `cargo run -p singularity_cli --bin sg -- run ... --agent-host python` 能启动 app-server、Python sidecar，并在 `sg trace <thread-id>` 中看到 `python_sidecar` trace。真实 provider evaluation 使用 `python -m singularity.cli eval run docs/evaluation/public-representative-task.json --run-id rust-turn-lifecycle-m2-final-20260706 --json`，provider 配置状态为 `SINGULARITY_API_KEY=present(redacted)`、`SINGULARITY_BASE_URL=present(redacted)`、`SINGULARITY_MODEL=present(redacted)`；它进入 `KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop.run`，不是 fake/mock/scripted/fallback。artifact 路径为 `work/evaluations/rust-turn-lifecycle-m2-final-20260706/result.json`、`work/evaluations/rust-turn-lifecycle-m2-final-20260706/report.json` 和 `work/evaluations/rust-turn-lifecycle-m2-final-20260706/sqlfluff__sqlfluff-2419/workspace/work/traces/runs/run_26da06e6d7af`。结果为 `status=success`、`evaluation_passed=true`、`tests_passed=true`、`public_verification_passed=true`、`hidden_verification_passed=true`、`evaluator_visibility_audit_passed=true`、`failure_category=none`、`local_process_fallback_count=0`、`turn_count=10`、`tool_calls=8`。
 
 ## 下一阶段顺序
 

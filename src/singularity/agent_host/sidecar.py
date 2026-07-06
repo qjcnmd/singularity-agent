@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,7 @@ from typing import Any
 from singularity.agent_host.host import AgentHost, AgentHostError
 from singularity.config import ProductionConfig
 from singularity.interaction import InteractionMode
+from singularity.kernel import CancellationError
 from singularity.observability import shared_trace_redactor
 
 JSON_RPC_INVALID_REQUEST = -32600
@@ -24,6 +27,9 @@ METHOD_STATUS = "agent/status"
 METHOD_HEALTH = "agent/health"
 
 DEFAULT_MAX_EVENTS = 20
+RUN_ID_WAIT_SECONDS = 2.0
+RUN_ID_POLL_SECONDS = 0.01
+RUN_ID_DISCOVERY_TIMEOUT_MESSAGE = "sidecar run did not publish a run id before lifecycle timeout"
 _REDACTOR = shared_trace_redactor()
 
 
@@ -45,6 +51,8 @@ class SidecarServer:
     ) -> None:
         self.project_root = Path(project_root).expanduser().resolve(strict=False)
         self.host = host or AgentHost(self.project_root)
+        self._runs: dict[str, _SidecarRun] = {}
+        self._lock = threading.Lock()
 
     @classmethod
     def from_env(cls) -> SidecarServer:
@@ -91,8 +99,12 @@ class SidecarServer:
         goal = str(params.get("goal") or "")
         if not goal.strip():
             raise ValueError("goal is required")
-        result = self.host.start_run(goal, config=self._config(params))
-        return _safe_run_result(self.host, result.run_id, result.to_dict())
+        result = self._start_background_run(
+            lambda: self.host.start_run(goal, config=self._config(params))
+        )
+        if result.result is not None:
+            return _safe_run_result(self.host, result.run_id, result.result)
+        return _safe_snapshot(result.run_id, result.session_id, result.task_id, result.status)
 
     def _resume(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = str(params.get("sessionId") or params.get("session_id") or "")
@@ -101,20 +113,59 @@ class SidecarServer:
             raise ValueError("sessionId is required")
         if not goal.strip():
             raise ValueError("goal is required")
-        result = self.host.resume_run(session_id, goal, config=self._config(params))
-        return _safe_run_result(self.host, result.run_id, result.to_dict())
+        result = self._start_background_run(
+            lambda: self.host.resume_run(session_id, goal, config=self._config(params))
+        )
+        if result.result is not None:
+            return _safe_run_result(self.host, result.run_id, result.result)
+        return _safe_snapshot(result.run_id, result.session_id, result.task_id, result.status)
 
     def _cancel(self, params: dict[str, Any]) -> dict[str, Any]:
         run_id = str(params.get("runId") or params.get("run_id") or "")
         if not run_id:
             raise ValueError("runId is required")
-        return self.host.cancel_run(run_id).to_dict()
+        try:
+            snapshot = self.host.cancel_run(run_id)
+            with self._lock:
+                run = self._runs.get(run_id)
+                if run is not None:
+                    run.status = str(snapshot.status)
+            return _safe_snapshot_from_host_snapshot(snapshot, fallback_run_id=run_id)
+        except AgentHostError:
+            return {"run_id": run_id, "status": "not_found"}
 
     def _status(self, params: dict[str, Any]) -> dict[str, Any]:
         run_id = str(params.get("runId") or params.get("run_id") or "")
         if not run_id:
             raise ValueError("runId is required")
-        return self.host.snapshot(run_id).to_dict()
+        with self._lock:
+            run = self._runs.get(run_id)
+        if run is not None and run.result is not None:
+            return _safe_run_result(self.host, run_id, run.result)
+        if run is not None and run.error is not None:
+            status = "cancelled" if isinstance(run.error, CancellationError) else "failed"
+            snapshot = self.host.snapshot(run_id)
+            session_id = str(snapshot.session_id or run.session_id)
+            task_id = str(snapshot.task_id or run.task_id)
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current.status = status
+            return _safe_snapshot(run_id, session_id, task_id, status)
+        if run is not None:
+            snapshot = self.host.snapshot(run_id)
+            status = str(snapshot.status or run.status)
+            session_id = str(snapshot.session_id or run.session_id)
+            task_id = str(snapshot.task_id or run.task_id)
+            with self._lock:
+                current = self._runs.get(run_id)
+                if current is not None:
+                    current.status = status
+            return _safe_snapshot(run_id, session_id, task_id, status)
+        return _safe_snapshot_from_host_snapshot(
+            self.host.snapshot(run_id),
+            fallback_run_id=run_id,
+        )
 
     def _config(self, params: dict[str, Any]) -> ProductionConfig:
         return ProductionConfig.from_cli(
@@ -127,6 +178,80 @@ class SidecarServer:
             base_url=_optional_str(params.get("baseUrl")),
             trace_dir=_optional_path(params.get("traceDir")),
         )
+
+    def _start_background_run(self, run: Any) -> _SidecarRun:
+        holder: dict[str, Any] = {}
+        ready = threading.Event()
+
+        def target() -> None:
+            try:
+                result = run()
+                with self._lock:
+                    current = self._runs.get(result.run_id)
+                    if current is None:
+                        current = _SidecarRun(
+                            run_id=result.run_id,
+                            session_id=result.session_id,
+                            task_id=result.task_id,
+                            status="running",
+                        )
+                        self._runs[result.run_id] = current
+                    current.status = str(result.status)
+                    current.result = result.to_dict()
+                    holder["run"] = current
+            except Exception as exc:  # pragma: no cover - defensive thread boundary
+                holder["error"] = exc
+                snapshot = _latest_snapshot(self.host)
+                if snapshot is not None:
+                    status = "cancelled" if isinstance(exc, CancellationError) else "failed"
+                    with self._lock:
+                        current = self._runs.get(snapshot.run_id)
+                        if current is None:
+                            current = _SidecarRun(
+                                run_id=snapshot.run_id,
+                                session_id=str(snapshot.session_id or snapshot.run_id),
+                                task_id=str(snapshot.task_id or snapshot.run_id),
+                                status=status,
+                            )
+                            self._runs[snapshot.run_id] = current
+                        current.status = status
+                        current.error = exc
+            finally:
+                ready.set()
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + RUN_ID_WAIT_SECONDS
+        snapshot = None
+        while not ready.wait(RUN_ID_POLL_SECONDS):
+            snapshot = _latest_snapshot(self.host)
+            if snapshot is not None or time.monotonic() >= deadline:
+                break
+        if "error" in holder:
+            raise holder["error"]
+        if "run" in holder:
+            return holder["run"]
+        snapshot = snapshot or _latest_snapshot(self.host)
+        if snapshot is None:
+            raise TimeoutError(RUN_ID_DISCOVERY_TIMEOUT_MESSAGE)
+        run_id = snapshot.run_id
+        session_id = str(snapshot.session_id or run_id)
+        task_id = str(snapshot.task_id or run_id)
+        pending = _SidecarRun(
+            run_id=run_id,
+            session_id=session_id,
+            task_id=task_id,
+            status="running",
+            thread=thread,
+        )
+        with self._lock:
+            existing = self._runs.get(run_id)
+            if existing is not None:
+                if existing.thread is None:
+                    existing.thread = thread
+                return existing
+            self._runs[run_id] = pending
+            return pending
 
 
 def _safe_run_result(host: AgentHost, run_id: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -141,6 +266,33 @@ def _safe_run_result(host: AgentHost, run_id: str, result: dict[str, Any]) -> di
         "trace_path": _safe_trace_path(snapshot.get("trace_run_dir")),
         "events": events,
     }
+
+
+def _safe_snapshot(run_id: str, session_id: str, task_id: str, status: str) -> dict[str, Any]:
+    return {
+        "run_id": run_id,
+        "session_id": session_id,
+        "task_id": task_id,
+        "status": status,
+    }
+
+
+def _safe_snapshot_from_host_snapshot(snapshot: Any, *, fallback_run_id: str) -> dict[str, Any]:
+    run_id = str(getattr(snapshot, "run_id", None) or fallback_run_id)
+    return _safe_snapshot(
+        run_id,
+        str(getattr(snapshot, "session_id", None) or run_id),
+        str(getattr(snapshot, "task_id", None) or run_id),
+        str(getattr(snapshot, "status", None) or "unknown"),
+    )
+
+
+def _latest_snapshot(host: AgentHost) -> Any | None:
+    sessions = getattr(host, "_sessions", None)
+    if isinstance(sessions, dict) and sessions:
+        run_id = next(reversed(sessions))
+        return host.snapshot(run_id)
+    return None
 
 
 def _safe_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -186,6 +338,17 @@ def _optional_path(value: Any) -> Path | None:
     if value is None:
         return None
     return Path(str(value)).expanduser()
+
+
+@dataclass
+class _SidecarRun:
+    run_id: str
+    session_id: str
+    task_id: str
+    status: str
+    thread: threading.Thread | None = None
+    result: dict[str, Any] | None = None
+    error: BaseException | None = None
 
 
 @dataclass

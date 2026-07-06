@@ -13,9 +13,10 @@ use singularity_protocol::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
 const DURABLE_LEDGER_SCHEMA_MIGRATION: &str = "0002_durable_ledger";
+const ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION: &str = "0003_active_sidecar_runs";
 const REDACTED_ARTIFACT_VALUE: &str = "[redacted]";
 const SENSITIVE_ARTIFACT_MARKERS: [&str; 5] =
     ["api_key", "authorization", "password", "secret", "token"];
@@ -44,6 +45,18 @@ pub struct SessionStoreDescriptor {
 pub struct SessionStore {
     connection: Connection,
     descriptor: SessionStoreDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ActiveSidecarRun {
+    pub turn_id: String,
+    pub thread_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 impl SessionStore {
@@ -123,6 +136,10 @@ impl SessionStore {
         if changed == 0 {
             return Err(StoreError::NotFound(format!("thread {thread_id}")));
         }
+        transaction.execute(
+            "delete from active_sidecar_runs where thread_id = ?1",
+            params![thread_id],
+        )?;
         transaction.execute(
             "delete from items where turn_id in (select turn_id from turns where thread_id = ?1)",
             params![thread_id],
@@ -241,6 +258,80 @@ impl SessionStore {
             return Err(StoreError::NotFound(format!("turn {turn_id}")));
         }
         self.get_turn(turn_id)
+    }
+
+    pub fn register_active_sidecar_run(
+        &self,
+        turn_id: &str,
+        run_id: &str,
+        session_id: &str,
+        task_id: &str,
+        status: &str,
+    ) -> StoreResult<ActiveSidecarRun> {
+        let turn = self.get_turn(turn_id)?;
+        self.connection.execute(
+            "insert into active_sidecar_runs(
+                turn_id, thread_id, run_id, session_id, task_id, status, created_at, updated_at
+            ) values(?1, ?2, ?3, ?4, ?5, ?6, current_timestamp, current_timestamp)
+            on conflict(turn_id) do update set
+                thread_id = excluded.thread_id,
+                run_id = excluded.run_id,
+                session_id = excluded.session_id,
+                task_id = excluded.task_id,
+                status = excluded.status,
+                updated_at = current_timestamp",
+            params![
+                turn.turn_id,
+                turn.thread_id,
+                run_id,
+                session_id,
+                task_id,
+                status
+            ],
+        )?;
+        self.get_active_sidecar_run(turn_id)
+    }
+
+    pub fn get_active_sidecar_run(&self, turn_id: &str) -> StoreResult<ActiveSidecarRun> {
+        self.connection
+            .query_row(
+                "select turn_id, thread_id, run_id, session_id, task_id, status, created_at, updated_at
+                 from active_sidecar_runs where turn_id = ?1",
+                params![turn_id],
+                active_sidecar_run_from_row,
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("active sidecar run {turn_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })
+    }
+
+    pub fn list_active_sidecar_runs(&self) -> StoreResult<Vec<ActiveSidecarRun>> {
+        let mut statement = self.connection.prepare(
+            "select turn_id, thread_id, run_id, session_id, task_id, status, created_at, updated_at
+             from active_sidecar_runs order by rowid",
+        )?;
+        let rows = statement.query_map([], active_sidecar_run_from_row)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
+
+    pub fn clear_active_sidecar_run(&self, turn_id: &str, _final_status: &str) -> StoreResult<()> {
+        let changed = self.connection.execute(
+            "delete from active_sidecar_runs where turn_id = ?1",
+            params![turn_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!(
+                "active sidecar run {turn_id}"
+            )));
+        }
+        Ok(())
     }
 
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
@@ -644,6 +735,16 @@ impl SessionStore {
                 metadata text not null,
                 redacted integer not null
             );
+            create table if not exists active_sidecar_runs(
+                turn_id text primary key,
+                thread_id text not null,
+                run_id text not null,
+                session_id text not null,
+                task_id text not null,
+                status text not null,
+                created_at text not null default current_timestamp,
+                updated_at text not null default current_timestamp
+            );
             ",
         )?;
         self.ensure_trace_session_id_column()?;
@@ -654,6 +755,10 @@ impl SessionStore {
         self.connection.execute(
             "insert or ignore into schema_migrations(migration_id) values(?1)",
             params![DURABLE_LEDGER_SCHEMA_MIGRATION],
+        )?;
+        self.connection.execute(
+            "insert or ignore into schema_migrations(migration_id) values(?1)",
+            params![ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION],
         )?;
         Ok(())
     }
@@ -787,6 +892,19 @@ fn insert_approval(connection: &Connection, request: &ApprovalRequest) -> StoreR
 
 fn short_id() -> String {
     Uuid::new_v4().simple().to_string()[..12].to_string()
+}
+
+fn active_sidecar_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveSidecarRun> {
+    Ok(ActiveSidecarRun {
+        turn_id: row.get(0)?,
+        thread_id: row.get(1)?,
+        run_id: row.get(2)?,
+        session_id: row.get(3)?,
+        task_id: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
 }
 
 fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRef> {

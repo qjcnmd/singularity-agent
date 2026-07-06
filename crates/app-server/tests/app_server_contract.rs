@@ -638,6 +638,1291 @@ fn app_server_sidecar_trace_projection_contains_only_safe_fields() {
 }
 
 #[test]
+fn turn_lifecycle_status_and_interrupt_cancel_active_sidecar_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_lifecycle.py"),
+        r#"
+import json
+import os
+import pathlib
+import sys
+import time
+
+log_path = pathlib.Path(os.environ["SIDECAR_REQUEST_LOG"])
+status_calls = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(json.dumps({"method": method, "params": params}, sort_keys=True) + "\n")
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/status":
+        status = "completed" if status_calls else "running"
+        status_calls += 1
+        result = {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": status}
+        if status == "completed":
+            result["final_answer"] = "done"
+        print(json.dumps({"id": message["id"], "result": result}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "status": "cancel_requested"}}), flush=True)
+    else:
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "status": "failed"}}), flush=True)
+"#,
+    )
+    .expect("lifecycle sidecar");
+    let request_log = dir.path().join("sidecar_requests.jsonl");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_lifecycle".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: vec![(
+            "SIDECAR_REQUEST_LOG".to_string(),
+            request_log.to_string_lossy().into_owned(),
+        )],
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_result = result_message(&turn);
+    let turn_id = turn_result["turn"]["turn_id"].as_str().unwrap();
+
+    assert_eq!(turn_result["turn"]["status"], "running");
+    assert_eq!(turn_result["turn"]["agent_loop_status"], "running");
+
+    let status = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(status[0]["result"]["turn"]["status"], "running");
+    assert_eq!(status[0]["result"]["turn"]["agent_loop_status"], "running");
+
+    let completed = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":5,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(completed[0]["result"]["turn"]["status"], "completed");
+    assert_eq!(
+        completed[0]["result"]["turn"]["agent_loop_status"],
+        "completed"
+    );
+
+    let trace = server
+        .handle_json(&format!(
+            r#"{{"method":"trace/tail","id":6,"params":{{"runId":"{thread_id}","limit":10}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(
+        trace[0]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["component"] == "python_sidecar")
+            .count(),
+        1
+    );
+    assert!(
+        trace[0]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["payload"]["transition"] == "sidecar_started")
+    );
+
+    let after_terminal = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":7,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(after_terminal[0]["result"]["turn"]["status"], "completed");
+    let requests = std::fs::read_to_string(request_log).expect("request log");
+    let status_calls = requests
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("request"))
+        .filter(|request| request["method"] == "agent/status")
+        .count();
+    assert_eq!(status_calls, 2);
+}
+
+#[test]
+fn turn_lifecycle_interrupt_cancel_active_sidecar_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_interrupt.py"),
+        r#"
+import json
+import os
+import pathlib
+import sys
+
+log_path = pathlib.Path(os.environ["SIDECAR_REQUEST_LOG"])
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(json.dumps({"method": method, "params": params}, sort_keys=True) + "\n")
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "cancel_requested"}}), flush=True)
+    else:
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "status": "running"}}), flush=True)
+"#,
+    )
+    .expect("interrupt sidecar");
+    let request_log = dir.path().join("sidecar_requests.jsonl");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_interrupt".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: vec![(
+            "SIDECAR_REQUEST_LOG".to_string(),
+            request_log.to_string_lossy().into_owned(),
+        )],
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"].as_str().unwrap();
+
+    let interrupted = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(interrupted[0]["result"]["status"], "interrupted");
+    assert_eq!(
+        interrupted[0]["result"]["agent_loop_status"],
+        "cancel_requested"
+    );
+    let requests = std::fs::read_to_string(request_log).expect("request log");
+    let methods = requests
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("request"))
+        .map(|request| request["method"].as_str().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+    assert!(methods.contains(&"agent/cancel".to_string()));
+
+    let trace = server
+        .handle_json(&format!(
+            r#"{{"method":"trace/tail","id":5,"params":{{"runId":"{thread_id}","limit":10}}}}"#
+        ))
+        .unwrap();
+    assert!(
+        trace[0]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["payload"]["transition"] == "cancel_requested")
+    );
+}
+
+#[test]
+fn turn_lifecycle_cancel_not_found_does_not_record_interrupted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_cancel_not_found.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "error": {"code": -32004, "message": "Unknown active run: run_active"}}), flush=True)
+"#,
+    )
+    .expect("cancel not found sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_cancel_not_found".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let interrupted = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert!(
+        interrupted[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown active run")
+    );
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let turn = store.get_turn(&turn_id).expect("turn remains");
+    assert_eq!(turn.status, singularity_protocol::TurnStatus::Running);
+    assert_eq!(turn.agent_loop_status, "running");
+    assert_eq!(
+        store
+            .get_active_sidecar_run(&turn_id)
+            .expect("active row remains")
+            .status,
+        "running"
+    );
+}
+
+#[test]
+fn turn_lifecycle_cancel_not_found_result_does_not_record_interrupted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_cancel_not_found_result.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "not_found"}}), flush=True)
+"#,
+    )
+    .expect("cancel not found result sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_cancel_not_found_result".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let interrupted = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert!(interrupted[0]["error"].is_object());
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let turn = store.get_turn(&turn_id).expect("turn remains");
+    assert_eq!(turn.status, singularity_protocol::TurnStatus::Running);
+    assert_eq!(turn.agent_loop_status, "running");
+    assert_eq!(
+        store
+            .get_active_sidecar_run(&turn_id)
+            .expect("active row remains")
+            .status,
+        "running"
+    );
+}
+
+#[test]
+fn turn_lifecycle_repeated_interrupt_is_idempotent_while_cancel_pending() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_repeat_interrupt.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "cancel_requested"}}), flush=True)
+"#,
+    )
+    .expect("repeat interrupt sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_repeat_interrupt".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"].as_str().unwrap();
+
+    for id in [4, 5] {
+        let interrupted = server
+            .handle_json(&format!(
+                r#"{{"method":"turn/interrupt","id":{id},"params":{{"turnId":"{turn_id}"}}}}"#
+            ))
+            .unwrap();
+
+        assert_eq!(interrupted[0]["result"]["status"], "interrupted");
+        assert_eq!(
+            interrupted[0]["result"]["agent_loop_status"],
+            "cancel_requested"
+        );
+    }
+}
+
+#[test]
+fn turn_lifecycle_drop_preserves_cancelled_turn_status() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_interrupt.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "cancel_requested"}}), flush=True)
+    else:
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "status": "running"}}), flush=True)
+"#,
+    )
+    .expect("interrupt sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_interrupt".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let turn_id = {
+        let mut server = AppServer::new(store).with_python_sidecar(config);
+        server
+            .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+            .unwrap();
+        server
+            .handle_json(r#"{"method":"initialized","params":{}}"#)
+            .unwrap();
+        let thread = server
+            .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+            .unwrap();
+        let thread_id = result_message(&thread)["thread"]["thread_id"]
+            .as_str()
+            .unwrap();
+        let turn = server
+            .handle_json(&format!(
+                r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            ))
+            .unwrap();
+        let turn_id = result_message(&turn)["turn"]["turn_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        server
+            .handle_json(&format!(
+                r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+            ))
+            .unwrap();
+        turn_id
+    };
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let turn = store.get_turn(&turn_id).expect("turn");
+    assert_eq!(turn.status, singularity_protocol::TurnStatus::Interrupted);
+    assert_eq!(turn.agent_loop_status, "cancelled");
+    assert!(store.get_active_sidecar_run(&turn_id).is_err());
+    assert!(
+        store
+            .list_trace(&turn.thread_id)
+            .expect("trace list")
+            .iter()
+            .any(|event| event.payload["transition"] == "interrupted")
+    );
+}
+
+#[test]
+fn turn_lifecycle_status_error_after_cancel_keeps_interrupted_status() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_cancel_then_eof.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "cancel_requested"}}), flush=True)
+    elif method == "agent/status":
+        sys.exit(0)
+"#,
+    )
+    .expect("cancel then eof sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_cancel_then_eof".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+    let status = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":5,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
+    assert_eq!(
+        status[0]["result"]["turn"]["agent_loop_status"],
+        "cancelled"
+    );
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    assert!(store.get_active_sidecar_run(&turn_id).is_err());
+}
+
+#[test]
+fn turn_lifecycle_status_success_after_cancel_keeps_interrupted_status() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_cancel_then_completed.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "cancel_requested"}}), flush=True)
+    elif method == "agent/status":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "completed", "final_answer": "late done"}}), flush=True)
+"#,
+    )
+    .expect("cancel then completed sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_cancel_then_completed".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+    let status = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":5,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
+    assert_eq!(
+        status[0]["result"]["turn"]["agent_loop_status"],
+        "cancelled"
+    );
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    assert!(store.get_active_sidecar_run(&turn_id).is_err());
+    let traces = store.list_trace(thread_id).expect("trace list");
+    assert!(traces.iter().any(|event| {
+        event.component == "python_sidecar" && event.payload["status"] == "cancelled"
+    }));
+    assert!(
+        !traces
+            .iter()
+            .any(|event| event.component == "python_sidecar"
+                && event.payload["status"] == "completed")
+    );
+}
+
+#[test]
+fn turn_lifecycle_status_failed_after_cancel_keeps_cancelled_projection() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_cancel_then_failed.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "cancel_requested"}}), flush=True)
+    elif method == "agent/status":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "failed", "final_answer": "late failure"}}), flush=True)
+"#,
+    )
+    .expect("cancel then failed sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_cancel_then_failed".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+    let status = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":5,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
+    assert_eq!(
+        status[0]["result"]["turn"]["agent_loop_status"],
+        "cancelled"
+    );
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    assert!(store.get_active_sidecar_run(&turn_id).is_err());
+    let traces = store.list_trace(thread_id).expect("trace list");
+    assert!(traces.iter().any(|event| {
+        event.component == "python_sidecar" && event.payload["status"] == "cancelled"
+    }));
+    assert!(!traces
+        .iter()
+        .any(|event| event.component == "python_sidecar" && event.payload["status"] == "failed"));
+}
+
+#[test]
+fn turn_lifecycle_status_after_cancel_requested_keeps_active_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_cancel_pending.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "cancel_requested"}}), flush=True)
+    elif method == "agent/status":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "cancel_requested"}}), flush=True)
+"#,
+    )
+    .expect("cancel pending sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_cancel_pending".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+    let status = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":5,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
+    assert_eq!(
+        status[0]["result"]["turn"]["agent_loop_status"],
+        "cancel_requested"
+    );
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let active = store
+        .get_active_sidecar_run(&turn_id)
+        .expect("active run remains while cancel is pending");
+    assert_eq!(active.status, "cancel_requested");
+}
+
+#[test]
+fn turn_lifecycle_status_running_after_cancel_keeps_cancel_requested_active_row() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_cancel_then_running.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "cancel_requested"}}), flush=True)
+    elif method == "agent/status":
+        print(json.dumps({"id": message["id"], "result": {"run_id": params["runId"], "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+"#,
+    )
+    .expect("cancel then running sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_cancel_then_running".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+    let status = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":5,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
+    assert_eq!(
+        status[0]["result"]["turn"]["agent_loop_status"],
+        "cancel_requested"
+    );
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    assert_eq!(
+        store
+            .get_active_sidecar_run(&turn_id)
+            .expect("active run remains while cancel unwinds")
+            .status,
+        "cancel_requested"
+    );
+}
+
+#[test]
+fn turn_lifecycle_cancel_transport_failure_does_not_record_cancelled() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_cancel_error.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    if method == "agent/run":
+        print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+    elif method == "agent/cancel":
+        print(json.dumps({"id": message["id"], "error": {"code": -32603, "message": "cancel transport failed"}}), flush=True)
+"#,
+    )
+    .expect("cancel error sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_cancel_error".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let interrupted = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert!(
+        interrupted[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cancel transport failed")
+    );
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let turn = store.get_turn(&turn_id).expect("turn");
+    assert_eq!(turn.status, singularity_protocol::TurnStatus::Running);
+    assert_eq!(turn.agent_loop_status, "running");
+    assert_eq!(
+        store
+            .get_active_sidecar_run(&turn_id)
+            .expect("active run")
+            .status,
+        "running"
+    );
+}
+
+#[test]
+fn turn_lifecycle_active_row_without_process_handle_returns_durable_status() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    store
+        .register_active_sidecar_run(
+            &turn.turn_id,
+            "run_orphan",
+            "session_orphan",
+            "task_orphan",
+            "running",
+        )
+        .expect("active run");
+    let mut server = AppServer::new(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    let status = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":2,"params":{{"turnId":"{}"}}}}"#,
+            turn.turn_id
+        ))
+        .unwrap();
+    let interrupt = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":3,"params":{{"turnId":"{}"}}}}"#,
+            turn.turn_id
+        ))
+        .unwrap();
+
+    assert_eq!(status[0]["result"]["turn"]["status"], "running");
+    assert_eq!(status[0]["result"]["turn"]["agent_loop_status"], "running");
+    assert_eq!(interrupt[0]["result"]["status"], "running");
+    assert_eq!(interrupt[0]["result"]["agent_loop_status"], "running");
+    drop(server);
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let turn = store.get_turn(&turn.turn_id).expect("turn");
+    assert_eq!(turn.status, singularity_protocol::TurnStatus::Running);
+    assert_eq!(turn.agent_loop_status, "running");
+}
+
+#[test]
+fn thread_delete_cleans_active_sidecar_run_before_deleting_rows() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_running.py"),
+        r#"
+import json
+import sys
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+"#,
+    )
+    .expect("running sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_running".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let deleted = server
+        .handle_json(&format!(
+            r#"{{"method":"thread/delete","id":4,"params":{{"threadId":"{thread_id}"}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(deleted[0]["result"]["deleted"], true);
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    assert!(store.get_thread(&thread_id).is_err());
+    assert!(store.get_turn(&turn_id).is_err());
+    assert!(store.get_active_sidecar_run(&turn_id).is_err());
+}
+
+#[test]
+fn server_shutdown_cleans_active_sidecar_runs() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_running.py"),
+        r#"
+import json
+import sys
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+"#,
+    )
+    .expect("running sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_running".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+        ))
+        .unwrap();
+    let turn_id = result_message(&turn)["turn"]["turn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let shutdown = server
+        .handle_json(r#"{"method":"server/shutdown","id":4,"params":{}}"#)
+        .unwrap();
+
+    assert_eq!(shutdown[0]["result"]["shutdown"], true);
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let turn = store.get_turn(&turn_id).expect("turn");
+    assert_eq!(turn.status, singularity_protocol::TurnStatus::Failed);
+    assert_eq!(turn.agent_loop_status, "failed");
+    assert!(store.get_active_sidecar_run(&turn_id).is_err());
+}
+
+#[test]
+fn turn_lifecycle_interrupt_on_terminal_turn_is_idempotent() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "completed")
+        .expect("turn");
+    store
+        .update_turn_state(
+            &turn.turn_id,
+            singularity_protocol::TurnStatus::Completed,
+            "completed",
+        )
+        .expect("completed turn");
+    let mut server = AppServer::new(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    let interrupted = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/interrupt","id":2,"params":{{"turnId":"{}"}}}}"#,
+            turn.turn_id
+        ))
+        .unwrap();
+    let status = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":3,"params":{{"turnId":"{}"}}}}"#,
+            turn.turn_id
+        ))
+        .unwrap();
+
+    assert_eq!(interrupted[0]["result"]["status"], "completed");
+    assert_eq!(status[0]["result"]["turn"]["status"], "completed");
+    assert_eq!(
+        status[0]["result"]["turn"]["agent_loop_status"],
+        "completed"
+    );
+}
+
+#[test]
+fn turn_lifecycle_drop_cleans_active_sidecar_run_on_app_server_exit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_running.py"),
+        r#"
+import json
+import sys
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
+"#,
+    )
+    .expect("running sidecar");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_running".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let turn_id = {
+        let mut server = AppServer::new(store).with_python_sidecar(config);
+        server
+            .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+            .unwrap();
+        server
+            .handle_json(r#"{"method":"initialized","params":{}}"#)
+            .unwrap();
+        let thread = server
+            .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+            .unwrap();
+        let thread_id = result_message(&thread)["thread"]["thread_id"]
+            .as_str()
+            .unwrap();
+        let turn = server
+            .handle_json(&format!(
+                r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            ))
+            .unwrap();
+        result_message(&turn)["turn"]["turn_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let turn = store.get_turn(&turn_id).expect("turn");
+    assert_eq!(turn.status, singularity_protocol::TurnStatus::Failed);
+    assert_eq!(turn.agent_loop_status, "failed");
+    assert!(store.get_active_sidecar_run(&turn_id).is_err());
+    assert!(
+        store
+            .list_trace(&turn.thread_id)
+            .expect("trace list")
+            .iter()
+            .any(|event| event.payload["transition"] == "cleanup")
+    );
+}
+
+#[test]
 fn app_server_binary_errors_are_valid_json_rpc_lines() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");

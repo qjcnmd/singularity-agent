@@ -3,6 +3,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,6 +19,7 @@ const SIDECAR_METHOD_HEALTH: &str = "agent/health";
 const SIDECAR_COMPONENT: &str = "python_sidecar";
 const DEFAULT_PYTHON_BIN: &str = "python";
 const DEFAULT_SIDECAR_MODULE: &str = "singularity.agent_host.sidecar";
+const DEFAULT_SIDECAR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_AGENT_LOOP_UNAVAILABLE_REASON: &str =
     "native Rust AgentLoop is not migrated; use Python sidecar as migration oracle";
 const NATIVE_AGENT_LOOP_MISSING_BOUNDARIES: [&str; 6] = [
@@ -32,6 +36,7 @@ const NATIVE_AGENT_LOOP_MISSING_BOUNDARIES: [&str; 6] = [
 pub enum AgentHostStatus {
     NotMigrated,
     Running,
+    CancelRequested,
     Completed,
     Blocked,
     Cancelled,
@@ -43,6 +48,7 @@ impl AgentHostStatus {
         match self {
             Self::NotMigrated => "not_migrated",
             Self::Running => "running",
+            Self::CancelRequested => "cancel_requested",
             Self::Completed => "completed",
             Self::Blocked => "blocked",
             Self::Cancelled => "cancelled",
@@ -55,6 +61,7 @@ impl From<&str> for AgentHostStatus {
     fn from(value: &str) -> Self {
         match value {
             "running" => Self::Running,
+            "cancel_requested" => Self::CancelRequested,
             "completed" => Self::Completed,
             "blocked" => Self::Blocked,
             "cancelled" | "canceled" => Self::Cancelled,
@@ -185,6 +192,22 @@ pub struct PythonSidecarRunResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PythonSidecarStatus {
+    pub run_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_path: Option<String>,
+    #[serde(default)]
+    pub events: Vec<SidecarRunEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SidecarRunEvent {
     pub event_id: String,
     pub event_type: String,
@@ -281,12 +304,21 @@ pub struct FinalizationMappingBoundary {
 pub struct PythonSidecarClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: Receiver<Result<String, String>>,
+    stdout_reader: Option<JoinHandle<()>>,
     next_id: i64,
+    response_timeout: Duration,
 }
 
 impl PythonSidecarClient {
     pub fn spawn(config: &PythonSidecarConfig) -> Result<Self, String> {
+        Self::spawn_with_response_timeout(config, DEFAULT_SIDECAR_RESPONSE_TIMEOUT)
+    }
+
+    pub fn spawn_with_response_timeout(
+        config: &PythonSidecarConfig,
+        response_timeout: Duration,
+    ) -> Result<Self, String> {
         let mut command = Command::new(&config.python_bin);
         command
             .args(["-m", &config.module])
@@ -311,11 +343,14 @@ impl PythonSidecarClient {
             .stdout
             .take()
             .ok_or_else(|| "Python sidecar stdout unavailable".to_string())?;
+        let (stdout, stdout_reader) = spawn_stdout_reader(stdout);
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout,
+            stdout_reader: Some(stdout_reader),
             next_id: 1,
+            response_timeout,
         })
     }
 
@@ -344,12 +379,16 @@ impl PythonSidecarClient {
             .map_err(|error| format!("invalid sidecar run result: {error}"))
     }
 
-    pub fn cancel(&mut self, run_id: &str) -> Result<Value, String> {
-        self.request(SIDECAR_METHOD_CANCEL, json!({"runId": run_id}))
+    pub fn cancel(&mut self, run_id: &str) -> Result<PythonSidecarStatus, String> {
+        let value = self.request(SIDECAR_METHOD_CANCEL, json!({"runId": run_id}))?;
+        serde_json::from_value(value)
+            .map_err(|error| format!("invalid sidecar cancel result: {error}"))
     }
 
-    pub fn status(&mut self, run_id: &str) -> Result<Value, String> {
-        self.request(SIDECAR_METHOD_STATUS, json!({"runId": run_id}))
+    pub fn status(&mut self, run_id: &str) -> Result<PythonSidecarStatus, String> {
+        let value = self.request(SIDECAR_METHOD_STATUS, json!({"runId": run_id}))?;
+        serde_json::from_value(value)
+            .map_err(|error| format!("invalid sidecar status result: {error}"))
     }
 
     pub fn health(&mut self) -> Result<Value, String> {
@@ -379,14 +418,24 @@ impl PythonSidecarClient {
     }
 
     fn read_response(&mut self) -> Result<Value, String> {
-        let mut line = String::new();
-        let bytes = self
-            .stdout
-            .read_line(&mut line)
-            .map_err(|error| format!("failed to read Python sidecar response: {error}"))?;
-        if bytes == 0 {
-            return Err("Python sidecar closed stdout".to_string());
-        }
+        let line = match self.stdout.recv_timeout(self.response_timeout) {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => return Err(error),
+            Err(RecvTimeoutError::Timeout) => {
+                self.terminate_child();
+                return Err("timed out waiting for Python sidecar response".to_string());
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(status) = self
+                    .child
+                    .try_wait()
+                    .map_err(|error| format!("failed to poll Python sidecar status: {error}"))?
+                {
+                    return Err(format!("Python sidecar exited before response: {status}"));
+                }
+                return Err("Python sidecar closed stdout".to_string());
+            }
+        };
         serde_json::from_str(line.trim())
             .map_err(|error| format!("invalid Python sidecar JSON: {error}"))
     }
@@ -396,13 +445,45 @@ impl PythonSidecarClient {
         self.next_id += 1;
         id
     }
+
+    fn terminate_child(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for PythonSidecarClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.terminate_child();
+        if let Some(stdout_reader) = self.stdout_reader.take() {
+            let _ = stdout_reader.join();
+        }
     }
+}
+
+fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<Result<String, String>>, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(format!(
+                        "failed to read Python sidecar response: {error}"
+                    )));
+                    break;
+                }
+            }
+        }
+    });
+    (receiver, handle)
 }
 
 pub fn sidecar_trace_summary(bridge: &AgentLoopStatusBridge) -> Value {
