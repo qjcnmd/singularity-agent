@@ -3,6 +3,27 @@ use singularity_app_server::AppServer;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_store::SessionStore;
 
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn test_python_bin() -> String {
+    let root = workspace_root();
+    let candidates = [
+        root.join(".venv").join("Scripts").join("python.exe"),
+        root.join(".venv").join("bin").join("python"),
+    ];
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "python".to_string())
+}
+
 #[test]
 fn app_server_enforces_initialize_and_emits_item_events() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -353,13 +374,9 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
 fn app_server_can_translate_python_sidecar_completion_when_enabled() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let python_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|path| path.parent())
-        .expect("workspace root")
-        .join("src");
+    let python_path = workspace_root().join("src");
     let config = PythonSidecarConfig {
-        python_bin: "python".to_string(),
+        python_bin: test_python_bin(),
         module: "singularity.agent_host.sidecar".to_string(),
         project_root: dir.path().to_path_buf(),
         python_path: Some(python_path),
