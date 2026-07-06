@@ -255,20 +255,20 @@ impl AppServer {
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnStartParams = message.params_as()?;
-        if let Err(error) = self.store.get_thread(&params.thread_id) {
-            return match error {
-                StoreError::NotFound(_) => not_found_response(message.id, THREAD_NOT_FOUND),
-                other => Err(other.into()),
-            };
-        }
-        let bridge = self.run_python_sidecar_if_enabled(&params);
+        let thread = match self.store.get_thread(&params.thread_id) {
+            Ok(thread) => thread,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.id, THREAD_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let payload = serde_json::to_value(&params.input)?;
         let (turn, item, _trace) = match self.store.create_turn_with_input_and_trace(
             &params.thread_id,
-            bridge.status.as_str(),
+            singularity_agent::AgentHostStatus::NotMigrated.as_str(),
             payload,
             "app_server",
-            "turn started without migrated AgentLoop",
+            "turn started",
         ) {
             Ok(result) => result,
             Err(StoreError::NotFound(_)) => {
@@ -276,22 +276,27 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        self.append_sidecar_trace(&params.thread_id, &turn.turn_id, &bridge)?;
-        let turn = self.update_turn_from_bridge(turn, &bridge)?;
-        let agent_delta = bridge
-            .final_answer
-            .as_deref()
-            .or(bridge.error.as_deref())
-            .unwrap_or("input accepted");
 
         let mut messages = Vec::new();
-        for event in [
-            AppEvent::turn_started(&turn),
-            AppEvent::item_started(item.item_id.clone()),
-            AppEvent::item_agent_message_delta(item.item_id.clone(), agent_delta),
-            AppEvent::item_completed(item.item_id.clone()),
-        ] {
-            messages.extend(self.event_notification(event));
+        messages.extend(self.event_notification(AppEvent::turn_started(&turn)));
+
+        let previous_session_id = self.previous_python_session_id(&params.thread_id);
+        let bridge = self.run_python_sidecar_if_enabled(
+            &params,
+            thread.model.as_deref(),
+            previous_session_id.as_deref(),
+        );
+        self.append_sidecar_trace(&params.thread_id, &turn.turn_id, &bridge)?;
+        let turn = self.update_turn_from_bridge(turn, &bridge)?;
+
+        if let Some(agent_delta) = bridge.final_answer.as_deref().or(bridge.error.as_deref()) {
+            for event in [
+                AppEvent::item_started(item.item_id.clone()),
+                AppEvent::item_agent_message_delta(item.item_id.clone(), agent_delta),
+                AppEvent::item_completed(item.item_id.clone()),
+            ] {
+                messages.extend(self.event_notification(event));
+            }
         }
         messages.push(
             JsonRpcMessage::response(
@@ -303,7 +308,12 @@ impl AppServer {
         Ok(messages)
     }
 
-    fn run_python_sidecar_if_enabled(&self, params: &TurnStartParams) -> AgentLoopStatusBridge {
+    fn run_python_sidecar_if_enabled(
+        &self,
+        params: &TurnStartParams,
+        model: Option<&str>,
+        previous_session_id: Option<&str>,
+    ) -> AgentLoopStatusBridge {
         let Some(config) = &self.python_sidecar else {
             return AgentLoopStatusBridge::not_migrated();
         };
@@ -315,7 +325,14 @@ impl AppServer {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        match PythonSidecarClient::spawn(config).and_then(|mut client| client.run_agent(&goal)) {
+        let result = PythonSidecarClient::spawn(config).and_then(|mut client| {
+            if let Some(session_id) = previous_session_id {
+                client.resume_agent(session_id, &goal, model)
+            } else {
+                client.run_agent(&goal, model)
+            }
+        });
+        match result {
             Ok(result) => AgentLoopStatusBridge::from_sidecar(result),
             Err(error) => AgentLoopStatusBridge::failed(error),
         }
@@ -339,15 +356,36 @@ impl AppServer {
             singularity_agent::AgentHostStatus::Cancelled => {
                 Some(singularity_protocol::TurnStatus::Interrupted)
             }
-            singularity_agent::AgentHostStatus::NotMigrated
-            | singularity_agent::AgentHostStatus::Running => None,
+            singularity_agent::AgentHostStatus::Running => {
+                Some(singularity_protocol::TurnStatus::Running)
+            }
+            singularity_agent::AgentHostStatus::NotMigrated => None,
         };
         let Some(status) = status else {
             return Ok(turn);
         };
         self.store
-            .update_turn_status(&turn.turn_id, status)
+            .update_turn_state(&turn.turn_id, status, bridge.status.as_str())
             .map_err(Into::into)
+    }
+
+    fn previous_python_session_id(&self, thread_id: &str) -> Option<String> {
+        self.store
+            .list_trace(thread_id)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find_map(|event| {
+                if event.component != "python_sidecar" {
+                    return None;
+                }
+                event
+                    .payload
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(str::to_string)
+            })
     }
 
     fn append_sidecar_trace(

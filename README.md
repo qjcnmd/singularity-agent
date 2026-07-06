@@ -6,7 +6,8 @@ Singularity 是本地优先的 CLI coding agent harness。当前工作树只描�
 
 - 产品名：`Singularity`
 - Python 包：`singularity`
-- CLI 入口：`singularity-agent`、`sg`
+- Rust CLI-first 入口：Cargo/build artifact 中的 `sg`，通过 `crates/app-server` 的 JSON-RPC 协议运行
+- Python legacy/oracle 入口：`singularity-agent`、Python console script `sg`
 - 环境变量前缀：`SINGULARITY_`
 - 项目本地状态目录：`.singularity/`
 
@@ -91,7 +92,21 @@ singularity-agent "inspect and verify this project" \
 
 ## CLI
 
-运行一次真实 agent：
+Rust CLI-first 路径通过 app-server 协议运行。默认只创建 Rust thread/turn 并显示 `agent_loop_status=not_migrated`；需要进入当前 Python AgentLoop sidecar 时使用 `--agent-host python`，不要求手动设置 `SINGULARITY_PYTHON_SIDECAR=1`：
+
+```bash
+cargo run -p singularity_cli --bin sg -- run "inspect the current project" --model gpt-4.1-mini --agent-host python
+cargo run -p singularity_cli --bin sg -- continue <thread-id> "follow up" --agent-host python
+cargo run -p singularity_cli --bin sg -- turn status <turn-id>
+cargo run -p singularity_cli --bin sg -- trace <thread-or-run-id> --limit 20
+cargo run -p singularity_cli --bin sg -- trace show <event-id>
+cargo run -p singularity_cli --bin sg -- approvals
+cargo run -p singularity_cli --bin sg -- approve <request-id> --decision allow --reason "operator approved"
+```
+
+M1 的 Python sidecar 调用是同步 app-server request：`turn/start` 会先把 Rust turn、user item 和 turn trace 写入 SQLite，再调用 `agent/run`；同一 Rust thread 上已有 `python_sidecar` trace 的 `session_id` 时，后续 `sg continue --agent-host python` 调用 `agent/resume`。`--model` 写入 Rust thread，并作为 sidecar `model` 参数进入 Python `ProductionConfig`。默认 no-sidecar 路径只显示 `not_migrated` turn，不输出伪 assistant delta。
+
+Python legacy/oracle 路径仍用于迁移期对照和真实 evaluation。运行一次 Python agent：
 
 ```bash
 singularity-agent "inspect the current project" \

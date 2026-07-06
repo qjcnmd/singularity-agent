@@ -69,6 +69,62 @@ fn sidecar_result_maps_agent_loop_status_without_raw_payloads() {
 }
 
 #[test]
+fn sidecar_result_ignores_raw_payload_and_metadata_fields() {
+    let value = serde_json::json!({
+        "run_id": "run_1",
+        "session_id": "session_1",
+        "task_id": "task_1",
+        "status": "completed",
+        "final_answer": "done",
+        "trace_path": "run_1",
+        "events": [
+            {
+                "event_id": "event_1",
+                "event_type": "lifecycle.run.started",
+                "summary": "started",
+                "component": "kernel",
+                "severity": "info",
+                "sequence": 0,
+                "raw_prompt": "do not project",
+                "raw_response": "do not project",
+                "raw_arguments": {"path": ".env"},
+                "provider_response": {"token": "secret"},
+                "metadata": {"api_key": "secret"}
+            }
+        ],
+        "raw_prompt": "do not project",
+        "raw_response": "do not project",
+        "raw_arguments": {"path": ".env"},
+        "provider_response": {"token": "secret"},
+        "metadata": {"api_key": "secret"}
+    });
+
+    let result: PythonSidecarRunResult =
+        serde_json::from_value(value).expect("unknown sidecar fields are ignored");
+    let bridge = AgentLoopStatusBridge::from_sidecar(result);
+    let summary = sidecar_trace_summary(&bridge);
+    let summary_text = summary.to_string().to_lowercase();
+
+    assert_eq!(bridge.status, AgentHostStatus::Completed);
+    assert_eq!(bridge.events.len(), 1);
+    for marker in [
+        "raw_prompt",
+        "raw_response",
+        "raw_arguments",
+        "provider_response",
+        "metadata",
+        "api_key",
+        "token",
+        "secret",
+    ] {
+        assert!(
+            !summary_text.contains(marker),
+            "sidecar trace summary leaked {marker}: {summary_text}"
+        );
+    }
+}
+
+#[test]
 fn sidecar_status_mapping_preserves_blocked_and_cancelled() {
     assert_eq!(AgentHostStatus::from("blocked"), AgentHostStatus::Blocked);
     assert_eq!(

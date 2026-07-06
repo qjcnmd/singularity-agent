@@ -70,22 +70,50 @@ def test_sidecar_rejects_invalid_json_and_missing_goal(tmp_path: Path) -> None:
     assert "goal is required" in missing_goal["error"]["message"]
 
 
+def test_sidecar_resume_uses_agent_host_resume_run_and_model(tmp_path: Path) -> None:
+    host = _FakeHost()
+    server = SidecarServer(tmp_path, host=host)
+
+    result = server.handle(
+        {
+            "id": 1,
+            "method": "agent/resume",
+            "params": {
+                "sessionId": "session_previous",
+                "goal": "continue task",
+                "model": "gpt-test",
+            },
+        }
+    )["result"]
+
+    assert result["session_id"] == "session_previous"
+    assert host.resume_calls == [("session_previous", "continue task", "gpt-test")]
+
+
 class _FakeHost:
     def __init__(self, *, final_answer: str = "done", summary: str = "started") -> None:
         self.final_answer = final_answer
         self.summary = summary
+        self.resume_calls: list[tuple[str, str, str | None]] = []
 
     def start_run(self, _goal: str, *, config: Any) -> SimpleNamespace:
         assert config.interaction_mode.value == "non_interactive"
+        return self._run_result("session_1")
+
+    def resume_run(self, session_id: str, goal: str, *, config: Any) -> SimpleNamespace:
+        self.resume_calls.append((session_id, goal, config.model))
+        return self._run_result(session_id)
+
+    def _run_result(self, session_id: str) -> SimpleNamespace:
         return SimpleNamespace(
             run_id="run_1",
-            session_id="session_1",
+            session_id=session_id,
             task_id="task_1",
             status="completed",
             final_answer=self.final_answer,
             to_dict=lambda: {
                 "run_id": "run_1",
-                "session_id": "session_1",
+                "session_id": session_id,
                 "task_id": "task_1",
                 "status": "completed",
                 "final_answer": self.final_answer,

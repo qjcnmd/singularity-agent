@@ -130,6 +130,16 @@ python scripts/verify_stage.py
 
 Stage gate 执行 deterministic 检查：mypy、ruff、`compileall src scripts`、`scripts/verify_runtime_docs.py`、过滤后的 pytest，以及 evaluation runner / test impact / quality gate 专项测试。它输出 ruff/mypy/compileall/pytest/runtime docs 分项耗时，但不默认跑多个真实 provider eval。
 
+### Rust CLI Agent Host Smoke
+
+Rust CLI-first 迁移相关改动需要验证 Rust `sg` 仍只通过 app-server JSON-RPC 进入 Python sidecar，不依赖 CLI 直接调用 Python AgentLoop 内部对象。重复 smoke 命令：
+
+```bash
+python scripts/verify_rust_cli_agent_host.py
+```
+
+该 smoke 使用 `SINGULARITY_SIDECAR_TEST_MODE=completed`，验证 `cargo run -p singularity_cli --bin sg -- run ... --agent-host python` 能启动 app-server、启动 Python sidecar、渲染 completed turn/assistant 输出，并通过 `sg trace <thread-id>` 看到 `python_sidecar` trace。它只证明 Rust transport/sidecar route，不替代真实 provider evaluation。
+
 ### Capability Gate（核心链路变更）
 
 只有影响 AgentLoop、ToolProtocol、sandbox、context、compaction、verification、CompletionGate、FinalReport 或 evaluation runner 时运行：

@@ -5,19 +5,22 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use singularity_core::ClientInfo;
 use singularity_protocol::{InitializeParams, JsonRpcMessage, Method};
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
+const PYTHON_SIDECAR_ENV: &str = "SINGULARITY_PYTHON_SIDECAR";
+const PYTHON_SIDECAR_PROJECT_ROOT_ENV: &str = "SINGULARITY_SIDECAR_PROJECT_ROOT";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const CLI_CLIENT_NAME: &str = "singularity_cli";
 const CLI_CLIENT_TITLE: &str = "Singularity Rust CLI";
 const CLI_CLIENT_VERSION: &str = "0.1.0";
 const DEFAULT_TRACE_TAIL_LIMIT: usize = 20;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const AGENT_HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
@@ -46,25 +49,40 @@ enum Command {
         goal: String,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long, value_enum)]
+        agent_host: Option<AgentHost>,
     },
     /// Alias for run with chat-oriented wording.
     Chat {
         goal: String,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long, value_enum)]
+        agent_host: Option<AgentHost>,
     },
     /// Resume an existing thread and submit a new user turn.
     Continue {
         thread_id: String,
         instruction: String,
+        #[arg(long, value_enum)]
+        agent_host: Option<AgentHost>,
+    },
+    /// Inspect or interrupt a turn through the app-server protocol.
+    Turn {
+        #[command(subcommand)]
+        command: TurnCommand,
     },
     /// List persisted threads through the app-server protocol.
     Threads,
     /// Render trace events for a thread or run id.
-    Trace {
-        run_id: String,
+    Trace(TraceArgs),
+    /// Record an approval decision through the app-server protocol.
+    Approve {
+        request_id: String,
+        #[arg(long, value_enum)]
+        decision: ApprovalDecisionArg,
         #[arg(long)]
-        limit: Option<usize>,
+        reason: Option<String>,
     },
     /// List pending approvals through the app-server protocol.
     Approvals,
@@ -79,6 +97,51 @@ enum Command {
 enum ConfigCommand {
     /// Print app-server client diagnostics.
     Doctor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AgentHost {
+    Python,
+}
+
+#[derive(Debug, Subcommand)]
+enum TurnCommand {
+    /// Print the current turn status.
+    Status { turn_id: String },
+    /// Interrupt a running turn.
+    Interrupt { turn_id: String },
+}
+
+#[derive(Debug, Parser)]
+struct TraceArgs {
+    #[command(subcommand)]
+    command: Option<TraceCommand>,
+    run_id: Option<String>,
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Subcommand)]
+enum TraceCommand {
+    /// Show one trace event by id.
+    Show { event_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ApprovalDecisionArg {
+    Allow,
+    Deny,
+    Defer,
+}
+
+impl ApprovalDecisionArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Defer => "defer",
+        }
+    }
 }
 
 fn main() {
@@ -97,8 +160,17 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             json!({"model": model}),
         )),
         Command::Daemon { db } => run_daemon(db),
-        Command::Run { goal, model } | Command::Chat { goal, model } => {
-            let mut client = AppServerClient::spawn()?;
+        Command::Run {
+            goal,
+            model,
+            agent_host,
+        }
+        | Command::Chat {
+            goal,
+            model,
+            agent_host,
+        } => {
+            let mut client = AppServerClient::spawn(agent_host)?;
             client.initialize()?;
             let thread = client.thread_start(model)?;
             println!(
@@ -111,28 +183,53 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         Command::Continue {
             thread_id,
             instruction,
+            agent_host,
         } => {
-            let mut client = AppServerClient::spawn()?;
+            let mut client = AppServerClient::spawn(agent_host)?;
             client.initialize()?;
             client.thread_read(&thread_id)?;
             println!("thread {thread_id}");
             client.turn_start(&thread_id, &instruction)?;
             Ok(())
         }
+        Command::Turn { command } => {
+            let mut client = AppServerClient::spawn(None)?;
+            client.initialize()?;
+            match command {
+                TurnCommand::Status { turn_id } => client.turn_status(&turn_id),
+                TurnCommand::Interrupt { turn_id } => client.turn_interrupt(&turn_id),
+            }
+        }
         Command::Threads => {
-            let mut client = AppServerClient::spawn()?;
+            let mut client = AppServerClient::spawn(None)?;
             client.initialize()?;
             client.thread_list()?;
             Ok(())
         }
-        Command::Trace { run_id, limit } => {
-            let mut client = AppServerClient::spawn()?;
+        Command::Trace(args) => {
+            let mut client = AppServerClient::spawn(None)?;
             client.initialize()?;
-            client.trace_tail(&run_id, limit.unwrap_or(DEFAULT_TRACE_TAIL_LIMIT))?;
-            Ok(())
+            match args.command {
+                Some(TraceCommand::Show { event_id }) => client.trace_show(&event_id),
+                None => {
+                    let run_id = args
+                        .run_id
+                        .ok_or_else(|| "trace requires a run id or subcommand".to_string())?;
+                    client.trace_tail(&run_id, args.limit.unwrap_or(DEFAULT_TRACE_TAIL_LIMIT))
+                }
+            }
+        }
+        Command::Approve {
+            request_id,
+            decision,
+            reason,
+        } => {
+            let mut client = AppServerClient::spawn(None)?;
+            client.initialize()?;
+            client.approval_decision(&request_id, decision, reason.as_deref().unwrap_or(""))
         }
         Command::Approvals => {
-            let mut client = AppServerClient::spawn()?;
+            let mut client = AppServerClient::spawn(None)?;
             client.initialize()?;
             client.approvals()?;
             Ok(())
@@ -173,16 +270,28 @@ struct AppServerClient {
     stdin: Option<ChildStdin>,
     stdout: Receiver<Result<String, String>>,
     stdout_reader: Option<JoinHandle<()>>,
+    response_timeout: Duration,
     next_id: i64,
 }
 
 impl AppServerClient {
-    fn spawn() -> Result<Self, String> {
+    fn spawn(agent_host: Option<AgentHost>) -> Result<Self, String> {
         let mut command = ProcessCommand::new(app_server_bin());
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
             command.env(APP_SERVER_DB_ENV, db);
         }
+        let response_timeout = if matches!(agent_host, Some(AgentHost::Python)) {
+            command.env(PYTHON_SIDECAR_ENV, "1");
+            if std::env::var_os(PYTHON_SIDECAR_PROJECT_ROOT_ENV).is_none() {
+                let cwd = std::env::current_dir()
+                    .map_err(|error| format!("failed to resolve current directory: {error}"))?;
+                command.env(PYTHON_SIDECAR_PROJECT_ROOT_ENV, cwd);
+            }
+            AGENT_HOST_RESPONSE_TIMEOUT
+        } else {
+            RESPONSE_TIMEOUT
+        };
         let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start app-server: {error}"))?;
@@ -200,6 +309,7 @@ impl AppServerClient {
             stdin: Some(stdin),
             stdout,
             stdout_reader: Some(stdout_reader),
+            response_timeout,
             next_id: 1,
         })
     }
@@ -217,7 +327,7 @@ impl AppServerClient {
             json!(id),
             json!({"model": model}),
         ))?;
-        render_messages(&responses);
+        render_messages(&responses, false);
         first_result(responses)
     }
 
@@ -237,7 +347,12 @@ impl AppServerClient {
             json!(id),
             json!({"threadId": thread_id, "input": [{"type": "text", "text": text}]}),
         ))?;
-        render_messages(&responses);
+        let turn = first_result_ref(&responses)?;
+        render_messages(&responses, should_render_assistant_alias(&turn["turn"]));
+        if should_render_response_turn(&responses, &turn["turn"]) {
+            render_turn(&turn["turn"]);
+        }
+        fail_for_failed_turn(&turn["turn"])?;
         Ok(())
     }
 
@@ -260,6 +375,32 @@ impl AppServerClient {
         Ok(())
     }
 
+    fn turn_status(&mut self, turn_id: &str) -> Result<(), String> {
+        let id = self.next_request_id();
+        let result = first_result(self.request(JsonRpcMessage::request(
+            Method::TurnStatus,
+            json!(id),
+            json!({"turnId": turn_id}),
+        ))?)?;
+        render_turn(&result["turn"]);
+        Ok(())
+    }
+
+    fn turn_interrupt(&mut self, turn_id: &str) -> Result<(), String> {
+        let id = self.next_request_id();
+        let result = first_result(self.request(JsonRpcMessage::request(
+            Method::TurnInterrupt,
+            json!(id),
+            json!({"turnId": turn_id}),
+        ))?)?;
+        println!(
+            "turn {} {}",
+            result["turnId"].as_str().unwrap_or(turn_id),
+            result["status"].as_str().unwrap_or("")
+        );
+        Ok(())
+    }
+
     fn trace_tail(&mut self, run_id: &str, limit: usize) -> Result<(), String> {
         let id = self.next_request_id();
         let result = first_result(self.request(JsonRpcMessage::request(
@@ -269,13 +410,20 @@ impl AppServerClient {
         ))?)?;
         if let Some(events) = result["events"].as_array() {
             for event in events {
-                println!(
-                    "{} {}",
-                    event["event_id"].as_str().unwrap_or(""),
-                    event["summary"].as_str().unwrap_or("")
-                );
+                render_trace_event(event);
             }
         }
+        Ok(())
+    }
+
+    fn trace_show(&mut self, event_id: &str) -> Result<(), String> {
+        let id = self.next_request_id();
+        let result = first_result(self.request(JsonRpcMessage::request(
+            Method::TraceShow,
+            json!(id),
+            json!({"eventId": event_id}),
+        ))?)?;
+        render_trace_event(&result["event"]);
         Ok(())
     }
 
@@ -298,6 +446,33 @@ impl AppServerClient {
         Ok(())
     }
 
+    fn approval_decision(
+        &mut self,
+        request_id: &str,
+        decision: ApprovalDecisionArg,
+        reason: &str,
+    ) -> Result<(), String> {
+        let id = self.next_request_id();
+        let outcome = decision.as_str();
+        let result = first_result(self.request(JsonRpcMessage::request(
+            Method::ApprovalDecision,
+            json!(id),
+            json!({
+                "request_id": request_id,
+                "decision_id": format!("{request_id}_decision"),
+                "outcome": outcome,
+                "reason": reason,
+            }),
+        ))?)?;
+        let decision = &result["decision"];
+        println!(
+            "approval {} {}",
+            decision["request_id"].as_str().unwrap_or(request_id),
+            decision["outcome"].as_str().unwrap_or(outcome)
+        );
+        Ok(())
+    }
+
     fn request(&mut self, message: JsonRpcMessage) -> Result<Vec<Value>, String> {
         let id = message
             .id
@@ -306,7 +481,7 @@ impl AppServerClient {
         self.write_message(&message)?;
         let mut messages = Vec::new();
         loop {
-            let value = self.read_message(RESPONSE_TIMEOUT)?;
+            let value = self.read_message(self.response_timeout)?;
             if value.get("id") == Some(&id) {
                 if value.get("error").is_some() {
                     return Err(format!("app-server error: {}", value["error"]["message"]));
@@ -423,7 +598,20 @@ fn first_result(messages: Vec<Value>) -> Result<Value, String> {
         .ok_or_else(|| "app-server response did not include result".to_string())
 }
 
-fn render_messages(messages: &[Value]) {
+fn first_result_ref(messages: &[Value]) -> Result<&Value, String> {
+    messages
+        .iter()
+        .find_map(|message| message.get("result"))
+        .ok_or_else(|| "app-server response did not include result".to_string())
+}
+
+fn has_method(messages: &[Value], method: &str) -> bool {
+    messages
+        .iter()
+        .any(|message| message["method"].as_str() == Some(method))
+}
+
+fn render_messages(messages: &[Value], render_assistant_alias: bool) {
     for message in messages {
         if let Some(method) = message["method"].as_str() {
             match method {
@@ -436,6 +624,7 @@ fn render_messages(messages: &[Value]) {
                     if let Some(turn_id) = message["params"]["turn"]["turn_id"].as_str() {
                         println!("turn/started {turn_id}");
                     }
+                    render_turn(&message["params"]["turn"]);
                 }
                 "item/started" | "item/completed" => {
                     if let Some(item_id) = message["params"]["item"]["item_id"].as_str() {
@@ -443,18 +632,62 @@ fn render_messages(messages: &[Value]) {
                     }
                 }
                 "item/agentMessage/delta" | "item/commandExecution/outputDelta" => {
-                    println!(
-                        "{method} {}",
-                        message["params"]["delta"]
-                            .as_str()
-                            .or_else(|| message["params"]["output"].as_str())
-                            .unwrap_or("")
-                    );
+                    let text = message["params"]["delta"]
+                        .as_str()
+                        .or_else(|| message["params"]["output"].as_str())
+                        .unwrap_or("");
+                    println!("{method} {text}");
+                    if render_assistant_alias && method == "item/agentMessage/delta" {
+                        println!("assistant {text}");
+                    }
                 }
                 _ => println!("{method}"),
             }
         }
     }
+}
+
+fn should_render_assistant_alias(turn: &Value) -> bool {
+    turn["status"].as_str() == Some("completed")
+        && turn["agent_loop_status"].as_str() == Some("completed")
+}
+
+fn should_render_response_turn(messages: &[Value], turn: &Value) -> bool {
+    if !has_method(messages, "turn/started") {
+        return true;
+    }
+    turn["agent_loop_status"].as_str() != Some("not_migrated")
+}
+
+fn render_turn(turn: &Value) {
+    let turn_id = turn["turn_id"].as_str().unwrap_or("");
+    if turn_id.is_empty() {
+        return;
+    }
+    println!(
+        "turn {} {} agent_loop_status={}",
+        turn_id,
+        turn["status"].as_str().unwrap_or(""),
+        turn["agent_loop_status"].as_str().unwrap_or("")
+    );
+}
+
+fn render_trace_event(event: &Value) {
+    println!(
+        "trace {} {} {}",
+        event["event_id"].as_str().unwrap_or(""),
+        event["component"].as_str().unwrap_or(""),
+        event["summary"].as_str().unwrap_or("")
+    );
+}
+
+fn fail_for_failed_turn(turn: &Value) -> Result<(), String> {
+    let status = turn["status"].as_str().unwrap_or("");
+    let agent_loop_status = turn["agent_loop_status"].as_str().unwrap_or("");
+    if status == "failed" || agent_loop_status == "failed" {
+        return Err("error failed: turn failed".to_string());
+    }
+    Ok(())
 }
 
 fn required_str<'a>(value: &'a Value, path: &[&str]) -> Result<&'a str, String> {

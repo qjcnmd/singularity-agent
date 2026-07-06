@@ -59,6 +59,25 @@ def test_agent_host_start_run_wraps_kernel_without_exposing_agent_graph(tmp_path
     assert "policy_engine" not in snapshot
 
 
+def test_agent_host_resume_run_preserves_explicit_config_and_sets_resume_session(tmp_path: Path) -> None:
+    trace = TraceRecorder.create(tmp_path, run_id="run_resume", session_id="session_new")
+    approval_gate = _ApprovalGate()
+    kernel = _Kernel(trace=trace, approval_gate=approval_gate)
+    bootstrap_factory = _BootstrapFactory(kernel)
+    host = AgentHost(tmp_path, bootstrap_factory=bootstrap_factory)
+    config = ProductionConfig.from_cli(
+        project_root=tmp_path,
+        approval_policy=ApprovalPolicy.NEVER,
+        dry_run=True,
+    )
+
+    host.resume_run("session_previous", "continue task", config=config)
+
+    assert bootstrap_factory.configs[0].resume_session == "session_previous"
+    assert bootstrap_factory.configs[0].approval_policy == ApprovalPolicy.NEVER
+    assert bootstrap_factory.configs[0].dry_run is True
+
+
 def test_agent_host_registers_approval_grants_through_approval_gate(tmp_path: Path) -> None:
     trace = TraceRecorder.create(tmp_path, run_id="run_approval", session_id="session_approval")
     approval_gate = _ApprovalGate()
@@ -120,6 +139,16 @@ class _Bootstrap:
 
     def boot(self, _goal: str) -> _Kernel:
         return self.kernel
+
+
+class _BootstrapFactory:
+    def __init__(self, kernel: _Kernel) -> None:
+        self.kernel = kernel
+        self.configs: list[ProductionConfig] = []
+
+    def __call__(self, **kwargs) -> _Bootstrap:
+        self.configs.append(kwargs["config"])
+        return _Bootstrap(self.kernel)
 
 
 class _Kernel:

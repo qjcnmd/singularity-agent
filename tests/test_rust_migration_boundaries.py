@@ -36,10 +36,14 @@ FORBIDDEN_PYTHON_RUNTIME_NAMES = (
 )
 
 FORBIDDEN_TOOL_OBSERVATION_PAYLOAD_MARKERS = (
+    "raw_response",
+    "raw_prompt",
     "raw_arguments",
+    "provider_response",
     "policy_decision_id",
     "approval_grant_id",
     "internal_metadata",
+    "metadata",
     "api_key",
     "authorization",
     "password",
@@ -51,6 +55,28 @@ TOOL_OBSERVATION_INTERNAL_FIELDS = (
     "policy_decision_id",
     "approval_grant_id",
     "internal_metadata",
+)
+
+RUST_AGENT_HOST_DOC_MARKERS = (
+    "Current Python owner",
+    "Rust owner after this stage",
+    "Parity expectation",
+    "Intentional divergence",
+    "AgentLoopStatusBridge",
+    "SessionStore.create_turn_with_input_and_trace",
+)
+
+FORBIDDEN_SIDECAR_TRACE_MARKERS = (
+    "raw_response",
+    "raw_prompt",
+    "raw_arguments",
+    "provider_response",
+    "api_key",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+    "metadata",
 )
 
 
@@ -84,12 +110,16 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "crates/store/src/lib.rs",
         "crates/protocol/src/lib.rs",
         "crates/tools/src/lib.rs",
+        "src/singularity/agent_host/sidecar.py",
+        "docs/singularity.md",
+        "docs/architecture/modules/rust-app-server-protocol.md",
+        "scripts/verify_rust_cli_agent_host.py",
     ):
         source = Path(relative)
         target = repo / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
-    (repo / "src/singularity").mkdir(parents=True)
+    (repo / "src/singularity").mkdir(parents=True, exist_ok=True)
     return repo
 
 
@@ -98,6 +128,20 @@ def test_current_repository_satisfies_rust_migration_boundaries() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "rust migration boundaries verified" in result.stdout
+
+
+@pytest.mark.parametrize("marker", RUST_AGENT_HOST_DOC_MARKERS)
+def test_guard_rejects_rust_agent_host_docs_without_logic_map_marker(tmp_path: Path, marker: str) -> None:
+    repo = copy_repo_slice(tmp_path)
+    for relative in ("docs/singularity.md", "docs/architecture/modules/rust-app-server-protocol.md"):
+        path = repo / relative
+        path.write_text(path.read_text(encoding="utf-8").replace(marker, ""), encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "rust-agent-host-docs-incomplete" in result.stderr
+    assert marker in result.stderr
 
 
 @pytest.mark.parametrize("dependency", FORBIDDEN_CLI_DEPENDENCIES)
@@ -228,6 +272,83 @@ def test_guard_rejects_cli_notification_drain(tmp_path: Path) -> None:
     assert "cli-notification-drain" in result.stderr
 
 
+def test_guard_rejects_cli_requiring_raw_sidecar_env_as_user_setup(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    cli = repo / "crates/cli/src/main.rs"
+    text = cli.read_text(encoding="utf-8")
+    text = text.replace("AgentHost::Python", "AgentHost::Disabled")
+    cli.write_text(text, encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "raw-sidecar-env-user-setup" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative", "old", "new", "violation"),
+    (
+        (
+            "crates/agent/src/lib.rs",
+            "SIDECAR_METHOD_RESUME",
+            "SIDECAR_METHOD_CONTINUE",
+            "sidecar-resume-missing",
+        ),
+        (
+            "crates/agent/src/lib.rs",
+            "sidecar_run_params(goal, model)",
+            "json!({\"goal\": goal})",
+            "sidecar-model-forwarding-missing",
+        ),
+        (
+            "crates/app-server/src/lib.rs",
+            "previous_python_session_id",
+            "previous_python_run_id",
+            "sidecar-resume-session-missing",
+        ),
+        (
+            "crates/app-server/src/lib.rs",
+            "client.resume_agent(session_id, &goal, model)",
+            "client.run_agent(&goal, model)",
+            "sidecar-resume-call-missing",
+        ),
+    ),
+)
+def test_guard_rejects_missing_sidecar_resume_or_model_forwarding(
+    tmp_path: Path, relative: str, old: str, new: str, violation: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    path = repo / relative
+    path.write_text(path.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert violation in result.stderr
+
+
+def test_guard_rejects_no_sidecar_fake_agent_delta(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    app_server = repo / "crates/app-server/src/lib.rs"
+    app_server.write_text(app_server.read_text(encoding="utf-8") + '\nlet _ = "input accepted";\n', encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "fake-agent-delta" in result.stderr
+
+
+def test_guard_rejects_rust_cli_smoke_copying_full_environment(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    smoke = repo / "scripts/verify_rust_cli_agent_host.py"
+    smoke.write_text(smoke.read_text(encoding="utf-8") + "\nenv = os.environ.copy()\n", encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "rust-cli-smoke-env-copy" in result.stderr
+
+
 def test_guard_rejects_duplicate_approval_decision_public_api(tmp_path: Path) -> None:
     repo = copy_repo_slice(tmp_path)
     store = repo / "crates/store/src/lib.rs"
@@ -315,6 +436,23 @@ def test_guard_rejects_native_agent_loop_drift_before_migration(
 
     assert result.returncode == 1
     assert violation in result.stderr
+
+
+@pytest.mark.parametrize("marker", FORBIDDEN_SIDECAR_TRACE_MARKERS)
+def test_guard_rejects_sidecar_trace_projection_leaks(tmp_path: Path, marker: str) -> None:
+    repo = copy_repo_slice(tmp_path)
+    agent = repo / "crates/agent/src/lib.rs"
+    text = agent.read_text(encoding="utf-8")
+    agent.write_text(
+        text.replace('"trace_path": bridge.trace_path,', f'"trace_path": bridge.trace_path,\n        "{marker}": "leak",'),
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "sidecar-trace-projection-leak" in result.stderr
+    assert marker in result.stderr
 
 
 @pytest.mark.parametrize("marker", FORBIDDEN_TOOL_OBSERVATION_PAYLOAD_MARKERS)

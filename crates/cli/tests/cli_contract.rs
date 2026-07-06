@@ -4,6 +4,8 @@ use std::sync::Once;
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
+const PYTHON_SIDECAR_ENV: &str = "SINGULARITY_PYTHON_SIDECAR";
+const PYTHON_SIDECAR_PROJECT_ROOT_ENV: &str = "SINGULARITY_SIDECAR_PROJECT_ROOT";
 const FAKE_APP_SERVER_EXIT_CODE: i32 = 7;
 
 #[test]
@@ -26,7 +28,8 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
     let run_stdout = stdout(&run);
     assert!(run_stdout.contains("thread/started"));
     assert!(run_stdout.contains("turn/started"));
-    assert!(run_stdout.contains("item/agentMessage/delta"));
+    assert!(!run_stdout.contains("item/agentMessage/delta"));
+    assert!(!run_stdout.contains("assistant input accepted"));
     let thread_id = run_stdout
         .lines()
         .find_map(|line| line.strip_prefix("thread "))
@@ -66,6 +69,227 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
         .expect("doctor cli");
     assert!(doctor.status.success(), "stderr={}", stderr(&doctor));
     assert!(stdout(&doctor).contains("client=protocol-only"));
+}
+
+#[test]
+fn cli_run_can_enable_python_sidecar_without_raw_env_plumbing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        enabled = os.environ.get("SINGULARITY_PYTHON_SIDECAR") == "1"
+        project_root = bool(os.environ.get("SINGULARITY_SIDECAR_PROJECT_ROOT"))
+        status = "completed" if enabled and project_root else "failed"
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": status, "agent_loop_status": status}}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "python"])
+        .env_remove(PYTHON_SIDECAR_ENV)
+        .env_remove(PYTHON_SIDECAR_PROJECT_ROOT_ENV)
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(stdout(&output).contains("agent_loop_status=completed"));
+}
+
+#[test]
+fn cli_continue_can_enable_python_sidecar_without_raw_env_plumbing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/read":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        enabled = os.environ.get("SINGULARITY_PYTHON_SIDECAR") == "1"
+        project_root = bool(os.environ.get("SINGULARITY_SIDECAR_PROJECT_ROOT"))
+        status = "completed" if enabled and project_root else "failed"
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": status, "agent_loop_status": status}}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args([
+            "continue",
+            "thread_fake",
+            "add docs",
+            "--agent-host",
+            "python",
+        ])
+        .env_remove(PYTHON_SIDECAR_ENV)
+        .env_remove(PYTHON_SIDECAR_PROJECT_ROOT_ENV)
+        .output()
+        .expect("continue cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(stdout(&output).contains("agent_loop_status=completed"));
+}
+
+#[test]
+fn cli_renders_agent_host_status_and_sidecar_answer() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"method": "thread/started", "params": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"method": "turn/started", "params": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "completed", "agent_loop_status": "completed"}}}), flush=True)
+        print(json.dumps({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "sidecar completed"}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "completed", "agent_loop_status": "completed"}}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "python"])
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("thread thread_fake"));
+    assert!(stdout.contains("turn turn_fake completed agent_loop_status=completed"));
+    assert!(stdout.contains("assistant sidecar completed"));
+}
+
+#[test]
+fn cli_exits_nonzero_for_sidecar_failed_turn_without_raw_payload() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "sidecar failed"}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_failed", "thread_id": "thread_fake", "status": "failed", "agent_loop_status": "failed"}}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "python"])
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains("turn turn_failed failed agent_loop_status=failed"));
+    assert!(!stdout(&output).to_lowercase().contains("raw_prompt"));
+}
+
+#[test]
+fn cli_turn_status_interrupt_approval_decision_and_trace_show_use_protocol() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "turn/status":
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": message["params"]["turnId"], "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+    elif method == "turn/interrupt":
+        print(json.dumps({"id": request_id, "result": {"turnId": message["params"]["turnId"], "status": "interrupted"}}), flush=True)
+    elif method == "approval/decision":
+        print(json.dumps({"id": request_id, "result": {"decision": message["params"]}}), flush=True)
+    elif method == "trace/show":
+        print(json.dumps({"id": request_id, "result": {"event": {"event_id": message["params"]["eventId"], "event_type": "trace.event", "run_id": "run_fake", "session_id": "session_fake", "task_id": None, "phase_id": None, "action_id": None, "parent_event_id": None, "timestamp": None, "monotonic_ms": None, "component": "python_sidecar", "severity": "info", "summary": "sidecar trace", "payload": {}, "artifact_refs": [], "policy_decision_id": None, "approval_grant_id": None, "sandbox_id": None, "command_id": None, "transaction_id": None, "verification_id": None, "span_id": None, "redaction_applied": True, "payload_hash": ""}}}), flush=True)
+"#,
+    );
+
+    let status = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["turn", "status", "turn_fake"])
+        .output()
+        .expect("turn status cli");
+    assert!(status.status.success(), "stderr={}", stderr(&status));
+    assert!(stdout(&status).contains("turn turn_fake running agent_loop_status=not_migrated"));
+
+    let interrupt = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["turn", "interrupt", "turn_fake"])
+        .output()
+        .expect("turn interrupt cli");
+    assert!(interrupt.status.success(), "stderr={}", stderr(&interrupt));
+    assert!(stdout(&interrupt).contains("turn turn_fake interrupted"));
+
+    let approve = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args([
+            "approve",
+            "approval_fake",
+            "--decision",
+            "allow",
+            "--reason",
+            "operator approved",
+        ])
+        .output()
+        .expect("approve cli");
+    assert!(approve.status.success(), "stderr={}", stderr(&approve));
+    assert!(stdout(&approve).contains("approval approval_fake allow"));
+
+    let trace_show = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["trace", "show", "event_fake"])
+        .output()
+        .expect("trace show cli");
+    assert!(
+        trace_show.status.success(),
+        "stderr={}",
+        stderr(&trace_show)
+    );
+    assert!(stdout(&trace_show).contains("trace event_fake python_sidecar sidecar trace"));
 }
 
 #[test]

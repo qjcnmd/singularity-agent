@@ -470,6 +470,174 @@ fn app_server_can_translate_python_sidecar_completion_when_enabled() {
 }
 
 #[test]
+fn app_server_resumes_python_sidecar_with_previous_session_and_thread_model() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_recording.py"),
+        r#"
+import json
+import os
+import pathlib
+import sys
+
+log_path = pathlib.Path(os.environ["SIDECAR_REQUEST_LOG"])
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message["method"]
+    params = message.get("params") or {}
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(json.dumps({"method": method, "params": params}, sort_keys=True) + "\n")
+    session_id = params.get("sessionId") or "session_first"
+    result = {
+        "run_id": "run_fake",
+        "session_id": session_id,
+        "task_id": "task_fake",
+        "status": "completed",
+        "final_answer": f"{method} model={params.get('model', '')} session={session_id}",
+        "trace_path": "run_fake",
+        "events": [],
+    }
+    print(json.dumps({"id": message["id"], "result": result}), flush=True)
+"#,
+    )
+    .expect("recording sidecar");
+    let request_log = dir.path().join("sidecar_requests.jsonl");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_recording".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: vec![(
+            "SIDECAR_REQUEST_LOG".to_string(),
+            request_log.to_string_lossy().into_owned(),
+        )],
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"first"}}]}}}}"#
+        ))
+        .unwrap();
+    let resumed = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":4,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"second"}}]}}}}"#
+        ))
+        .unwrap();
+    let resumed_text = resumed
+        .iter()
+        .filter_map(|message| message["params"]["delta"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(resumed_text.contains("agent/resume model=gpt-test session=session_first"));
+
+    let requests = std::fs::read_to_string(request_log).expect("request log");
+    let requests = requests
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("request"))
+        .collect::<Vec<_>>();
+    assert_eq!(requests[0]["method"], "agent/run");
+    assert_eq!(requests[0]["params"]["model"], "gpt-test");
+    assert_eq!(requests[1]["method"], "agent/resume");
+    assert_eq!(requests[1]["params"]["sessionId"], "session_first");
+    assert_eq!(requests[1]["params"]["model"], "gpt-test");
+}
+
+#[test]
+fn app_server_sidecar_trace_projection_contains_only_safe_fields() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let python_path = workspace_root().join("src");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "singularity.agent_host.sidecar".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(python_path),
+        env: vec![(
+            "SINGULARITY_SIDECAR_TEST_MODE".to_string(),
+            "completed".to_string(),
+        )],
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"complete through sidecar"}}]}}}}"#
+        ))
+        .unwrap();
+    let trace = server
+        .handle_json(&format!(
+            r#"{{"method":"trace/tail","id":4,"params":{{"runId":"{thread_id}","limit":5}}}}"#
+        ))
+        .unwrap();
+    let event = trace[0]["result"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["component"] == "python_sidecar")
+        .expect("python sidecar trace");
+    let payload = event["payload"].as_object().expect("payload object");
+    let keys = payload.keys().cloned().collect::<Vec<_>>();
+
+    assert_eq!(
+        keys,
+        vec![
+            "component".to_string(),
+            "run_id".to_string(),
+            "session_id".to_string(),
+            "status".to_string(),
+            "task_id".to_string(),
+            "trace_path".to_string(),
+        ]
+    );
+    let payload_text = event["payload"].to_string().to_lowercase();
+    for marker in [
+        "raw_prompt",
+        "raw_response",
+        "raw_arguments",
+        "provider_response",
+        "metadata",
+        "api_key",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+    ] {
+        assert!(
+            !payload_text.contains(marker),
+            "sidecar trace payload leaked {marker}: {payload_text}"
+        );
+    }
+}
+
+#[test]
 fn app_server_binary_errors_are_valid_json_rpc_lines() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");

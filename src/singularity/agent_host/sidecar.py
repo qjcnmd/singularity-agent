@@ -18,6 +18,7 @@ JSON_RPC_INTERNAL_ERROR = -32603
 JSON_RPC_NOT_FOUND = -32004
 
 METHOD_RUN = "agent/run"
+METHOD_RESUME = "agent/resume"
 METHOD_CANCEL = "agent/cancel"
 METHOD_STATUS = "agent/status"
 METHOD_HEALTH = "agent/health"
@@ -73,6 +74,8 @@ class SidecarServer:
                 return _response(request_id, {"status": "ok", "component": "python_sidecar"})
             if method == METHOD_RUN:
                 return _response(request_id, self._run(params))
+            if method == METHOD_RESUME:
+                return _response(request_id, self._resume(params))
             if method == METHOD_CANCEL:
                 return _response(request_id, self._cancel(params))
             if method == METHOD_STATUS:
@@ -89,6 +92,16 @@ class SidecarServer:
         if not goal.strip():
             raise ValueError("goal is required")
         result = self.host.start_run(goal, config=self._config(params))
+        return _safe_run_result(self.host, result.run_id, result.to_dict())
+
+    def _resume(self, params: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(params.get("sessionId") or params.get("session_id") or "")
+        goal = str(params.get("goal") or "")
+        if not session_id.strip():
+            raise ValueError("sessionId is required")
+        if not goal.strip():
+            raise ValueError("goal is required")
+        result = self.host.resume_run(session_id, goal, config=self._config(params))
         return _safe_run_result(self.host, result.run_id, result.to_dict())
 
     def _cancel(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -181,12 +194,27 @@ class _SidecarTestHost:
     project_root: Path
 
     def start_run(self, goal: str, *, config: ProductionConfig) -> Any:
+        return self._run_result(goal, config=config, resumed_from=None)
+
+    def resume_run(self, session_id: str, goal: str, *, config: ProductionConfig) -> Any:
+        return self._run_result(goal, config=config, resumed_from=session_id)
+
+    def _run_result(
+        self,
+        goal: str,
+        *,
+        config: ProductionConfig,
+        resumed_from: str | None,
+    ) -> _SidecarTestRunResult:
+        model = str(getattr(config, "model", "") or "")
+        suffix = f" model={_REDACTOR.redact_text(model)}" if model else ""
+        resume_prefix = f"resume {resumed_from}: " if resumed_from else ""
         return _SidecarTestRunResult(
             run_id="run_sidecar_test",
-            session_id="session_sidecar_test",
+            session_id=resumed_from or "session_sidecar_test",
             task_id="task_sidecar_test",
             status=self.status,
-            final_answer=f"sidecar {self.status}: {_REDACTOR.redact_text(goal)}",
+            final_answer=f"sidecar {self.status}: {resume_prefix}{_REDACTOR.redact_text(goal)}{suffix}",
             trace_run_dir=self.project_root / "work" / "traces" / "runs" / "run_sidecar_test",
         )
 

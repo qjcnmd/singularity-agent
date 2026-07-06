@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const SIDECAR_METHOD_RUN: &str = "agent/run";
+const SIDECAR_METHOD_RESUME: &str = "agent/resume";
 const SIDECAR_METHOD_CANCEL: &str = "agent/cancel";
 const SIDECAR_METHOD_STATUS: &str = "agent/status";
 const SIDECAR_METHOD_HEALTH: &str = "agent/health";
@@ -318,8 +319,27 @@ impl PythonSidecarClient {
         })
     }
 
-    pub fn run_agent(&mut self, goal: &str) -> Result<PythonSidecarRunResult, String> {
-        let value = self.request(SIDECAR_METHOD_RUN, json!({"goal": goal}))?;
+    pub fn run_agent(
+        &mut self,
+        goal: &str,
+        model: Option<&str>,
+    ) -> Result<PythonSidecarRunResult, String> {
+        let value = self.request(SIDECAR_METHOD_RUN, sidecar_run_params(goal, model))?;
+        serde_json::from_value(value)
+            .map_err(|error| format!("invalid sidecar run result: {error}"))
+    }
+
+    pub fn resume_agent(
+        &mut self,
+        session_id: &str,
+        goal: &str,
+        model: Option<&str>,
+    ) -> Result<PythonSidecarRunResult, String> {
+        let mut params = sidecar_run_params(goal, model);
+        if let Some(object) = params.as_object_mut() {
+            object.insert("sessionId".to_string(), json!(session_id));
+        }
+        let value = self.request(SIDECAR_METHOD_RESUME, params)?;
         serde_json::from_value(value)
             .map_err(|error| format!("invalid sidecar run result: {error}"))
     }
@@ -394,4 +414,14 @@ pub fn sidecar_trace_summary(bridge: &AgentLoopStatusBridge) -> Value {
         "task_id": bridge.task_id,
         "trace_path": bridge.trace_path,
     })
+}
+
+fn sidecar_run_params(goal: &str, model: Option<&str>) -> Value {
+    let mut params = json!({"goal": goal});
+    if let Some(model) = model {
+        if let Some(object) = params.as_object_mut() {
+            object.insert("model".to_string(), json!(model));
+        }
+    }
+    params
 }

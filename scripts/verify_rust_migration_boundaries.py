@@ -109,15 +109,41 @@ FORBIDDEN_DESKTOP_PATHS = {
 }
 
 TOOL_OBSERVATION_MODEL_PAYLOAD_FORBIDDEN = {
+    "raw_response",
+    "raw_prompt",
     "raw_arguments",
+    "provider_response",
     "policy_decision_id",
     "approval_grant_id",
     "internal_metadata",
+    "metadata",
     "api_key",
     "authorization",
     "password",
     "secret",
     "token",
+}
+
+RUST_AGENT_HOST_DOC_MARKERS = {
+    "Current Python owner",
+    "Rust owner after this stage",
+    "Parity expectation",
+    "Intentional divergence",
+    "AgentLoopStatusBridge",
+    "SessionStore.create_turn_with_input_and_trace",
+}
+
+SIDECAR_TRACE_PROJECTION_FORBIDDEN = {
+    "raw_response",
+    "raw_prompt",
+    "raw_arguments",
+    "provider_response",
+    "api_key",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+    "metadata",
 }
 
 
@@ -149,6 +175,12 @@ def main() -> int:
     violations.extend(_check_forbidden_python_runtime_names(repo_root))
     violations.extend(_check_forbidden_desktop_paths(repo_root))
     violations.extend(_check_agent_loop_status(repo_root))
+    violations.extend(_check_rust_agent_host_docs(repo_root))
+    violations.extend(_check_cli_sidecar_surface(repo_root))
+    violations.extend(_check_sidecar_resume_and_model(repo_root))
+    violations.extend(_check_no_fake_agent_delta(repo_root))
+    violations.extend(_check_rust_cli_smoke_env(repo_root))
+    violations.extend(_check_sidecar_trace_projection(repo_root))
     violations.extend(_check_tool_observation_payload(repo_root))
     violations.extend(_check_sandbox_phase1_boundary(repo_root))
     violations.extend(_check_app_server_transport_errors(repo_root))
@@ -300,6 +332,165 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
             )
         ]
     return []
+
+
+def _check_rust_agent_host_docs(repo_root: Path) -> list[Violation]:
+    docs = [
+        repo_root / "docs" / "singularity.md",
+        repo_root / "docs" / "architecture" / "modules" / "rust-app-server-protocol.md",
+    ]
+    text = "\n".join(path.read_text(encoding="utf-8") for path in docs)
+    return [
+        Violation(
+            "rust-agent-host-docs-incomplete",
+            "docs/singularity.md,docs/architecture/modules/rust-app-server-protocol.md",
+            f"Rust CLI-first migration docs must include marker: {marker}",
+        )
+        for marker in sorted(RUST_AGENT_HOST_DOC_MARKERS)
+        if marker not in text
+    ]
+
+
+def _check_cli_sidecar_surface(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "cli" / "src" / "main.rs"
+    text = path.read_text(encoding="utf-8")
+    if "AgentHost::Python" in text and "SINGULARITY_PYTHON_SIDECAR" in text:
+        return []
+    return [
+        Violation(
+            "raw-sidecar-env-user-setup",
+            _relative(path, repo_root),
+            "CLI must expose a user-facing Python agent-host option instead of requiring raw SINGULARITY_PYTHON_SIDECAR setup",
+        )
+    ]
+
+
+def _check_sidecar_resume_and_model(repo_root: Path) -> list[Violation]:
+    agent_path = repo_root / "crates" / "agent" / "src" / "lib.rs"
+    app_server_path = repo_root / "crates" / "app-server" / "src" / "lib.rs"
+    sidecar_path = repo_root / "src" / "singularity" / "agent_host" / "sidecar.py"
+    agent_text = agent_path.read_text(encoding="utf-8")
+    app_server_text = app_server_path.read_text(encoding="utf-8")
+    sidecar_text = sidecar_path.read_text(encoding="utf-8") if sidecar_path.exists() else ""
+    checks = [
+        (
+            agent_path,
+            agent_text,
+            "SIDECAR_METHOD_RESUME",
+            "sidecar-resume-missing",
+            "Rust sidecar client must expose agent/resume for sg continue --agent-host python",
+        ),
+        (
+            agent_path,
+            agent_text,
+            "sidecar_run_params(goal, model)",
+            "sidecar-model-forwarding-missing",
+            "Rust sidecar client must forward thread model to Python sidecar",
+        ),
+        (
+            app_server_path,
+            app_server_text,
+            "previous_python_session_id",
+            "sidecar-resume-session-missing",
+            "app-server must derive safe previous Python session_id for sidecar resume",
+        ),
+        (
+            app_server_path,
+            app_server_text,
+            "client.resume_agent(session_id, &goal, model)",
+            "sidecar-resume-call-missing",
+            "app-server continue path must call Python sidecar agent/resume",
+        ),
+        (
+            sidecar_path,
+            sidecar_text,
+            "METHOD_RESUME",
+            "python-sidecar-resume-method-missing",
+            "Python sidecar must accept agent/resume",
+        ),
+        (
+            sidecar_path,
+            sidecar_text,
+            "model=_optional_str(params.get(\"model\"))",
+            "python-sidecar-model-forwarding-missing",
+            "Python sidecar must pass model into ProductionConfig",
+        ),
+    ]
+    return [
+        Violation(code, _relative(path, repo_root), detail)
+        for path, text, marker, code, detail in checks
+        if marker not in text
+    ]
+
+
+def _check_no_fake_agent_delta(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "app-server" / "src" / "lib.rs"
+    text = path.read_text(encoding="utf-8")
+    if "input accepted" not in text:
+        return []
+    return [
+        Violation(
+            "fake-agent-delta",
+            _relative(path, repo_root),
+            "no-sidecar turn/start must not emit a fake assistant delta such as input accepted",
+        )
+    ]
+
+
+def _check_rust_cli_smoke_env(repo_root: Path) -> list[Violation]:
+    path = repo_root / "scripts" / "verify_rust_cli_agent_host.py"
+    if not path.exists():
+        return [
+            Violation(
+                "rust-cli-agent-host-smoke-missing",
+                _relative(path, repo_root),
+                "Rust CLI agent host smoke script is required",
+            )
+        ]
+    text = path.read_text(encoding="utf-8")
+    violations: list[Violation] = []
+    if "os.environ.copy()" in text:
+        violations.append(
+            Violation(
+                "rust-cli-smoke-env-copy",
+                _relative(path, repo_root),
+                "sidecar smoke must not copy the full process environment with provider secrets",
+            )
+        )
+    for marker in ("SECRET_ENV_MARKERS", "SAFE_ENV_ALLOWLIST", "_safe_smoke_env"):
+        if marker not in text:
+            violations.append(
+                Violation(
+                    "rust-cli-smoke-env-scrub-missing",
+                    _relative(path, repo_root),
+                    f"sidecar smoke must define {marker} to scrub provider secrets",
+                )
+            )
+    return violations
+
+
+def _check_sidecar_trace_projection(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "agent" / "src" / "lib.rs"
+    text = path.read_text(encoding="utf-8")
+    body = _extract_rust_function_body(text, "sidecar_trace_summary")
+    if body is None:
+        return [
+            Violation(
+                "sidecar-trace-summary-missing",
+                _relative(path, repo_root),
+                "sidecar_trace_summary not found",
+            )
+        ]
+    lowered = body.lower()
+    return [
+        Violation(
+            "sidecar-trace-projection-leak",
+            _relative(path, repo_root),
+            f"sidecar_trace_summary references forbidden marker {marker}",
+        )
+        for marker in sorted(SIDECAR_TRACE_PROJECTION_FORBIDDEN)
+        if marker in lowered
+    ]
 
 
 def _check_tool_observation_payload(repo_root: Path) -> list[Violation]:

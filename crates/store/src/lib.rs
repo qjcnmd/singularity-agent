@@ -227,6 +227,22 @@ impl SessionStore {
         self.get_turn(turn_id)
     }
 
+    pub fn update_turn_state(
+        &self,
+        turn_id: &str,
+        status: TurnStatus,
+        agent_loop_status: &str,
+    ) -> StoreResult<Turn> {
+        let changed = self.connection.execute(
+            "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
+            params![serde_json::to_string(&status)?, agent_loop_status, turn_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("turn {turn_id}")));
+        }
+        self.get_turn(turn_id)
+    }
+
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
         if !self.turn_exists(turn_id)? {
             return Err(StoreError::NotFound(format!("turn {turn_id}")));

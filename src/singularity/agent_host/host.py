@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -83,9 +84,14 @@ class AgentHost:
         *,
         config: ProductionConfig | None = None,
     ) -> HostedRunResult:
-        resolved_config = config or ProductionConfig.from_cli(
-            project_root=self.project_root,
-            resume_session=session_id,
+        resolved_config = (
+            replace(config, resume_session=session_id, session_run_mode="resume")
+            if config is not None
+            else ProductionConfig.from_cli(
+                project_root=self.project_root,
+                resume_session=session_id,
+                session_run_mode="resume",
+            )
         )
         return self.start_run(goal, config=resolved_config)
 
