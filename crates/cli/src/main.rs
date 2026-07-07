@@ -294,15 +294,18 @@ fn ensure_native_agent_loop_available(
 ) -> Result<(), String> {
     if matches!(agent_host, Some(AgentHost::Native)) {
         let capability = client.agent_capability()?;
-        if capability["nativeAgentLoop"]["available"]
-            .as_bool()
-            .unwrap_or(false)
-        {
+        let native = &capability["nativeAgentLoop"];
+        let available = native["available"].as_bool().unwrap_or(false);
+        let blockers_empty = native["missing_boundaries"]
+            .as_array()
+            .is_some_and(|blockers| blockers.is_empty());
+        if available && blockers_empty {
             return Ok(());
         }
-        return Err(
-            "native AgentLoop is not available; use --agent-host python as oracle".to_string(),
-        );
+        let status = native["status"].as_str().unwrap_or("unknown");
+        return Err(format!(
+            "native AgentLoop is not production-ready: status={status}; use --agent-host python as oracle"
+        ));
     }
     Ok(())
 }
@@ -402,6 +405,7 @@ impl AppServerClient {
             }
             AGENT_HOST_RESPONSE_TIMEOUT
         } else {
+            command.env_remove(PYTHON_SIDECAR_ENV);
             RESPONSE_TIMEOUT
         };
         let mut child = command

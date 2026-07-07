@@ -547,15 +547,21 @@ def test_guard_rejects_unused_tokio_crate_dependency(tmp_path: Path, manifest_pa
 @pytest.mark.parametrize(
     ("old", "new", "violation"),
     (
-        ("available: false", "available: true", "native-agent-loop-capability-drift"),
+        ("pub struct AgentLoopCapability", "pub struct AgentLoopState", "native-agent-loop-capability-drift"),
+        ("available: false", "available: true", "native-agent-loop-status-drift"),
         (
-            "status: AgentHostStatus::NotMigrated",
-            "status: AgentHostStatus::Completed",
-            "native-agent-loop-status-drift",
+            '"strict_command_sandbox"',
+            '"strict_sandbox_done"',
+            "native-agent-loop-blocker-drift",
+        ),
+        (
+            '"rust_evaluation_runner"',
+            '"rust_eval_done"',
+            "native-agent-loop-blocker-drift",
         ),
     ),
 )
-def test_guard_rejects_native_agent_loop_drift_before_migration(
+def test_guard_rejects_native_agent_loop_capability_drift(
     tmp_path: Path, old: str, new: str, violation: str
 ) -> None:
     repo = copy_repo_slice(tmp_path)
@@ -566,6 +572,51 @@ def test_guard_rejects_native_agent_loop_drift_before_migration(
 
     assert result.returncode == 1
     assert violation in result.stderr
+
+
+def test_guard_rejects_old_native_agent_loop_names(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    agent = repo / "crates/agent/src/lib.rs"
+    agent.write_text(agent.read_text(encoding="utf-8") + "\npub struct NativeAgentLoop;\n", encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "native-agent-loop-name-drift" in result.stderr
+
+
+def test_guard_rejects_cli_native_path_without_partial_capability_gate(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    cli = repo / "crates/cli/src/main.rs"
+    cli.write_text(cli.read_text(encoding="utf-8").replace("blockers_empty", "native_ready"), encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "native-agent-loop-cli-gate-drift" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("NATIVE_AGENT_LOOP_NOT_READY", "NATIVE_AGENT_LOOP_DELAYED"),
+        (
+            "capability.available && capability.missing_boundaries.is_empty()",
+            "capability.available",
+        ),
+    ),
+)
+def test_guard_rejects_app_server_native_path_without_partial_capability_gate(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    app_server = repo / "crates/app-server/src/lib.rs"
+    app_server.write_text(app_server.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "native-agent-loop-app-server-gate-drift" in result.stderr
 
 
 @pytest.mark.parametrize("marker", FORBIDDEN_SIDECAR_TRACE_MARKERS)

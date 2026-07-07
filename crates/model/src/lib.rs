@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
+use std::fmt;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use thiserror::Error;
 
 const DEFAULT_MAX_TOOL_CALLS: u32 = 8;
 const DEFAULT_MAX_RETRIES: u32 = 2;
@@ -15,6 +18,15 @@ const ENV_PROVIDER: &str = "SINGULARITY_MODEL_PROVIDER";
 const ENV_MODEL: &str = "SINGULARITY_MODEL";
 const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";
 const ENV_API_KEY: &str = "SINGULARITY_API_KEY";
+const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
+const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
+const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
+const HTTP_STATUS_FORBIDDEN: u16 = 403;
+const HTTP_STATUS_NOT_FOUND: u16 = 404;
+const HTTP_STATUS_RATE_LIMITED: u16 = 429;
+const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 
 const PERMISSION_DENIED_MARKERS: [&str; 4] = [
     "winerror 10013",
@@ -434,6 +446,11 @@ impl ModelError {
         self
     }
 
+    pub fn with_raw_ref(mut self, raw_error_ref: impl Into<String>) -> Self {
+        self.raw_error_ref = Some(raw_error_ref.into());
+        self
+    }
+
     pub fn category(&self) -> ModelErrorCategory {
         classify_model_error(self)
     }
@@ -592,6 +609,182 @@ pub struct ProviderStreamEvent {
     pub metadata: Value,
 }
 
+pub trait Provider {
+    fn complete(&self, request: &ModelTurnRequest) -> Result<ModelTurnResponse, ProviderError>;
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpenAiProviderConfig {
+    pub provider_name: String,
+    pub model_name: String,
+    pub base_url: String,
+    pub api_key: String,
+}
+
+impl fmt::Debug for OpenAiProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiProviderConfig")
+            .field("provider_name", &self.provider_name)
+            .field("model_name", &self.model_name)
+            .field("base_url", &"[redacted]")
+            .field("api_key", &"[redacted]")
+            .finish()
+    }
+}
+
+impl OpenAiProviderConfig {
+    pub fn from_env<F>(mut get_env: F) -> Result<Self, ProviderError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let provider_name = value_from_env(&mut get_env, ENV_PROVIDER)
+            .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string());
+        let model_name = required_env_value(&mut get_env, ENV_MODEL)?;
+        let base_url = required_env_value(&mut get_env, ENV_BASE_URL)?;
+        let api_key = required_env_value(&mut get_env, ENV_API_KEY)?;
+        Ok(Self {
+            provider_name,
+            model_name,
+            base_url,
+            api_key,
+        })
+    }
+
+    pub fn redacted_status(&self) -> ModelProviderStatus {
+        ModelProviderStatus::from_config(&ModelProviderConfig {
+            provider_name: Some(self.provider_name.clone()),
+            model_name: Some(self.model_name.clone()),
+            base_url_present: true,
+            api_key_present: true,
+        })
+    }
+
+    pub fn endpoint(&self) -> String {
+        chat_completions_endpoint(&self.base_url)
+    }
+}
+
+pub struct OpenAiProvider {
+    config: OpenAiProviderConfig,
+    client: reqwest::blocking::Client,
+}
+
+impl fmt::Debug for OpenAiProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiProvider")
+            .field("config", &self.config)
+            .field("client", &"[redacted]")
+            .finish()
+    }
+}
+
+impl OpenAiProvider {
+    pub fn new(config: OpenAiProviderConfig) -> Result<Self, ProviderError> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
+            .build()
+            .map_err(provider_transport_error)?;
+        Ok(Self { config, client })
+    }
+
+    pub fn from_env<F>(get_env: F) -> Result<Self, ProviderError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        Self::new(OpenAiProviderConfig::from_env(get_env)?)
+    }
+}
+
+impl Provider for OpenAiProvider {
+    fn complete(&self, request: &ModelTurnRequest) -> Result<ModelTurnResponse, ProviderError> {
+        let request_validation = validate_model_request(request);
+        if !request_validation.valid {
+            return Err(ProviderError::from_model_error(
+                ModelError::new(
+                    ModelErrorKind::InvalidRequest,
+                    "model request validation failed",
+                )
+                .with_provider(self.config.provider_name.clone())
+                .with_model(self.config.model_name.clone()),
+            ));
+        }
+        let response = self
+            .client
+            .post(self.config.endpoint())
+            .bearer_auth(&self.config.api_key)
+            .json(&openai_request_payload(request, &self.config.model_name))
+            .send()
+            .map_err(provider_transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProviderError::from_model_error(
+                model_error_from_http_status(
+                    status.as_u16(),
+                    &self.config.provider_name,
+                    &self.config.model_name,
+                )
+                .with_raw_ref(format!("provider_http_status_{}", status.as_u16())),
+            ));
+        }
+        let payload = response.json::<Value>().map_err(|error| {
+            ProviderError::from_model_error(provider_response_json_error(error))
+        })?;
+        parse_openai_response(request, &self.config, payload)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Error)]
+#[error("{message}")]
+pub struct ProviderError {
+    pub message: String,
+    pub error: ModelError,
+}
+
+impl ProviderError {
+    pub fn from_model_error(error: ModelError) -> Self {
+        Self {
+            message: error.message.clone(),
+            error,
+        }
+    }
+}
+
+pub fn chat_completions_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with(CHAT_COMPLETIONS_PATH) {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}{CHAT_COMPLETIONS_PATH}")
+    } else {
+        format!("{trimmed}{V1_CHAT_COMPLETIONS_PATH}")
+    }
+}
+
+pub fn provider_error_response(
+    request: &ModelTurnRequest,
+    error: ProviderError,
+) -> ModelTurnResponse {
+    ModelTurnResponse {
+        request_id: request.request_id.clone(),
+        response_id: format!("{}_provider_error", request.request_id),
+        status: ModelTurnStatus::Failed,
+        assistant_message: None,
+        tool_calls: Vec::new(),
+        usage: ModelUsage::default(),
+        finish_reason: None,
+        validation: None,
+        error: Some(error.error),
+        provider_name: None,
+        model_name: request.model_preferences.model_name.clone(),
+        latency_ms: None,
+        trace_event_ids: Vec::new(),
+        raw_response_ref: None,
+        metadata: json!({}),
+    }
+}
+
 pub fn provider_config_from_env<F>(mut get_env: F) -> ModelProviderConfig
 where
     F: FnMut(&str) -> Option<String>,
@@ -602,6 +795,300 @@ where
         base_url_present: value_from_env(&mut get_env, ENV_BASE_URL).is_some(),
         api_key_present: value_from_env(&mut get_env, ENV_API_KEY).is_some(),
     }
+}
+
+fn openai_request_payload(request: &ModelTurnRequest, model_name: &str) -> Value {
+    let mut payload = json!({
+        "model": request
+            .model_preferences
+            .model_name
+            .as_deref()
+            .unwrap_or(model_name),
+        "messages": request
+            .messages
+            .iter()
+            .map(openai_message_payload)
+            .collect::<Vec<_>>(),
+        "stream": false,
+    });
+    if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
+        payload["max_tokens"] = json!(max_output_tokens);
+    }
+    if let Some(temperature) = request.model_preferences.temperature {
+        payload["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.model_preferences.top_p {
+        payload["top_p"] = json!(top_p);
+    }
+    if request.model_preferences.json_mode {
+        payload["response_format"] = json!({"type": "json_object"});
+    }
+    if !request.tools.is_empty() {
+        payload["tools"] = json!(
+            request
+                .tools
+                .iter()
+                .map(openai_tool_payload)
+                .collect::<Vec<_>>()
+        );
+        payload["tool_choice"] = openai_tool_choice_payload(&request.tool_choice);
+    }
+    payload
+}
+
+fn openai_message_payload(message: &ModelMessage) -> Value {
+    let role = serde_json::to_value(&message.role)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "user".to_string());
+    let mut payload = json!({
+        "role": role,
+        "content": message_text(message),
+    });
+    if let Some(name) = &message.name {
+        payload["name"] = json!(name);
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        payload["tool_call_id"] = json!(tool_call_id);
+    }
+    payload
+}
+
+fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters_schema,
+        }
+    })
+}
+
+fn openai_tool_choice_payload(tool_choice: &ToolChoicePolicy) -> Value {
+    match tool_choice.mode {
+        ToolChoiceMode::None => json!("none"),
+        ToolChoiceMode::Required => json!("required"),
+        ToolChoiceMode::SpecificTool => match &tool_choice.tool_name {
+            Some(name) => json!({"type": "function", "function": {"name": name}}),
+            None => json!("auto"),
+        },
+        ToolChoiceMode::Auto | ToolChoiceMode::AllowedTools => json!("auto"),
+    }
+}
+
+fn parse_openai_response(
+    request: &ModelTurnRequest,
+    config: &OpenAiProviderConfig,
+    payload: Value,
+) -> Result<ModelTurnResponse, ProviderError> {
+    let response_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("response")
+        .to_string();
+    let choice = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| {
+            ProviderError::from_model_error(
+                ModelError::new(
+                    ModelErrorKind::JsonSchemaViolation,
+                    "provider response missing choices",
+                )
+                .with_provider(config.provider_name.clone())
+                .with_model(config.model_name.clone())
+                .with_raw_ref(format!("provider_response_ref:{response_id}")),
+            )
+        })?;
+    let message = choice.get("message").unwrap_or(&Value::Null);
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let tool_calls = parse_openai_tool_calls(message);
+    let assistant_message = Some(ModelMessage::text(ModelRole::Assistant, content));
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut response = ModelTurnResponse {
+        request_id: request.request_id.clone(),
+        response_id: response_id.clone(),
+        status: ModelTurnStatus::Success,
+        assistant_message,
+        tool_calls,
+        usage: parse_openai_usage(payload.get("usage")),
+        finish_reason,
+        validation: None,
+        error: None,
+        provider_name: Some(config.provider_name.clone()),
+        model_name: Some(config.model_name.clone()),
+        latency_ms: None,
+        trace_event_ids: Vec::new(),
+        raw_response_ref: Some(format!("provider_response_ref:{response_id}")),
+        metadata: json!({}),
+    };
+    let allowed_tool_names = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    let validation = validate_model_turn_response(request, &response, &allowed_tool_names, None);
+    if !validation.valid {
+        response.status = ModelTurnStatus::Invalid;
+        response.error = Some(
+            ModelError::new(
+                ModelErrorKind::JsonSchemaViolation,
+                "provider response validation failed",
+            )
+            .with_provider(config.provider_name.clone())
+            .with_model(config.model_name.clone())
+            .with_raw_ref(format!("provider_response_ref:{response_id}")),
+        );
+    }
+    response.validation = Some(validation);
+    Ok(response)
+}
+
+fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
+    message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| parse_openai_tool_call(index, call))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_openai_tool_call(index: usize, call: &Value) -> ModelToolCall {
+    let function = call.get("function").unwrap_or(&Value::Null);
+    let raw_arguments = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let (arguments, parse_status, validation_errors) = parse_tool_arguments(&raw_arguments);
+    ModelToolCall {
+        tool_call_id: call
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("call_{index}")),
+        tool_name: function
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        arguments,
+        raw_arguments,
+        parse_status,
+        validation_errors,
+        provider_metadata: json!({}),
+    }
+}
+
+fn parse_tool_arguments(raw_arguments: &str) -> (Value, ModelToolParseStatus, Vec<String>) {
+    match serde_json::from_str::<Value>(raw_arguments) {
+        Ok(arguments) if arguments.is_object() => {
+            (arguments, ModelToolParseStatus::Valid, Vec::new())
+        }
+        Ok(arguments) => (
+            arguments,
+            ModelToolParseStatus::SchemaMismatch,
+            vec!["tool_call_arguments_must_be_object".to_string()],
+        ),
+        Err(_) => (
+            json!({}),
+            ModelToolParseStatus::InvalidJson,
+            vec!["invalid_json".to_string()],
+        ),
+    }
+}
+
+fn parse_openai_usage(usage: Option<&Value>) -> ModelUsage {
+    let Some(usage) = usage else {
+        return ModelUsage::default();
+    };
+    ModelUsage {
+        input_tokens: usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        output_tokens: usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        total_tokens: usage
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        cached_input_tokens: usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        reasoning_tokens: usage
+            .pointer("/completion_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        cost_estimate: None,
+    }
+}
+
+fn required_env_value<F>(get_env: &mut F, name: &str) -> Result<String, ProviderError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    value_from_env(get_env, name).ok_or_else(|| {
+        ProviderError::from_model_error(
+            ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                format!("required provider configuration is missing: {name}"),
+            )
+            .retryable(false),
+        )
+    })
+}
+
+fn model_error_from_http_status(status: u16, provider_name: &str, model_name: &str) -> ModelError {
+    let kind = match status {
+        HTTP_STATUS_UNAUTHORIZED | HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
+        HTTP_STATUS_NOT_FOUND => ModelErrorKind::InvalidRequest,
+        HTTP_STATUS_RATE_LIMITED => ModelErrorKind::RateLimited,
+        status if status >= HTTP_STATUS_INTERNAL_SERVER_ERROR => ModelErrorKind::ProviderOverloaded,
+        _ => ModelErrorKind::UnknownProviderError,
+    };
+    ModelError::new(kind, format!("Provider returned HTTP {status}."))
+        .with_provider(provider_name.to_string())
+        .with_model(model_name.to_string())
+}
+
+fn provider_transport_error(error: reqwest::Error) -> ProviderError {
+    let kind = if error.is_timeout() {
+        ModelErrorKind::Timeout
+    } else {
+        ModelErrorKind::NetworkError
+    };
+    ProviderError::from_model_error(
+        ModelError::new(kind, "provider transport failed")
+            .retryable(true)
+            .with_raw_ref("provider_transport_error"),
+    )
+}
+
+fn provider_response_json_error(_error: reqwest::Error) -> ModelError {
+    ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider response was not valid JSON",
+    )
+    .retryable(false)
+    .with_raw_ref("provider_json_error")
 }
 
 pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidationResult {

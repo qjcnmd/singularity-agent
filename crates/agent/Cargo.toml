@@ -9,6 +9,10 @@ repository.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+singularity_model = { path = "../model" }
+singularity_policy = { path = "../policy" }
+singularity_tools = { path = "../tools" }
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

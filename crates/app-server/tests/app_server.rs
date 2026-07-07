@@ -234,7 +234,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 }
 
 #[test]
-fn app_server_reports_native_agent_loop_capability_as_unavailable() {
+fn app_server_reports_native_agent_loop_capability_as_unavailable_until_blockers_clear() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = AppServer::new(store);
@@ -262,12 +262,12 @@ fn app_server_reports_native_agent_loop_capability_as_unavailable() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|boundary| boundary == "model_provider_adapter")
+            .any(|boundary| boundary == "strict_command_sandbox")
     );
 }
 
 #[test]
-fn native_agent_loop_disabled_turn_does_not_emit_fake_completion() {
+fn app_server_rejects_native_turn_start_until_capability_blockers_clear() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = AppServer::new(store);
@@ -292,22 +292,19 @@ fn native_agent_loop_disabled_turn_does_not_emit_fake_completion() {
 
     assert_eq!(
         turn[0]["error"]["message"],
-        "Native agent loop is not available"
+        "Native AgentLoop is not production-ready"
     );
-    assert!(
-        !turn
-            .iter()
-            .any(|message| message["method"] == "item/agentMessage/delta")
-    );
-    assert!(
-        !turn
-            .iter()
-            .any(|message| message["params"]["turn"]["status"] == "completed")
-    );
+    let trace = server
+        .handle_json(&format!(
+            r#"{{"method":"trace/tail","id":4,"params":{{"runId":"{thread_id}","limit":10}}}}"#
+        ))
+        .unwrap();
+    let serialized = serde_json::to_string(&trace).expect("serialize trace");
+    assert!(!serialized.contains("agent_loop"));
 }
 
 #[test]
-fn native_agent_loop_selection_does_not_start_python_sidecar() {
+fn native_agent_loop_missing_provider_does_not_start_python_sidecar() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let module_root = dir.path().join("sidecar_modules");
@@ -350,11 +347,11 @@ fn native_agent_loop_selection_does_not_start_python_sidecar() {
 
     assert_eq!(
         turn[0]["error"]["message"],
-        "Native agent loop is not available"
+        "Native AgentLoop is not production-ready"
     );
     assert!(
         !marker.exists(),
-        "native-disabled path must not start the Python sidecar"
+        "native path must not start the Python sidecar"
     );
 }
 
@@ -746,11 +743,14 @@ fn app_server_sidecar_trace_projection_contains_only_safe_fields() {
     assert_eq!(
         keys,
         vec![
+            "approval_count".to_string(),
             "component".to_string(),
+            "model_turns".to_string(),
             "run_id".to_string(),
             "session_id".to_string(),
             "status".to_string(),
             "task_id".to_string(),
+            "tool_calls".to_string(),
             "trace_path".to_string(),
         ]
     );

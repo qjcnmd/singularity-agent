@@ -152,7 +152,7 @@ for line in sys.stdin:
         .expect("run cli");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("native AgentLoop is not available"));
+    assert!(stderr(&output).contains("native AgentLoop is not production-ready"));
     let trace = std::fs::read_to_string(trace_path).expect("method trace");
     assert!(trace.contains("initialize"));
     assert!(trace.contains("agent/capability"));
@@ -203,6 +203,47 @@ for line in sys.stdin:
             .expect("turn trace json");
     assert_eq!(params["agentHost"], "native");
     assert_eq!(params["threadId"], "thread_native");
+}
+
+#[test]
+fn cli_rejects_partial_native_capability_until_blockers_clear() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let trace_path = temp.path().join("partial_native_methods.txt");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    with open(os.environ["METHOD_TRACE"], "a", encoding="utf-8") as trace:
+        trace.write(f"{method}\n")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "running", "reason": "partial", "missing_boundaries": ["strict_command_sandbox"]}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "native"])
+        .env("METHOD_TRACE", &trace_path)
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("native AgentLoop is not production-ready"));
+    let trace = std::fs::read_to_string(trace_path).expect("method trace");
+    assert!(trace.contains("agent/capability"));
+    assert!(!trace.contains("turn/start"));
 }
 
 #[test]
@@ -280,6 +321,42 @@ for line in sys.stdin:
         .args(["run", "write tests", "--agent-host", "python"])
         .env_remove(PYTHON_SIDECAR_ENV)
         .env_remove(PYTHON_SIDECAR_PROJECT_ROOT_ENV)
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(stdout(&output).contains("agent_loop_status=completed"));
+}
+
+#[test]
+fn cli_default_run_does_not_inherit_python_sidecar_env() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        inherited = os.environ.get("SINGULARITY_PYTHON_SIDECAR") == "1"
+        status = "failed" if inherited else "completed"
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": status, "agent_loop_status": status}}}), flush=True)
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests"])
+        .env(PYTHON_SIDECAR_ENV, "1")
         .output()
         .expect("run cli");
 

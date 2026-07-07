@@ -55,11 +55,19 @@ ALLOWED_CRATE_DEPENDENCIES = {
         "dev-dependencies": set(),
     },
     "crates/model/Cargo.toml": {
-        "dependencies": {"schemars", "serde", "serde_json"},
+        "dependencies": {"reqwest", "schemars", "serde", "serde_json", "thiserror"},
         "dev-dependencies": set(),
     },
     "crates/agent/Cargo.toml": {
-        "dependencies": {"schemars", "serde", "serde_json"},
+        "dependencies": {
+            "schemars",
+            "serde",
+            "serde_json",
+            "singularity_model",
+            "singularity_policy",
+            "singularity_tools",
+            "thiserror",
+        },
         "dev-dependencies": {"tempfile"},
     },
     "crates/app-server/Cargo.toml": {
@@ -69,9 +77,11 @@ ALLOWED_CRATE_DEPENDENCIES = {
             "serde_json",
             "singularity_agent",
             "singularity_core",
+            "singularity_model",
             "singularity_policy",
             "singularity_protocol",
             "singularity_store",
+            "singularity_tools",
             "thiserror",
         },
         "dev-dependencies": {"tempfile"},
@@ -341,24 +351,66 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
             Violation(
                 "agent-loop-status-drift",
                 _relative(app_server, repo_root),
-                'turn/start must keep explicit not_migrated status until the Rust AgentLoop milestone',
+                'default non-native turn/start must keep explicit not_migrated status',
             )
         ]
     agent_text = agent.read_text(encoding="utf-8")
-    if "pub struct NativeAgentLoopCapability" not in agent_text or "available: false" not in agent_text:
+    if "NativeAgentLoop" in agent_text:
+        return [
+            Violation(
+                "native-agent-loop-name-drift",
+                _relative(agent, repo_root),
+                "temporary NativeAgentLoop names must not remain after AgentLoop exists",
+            )
+        ]
+    if "pub struct AgentLoopCapability" not in agent_text or "pub struct AgentLoop<" not in agent_text:
         return [
             Violation(
                 "native-agent-loop-capability-drift",
                 _relative(agent, repo_root),
-                "NativeAgentLoopCapability must stay explicitly unavailable until Rust AgentLoop is migrated",
+                "AgentLoopCapability and AgentLoop must exist for the partial native AgentLoop path",
             )
         ]
-    if "status: AgentHostStatus::NotMigrated" not in agent_text:
+    if "available: false" not in agent_text or "status: AgentHostStatus::NotMigrated" not in agent_text:
         return [
             Violation(
                 "native-agent-loop-status-drift",
                 _relative(agent, repo_root),
-                "NativeAgentLoopCapability must report NotMigrated until full Rust AgentLoop is implemented",
+                "AgentLoopCapability must stay unavailable while production blockers remain",
+            )
+        ]
+    for blocker in ("strict_command_sandbox", "rust_evaluation_runner"):
+        if blocker not in agent_text:
+            return [
+                Violation(
+                    "native-agent-loop-blocker-drift",
+                    _relative(agent, repo_root),
+                    f"AgentLoopCapability must keep remaining blocker: {blocker}",
+                )
+            ]
+    cli_text = (repo_root / "crates" / "cli" / "src" / "main.rs").read_text(encoding="utf-8")
+    if "missing_boundaries" not in cli_text or "blockers_empty" not in cli_text:
+        return [
+            Violation(
+                "native-agent-loop-cli-gate-drift",
+                "crates/cli/src/main.rs",
+                "CLI --agent-host native must reject partial AgentLoop capability until blockers are empty",
+            )
+        ]
+    if "NATIVE_AGENT_LOOP_NOT_READY" not in text or "native_agent_loop_ready()" not in text:
+        return [
+            Violation(
+                "native-agent-loop-app-server-gate-drift",
+                _relative(app_server, repo_root),
+                "app-server must reject agentHost=native while AgentLoopCapability blockers remain",
+            )
+        ]
+    if "capability.available && capability.missing_boundaries.is_empty()" not in text:
+        return [
+            Violation(
+                "native-agent-loop-app-server-gate-drift",
+                _relative(app_server, repo_root),
+                "app-server native gate must require available capability and empty blockers",
             )
         ]
     protocol_text = protocol.read_text(encoding="utf-8")

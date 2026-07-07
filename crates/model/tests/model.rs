@@ -3,11 +3,15 @@ use singularity_model::{
     ModelBlockerKind, ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind,
     ModelMessage, ModelProviderConfig, ModelProviderStatus, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
-    ModelUsage, ProviderStreamEvent, ProviderStreamEventType, ToolChoiceMode, ToolChoicePolicy,
+    ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider, ProviderStreamEvent,
+    ProviderStreamEventType, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
     classify_model_error, provider_config_from_env, retry_decision, validate_model_request,
     validate_model_response, validate_model_turn_response, validate_provider_config,
     validate_stream_events,
 };
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::thread;
 
 fn stream_event(event_type: ProviderStreamEventType) -> ProviderStreamEvent {
     ProviderStreamEvent {
@@ -32,6 +36,46 @@ fn tool_call(id: &str, name: &str) -> ModelToolCall {
         validation_errors: Vec::new(),
         provider_metadata: serde_json::json!({}),
     }
+}
+
+fn provider_test_config(base_url: String) -> OpenAiProviderConfig {
+    OpenAiProviderConfig {
+        provider_name: "openai_compatible".to_string(),
+        model_name: "gpt-test".to_string(),
+        base_url,
+        api_key: "sk-secret-value".to_string(),
+    }
+}
+
+fn single_response_server(status_line: &'static str, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test provider");
+    let addr = listener.local_addr().expect("test provider address");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept test provider request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut first_line = String::new();
+        reader
+            .read_line(&mut first_line)
+            .expect("read request line");
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        assert!(first_line.contains("/v1/chat/completions"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        write!(
+            stream,
+            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write provider response");
+    });
+    format!("http://{addr}")
 }
 
 #[test]
@@ -198,6 +242,179 @@ fn provider_config_loads_presence_from_env_without_secret_values() {
     assert_eq!(status.base_url_status, "present(redacted)");
     assert!(!serialized.contains("sk-secret-value"));
     assert!(!serialized.contains("provider.example"));
+}
+
+#[test]
+fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
+    assert_eq!(
+        chat_completions_endpoint("https://provider.example/v1"),
+        "https://provider.example/v1/chat/completions"
+    );
+    assert_eq!(
+        chat_completions_endpoint("https://provider.example/chat/completions"),
+        "https://provider.example/chat/completions"
+    );
+    assert_eq!(
+        chat_completions_endpoint("https://provider.example/api"),
+        "https://provider.example/api/v1/chat/completions"
+    );
+
+    let config = OpenAiProviderConfig::from_env(|name| match name {
+        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
+        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    })
+    .expect("provider config");
+    let status = config.redacted_status();
+    let serialized = serde_json::to_string(&status).expect("serialize status");
+
+    assert_eq!(config.provider_name, "openai_compatible");
+    assert!(status.ready);
+    assert_eq!(status.api_key_status, "present(redacted)");
+    assert!(!serialized.contains("sk-secret-value"));
+    assert!(!serialized.contains("provider.example"));
+}
+
+#[test]
+fn openai_provider_debug_redacts_secret_configuration() {
+    let config = provider_test_config("https://provider.example/v1".to_string());
+    let provider = OpenAiProvider::new(config.clone()).expect("provider");
+    let config_debug = format!("{config:?}");
+    let provider_debug = format!("{provider:?}");
+
+    for debug_text in [config_debug, provider_debug] {
+        assert!(!debug_text.contains("sk-secret-value"));
+        assert!(!debug_text.contains("provider.example"));
+        assert!(debug_text.contains("[redacted]"));
+    }
+}
+
+#[test]
+fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
+    let body = r#"{
+        "id": "resp_1",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "done",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "builtin.read", "arguments": "{\"path\":\"README.md\"}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    }"#;
+    let base_url = single_response_server("HTTP/1.1 200 OK", body);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let mut request = ModelTurnRequest::new(
+        "request_1",
+        "run_1",
+        "session_1",
+        "task_1",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request.tools.push(ModelToolSchema {
+        name: "builtin.read".to_string(),
+        description: "Read a file".to_string(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+        capability_tags: vec!["read".to_string()],
+        risk_tags: vec![],
+        metadata: serde_json::json!({}),
+    });
+
+    let response = provider.complete(&request).expect("provider response");
+    let serialized = serde_json::to_string(&response).expect("serialize response");
+
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(response.response_id, "resp_1");
+    assert_eq!(response.usage.total_tokens, 5);
+    assert_eq!(
+        response.tool_calls[0].arguments,
+        serde_json::json!({"path": "README.md"})
+    );
+    assert_eq!(
+        response.raw_response_ref.as_deref(),
+        Some("provider_response_ref:resp_1")
+    );
+    assert!(!serialized.contains("sk-secret-value"));
+    assert!(!serialized.contains("choices"));
+}
+
+#[test]
+fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
+    let base_url = single_response_server(
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":{"message":"bad key sk-secret-value"}}"#,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_1",
+        "run_1",
+        "session_1",
+        "task_1",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let error = provider.complete(&request).expect_err("auth error");
+    let serialized = serde_json::to_string(&error.error).expect("serialize error");
+
+    assert_eq!(error.error.kind, ModelErrorKind::AuthError);
+    assert_eq!(error.error.category(), ModelErrorCategory::Authentication);
+    assert!(error.error.message.contains("HTTP 401"));
+    assert!(!serialized.contains("bad key"));
+    assert!(!serialized.contains("sk-secret-value"));
+}
+
+#[test]
+fn openai_provider_validation_rejects_non_object_tool_arguments() {
+    let body = r#"{
+        "id": "resp_1",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "builtin.read", "arguments": "\"README.md\""}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }"#;
+    let base_url = single_response_server("HTTP/1.1 200 OK", body);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let mut request = ModelTurnRequest::new(
+        "request_1",
+        "run_1",
+        "session_1",
+        "task_1",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request.tools.push(ModelToolSchema {
+        name: "builtin.read".to_string(),
+        description: "Read a file".to_string(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+        capability_tags: Vec::new(),
+        risk_tags: Vec::new(),
+        metadata: serde_json::json!({}),
+    });
+
+    let response = provider.complete(&request).expect("provider response");
+
+    assert_eq!(response.status, ModelTurnStatus::Invalid);
+    assert_eq!(
+        response.validation.as_ref().expect("validation").errors,
+        vec!["schema_mismatch", "tool_call_arguments_must_be_object"]
+    );
+    assert_eq!(
+        response.error.as_ref().expect("validation error").kind,
+        ModelErrorKind::JsonSchemaViolation
+    );
 }
 
 #[test]

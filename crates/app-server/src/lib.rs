@@ -6,21 +6,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentHostStatus, AgentLoopStatusBridge, NativeAgentLoopCapability, PythonSidecarClient,
-    PythonSidecarConfig, PythonSidecarStatus, sidecar_trace_summary,
+    AgentHostStatus, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopStatusBridge,
+    PythonSidecarClient, PythonSidecarConfig, PythonSidecarStatus, sidecar_trace_summary,
 };
 use singularity_core::{ErrorCode, contains_sensitive_text};
-use singularity_policy::{ApprovalDecision, ApprovalRequest};
+use singularity_model::OpenAiProvider;
+use singularity_policy::{
+    ApprovalDecision, ApprovalRequest, PermissionDecisionOutcome, PermissionOperation,
+    PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
+};
 use singularity_protocol::{
     AgentCapabilityResult, AgentHost, AppEvent, ApprovalCenterResult, ApprovalListResult,
     ArtifactFetchParams, ArtifactFetchResult, EventSubscribeParams, EventSubscribeResult,
-    InitializeParams, InitializeResult, JsonRpcMessage, Method, ServerCapabilitiesResult,
+    InitializeParams, InitializeResult, JsonRpcMessage, Method, ServerCapabilitiesResult, Thread,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
     ThreadResult, ThreadStartParams, ThreadStartResult, TraceEvent, TraceListParams,
     TraceListResult, TraceShowParams, TraceTailParams, TransportCapability, Turn, TurnIdParams,
     TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{ActiveSidecarRun, SessionStore, StoreError};
+use singularity_tools::{ToolBroker, ToolRegistry, ToolSpec, WorkspaceTools};
 use thiserror::Error;
 
 const THREAD_NOT_FOUND: &str = "Thread not found";
@@ -30,8 +35,13 @@ const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
 const PENDING_APPROVAL_NOT_FOUND: &str = "Pending approval not found";
 const APPROVAL_ALREADY_EXISTS: &str = "Approval already exists";
 const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
-const NATIVE_AGENT_LOOP_NOT_AVAILABLE: &str = "Native agent loop is not available";
 const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
+const TOOL_READ: &str = "builtin.read";
+const TOOL_LIST: &str = "builtin.list";
+const TOOL_GREP: &str = "builtin.grep";
+const TOOL_EDIT: &str = "builtin.edit";
+const TOOL_PATCH: &str = "builtin.patch";
+const NATIVE_AGENT_LOOP_NOT_READY: &str = "Native AgentLoop is not production-ready";
 static TRACE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -275,9 +285,6 @@ impl AppServer {
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnStartParams = message.params_as()?;
-        if matches!(params.agent_host, Some(AgentHost::Native)) {
-            return invalid_request_response(message.id, NATIVE_AGENT_LOOP_NOT_AVAILABLE);
-        }
         let thread = match self.store.get_thread(&params.thread_id) {
             Ok(thread) => thread,
             Err(StoreError::NotFound(_)) => {
@@ -285,6 +292,9 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
+        if matches!(params.agent_host, Some(AgentHost::Native)) && !native_agent_loop_ready() {
+            return invalid_request_response(message.id, NATIVE_AGENT_LOOP_NOT_READY);
+        }
         let payload = serde_json::to_value(&params.input)?;
         let (turn, _item, _trace) = match self.store.create_turn_with_input_and_trace(
             &params.thread_id,
@@ -302,6 +312,20 @@ impl AppServer {
 
         let mut messages = Vec::new();
         messages.extend(self.event_notification(AppEvent::turn_started(&turn)));
+        if matches!(params.agent_host, Some(AgentHost::Native)) {
+            let bridge = self.run_native_agent_loop(&thread, &params, &turn.turn_id)?;
+            let turn = self.update_turn_from_bridge(turn, &bridge)?;
+            self.append_native_trace(&params.thread_id, &turn.turn_id, &bridge)?;
+            messages.extend(self.agent_terminal_item_events(&bridge, &turn)?);
+            messages.push(
+                JsonRpcMessage::response(
+                    message.id,
+                    serde_json::to_value(TurnStartResult { turn: turn.clone() })?,
+                )
+                .to_wire_value(),
+            );
+            return Ok(messages);
+        }
 
         let previous_session_id = self.previous_python_session_id(&params.thread_id);
         let bridge = self.run_python_sidecar_if_enabled(
@@ -315,7 +339,7 @@ impl AppServer {
         }
         let turn = self.update_turn_from_bridge(turn, &bridge)?;
 
-        messages.extend(self.sidecar_terminal_item_events(&bridge, &turn)?);
+        messages.extend(self.agent_terminal_item_events(&bridge, &turn)?);
         messages.push(
             JsonRpcMessage::response(
                 message.id,
@@ -330,9 +354,58 @@ impl AppServer {
         json_response(
             message.id,
             AgentCapabilityResult {
-                native_agent_loop: serde_json::to_value(NativeAgentLoopCapability::current())?,
+                native_agent_loop: serde_json::to_value(AgentLoopCapability::current())?,
             },
         )
+    }
+
+    fn run_native_agent_loop(
+        &self,
+        thread: &Thread,
+        params: &TurnStartParams,
+        turn_id: &str,
+    ) -> AppServerResult<AgentLoopStatusBridge> {
+        let provider = match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
+            Ok(provider) => provider,
+            Err(error) => {
+                return Ok(AgentLoopStatusBridge::failed(error.message)
+                    .with_status(AgentHostStatus::Failed));
+            }
+        };
+        let registry = native_workspace_registry();
+        let workspace_root = thread
+            .cwd
+            .as_deref()
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(Into::into)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| ".".into());
+        let workspace_root_display = workspace_root.to_string_lossy().into_owned();
+        let policy = native_workspace_policy(workspace_root_display);
+        let goal = params
+            .input
+            .iter()
+            .map(|item| match item {
+                singularity_protocol::InputItem::Text { text } => text.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let loop_input = AgentLoopInput::new(&params.thread_id, turn_id, goal)
+            .with_model_name(thread.model.clone());
+        let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
+            .with_workspace_tools(WorkspaceTools::new(workspace_root))
+            .run(&loop_input);
+        for request in &result.approval_requests {
+            match self
+                .store
+                .create_approval_with_trace(request, "approval", "approval requested")
+            {
+                Ok(_) => {}
+                Err(StoreError::AlreadyExists(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(result.bridge(&loop_input))
     }
 
     fn run_python_sidecar_if_enabled(
@@ -426,12 +499,14 @@ impl AppServer {
             singularity_agent::AgentHostStatus::Running => Some(TurnStatus::Running),
             singularity_agent::AgentHostStatus::NotMigrated => None,
         };
-        let Some(status) = status else {
-            return Ok(turn);
-        };
-        self.store
-            .update_turn_state(&turn.turn_id, status, bridge.status.as_str())
-            .map_err(Into::into)
+        if let Some(status) = status {
+            return Ok(self.store.update_turn_state(
+                &turn.turn_id,
+                status,
+                bridge.status.as_str(),
+            )?);
+        }
+        Ok(turn)
     }
 
     fn previous_python_session_id(&self, thread_id: &str) -> Option<String> {
@@ -490,6 +565,34 @@ impl AppServer {
             });
             self.store.append_trace(&translated)?;
         }
+        Ok(())
+    }
+
+    fn append_native_trace(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        bridge: &AgentLoopStatusBridge,
+    ) -> AppServerResult<()> {
+        let mut event = TraceEvent::new(
+            format!("trace_{turn_id}_native_agent_loop"),
+            thread_id,
+            turn_id,
+            "agent_loop",
+            "Rust native AgentLoop result translated",
+        );
+        event.payload = json!({
+            "component": "agent_loop",
+            "status": bridge.status.as_str(),
+            "run_id": bridge.run_id,
+            "session_id": bridge.session_id,
+            "task_id": bridge.task_id,
+            "model_turns": bridge.model_turns,
+            "tool_calls": bridge.tool_calls,
+            "approval_count": bridge.approval_count,
+            "error": bridge.error.as_deref().map(redact_app_server_text),
+        });
+        self.store.append_trace(&event)?;
         Ok(())
     }
 
@@ -697,7 +800,7 @@ impl AppServer {
                 )?;
             }
             let mut messages =
-                self.sidecar_terminal_item_events(&bridge, &self.store.get_turn(&params.turn_id)?)?;
+                self.agent_terminal_item_events(&bridge, &self.store.get_turn(&params.turn_id)?)?;
             messages.push(
                 JsonRpcMessage::response(message.id, serde_json::to_value(TurnResult { turn })?)
                     .to_wire_value(),
@@ -840,12 +943,12 @@ impl AppServer {
         Some(event.to_notification().to_wire_value())
     }
 
-    fn sidecar_terminal_item_events(
+    fn agent_terminal_item_events(
         &self,
         bridge: &AgentLoopStatusBridge,
         turn: &Turn,
     ) -> AppServerResult<Vec<Value>> {
-        let Some(agent_delta) = sidecar_completed_delta(bridge) else {
+        let Some(agent_delta) = agent_completed_delta(bridge) else {
             return Ok(Vec::new());
         };
         let agent_item = self.store.append_item(
@@ -1006,6 +1109,9 @@ impl AppServer {
                 run_id: Some(active.run_id.clone()),
                 session_id: Some(active.session_id.clone()),
                 task_id: Some(active.task_id.clone()),
+                model_turns: 0,
+                tool_calls: 0,
+                approval_count: 0,
                 events: Vec::new(),
                 trace_path: None,
                 error: None,
@@ -1024,6 +1130,117 @@ fn json_response<T: serde::Serialize>(id: Option<Value>, result: T) -> AppServer
     Ok(vec![
         JsonRpcMessage::response(id, serde_json::to_value(result)?).to_wire_value(),
     ])
+}
+
+fn native_workspace_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::default();
+    for spec in native_workspace_tool_specs() {
+        registry
+            .register(spec)
+            .expect("valid native workspace tool");
+    }
+    registry
+}
+
+fn native_agent_loop_ready() -> bool {
+    let capability = AgentLoopCapability::current();
+    capability.available && capability.missing_boundaries.is_empty()
+}
+
+fn native_workspace_policy(workspace_root: String) -> PolicyEngine {
+    PolicyEngine::new(PermissionProfile::workspace_write(workspace_root))
+        .with_rule(native_read_tool_rule())
+}
+
+fn native_read_tool_rule() -> PermissionRule {
+    PermissionRule::new(
+        "allow_native_read_tools",
+        SettingsScope::Project,
+        PermissionDecisionOutcome::Allow,
+    )
+    .for_operation(PermissionOperation::Read)
+}
+
+fn native_workspace_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec::new(
+            TOOL_READ,
+            "Read a workspace file through the native Rust tool boundary",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "max_chars": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            TOOL_LIST,
+            "List workspace directory entries through the native Rust tool boundary",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "max_entries": {"type": "integer", "minimum": 1}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            TOOL_GREP,
+            "Search workspace text files through the native Rust tool boundary",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "max_matches": {"type": "integer", "minimum": 1}
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            TOOL_EDIT,
+            "Replace expected text in a workspace file through the native Rust tool boundary",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "expected": {"type": "string"},
+                    "replacement": {"type": "string"}
+                },
+                "required": ["path", "expected", "replacement"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            TOOL_PATCH,
+            "Apply explicit workspace file changes through the native Rust tool boundary",
+            json!({
+                "type": "object",
+                "properties": {
+                    "changes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "expected": {"type": ["string", "null"]},
+                                "replacement": {"type": "string"}
+                            },
+                            "required": ["path", "replacement"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["changes"],
+                "additionalProperties": false
+            }),
+        ),
+    ]
 }
 
 fn json_error(id: Option<Value>, error: ErrorCode) -> AppServerResult<Vec<Value>> {
@@ -1051,6 +1268,9 @@ fn cancelled_sidecar_bridge(active: &ActiveSidecarRun) -> AgentLoopStatusBridge 
         run_id: Some(active.run_id.clone()),
         session_id: Some(active.session_id.clone()),
         task_id: Some(active.task_id.clone()),
+        model_turns: 0,
+        tool_calls: 0,
+        approval_count: 0,
         events: Vec::new(),
         trace_path: None,
         error: None,
@@ -1066,6 +1286,9 @@ fn sidecar_status_bridge(status: PythonSidecarStatus) -> AgentLoopStatusBridge {
         run_id: Some(status.run_id),
         session_id: status.session_id,
         task_id: status.task_id,
+        model_turns: 0,
+        tool_calls: 0,
+        approval_count: 0,
         events: status.events,
         trace_path: status.trace_path,
         error: None,
@@ -1107,7 +1330,7 @@ fn is_cancel_ack_status(status: &AgentHostStatus) -> bool {
     )
 }
 
-fn sidecar_completed_delta(bridge: &AgentLoopStatusBridge) -> Option<String> {
+fn agent_completed_delta(bridge: &AgentLoopStatusBridge) -> Option<String> {
     if bridge.status == AgentHostStatus::Completed {
         bridge.final_answer.as_deref().map(redact_app_server_text)
     } else {

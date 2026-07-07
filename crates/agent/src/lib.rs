@@ -10,6 +10,20 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use singularity_model::{
+    ModelMessage, ModelPreferences, ModelPurpose, ModelRole, ModelToolCall, ModelToolParseStatus,
+    ModelToolSchema, ModelTurnRequest, ModelTurnStatus, Provider, provider_error_response,
+};
+use singularity_policy::{
+    ApprovalRequest, PermissionDecisionOutcome, PermissionOperation, PermissionRequest,
+    PolicyEngine,
+};
+use singularity_tools::{
+    EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker, ToolBrokerDecision,
+    ToolCallEnvelope, ToolObservation, ToolResult, WorkspacePatch, WorkspaceToolError,
+    WorkspaceTools,
+};
+use thiserror::Error;
 
 const SIDECAR_METHOD_RUN: &str = "agent/run";
 const SIDECAR_METHOD_RESUME: &str = "agent/resume";
@@ -21,17 +35,22 @@ const DEFAULT_PYTHON_BIN: &str = "python";
 const DEFAULT_SIDECAR_MODULE: &str = "singularity.agent_host.sidecar";
 const DEFAULT_SIDECAR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_AGENT_LOOP_UNAVAILABLE_REASON: &str =
-    "native Rust AgentLoop is not migrated; use Python sidecar as migration oracle";
-const NATIVE_AGENT_LOOP_MISSING_BOUNDARIES: [&str; 8] = [
-    "model_provider_adapter",
-    "tool_execution_runtime",
+    "native Rust AgentLoop is partially migrated; command/sandbox/eval remain blocked";
+const NATIVE_AGENT_LOOP_MISSING_BOUNDARIES: [&str; 6] = [
     "planner_step",
-    "context_assembler",
     "compaction_executor",
     "tool_repair_runtime",
     "completion_gate",
-    "finalizer_runtime",
+    "strict_command_sandbox",
+    "rust_evaluation_runner",
 ];
+const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 4;
+const COMPLETION_GATE_NOT_MIGRATED: &str = "completion_gate_not_migrated";
+const TOOL_READ: &str = "builtin.read";
+const TOOL_LIST: &str = "builtin.list";
+const TOOL_GREP: &str = "builtin.grep";
+const TOOL_EDIT: &str = "builtin.edit";
+const TOOL_PATCH: &str = "builtin.patch";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +101,9 @@ pub struct AgentLoopStatusBridge {
     pub run_id: Option<String>,
     pub session_id: Option<String>,
     pub task_id: Option<String>,
+    pub model_turns: u32,
+    pub tool_calls: u32,
+    pub approval_count: u32,
     pub events: Vec<SidecarRunEvent>,
     pub trace_path: Option<String>,
     pub error: Option<String>,
@@ -96,6 +118,9 @@ impl AgentLoopStatusBridge {
             run_id: None,
             session_id: None,
             task_id: None,
+            model_turns: 0,
+            tool_calls: 0,
+            approval_count: 0,
             events: Vec::new(),
             trace_path: None,
             error: None,
@@ -110,6 +135,9 @@ impl AgentLoopStatusBridge {
             run_id: Some(result.run_id),
             session_id: Some(result.session_id),
             task_id: Some(result.task_id),
+            model_turns: 0,
+            tool_calls: 0,
+            approval_count: 0,
             events: result.events,
             trace_path: result.trace_path,
             error: None,
@@ -125,6 +153,9 @@ impl AgentLoopStatusBridge {
             run_id: None,
             session_id: None,
             task_id: None,
+            model_turns: 0,
+            tool_calls: 0,
+            approval_count: 0,
             events: Vec::new(),
             trace_path: None,
             error: Some(message.into()),
@@ -139,14 +170,14 @@ impl AgentLoopStatusBridge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct NativeAgentLoopCapability {
+pub struct AgentLoopCapability {
     pub available: bool,
     pub status: AgentHostStatus,
     pub reason: String,
     pub missing_boundaries: Vec<String>,
 }
 
-impl NativeAgentLoopCapability {
+impl AgentLoopCapability {
     pub fn current() -> Self {
         Self {
             available: false,
@@ -158,15 +189,11 @@ impl NativeAgentLoopCapability {
                 .collect(),
         }
     }
-
-    pub fn status_bridge(&self) -> AgentLoopStatusBridge {
-        AgentLoopStatusBridge::not_migrated()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum NativeAgentLoopStep {
+pub enum AgentLoopStep {
     LoadTurn,
     AssembleContext,
     CallModel,
@@ -180,33 +207,120 @@ pub enum NativeAgentLoopStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct NativeAgentLoopPlan {
-    pub steps: Vec<NativeAgentLoopStep>,
+pub struct AgentLoopPlan {
+    pub steps: Vec<AgentLoopStep>,
     pub merge_requirements: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct NativeAgentLoopInput {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentLoopInput {
     pub thread_id: String,
     pub turn_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub model_preferences: ModelPreferences,
+    pub input: Vec<AgentContextItem>,
+    pub interrupted: bool,
+    pub max_turns: u32,
 }
 
-pub struct NativeAgentLoop;
+impl AgentLoopInput {
+    pub fn new(
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        goal: impl Into<String>,
+    ) -> Self {
+        let turn_id = turn_id.into();
+        Self {
+            thread_id: thread_id.into(),
+            run_id: turn_id.clone(),
+            session_id: turn_id.clone(),
+            task_id: turn_id.clone(),
+            turn_id,
+            model_preferences: ModelPreferences::default(),
+            input: vec![AgentContextItem::user("input_1", goal.into())],
+            interrupted: false,
+            max_turns: DEFAULT_MAX_AGENT_LOOP_TURNS,
+        }
+    }
 
-impl NativeAgentLoop {
-    pub fn integration_plan() -> NativeAgentLoopPlan {
-        NativeAgentLoopPlan {
+    pub fn with_model_name(mut self, model_name: Option<String>) -> Self {
+        self.model_preferences.model_name = model_name;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentLoopResult {
+    pub status: AgentHostStatus,
+    pub completed: bool,
+    pub final_answer: Option<String>,
+    pub model_turns: u32,
+    pub tool_calls: u32,
+    pub approval_count: u32,
+    pub approval_requests: Vec<ApprovalRequest>,
+    pub observations: Vec<ToolObservation>,
+    pub error: Option<String>,
+}
+
+impl AgentLoopResult {
+    pub fn bridge(&self, input: &AgentLoopInput) -> AgentLoopStatusBridge {
+        AgentLoopStatusBridge {
+            status: self.status.clone(),
+            completed: self.completed,
+            final_answer: self.final_answer.clone(),
+            run_id: Some(input.run_id.clone()),
+            session_id: Some(input.session_id.clone()),
+            task_id: Some(input.task_id.clone()),
+            model_turns: self.model_turns,
+            tool_calls: self.tool_calls,
+            approval_count: self.approval_count,
+            events: Vec::new(),
+            trace_path: None,
+            error: self.error.clone(),
+        }
+    }
+}
+
+pub struct AgentLoop<P> {
+    provider: P,
+    tool_broker: ToolBroker,
+    policy: PolicyEngine,
+    workspace_tools: Option<WorkspaceTools>,
+}
+
+impl<P> AgentLoop<P>
+where
+    P: Provider,
+{
+    pub fn new(provider: P, tool_broker: ToolBroker, policy: PolicyEngine) -> Self {
+        Self {
+            provider,
+            tool_broker,
+            policy,
+            workspace_tools: None,
+        }
+    }
+
+    pub fn with_workspace_tools(mut self, workspace_tools: WorkspaceTools) -> Self {
+        self.workspace_tools = Some(workspace_tools);
+        self
+    }
+
+    pub fn integration_plan() -> AgentLoopPlan {
+        AgentLoopPlan {
             steps: vec![
-                NativeAgentLoopStep::LoadTurn,
-                NativeAgentLoopStep::AssembleContext,
-                NativeAgentLoopStep::CallModel,
-                NativeAgentLoopStep::AdmitToolCalls,
-                NativeAgentLoopStep::ExecuteApprovedTools,
-                NativeAgentLoopStep::AppendObservations,
-                NativeAgentLoopStep::RepairOnFailure,
-                NativeAgentLoopStep::FinalizeReport,
-                NativeAgentLoopStep::PersistItemsTraceArtifacts,
-                NativeAgentLoopStep::HandleInterrupt,
+                AgentLoopStep::LoadTurn,
+                AgentLoopStep::AssembleContext,
+                AgentLoopStep::CallModel,
+                AgentLoopStep::AdmitToolCalls,
+                AgentLoopStep::ExecuteApprovedTools,
+                AgentLoopStep::AppendObservations,
+                AgentLoopStep::RepairOnFailure,
+                AgentLoopStep::FinalizeReport,
+                AgentLoopStep::PersistItemsTraceArtifacts,
+                AgentLoopStep::HandleInterrupt,
             ],
             merge_requirements: NATIVE_AGENT_LOOP_MISSING_BOUNDARIES
                 .iter()
@@ -215,19 +329,197 @@ impl NativeAgentLoop {
         }
     }
 
-    pub fn run(
-        input: &NativeAgentLoopInput,
-        capability: &NativeAgentLoopCapability,
-    ) -> AgentLoopStatusBridge {
-        if !capability.available {
-            return AgentLoopStatusBridge::failed(format!(
-                "native Rust AgentLoop is not migrated for turn {}",
-                input.turn_id
-            ))
-            .with_status(AgentHostStatus::NotMigrated);
+    pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
+        if input.interrupted {
+            return AgentLoopResult {
+                status: AgentHostStatus::Cancelled,
+                completed: false,
+                final_answer: None,
+                model_turns: 0,
+                tool_calls: 0,
+                approval_count: 0,
+                approval_requests: Vec::new(),
+                observations: Vec::new(),
+                error: None,
+            };
         }
-        AgentLoopStatusBridge::failed("native Rust AgentLoop dependencies are not wired")
+        let mut observations = Vec::new();
+        let mut approval_requests = Vec::new();
+        let mut messages = model_messages_from_context(&input.input);
+        let max_turns = input.max_turns.max(1);
+        for turn_index in 0..max_turns {
+            let request =
+                model_turn_request(&self.tool_broker, input, turn_index, messages.clone());
+            let response = match self.provider.complete(&request) {
+                Ok(response) => response,
+                Err(error) => provider_error_response(&request, error),
+            };
+            if response.status != ModelTurnStatus::Success {
+                return AgentLoopResult {
+                    status: AgentHostStatus::Failed,
+                    completed: false,
+                    final_answer: None,
+                    model_turns: turn_index + 1,
+                    tool_calls: observations.len() as u32,
+                    approval_count: 0,
+                    approval_requests,
+                    observations,
+                    error: response.error.map(|error| error.message),
+                };
+            }
+            if response.tool_calls.is_empty() {
+                return AgentLoopResult {
+                    status: AgentHostStatus::Blocked,
+                    completed: false,
+                    final_answer: None,
+                    model_turns: turn_index + 1,
+                    tool_calls: observations.len() as u32,
+                    approval_count: 0,
+                    approval_requests,
+                    observations,
+                    error: Some(COMPLETION_GATE_NOT_MIGRATED.to_string()),
+                };
+            }
+            for call in &response.tool_calls {
+                let decision = self.tool_decision(input, call);
+                if let ToolBrokerDecision::Ask {
+                    approval_request_id,
+                    reason,
+                } = &decision
+                {
+                    approval_requests.push(approval_request(
+                        input,
+                        approval_request_id,
+                        &call.tool_name,
+                        reason,
+                    ));
+                    let observation = self.execute_tool(input, call, decision);
+                    observations.push(observation);
+                    return AgentLoopResult {
+                        status: AgentHostStatus::Blocked,
+                        completed: false,
+                        final_answer: None,
+                        model_turns: turn_index + 1,
+                        tool_calls: observations.len() as u32,
+                        approval_count: approval_requests.len() as u32,
+                        approval_requests,
+                        observations,
+                        error: None,
+                    };
+                }
+                let observation = self.execute_tool(input, call, decision);
+                let failed_observation = !observation.ok;
+                observations.push(observation.clone());
+                messages.push(observation_message(&observation));
+                if failed_observation {
+                    let error_code = observation
+                        .error_code
+                        .as_deref()
+                        .unwrap_or("tool_execution_failed");
+                    return AgentLoopResult {
+                        status: AgentHostStatus::Failed,
+                        completed: false,
+                        final_answer: None,
+                        model_turns: turn_index + 1,
+                        tool_calls: observations.len() as u32,
+                        approval_count: 0,
+                        approval_requests,
+                        observations,
+                        error: Some(format!("tool execution failed: {error_code}")),
+                    };
+                }
+            }
+        }
+        AgentLoopResult {
+            status: AgentHostStatus::Failed,
+            completed: false,
+            final_answer: None,
+            model_turns: max_turns,
+            tool_calls: observations.len() as u32,
+            approval_count: 0,
+            approval_requests,
+            observations,
+            error: Some("max turns exceeded".to_string()),
+        }
     }
+
+    fn tool_decision(&self, input: &AgentLoopInput, call: &ModelToolCall) -> ToolBrokerDecision {
+        if call.parse_status != ModelToolParseStatus::Valid || !call.arguments.is_object() {
+            return ToolBrokerDecision::deny("invalid tool call arguments");
+        }
+        let operation = permission_operation_for_tool(&call.tool_name);
+        let resource = permission_resource_for_tool(call);
+        let mut request = PermissionRequest::new(call.tool_name.clone(), operation, resource);
+        if tool_call_targets_sensitive_resource(call) {
+            request = request.with_sensitive_resource();
+        }
+        let permission = self.policy.evaluate(&request);
+        match permission.outcome {
+            PermissionDecisionOutcome::Allow => ToolBrokerDecision::Allow,
+            PermissionDecisionOutcome::Deny => ToolBrokerDecision::deny(permission.reason),
+            PermissionDecisionOutcome::Ask => {
+                ToolBrokerDecision::ask(format!("approval_{}", input.turn_id), permission.reason)
+            }
+        }
+    }
+
+    fn execute_tool(
+        &self,
+        input: &AgentLoopInput,
+        call: &ModelToolCall,
+        decision: ToolBrokerDecision,
+    ) -> ToolObservation {
+        let envelope = ToolCallEnvelope::new(
+            input.run_id.clone(),
+            input.session_id.clone(),
+            input.task_id.clone(),
+            call.tool_call_id.clone(),
+            call.tool_name.clone(),
+            call.raw_arguments.clone(),
+        );
+        let executor_decision = decision.clone();
+        self.tool_broker.execute(&envelope, decision, |_envelope| {
+            self.execute_workspace_tool(call, &executor_decision)
+        })
+    }
+
+    fn execute_workspace_tool(
+        &self,
+        call: &ModelToolCall,
+        decision: &ToolBrokerDecision,
+    ) -> ToolResult {
+        let Some(workspace_tools) = &self.workspace_tools else {
+            return ToolResult::failure(
+                "backend_unavailable",
+                json!({"summary": "workspace tool backend is unavailable"}),
+            );
+        };
+        let result = match call.tool_name.as_str() {
+            TOOL_READ => read_tool_input(&call.arguments)
+                .and_then(|input| workspace_tools.read(input).map_err(Into::into)),
+            TOOL_LIST => list_tool_input(&call.arguments)
+                .and_then(|input| workspace_tools.list(input).map_err(Into::into)),
+            TOOL_GREP => grep_tool_input(&call.arguments)
+                .and_then(|input| workspace_tools.grep(input).map_err(Into::into)),
+            TOOL_EDIT => edit_tool_input(&call.arguments)
+                .and_then(|input| workspace_tools.edit(input, decision).map_err(Into::into)),
+            TOOL_PATCH => patch_tool_input(&call.arguments)
+                .and_then(|input| workspace_tools.patch(input, decision).map_err(Into::into)),
+            _ => Ok(ToolResult::failure(
+                "backend_unavailable",
+                json!({"summary": "tool backend is unavailable"}),
+            )),
+        };
+        result.unwrap_or_else(workspace_tool_failure)
+    }
+}
+
+#[derive(Debug, Error)]
+enum AgentLoopToolError {
+    #[error("invalid tool arguments: {0}")]
+    InvalidArguments(String),
+    #[error("{0}")]
+    Workspace(#[from] WorkspaceToolError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -277,6 +569,22 @@ pub struct AgentContextItem {
     pub safe_for_model: bool,
     pub evaluator_only: bool,
     pub digest: String,
+}
+
+impl AgentContextItem {
+    pub fn user(item_id: impl Into<String>, content: impl Into<String>) -> Self {
+        let content = content.into();
+        Self {
+            item_id: item_id.into(),
+            role: "user".to_string(),
+            content,
+            priority: AgentContextItemPriority::CurrentTurn,
+            token_count: 1,
+            safe_for_model: true,
+            evaluator_only: false,
+            digest: "user_input".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -772,6 +1080,9 @@ pub fn sidecar_trace_summary(bridge: &AgentLoopStatusBridge) -> Value {
         "run_id": bridge.run_id,
         "session_id": bridge.session_id,
         "task_id": bridge.task_id,
+        "model_turns": bridge.model_turns,
+        "tool_calls": bridge.tool_calls,
+        "approval_count": bridge.approval_count,
         "trace_path": bridge.trace_path,
     })
 }
@@ -784,6 +1095,181 @@ fn sidecar_run_params(goal: &str, model: Option<&str>) -> Value {
         }
     }
     params
+}
+
+fn model_turn_request(
+    loop_tools: &ToolBroker,
+    input: &AgentLoopInput,
+    turn_index: u32,
+    messages: Vec<ModelMessage>,
+) -> ModelTurnRequest {
+    ModelTurnRequest {
+        purpose: ModelPurpose::PlanNextAction,
+        request_id: format!("model_request_{}_{}", input.turn_id, turn_index),
+        run_id: input.run_id.clone(),
+        session_id: input.session_id.clone(),
+        task_id: input.task_id.clone(),
+        phase_id: "model".to_string(),
+        action_id: format!("model_action_{}_{}", input.turn_id, turn_index),
+        messages,
+        tools: model_tool_schemas(loop_tools),
+        tool_choice: Default::default(),
+        model_preferences: input.model_preferences.clone(),
+        budget: Default::default(),
+        context_metadata: json!({}),
+        policy_metadata: json!({}),
+        trace_metadata: json!({}),
+    }
+}
+
+fn model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
+    loop_tools
+        .model_visible_tools()
+        .into_iter()
+        .filter_map(|tool| {
+            Some(ModelToolSchema {
+                name: tool.get("name")?.as_str()?.to_string(),
+                description: tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                parameters_schema: tool
+                    .get("input_schema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                capability_tags: Vec::new(),
+                risk_tags: Vec::new(),
+                metadata: json!({}),
+            })
+        })
+        .collect()
+}
+
+fn model_messages_from_context(items: &[AgentContextItem]) -> Vec<ModelMessage> {
+    assemble_context_items(items, 128_000)
+        .messages
+        .into_iter()
+        .filter_map(|message| {
+            let role = match message.get("role").and_then(Value::as_str) {
+                Some("system") => ModelRole::System,
+                Some("developer") => ModelRole::Developer,
+                Some("assistant") => ModelRole::Assistant,
+                Some("tool") => ModelRole::Tool,
+                _ => ModelRole::User,
+            };
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|content| ModelMessage::text(role, content))
+        })
+        .collect()
+}
+
+fn observation_message(observation: &ToolObservation) -> ModelMessage {
+    let mut message =
+        ModelMessage::text(ModelRole::Tool, observation.to_model_payload().to_string());
+    message.tool_call_id = Some(observation.tool_call_id.clone());
+    message.name = Some(observation.tool_name.clone());
+    message
+}
+
+fn approval_request(
+    input: &AgentLoopInput,
+    approval_request_id: &str,
+    action: &str,
+    reason: &str,
+) -> ApprovalRequest {
+    let mut request = ApprovalRequest::new(
+        approval_request_id,
+        input.session_id.clone(),
+        input.task_id.clone(),
+        action,
+    );
+    request.reason = reason.to_string();
+    request
+}
+
+fn permission_operation_for_tool(tool_name: &str) -> PermissionOperation {
+    match tool_name {
+        TOOL_EDIT | TOOL_PATCH => PermissionOperation::Write,
+        _ => PermissionOperation::Read,
+    }
+}
+
+fn permission_resource_for_tool(call: &ModelToolCall) -> String {
+    path_argument(&call.arguments).unwrap_or_else(|| call.tool_name.clone())
+}
+
+fn tool_call_targets_sensitive_resource(call: &ModelToolCall) -> bool {
+    path_argument(&call.arguments)
+        .map(|path| is_sensitive_tool_path(&path))
+        .unwrap_or(false)
+}
+
+fn is_sensitive_tool_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.split('/').any(|component| {
+        component == ".env"
+            || component.strip_prefix(".env.").is_some()
+            || component == ".ssh"
+            || component == ".git"
+            || component == "credentials"
+            || component == "credentials.json"
+            || component.contains("secret")
+            || component.ends_with(".key")
+            || component.ends_with(".pem")
+            || component.ends_with(".p12")
+            || component.ends_with(".pfx")
+    })
+}
+
+fn path_argument(arguments: &Value) -> Option<String> {
+    arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn read_tool_input(arguments: &Value) -> Result<ReadToolInput, AgentLoopToolError> {
+    serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
+}
+
+fn list_tool_input(arguments: &Value) -> Result<ListToolInput, AgentLoopToolError> {
+    serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
+}
+
+fn grep_tool_input(arguments: &Value) -> Result<GrepToolInput, AgentLoopToolError> {
+    serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
+}
+
+fn edit_tool_input(arguments: &Value) -> Result<EditToolInput, AgentLoopToolError> {
+    serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
+}
+
+fn patch_tool_input(arguments: &Value) -> Result<WorkspacePatch, AgentLoopToolError> {
+    serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
+}
+
+fn invalid_tool_arguments(error: serde_json::Error) -> AgentLoopToolError {
+    AgentLoopToolError::InvalidArguments(error.to_string())
+}
+
+fn workspace_tool_failure(error: AgentLoopToolError) -> ToolResult {
+    let error_code = match &error {
+        AgentLoopToolError::InvalidArguments(_) => "invalid_tool_arguments",
+        AgentLoopToolError::Workspace(WorkspaceToolError::OutsideWorkspace(_)) => {
+            "outside_workspace"
+        }
+        AgentLoopToolError::Workspace(WorkspaceToolError::ProtectedPath(_)) => "protected_path",
+        AgentLoopToolError::Workspace(WorkspaceToolError::BinaryPattern) => "binary_pattern",
+        AgentLoopToolError::Workspace(WorkspaceToolError::ReadFailed(_)) => "tool_read_failed",
+        AgentLoopToolError::Workspace(WorkspaceToolError::ExpectedContentMissing(_)) => {
+            "expected_content_missing"
+        }
+        AgentLoopToolError::Workspace(WorkspaceToolError::InvalidInput(_)) => "invalid_tool_input",
+    };
+    ToolResult::failure(error_code, json!({"summary": error.to_string()}))
 }
 
 fn action_matches(action: &Value, kind: &str, status: &str) -> bool {
