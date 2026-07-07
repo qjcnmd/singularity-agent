@@ -6,19 +6,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentHostStatus, AgentLoopStatusBridge, PythonSidecarClient, PythonSidecarConfig,
-    PythonSidecarStatus, sidecar_trace_summary,
+    AgentHostStatus, AgentLoopStatusBridge, NativeAgentLoopCapability, PythonSidecarClient,
+    PythonSidecarConfig, PythonSidecarStatus, sidecar_trace_summary,
 };
-use singularity_core::ErrorCode;
+use singularity_core::{ErrorCode, contains_sensitive_text};
 use singularity_policy::{ApprovalDecision, ApprovalRequest};
 use singularity_protocol::{
-    AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams, ArtifactFetchResult,
-    EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult, JsonRpcMessage,
-    Method, ServerCapabilitiesResult, ThreadDeleteResult, ThreadForkParams, ThreadForkResult,
-    ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult,
-    TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceTailParams,
-    TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
-    TurnStartResult, TurnStatus,
+    AgentCapabilityResult, AgentHost, AppEvent, ApprovalCenterResult, ApprovalListResult,
+    ArtifactFetchParams, ArtifactFetchResult, EventSubscribeParams, EventSubscribeResult,
+    InitializeParams, InitializeResult, JsonRpcMessage, Method, ServerCapabilitiesResult,
+    ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
+    ThreadResult, ThreadStartParams, ThreadStartResult, TraceEvent, TraceListParams,
+    TraceListResult, TraceShowParams, TraceTailParams, TransportCapability, Turn, TurnIdParams,
+    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_store::{ActiveSidecarRun, SessionStore, StoreError};
 use thiserror::Error;
@@ -30,6 +30,7 @@ const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
 const PENDING_APPROVAL_NOT_FOUND: &str = "Pending approval not found";
 const APPROVAL_ALREADY_EXISTS: &str = "Approval already exists";
 const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
+const NATIVE_AGENT_LOOP_NOT_AVAILABLE: &str = "Native agent loop is not available";
 const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
 static TRACE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -126,6 +127,7 @@ impl AppServer {
             Method::ThreadArchive => self.thread_archive(message),
             Method::ThreadDelete => self.thread_delete(message),
             Method::TurnStart => self.turn_start(message),
+            Method::AgentCapability => self.agent_capability(message),
             Method::TurnInterrupt => self.turn_interrupt(message),
             Method::TurnStatus => self.turn_status(message),
             Method::ApprovalList => self.approval_list(message),
@@ -273,6 +275,9 @@ impl AppServer {
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnStartParams = message.params_as()?;
+        if matches!(params.agent_host, Some(AgentHost::Native)) {
+            return invalid_request_response(message.id, NATIVE_AGENT_LOOP_NOT_AVAILABLE);
+        }
         let thread = match self.store.get_thread(&params.thread_id) {
             Ok(thread) => thread,
             Err(StoreError::NotFound(_)) => {
@@ -281,7 +286,7 @@ impl AppServer {
             Err(error) => return Err(error.into()),
         };
         let payload = serde_json::to_value(&params.input)?;
-        let (turn, item, _trace) = match self.store.create_turn_with_input_and_trace(
+        let (turn, _item, _trace) = match self.store.create_turn_with_input_and_trace(
             &params.thread_id,
             singularity_agent::AgentHostStatus::NotMigrated.as_str(),
             payload,
@@ -310,15 +315,7 @@ impl AppServer {
         }
         let turn = self.update_turn_from_bridge(turn, &bridge)?;
 
-        if let Some(agent_delta) = bridge.final_answer.as_deref().or(bridge.error.as_deref()) {
-            for event in [
-                AppEvent::item_started(item.item_id.clone()),
-                AppEvent::item_agent_message_delta(item.item_id.clone(), agent_delta),
-                AppEvent::item_completed(item.item_id.clone()),
-            ] {
-                messages.extend(self.event_notification(event));
-            }
-        }
+        messages.extend(self.sidecar_terminal_item_events(&bridge, &turn)?);
         messages.push(
             JsonRpcMessage::response(
                 message.id,
@@ -327,6 +324,15 @@ impl AppServer {
             .to_wire_value(),
         );
         Ok(messages)
+    }
+
+    fn agent_capability(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        json_response(
+            message.id,
+            AgentCapabilityResult {
+                native_agent_loop: serde_json::to_value(NativeAgentLoopCapability::current())?,
+            },
+        )
     }
 
     fn run_python_sidecar_if_enabled(
@@ -466,20 +472,20 @@ impl AppServer {
             "python_sidecar",
             "Python sidecar result translated",
         );
-        summary.payload = sidecar_trace_summary(bridge);
+        summary.payload = redact_sidecar_trace_summary(sidecar_trace_summary(bridge));
         self.store.append_trace(&summary)?;
         for event in &bridge.events {
             let mut translated = TraceEvent::new(
-                format!("trace_{turn_id}_{}", event.event_id),
+                sidecar_event_trace_id(turn_id, event),
                 thread_id,
                 turn_id,
                 "python_sidecar",
-                event.summary.clone(),
+                redact_app_server_text(&event.summary),
             );
-            translated.event_type = event.event_type.clone();
-            translated.severity = event.severity.clone();
+            translated.event_type = safe_sidecar_event_type(&event.event_type);
+            translated.severity = safe_sidecar_event_severity(&event.severity);
             translated.payload = serde_json::json!({
-                "component": event.component,
+                "component": "python_sidecar",
                 "sequence": event.sequence,
             });
             self.store.append_trace(&translated)?;
@@ -500,7 +506,10 @@ impl AppServer {
                 Err(error) => {
                     return json_error(
                         message.id,
-                        ErrorCode::new(singularity_core::JSON_RPC_INTERNAL_ERROR, error),
+                        ErrorCode::new(
+                            singularity_core::JSON_RPC_INTERNAL_ERROR,
+                            redact_app_server_text(&error),
+                        ),
                     );
                 }
             };
@@ -687,7 +696,13 @@ impl AppServer {
                     active_status,
                 )?;
             }
-            return json_response(message.id, TurnResult { turn });
+            let mut messages =
+                self.sidecar_terminal_item_events(&bridge, &self.store.get_turn(&params.turn_id)?)?;
+            messages.push(
+                JsonRpcMessage::response(message.id, serde_json::to_value(TurnResult { turn })?)
+                    .to_wire_value(),
+            );
+            return Ok(messages);
         }
         match self.store.get_turn(&params.turn_id) {
             Ok(turn) => json_response(message.id, TurnResult { turn }),
@@ -823,6 +838,29 @@ impl AppServer {
             return None;
         }
         Some(event.to_notification().to_wire_value())
+    }
+
+    fn sidecar_terminal_item_events(
+        &self,
+        bridge: &AgentLoopStatusBridge,
+        turn: &Turn,
+    ) -> AppServerResult<Vec<Value>> {
+        let Some(agent_delta) = sidecar_completed_delta(bridge) else {
+            return Ok(Vec::new());
+        };
+        let agent_item = self.store.append_item(
+            &turn.turn_id,
+            singularity_protocol::ItemKind::AgentMessage,
+            json!({"delta": agent_delta}),
+        )?;
+        Ok([
+            AppEvent::item_started(agent_item.item_id.clone()),
+            AppEvent::item_agent_message_delta(agent_item.item_id.clone(), agent_delta),
+            AppEvent::item_completed(agent_item.item_id),
+        ]
+        .into_iter()
+        .filter_map(|event| self.event_notification(event))
+        .collect())
     }
 
     fn trace_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -1067,6 +1105,62 @@ fn is_cancel_ack_status(status: &AgentHostStatus) -> bool {
         status,
         AgentHostStatus::CancelRequested | AgentHostStatus::Cancelled
     )
+}
+
+fn sidecar_completed_delta(bridge: &AgentLoopStatusBridge) -> Option<String> {
+    if bridge.status == AgentHostStatus::Completed {
+        bridge.final_answer.as_deref().map(redact_app_server_text)
+    } else {
+        None
+    }
+}
+
+fn redact_app_server_text(text: &str) -> String {
+    if contains_sensitive_text(text) {
+        "[redacted sensitive app-server output]".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn redact_sidecar_trace_summary(mut payload: Value) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(Value::String(trace_path)) = object.get_mut("trace_path") {
+            *trace_path = redact_app_server_text(trace_path);
+        }
+    }
+    payload
+}
+
+fn sidecar_event_trace_id(turn_id: &str, event: &singularity_agent::SidecarRunEvent) -> String {
+    let event_id = safe_trace_id_segment(&event.event_id);
+    if event_id.is_empty() || contains_sensitive_text(&event.event_id) {
+        format!("trace_{turn_id}_python_sidecar_{}", event.sequence)
+    } else {
+        format!("trace_{turn_id}_{event_id}")
+    }
+}
+
+fn safe_trace_id_segment(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        .collect()
+}
+
+fn safe_sidecar_event_type(event_type: &str) -> String {
+    if event_type.trim().is_empty() || contains_sensitive_text(event_type) {
+        "python_sidecar.event".to_string()
+    } else {
+        event_type.to_string()
+    }
+}
+
+fn safe_sidecar_event_severity(severity: &str) -> String {
+    match severity.to_ascii_lowercase().as_str() {
+        "debug" | "info" | "warning" | "error" => severity.to_ascii_lowercase(),
+        _ => "info".to_string(),
+    }
 }
 
 fn short_trace_id() -> String {

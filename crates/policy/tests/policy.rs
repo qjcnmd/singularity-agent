@@ -203,3 +203,27 @@ fn equivalent_shell_forms_are_not_a_policy_special_case() {
         PermissionDecisionOutcome::Deny
     );
 }
+
+#[test]
+fn pre_tool_hook_denies_before_lower_priority_allow_rule() {
+    let request = PermissionRequest::new("builtin.patch", PermissionOperation::Write, "README.md");
+    let hook = PreToolUseHook::new(
+        "hook_1",
+        PermissionDecision::new(PermissionDecisionOutcome::Deny, "hook denied write"),
+    );
+    let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+        .with_hook(hook)
+        .with_rule(rule(
+            "allow_readme",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+            PermissionOperation::Write,
+            "README.md",
+        ));
+
+    let decision = engine.evaluate(&request);
+
+    assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.reason, "hook denied write");
+    assert_eq!(decision.rule_id, None);
+}

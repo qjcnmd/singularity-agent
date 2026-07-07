@@ -18,6 +18,7 @@ pub enum Method {
     ThreadArchive,
     ThreadDelete,
     TurnStart,
+    AgentCapability,
     TurnInterrupt,
     TurnStatus,
     ApprovalList,
@@ -46,6 +47,7 @@ impl Method {
             "thread/archive" => Self::ThreadArchive,
             "thread/delete" => Self::ThreadDelete,
             "turn/start" => Self::TurnStart,
+            "agent/capability" => Self::AgentCapability,
             "turn/interrupt" => Self::TurnInterrupt,
             "turn/status" => Self::TurnStatus,
             "approval/list" => Self::ApprovalList,
@@ -75,6 +77,7 @@ impl Method {
             Self::ThreadArchive => "thread/archive",
             Self::ThreadDelete => "thread/delete",
             Self::TurnStart => "turn/start",
+            Self::AgentCapability => "agent/capability",
             Self::TurnInterrupt => "turn/interrupt",
             Self::TurnStatus => "turn/status",
             Self::ApprovalList => "approval/list",
@@ -288,6 +291,15 @@ pub struct TurnStartParams {
     #[serde(rename = "threadId")]
     pub thread_id: String,
     pub input: Vec<InputItem>,
+    #[serde(rename = "agentHost", default, skip_serializing_if = "Option::is_none")]
+    pub agent_host: Option<AgentHost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHost {
+    Native,
+    Python,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -351,6 +363,12 @@ pub enum ItemStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TurnStartResult {
     pub turn: Turn,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentCapabilityResult {
+    #[serde(rename = "nativeAgentLoop")]
+    pub native_agent_loop: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

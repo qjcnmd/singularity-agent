@@ -1,8 +1,12 @@
 use singularity_agent::{
-    AgentHostStatus, AgentLoopStatusBridge, ContextAssemblyBoundary,
-    ContextSummaryEnvelopeBoundary, FinalizationMappingBoundary, NativeAgentLoopCapability,
+    AgentContextItem, AgentContextItemPriority, AgentHostStatus, AgentLoopStatusBridge,
+    CompletionGateInput, ContextAssemblyBoundary, ContextSummaryEnvelopeBoundary,
+    EvaluationDiagnostics, EvaluationRunReport, FinalizationMappingBoundary, NativeAgentLoop,
+    NativeAgentLoopCapability, NativeAgentLoopInput, NativeAgentLoopStep, PlannerNextAction,
     PlannerStateBoundary, PythonSidecarClient, PythonSidecarConfig, PythonSidecarRunResult,
-    SidecarRunEvent, ToolCallRepairBoundary, sidecar_trace_summary,
+    RepairNextAction, SidecarRunEvent, ToolCallRepairBoundary, assemble_context_items,
+    completion_gate_allows_final, final_mapping_from_status, planner_next_action,
+    repair_next_action, sidecar_trace_summary,
 };
 use std::time::Duration;
 
@@ -38,6 +42,206 @@ fn native_agent_loop_capability_is_explicitly_not_available() {
     );
     assert_eq!(bridge.status, AgentHostStatus::NotMigrated);
     assert!(!bridge.completed);
+}
+
+#[test]
+fn native_agent_loop_plan_lists_real_integration_steps_without_running_them() {
+    let plan = NativeAgentLoop::integration_plan();
+
+    assert_eq!(
+        plan.steps,
+        vec![
+            NativeAgentLoopStep::LoadTurn,
+            NativeAgentLoopStep::AssembleContext,
+            NativeAgentLoopStep::CallModel,
+            NativeAgentLoopStep::AdmitToolCalls,
+            NativeAgentLoopStep::ExecuteApprovedTools,
+            NativeAgentLoopStep::AppendObservations,
+            NativeAgentLoopStep::RepairOnFailure,
+            NativeAgentLoopStep::FinalizeReport,
+            NativeAgentLoopStep::PersistItemsTraceArtifacts,
+            NativeAgentLoopStep::HandleInterrupt,
+        ]
+    );
+    assert!(
+        plan.merge_requirements
+            .contains(&"model_provider_adapter".to_string())
+    );
+    assert!(
+        plan.merge_requirements
+            .contains(&"tool_execution_runtime".to_string())
+    );
+}
+
+#[test]
+fn native_agent_loop_run_is_blocked_until_capability_is_available() {
+    let input = NativeAgentLoopInput {
+        thread_id: "thread_1".to_string(),
+        turn_id: "turn_1".to_string(),
+    };
+    let result = NativeAgentLoop::run(&input, &NativeAgentLoopCapability::current());
+
+    assert_eq!(result.status, AgentHostStatus::NotMigrated);
+    assert!(!result.completed);
+    assert!(result.final_answer.is_none());
+    assert!(result.error.as_deref().unwrap().contains("not migrated"));
+}
+
+#[test]
+fn evaluation_report_contract_keeps_gate_fields_separate_from_diagnostics() {
+    let report = EvaluationRunReport {
+        evaluation_passed: false,
+        agent_completed: true,
+        tests_passed: true,
+        public_verification_passed: true,
+        hidden_verification_passed: false,
+        local_process_fallback_count: 0,
+        diagnostics: EvaluationDiagnostics {
+            base_verification_passed: Some(false),
+            sandbox_required: true,
+            notes: vec!["diagnostic-only timing note".to_string()],
+        },
+    };
+
+    let value = serde_json::to_value(&report).expect("serialize evaluation report");
+
+    assert_eq!(value["evaluation_passed"], false);
+    assert_eq!(value["agent_completed"], true);
+    assert_eq!(value["tests_passed"], true);
+    assert_eq!(value["public_verification_passed"], true);
+    assert_eq!(value["hidden_verification_passed"], false);
+    assert_eq!(value["local_process_fallback_count"], 0);
+    assert_eq!(value["diagnostics"]["base_verification_passed"], false);
+    assert_eq!(value["diagnostics"]["sandbox_required"], true);
+    assert!(value["diagnostics"].get("evaluation_passed").is_none());
+    assert!(value.get("base_verification_passed").is_none());
+
+    let round_trip: EvaluationRunReport =
+        serde_json::from_value(value).expect("deserialize evaluation report");
+    assert_eq!(round_trip, report);
+}
+
+#[test]
+fn context_assembly_keeps_user_turn_and_safe_tool_observations_with_budget() {
+    let items = vec![
+        AgentContextItem {
+            item_id: "tool_raw".to_string(),
+            role: "tool".to_string(),
+            content: "raw".to_string(),
+            priority: AgentContextItemPriority::Evidence,
+            token_count: 3,
+            safe_for_model: false,
+            evaluator_only: false,
+            digest: "digest_raw".to_string(),
+        },
+        AgentContextItem {
+            item_id: "user_1".to_string(),
+            role: "user".to_string(),
+            content: "fix tests".to_string(),
+            priority: AgentContextItemPriority::CurrentTurn,
+            token_count: 6,
+            safe_for_model: true,
+            evaluator_only: false,
+            digest: "digest_user".to_string(),
+        },
+        AgentContextItem {
+            item_id: "eval_1".to_string(),
+            role: "system".to_string(),
+            content: "hidden scorer".to_string(),
+            priority: AgentContextItemPriority::System,
+            token_count: 4,
+            safe_for_model: true,
+            evaluator_only: true,
+            digest: "digest_eval".to_string(),
+        },
+        AgentContextItem {
+            item_id: "tool_safe".to_string(),
+            role: "tool".to_string(),
+            content: "safe preview".to_string(),
+            priority: AgentContextItemPriority::Evidence,
+            token_count: 5,
+            safe_for_model: true,
+            evaluator_only: false,
+            digest: "digest_tool".to_string(),
+        },
+    ];
+
+    let context = assemble_context_items(&items, 11);
+
+    assert_eq!(context.included_item_ids, vec!["user_1", "tool_safe"]);
+    assert_eq!(context.excluded_item_ids, vec!["tool_raw", "eval_1"]);
+    assert_eq!(context.messages.len(), 2);
+    assert_eq!(context.messages[0]["role"], "user");
+    assert_eq!(context.messages[1]["role"], "tool");
+    assert_eq!(context.budget["message_tokens"], 11);
+    assert!(context.bundle_digest.contains("digest_user"));
+    assert!(context.bundle_digest.contains("digest_tool"));
+}
+
+#[test]
+fn planner_repair_completion_and_final_mapping_are_deterministic() {
+    let pending_approval = PlannerStateBoundary {
+        task_id: "task_1".to_string(),
+        current_phase: "running_verification".to_string(),
+        status: "running".to_string(),
+        current_plan: Vec::new(),
+        completion_criteria: serde_json::json!({}),
+        open_actions: vec![serde_json::json!({"kind": "approval", "status": "pending"})],
+        blocked_actions: Vec::new(),
+        risk_escalations: Vec::new(),
+        evidence_refs: Vec::new(),
+    };
+    let pending_tool = PlannerStateBoundary {
+        open_actions: vec![serde_json::json!({"kind": "tool", "status": "pending"})],
+        ..pending_approval.clone()
+    };
+    let repair = ToolCallRepairBoundary {
+        repair_id: "repair_1".to_string(),
+        run_id: "run_1".to_string(),
+        session_id: "session_1".to_string(),
+        task_id: "task_1".to_string(),
+        phase_id: "repairing_failures".to_string(),
+        failed_tool_call_id: "call_1".to_string(),
+        failure_kind: "tool_executor_failed".to_string(),
+        next_action: "repair_then_verify".to_string(),
+        failed_result: serde_json::json!({"ok": false}),
+        recovery_report: serde_json::json!({}),
+        repair_contract: serde_json::json!({}),
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+        metadata: serde_json::json!({}),
+    };
+
+    assert_eq!(
+        planner_next_action(&pending_approval),
+        PlannerNextAction::ResumePendingApproval
+    );
+    assert_eq!(
+        planner_next_action(&pending_tool),
+        PlannerNextAction::ExecutePendingTool
+    );
+    assert_eq!(
+        repair_next_action(&repair),
+        RepairNextAction::RepairThenVerify
+    );
+    assert!(!completion_gate_allows_final(&CompletionGateInput {
+        verification_passed: false,
+        unresolved_failures: Vec::new(),
+        interrupted: false,
+    }));
+
+    let mapping = final_mapping_from_status(
+        "mapping_1",
+        "run_1",
+        "session_1",
+        "task_1",
+        AgentHostStatus::Completed,
+        "done",
+    );
+
+    assert_eq!(mapping.run_status, "completed");
+    assert_eq!(mapping.final_report_status, "completed");
+    assert_eq!(mapping.completion_status, "completed");
+    assert_eq!(mapping.final_answer, "done");
 }
 
 #[test]

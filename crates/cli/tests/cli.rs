@@ -72,6 +72,184 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
 }
 
 #[test]
+fn cli_config_doctor_reports_redacted_native_sidecar_and_eval_readiness() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": False, "status": "not_migrated", "reason": "not migrated", "missing_boundaries": ["model_provider_adapter"]}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let doctor = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["config", "doctor"])
+        .env("SINGULARITY_API_KEY", "secret-value")
+        .env("SINGULARITY_BASE_URL", "https://provider.example/v1")
+        .env("SINGULARITY_MODEL", "gpt-test")
+        .output()
+        .expect("doctor cli");
+
+    assert!(doctor.status.success(), "stderr={}", stderr(&doctor));
+    let stdout = stdout(&doctor);
+    assert!(stdout.contains("client=protocol-only"));
+    assert!(stdout.contains("native_agent_loop=not_migrated"));
+    assert!(stdout.contains("sidecar_oracle=available"));
+    assert!(stdout.contains("evaluation=python_oracle"));
+    assert!(stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
+    assert!(stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
+    assert!(stdout.contains("SINGULARITY_MODEL=present(redacted)"));
+    assert!(!stdout.contains("secret-value"));
+    assert!(!stdout.contains("https://provider.example/v1"));
+    assert!(!stdout.contains("gpt-test"));
+}
+
+#[test]
+fn cli_rejects_native_run_when_capability_is_disabled() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let trace_path = temp.path().join("native_disabled_methods.txt");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    with open(os.environ["METHOD_TRACE"], "a", encoding="utf-8") as trace:
+        trace.write(f"{method}\n")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": False, "status": "not_migrated", "reason": "not migrated", "missing_boundaries": ["model_provider_adapter"]}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "native"])
+        .env("METHOD_TRACE", &trace_path)
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("native AgentLoop is not available"));
+    let trace = std::fs::read_to_string(trace_path).expect("method trace");
+    assert!(trace.contains("initialize"));
+    assert!(trace.contains("agent/capability"));
+    assert!(!trace.contains("turn/start"));
+}
+
+#[test]
+fn cli_sends_native_agent_host_after_capability_allows_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let trace_path = temp.path().join("native_enabled_turn.json");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import os
+import pathlib
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "running", "reason": "enabled", "missing_boundaries": []}}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_native", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        pathlib.Path(os.environ["TURN_TRACE"]).write_text(json.dumps(message["params"]), encoding="utf-8")
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_native", "thread_id": "thread_native", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "native"])
+        .env("TURN_TRACE", &trace_path)
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(trace_path).expect("turn trace"))
+            .expect("turn trace json");
+    assert_eq!(params["agentHost"], "native");
+    assert_eq!(params["threadId"], "thread_native");
+}
+
+#[test]
+fn cli_eval_command_is_script_friendly_and_validates_manifest() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let missing_manifest = temp.path().join("missing.json");
+    let manifest = temp.path().join("eval.json");
+    std::fs::write(&manifest, "{}").expect("write manifest");
+
+    let output = Command::cargo_bin("sg")
+        .expect("binary")
+        .args([
+            "eval",
+            "run",
+            path_str(&missing_manifest),
+            "--run-id",
+            "eval_contract",
+            "--json",
+        ])
+        .output()
+        .expect("eval cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("eval manifest not found"));
+
+    let blocked = Command::cargo_bin("sg")
+        .expect("binary")
+        .args([
+            "eval",
+            "run",
+            path_str(&manifest),
+            "--run-id",
+            "eval_blocked",
+            "--json",
+        ])
+        .output()
+        .expect("eval cli blocked");
+
+    assert!(!blocked.status.success());
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&blocked)).expect("blocked eval json");
+    assert_eq!(value["status"], "blocked");
+    assert_eq!(value["blocker"], "rust_evaluation_runner_not_migrated");
+    assert_eq!(value["evaluation_passed"], false);
+}
+
+#[test]
 fn cli_run_can_enable_python_sidecar_without_raw_env_plumbing() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");

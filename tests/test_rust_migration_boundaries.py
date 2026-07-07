@@ -278,6 +278,17 @@ def test_guard_rejects_python_core_changes_outside_allowlist(tmp_path: Path) -> 
     assert "python-core-freeze" in result.stderr
 
 
+def test_guard_allows_model_runner_context_export_fix_path(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    model_file = repo / "src/singularity/model/runner.py"
+    model_file.parent.mkdir(parents=True, exist_ok=True)
+    model_file.write_text("ENV_ASSIGNMENT_PATTERN = 'bounded context-export policy'\n", encoding="utf-8")
+
+    result = run_guard(repo, "--changed-file", "src/singularity/model/runner.py")
+
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     ("marker", "violation"),
     (

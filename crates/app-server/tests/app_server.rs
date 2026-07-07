@@ -152,7 +152,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
             r#"{{"method":"turn/status","id":51,"params":{{"turnId":"{turn_id}"}}}}"#
         ))
         .unwrap();
-    assert_eq!(status[0]["result"]["turn"]["turn_id"], turn_id);
+    assert_eq!(result_message(&status)["turn"]["turn_id"], turn_id);
 
     let interrupted = server
         .handle_json(&format!(
@@ -231,6 +231,131 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         ))
         .unwrap();
     assert_eq!(deleted[0]["result"]["deleted"], true);
+}
+
+#[test]
+fn app_server_reports_native_agent_loop_capability_as_unavailable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut server = AppServer::new(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    let capability = server
+        .handle_json(r#"{"method":"agent/capability","id":2,"params":{}}"#)
+        .unwrap();
+
+    assert_eq!(
+        capability[0]["result"]["nativeAgentLoop"]["available"],
+        false
+    );
+    assert_eq!(
+        capability[0]["result"]["nativeAgentLoop"]["status"],
+        "not_migrated"
+    );
+    assert!(
+        capability[0]["result"]["nativeAgentLoop"]["missing_boundaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|boundary| boundary == "model_provider_adapter")
+    );
+}
+
+#[test]
+fn native_agent_loop_disabled_turn_does_not_emit_fake_completion() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut server = AppServer::new(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"native","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(
+        turn[0]["error"]["message"],
+        "Native agent loop is not available"
+    );
+    assert!(
+        !turn
+            .iter()
+            .any(|message| message["method"] == "item/agentMessage/delta")
+    );
+    assert!(
+        !turn
+            .iter()
+            .any(|message| message["params"]["turn"]["status"] == "completed")
+    );
+}
+
+#[test]
+fn native_agent_loop_selection_does_not_start_python_sidecar() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_probe.py"),
+        "import os, pathlib\npathlib.Path(os.environ['SIDECAR_MARKER']).write_text('spawned')\n",
+    )
+    .expect("sidecar probe");
+    let marker = dir.path().join("sidecar_spawned.txt");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_probe".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: vec![(
+            "SIDECAR_MARKER".to_string(),
+            marker.to_string_lossy().into_owned(),
+        )],
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"native","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+
+    assert_eq!(
+        turn[0]["error"]["message"],
+        "Native agent loop is not available"
+    );
+    assert!(
+        !marker.exists(),
+        "native-disabled path must not start the Python sidecar"
+    );
 }
 
 #[test]
@@ -455,6 +580,18 @@ fn app_server_can_translate_python_sidecar_completion_when_enabled() {
         turn.iter()
             .any(|message| message["method"] == "item/agentMessage/delta")
     );
+    let response_index = turn
+        .iter()
+        .position(|message| message.get("result").is_some())
+        .expect("turn/start response");
+    let delta_index = turn
+        .iter()
+        .position(|message| message["method"] == "item/agentMessage/delta")
+        .expect("agent delta");
+    assert!(
+        delta_index < response_index,
+        "terminal item delta must be emitted before response so clients read it"
+    );
     let trace = server
         .handle_json(&format!(
             r#"{{"method":"trace/tail","id":4,"params":{{"runId":"{thread_id}","limit":5}}}}"#
@@ -638,6 +775,493 @@ fn app_server_sidecar_trace_projection_contains_only_safe_fields() {
 }
 
 #[test]
+fn app_server_redacts_sidecar_event_summary_before_trace_projection() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_leaky_event.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({
+        "id": message["id"],
+        "result": {
+            "run_id": "run_1",
+            "session_id": "session_1",
+            "task_id": "task_1",
+            "status": "completed",
+            "final_answer": "safe final",
+            "events": [{
+                "event_id": "raw_prompt_event_sk-abcdefghijklmnopqrstuvwxyz",
+                "event_type": "provider_response",
+                "summary": "raw_prompt provider_response Authorization: Bearer abc123",
+                "component": "raw_prompt",
+                "severity": "secret",
+                "sequence": 1
+            }]
+        }
+    }), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_leaky_event".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+    let trace = server
+        .handle_json(&format!(
+            r#"{{"method":"trace/tail","id":4,"params":{{"runId":"{thread_id}","limit":10}}}}"#
+        ))
+        .unwrap();
+    let serialized = serde_json::to_string(&trace).expect("serialize trace");
+
+    assert!(serialized.contains("[redacted sensitive app-server output]"));
+    assert!(serialized.contains("python_sidecar.event"));
+    assert!(serialized.contains(r#""severity":"info""#));
+    for marker in [
+        "raw_prompt",
+        "provider_response",
+        "Authorization",
+        "abc123",
+        "sk-",
+    ] {
+        assert!(
+            !serialized.contains(marker),
+            "{marker} leaked to trace projection"
+        );
+    }
+}
+
+#[test]
+fn app_server_redacts_sidecar_final_answer_before_item_delta() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_leaky_final.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({
+        "id": message["id"],
+        "result": {
+            "run_id": "run_1",
+            "session_id": "session_1",
+            "task_id": "task_1",
+            "status": "completed",
+            "final_answer": "\"provider\" evaluator_only raw_prompt provider_response Authorization: Bearer abc123",
+            "events": []
+        }
+    }), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_leaky_final".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+    let delta = turn
+        .iter()
+        .find_map(|message| message["params"]["delta"].as_str())
+        .expect("agent delta");
+    let serialized = serde_json::to_string(&turn).expect("serialize turn messages");
+
+    assert_eq!(delta, "[redacted sensitive app-server output]");
+    for marker in [
+        "\"provider\"",
+        "evaluator_only",
+        "raw_prompt",
+        "provider_response",
+        "Authorization",
+        "abc123",
+    ] {
+        assert!(
+            !serialized.contains(marker),
+            "{marker} leaked to app-server messages"
+        );
+    }
+}
+
+#[test]
+fn app_server_redacts_standalone_secret_values_in_final_answer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_standalone_secret_final.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({
+        "id": message["id"],
+        "result": {
+            "run_id": "run_1",
+            "session_id": "session_1",
+            "task_id": "task_1",
+            "status": "completed",
+            "final_answer": "sk-abcdefghijklmnopqrstuvwxyz ghp_abcdefghijklmnopqrstuvwxyz123456 eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123",
+            "events": []
+        }
+    }), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_standalone_secret_final".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+    let delta = turn
+        .iter()
+        .find_map(|message| message["params"]["delta"].as_str())
+        .expect("agent delta");
+    let serialized = serde_json::to_string(&turn).expect("serialize turn messages");
+
+    assert_eq!(delta, "[redacted sensitive app-server output]");
+    for marker in ["sk-", "ghp_", "eyJhbGci"] {
+        assert!(
+            !serialized.contains(marker),
+            "{marker} leaked to app-server messages"
+        );
+    }
+}
+
+#[test]
+fn app_server_keeps_non_secret_environment_variable_final_answer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_environment_final.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({
+        "id": message["id"],
+        "result": {
+            "run_id": "run_1",
+            "session_id": "session_1",
+            "task_id": "task_1",
+            "status": "completed",
+            "final_answer": "The environment variable name is documented without a value.",
+            "events": []
+        }
+    }), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_environment_final".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+    let delta = turn
+        .iter()
+        .find_map(|message| message["params"]["delta"].as_str())
+        .expect("agent delta");
+
+    assert_eq!(
+        delta,
+        "The environment variable name is documented without a value."
+    );
+}
+
+#[test]
+fn app_server_keeps_safe_token_metrics_final_answer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_token_metrics_final.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({
+        "id": message["id"],
+        "result": {
+            "run_id": "run_1",
+            "session_id": "session_1",
+            "task_id": "task_1",
+            "status": "completed",
+            "final_answer": "token count is 42 and token budget is 100",
+            "events": []
+        }
+    }), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_token_metrics_final".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+    let delta = turn
+        .iter()
+        .find_map(|message| message["params"]["delta"].as_str())
+        .expect("agent delta");
+
+    assert_eq!(delta, "token count is 42 and token budget is 100");
+}
+
+#[test]
+fn app_server_does_not_emit_agent_delta_for_sidecar_transport_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_error.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({
+        "id": message["id"],
+        "error": {
+            "code": -32603,
+            "message": "unrecognized sensitive payload shape abc123"
+        }
+    }), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_error".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+    let result = result_message(&turn);
+    let serialized = serde_json::to_string(&turn).expect("serialize turn messages");
+
+    assert_eq!(result["turn"]["status"], "failed");
+    assert!(
+        !turn
+            .iter()
+            .any(|message| message["method"] == "item/agentMessage/delta")
+    );
+    assert!(!serialized.contains("abc123"));
+}
+
+#[test]
+fn app_server_does_not_emit_agent_delta_for_sidecar_failed_final_answer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_failed_final.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({
+        "id": message["id"],
+        "result": {
+            "run_id": "run_1",
+            "session_id": "session_1",
+            "task_id": "task_1",
+            "status": "failed",
+            "final_answer": "failure summary with provider_response abc123",
+            "events": []
+        }
+    }), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_failed_final".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+    let result = result_message(&turn);
+    let serialized = serde_json::to_string(&turn).expect("serialize turn messages");
+
+    assert_eq!(result["turn"]["status"], "failed");
+    assert_eq!(result["turn"]["agent_loop_status"], "failed");
+    assert!(
+        !turn
+            .iter()
+            .any(|message| message["method"] == "item/agentMessage/delta")
+    );
+    assert!(!serialized.contains("provider_response"));
+    assert!(!serialized.contains("abc123"));
+}
+
+#[test]
 fn turn_lifecycle_status_and_interrupt_cancel_active_sidecar_run() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
@@ -717,19 +1341,23 @@ for line in sys.stdin:
             r#"{{"method":"turn/status","id":4,"params":{{"turnId":"{turn_id}"}}}}"#
         ))
         .unwrap();
-    assert_eq!(status[0]["result"]["turn"]["status"], "running");
-    assert_eq!(status[0]["result"]["turn"]["agent_loop_status"], "running");
+    let status_result = result_message(&status);
+    assert_eq!(status_result["turn"]["status"], "running");
+    assert_eq!(status_result["turn"]["agent_loop_status"], "running");
 
     let completed = server
         .handle_json(&format!(
             r#"{{"method":"turn/status","id":5,"params":{{"turnId":"{turn_id}"}}}}"#
         ))
         .unwrap();
-    assert_eq!(completed[0]["result"]["turn"]["status"], "completed");
-    assert_eq!(
-        completed[0]["result"]["turn"]["agent_loop_status"],
-        "completed"
-    );
+    let completed_result = result_message(&completed);
+    assert_eq!(completed_result["turn"]["status"], "completed");
+    assert_eq!(completed_result["turn"]["agent_loop_status"], "completed");
+    let status_delta = completed
+        .iter()
+        .find_map(|message| message["params"]["delta"].as_str())
+        .expect("completed status emits agent message delta");
+    assert_eq!(status_delta, "done");
 
     let trace = server
         .handle_json(&format!(
@@ -758,7 +1386,15 @@ for line in sys.stdin:
             r#"{{"method":"turn/status","id":7,"params":{{"turnId":"{turn_id}"}}}}"#
         ))
         .unwrap();
-    assert_eq!(after_terminal[0]["result"]["turn"]["status"], "completed");
+    assert_eq!(
+        result_message(&after_terminal)["turn"]["status"],
+        "completed"
+    );
+    assert!(
+        !after_terminal
+            .iter()
+            .any(|message| message["method"] == "item/agentMessage/delta")
+    );
     let requests = std::fs::read_to_string(request_log).expect("request log");
     let status_calls = requests
         .lines()
@@ -1224,11 +1860,9 @@ for line in sys.stdin:
         ))
         .unwrap();
 
-    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
-    assert_eq!(
-        status[0]["result"]["turn"]["agent_loop_status"],
-        "cancelled"
-    );
+    let status_result = result_message(&status);
+    assert_eq!(status_result["turn"]["status"], "interrupted");
+    assert_eq!(status_result["turn"]["agent_loop_status"], "cancelled");
     let store = SessionStore::open(&db_path).expect("reopen store");
     assert!(store.get_active_sidecar_run(&turn_id).is_err());
 }
@@ -1300,11 +1934,9 @@ for line in sys.stdin:
         ))
         .unwrap();
 
-    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
-    assert_eq!(
-        status[0]["result"]["turn"]["agent_loop_status"],
-        "cancelled"
-    );
+    let status_result = result_message(&status);
+    assert_eq!(status_result["turn"]["status"], "interrupted");
+    assert_eq!(status_result["turn"]["agent_loop_status"], "cancelled");
     let store = SessionStore::open(&db_path).expect("reopen store");
     assert!(store.get_active_sidecar_run(&turn_id).is_err());
     let traces = store.list_trace(thread_id).expect("trace list");
@@ -1386,11 +2018,9 @@ for line in sys.stdin:
         ))
         .unwrap();
 
-    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
-    assert_eq!(
-        status[0]["result"]["turn"]["agent_loop_status"],
-        "cancelled"
-    );
+    let status_result = result_message(&status);
+    assert_eq!(status_result["turn"]["status"], "interrupted");
+    assert_eq!(status_result["turn"]["agent_loop_status"], "cancelled");
     let store = SessionStore::open(&db_path).expect("reopen store");
     assert!(store.get_active_sidecar_run(&turn_id).is_err());
     let traces = store.list_trace(thread_id).expect("trace list");
@@ -1469,9 +2099,10 @@ for line in sys.stdin:
         ))
         .unwrap();
 
-    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
+    let status_result = result_message(&status);
+    assert_eq!(status_result["turn"]["status"], "interrupted");
     assert_eq!(
-        status[0]["result"]["turn"]["agent_loop_status"],
+        status_result["turn"]["agent_loop_status"],
         "cancel_requested"
     );
     let store = SessionStore::open(&db_path).expect("reopen store");
@@ -1548,9 +2179,10 @@ for line in sys.stdin:
         ))
         .unwrap();
 
-    assert_eq!(status[0]["result"]["turn"]["status"], "interrupted");
+    let status_result = result_message(&status);
+    assert_eq!(status_result["turn"]["status"], "interrupted");
     assert_eq!(
-        status[0]["result"]["turn"]["agent_loop_status"],
+        status_result["turn"]["agent_loop_status"],
         "cancel_requested"
     );
     let store = SessionStore::open(&db_path).expect("reopen store");
@@ -1582,7 +2214,7 @@ for line in sys.stdin:
     if method == "agent/run":
         print(json.dumps({"id": message["id"], "result": {"run_id": "run_active", "session_id": "session_active", "task_id": "task_active", "status": "running"}}), flush=True)
     elif method == "agent/cancel":
-        print(json.dumps({"id": message["id"], "error": {"code": -32603, "message": "cancel transport failed"}}), flush=True)
+        print(json.dumps({"id": message["id"], "error": {"code": -32603, "message": "raw_prompt provider_response Authorization: Bearer abc123"}}), flush=True)
 "#,
     )
     .expect("cancel error sidecar");
@@ -1622,12 +2254,17 @@ for line in sys.stdin:
         ))
         .unwrap();
 
-    assert!(
-        interrupted[0]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("cancel transport failed")
+    let serialized = serde_json::to_string(&interrupted).expect("serialize interrupt response");
+    assert_eq!(
+        interrupted[0]["error"]["message"],
+        "[redacted sensitive app-server output]"
     );
+    for marker in ["raw_prompt", "provider_response", "Authorization", "abc123"] {
+        assert!(
+            !serialized.contains(marker),
+            "{marker} leaked to interrupt response"
+        );
+    }
     let store = SessionStore::open(&db_path).expect("reopen store");
     let turn = store.get_turn(&turn_id).expect("turn");
     assert_eq!(turn.status, singularity_protocol::TurnStatus::Running);
@@ -1680,8 +2317,9 @@ fn turn_lifecycle_active_row_without_process_handle_returns_durable_status() {
         ))
         .unwrap();
 
-    assert_eq!(status[0]["result"]["turn"]["status"], "running");
-    assert_eq!(status[0]["result"]["turn"]["agent_loop_status"], "running");
+    let status_result = result_message(&status);
+    assert_eq!(status_result["turn"]["status"], "running");
+    assert_eq!(status_result["turn"]["agent_loop_status"], "running");
     assert_eq!(interrupt[0]["result"]["status"], "running");
     assert_eq!(interrupt[0]["result"]["agent_loop_status"], "running");
     drop(server);
@@ -1851,11 +2489,9 @@ fn turn_lifecycle_interrupt_on_terminal_turn_is_idempotent() {
         .unwrap();
 
     assert_eq!(interrupted[0]["result"]["status"], "completed");
-    assert_eq!(status[0]["result"]["turn"]["status"], "completed");
-    assert_eq!(
-        status[0]["result"]["turn"]["agent_loop_status"],
-        "completed"
-    );
+    let status_result = result_message(&status);
+    assert_eq!(status_result["turn"]["status"], "completed");
+    assert_eq!(status_result["turn"]["agent_loop_status"], "completed");
 }
 
 #[test]

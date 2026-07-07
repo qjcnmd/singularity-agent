@@ -84,9 +84,11 @@ ALLOWED_CRATE_DEPENDENCIES = {
 
 ALLOWED_PYTHON_MIGRATION_PATHS = {
     "src/singularity/agent_host",
+    "src/singularity/model/runner.py",
     "scripts/export_rust_parity_fixtures.py",
     "tests/test_rust_parity_fixtures.py",
     "tests/test_rust_migration_boundaries.py",
+    "tests/test_model_runner.py",
 }
 
 FORBIDDEN_PYTHON_RUNTIME_NAMES = {

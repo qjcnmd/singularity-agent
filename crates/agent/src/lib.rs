@@ -22,7 +22,9 @@ const DEFAULT_SIDECAR_MODULE: &str = "singularity.agent_host.sidecar";
 const DEFAULT_SIDECAR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_AGENT_LOOP_UNAVAILABLE_REASON: &str =
     "native Rust AgentLoop is not migrated; use Python sidecar as migration oracle";
-const NATIVE_AGENT_LOOP_MISSING_BOUNDARIES: [&str; 6] = [
+const NATIVE_AGENT_LOOP_MISSING_BOUNDARIES: [&str; 8] = [
+    "model_provider_adapter",
+    "tool_execution_runtime",
     "planner_step",
     "context_assembler",
     "compaction_executor",
@@ -128,6 +130,12 @@ impl AgentLoopStatusBridge {
             error: Some(message.into()),
         }
     }
+
+    pub fn with_status(mut self, status: AgentHostStatus) -> Self {
+        self.completed = status == AgentHostStatus::Completed;
+        self.status = status;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -153,6 +161,277 @@ impl NativeAgentLoopCapability {
 
     pub fn status_bridge(&self) -> AgentLoopStatusBridge {
         AgentLoopStatusBridge::not_migrated()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeAgentLoopStep {
+    LoadTurn,
+    AssembleContext,
+    CallModel,
+    AdmitToolCalls,
+    ExecuteApprovedTools,
+    AppendObservations,
+    RepairOnFailure,
+    FinalizeReport,
+    PersistItemsTraceArtifacts,
+    HandleInterrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeAgentLoopPlan {
+    pub steps: Vec<NativeAgentLoopStep>,
+    pub merge_requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeAgentLoopInput {
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+pub struct NativeAgentLoop;
+
+impl NativeAgentLoop {
+    pub fn integration_plan() -> NativeAgentLoopPlan {
+        NativeAgentLoopPlan {
+            steps: vec![
+                NativeAgentLoopStep::LoadTurn,
+                NativeAgentLoopStep::AssembleContext,
+                NativeAgentLoopStep::CallModel,
+                NativeAgentLoopStep::AdmitToolCalls,
+                NativeAgentLoopStep::ExecuteApprovedTools,
+                NativeAgentLoopStep::AppendObservations,
+                NativeAgentLoopStep::RepairOnFailure,
+                NativeAgentLoopStep::FinalizeReport,
+                NativeAgentLoopStep::PersistItemsTraceArtifacts,
+                NativeAgentLoopStep::HandleInterrupt,
+            ],
+            merge_requirements: NATIVE_AGENT_LOOP_MISSING_BOUNDARIES
+                .iter()
+                .map(|boundary| (*boundary).to_string())
+                .collect(),
+        }
+    }
+
+    pub fn run(
+        input: &NativeAgentLoopInput,
+        capability: &NativeAgentLoopCapability,
+    ) -> AgentLoopStatusBridge {
+        if !capability.available {
+            return AgentLoopStatusBridge::failed(format!(
+                "native Rust AgentLoop is not migrated for turn {}",
+                input.turn_id
+            ))
+            .with_status(AgentHostStatus::NotMigrated);
+        }
+        AgentLoopStatusBridge::failed("native Rust AgentLoop dependencies are not wired")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EvaluationDiagnostics {
+    pub base_verification_passed: Option<bool>,
+    pub sandbox_required: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EvaluationRunReport {
+    pub evaluation_passed: bool,
+    pub agent_completed: bool,
+    pub tests_passed: bool,
+    pub public_verification_passed: bool,
+    pub hidden_verification_passed: bool,
+    pub local_process_fallback_count: u32,
+    pub diagnostics: EvaluationDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum AgentContextItemPriority {
+    System,
+    CurrentTurn,
+    Evidence,
+    History,
+}
+
+impl AgentContextItemPriority {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::CurrentTurn => 0,
+            Self::System => 1,
+            Self::Evidence => 2,
+            Self::History => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentContextItem {
+    pub item_id: String,
+    pub role: String,
+    pub content: String,
+    pub priority: AgentContextItemPriority,
+    pub token_count: u32,
+    pub safe_for_model: bool,
+    pub evaluator_only: bool,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerNextAction {
+    ResumePendingApproval,
+    ExecutePendingTool,
+    Final,
+    AskUser,
+    Continue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairNextAction {
+    RepairThenVerify,
+    RequestModel,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompletionGateInput {
+    pub verification_passed: bool,
+    pub unresolved_failures: Vec<String>,
+    pub interrupted: bool,
+}
+
+pub fn assemble_context_items(
+    items: &[AgentContextItem],
+    max_tokens: u32,
+) -> ContextAssemblyBoundary {
+    let mut candidates: Vec<(usize, &AgentContextItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.safe_for_model && !item.evaluator_only)
+        .collect();
+    candidates.sort_by_key(|(index, item)| (item.priority.rank(), *index));
+
+    let mut used_tokens = 0;
+    let mut included_item_ids = Vec::new();
+    let mut excluded_item_ids: Vec<String> = items
+        .iter()
+        .filter(|item| !item.safe_for_model || item.evaluator_only)
+        .map(|item| item.item_id.clone())
+        .collect();
+    let mut messages = Vec::new();
+    let mut digest_parts = Vec::new();
+
+    for (_, item) in candidates {
+        if used_tokens + item.token_count > max_tokens {
+            excluded_item_ids.push(item.item_id.clone());
+            continue;
+        }
+        used_tokens += item.token_count;
+        included_item_ids.push(item.item_id.clone());
+        digest_parts.push(item.digest.clone());
+        messages.push(json!({
+            "role": item.role,
+            "content": item.content,
+        }));
+    }
+
+    ContextAssemblyBoundary {
+        bundle_id: "rust_context_bundle".to_string(),
+        run_id: String::new(),
+        task_id: String::new(),
+        phase_id: "context".to_string(),
+        model: String::new(),
+        provider: String::new(),
+        messages,
+        included_item_ids,
+        excluded_item_ids,
+        budget: json!({
+            "model_context_window": max_tokens,
+            "message_tokens": used_tokens,
+        }),
+        compression_snapshot_id: None,
+        retrieval_query: None,
+        render_policy: json!({
+            "include_raw_tool_outputs": false,
+            "redact_sensitive": true,
+        }),
+        created_at: String::new(),
+        bundle_digest: digest_parts.join(":"),
+        metadata: json!({}),
+    }
+}
+
+pub fn planner_next_action(state: &PlannerStateBoundary) -> PlannerNextAction {
+    if state
+        .open_actions
+        .iter()
+        .any(|action| action_matches(action, "approval", "pending"))
+    {
+        return PlannerNextAction::ResumePendingApproval;
+    }
+    if state
+        .open_actions
+        .iter()
+        .any(|action| action_matches(action, "tool", "pending"))
+    {
+        return PlannerNextAction::ExecutePendingTool;
+    }
+    if state.current_phase == "finalizing" {
+        return PlannerNextAction::Final;
+    }
+    if !state.blocked_actions.is_empty() {
+        return PlannerNextAction::AskUser;
+    }
+    PlannerNextAction::Continue
+}
+
+pub fn repair_next_action(repair: &ToolCallRepairBoundary) -> RepairNextAction {
+    match repair.next_action.as_str() {
+        "repair_then_verify" => RepairNextAction::RepairThenVerify,
+        "request_model" => RepairNextAction::RequestModel,
+        _ => RepairNextAction::Blocked,
+    }
+}
+
+pub fn completion_gate_allows_final(input: &CompletionGateInput) -> bool {
+    input.verification_passed && input.unresolved_failures.is_empty() && !input.interrupted
+}
+
+pub fn final_mapping_from_status(
+    mapping_id: &str,
+    run_id: &str,
+    session_id: &str,
+    task_id: &str,
+    status: AgentHostStatus,
+    final_answer: &str,
+) -> FinalizationMappingBoundary {
+    let run_status = match status {
+        AgentHostStatus::Completed => "completed",
+        AgentHostStatus::Blocked => "blocked",
+        AgentHostStatus::Cancelled | AgentHostStatus::CancelRequested => "interrupted",
+        AgentHostStatus::Failed => "failed",
+        AgentHostStatus::Running | AgentHostStatus::NotMigrated => "running",
+    };
+    FinalizationMappingBoundary {
+        mapping_id: mapping_id.to_string(),
+        run_id: run_id.to_string(),
+        session_id: session_id.to_string(),
+        task_id: task_id.to_string(),
+        phase_id: "finalizing".to_string(),
+        agent_loop_status: status.as_str().to_string(),
+        run_status: run_status.to_string(),
+        final_report_status: run_status.to_string(),
+        completion_status: run_status.to_string(),
+        final_answer: final_answer.to_string(),
+        final_report: json!({"status": run_status}),
+        completion_assessment: json!({"status": run_status}),
+        contract_satisfaction: json!({"satisfied": status == AgentHostStatus::Completed}),
+        created_at: String::new(),
+        metadata: json!({}),
     }
 }
 
@@ -505,4 +784,9 @@ fn sidecar_run_params(goal: &str, model: Option<&str>) -> Value {
         }
     }
     params
+}
+
+fn action_matches(action: &Value, kind: &str, status: &str) -> bool {
+    action.get("kind").and_then(Value::as_str) == Some(kind)
+        && action.get("status").and_then(Value::as_str) == Some(status)
 }

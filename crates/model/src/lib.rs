@@ -11,6 +11,10 @@ const DEFAULT_MAX_RETRIES: u32 = 2;
 const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 const STREAM_EVENT_PREFIX: &str = "stream_event";
+const ENV_PROVIDER: &str = "SINGULARITY_MODEL_PROVIDER";
+const ENV_MODEL: &str = "SINGULARITY_MODEL";
+const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";
+const ENV_API_KEY: &str = "SINGULARITY_API_KEY";
 
 const PERMISSION_DENIED_MARKERS: [&str; 4] = [
     "winerror 10013",
@@ -220,6 +224,56 @@ pub struct ModelProviderConfig {
     pub api_key_present: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelBlockerKind {
+    RequiredEnvMissing,
+    AuthenticationProviderError,
+    BaseUrlNetworkError,
+    ModelNameConfigError,
+    SandboxPermissionError,
+}
+
+impl ModelBlockerKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RequiredEnvMissing => "required env missing",
+            Self::AuthenticationProviderError => "authentication/provider error",
+            Self::BaseUrlNetworkError => "base_url/network error",
+            Self::ModelNameConfigError => "model name/config error",
+            Self::SandboxPermissionError => "sandbox/permission error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ModelProviderStatus {
+    pub ready: bool,
+    pub provider_name: Option<String>,
+    pub model_name: Option<String>,
+    pub api_key_status: String,
+    pub base_url_status: String,
+    pub blocker: Option<ModelBlockerKind>,
+}
+
+impl ModelProviderStatus {
+    pub fn from_config(config: &ModelProviderConfig) -> Self {
+        let validation = validate_provider_config(config);
+        Self {
+            ready: validation.valid,
+            provider_name: config.provider_name.clone(),
+            model_name: config.model_name.clone(),
+            api_key_status: redacted_presence(config.api_key_present),
+            base_url_status: redacted_presence(config.base_url_present),
+            blocker: if validation.valid {
+                None
+            } else {
+                Some(ModelBlockerKind::RequiredEnvMissing)
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelBudget {
     pub max_input_tokens: Option<u32>,
@@ -295,6 +349,13 @@ impl ModelValidationResult {
             repair_message: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ModelRetryDecision {
+    pub retry: bool,
+    pub next_attempt: Option<u32>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -380,6 +441,20 @@ impl ModelError {
 
 pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
     model_error_category(error)
+}
+
+impl From<&ModelErrorCategory> for ModelBlockerKind {
+    fn from(category: &ModelErrorCategory) -> Self {
+        match category {
+            ModelErrorCategory::Authentication => Self::AuthenticationProviderError,
+            ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable => {
+                Self::BaseUrlNetworkError
+            }
+            ModelErrorCategory::SandboxPermission => Self::SandboxPermissionError,
+            ModelErrorCategory::ModelConfiguration => Self::ModelNameConfigError,
+            _ => Self::BaseUrlNetworkError,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -517,6 +592,18 @@ pub struct ProviderStreamEvent {
     pub metadata: Value,
 }
 
+pub fn provider_config_from_env<F>(mut get_env: F) -> ModelProviderConfig
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    ModelProviderConfig {
+        provider_name: value_from_env(&mut get_env, ENV_PROVIDER),
+        model_name: value_from_env(&mut get_env, ENV_MODEL),
+        base_url_present: value_from_env(&mut get_env, ENV_BASE_URL).is_some(),
+        api_key_present: value_from_env(&mut get_env, ENV_API_KEY).is_some(),
+    }
+}
+
 pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidationResult {
     let mut errors = Vec::new();
     if missing(&config.provider_name) {
@@ -532,6 +619,58 @@ pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidation
         errors.push("api_key_required".to_string());
     }
     validation_result(errors, Vec::new())
+}
+
+pub fn validate_model_request(request: &ModelTurnRequest) -> ModelValidationResult {
+    let mut errors = Vec::new();
+    for (field, value) in [
+        ("request_id_required", &request.request_id),
+        ("run_id_required", &request.run_id),
+        ("session_id_required", &request.session_id),
+        ("task_id_required", &request.task_id),
+        ("phase_id_required", &request.phase_id),
+        ("action_id_required", &request.action_id),
+    ] {
+        if value.trim().is_empty() {
+            errors.push(field.to_string());
+        }
+    }
+    if request.messages.is_empty() {
+        errors.push("messages_required".to_string());
+    }
+    validation_result(errors, Vec::new())
+}
+
+pub fn validate_model_turn_response(
+    request: &ModelTurnRequest,
+    response: &ModelTurnResponse,
+    allowed_tool_names: &[String],
+    capabilities: Option<&ModelCapabilities>,
+) -> ModelValidationResult {
+    let mut result = validate_model_response(
+        response.assistant_message.as_ref(),
+        &response.tool_calls,
+        &request.tool_choice,
+        allowed_tool_names,
+        capabilities,
+    );
+    if response.request_id != request.request_id {
+        result
+            .errors
+            .push("response_request_id_mismatch".to_string());
+    }
+    if response.response_id.trim().is_empty() {
+        result.errors.push("response_id_required".to_string());
+    }
+    if response.status == ModelTurnStatus::Success && response.error.is_some() {
+        result
+            .errors
+            .push("successful_response_has_error".to_string());
+    }
+    result.errors.sort();
+    result.errors.dedup();
+    result.valid = result.errors.is_empty();
+    result
 }
 
 pub fn validate_model_response(
@@ -586,6 +725,9 @@ pub fn validate_model_response(
         if call.tool_name.trim().is_empty() {
             errors.push("missing_tool_name".to_string());
         }
+        if !call.arguments.is_object() {
+            errors.push("tool_call_arguments_must_be_object".to_string());
+        }
         if !allowed_tool_names
             .iter()
             .any(|name| name == &call.tool_name)
@@ -603,6 +745,28 @@ pub fn validate_model_response(
     }
 
     validation_result(errors, warnings)
+}
+
+pub fn retry_decision(error: &ModelError, attempt: u32, max_retries: u32) -> ModelRetryDecision {
+    if !error.retryable {
+        return ModelRetryDecision {
+            retry: false,
+            next_attempt: None,
+            reason: Some("non_retryable_model_error".to_string()),
+        };
+    }
+    if attempt >= max_retries {
+        return ModelRetryDecision {
+            retry: false,
+            next_attempt: None,
+            reason: Some("retry_budget_exhausted".to_string()),
+        };
+    }
+    ModelRetryDecision {
+        retry: true,
+        next_attempt: Some(attempt + 1),
+        reason: Some("retryable_model_error".to_string()),
+    }
 }
 
 pub fn validate_stream_events(events: &[ProviderStreamEvent]) -> ModelValidationResult {
@@ -750,6 +914,21 @@ fn message_text(message: &ModelMessage) -> String {
 
 fn missing(value: &Option<String>) -> bool {
     value.as_deref().map(str::trim).unwrap_or("").is_empty()
+}
+
+fn value_from_env<F>(get_env: &mut F, name: &str) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    get_env(name).filter(|value| !value.trim().is_empty())
+}
+
+fn redacted_presence(present: bool) -> String {
+    if present {
+        "present(redacted)".to_string()
+    } else {
+        "missing".to_string()
+    }
 }
 
 fn looks_like_model_config_error(message: &str) -> bool {

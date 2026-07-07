@@ -280,7 +280,7 @@ ModelRunner 写 request-created、response-received、tool-call、output-rejecte
 
 ## 失败路径
 
-`ModelTurnStatus` 区分 invalid、failed、timeout、cancelled、budget_exceeded；provider auth/rate/network/timeout/invalid request映射为 `ModelError.kind/retryable`。streaming provider 产生 `ProviderStreamEventType.ERROR` 时，`ModelRunner._stream_provider_response()` 转成 `ModelError`，不会把半截 stream 当作成功。validator对 tool call invalid JSON/schema/unknown/duplicate/max-count返回错误，AgentLoop再决定 retry、blocked或fatal。
+`ModelTurnStatus` 区分 invalid、failed、timeout、cancelled、budget_exceeded；provider auth/rate/network/timeout/invalid request映射为 `ModelError.kind/retryable`。streaming provider 产生 `ProviderStreamEventType.ERROR` 时，`ModelRunner._stream_provider_response()` 转成 `ModelError`，不会把半截 stream 当作成功。validator对 tool call invalid JSON/schema/unknown/duplicate/max-count返回错误，AgentLoop再决定 retry、blocked或fatal。`allow_remote_provider=True` 时，`ModelRunner._context_export_error()` 在请求发送前按 `context_export_policy` fail closed：真实整行 env assignment、secret-like token 和敏感 key/value 会返回 `context_export_policy_env_content` 或 `context_export_policy_secret_like_content`；普通代码文本中的 lowercase assignment（例如 `description = "..."`）不按 `.env` 内容处理，仍允许安全说明文本进入远端 provider。
 
 ## 当前结构问题
 

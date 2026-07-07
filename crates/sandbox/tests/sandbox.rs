@@ -1,9 +1,10 @@
 use schemars::schema_for;
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
-    SandboxBackendDescriptor, SandboxCapabilities, SandboxPolicy, git_diff_request,
-    git_status_request,
+    SandboxBackendDescriptor, SandboxCapabilities, SandboxPolicy, bound_command_output,
+    changed_files_inside_workspace, git_diff_request, git_status_request, redacted_child_env,
 };
+use std::collections::BTreeMap;
 
 const SANDBOX_SRC: &str = include_str!("../src/lib.rs");
 const FORBIDDEN_LOCAL_PROCESS_SURFACES: [&str; 12] = [
@@ -61,6 +62,7 @@ fn command_request_and_result_are_schema_backed_boundaries() {
     assert_eq!(request_value["purpose"], "project_verification");
     assert_eq!(request_value["network"]["mode"], "denied");
     assert_eq!(result_value["semantic_status"], "succeeded");
+    assert_eq!(result_value["redacted"], true);
     assert_eq!(request.permission_resource(), "python -m pytest");
     assert_eq!(
         schema_for!(CommandRequest)
@@ -178,9 +180,12 @@ fn patch_schema_objects_are_snapshotted() {
 fn sandbox_backend_descriptor_is_a_serializable_contract() {
     let descriptor = SandboxBackendDescriptor::strict("windows_elevated");
     let value = serde_json::to_value(&descriptor).expect("serialize backend descriptor");
+    let schema = schema_for!(SandboxBackendDescriptor);
+    let schema_text = serde_json::to_string(&schema).expect("serialize schema");
 
     assert_eq!(value["backend"], "windows_elevated");
     assert_eq!(value["enforcement"], "strict");
+    assert!(!schema_text.contains("reduced"));
     assert!(
         value["capabilities"]["filesystem_isolation"]
             .as_bool()
@@ -195,4 +200,84 @@ fn sandbox_backend_descriptor_is_a_serializable_contract() {
             .unwrap(),
         "SandboxBackendDescriptor"
     );
+}
+
+#[test]
+fn command_output_and_child_environment_are_safe_bounded_projections() {
+    let output = bound_command_output("abcdef", 3);
+    let redacted_result =
+        CommandResult::completed("command_secret", "Authorization: Bearer abc123");
+    let bounded_result = CommandResult::completed("command_long", "x".repeat(40_010));
+    let blocked_result =
+        CommandResult::policy_denied("command_blocked", "raw_prompt provider_response abc123");
+    let mut env = BTreeMap::new();
+    env.insert("PATH".to_string(), "C:/Windows".to_string());
+    env.insert("SINGULARITY_API_KEY".to_string(), "secret".to_string());
+
+    let child_env = redacted_child_env(&env);
+
+    assert_eq!(output.preview, "abc");
+    assert!(output.truncated);
+    assert_eq!(
+        redacted_result.stdout_preview,
+        "[redacted sensitive command output]"
+    );
+    assert!(redacted_result.output_truncated);
+    assert_eq!(bounded_result.stdout_preview.chars().count(), 40_000);
+    assert!(bounded_result.output_truncated);
+    assert_eq!(
+        blocked_result.stderr_preview,
+        "[redacted sensitive command output]"
+    );
+    assert_eq!(
+        CommandResult::completed(
+            "command_key",
+            "provider returned sk-abcdefghijklmnopqrstuvwxyz"
+        )
+        .stdout_preview,
+        "[redacted sensitive command output]"
+    );
+    assert_eq!(
+        CommandResult::completed(
+            "command_gh",
+            "provider returned ghp_abcdefghijklmnopqrstuvwxyz123456"
+        )
+        .stdout_preview,
+        "[redacted sensitive command output]"
+    );
+    assert_eq!(
+        CommandResult::completed(
+            "command_jwt",
+            "bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123"
+        )
+        .stdout_preview,
+        "[redacted sensitive command output]"
+    );
+    assert_eq!(
+        CommandResult::completed(
+            "command_tokens",
+            "token count is 42 and token budget is 100"
+        )
+        .stdout_preview,
+        "token count is 42 and token budget is 100"
+    );
+    assert_eq!(
+        child_env.get("PATH").map(String::as_str),
+        Some("C:/Windows")
+    );
+    assert!(!child_env.contains_key("SINGULARITY_API_KEY"));
+}
+
+#[test]
+fn changed_file_detection_never_reports_paths_outside_workspace() {
+    let files = changed_files_inside_workspace(
+        "C:/repo",
+        &[
+            "C:/repo/src/lib.rs".to_string(),
+            "C:/repo/../secrets.txt".to_string(),
+            "D:/outside.txt".to_string(),
+        ],
+    );
+
+    assert_eq!(files, vec!["src/lib.rs"]);
 }

@@ -1,10 +1,12 @@
 use schemars::schema_for;
 use singularity_model::{
-    ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage,
-    ModelProviderConfig, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, ProviderStreamEvent,
-    ProviderStreamEventType, ToolChoiceMode, ToolChoicePolicy, classify_model_error,
-    validate_model_response, validate_provider_config, validate_stream_events,
+    ModelBlockerKind, ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind,
+    ModelMessage, ModelProviderConfig, ModelProviderStatus, ModelRole, ModelToolCall,
+    ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
+    ModelUsage, ProviderStreamEvent, ProviderStreamEventType, ToolChoiceMode, ToolChoicePolicy,
+    classify_model_error, provider_config_from_env, retry_decision, validate_model_request,
+    validate_model_response, validate_model_turn_response, validate_provider_config,
+    validate_stream_events,
 };
 
 fn stream_event(event_type: ProviderStreamEventType) -> ProviderStreamEvent {
@@ -176,6 +178,46 @@ fn provider_config_validation_reports_missing_boundary_fields() {
 }
 
 #[test]
+fn provider_config_loads_presence_from_env_without_secret_values() {
+    let config = provider_config_from_env(|name| match name {
+        "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
+        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    });
+    let status = ModelProviderStatus::from_config(&config);
+    let serialized = serde_json::to_string(&status).expect("serialize provider status");
+
+    assert_eq!(config.provider_name.as_deref(), Some("openai_compatible"));
+    assert_eq!(config.model_name.as_deref(), Some("gpt-test"));
+    assert!(config.base_url_present);
+    assert!(config.api_key_present);
+    assert!(status.ready);
+    assert_eq!(status.api_key_status, "present(redacted)");
+    assert_eq!(status.base_url_status, "present(redacted)");
+    assert!(!serialized.contains("sk-secret-value"));
+    assert!(!serialized.contains("provider.example"));
+}
+
+#[test]
+fn provider_status_reports_required_env_missing_blocker() {
+    let status = ModelProviderStatus::from_config(&ModelProviderConfig {
+        provider_name: Some("openai_compatible".to_string()),
+        model_name: None,
+        base_url_present: true,
+        api_key_present: false,
+    });
+
+    assert!(!status.ready);
+    assert_eq!(status.blocker, Some(ModelBlockerKind::RequiredEnvMissing));
+    assert_eq!(
+        status.blocker.as_ref().unwrap().as_str(),
+        "required env missing"
+    );
+}
+
+#[test]
 fn model_errors_classify_provider_failures_without_transport_calls() {
     let auth = ModelError::new(ModelErrorKind::AuthError, "Provider returned HTTP 401.")
         .with_provider("openai_compatible")
@@ -207,6 +249,49 @@ fn model_errors_classify_provider_failures_without_transport_calls() {
         model_missing.category(),
         ModelErrorCategory::ModelConfiguration
     );
+}
+
+#[test]
+fn retry_decision_is_bounded_to_retryable_provider_errors() {
+    let rate_limited = ModelError::new(ModelErrorKind::RateLimited, "Provider returned HTTP 429.");
+    let validation = ModelError::new(ModelErrorKind::JsonSchemaViolation, "schema mismatch");
+
+    let retry = retry_decision(&rate_limited, 0, 2);
+    let exhausted = retry_decision(&rate_limited, 2, 2);
+    let non_retryable = retry_decision(&validation, 0, 2);
+
+    assert!(retry.retry);
+    assert_eq!(retry.next_attempt, Some(1));
+    assert_eq!(retry.reason.as_deref(), Some("retryable_model_error"));
+    assert!(!exhausted.retry);
+    assert_eq!(exhausted.reason.as_deref(), Some("retry_budget_exhausted"));
+    assert!(!non_retryable.retry);
+    assert_eq!(
+        non_retryable.reason.as_deref(),
+        Some("non_retryable_model_error")
+    );
+}
+
+#[test]
+fn request_and_response_validation_helpers_reject_empty_or_mismatched_envelopes() {
+    let mut request = ModelTurnRequest::new("request_1", "run_1", "session_1", "task_1", vec![]);
+    request.model_preferences.provider_name = Some("openai_compatible".to_string());
+    request.model_preferences.model_name = Some("gpt-test".to_string());
+
+    let request_result = validate_model_request(&request);
+    assert!(!request_result.valid);
+    assert_eq!(request_result.errors, vec!["messages_required"]);
+
+    let response = ModelTurnResponse::completed("other_request", "response_1", "done");
+    let response_result = validate_model_turn_response(
+        &request,
+        &response,
+        &["builtin.read_file".to_string()],
+        None,
+    );
+
+    assert!(!response_result.valid);
+    assert_eq!(response_result.errors, vec!["response_request_id_mismatch"]);
 }
 
 #[test]
@@ -354,6 +439,23 @@ fn model_response_validation_rejects_unknown_or_malformed_tool_calls() {
     assert!(!result.valid);
     assert_eq!(result.errors, vec!["invalid_json", "unknown_tool"]);
     assert_eq!(result.warnings, vec!["schema detail"]);
+}
+
+#[test]
+fn model_response_validation_requires_tool_call_arguments_object() {
+    let mut call = tool_call("call_1", "builtin.read_file");
+    call.arguments = serde_json::json!("not an object");
+
+    let result = validate_model_response(
+        Some(&ModelMessage::text(ModelRole::Assistant, "")),
+        &[call],
+        &ToolChoicePolicy::default(),
+        &["builtin.read_file".to_string()],
+        None,
+    );
+
+    assert!(!result.valid);
+    assert_eq!(result.errors, vec!["tool_call_arguments_must_be_object"]);
 }
 
 #[test]

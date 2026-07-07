@@ -163,6 +163,37 @@ def test_model_runner_allows_env_filename_safety_instruction(tmp_path: Path) -> 
     assert provider.complete_calls == 1
 
 
+def test_model_runner_allows_code_assignment_with_env_safety_text(
+    tmp_path: Path,
+) -> None:
+    provider = MockModelProvider(text="ok")
+    component = ModelRunner.with_mock_provider(
+        provider,
+        tool_registry=ToolRegistry(tmp_path),
+        config=ModelRunnerConfig(allow_remote_provider=True),
+    )
+
+    result = component.run_turn(
+        ModelTurnRequest(
+            request_id="req_1",
+            run_id="run_1",
+            session_id="session_1",
+            task_id="task_1",
+            phase_id="running_verification",
+            action_id="action_1",
+            purpose=ModelPurpose.PLAN_NEXT_ACTION,
+            messages=[
+                ModelMessage.assistant_text(
+                    "description = \"Do not read, print, or modify .env files or API keys.\""
+                )
+            ],
+        )
+    )
+
+    assert result.status == ModelTurnStatus.SUCCESS
+    assert provider.complete_calls == 1
+
+
 def test_model_runner_allows_structured_redacted_env_status(tmp_path: Path) -> None:
     provider = MockModelProvider(text="ok")
     component = ModelRunner.with_mock_provider(

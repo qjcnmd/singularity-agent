@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use singularity_core::ClientInfo;
-use singularity_protocol::{InitializeParams, JsonRpcMessage, Method};
+use singularity_protocol::{
+    AgentHost as ProtocolAgentHost, InitializeParams, JsonRpcMessage, Method,
+};
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
@@ -23,6 +25,11 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PROVIDER_ENV_NAMES: [&str; 3] = [
+    "SINGULARITY_API_KEY",
+    "SINGULARITY_BASE_URL",
+    "SINGULARITY_MODEL",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
@@ -93,6 +100,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Validate evaluation manifests and report the current runner path.
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -101,8 +113,21 @@ enum ConfigCommand {
     Doctor,
 }
 
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    /// Validate and run an evaluation manifest.
+    Run {
+        manifest: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum AgentHost {
+    Native,
     Python,
 }
 
@@ -174,12 +199,17 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         } => {
             let mut client = AppServerClient::spawn(agent_host)?;
             client.initialize()?;
+            ensure_native_agent_loop_available(agent_host, &mut client)?;
             let thread = client.thread_start(model)?;
             println!(
                 "thread {}",
                 required_str(&thread, &["thread", "thread_id"])?
             );
-            client.turn_start(required_str(&thread, &["thread", "thread_id"])?, &goal)?;
+            client.turn_start(
+                required_str(&thread, &["thread", "thread_id"])?,
+                &goal,
+                agent_host,
+            )?;
             Ok(())
         }
         Command::Continue {
@@ -189,9 +219,10 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         } => {
             let mut client = AppServerClient::spawn(agent_host)?;
             client.initialize()?;
+            ensure_native_agent_loop_available(agent_host, &mut client)?;
             client.thread_read(&thread_id)?;
             println!("thread {thread_id}");
-            client.turn_start(&thread_id, &instruction)?;
+            client.turn_start(&thread_id, &instruction, agent_host)?;
             Ok(())
         }
         Command::Turn { command } => {
@@ -242,9 +273,88 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             println!("app_server_bin={}", app_server_bin());
             println!("app_server_db={}", app_server_db_display());
             println!("client=protocol-only");
+            print_readiness()?;
+            print_redacted_provider_status();
             Ok(())
         }
+        Command::Eval {
+            command:
+                EvalCommand::Run {
+                    manifest,
+                    run_id,
+                    json,
+                },
+        } => run_eval(manifest, &run_id, json),
     }
+}
+
+fn ensure_native_agent_loop_available(
+    agent_host: Option<AgentHost>,
+    client: &mut AppServerClient,
+) -> Result<(), String> {
+    if matches!(agent_host, Some(AgentHost::Native)) {
+        let capability = client.agent_capability()?;
+        if capability["nativeAgentLoop"]["available"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        return Err(
+            "native AgentLoop is not available; use --agent-host python as oracle".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn print_readiness() -> Result<(), String> {
+    let mut client = AppServerClient::spawn(None)?;
+    client.initialize()?;
+    let capability = client.agent_capability()?;
+    let native = &capability["nativeAgentLoop"];
+    println!(
+        "native_agent_loop={}",
+        native["status"].as_str().unwrap_or("unknown")
+    );
+    println!("sidecar_oracle=available");
+    println!("evaluation=python_oracle");
+    Ok(())
+}
+
+fn print_redacted_provider_status() {
+    for name in PROVIDER_ENV_NAMES {
+        let status = if std::env::var_os(name).is_some() {
+            "present(redacted)"
+        } else {
+            "missing"
+        };
+        println!("{name}={status}");
+    }
+}
+
+fn run_eval(manifest: PathBuf, run_id: &str, json_output: bool) -> Result<(), String> {
+    if !manifest.exists() {
+        return Err(format!("eval manifest not found: {}", manifest.display()));
+    }
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "run_id": run_id,
+                "manifest": manifest.to_string_lossy(),
+                "runner": "python_oracle",
+                "status": "blocked",
+                "blocker": "rust_evaluation_runner_not_migrated",
+                "evaluation_passed": false,
+            })
+        );
+        return Err("rust_evaluation_runner_not_migrated".to_string());
+    }
+    println!(
+        "eval {run_id} blocked rust_evaluation_runner_not_migrated manifest={}",
+        manifest.display()
+    );
+    Err("rust_evaluation_runner_not_migrated".to_string())
 }
 
 fn print_wire_request(message: JsonRpcMessage) -> Result<(), String> {
@@ -342,12 +452,27 @@ impl AppServerClient {
         ))?)
     }
 
-    fn turn_start(&mut self, thread_id: &str, text: &str) -> Result<(), String> {
+    fn agent_capability(&mut self) -> Result<Value, String> {
         let id = self.next_request_id();
+        first_result(self.request(JsonRpcMessage::request(
+            Method::AgentCapability,
+            json!(id),
+            json!({}),
+        ))?)
+    }
+
+    fn turn_start(
+        &mut self,
+        thread_id: &str,
+        text: &str,
+        agent_host: Option<AgentHost>,
+    ) -> Result<(), String> {
+        let id = self.next_request_id();
+        let agent_host = agent_host.map(ProtocolAgentHost::from);
         let responses = self.request(JsonRpcMessage::request(
             Method::TurnStart,
             json!(id),
-            json!({"threadId": thread_id, "input": [{"type": "text", "text": text}]}),
+            json!({"threadId": thread_id, "agentHost": agent_host, "input": [{"type": "text", "text": text}]}),
         ))?;
         let turn = first_result_ref(&responses)?;
         render_messages(&responses, should_render_assistant_alias(&turn["turn"]));
@@ -589,6 +714,15 @@ impl AppServerClient {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+}
+
+impl From<AgentHost> for ProtocolAgentHost {
+    fn from(agent_host: AgentHost) -> Self {
+        match agent_host {
+            AgentHost::Native => Self::Native,
+            AgentHost::Python => Self::Python,
+        }
     }
 }
 

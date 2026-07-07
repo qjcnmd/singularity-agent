@@ -59,8 +59,7 @@ SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bgh[opusr]_[A-Za-z0-9_]{8,}\b"),
 )
 ENV_ASSIGNMENT_PATTERN = re.compile(
-    r"(?im)^\s*(?:export\s+)?(?P<name>[A-Z_][A-Z0-9_]{1,})\s*=\s*(?P<value>[^\r\n]*)",
-    re.IGNORECASE,
+    r"(?m)^\s*(?:export\s+)?(?P<name>[A-Z_][A-Z0-9_]{1,})\s*=\s*(?P<value>[^\r\n]*)\s*$",
 )
 KEY_VALUE_PATTERN = re.compile(
     r"\b(?P<name>[A-Z_][A-Z0-9_]{1,})\s*=\s*(?P<value>[^\s\r\n]*)",

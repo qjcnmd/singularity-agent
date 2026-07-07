@@ -1,14 +1,28 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use singularity_core::contains_sensitive_text;
 
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
 const SANDBOX_BACKEND_UNAVAILABLE: &str = "sandbox-required command has no sandbox backend";
+const PATH_ENV_NAME: &str = "PATH";
 const SHELL_COMMAND_FLAGS: [&str; 3] = ["/c", "-c", "-command"];
 const GIT_STATUS_ARGS: [&str; 3] = ["git", "status", "--porcelain=v1"];
 const GIT_DIFF_ARGS: [&str; 3] = ["git", "diff", "--"];
+const REDACTED_COMMAND_OUTPUT: &str = "[redacted sensitive command output]";
+const SECRET_ENV_MARKERS: [&str; 6] = [
+    "API_KEY",
+    "AUTH",
+    "CREDENTIAL",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -201,8 +215,48 @@ pub struct CommandResult {
     pub changed_files: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BoundedCommandOutput {
+    pub preview: String,
+    pub truncated: bool,
+}
+
+pub fn bound_command_output(output: &str, max_chars: usize) -> BoundedCommandOutput {
+    let preview = output.chars().take(max_chars).collect::<String>();
+    let truncated = output.chars().count() > preview.chars().count();
+    BoundedCommandOutput { preview, truncated }
+}
+
+pub fn redacted_child_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .filter(|(name, _value)| {
+            name.eq_ignore_ascii_case(PATH_ENV_NAME) || !is_secret_env_name(name)
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+pub fn changed_files_inside_workspace(
+    workspace_root: impl AsRef<Path>,
+    changed_paths: &[String],
+) -> Vec<String> {
+    let workspace = normalize_path(workspace_root.as_ref());
+    changed_paths
+        .iter()
+        .filter_map(|path| {
+            let normalized = normalize_path(Path::new(path));
+            normalized
+                .strip_prefix(&workspace)
+                .ok()
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                .filter(|relative| !relative.is_empty())
+        })
+        .collect()
+}
+
 impl CommandResult {
     pub fn completed(command_id: impl Into<String>, stdout_preview: impl Into<String>) -> Self {
+        let stdout = safe_command_preview(stdout_preview.into());
         Self {
             command_id: command_id.into(),
             execution_status: CommandExecutionStatus::Completed,
@@ -210,10 +264,10 @@ impl CommandResult {
             exit_code: Some(0),
             duration_ms: 0,
             timed_out: false,
-            stdout_preview: stdout_preview.into(),
+            stdout_preview: stdout.preview,
             stderr_preview: String::new(),
-            output_truncated: false,
-            redacted: false,
+            output_truncated: stdout.truncated,
+            redacted: true,
             changed_files: Vec::new(),
         }
     }
@@ -242,6 +296,7 @@ impl CommandResult {
         semantic_status: CommandSemanticStatus,
         reason: impl Into<String>,
     ) -> Self {
+        let stderr = safe_command_preview(reason.into());
         Self {
             command_id: command_id.into(),
             execution_status,
@@ -250,12 +305,26 @@ impl CommandResult {
             duration_ms: 0,
             timed_out: false,
             stdout_preview: String::new(),
-            stderr_preview: reason.into(),
-            output_truncated: false,
-            redacted: false,
+            stderr_preview: stderr.preview,
+            output_truncated: stderr.truncated,
+            redacted: true,
             changed_files: Vec::new(),
         }
     }
+}
+
+fn safe_command_preview(output: String) -> BoundedCommandOutput {
+    if command_output_contains_sensitive_marker(&output) {
+        return BoundedCommandOutput {
+            preview: REDACTED_COMMAND_OUTPUT.to_string(),
+            truncated: true,
+        };
+    }
+    bound_command_output(&output, DEFAULT_MAX_OUTPUT_CHARS)
+}
+
+fn command_output_contains_sensitive_marker(output: &str) -> bool {
+    contains_sensitive_text(output)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -302,7 +371,6 @@ pub trait SandboxBackend {
 #[serde(rename_all = "snake_case")]
 pub enum SandboxBackendEnforcement {
     Strict,
-    Reduced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -392,4 +460,25 @@ fn project_command_request(
         cwd,
         workspace_root,
     )
+}
+
+fn is_secret_env_name(name: &str) -> bool {
+    let upper_name = name.to_ascii_uppercase();
+    SECRET_ENV_MARKERS
+        .iter()
+        .any(|marker| upper_name.contains(marker))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
