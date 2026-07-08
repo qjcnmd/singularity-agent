@@ -51,7 +51,7 @@ ALLOWED_CRATE_DEPENDENCIES = {
         "dev-dependencies": {"tempfile"},
     },
     "crates/tools/Cargo.toml": {
-        "dependencies": {"schemars", "serde", "serde_json", "singularity_core"},
+        "dependencies": {"schemars", "serde", "serde_json", "singularity_core", "singularity_sandbox"},
         "dev-dependencies": set(),
     },
     "crates/model/Cargo.toml": {
@@ -120,14 +120,14 @@ FORBIDDEN_DESKTOP_PATHS = {
     "tauri.conf.json",
 }
 
-TOOL_OBSERVATION_MODEL_PAYLOAD_FORBIDDEN = {
+TOOL_RESULT_PAYLOAD_FORBIDDEN = {
     "raw_response",
     "raw_prompt",
     "raw_arguments",
     "provider_response",
     "policy_decision_id",
     "approval_grant_id",
-    "internal_metadata",
+    "audit_metadata",
     "metadata",
     "api_key",
     "authorization",
@@ -141,7 +141,7 @@ RUST_AGENT_HOST_DOC_MARKERS = {
     "Rust owner after this stage",
     "Parity expectation",
     "Intentional divergence",
-    "AgentLoopStatusBridge",
+    "AgentRunStatus",
     "SessionStore.create_turn_with_input_and_trace",
 }
 
@@ -166,6 +166,11 @@ FORBIDDEN_LIFECYCLE_NAMES = {
     "ActiveSidecarExecution",
     "SidecarExecutionState",
 }
+STALE_TOOL_RESULT_TYPE_NAME = "Tool" + "Observation"
+STALE_INTERNAL_METADATA_FIELD = "internal" + "_metadata"
+STALE_TOOL_OUTPUT_FIXTURE_KEY = "tool_protocol_result" + "_envelope"
+STALE_CAPABILITY_FIELD = "missing" + "_boundaries"
+STALE_PLAN_FIELD = "merge" + "_requirements"
 
 LIFECYCLE_NAME_TARGETS = (
     "docs/singularity.md",
@@ -229,9 +234,12 @@ def main() -> int:
     violations.extend(_check_turn_interrupt_cancel_boundary(repo_root, changed_files))
     violations.extend(_check_active_sidecar_run_persistence(repo_root))
     violations.extend(_check_rust_cli_smoke_env(repo_root))
-    violations.extend(_check_sidecar_trace_projection(repo_root))
-    violations.extend(_check_tool_observation_payload(repo_root))
-    violations.extend(_check_sandbox_phase1_boundary(repo_root))
+    violations.extend(_check_sidecar_trace_payload(repo_root))
+    violations.extend(_check_tool_result_payload(repo_root))
+    violations.extend(_check_command_approval_resource_boundary(repo_root))
+    violations.extend(_check_tools_command_backend_boundary(repo_root))
+    violations.extend(_check_rust_parity_fixture_names(repo_root))
+    violations.extend(_check_sandbox_command_boundary(repo_root))
     violations.extend(_check_app_server_transport_errors(repo_root))
     violations.extend(_check_cli_protocol_read_loop(repo_root))
     violations.extend(_check_approval_decision_boundary(repo_root))
@@ -346,7 +354,7 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
     agent = repo_root / "crates" / "agent" / "src" / "lib.rs"
     protocol = repo_root / "crates" / "protocol" / "src" / "lib.rs"
     text = app_server.read_text(encoding="utf-8")
-    if "AgentLoopStatusBridge::not_migrated()" not in text:
+    if "AgentRunStatus::not_migrated()" not in text:
         return [
             Violation(
                 "agent-loop-status-drift",
@@ -368,28 +376,40 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
             Violation(
                 "native-agent-loop-capability-drift",
                 _relative(agent, repo_root),
-                "AgentLoopCapability and AgentLoop must exist for the partial native AgentLoop path",
+                "AgentLoopCapability and AgentLoop must exist for the native AgentLoop path",
             )
         ]
-    if "available: false" not in agent_text or "status: AgentHostStatus::NotMigrated" not in agent_text:
+    if "available: true" not in agent_text or "status: AgentStatus::Completed" not in agent_text:
         return [
             Violation(
                 "native-agent-loop-status-drift",
                 _relative(agent, repo_root),
-                "AgentLoopCapability must stay unavailable while production blockers remain",
+                "AgentLoopCapability must report completed native cutover with no blockers",
             )
         ]
-    for blocker in ("strict_command_sandbox", "rust_evaluation_runner"):
-        if blocker not in agent_text:
+    for blocker in (
+        "approval_resume",
+        "strict_command_sandbox",
+        "rust_evaluation_runner",
+    ):
+        if f'"{blocker}"' in agent_text:
             return [
                 Violation(
                     "native-agent-loop-blocker-drift",
                     _relative(agent, repo_root),
-                    f"AgentLoopCapability must keep remaining blocker: {blocker}",
+                    f"AgentLoopCapability must not keep completed blocker: {blocker}",
                 )
             ]
+    if "blockers: Vec::new()" not in agent_text:
+        return [
+            Violation(
+                "native-agent-loop-status-drift",
+                _relative(agent, repo_root),
+                "AgentLoopCapability must report completed native cutover with no blockers",
+            )
+        ]
     cli_text = (repo_root / "crates" / "cli" / "src" / "main.rs").read_text(encoding="utf-8")
-    if "missing_boundaries" not in cli_text or "blockers_empty" not in cli_text:
+    if '"blockers"' not in cli_text or "blockers_empty" not in cli_text:
         return [
             Violation(
                 "native-agent-loop-cli-gate-drift",
@@ -405,7 +425,7 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
                 "app-server must reject agentHost=native while AgentLoopCapability blockers remain",
             )
         ]
-    if "capability.available && capability.missing_boundaries.is_empty()" not in text:
+    if "capability.available && capability.blockers.is_empty()" not in text:
         return [
             Violation(
                 "native-agent-loop-app-server-gate-drift",
@@ -429,17 +449,41 @@ def _check_rust_agent_host_docs(repo_root: Path) -> list[Violation]:
     docs = [
         repo_root / "docs" / "singularity.md",
         repo_root / "docs" / "architecture" / "modules" / "rust-app-server-protocol.md",
+        repo_root / "docs" / "architecture" / "rust-agent-host.md",
     ]
-    text = "\n".join(path.read_text(encoding="utf-8") for path in docs)
-    return [
+    doc_texts = {path: path.read_text(encoding="utf-8") for path in docs}
+    violations = [
         Violation(
             "rust-agent-host-docs-incomplete",
-            "docs/singularity.md,docs/architecture/modules/rust-app-server-protocol.md",
+            "docs/singularity.md,docs/architecture/modules/rust-app-server-protocol.md,docs/architecture/rust-agent-host.md",
             f"Rust CLI-first migration docs must include marker: {marker}",
         )
         for marker in sorted(RUST_AGENT_HOST_DOC_MARKERS)
-        if marker not in text
+        if marker not in "\n".join(doc_texts.values())
     ]
+    stale_names = (STALE_CAPABILITY_FIELD, STALE_PLAN_FIELD, STALE_TOOL_RESULT_TYPE_NAME)
+    for path in docs:
+        text = _rust_migration_doc_text(path, repo_root, doc_texts[path])
+        for name in stale_names:
+            if name in text:
+                violations.append(
+                    Violation(
+                        "rust-agent-host-stale-name",
+                        _relative(path, repo_root),
+                        f"Rust migration docs must use current public names, not {name}",
+                    )
+                )
+    return violations
+
+
+def _rust_migration_doc_text(path: Path, repo_root: Path, text: str) -> str:
+    if _relative(path, repo_root) != "docs/singularity.md":
+        return text
+    start = text.find("## Rust Agent Host")
+    if start < 0:
+        return text
+    end = text.find("\n---\n\n```", start + 1)
+    return text[start:] if end < 0 else text[start:end]
 
 
 def _check_turn_lifecycle_docs(repo_root: Path) -> list[Violation]:
@@ -574,15 +618,105 @@ def _check_sidecar_resume_and_model(repo_root: Path) -> list[Violation]:
 def _check_no_fake_agent_delta(repo_root: Path) -> list[Violation]:
     path = repo_root / "crates" / "app-server" / "src" / "lib.rs"
     text = path.read_text(encoding="utf-8")
-    if "input accepted" not in text:
-        return []
-    return [
-        Violation(
-            "fake-agent-delta",
-            _relative(path, repo_root),
-            "no-sidecar turn/start must not emit a fake assistant delta such as input accepted",
+    relative = _relative(path, repo_root)
+    violations: list[Violation] = []
+    terminal_body = _extract_rust_function_body(text, "agent_terminal_item_events")
+    if terminal_body is None:
+        return [
+            Violation(
+                "fake-agent-delta",
+                relative,
+                "agent_terminal_item_events must own assistant delta projection",
+            )
+        ]
+    if text.count("item_agent_message_delta(") != terminal_body.count("item_agent_message_delta("):
+        violations.append(
+            Violation(
+                "fake-agent-delta",
+                relative,
+                "assistant delta events must only be emitted by agent_terminal_item_events",
+            )
         )
-    ]
+    if "agent_completed_delta(run_status)" not in terminal_body:
+        violations.append(
+            Violation(
+                "fake-agent-delta",
+                relative,
+                "agent_terminal_item_events must gate assistant delta through agent_completed_delta(run_status)",
+            )
+        )
+    delta_body = _extract_rust_function_body(text, "agent_completed_delta")
+    required_delta_markers = (
+        "run_status.status == AgentStatus::Completed",
+        ".final_answer",
+        ".filter(|answer| !answer.trim().is_empty())",
+        "redact_app_server_text",
+    )
+    if delta_body is None:
+        violations.append(
+            Violation(
+                "fake-agent-delta",
+                relative,
+                "agent_completed_delta must gate completed non-empty final answers before assistant delta projection",
+            )
+        )
+    else:
+        for marker in required_delta_markers:
+            if marker not in delta_body:
+                violations.append(
+                    Violation(
+                        "fake-agent-delta",
+                        relative,
+                        f"agent_completed_delta must require marker before assistant delta projection: {marker}",
+                    )
+                )
+    turn_start_body = _extract_rust_function_body(text, "turn_start")
+    if turn_start_body is None:
+        violations.append(
+            Violation(
+                "fake-agent-delta",
+                relative,
+                "turn_start must keep native gate before turn creation",
+            )
+        )
+    else:
+        gate_index = turn_start_body.find("NATIVE_AGENT_LOOP_NOT_READY")
+        create_index = turn_start_body.find("create_turn_with_input_and_trace")
+        if gate_index == -1 or create_index == -1 or gate_index > create_index:
+            violations.append(
+                Violation(
+                    "fake-agent-delta",
+                    relative,
+                    "native AgentLoop rejection must happen before durable turn creation or assistant delta projection",
+                )
+            )
+    return violations
+
+
+def _check_command_approval_resource_boundary(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "agent" / "src" / "lib.rs"
+    text = path.read_text(encoding="utf-8")
+    relative = _relative(path, repo_root)
+    violations: list[Violation] = []
+    permission_body = _extract_rust_function_body(text, "permission_resources_for_tool")
+    command_body = _extract_rust_function_body(text, "command_permission_resources")
+    if permission_body is None or "call.tool_name == TOOL_COMMAND" not in permission_body or "command_permission_resources(&call.arguments, &call.tool_name)" not in permission_body:
+        violations.append(
+            Violation(
+                "command-approval-resource-drift",
+                relative,
+                "command tool approvals must route through command_permission_resources instead of a generic builtin.command resource",
+            )
+        )
+    if command_body is None or "command_scope_resource(" not in command_body or ".sandbox_mode()" not in command_body or ".network_access()" not in command_body:
+        violations.append(
+            Violation(
+                "command-approval-resource-drift",
+                relative,
+                "command_permission_resources must derive the approval resource from argv plus sandbox/network scope",
+            )
+        )
+    return violations
 
 
 def _check_turn_interrupt_cancel_boundary(repo_root: Path, changed_files: list[str]) -> list[Violation]:
@@ -657,7 +791,7 @@ def _check_rust_cli_smoke_env(repo_root: Path) -> list[Violation]:
     return violations
 
 
-def _check_sidecar_trace_projection(repo_root: Path) -> list[Violation]:
+def _check_sidecar_trace_payload(repo_root: Path) -> list[Violation]:
     path = repo_root / "crates" / "agent" / "src" / "lib.rs"
     text = path.read_text(encoding="utf-8")
     body = _extract_rust_function_body(text, "sidecar_trace_summary")
@@ -672,7 +806,7 @@ def _check_sidecar_trace_projection(repo_root: Path) -> list[Violation]:
     lowered = body.lower()
     return [
         Violation(
-            "sidecar-trace-projection-leak",
+            "sidecar-trace-payload-leak",
             _relative(path, repo_root),
             f"sidecar_trace_summary references forbidden marker {marker}",
         )
@@ -681,28 +815,28 @@ def _check_sidecar_trace_projection(repo_root: Path) -> list[Violation]:
     ]
 
 
-def _check_tool_observation_payload(repo_root: Path) -> list[Violation]:
+def _check_tool_result_payload(repo_root: Path) -> list[Violation]:
     path = repo_root / "crates" / "tools" / "src" / "lib.rs"
     text = path.read_text(encoding="utf-8")
-    body = _extract_rust_function_body(text, "to_model_payload")
+    body = _extract_rust_function_body(text, "to_message_payload")
     violations: list[Violation] = []
     if body is None:
-        return [Violation("tool-observation-payload-missing", _relative(path, repo_root), "to_model_payload not found")]
+        return [Violation("tool-result-payload-missing", _relative(path, repo_root), "to_message_payload not found")]
     lowered = body.lower()
-    for marker in sorted(TOOL_OBSERVATION_MODEL_PAYLOAD_FORBIDDEN):
+    for marker in sorted(TOOL_RESULT_PAYLOAD_FORBIDDEN):
         if marker in lowered:
             violations.append(
                 Violation(
-                    "tool-observation-model-leak",
+                    "tool-result-model-leak",
                     _relative(path, repo_root),
-                    f"to_model_payload references model-forbidden marker {marker}",
+                    f"to_message_payload references model-forbidden marker {marker}",
                 )
             )
-    for field in ("policy_decision_id", "approval_grant_id", "internal_metadata"):
+    for field in ("policy_decision_id", "approval_grant_id", "audit_metadata"):
         if f"#[serde(skip)]\n    {field}" not in text:
             violations.append(
                 Violation(
-                    "tool-observation-internal-field-serialized",
+                    "tool-result-internal-field-serialized",
                     _relative(path, repo_root),
                     f"{field} must stay serde-skipped",
                 )
@@ -710,21 +844,97 @@ def _check_tool_observation_payload(repo_root: Path) -> list[Violation]:
     return violations
 
 
-def _check_sandbox_phase1_boundary(repo_root: Path) -> list[Violation]:
+def _check_rust_parity_fixture_names(repo_root: Path) -> list[Violation]:
+    violations: list[Violation] = []
+    fixture = repo_root / "tests" / "fixtures" / "rust_parity" / "python_oracle.json"
+    stale_names = (
+        STALE_TOOL_RESULT_TYPE_NAME,
+        "observation_id",
+        "content_preview",
+        "content_digest",
+        "raw_result_ref",
+        STALE_TOOL_OUTPUT_FIXTURE_KEY,
+        STALE_INTERNAL_METADATA_FIELD,
+    )
+    if fixture.exists():
+        text = fixture.read_text(encoding="utf-8")
+        for name in stale_names:
+            if name in text:
+                violations.append(
+                    Violation(
+                        "rust-parity-fixture-stale-tool-result-name",
+                        _relative(fixture, repo_root),
+                        f"Rust-facing parity fixture/export must use ToolResult/ToolOutput names, not {name}",
+                    )
+                )
+    exporter = repo_root / "scripts" / "export_rust_parity_fixtures.py"
+    if exporter.exists():
+        text = exporter.read_text(encoding="utf-8")
+        for name in (
+            STALE_TOOL_RESULT_TYPE_NAME,
+            STALE_TOOL_OUTPUT_FIXTURE_KEY,
+            STALE_INTERNAL_METADATA_FIELD,
+        ):
+            if name not in text:
+                continue
+            violations.append(
+                Violation(
+                    "rust-parity-fixture-stale-tool-result-name",
+                    _relative(exporter, repo_root),
+                    f"Rust-facing parity exporter must not expose stale tool result terminology: {name}",
+                )
+            )
+        if '"failed_result": _rust_tool_output(failed_tool_result)' not in text:
+            violations.append(
+                Violation(
+                    "rust-parity-fixture-stale-tool-result-name",
+                    _relative(exporter, repo_root),
+                    "tool_repair.failed_result must be exported with Rust ToolOutput field names",
+                )
+            )
+    return violations
+
+
+def _check_tools_command_backend_boundary(repo_root: Path) -> list[Violation]:
+    path = repo_root / "crates" / "tools" / "src" / "lib.rs"
+    text = path.read_text(encoding="utf-8")
+    relative = _relative(path, repo_root)
+    violations: list[Violation] = []
+    if any(marker in text for marker in ("Command::new", ".spawn()", "std::process::Command", "std::process::{")):
+        violations.append(
+            Violation(
+                "direct-tools-command-process-spawn",
+                relative,
+                "tools command backend boundary must delegate to SandboxBackend and must not spawn host processes",
+            )
+        )
+    body = _extract_rust_function_body(text, "command")
+    if body is None or "supports_strict_command_execution" not in body:
+        violations.append(
+            Violation(
+                "tools-command-strict-capability-check-missing",
+                relative,
+                "WorkspaceTools::command must reject command backends without strict sandbox capabilities",
+            )
+        )
+    return violations
+
+
+def _check_sandbox_command_boundary(repo_root: Path) -> list[Violation]:
     path = repo_root / "crates" / "sandbox" / "src" / "lib.rs"
     text = path.read_text(encoding="utf-8")
     relative = _relative(path, repo_root)
     checks = (
-        ("relaxed-sandbox-filesystem-mode", "HostWorkspace", "SandboxFilesystemMode must not expose host-workspace/no-sandbox mode in Phase 1"),
-        ("relaxed-sandbox-backend-enforcement", "Relaxed", "SandboxBackendEnforcement must not expose relaxed backend mode in Phase 1"),
-        ("relaxed-sandbox-executor", "pub struct CommandExecutor", "sandbox crate must not expose a local process executor in Phase 1"),
+        ("relaxed-sandbox-filesystem-mode", "HostWorkspace", "SandboxFilesystemMode must not expose host-workspace/no-sandbox mode during native cutover"),
+        ("relaxed-sandbox-backend-enforcement", "Relaxed", "SandboxBackendEnforcement must not expose relaxed backend mode during native cutover"),
+        ("relaxed-sandbox-executor", "pub struct CommandExecutor", "sandbox crate must not expose a local process executor during native cutover"),
         (
             "relaxed-sandbox-command-request",
             "pub fn local_process",
             "CommandRequest must not expose a relaxed host local-process constructor",
         ),
         ("relaxed-sandbox-run-local", "pub fn run_local", "sandbox crate must not expose run_local without a strict backend"),
-        ("sandbox-host-patch-executor", "pub struct PatchExecutor", "sandbox crate must not expose host filesystem mutation executor in Phase 1"),
+        ("sandbox-host-patch-executor", "pub struct PatchExecutor", "sandbox crate must not expose host filesystem mutation executor during native cutover"),
     )
     violations = [
         Violation(code, relative, detail)
@@ -736,15 +946,38 @@ def _check_sandbox_phase1_boundary(repo_root: Path) -> list[Violation]:
             Violation(
                 "direct-sandbox-process-spawn",
                 relative,
-                "sandbox crate must not spawn host processes until a strict backend is implemented",
+                "sandbox crate must not use std::process or local process fallback; command execution must stay inside a Rust-owned SandboxBackend",
             )
         )
+    if "WindowsRestrictedTokenSandboxBackend" in text:
+        required_markers = {
+            "CreateRestrictedToken": "restricted token",
+            "SetTokenInformation": "low-integrity token",
+            "TokenIntegrityLevel": "low-integrity token",
+            "SECURITY_MANDATORY_LOW_RID": "low-integrity token",
+            "CreateJobObjectW": "Job Object",
+            "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE": "process-tree cleanup",
+            "PROC_THREAD_ATTRIBUTE_HANDLE_LIST": "stdio handle allowlist",
+            "command_request_denial": "path admission",
+            "COMMAND_SENSITIVE_PATH_DENIED": "sensitive path deny",
+            "COMMAND_READ_ONLY_WRITE_DENIED": "read-only write deny",
+            "CommandExecutionStatus::Unsupported": "unsupported status",
+        }
+        for marker, reason in required_markers.items():
+            if marker not in text:
+                violations.append(
+                    Violation(
+                        "windows-restricted-token-sandbox-incomplete",
+                        relative,
+                        f"Windows restricted-token sandbox backend must include {reason} marker: {marker}",
+                    )
+                )
     if any(marker in text for marker in ("fs::write", "std::fs::write", "fs::remove_file", "std::fs::remove_file")):
         violations.append(
             Violation(
                 "direct-sandbox-filesystem-mutation",
                 relative,
-                "sandbox crate must not mutate host filesystem paths in Phase 1",
+                "sandbox crate must not mutate host filesystem paths during native cutover",
             )
         )
     return violations

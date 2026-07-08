@@ -209,7 +209,7 @@
     },
     "version": 1
   },
-  "finalization_mapping_boundary": {
+  "final_report_mapping": {
     "agent_loop_status": "completed",
     "completion_assessment": {
       "criteria": {
@@ -562,28 +562,36 @@
       "timeout_seconds": 120
     }
   },
-  "tool_call_repair_boundary": {
+  "tool_output": {
+    "content": {
+      "artifact_ref": "artifact_1",
+      "artifact_refs": [
+        "artifact_1"
+      ],
+      "digest": "digest_1",
+      "preview": "safe preview",
+      "result_id": "obs_1"
+    },
+    "error_code": null,
+    "metadata": {},
+    "ok": true,
+    "truncated": false
+  },
+  "tool_repair": {
     "created_at": "2026-01-01T00:00:00+00:00",
     "failed_result": {
-      "approval_grant_id": null,
-      "artifact_refs": [
-        "artifact_failed_1"
-      ],
-      "content_digest": "digest_failed_1",
-      "content_preview": "pytest failed",
-      "error_code": "tool_executor_failed",
-      "error_kind": "tool_executor_failed",
-      "metadata": {
-        "exit_code": 1
+      "content": {
+        "artifact_ref": "artifact_failed_1",
+        "artifact_refs": [
+          "artifact_failed_1"
+        ],
+        "digest": "digest_failed_1",
+        "preview": "pytest failed",
+        "result_id": "obs_failed_1"
       },
-      "observation_id": "obs_failed_1",
+      "error_code": "tool_executor_failed",
+      "metadata": {},
       "ok": false,
-      "policy_decision_id": null,
-      "raw_result_ref": "artifact_failed_1",
-      "redacted": true,
-      "status": "failed",
-      "tool_call_id": "call_failed_1",
-      "tool_name": "run_verification",
       "truncated": true
     },
     "failed_tool_call_id": "call_failed_1",
@@ -666,43 +674,19 @@
     "session_id": "session_1",
     "task_id": "task_1"
   },
-  "tool_observation_model_payload": {
-    "content": "safe preview",
-    "content_digest": "digest_1",
-    "content_preview": "safe preview",
-    "error_code": null,
-    "error_kind": null,
-    "observation_id": "obs_1",
-    "ok": true,
-    "redacted": false,
-    "reference_ids": [
-      "artifact_1"
-    ],
-    "result_ref": "artifact_1",
-    "status": "ok",
-    "tool_call_id": "call_1",
-    "tool_name": "read_file",
-    "truncated": false
-  },
-  "tool_protocol_result_envelope": {
-    "approval_grant_id": "grant_1",
+  "tool_result_payload": {
+    "artifact_ref": "artifact_1",
     "artifact_refs": [
       "artifact_1"
     ],
-    "content_digest": "digest_1",
-    "content_preview": "safe preview",
+    "content": "safe preview",
+    "digest": "digest_1",
     "error_code": null,
     "error_kind": null,
-    "metadata": {
-      "raw_arguments": {
-        "path": ".env"
-      }
-    },
-    "observation_id": "obs_1",
     "ok": true,
-    "policy_decision_id": "policy_1",
-    "raw_result_ref": "artifact_1",
+    "preview": "safe preview",
     "redacted": false,
+    "result_id": "obs_1",
     "status": "ok",
     "tool_call_id": "call_1",
     "tool_name": "read_file",

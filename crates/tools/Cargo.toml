@@ -10,3 +10,4 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 singularity_core = { path = "../core" }
+singularity_sandbox = { path = "../sandbox" }

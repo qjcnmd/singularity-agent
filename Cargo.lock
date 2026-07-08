@@ -1189,6 +1189,7 @@ dependencies = [
  "serde_json",
  "singularity_core",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1215,6 +1216,7 @@ dependencies = [
  "serde",
  "serde_json",
  "singularity_core",
+ "singularity_sandbox",
 ]
 
 [[package]]

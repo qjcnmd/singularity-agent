@@ -9,8 +9,9 @@ use singularity_model::{
     validate_model_response, validate_model_turn_response, validate_provider_config,
     validate_stream_events,
 };
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 fn stream_event(event_type: ProviderStreamEventType) -> ProviderStreamEvent {
@@ -76,6 +77,53 @@ fn single_response_server(status_line: &'static str, body: &'static str) -> Stri
         .expect("write provider response");
     });
     format!("http://{addr}")
+}
+
+fn captured_request_server(
+    status_line: &'static str,
+    body: &'static str,
+) -> (String, Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test provider");
+    let addr = listener.local_addr().expect("test provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept test provider request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut first_line = String::new();
+        reader
+            .read_line(&mut first_line)
+            .expect("read request line");
+        let mut headers = String::new();
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse::<usize>().unwrap_or(0);
+            }
+            headers.push_str(&line);
+        }
+        assert!(first_line.contains("/v1/chat/completions"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        let mut request_body = vec![0; content_length];
+        reader
+            .read_exact(&mut request_body)
+            .expect("read request body");
+        tx.send(String::from_utf8(request_body).expect("utf8 request body"))
+            .expect("send request body");
+        write!(
+            stream,
+            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write provider response");
+    });
+    (format!("http://{addr}"), rx)
 }
 
 #[test]
@@ -345,6 +393,103 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
 }
 
 #[test]
+fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
+    let body = r#"{
+        "id": "resp_1",
+        "choices": [{
+            "message": {"role": "assistant", "content": "done"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    }"#;
+    let (base_url, captured_request) = captured_request_server("HTTP/1.1 200 OK", body);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let mut tool_message = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
+    tool_message.tool_call_id = Some("call_1".to_string());
+    let request = ModelTurnRequest::new(
+        "request_1",
+        "run_1",
+        "session_1",
+        "task_1",
+        vec![
+            ModelMessage::text(ModelRole::User, "hello"),
+            ModelMessage::assistant_tool_calls(vec![tool_call("call_1", "builtin.read")]),
+            tool_message,
+        ],
+    );
+
+    let response = provider.complete(&request).expect("provider response");
+    let captured: serde_json::Value = serde_json::from_str(
+        &captured_request
+            .recv()
+            .expect("captured provider request body"),
+    )
+    .expect("parse captured provider request body");
+
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(captured["messages"][1]["role"], "assistant");
+    assert!(captured["messages"][1]["content"].is_null());
+    assert_eq!(
+        captured["messages"][1]["tool_calls"][0]["function"]["name"],
+        "read"
+    );
+    assert_eq!(
+        captured["messages"][1]["tool_calls"][0]["function"]["arguments"],
+        r#"{"path":"README.md"}"#
+    );
+    assert_eq!(captured["messages"][2]["role"], "tool");
+    assert_eq!(captured["messages"][2]["tool_call_id"], "call_1");
+}
+
+#[test]
+fn openai_provider_maps_internal_tool_names_to_wire_names_and_back() {
+    let body = r#"{
+        "id": "resp_1",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }"#;
+    let (base_url, captured_request) = captured_request_server("HTTP/1.1 200 OK", body);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let mut request = ModelTurnRequest::new(
+        "request_1",
+        "run_1",
+        "session_1",
+        "task_1",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request.tools.push(ModelToolSchema {
+        name: "builtin.read".to_string(),
+        description: "Read a file".to_string(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+        capability_tags: Vec::new(),
+        risk_tags: Vec::new(),
+        metadata: serde_json::json!({}),
+    });
+
+    let response = provider.complete(&request).expect("provider response");
+    let captured: serde_json::Value = serde_json::from_str(
+        &captured_request
+            .recv()
+            .expect("captured provider request body"),
+    )
+    .expect("parse captured provider request body");
+
+    assert_eq!(captured["tools"][0]["function"]["name"], "read");
+    assert_eq!(response.tool_calls[0].tool_name, "builtin.read");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+}
+
+#[test]
 fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
     let base_url = single_response_server(
         "HTTP/1.1 401 Unauthorized",
@@ -367,6 +512,47 @@ fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
     assert!(error.error.message.contains("HTTP 401"));
     assert!(!serialized.contains("bad key"));
     assert!(!serialized.contains("sk-secret-value"));
+}
+
+#[test]
+fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
+    for (status_line, expected_kind, expected_category) in [
+        (
+            "HTTP/1.1 404 Not Found",
+            ModelErrorKind::InvalidRequest,
+            ModelErrorCategory::ModelConfiguration,
+        ),
+        (
+            "HTTP/1.1 429 Too Many Requests",
+            ModelErrorKind::RateLimited,
+            ModelErrorCategory::ProviderUnavailable,
+        ),
+        (
+            "HTTP/1.1 500 Internal Server Error",
+            ModelErrorKind::ProviderOverloaded,
+            ModelErrorCategory::ProviderUnavailable,
+        ),
+    ] {
+        let base_url = single_response_server(
+            status_line,
+            r#"{"error":{"message":"provider body must not leak"}}"#,
+        );
+        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let request = ModelTurnRequest::new(
+            "request_1",
+            "run_1",
+            "session_1",
+            "task_1",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+
+        let error = provider.complete(&request).expect_err("http error");
+        let serialized = serde_json::to_string(&error.error).expect("serialize error");
+
+        assert_eq!(error.error.kind, expected_kind);
+        assert_eq!(error.error.category(), expected_category);
+        assert!(!serialized.contains("provider body must not leak"));
+    }
 }
 
 #[test]

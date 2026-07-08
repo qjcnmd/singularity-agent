@@ -295,6 +295,8 @@ pub struct ApprovalRequest {
     pub session_id: String,
     pub task_id: String,
     pub action: String,
+    #[serde(default)]
+    pub resources: Vec<String>,
     pub reason: String,
 }
 
@@ -310,8 +312,18 @@ impl ApprovalRequest {
             session_id: session_id.into(),
             task_id: task_id.into(),
             action: action.into(),
+            resources: Vec::new(),
             reason: String::new(),
         }
+    }
+
+    pub fn with_resources<I, S>(mut self, resources: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.resources = resources.into_iter().map(Into::into).collect();
+        self
     }
 }
 

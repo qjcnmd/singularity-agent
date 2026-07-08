@@ -1,31 +1,38 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentHostStatus, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopStatusBridge,
-    PythonSidecarClient, PythonSidecarConfig, PythonSidecarStatus, sidecar_trace_summary,
+    AgentLoop, AgentLoopCapability, AgentLoopInput, AgentRunStatus, AgentStatus, ApprovalGrant,
+    PendingToolCall, PythonSidecarClient, PythonSidecarConfig, PythonSidecarStatus,
+    sidecar_trace_summary,
 };
 use singularity_core::{ErrorCode, contains_sensitive_text};
-use singularity_model::OpenAiProvider;
+use singularity_model::{OpenAiProvider, Provider};
 use singularity_policy::{
-    ApprovalDecision, ApprovalRequest, PermissionDecisionOutcome, PermissionOperation,
-    PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
+    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecisionOutcome,
+    PermissionOperation, PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
 };
 use singularity_protocol::{
     AgentCapabilityResult, AgentHost, AppEvent, ApprovalCenterResult, ApprovalListResult,
-    ArtifactFetchParams, ArtifactFetchResult, EventSubscribeParams, EventSubscribeResult,
-    InitializeParams, InitializeResult, JsonRpcMessage, Method, ServerCapabilitiesResult, Thread,
-    ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
-    ThreadResult, ThreadStartParams, ThreadStartResult, TraceEvent, TraceListParams,
-    TraceListResult, TraceShowParams, TraceTailParams, TransportCapability, Turn, TurnIdParams,
-    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
+    ArtifactFetchParams, ArtifactFetchResult, EvalRunParams, EvalRunResult, EventSubscribeParams,
+    EventSubscribeResult, InitializeParams, InitializeResult, JsonRpcMessage, Method,
+    ServerCapabilitiesResult, Thread, ThreadDeleteResult, ThreadForkParams, ThreadForkResult,
+    ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult,
+    TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceTailParams,
+    TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
+    TurnStartResult, TurnStatus,
 };
 use singularity_store::{ActiveSidecarRun, SessionStore, StoreError};
-use singularity_tools::{ToolBroker, ToolRegistry, ToolSpec, WorkspaceTools};
+use singularity_tools::{
+    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
+    SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolRegistry, ToolSpec,
+    WindowsRestrictedTokenSandboxBackend, WorkspaceTools,
+};
 use thiserror::Error;
 
 const THREAD_NOT_FOUND: &str = "Thread not found";
@@ -41,8 +48,24 @@ const TOOL_LIST: &str = "builtin.list";
 const TOOL_GREP: &str = "builtin.grep";
 const TOOL_EDIT: &str = "builtin.edit";
 const TOOL_PATCH: &str = "builtin.patch";
+const TOOL_COMMAND: &str = "builtin.command";
 const NATIVE_AGENT_LOOP_NOT_READY: &str = "Native AgentLoop is not production-ready";
+const EVAL_TASK_SET_SCHEMA: &str = "evaluation.task_set/v1";
+const EVAL_RESULT_SCHEMA: &str = "evaluation.result/v1";
+const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
+const EVAL_PROVIDER_BLOCKER: &str = "provider_config_missing";
+const EVAL_WORKSPACE_BLOCKER: &str = "eval_workspace_failed";
+const EVAL_AGENT_BLOCKER: &str = "agent_loop_failed";
+const EVAL_VERIFICATION_BLOCKER: &str = "verification_failed";
+const EVAL_RUNNER_NAME: &str = "rust_native";
+const EVAL_REPO_DIR: &str = "repo";
+const EVAL_TEST_PATCH_FILE: &str = "eval-test.patch";
+const EVAL_DEFAULT_MAX_TURNS: u32 = 24;
+const EVAL_DEFAULT_TIMEOUT_SECONDS: u64 = 300;
+const EVAL_PREPARE_TIMEOUT_SECONDS: u64 = 900;
+const EVAL_GIT_TIMEOUT_SECONDS: u64 = 900;
 static TRACE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static EVAL_COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum AppServerError {
@@ -137,6 +160,7 @@ impl AppServer {
             Method::ThreadArchive => self.thread_archive(message),
             Method::ThreadDelete => self.thread_delete(message),
             Method::TurnStart => self.turn_start(message),
+            Method::EvalRun => self.eval_run(message),
             Method::AgentCapability => self.agent_capability(message),
             Method::TurnInterrupt => self.turn_interrupt(message),
             Method::TurnStatus => self.turn_status(message),
@@ -292,13 +316,14 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        if matches!(params.agent_host, Some(AgentHost::Native)) && !native_agent_loop_ready() {
+        let agent_host = params.agent_host.clone().unwrap_or(AgentHost::Native);
+        if matches!(agent_host, AgentHost::Native) && !native_agent_loop_ready() {
             return invalid_request_response(message.id, NATIVE_AGENT_LOOP_NOT_READY);
         }
         let payload = serde_json::to_value(&params.input)?;
         let (turn, _item, _trace) = match self.store.create_turn_with_input_and_trace(
             &params.thread_id,
-            singularity_agent::AgentHostStatus::NotMigrated.as_str(),
+            agent_host_initial_status(&agent_host),
             payload,
             "app_server",
             "turn started",
@@ -312,11 +337,11 @@ impl AppServer {
 
         let mut messages = Vec::new();
         messages.extend(self.event_notification(AppEvent::turn_started(&turn)));
-        if matches!(params.agent_host, Some(AgentHost::Native)) {
-            let bridge = self.run_native_agent_loop(&thread, &params, &turn.turn_id)?;
-            let turn = self.update_turn_from_bridge(turn, &bridge)?;
-            self.append_native_trace(&params.thread_id, &turn.turn_id, &bridge)?;
-            messages.extend(self.agent_terminal_item_events(&bridge, &turn)?);
+        if matches!(agent_host, AgentHost::Native) {
+            let status = self.run_native_agent_loop(&thread, &params, &turn.turn_id)?;
+            let turn = self.update_turn_from_run_status(turn, &status)?;
+            self.append_native_trace(&params.thread_id, &turn.turn_id, &status)?;
+            messages.extend(self.agent_terminal_item_events(&status, &turn)?);
             messages.push(
                 JsonRpcMessage::response(
                     message.id,
@@ -328,18 +353,18 @@ impl AppServer {
         }
 
         let previous_session_id = self.previous_python_session_id(&params.thread_id);
-        let bridge = self.run_python_sidecar_if_enabled(
+        let status = self.run_python_sidecar_if_enabled(
             &turn.turn_id,
             &params,
             thread.model.as_deref(),
             previous_session_id.as_deref(),
         );
-        if is_terminal_sidecar_status(&bridge.status) {
-            self.append_sidecar_trace(&params.thread_id, &turn.turn_id, &bridge)?;
+        if is_terminal_sidecar_status(&status.status) {
+            self.append_sidecar_trace(&params.thread_id, &turn.turn_id, &status)?;
         }
-        let turn = self.update_turn_from_bridge(turn, &bridge)?;
+        let turn = self.update_turn_from_run_status(turn, &status)?;
 
-        messages.extend(self.agent_terminal_item_events(&bridge, &turn)?);
+        messages.extend(self.agent_terminal_item_events(&status, &turn)?);
         messages.push(
             JsonRpcMessage::response(
                 message.id,
@@ -359,53 +384,202 @@ impl AppServer {
         )
     }
 
+    fn eval_run(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: EvalRunParams = message.params_as()?;
+        let manifest_text = match std::fs::read_to_string(&params.manifest) {
+            Ok(text) => text,
+            Err(error) => {
+                return json_error(
+                    message.id,
+                    ErrorCode::invalid_request(format!("invalid eval manifest: {error}")),
+                );
+            }
+        };
+        let manifest: Value = match serde_json::from_str(&manifest_text) {
+            Ok(value) => value,
+            Err(error) => {
+                return json_error(
+                    message.id,
+                    ErrorCode::invalid_request(format!("invalid eval manifest: {error}")),
+                );
+            }
+        };
+        if manifest.get("schema_version").and_then(Value::as_str) != Some(EVAL_TASK_SET_SCHEMA) {
+            return json_error(
+                message.id,
+                ErrorCode::invalid_request("invalid eval manifest: unsupported schema_version"),
+            );
+        }
+        let Some(tasks) = manifest.get("tasks").and_then(Value::as_array) else {
+            return json_error(
+                message.id,
+                ErrorCode::invalid_request("invalid eval manifest: tasks must be an array"),
+            );
+        };
+        if tasks.is_empty() {
+            return json_error(
+                message.id,
+                ErrorCode::invalid_request("invalid eval manifest: tasks must not be empty"),
+            );
+        }
+        let mut result = run_native_eval(&params, tasks);
+        if let Err(error) = write_eval_artifacts(&mut result, params.output_root.as_deref()) {
+            return json_error(
+                message.id,
+                ErrorCode::invalid_request(format!("failed to write eval artifacts: {error}")),
+            );
+        }
+        json_response(message.id, result)
+    }
+
     fn run_native_agent_loop(
         &self,
         thread: &Thread,
         params: &TurnStartParams,
         turn_id: &str,
-    ) -> AppServerResult<AgentLoopStatusBridge> {
+    ) -> AppServerResult<AgentRunStatus> {
         let provider = match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
             Ok(provider) => provider,
             Err(error) => {
-                return Ok(AgentLoopStatusBridge::failed(error.message)
-                    .with_status(AgentHostStatus::Failed));
+                return Ok(AgentRunStatus::failed(error.message).with_status(AgentStatus::Failed));
             }
         };
+        self.run_native_agent_loop_with_provider(provider, thread, params, turn_id, None)
+    }
+
+    fn resume_native_agent_loop(
+        &self,
+        request: &ApprovalRequest,
+        decision: &ApprovalDecision,
+        pending_tool_call: Option<Value>,
+    ) -> AppServerResult<Option<(Turn, AgentRunStatus)>> {
+        if !native_agent_loop_ready() {
+            return Ok(None);
+        }
+        if pending_tool_call.is_none() {
+            return Ok(None);
+        }
+        let provider = match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
+            Ok(provider) => provider,
+            Err(error) => {
+                let turn_id = &request.task_id;
+                let turn = self.store.get_turn(turn_id)?;
+                return Ok(Some((
+                    turn,
+                    AgentRunStatus::failed(error.message).with_status(AgentStatus::Failed),
+                )));
+            }
+        };
+        self.resume_native_agent_loop_after_gate(request, decision, pending_tool_call, provider)
+    }
+
+    fn resume_native_agent_loop_after_gate<P>(
+        &self,
+        request: &ApprovalRequest,
+        decision: &ApprovalDecision,
+        pending_tool_call: Option<Value>,
+        provider: P,
+    ) -> AppServerResult<Option<(Turn, AgentRunStatus)>>
+    where
+        P: Provider,
+    {
+        if !matches!(decision.outcome, ApprovalOutcome::Allow) {
+            return Ok(None);
+        }
+        let turn_id = &request.task_id;
+        let turn = self.store.get_turn(turn_id)?;
+        if turn.status != TurnStatus::Blocked
+            || turn.agent_loop_status != AgentStatus::Blocked.as_str()
+        {
+            return Ok(None);
+        }
+        let Some(pending_tool_call) = pending_tool_call else {
+            return Ok(None);
+        };
+        let pending = match serde_json::from_value::<PendingToolCall>(pending_tool_call) {
+            Ok(pending) => pending,
+            Err(error) => {
+                return Ok(Some((
+                    turn,
+                    AgentRunStatus::failed(format!("invalid pending tool call: {error}"))
+                        .with_status(AgentStatus::Failed),
+                )));
+            }
+        };
+        if pending.request_id != request.request_id {
+            return Ok(Some((
+                turn,
+                AgentRunStatus::failed("pending tool call request mismatch")
+                    .with_status(AgentStatus::Failed),
+            )));
+        }
+        let thread = self.store.get_thread(&turn.thread_id)?;
+        let user_input = self.store.get_turn_user_input(turn_id)?;
+        let params = TurnStartParams {
+            thread_id: turn.thread_id.clone(),
+            input: serde_json::from_value(user_input)?,
+            agent_host: Some(AgentHost::Native),
+        };
+        let grant = ApprovalGrant::allow(
+            request.request_id.clone(),
+            request.action.clone(),
+            request.resources.clone(),
+        );
         let registry = native_workspace_registry();
-        let workspace_root = thread
-            .cwd
-            .as_deref()
-            .filter(|cwd| !cwd.trim().is_empty())
-            .map(Into::into)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| ".".into());
+        let workspace_root = native_workspace_root(&thread);
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
         let policy = native_workspace_policy(workspace_root_display);
-        let goal = params
-            .input
-            .iter()
-            .map(|item| match item {
-                singularity_protocol::InputItem::Text { text } => text.as_str(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let loop_input = AgentLoopInput::new(&params.thread_id, turn_id, goal)
-            .with_model_name(thread.model.clone());
+        let loop_input = native_loop_input(&thread, &params, turn_id).with_approval_grant(grant);
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-            .with_workspace_tools(WorkspaceTools::new(workspace_root))
+            .with_workspace_tools(native_workspace_tools(workspace_root))
+            .resume_pending_tool_call(&loop_input, &pending);
+        Ok(Some((turn, result.to_run_status(&loop_input))))
+    }
+
+    fn run_native_agent_loop_with_provider<P>(
+        &self,
+        provider: P,
+        thread: &Thread,
+        params: &TurnStartParams,
+        turn_id: &str,
+        approval_grant: Option<ApprovalGrant>,
+    ) -> AppServerResult<AgentRunStatus>
+    where
+        P: Provider,
+    {
+        let registry = native_workspace_registry();
+        let workspace_root = native_workspace_root(thread);
+        let workspace_root_display = workspace_root.to_string_lossy().into_owned();
+        let policy = native_workspace_policy(workspace_root_display);
+        let mut loop_input = native_loop_input(thread, params, turn_id);
+        if let Some(grant) = approval_grant {
+            loop_input = loop_input.with_approval_grant(grant);
+        }
+        let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
+            .with_workspace_tools(native_workspace_tools(workspace_root))
             .run(&loop_input);
+        let pending_by_request = result
+            .pending_tool_calls
+            .iter()
+            .map(|pending| (pending.request_id.as_str(), pending))
+            .collect::<HashMap<_, _>>();
         for request in &result.approval_requests {
-            match self
-                .store
-                .create_approval_with_trace(request, "approval", "approval requested")
-            {
+            let pending_tool_call = pending_by_request
+                .get(request.request_id.as_str())
+                .map(|pending| serde_json::to_value(*pending))
+                .transpose()?;
+            match self.store.create_approval_with_pending_tool_call_and_trace(
+                request,
+                pending_tool_call,
+                "approval",
+                "approval requested",
+            ) {
                 Ok(_) => {}
                 Err(StoreError::AlreadyExists(_)) => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        Ok(result.bridge(&loop_input))
+        Ok(result.to_run_status(&loop_input))
     }
 
     fn run_python_sidecar_if_enabled(
@@ -414,9 +588,9 @@ impl AppServer {
         params: &TurnStartParams,
         model: Option<&str>,
         previous_session_id: Option<&str>,
-    ) -> AgentLoopStatusBridge {
+    ) -> AgentRunStatus {
         let Some(config) = &self.python_sidecar else {
-            return AgentLoopStatusBridge::not_migrated();
+            return AgentRunStatus::not_migrated();
         };
         let goal = params
             .input
@@ -439,23 +613,23 @@ impl AppServer {
         });
         match result {
             Ok((client, result)) => {
-                let bridge = AgentLoopStatusBridge::from_sidecar(result);
+                let run_status = AgentRunStatus::from_sidecar(result);
                 if matches!(
-                    bridge.status,
-                    AgentHostStatus::Running | AgentHostStatus::CancelRequested
+                    run_status.status,
+                    AgentStatus::Running | AgentStatus::CancelRequested
                 ) && let (Some(run_id), Some(session_id), Some(task_id)) = (
-                    bridge.run_id.as_deref(),
-                    bridge.session_id.as_deref(),
-                    bridge.task_id.as_deref(),
+                    run_status.run_id.as_deref(),
+                    run_status.session_id.as_deref(),
+                    run_status.task_id.as_deref(),
                 ) {
                     if let Err(error) = self.store.register_active_sidecar_run(
                         turn_id,
                         run_id,
                         session_id,
                         task_id,
-                        bridge.status.as_str(),
+                        run_status.status.as_str(),
                     ) {
-                        return AgentLoopStatusBridge::failed(error.to_string());
+                        return AgentRunStatus::failed(error.to_string());
                     }
                     if let Err(error) = self.append_lifecycle_trace(
                         &params.thread_id,
@@ -464,12 +638,12 @@ impl AppServer {
                         session_id,
                         task_id,
                         "sidecar_started",
-                        bridge.status.as_str(),
+                        run_status.status.as_str(),
                     ) {
                         let _ = self
                             .store
-                            .clear_active_sidecar_run(turn_id, bridge.status.as_str());
-                        return AgentLoopStatusBridge::failed(error.to_string());
+                            .clear_active_sidecar_run(turn_id, run_status.status.as_str());
+                        return AgentRunStatus::failed(error.to_string());
                     }
                     self.sidecar_runs.insert(
                         turn_id.to_string(),
@@ -479,31 +653,31 @@ impl AppServer {
                         },
                     );
                 }
-                bridge
+                run_status
             }
-            Err(error) => AgentLoopStatusBridge::failed(error),
+            Err(error) => AgentRunStatus::failed(error),
         }
     }
 
-    fn update_turn_from_bridge(
+    fn update_turn_from_run_status(
         &self,
         turn: Turn,
-        bridge: &AgentLoopStatusBridge,
+        run_status: &AgentRunStatus,
     ) -> AppServerResult<Turn> {
-        let status = match bridge.status {
-            singularity_agent::AgentHostStatus::Completed => Some(TurnStatus::Completed),
-            singularity_agent::AgentHostStatus::Blocked => Some(TurnStatus::Blocked),
-            singularity_agent::AgentHostStatus::Failed => Some(TurnStatus::Failed),
-            singularity_agent::AgentHostStatus::CancelRequested => Some(TurnStatus::Interrupted),
-            singularity_agent::AgentHostStatus::Cancelled => Some(TurnStatus::Interrupted),
-            singularity_agent::AgentHostStatus::Running => Some(TurnStatus::Running),
-            singularity_agent::AgentHostStatus::NotMigrated => None,
+        let status = match run_status.status {
+            singularity_agent::AgentStatus::Completed => Some(TurnStatus::Completed),
+            singularity_agent::AgentStatus::Blocked => Some(TurnStatus::Blocked),
+            singularity_agent::AgentStatus::Failed => Some(TurnStatus::Failed),
+            singularity_agent::AgentStatus::CancelRequested => Some(TurnStatus::Interrupted),
+            singularity_agent::AgentStatus::Cancelled => Some(TurnStatus::Interrupted),
+            singularity_agent::AgentStatus::Running => Some(TurnStatus::Running),
+            singularity_agent::AgentStatus::NotMigrated => None,
         };
         if let Some(status) = status {
             return Ok(self.store.update_turn_state(
                 &turn.turn_id,
                 status,
-                bridge.status.as_str(),
+                run_status.status.as_str(),
             )?);
         }
         Ok(turn)
@@ -532,11 +706,11 @@ impl AppServer {
         &self,
         thread_id: &str,
         turn_id: &str,
-        bridge: &AgentLoopStatusBridge,
+        run_status: &AgentRunStatus,
     ) -> AppServerResult<()> {
         if matches!(
-            bridge.status,
-            singularity_agent::AgentHostStatus::NotMigrated
+            run_status.status,
+            singularity_agent::AgentStatus::NotMigrated
         ) {
             return Ok(());
         }
@@ -547,9 +721,9 @@ impl AppServer {
             "python_sidecar",
             "Python sidecar result translated",
         );
-        summary.payload = redact_sidecar_trace_summary(sidecar_trace_summary(bridge));
+        summary.payload = redact_sidecar_trace_summary(sidecar_trace_summary(run_status));
         self.store.append_trace(&summary)?;
-        for event in &bridge.events {
+        for event in &run_status.events {
             let mut translated = TraceEvent::new(
                 sidecar_event_trace_id(turn_id, event),
                 thread_id,
@@ -572,7 +746,7 @@ impl AppServer {
         &self,
         thread_id: &str,
         turn_id: &str,
-        bridge: &AgentLoopStatusBridge,
+        run_status: &AgentRunStatus,
     ) -> AppServerResult<()> {
         let mut event = TraceEvent::new(
             format!("trace_{turn_id}_native_agent_loop"),
@@ -583,14 +757,14 @@ impl AppServer {
         );
         event.payload = json!({
             "component": "agent_loop",
-            "status": bridge.status.as_str(),
-            "run_id": bridge.run_id,
-            "session_id": bridge.session_id,
-            "task_id": bridge.task_id,
-            "model_turns": bridge.model_turns,
-            "tool_calls": bridge.tool_calls,
-            "approval_count": bridge.approval_count,
-            "error": bridge.error.as_deref().map(redact_app_server_text),
+            "status": run_status.status.as_str(),
+            "run_id": run_status.run_id,
+            "session_id": run_status.session_id,
+            "task_id": run_status.task_id,
+            "model_turns": run_status.model_turns,
+            "tool_calls": run_status.tool_calls,
+            "approval_count": run_status.approval_count,
+            "error": run_status.error.as_deref().map(redact_app_server_text),
         });
         self.store.append_trace(&event)?;
         Ok(())
@@ -603,7 +777,7 @@ impl AppServer {
                 let turn = self.store.get_turn(&params.turn_id)?;
                 return json_response(message.id, stale_active_run_interrupt_result(turn, &active));
             };
-            let status = run.client.cancel(&active.run_id).map(sidecar_status_bridge);
+            let status = run.client.cancel(&active.run_id).map(sidecar_run_status);
             let status = match status {
                 Ok(status) => status,
                 Err(error) => {
@@ -635,7 +809,7 @@ impl AppServer {
                 active.task_id.as_str(),
                 status.status.as_str(),
             )?;
-            let transition = if matches!(status.status, AgentHostStatus::CancelRequested) {
+            let transition = if matches!(status.status, AgentStatus::CancelRequested) {
                 "cancel_requested"
             } else {
                 "interrupted"
@@ -713,8 +887,8 @@ impl AppServer {
                 let turn = self.store.get_turn(&params.turn_id)?;
                 return json_response(message.id, stale_active_run_status_result(turn, &active));
             };
-            let bridge = match run.client.status(&run.run_id) {
-                Ok(status) => sidecar_status_bridge(status),
+            let run_status = match run.client.status(&run.run_id) {
+                Ok(status) => sidecar_run_status(status),
                 Err(error) => {
                     if is_cancelled_or_interrupted(active.status.as_str()) {
                         self.finalize_active_sidecar_run(
@@ -732,17 +906,17 @@ impl AppServer {
                             },
                         );
                     }
-                    let mut bridge = AgentLoopStatusBridge::failed(error);
-                    bridge.run_id = Some(active.run_id.clone());
-                    bridge.session_id = Some(active.session_id.clone());
-                    bridge.task_id = Some(active.task_id.clone());
-                    bridge
+                    let mut run_status = AgentRunStatus::failed(error);
+                    run_status.run_id = Some(active.run_id.clone());
+                    run_status.session_id = Some(active.session_id.clone());
+                    run_status.task_id = Some(active.task_id.clone());
+                    run_status
                 }
             };
             let current_turn = self.store.get_turn(&params.turn_id)?;
             let current_turn_interrupted = current_turn.status == TurnStatus::Interrupted;
             let terminal_after_interrupt =
-                current_turn_interrupted && is_terminal_sidecar_status(&bridge.status);
+                current_turn_interrupted && is_terminal_sidecar_status(&run_status.status);
             let turn = if current_turn_interrupted {
                 if terminal_after_interrupt {
                     self.store.update_turn_state(
@@ -754,7 +928,7 @@ impl AppServer {
                     let active_status = if is_cancelled_or_interrupted(active.status.as_str()) {
                         active.status.as_str()
                     } else {
-                        bridge.status.as_str()
+                        run_status.status.as_str()
                     };
                     let _ = self.store.register_active_sidecar_run(
                         &params.turn_id,
@@ -766,18 +940,18 @@ impl AppServer {
                     current_turn
                 }
             } else {
-                self.update_turn_from_bridge(current_turn, &bridge)?
+                self.update_turn_from_run_status(current_turn, &run_status)?
             };
-            if is_terminal_sidecar_status(&bridge.status) {
+            if is_terminal_sidecar_status(&run_status.status) {
                 if terminal_after_interrupt {
-                    let cancelled_bridge = cancelled_sidecar_bridge(&active);
+                    let cancelled_status = cancelled_sidecar_status(&active);
                     self.append_sidecar_trace(
                         &active.thread_id,
                         &params.turn_id,
-                        &cancelled_bridge,
+                        &cancelled_status,
                     )?;
                 } else {
-                    self.append_sidecar_trace(&active.thread_id, &params.turn_id, &bridge)?;
+                    self.append_sidecar_trace(&active.thread_id, &params.turn_id, &run_status)?;
                 }
                 let _ = self
                     .store
@@ -789,7 +963,7 @@ impl AppServer {
                 {
                     active.status.as_str()
                 } else {
-                    bridge.status.as_str()
+                    run_status.status.as_str()
                 };
                 let _ = self.store.register_active_sidecar_run(
                     &params.turn_id,
@@ -799,8 +973,8 @@ impl AppServer {
                     active_status,
                 )?;
             }
-            let mut messages =
-                self.agent_terminal_item_events(&bridge, &self.store.get_turn(&params.turn_id)?)?;
+            let mut messages = self
+                .agent_terminal_item_events(&run_status, &self.store.get_turn(&params.turn_id)?)?;
             messages.push(
                 JsonRpcMessage::response(message.id, serde_json::to_value(TurnResult { turn })?)
                     .to_wire_value(),
@@ -895,20 +1069,36 @@ impl AppServer {
 
     fn approval_decision(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let decision: ApprovalDecision = message.params_as()?;
-        if let Err(error) =
-            self.store
-                .record_approval_decision(&decision, "approval", "approval decision recorded")
-        {
-            return match error {
-                StoreError::NotFound(_) => {
-                    not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND)
-                }
-                other => Err(other.into()),
-            };
+        let recorded = match self.store.record_approval_decision(
+            &decision,
+            "approval",
+            "approval decision recorded",
+        ) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                return match error {
+                    StoreError::NotFound(_) => {
+                        not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND)
+                    }
+                    other => Err(other.into()),
+                };
+            }
+        };
+        let resumed = self.resume_native_agent_loop(
+            &recorded.request,
+            &decision,
+            recorded.pending_tool_call,
+        )?;
+        let mut messages = Vec::new();
+        if let Some((turn, run_status)) = resumed {
+            let turn = self.update_turn_from_run_status(turn, &run_status)?;
+            self.append_native_trace(&turn.thread_id, &turn.turn_id, &run_status)?;
+            messages.extend(self.agent_terminal_item_events(&run_status, &turn)?);
         }
-        Ok(vec![
+        messages.push(
             JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
-        ])
+        );
+        Ok(messages)
     }
 
     fn event_subscribe(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -945,10 +1135,10 @@ impl AppServer {
 
     fn agent_terminal_item_events(
         &self,
-        bridge: &AgentLoopStatusBridge,
+        run_status: &AgentRunStatus,
         turn: &Turn,
     ) -> AppServerResult<Vec<Value>> {
-        let Some(agent_delta) = agent_completed_delta(bridge) else {
+        let Some(agent_delta) = agent_completed_delta(run_status) else {
             return Ok(Vec::new());
         };
         let agent_item = self.store.append_item(
@@ -1102,8 +1292,8 @@ impl AppServer {
         self.store
             .update_turn_state(turn_id, turn_status, agent_loop_status)?;
         if append_sidecar_trace_event {
-            let bridge = AgentLoopStatusBridge {
-                status: AgentHostStatus::Cancelled,
+            let run_status = AgentRunStatus {
+                status: AgentStatus::Cancelled,
                 completed: false,
                 final_answer: None,
                 run_id: Some(active.run_id.clone()),
@@ -1116,7 +1306,7 @@ impl AppServer {
                 trace_path: None,
                 error: None,
             };
-            self.append_sidecar_trace(&active.thread_id, turn_id, &bridge)?;
+            self.append_sidecar_trace(&active.thread_id, turn_id, &run_status)?;
         }
         let _ = self
             .store
@@ -1142,9 +1332,695 @@ fn native_workspace_registry() -> ToolRegistry {
     registry
 }
 
+fn native_workspace_root(thread: &Thread) -> PathBuf {
+    thread
+        .cwd
+        .as_deref()
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(Into::into)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| ".".into())
+}
+
+fn native_workspace_tools(workspace_root: PathBuf) -> WorkspaceTools {
+    WorkspaceTools::new(workspace_root)
+        .with_sandbox_backend(WindowsRestrictedTokenSandboxBackend::new())
+}
+
+fn native_loop_input(thread: &Thread, params: &TurnStartParams, turn_id: &str) -> AgentLoopInput {
+    let goal = params
+        .input
+        .iter()
+        .map(|item| match item {
+            singularity_protocol::InputItem::Text { text } => text.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    AgentLoopInput::new(&params.thread_id, turn_id, goal).with_model_name(thread.model.clone())
+}
+
+struct EvalWorkspace {
+    task_dir: PathBuf,
+    repo_dir: PathBuf,
+}
+
+fn run_native_eval(params: &EvalRunParams, tasks: &[Value]) -> EvalRunResult {
+    let run_dir =
+        eval_output_root(params.output_root.as_deref()).join(safe_path_segment(&params.run_id));
+    let task_results = tasks
+        .iter()
+        .map(|task| run_native_eval_task(task, &params.run_id, &run_dir))
+        .collect::<Vec<_>>();
+    let evaluation_passed = task_results
+        .iter()
+        .all(|task| task.get("evaluation_passed").and_then(Value::as_bool) == Some(true));
+    let blocker = if evaluation_passed {
+        None
+    } else {
+        task_results
+            .iter()
+            .filter_map(|task| task.get("blocker").and_then(Value::as_str))
+            .next()
+            .map(str::to_string)
+            .or_else(|| Some(EVAL_VERIFICATION_BLOCKER.to_string()))
+    };
+    let status = if evaluation_passed {
+        "completed"
+    } else if task_results
+        .iter()
+        .any(|task| task.get("status").and_then(Value::as_str) == Some("blocked"))
+    {
+        "blocked"
+    } else {
+        "failed"
+    };
+    EvalRunResult {
+        run_id: params.run_id.clone(),
+        manifest: params.manifest.clone(),
+        runner: EVAL_RUNNER_NAME.to_string(),
+        status: status.to_string(),
+        blocker,
+        tasks: task_results,
+        result_path: None,
+        report_path: None,
+        evaluation_passed,
+    }
+}
+
+fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &PathBuf) -> Value {
+    let task_id = eval_task_id(task);
+    if let Err(error) = validate_eval_workspace(task) {
+        return blocked_eval_task_result(task, EVAL_WORKSPACE_BLOCKER, error);
+    }
+    let provider = match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
+        Ok(provider) => provider,
+        Err(error) => return blocked_eval_task_result(task, EVAL_PROVIDER_BLOCKER, error.message),
+    };
+    let workspace = match prepare_eval_workspace(task, run_dir) {
+        Ok(workspace) => workspace,
+        Err(error) => return blocked_eval_task_result(task, EVAL_WORKSPACE_BLOCKER, error),
+    };
+    if let Err(error) = run_prepare_commands(task, &workspace) {
+        return blocked_eval_task_result(task, EVAL_WORKSPACE_BLOCKER, error);
+    }
+    let max_turns = task
+        .pointer("/strategy/max_turns")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(EVAL_DEFAULT_MAX_TURNS);
+    let agent_input = AgentLoopInput::new(
+        &task_id,
+        format!("{run_id}_{task_id}"),
+        eval_agent_prompt(task),
+    )
+    .with_max_turns(max_turns);
+    let agent_result = AgentLoop::new(
+        provider,
+        ToolBroker::new(native_workspace_registry()),
+        native_eval_policy(workspace.repo_dir.to_string_lossy().into_owned(), task),
+    )
+    .with_workspace_tools(native_eval_workspace_tools(
+        workspace.repo_dir.clone(),
+        task,
+    ))
+    .run(&agent_input);
+    let changed_files = git_changed_files(&workspace).unwrap_or_default();
+    if let Err(error) = apply_eval_test_patch(task, &workspace) {
+        return eval_task_result(
+            task,
+            &agent_result,
+            changed_files,
+            false,
+            false,
+            Some(EVAL_WORKSPACE_BLOCKER),
+            Some(error),
+            json!({"passed": false, "status": "not_run"}),
+            json!({"passed": false, "status": "not_run"}),
+        );
+    }
+    let public_check = run_verification(task, &workspace, "public_verification_command")
+        .or_else(|| run_verification(task, &workspace, "verification_command"))
+        .unwrap_or_else(|| json!({"passed": false, "status": "not_run"}));
+    let hidden_check = run_verification(task, &workspace, "hidden_verification_command")
+        .unwrap_or_else(|| public_check.clone());
+    let public_passed = public_check.get("passed").and_then(Value::as_bool) == Some(true);
+    let hidden_passed = hidden_check.get("passed").and_then(Value::as_bool) == Some(true);
+    let expected_change = expected_file_change_satisfied(task, &changed_files);
+    let summary_ok = summary_requirement_satisfied(task, agent_result.final_answer.as_deref());
+    let agent_completed = agent_result.completed;
+    let evaluation_passed =
+        agent_completed && public_passed && hidden_passed && expected_change && summary_ok;
+    let blocker = if evaluation_passed {
+        None
+    } else if !agent_completed {
+        Some(EVAL_AGENT_BLOCKER)
+    } else {
+        Some(EVAL_VERIFICATION_BLOCKER)
+    };
+    eval_task_result(
+        task,
+        &agent_result,
+        changed_files,
+        public_passed,
+        hidden_passed,
+        blocker,
+        agent_result.error.clone(),
+        public_check,
+        hidden_check,
+    )
+}
+
+fn prepare_eval_workspace(task: &Value, run_dir: &PathBuf) -> Result<EvalWorkspace, String> {
+    let task_dir = run_dir.join(safe_path_segment(&eval_task_id(task)));
+    if task_dir.exists() {
+        std::fs::remove_dir_all(&task_dir).map_err(|error| error.to_string())?;
+    }
+    std::fs::create_dir_all(&task_dir).map_err(|error| error.to_string())?;
+    let repo_dir = task_dir.join(EVAL_REPO_DIR);
+    let workspace = task
+        .get("workspace")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "eval task workspace must be an object".to_string())?;
+    match workspace.get("type").and_then(Value::as_str) {
+        Some("fixture") => {
+            std::fs::create_dir_all(&repo_dir).map_err(|error| error.to_string())?;
+            let files = workspace
+                .get("files")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "fixture workspace files must be an object".to_string())?;
+            for (path, content) in files {
+                let content = content
+                    .as_str()
+                    .ok_or_else(|| format!("fixture file content must be text: {path}"))?;
+                write_eval_workspace_file(&repo_dir, path, content)?;
+            }
+        }
+        Some("repo") => {
+            let repo = workspace
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "repo workspace path must be a string".to_string())?;
+            let clone = run_eval_command(
+                &task_dir,
+                &task_dir,
+                vec![
+                    "git".to_string(),
+                    "clone".to_string(),
+                    "--quiet".to_string(),
+                    repo.to_string(),
+                    EVAL_REPO_DIR.to_string(),
+                ],
+                EVAL_GIT_TIMEOUT_SECONDS,
+                SandboxNetworkMode::Allowed,
+                SandboxFilesystemMode::WorkspaceWrite,
+            );
+            ensure_command_success(&clone, "git clone")?;
+            if let Some(commit) = workspace.get("start_commit").and_then(Value::as_str) {
+                let checkout = run_eval_command(
+                    &task_dir,
+                    &repo_dir,
+                    vec![
+                        "git".to_string(),
+                        "checkout".to_string(),
+                        "--quiet".to_string(),
+                        commit.to_string(),
+                    ],
+                    EVAL_GIT_TIMEOUT_SECONDS,
+                    SandboxNetworkMode::Denied,
+                    SandboxFilesystemMode::WorkspaceWrite,
+                );
+                ensure_command_success(&checkout, "git checkout")?;
+            }
+        }
+        Some(other) => return Err(format!("unsupported eval workspace type: {other}")),
+        None => return Err("eval task workspace type is missing".to_string()),
+    }
+    Ok(EvalWorkspace { task_dir, repo_dir })
+}
+
+fn validate_eval_workspace(task: &Value) -> Result<(), String> {
+    let workspace = task
+        .get("workspace")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "eval task workspace must be an object".to_string())?;
+    match workspace.get("type").and_then(Value::as_str) {
+        Some("fixture") => workspace
+            .get("files")
+            .and_then(Value::as_object)
+            .map(|_| ())
+            .ok_or_else(|| "fixture workspace files must be an object".to_string()),
+        Some("repo") => workspace
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|_| ())
+            .ok_or_else(|| "repo workspace path must be a string".to_string()),
+        Some(other) => Err(format!("unsupported eval workspace type: {other}")),
+        None => Err("eval task workspace type is missing".to_string()),
+    }
+}
+
+fn run_prepare_commands(task: &Value, workspace: &EvalWorkspace) -> Result<(), String> {
+    let Some(commands) = task.get("prepare_commands").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for command in commands {
+        let command = command
+            .as_str()
+            .ok_or_else(|| "prepare command must be a string".to_string())?;
+        let result = run_eval_shell_command(
+            workspace,
+            command,
+            EVAL_PREPARE_TIMEOUT_SECONDS,
+            SandboxNetworkMode::Allowed,
+            SandboxFilesystemMode::WorkspaceWrite,
+        );
+        ensure_command_success(&result, "prepare command")?;
+    }
+    Ok(())
+}
+
+fn run_verification(task: &Value, workspace: &EvalWorkspace, field: &str) -> Option<Value> {
+    let command = task.get(field).and_then(Value::as_str)?;
+    let timeout = task
+        .get("verification_timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(EVAL_DEFAULT_TIMEOUT_SECONDS);
+    let result = run_eval_shell_command(
+        workspace,
+        command,
+        timeout,
+        SandboxNetworkMode::Denied,
+        SandboxFilesystemMode::WorkspaceWrite,
+    );
+    Some(command_check_payload(result))
+}
+
+fn apply_eval_test_patch(task: &Value, workspace: &EvalWorkspace) -> Result<(), String> {
+    let Some(patch) = task.get("test_patch").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let patch_path = workspace.repo_dir.join(EVAL_TEST_PATCH_FILE);
+    std::fs::write(&patch_path, patch).map_err(|error| error.to_string())?;
+    let result = run_eval_command(
+        &workspace.task_dir,
+        &workspace.repo_dir,
+        vec![
+            "git".to_string(),
+            "apply".to_string(),
+            EVAL_TEST_PATCH_FILE.to_string(),
+        ],
+        EVAL_DEFAULT_TIMEOUT_SECONDS,
+        SandboxNetworkMode::Denied,
+        SandboxFilesystemMode::WorkspaceWrite,
+    );
+    let _ = std::fs::remove_file(&patch_path);
+    ensure_command_success(&result, "git apply test patch")
+}
+
+fn git_changed_files(workspace: &EvalWorkspace) -> Result<Vec<String>, String> {
+    let result = run_eval_command(
+        &workspace.task_dir,
+        &workspace.repo_dir,
+        vec![
+            "git".to_string(),
+            "diff".to_string(),
+            "--name-only".to_string(),
+        ],
+        EVAL_DEFAULT_TIMEOUT_SECONDS,
+        SandboxNetworkMode::Denied,
+        SandboxFilesystemMode::WorkspaceWrite,
+    );
+    ensure_command_success(&result, "git diff")?;
+    Ok(result
+        .stdout_preview
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn run_eval_shell_command(
+    workspace: &EvalWorkspace,
+    command: &str,
+    timeout_seconds: u64,
+    network_mode: SandboxNetworkMode,
+    filesystem_mode: SandboxFilesystemMode,
+) -> CommandResult {
+    #[cfg(windows)]
+    {
+        let script_id = next_eval_command_id();
+        let script_path = workspace.task_dir.join(format!("{script_id}.cmd"));
+        if let Err(error) = std::fs::write(&script_path, format!("@echo off\r\n{command}\r\n")) {
+            return CommandResult::spawn_failed(
+                script_id,
+                format!("failed to write eval command script: {error}"),
+            );
+        }
+        let script_arg = eval_command_path_arg(&script_path);
+        let result = run_eval_command(
+            &workspace.task_dir,
+            &workspace.repo_dir,
+            vec!["cmd.exe".to_string(), "/C".to_string(), script_arg],
+            timeout_seconds,
+            network_mode,
+            filesystem_mode,
+        );
+        let _ = std::fs::remove_file(script_path);
+        result
+    }
+    #[cfg(not(windows))]
+    {
+        run_eval_command(
+            &workspace.task_dir,
+            &workspace.repo_dir,
+            shell_argv(command),
+            timeout_seconds,
+            network_mode,
+            filesystem_mode,
+        )
+    }
+}
+
+#[cfg(windows)]
+fn eval_command_path_arg(path: &PathBuf) -> String {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    value.to_string()
+}
+
+fn run_eval_command(
+    workspace_root: &PathBuf,
+    cwd: &PathBuf,
+    argv: Vec<String>,
+    timeout_seconds: u64,
+    network_mode: SandboxNetworkMode,
+    filesystem_mode: SandboxFilesystemMode,
+) -> CommandResult {
+    let workspace_root = std::fs::canonicalize(workspace_root)
+        .unwrap_or_else(|_| workspace_root.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let cwd = std::fs::canonicalize(cwd)
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut request =
+        CommandRequest::project_verification(next_eval_command_id(), argv, cwd, workspace_root);
+    request.timeout_seconds = timeout_seconds;
+    request.network.mode = network_mode;
+    request.filesystem.mode = filesystem_mode;
+    WindowsRestrictedTokenSandboxBackend::new().execute(&request)
+}
+
+fn ensure_command_success(result: &CommandResult, label: &str) -> Result<(), String> {
+    if result.execution_status == CommandExecutionStatus::Completed
+        && result.semantic_status == CommandSemanticStatus::Succeeded
+    {
+        Ok(())
+    } else {
+        Err(format!("{label} failed: {}", result.stderr_preview))
+    }
+}
+
+fn command_check_payload(result: CommandResult) -> Value {
+    let passed = result.execution_status == CommandExecutionStatus::Completed
+        && result.semantic_status == CommandSemanticStatus::Succeeded;
+    json!({
+        "passed": passed,
+        "status": if passed { "passed" } else { "failed" },
+        "exit_code": result.exit_code,
+        "execution_status": result.execution_status,
+        "semantic_status": result.semantic_status,
+        "stdout_preview": result.stdout_preview,
+        "stderr_preview": result.stderr_preview,
+        "timed_out": result.timed_out,
+        "output_truncated": result.output_truncated,
+    })
+}
+
+fn eval_task_result(
+    task: &Value,
+    agent_result: &singularity_agent::AgentLoopResult,
+    changed_files: Vec<String>,
+    public_passed: bool,
+    hidden_passed: bool,
+    blocker: Option<&str>,
+    error: Option<String>,
+    public_check: Value,
+    hidden_check: Value,
+) -> Value {
+    let evaluation_passed =
+        blocker.is_none() && agent_result.completed && public_passed && hidden_passed;
+    json!({
+        "task_id": eval_task_id(task),
+        "agent_completed": agent_result.completed,
+        "tests_passed": public_passed && hidden_passed,
+        "public_verification_passed": public_passed,
+        "hidden_verification_passed": hidden_passed,
+        "evaluation_passed": evaluation_passed,
+        "local_process_fallback_count": 0,
+        "status": if evaluation_passed { "completed" } else if blocker == Some(EVAL_WORKSPACE_BLOCKER) || blocker == Some(EVAL_PROVIDER_BLOCKER) { "blocked" } else { "failed" },
+        "blocker": blocker,
+        "error": error,
+        "changed_files": changed_files,
+        "model_turns": agent_result.model_turns,
+        "tool_calls": agent_result.tool_calls,
+        "approval_count": agent_result.approval_count,
+        "checks": {
+            "public": public_check,
+            "hidden": hidden_check,
+        }
+    })
+}
+
+fn blocked_eval_task_result(task: &Value, blocker: &str, message: String) -> Value {
+    json!({
+        "task_id": eval_task_id(task),
+        "agent_completed": false,
+        "tests_passed": false,
+        "public_verification_passed": false,
+        "hidden_verification_passed": false,
+        "evaluation_passed": false,
+        "local_process_fallback_count": 0,
+        "status": "blocked",
+        "blocker": blocker,
+        "error": message,
+        "checks": {
+            "public": {"passed": false, "status": "not_run"},
+            "hidden": {"passed": false, "status": "not_run"}
+        }
+    })
+}
+
+fn native_eval_workspace_tools(workspace_root: PathBuf, _task: &Value) -> WorkspaceTools {
+    WorkspaceTools::new(workspace_root)
+        .with_sandbox_backend(WindowsRestrictedTokenSandboxBackend::new())
+}
+
+fn native_eval_policy(workspace_root: String, task: &Value) -> PolicyEngine {
+    let mut profile = PermissionProfile::workspace_write(workspace_root);
+    profile.approval_policy = ApprovalPolicy::Never;
+    let mut policy = PolicyEngine::new(profile)
+        .with_rule(native_read_tool_rule())
+        .with_rule(native_execute_tool_rule());
+    if let Some(paths) = task.get("allowed_paths").and_then(Value::as_array) {
+        for (index, path) in paths.iter().filter_map(Value::as_str).enumerate() {
+            policy = policy.with_rule(native_write_tool_rule(index, path));
+        }
+    } else {
+        policy = policy.with_rule(native_write_tool_rule(0, ""));
+    }
+    policy
+}
+
+fn native_write_tool_rule(index: usize, path: &str) -> PermissionRule {
+    let rule = PermissionRule::new(
+        format!("allow_native_eval_write_tool_{index}"),
+        SettingsScope::Project,
+        PermissionDecisionOutcome::Allow,
+    )
+    .for_operation(PermissionOperation::Write);
+    if path.is_empty() {
+        rule
+    } else {
+        rule.for_resource(path)
+    }
+}
+
+fn native_execute_tool_rule() -> PermissionRule {
+    PermissionRule::new(
+        "allow_native_eval_command_tools",
+        SettingsScope::Project,
+        PermissionDecisionOutcome::Allow,
+    )
+    .for_operation(PermissionOperation::Execute)
+}
+
+fn eval_agent_prompt(task: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(user_task) = task.get("user_task").and_then(Value::as_str) {
+        parts.push(user_task.to_string());
+    }
+    if let Some(paths) = task.get("allowed_paths").and_then(Value::as_array) {
+        let allowed = paths
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !allowed.is_empty() {
+            parts.push(format!("Only modify these workspace paths unless the task proves another path is required: {allowed}."));
+        }
+    }
+    if let Some(command) = task.get("smoke_command").and_then(Value::as_str) {
+        parts.push(format!("Use the command tool with argv to run this smoke command before the final answer: {command}"));
+    }
+    parts.push("Available tools are read, list, grep, edit, patch, and command. Finish with a concise final answer that mentions verification.".to_string());
+    parts.join("\n\n")
+}
+
+fn expected_file_change_satisfied(task: &Value, changed_files: &[String]) -> bool {
+    let Some(expected) = task.get("expected_file_changes").and_then(Value::as_array) else {
+        return true;
+    };
+    expected.iter().filter_map(Value::as_str).all(|path| {
+        changed_files
+            .iter()
+            .any(|changed| changed.replace('\\', "/") == path.replace('\\', "/"))
+    })
+}
+
+fn summary_requirement_satisfied(task: &Value, final_answer: Option<&str>) -> bool {
+    let Some(required) = task
+        .pointer("/success/summary_contains")
+        .and_then(Value::as_str)
+    else {
+        return true;
+    };
+    final_answer
+        .map(|answer| {
+            answer
+                .to_ascii_lowercase()
+                .contains(&required.to_ascii_lowercase())
+        })
+        .unwrap_or(false)
+}
+
+fn write_eval_workspace_file(root: &PathBuf, relative: &str, content: &str) -> Result<(), String> {
+    if relative.contains("..") || relative.starts_with('/') || relative.starts_with('\\') {
+        return Err(format!(
+            "fixture file path is outside workspace: {relative}"
+        ));
+    }
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(path, content).map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+fn shell_argv(command: &str) -> Vec<String> {
+    vec!["sh".to_string(), "-c".to_string(), command.to_string()]
+}
+
+fn eval_task_id(task: &Value) -> String {
+    task.get("task_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn next_eval_command_id() -> String {
+    let sequence = EVAL_COMMAND_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("eval_command_{sequence}")
+}
+
+fn write_eval_artifacts(
+    result: &mut EvalRunResult,
+    output_root: Option<&str>,
+) -> Result<(), String> {
+    let run_dir = eval_output_root(output_root).join(safe_path_segment(&result.run_id));
+    std::fs::create_dir_all(&run_dir).map_err(|error| error.to_string())?;
+    let result_path = run_dir.join("result.json");
+    let report_path = run_dir.join("report.json");
+    result.result_path = Some(result_path.to_string_lossy().to_string());
+    result.report_path = Some(report_path.to_string_lossy().to_string());
+    let payload = eval_result_payload(result, &run_dir);
+    let serialized = serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?;
+    std::fs::write(&result_path, format!("{serialized}\n")).map_err(|error| error.to_string())?;
+    std::fs::write(&report_path, format!("{serialized}\n")).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn eval_result_payload(result: &EvalRunResult, run_dir: &std::path::Path) -> Value {
+    let total = result.tasks.len();
+    let passed = result
+        .tasks
+        .iter()
+        .filter(|task| task.get("evaluation_passed").and_then(Value::as_bool) == Some(true))
+        .count();
+    json!({
+        "schema_version": EVAL_RESULT_SCHEMA,
+        "run_id": &result.run_id,
+        "output_dir": run_dir.to_string_lossy(),
+        "runner": &result.runner,
+        "status": &result.status,
+        "blocker": &result.blocker,
+        "summary": {
+            "total": total,
+            "passed": passed,
+            "failed": total.saturating_sub(passed),
+            "evaluation_passed": result.evaluation_passed,
+        },
+        "tasks": &result.tasks,
+        "result_path": &result.result_path,
+        "report_path": &result.report_path,
+        "evaluation_passed": result.evaluation_passed,
+    })
+}
+
+fn eval_output_root(output_root: Option<&str>) -> PathBuf {
+    output_root
+        .map(PathBuf::from)
+        .or_else(|| std::env::var(EVAL_OUTPUT_DIR_ENV).ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("work").join("evaluations"))
+}
+
+fn safe_path_segment(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.trim_matches('.').is_empty() {
+        "eval_run".to_string()
+    } else {
+        safe
+    }
+}
+
 fn native_agent_loop_ready() -> bool {
     let capability = AgentLoopCapability::current();
-    capability.available && capability.missing_boundaries.is_empty()
+    capability.available && capability.blockers.is_empty()
+}
+
+fn agent_host_initial_status(agent_host: &AgentHost) -> &'static str {
+    match agent_host {
+        AgentHost::Native => AgentStatus::Running.as_str(),
+        AgentHost::Python => AgentStatus::NotMigrated.as_str(),
+    }
 }
 
 fn native_workspace_policy(workspace_root: String) -> PolicyEngine {
@@ -1162,10 +2038,12 @@ fn native_read_tool_rule() -> PermissionRule {
 }
 
 fn native_workspace_tool_specs() -> Vec<ToolSpec> {
+    let command_sandbox_modes = ["read_only", "workspace_write", "danger_full_access"];
+    let command_network_access = ["denied", "allowed"];
     vec![
         ToolSpec::new(
             TOOL_READ,
-            "Read a workspace file through the native Rust tool boundary",
+            "Read a workspace file",
             json!({
                 "type": "object",
                 "properties": {
@@ -1178,7 +2056,7 @@ fn native_workspace_tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             TOOL_LIST,
-            "List workspace directory entries through the native Rust tool boundary",
+            "List workspace directory entries",
             json!({
                 "type": "object",
                 "properties": {
@@ -1190,7 +2068,7 @@ fn native_workspace_tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             TOOL_GREP,
-            "Search workspace text files through the native Rust tool boundary",
+            "Search workspace text files",
             json!({
                 "type": "object",
                 "properties": {
@@ -1204,7 +2082,7 @@ fn native_workspace_tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             TOOL_EDIT,
-            "Replace expected text in a workspace file through the native Rust tool boundary",
+            "Replace expected text in a workspace file",
             json!({
                 "type": "object",
                 "properties": {
@@ -1218,7 +2096,7 @@ fn native_workspace_tool_specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             TOOL_PATCH,
-            "Apply explicit workspace file changes through the native Rust tool boundary",
+            "Apply explicit workspace file changes",
             json!({
                 "type": "object",
                 "properties": {
@@ -1237,6 +2115,26 @@ fn native_workspace_tool_specs() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["changes"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            TOOL_COMMAND,
+            "Run a sandboxed command",
+            json!({
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1
+                    },
+                    "cwd": {"type": "string"},
+                    "timeout_seconds": {"type": "integer", "minimum": 1},
+                    "sandbox_mode": {"type": "string", "enum": command_sandbox_modes},
+                    "network_access": {"type": "string", "enum": command_network_access}
+                },
+                "required": ["argv"],
                 "additionalProperties": false
             }),
         ),
@@ -1260,9 +2158,9 @@ fn stale_active_run_status_result(mut turn: Turn, active: &ActiveSidecarRun) -> 
     TurnResult { turn }
 }
 
-fn cancelled_sidecar_bridge(active: &ActiveSidecarRun) -> AgentLoopStatusBridge {
-    AgentLoopStatusBridge {
-        status: AgentHostStatus::Cancelled,
+fn cancelled_sidecar_status(active: &ActiveSidecarRun) -> AgentRunStatus {
+    AgentRunStatus {
+        status: AgentStatus::Cancelled,
         completed: false,
         final_answer: None,
         run_id: Some(active.run_id.clone()),
@@ -1277,9 +2175,9 @@ fn cancelled_sidecar_bridge(active: &ActiveSidecarRun) -> AgentLoopStatusBridge 
     }
 }
 
-fn sidecar_status_bridge(status: PythonSidecarStatus) -> AgentLoopStatusBridge {
-    let host_status = AgentHostStatus::from(status.status.as_str());
-    AgentLoopStatusBridge {
+fn sidecar_run_status(status: PythonSidecarStatus) -> AgentRunStatus {
+    let host_status = AgentStatus::from(status.status.as_str());
+    AgentRunStatus {
         status: host_status,
         completed: status.status == "completed",
         final_answer: status.final_answer,
@@ -1295,13 +2193,13 @@ fn sidecar_status_bridge(status: PythonSidecarStatus) -> AgentLoopStatusBridge {
     }
 }
 
-fn is_terminal_sidecar_status(status: &AgentHostStatus) -> bool {
+fn is_terminal_sidecar_status(status: &AgentStatus) -> bool {
     matches!(
         status,
-        AgentHostStatus::Completed
-            | AgentHostStatus::Blocked
-            | AgentHostStatus::Cancelled
-            | AgentHostStatus::Failed
+        AgentStatus::Completed
+            | AgentStatus::Blocked
+            | AgentStatus::Cancelled
+            | AgentStatus::Failed
     )
 }
 
@@ -1323,18 +2221,261 @@ fn is_cancelled_or_interrupted(status: &str) -> bool {
     matches!(status, "cancel_requested" | "cancelled" | "canceled")
 }
 
-fn is_cancel_ack_status(status: &AgentHostStatus) -> bool {
+fn is_cancel_ack_status(status: &AgentStatus) -> bool {
     matches!(
         status,
-        AgentHostStatus::CancelRequested | AgentHostStatus::Cancelled
+        AgentStatus::CancelRequested | AgentStatus::Cancelled
     )
 }
 
-fn agent_completed_delta(bridge: &AgentLoopStatusBridge) -> Option<String> {
-    if bridge.status == AgentHostStatus::Completed {
-        bridge.final_answer.as_deref().map(redact_app_server_text)
+fn agent_completed_delta(run_status: &AgentRunStatus) -> Option<String> {
+    if run_status.status == AgentStatus::Completed {
+        run_status
+            .final_answer
+            .as_deref()
+            .filter(|answer| !answer.trim().is_empty())
+            .map(redact_app_server_text)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use singularity_agent::PendingToolCall;
+    use singularity_model::{
+        ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, Provider,
+        ProviderError,
+    };
+    use singularity_tools::command_scope_resource;
+
+    use super::*;
+
+    struct StaticProvider {
+        responses: Vec<ModelTurnResponse>,
+        seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    }
+
+    impl Provider for StaticProvider {
+        fn complete(&self, request: &ModelTurnRequest) -> Result<ModelTurnResponse, ProviderError> {
+            let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
+            let response_index = seen_requests.len();
+            seen_requests.push(request.clone());
+            Ok(self
+                .responses
+                .get(response_index)
+                .unwrap_or_else(|| self.responses.last().expect("static provider response"))
+                .clone())
+        }
+    }
+
+    #[test]
+    fn native_approval_resume_without_pending_tool_call_fails_closed_after_gate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let file_path = workspace.join("README.md");
+        std::fs::write(&file_path, "before").expect("write readme");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Blocked.as_str(),
+                json!([{"type": "text", "text": "edit readme"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                TurnStatus::Blocked,
+                AgentStatus::Blocked.as_str(),
+            )
+            .expect("blocked turn");
+        let server = AppServer::new(store);
+        let request = ApprovalRequest::new(
+            format!("approval_{}_call_1", turn.turn_id),
+            turn.turn_id.clone(),
+            turn.turn_id.clone(),
+            TOOL_EDIT,
+        )
+        .with_resources(["README.md"]);
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        let final_response =
+            ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "done");
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = StaticProvider {
+            responses: vec![final_response],
+            seen_requests: Arc::clone(&seen_requests),
+        };
+
+        let resumed = server
+            .resume_native_agent_loop_after_gate(&request, &decision, None, provider)
+            .expect("resume");
+
+        assert!(resumed.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read readme"),
+            "before"
+        );
+        assert!(seen_requests.lock().expect("seen requests").is_empty());
+    }
+
+    #[test]
+    fn native_approval_resume_uses_stored_pending_tool_call_after_gate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let file_path = workspace.join("README.md");
+        std::fs::write(&file_path, "before").expect("write readme");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Blocked.as_str(),
+                json!([{"type": "text", "text": "edit readme"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                TurnStatus::Blocked,
+                AgentStatus::Blocked.as_str(),
+            )
+            .expect("blocked turn");
+        let request = ApprovalRequest::new(
+            format!("approval_{}_call_1", turn.turn_id),
+            turn.turn_id.clone(),
+            turn.turn_id.clone(),
+            TOOL_EDIT,
+        )
+        .with_resources(["README.md"]);
+        let pending = PendingToolCall {
+            request_id: request.request_id.clone(),
+            tool_call_id: "call_1".to_string(),
+            tool_name: TOOL_EDIT.to_string(),
+            raw_arguments: json!({
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "after"
+            })
+            .to_string(),
+            resources: vec!["README.md".to_string()],
+        };
+        let pending_payload = serde_json::to_value(&pending).expect("pending payload");
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        let final_response =
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = StaticProvider {
+            responses: vec![final_response],
+            seen_requests: Arc::clone(&seen_requests),
+        };
+        let server = AppServer::new(store);
+
+        let resumed = server
+            .resume_native_agent_loop_after_gate(
+                &request,
+                &decision,
+                Some(pending_payload),
+                provider,
+            )
+            .expect("resume")
+            .expect("resumed");
+
+        assert_eq!(resumed.0.turn_id, turn.turn_id);
+        assert_eq!(resumed.1.status, AgentStatus::Completed);
+        assert_eq!(resumed.1.final_answer.as_deref(), Some("done"));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read readme"),
+            "after"
+        );
+        assert_eq!(seen_requests.lock().expect("seen requests").len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_agent_loop_command_uses_restricted_token_backend_after_gate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let params = TurnStartParams {
+            thread_id: thread.thread_id.clone(),
+            input: vec![singularity_protocol::InputItem::Text {
+                text: "run command".to_string(),
+            }],
+            agent_host: Some(AgentHost::Native),
+        };
+        let mut command_response =
+            ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+        command_response.tool_calls.push(ModelToolCall {
+            tool_call_id: "call_1".to_string(),
+            tool_name: "builtin.command".to_string(),
+            arguments: json!({
+                "argv": ["cmd.exe", "/C", "echo app-server-sandbox-ok"],
+                "timeout_seconds": 5
+            }),
+            raw_arguments: json!({
+                "argv": ["cmd.exe", "/C", "echo app-server-sandbox-ok"],
+                "timeout_seconds": 5
+            })
+            .to_string(),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+            provider_metadata: json!({}),
+        });
+        let final_response =
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+        let provider = StaticProvider {
+            responses: vec![command_response, final_response],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let server = AppServer::new(store);
+        let command_resource = command_scope_resource(
+            &[
+                "cmd.exe".to_string(),
+                "/C".to_string(),
+                "echo app-server-sandbox-ok".to_string(),
+            ],
+            &SandboxFilesystemMode::ReadOnly,
+            &SandboxNetworkMode::Denied,
+        );
+        let grant = ApprovalGrant::allow(
+            "approval_turn_1_call_1",
+            "builtin.command",
+            [command_resource],
+        );
+
+        let status = server
+            .run_native_agent_loop_with_provider(provider, &thread, &params, "turn_1", Some(grant))
+            .expect("native loop");
+
+        assert_eq!(status.status, AgentStatus::Completed);
+        assert_eq!(status.final_answer.as_deref(), Some("done"));
+        assert_eq!(status.tool_calls, 1);
     }
 }
 

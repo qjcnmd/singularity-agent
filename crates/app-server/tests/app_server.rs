@@ -120,7 +120,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":5,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":5,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
     let turn_result = result_message(&turn);
@@ -234,7 +234,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 }
 
 #[test]
-fn app_server_reports_native_agent_loop_capability_as_unavailable_until_blockers_clear() {
+fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = AppServer::new(store);
@@ -251,23 +251,84 @@ fn app_server_reports_native_agent_loop_capability_as_unavailable_until_blockers
 
     assert_eq!(
         capability[0]["result"]["nativeAgentLoop"]["available"],
-        false
+        true
     );
     assert_eq!(
         capability[0]["result"]["nativeAgentLoop"]["status"],
-        "not_migrated"
+        "completed"
     );
     assert!(
-        capability[0]["result"]["nativeAgentLoop"]["missing_boundaries"]
+        capability[0]["result"]["nativeAgentLoop"]["blockers"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|boundary| boundary == "strict_command_sandbox")
+            .is_empty()
     );
 }
 
 #[test]
-fn app_server_rejects_native_turn_start_until_capability_blockers_clear() {
+fn app_server_eval_run_writes_blocked_native_result_artifacts_without_python_sidecar() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut server = AppServer::new(store);
+    let manifest = dir.path().join("eval.json");
+    let output_root = dir.path().join("eval-output");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "schema_version": "evaluation.task_set/v1",
+  "tasks": [
+    {
+      "task_id": "fixture_eval",
+      "workspace": {"type": "unsupported"},
+      "user_task": "finish",
+      "verification_command": "python -c pass"
+    }
+  ]
+}"#,
+    )
+    .expect("manifest");
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    let request = serde_json::json!({
+        "method": "eval/run",
+        "id": 2,
+        "params": {
+            "manifest": manifest,
+            "runId": "eval_blocked",
+            "outputRoot": output_root,
+        }
+    })
+    .to_string();
+    let response = server.handle_json(&request).unwrap();
+    let result = result_message(&response);
+
+    assert_eq!(result["runner"], "rust_native");
+    assert_eq!(result["status"], "blocked");
+    assert_eq!(result["blocker"], "eval_workspace_failed");
+    assert_eq!(result["evaluation_passed"], false);
+    assert_eq!(result["tasks"][0]["agent_completed"], false);
+    assert_eq!(result["tasks"][0]["tests_passed"], false);
+    assert_eq!(result["tasks"][0]["local_process_fallback_count"], 0);
+    let result_path = result["result_path"].as_str().expect("result path");
+    let report_path = result["report_path"].as_str().expect("report path");
+    assert!(std::path::Path::new(result_path).exists());
+    assert!(std::path::Path::new(report_path).exists());
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
+            .expect("result payload");
+    assert_eq!(payload["schema_version"], "evaluation.result/v1");
+    assert_eq!(payload["runner"], "rust_native");
+    assert_eq!(payload["tasks"][0]["blocker"], "eval_workspace_failed");
+    assert_eq!(payload["tasks"][0]["checks"]["public"]["status"], "not_run");
+}
+
+#[test]
+fn app_server_keeps_python_oracle_explicit_after_native_cutover() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = AppServer::new(store);
@@ -286,13 +347,13 @@ fn app_server_rejects_native_turn_start_until_capability_blockers_clear() {
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"native","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
 
     assert_eq!(
-        turn[0]["error"]["message"],
-        "Native AgentLoop is not production-ready"
+        result_message(&turn)["turn"]["agent_loop_status"],
+        "not_migrated"
     );
     let trace = server
         .handle_json(&format!(
@@ -304,28 +365,10 @@ fn app_server_rejects_native_turn_start_until_capability_blockers_clear() {
 }
 
 #[test]
-fn native_agent_loop_missing_provider_does_not_start_python_sidecar() {
+fn python_oracle_without_sidecar_config_stays_not_migrated() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let module_root = dir.path().join("sidecar_modules");
-    std::fs::create_dir_all(&module_root).expect("module root");
-    std::fs::write(
-        module_root.join("sidecar_probe.py"),
-        "import os, pathlib\npathlib.Path(os.environ['SIDECAR_MARKER']).write_text('spawned')\n",
-    )
-    .expect("sidecar probe");
-    let marker = dir.path().join("sidecar_spawned.txt");
-    let config = PythonSidecarConfig {
-        python_bin: test_python_bin(),
-        module: "sidecar_probe".to_string(),
-        project_root: dir.path().to_path_buf(),
-        python_path: Some(module_root),
-        env: vec![(
-            "SIDECAR_MARKER".to_string(),
-            marker.to_string_lossy().into_owned(),
-        )],
-    };
-    let mut server = AppServer::new(store).with_python_sidecar(config);
+    let mut server = AppServer::new(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
@@ -341,17 +384,13 @@ fn native_agent_loop_missing_provider_does_not_start_python_sidecar() {
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"native","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
 
     assert_eq!(
-        turn[0]["error"]["message"],
-        "Native AgentLoop is not production-ready"
-    );
-    assert!(
-        !marker.exists(),
-        "native path must not start the Python sidecar"
+        result_message(&turn)["turn"]["agent_loop_status"],
+        "not_migrated"
     );
 }
 
@@ -449,6 +488,205 @@ fn approval_decisions_consume_pending_requests_once_for_all_outcomes() {
 }
 
 #[test]
+fn approval_decision_allow_without_pending_tool_call_does_not_resume_native_turn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    std::fs::write(workspace.join("README.md"), "before").expect("readme");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let mut server = AppServer::new(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let thread = store
+        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let (turn, _item, _trace) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "blocked",
+            serde_json::json!([{"type": "text", "text": "edit readme"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("turn");
+    store
+        .update_turn_state(
+            &turn.turn_id,
+            singularity_protocol::TurnStatus::Blocked,
+            "blocked",
+        )
+        .expect("blocked state");
+    let request = ApprovalRequest::new(
+        format!("approval_{}_call_1", turn.turn_id),
+        turn.turn_id.clone(),
+        turn.turn_id.clone(),
+        "builtin.edit",
+    )
+    .with_resources(["README.md"]);
+    store
+        .create_approval_with_trace(&request, "approval", "approval requested")
+        .expect("approval");
+    drop(store);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("README.md")).expect("read before"),
+        "before"
+    );
+
+    let decision = ApprovalDecision::new(
+        request.request_id.clone(),
+        ApprovalOutcome::Allow,
+        "operator approved",
+    );
+    let response = server
+        .handle_json(
+            &serde_json::json!({
+                "method": "approval/decision",
+                "id": 4,
+                "params": decision,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+    assert!(
+        !response
+            .iter()
+            .any(|message| message["method"] == "item/agentMessage/delta")
+    );
+    assert_eq!(
+        result_message(&response)["decision"]["request_id"],
+        request.request_id
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("README.md")).expect("read readme"),
+        "before"
+    );
+    assert_eq!(
+        SessionStore::open(&db_path)
+            .expect("reopen store")
+            .get_turn(&turn.turn_id)
+            .expect("turn")
+            .status,
+        singularity_protocol::TurnStatus::Blocked
+    );
+
+    let duplicate = server
+        .handle_json(
+            &serde_json::json!({
+                "method": "approval/decision",
+                "id": 6,
+                "params": response
+                    .iter()
+                    .find_map(|message| message.get("result"))
+                    .expect("decision result")["decision"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    assert_eq!(
+        duplicate[0]["error"]["message"],
+        "Pending approval not found"
+    );
+}
+
+#[test]
+fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_native_turn() {
+    for (outcome, request_resource) in [
+        (ApprovalOutcome::Deny, "README.md"),
+        (ApprovalOutcome::Defer, "README.md"),
+        (ApprovalOutcome::Allow, "other.md"),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::write(workspace.join("README.md"), "before").expect("readme");
+        let db_path = dir.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&db_path).expect("open store");
+        let mut server = AppServer::new(store);
+        server
+            .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+            .unwrap();
+        server
+            .handle_json(r#"{"method":"initialized","params":{}}"#)
+            .unwrap();
+        let thread = server
+            .handle_json(&format!(
+                r#"{{"method":"thread/start","id":2,"params":{{"cwd":{}}}}}"#,
+                serde_json::to_string(&workspace.to_string_lossy()).expect("cwd")
+            ))
+            .unwrap();
+        let thread_id = result_message(&thread)["thread"]["thread_id"]
+            .as_str()
+            .unwrap();
+        let store = SessionStore::open(&db_path).expect("reopen store");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                thread_id,
+                "blocked",
+                serde_json::json!([{"type": "text", "text": "edit readme"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("blocked turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                singularity_protocol::TurnStatus::Blocked,
+                "blocked",
+            )
+            .expect("blocked state");
+        let request = ApprovalRequest::new(
+            format!("approval_{}_call_1", turn.turn_id),
+            turn.turn_id.clone(),
+            turn.turn_id.clone(),
+            "builtin.edit",
+        )
+        .with_resources([request_resource]);
+        store
+            .create_approval_with_trace(&request, "approval", "approval requested")
+            .expect("approval");
+        drop(store);
+        let decision =
+            ApprovalDecision::new(request.request_id.clone(), outcome, "operator decision");
+
+        let response = server
+            .handle_json(
+                &serde_json::json!({
+                    "method": "approval/decision",
+                    "id": 3,
+                    "params": decision,
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        assert!(
+            !response
+                .iter()
+                .any(|message| message["method"] == "item/agentMessage/delta")
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("README.md")).expect("read readme"),
+            "before"
+        );
+        assert_eq!(
+            SessionStore::open(&db_path)
+                .expect("reopen store")
+                .get_turn(&turn.turn_id)
+                .expect("turn")
+                .status,
+            singularity_protocol::TurnStatus::Blocked
+        );
+    }
+}
+
+#[test]
 fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
@@ -462,7 +700,7 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
 
     let missing_turn_thread = server
         .handle_json(
-            r#"{"method":"turn/start","id":2,"params":{"threadId":"missing","input":[{"type":"text","text":"hello"}]}}"#,
+            r#"{"method":"turn/start","id":2,"params":{"threadId":"missing","agentHost":"python","input":[{"type":"text","text":"hello"}]}}"#,
         )
         .unwrap();
     assert_eq!(
@@ -525,7 +763,7 @@ fn turn_start_missing_thread_does_not_spawn_python_sidecar() {
 
     let missing_thread = server
         .handle_json(
-            r#"{"method":"turn/start","id":2,"params":{"threadId":"missing","input":[{"type":"text","text":"hello"}]}}"#,
+            r#"{"method":"turn/start","id":2,"params":{"threadId":"missing","agentHost":"python","input":[{"type":"text","text":"hello"}]}}"#,
         )
         .unwrap();
 
@@ -566,7 +804,7 @@ fn app_server_can_translate_python_sidecar_completion_when_enabled() {
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"complete through sidecar"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"complete through sidecar"}}]}}}}"#
         ))
         .unwrap();
 
@@ -665,12 +903,12 @@ for line in sys.stdin:
 
     server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"first"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"first"}}]}}}}"#
         ))
         .unwrap();
     let resumed = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":4,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"second"}}]}}}}"#
+            r#"{{"method":"turn/start","id":4,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"second"}}]}}}}"#
         ))
         .unwrap();
     let resumed_text = resumed
@@ -693,7 +931,7 @@ for line in sys.stdin:
 }
 
 #[test]
-fn app_server_sidecar_trace_projection_contains_only_safe_fields() {
+fn app_server_sidecar_trace_payload_contains_only_safe_fields() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let python_path = workspace_root().join("src");
@@ -723,7 +961,7 @@ fn app_server_sidecar_trace_projection_contains_only_safe_fields() {
 
     server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"complete through sidecar"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"complete through sidecar"}}]}}}}"#
         ))
         .unwrap();
     let trace = server
@@ -775,7 +1013,7 @@ fn app_server_sidecar_trace_projection_contains_only_safe_fields() {
 }
 
 #[test]
-fn app_server_redacts_sidecar_event_summary_before_trace_projection() {
+fn app_server_redacts_sidecar_event_summary_before_trace_payload() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let module_root = dir.path().join("sidecar_modules");
@@ -832,7 +1070,7 @@ for line in sys.stdin:
 
     server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
     let trace = server
@@ -854,7 +1092,7 @@ for line in sys.stdin:
     ] {
         assert!(
             !serialized.contains(marker),
-            "{marker} leaked to trace projection"
+            "{marker} leaked to trace payload"
         );
     }
 }
@@ -910,7 +1148,7 @@ for line in sys.stdin:
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
     let delta = turn
@@ -986,7 +1224,7 @@ for line in sys.stdin:
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
     let delta = turn
@@ -1055,7 +1293,7 @@ for line in sys.stdin:
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
     let delta = turn
@@ -1120,7 +1358,7 @@ for line in sys.stdin:
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
     let delta = turn
@@ -1178,7 +1416,7 @@ for line in sys.stdin:
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
     let result = result_message(&turn);
@@ -1244,7 +1482,7 @@ for line in sys.stdin:
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
     let result = result_message(&turn);
@@ -1259,6 +1497,71 @@ for line in sys.stdin:
     );
     assert!(!serialized.contains("provider_response"));
     assert!(!serialized.contains("abc123"));
+}
+
+#[test]
+fn app_server_does_not_emit_agent_delta_for_empty_completed_final_answer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let module_root = dir.path().join("sidecar_modules");
+    std::fs::create_dir_all(&module_root).expect("module root");
+    std::fs::write(
+        module_root.join("sidecar_empty_final.py"),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    print(json.dumps({
+        "id": message["id"],
+        "result": {
+            "run_id": "run_1",
+            "session_id": "session_1",
+            "task_id": "task_1",
+            "status": "completed",
+            "final_answer": "   ",
+            "events": []
+        }
+    }), flush=True)
+"#,
+    )
+    .expect("sidecar module");
+    let config = PythonSidecarConfig {
+        python_bin: test_python_bin(),
+        module: "sidecar_empty_final".to_string(),
+        project_root: dir.path().to_path_buf(),
+        python_path: Some(module_root),
+        env: Vec::new(),
+    };
+    let mut server = AppServer::new(store).with_python_sidecar(config);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+    let thread = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .unwrap();
+    let thread_id = result_message(&thread)["thread"]["thread_id"]
+        .as_str()
+        .unwrap();
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .unwrap();
+    let result = result_message(&turn);
+
+    assert_eq!(result["turn"]["status"], "completed");
+    assert_eq!(result["turn"]["agent_loop_status"], "completed");
+    assert!(
+        !turn
+            .iter()
+            .any(|message| message["method"] == "item/agentMessage/delta")
+    );
 }
 
 #[test]
@@ -1327,7 +1630,7 @@ for line in sys.stdin:
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_result = result_message(&turn);
@@ -1460,7 +1763,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"].as_str().unwrap();
@@ -1543,7 +1846,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -1622,7 +1925,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -1695,7 +1998,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"].as_str().unwrap();
@@ -1764,7 +2067,7 @@ for line in sys.stdin:
             .unwrap();
         let turn = server
             .handle_json(&format!(
-                r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+                r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
             ))
             .unwrap();
         let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -1841,7 +2144,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -1915,7 +2218,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -1952,7 +2255,7 @@ for line in sys.stdin:
 }
 
 #[test]
-fn turn_lifecycle_status_failed_after_cancel_keeps_cancelled_projection() {
+fn turn_lifecycle_status_failed_after_cancel_keeps_cancelled_mapping() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
@@ -1999,7 +2302,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -2080,7 +2383,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -2160,7 +2463,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -2240,7 +2543,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -2371,7 +2674,7 @@ for line in sys.stdin:
         .to_string();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]
@@ -2535,7 +2838,7 @@ for line in sys.stdin:
             .unwrap();
         let turn = server
             .handle_json(&format!(
-                r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+                r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
             ))
             .unwrap();
         result_message(&turn)["turn"]["turn_id"]

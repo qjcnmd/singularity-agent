@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
@@ -14,6 +14,7 @@ use singularity_protocol::{
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
+const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const PYTHON_SIDECAR_ENV: &str = "SINGULARITY_PYTHON_SIDECAR";
 const PYTHON_SIDECAR_PROJECT_ROOT_ENV: &str = "SINGULARITY_SIDECAR_PROJECT_ROOT";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
@@ -22,6 +23,7 @@ const CLI_CLIENT_TITLE: &str = "Singularity Rust CLI";
 const CLI_CLIENT_VERSION: &str = "0.1.0";
 const DEFAULT_TRACE_TAIL_LIMIT: usize = 20;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const EVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const AGENT_HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -197,7 +199,8 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             model,
             agent_host,
         } => {
-            let mut client = AppServerClient::spawn(agent_host)?;
+            let agent_host = default_agent_host(agent_host);
+            let mut client = AppServerClient::spawn(Some(agent_host))?;
             client.initialize()?;
             ensure_native_agent_loop_available(agent_host, &mut client)?;
             let thread = client.thread_start(model)?;
@@ -208,7 +211,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             client.turn_start(
                 required_str(&thread, &["thread", "thread_id"])?,
                 &goal,
-                agent_host,
+                Some(agent_host),
             )?;
             Ok(())
         }
@@ -217,12 +220,13 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             instruction,
             agent_host,
         } => {
-            let mut client = AppServerClient::spawn(agent_host)?;
+            let agent_host = default_agent_host(agent_host);
+            let mut client = AppServerClient::spawn(Some(agent_host))?;
             client.initialize()?;
             ensure_native_agent_loop_available(agent_host, &mut client)?;
             client.thread_read(&thread_id)?;
             println!("thread {thread_id}");
-            client.turn_start(&thread_id, &instruction, agent_host)?;
+            client.turn_start(&thread_id, &instruction, Some(agent_host))?;
             Ok(())
         }
         Command::Turn { command } => {
@@ -289,14 +293,14 @@ fn run_cli(cli: Cli) -> Result<(), String> {
 }
 
 fn ensure_native_agent_loop_available(
-    agent_host: Option<AgentHost>,
+    agent_host: AgentHost,
     client: &mut AppServerClient,
 ) -> Result<(), String> {
-    if matches!(agent_host, Some(AgentHost::Native)) {
+    if matches!(agent_host, AgentHost::Native) {
         let capability = client.agent_capability()?;
         let native = &capability["nativeAgentLoop"];
         let available = native["available"].as_bool().unwrap_or(false);
-        let blockers_empty = native["missing_boundaries"]
+        let blockers_empty = native["blockers"]
             .as_array()
             .is_some_and(|blockers| blockers.is_empty());
         if available && blockers_empty {
@@ -310,8 +314,13 @@ fn ensure_native_agent_loop_available(
     Ok(())
 }
 
+fn default_agent_host(agent_host: Option<AgentHost>) -> AgentHost {
+    agent_host.unwrap_or(AgentHost::Native)
+}
+
 fn print_readiness() -> Result<(), String> {
     let mut client = AppServerClient::spawn(None)?;
+    client.response_timeout = AGENT_HOST_RESPONSE_TIMEOUT;
     client.initialize()?;
     let capability = client.agent_capability()?;
     let native = &capability["nativeAgentLoop"];
@@ -319,8 +328,8 @@ fn print_readiness() -> Result<(), String> {
         "native_agent_loop={}",
         native["status"].as_str().unwrap_or("unknown")
     );
-    println!("sidecar_oracle=available");
-    println!("evaluation=python_oracle");
+    println!("sidecar_oracle=explicit");
+    println!("evaluation=rust_native");
     Ok(())
 }
 
@@ -339,25 +348,28 @@ fn run_eval(manifest: PathBuf, run_id: &str, json_output: bool) -> Result<(), St
     if !manifest.exists() {
         return Err(format!("eval manifest not found: {}", manifest.display()));
     }
+    let mut client = AppServerClient::spawn(None)?;
+    client.response_timeout = EVAL_RESPONSE_TIMEOUT;
+    client.initialize()?;
+    let result = client.eval_run(&manifest, run_id)?;
     if json_output {
+        println!("{result}");
+    } else {
         println!(
-            "{}",
-            json!({
-                "run_id": run_id,
-                "manifest": manifest.to_string_lossy(),
-                "runner": "python_oracle",
-                "status": "blocked",
-                "blocker": "rust_evaluation_runner_not_migrated",
-                "evaluation_passed": false,
-            })
+            "eval {} {} runner={}",
+            result["run_id"].as_str().unwrap_or(run_id),
+            result["status"].as_str().unwrap_or("unknown"),
+            result["runner"].as_str().unwrap_or("unknown")
         );
-        return Err("rust_evaluation_runner_not_migrated".to_string());
     }
-    println!(
-        "eval {run_id} blocked rust_evaluation_runner_not_migrated manifest={}",
-        manifest.display()
-    );
-    Err("rust_evaluation_runner_not_migrated".to_string())
+    if result["evaluation_passed"].as_bool().unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(result["blocker"]
+            .as_str()
+            .unwrap_or("evaluation_failed")
+            .to_string())
+    }
 }
 
 fn print_wire_request(message: JsonRpcMessage) -> Result<(), String> {
@@ -396,18 +408,21 @@ impl AppServerClient {
         if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
             command.env(APP_SERVER_DB_ENV, db);
         }
-        let response_timeout = if matches!(agent_host, Some(AgentHost::Python)) {
+        let response_timeout = if agent_host.is_some() {
+            AGENT_HOST_RESPONSE_TIMEOUT
+        } else {
+            RESPONSE_TIMEOUT
+        };
+        if matches!(agent_host, Some(AgentHost::Python)) {
             command.env(PYTHON_SIDECAR_ENV, "1");
             if std::env::var_os(PYTHON_SIDECAR_PROJECT_ROOT_ENV).is_none() {
                 let cwd = std::env::current_dir()
                     .map_err(|error| format!("failed to resolve current directory: {error}"))?;
                 command.env(PYTHON_SIDECAR_PROJECT_ROOT_ENV, cwd);
             }
-            AGENT_HOST_RESPONSE_TIMEOUT
         } else {
             command.env_remove(PYTHON_SIDECAR_ENV);
-            RESPONSE_TIMEOUT
-        };
+        }
         let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start app-server: {error}"))?;
@@ -444,6 +459,17 @@ impl AppServerClient {
             json!({"model": model}),
         ))?;
         render_messages(&responses, false);
+        first_result(responses)
+    }
+
+    fn eval_run(&mut self, manifest: &Path, run_id: &str) -> Result<Value, String> {
+        let id = self.next_request_id();
+        let mut params = json!({"manifest": manifest.to_string_lossy(), "runId": run_id});
+        if let Ok(output_root) = std::env::var(EVAL_OUTPUT_DIR_ENV) {
+            params["outputRoot"] = json!(output_root);
+        }
+        let responses =
+            self.request(JsonRpcMessage::request(Method::EvalRun, json!(id), params))?;
         first_result(responses)
     }
 

@@ -1,20 +1,33 @@
 use schemars::schema_for;
 use serde_json::Value;
 use singularity_protocol::{TraceEvent, TurnStartParams};
-use singularity_tools::ToolObservation;
+use singularity_tools::ToolResult;
 
 #[test]
-fn python_oracle_fixture_has_expected_safe_tool_observation_shape() {
+fn python_oracle_fixture_has_expected_safe_tool_result_shape() {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/rust_parity/python_oracle.json"
     ))
     .expect("parse python oracle fixture");
-    let payload = &fixture["tool_observation_model_payload"];
+    let payload = &fixture["tool_result_payload"];
+    let output = &fixture["tool_output"];
 
     assert_eq!(payload["tool_call_id"], "call_1");
+    assert_eq!(
+        output
+            .as_object()
+            .expect("tool output object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["content", "error_code", "metadata", "ok", "truncated"]
+    );
     assert!(payload.get("policy_decision_id").is_none());
     assert!(payload.get("approval_grant_id").is_none());
     assert!(payload.get("metadata").is_none());
+    assert!(output.get("tool_call_id").is_none());
+    assert!(output.get("tool_name").is_none());
+    assert!(output.get("status").is_none());
     assert!(
         !serde_json::to_string(payload)
             .unwrap()
@@ -23,10 +36,10 @@ fn python_oracle_fixture_has_expected_safe_tool_observation_shape() {
 }
 
 #[test]
-fn rust_protocol_and_observation_schemas_are_generated() {
+fn rust_protocol_and_tool_result_schemas_are_generated() {
     let turn_schema = schema_for!(TurnStartParams);
     let trace_schema = schema_for!(TraceEvent);
-    let observation_schema = schema_for!(ToolObservation);
+    let tool_result_schema = schema_for!(ToolResult);
 
     assert_eq!(
         turn_schema.schema.metadata.unwrap().title.unwrap(),
@@ -37,8 +50,8 @@ fn rust_protocol_and_observation_schemas_are_generated() {
         "TraceEvent"
     );
     assert_eq!(
-        observation_schema.schema.metadata.unwrap().title.unwrap(),
-        "ToolObservation"
+        tool_result_schema.schema.metadata.unwrap().title.unwrap(),
+        "ToolResult"
     );
 }
 

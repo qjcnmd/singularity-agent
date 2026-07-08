@@ -13,10 +13,11 @@ use singularity_protocol::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
 const DURABLE_LEDGER_SCHEMA_MIGRATION: &str = "0002_durable_ledger";
 const ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION: &str = "0003_active_sidecar_runs";
+const PENDING_TOOL_CALL_SCHEMA_MIGRATION: &str = "0004_pending_tool_calls";
 const REDACTED_ARTIFACT_VALUE: &str = "[redacted]";
 const SENSITIVE_ARTIFACT_MARKERS: [&str; 5] =
     ["api_key", "authorization", "password", "secret", "token"];
@@ -57,6 +58,14 @@ pub struct ActiveSidecarRun {
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RecordedApprovalDecision {
+    pub request: ApprovalRequest,
+    pub decision: ApprovalDecision,
+    pub pending_tool_call: Option<Value>,
+    pub trace: TraceEvent,
 }
 
 impl SessionStore {
@@ -138,6 +147,10 @@ impl SessionStore {
         }
         transaction.execute(
             "delete from active_sidecar_runs where thread_id = ?1",
+            params![thread_id],
+        )?;
+        transaction.execute(
+            "delete from pending_tool_calls where turn_id in (select turn_id from turns where thread_id = ?1)",
             params![thread_id],
         )?;
         transaction.execute(
@@ -343,6 +356,23 @@ impl SessionStore {
         Ok(item)
     }
 
+    pub fn get_turn_user_input(&self, turn_id: &str) -> StoreResult<Value> {
+        let payload: String = self
+            .connection
+            .query_row(
+                "select payload from items where turn_id = ?1 and kind = ?2 order by rowid limit 1",
+                params![turn_id, serde_json::to_string(&ItemKind::UserMessage)?],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("turn user input {turn_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
     pub fn append_trace(&self, event: &TraceEvent) -> StoreResult<()> {
         Self::insert_trace(&self.connection, event)?;
         Ok(())
@@ -426,8 +456,28 @@ impl SessionStore {
         component: &str,
         summary: &str,
     ) -> StoreResult<TraceEvent> {
+        self.create_approval_with_pending_tool_call_and_trace(request, None, component, summary)
+    }
+
+    pub fn create_approval_with_pending_tool_call_and_trace(
+        &self,
+        request: &ApprovalRequest,
+        pending_tool_call: Option<Value>,
+        component: &str,
+        summary: &str,
+    ) -> StoreResult<TraceEvent> {
         let transaction = self.connection.unchecked_transaction()?;
         insert_approval(&transaction, request)?;
+        if let Some(payload) = pending_tool_call {
+            transaction.execute(
+                "insert into pending_tool_calls(request_id, turn_id, payload) values(?1, ?2, ?3)",
+                params![
+                    request.request_id,
+                    request.task_id,
+                    serde_json::to_string(&payload)?
+                ],
+            )?;
+        }
         let trace = TraceEvent::new(
             format!("trace_{}", request.request_id),
             request.request_id.clone(),
@@ -452,6 +502,23 @@ impl SessionStore {
         Ok(approvals)
     }
 
+    pub fn get_pending_approval(&self, request_id: &str) -> StoreResult<ApprovalRequest> {
+        let payload: String = self
+            .connection
+            .query_row(
+                "select payload from approvals where request_id = ?1 and decision_outcome is null",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("approval {request_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
     pub fn list_approval_decisions(&self) -> StoreResult<Vec<ApprovalDecision>> {
         let mut statement = self
             .connection
@@ -469,7 +536,7 @@ impl SessionStore {
         decision: &ApprovalDecision,
         component: &str,
         summary: &str,
-    ) -> StoreResult<TraceEvent> {
+    ) -> StoreResult<RecordedApprovalDecision> {
         let transaction = self.connection.unchecked_transaction()?;
         let request_payload: String = transaction
             .query_row(
@@ -484,6 +551,15 @@ impl SessionStore {
                 other => StoreError::Sqlite(other),
             })?;
         let request: ApprovalRequest = serde_json::from_str(&request_payload)?;
+        let pending_tool_call = match transaction.query_row(
+            "select payload from pending_tool_calls where request_id = ?1",
+            params![decision.request_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(payload) => Some(serde_json::from_str(&payload)?),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(StoreError::Sqlite(error)),
+        };
         let changed = transaction.execute(
             "update approvals set decision_outcome = ?1, decision_reason = ?2 where request_id = ?3 and decision_outcome is null",
             params![
@@ -508,15 +584,19 @@ impl SessionStore {
                 serde_json::to_string(decision)?
             ],
         )?;
+        transaction.execute(
+            "delete from pending_tool_calls where request_id = ?1",
+            params![decision.request_id],
+        )?;
         let trace = TraceEvent::new(
             format!("trace_{}", decision.decision_id),
             request.session_id.clone(),
-            request.session_id,
+            request.session_id.clone(),
             component,
             summary,
         );
         let trace = TraceEvent {
-            task_id: Some(request.task_id),
+            task_id: Some(request.task_id.clone()),
             payload: serde_json::json!({
                 "request_id": decision.request_id,
                 "decision_id": decision.decision_id,
@@ -526,7 +606,12 @@ impl SessionStore {
         };
         Self::insert_trace(&transaction, &trace)?;
         transaction.commit()?;
-        Ok(trace)
+        Ok(RecordedApprovalDecision {
+            request,
+            decision: decision.clone(),
+            pending_tool_call,
+            trace,
+        })
     }
 
     pub fn get_approval_decision(&self, decision_id: &str) -> StoreResult<ApprovalDecision> {
@@ -745,6 +830,11 @@ impl SessionStore {
                 created_at text not null default current_timestamp,
                 updated_at text not null default current_timestamp
             );
+            create table if not exists pending_tool_calls(
+                request_id text primary key,
+                turn_id text not null,
+                payload text not null
+            );
             ",
         )?;
         self.ensure_trace_session_id_column()?;
@@ -759,6 +849,10 @@ impl SessionStore {
         self.connection.execute(
             "insert or ignore into schema_migrations(migration_id) values(?1)",
             params![ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION],
+        )?;
+        self.connection.execute(
+            "insert or ignore into schema_migrations(migration_id) values(?1)",
+            params![PENDING_TOOL_CALL_SCHEMA_MIGRATION],
         )?;
         Ok(())
     }

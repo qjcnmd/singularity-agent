@@ -10,13 +10,14 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let descriptor = store.descriptor();
 
     assert_eq!(descriptor.backend, "sqlite");
-    assert_eq!(descriptor.schema_version, 3);
+    assert_eq!(descriptor.schema_version, 4);
     assert_eq!(
         store.applied_migrations().expect("migrations"),
         vec![
             "0001_initial_session_store".to_string(),
             "0002_durable_ledger".to_string(),
-            "0003_active_sidecar_runs".to_string()
+            "0003_active_sidecar_runs".to_string(),
+            "0004_pending_tool_calls".to_string()
         ]
     );
     assert_eq!(
@@ -102,10 +103,13 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
         store.create_approval(&request).expect("approval");
         let decision = ApprovalDecision::new("approval_1", outcome, "operator decision");
 
-        let trace = store
+        let recorded = store
             .record_approval_decision(&decision, "approval", "approval decision recorded")
             .expect("decision");
+        let trace = recorded.trace;
 
+        assert_eq!(recorded.request, request);
+        assert_eq!(recorded.decision, decision);
         assert_eq!(trace.run_id, "session_1");
         assert_eq!(trace.session_id, "session_1");
         assert_eq!(trace.task_id.as_deref(), Some("task_1"));
@@ -136,6 +140,34 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
             Err(StoreError::NotFound(message)) if message == "approval approval_1"
         ));
     }
+}
+
+#[test]
+fn turn_user_input_can_be_read_for_native_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let payload = serde_json::json!([{"type": "text", "text": "resume this turn"}]);
+    let (turn, _item, _trace) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "blocked",
+            payload.clone(),
+            "app_server",
+            "turn started",
+        )
+        .expect("turn");
+
+    assert_eq!(
+        store
+            .get_turn_user_input(&turn.turn_id)
+            .expect("turn user input"),
+        payload
+    );
+    assert!(matches!(
+        store.get_turn_user_input("missing_turn"),
+        Err(StoreError::NotFound(message)) if message == "turn user input missing_turn"
+    ));
 }
 
 #[test]

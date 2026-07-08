@@ -35,14 +35,14 @@ FORBIDDEN_PYTHON_RUNTIME_NAMES = (
     "DesktopTransitionRuntime",
 )
 
-FORBIDDEN_TOOL_OBSERVATION_PAYLOAD_MARKERS = (
+FORBIDDEN_TOOL_RESULT_PAYLOAD_MARKERS = (
     "raw_response",
     "raw_prompt",
     "raw_arguments",
     "provider_response",
     "policy_decision_id",
     "approval_grant_id",
-    "internal_metadata",
+    "audit_metadata",
     "metadata",
     "api_key",
     "authorization",
@@ -51,10 +51,10 @@ FORBIDDEN_TOOL_OBSERVATION_PAYLOAD_MARKERS = (
     "token",
 )
 
-TOOL_OBSERVATION_INTERNAL_FIELDS = (
+TOOL_RESULT_INTERNAL_FIELDS = (
     "policy_decision_id",
     "approval_grant_id",
-    "internal_metadata",
+    "audit_metadata",
 )
 
 RUST_AGENT_HOST_DOC_MARKERS = (
@@ -62,7 +62,7 @@ RUST_AGENT_HOST_DOC_MARKERS = (
     "Rust owner after this stage",
     "Parity expectation",
     "Intentional divergence",
-    "AgentLoopStatusBridge",
+    "AgentRunStatus",
     "SessionStore.create_turn_with_input_and_trace",
 )
 
@@ -100,6 +100,9 @@ FORBIDDEN_SIDECAR_TRACE_MARKERS = (
     "token",
     "metadata",
 )
+STALE_TOOL_RESULT_TYPE_NAME = "Tool" + "Observation"
+STALE_CAPABILITY_FIELD = "missing" + "_boundaries"
+STALE_PLAN_FIELD = "merge" + "_requirements"
 
 
 def run_guard(repo_root: Path, *extra_args: str) -> subprocess.CompletedProcess[str]:
@@ -137,6 +140,8 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "docs/architecture/modules/rust-app-server-protocol.md",
         "docs/architecture/rust-agent-host.md",
         "scripts/verify_rust_cli_agent_host.py",
+        "scripts/export_rust_parity_fixtures.py",
+        "tests/fixtures/rust_parity/python_oracle.json",
     ):
         source = Path(relative)
         target = repo / relative
@@ -165,6 +170,44 @@ def test_guard_rejects_rust_agent_host_docs_without_logic_map_marker(tmp_path: P
     assert result.returncode == 1
     assert "rust-agent-host-docs-incomplete" in result.stderr
     assert marker in result.stderr
+
+
+@pytest.mark.parametrize(
+    "stale_name",
+    (STALE_CAPABILITY_FIELD, STALE_PLAN_FIELD, STALE_TOOL_RESULT_TYPE_NAME),
+    ids=("old_capability_field", "old_plan_field", "old_tool_result_type"),
+)
+def test_guard_rejects_stale_rust_migration_doc_names(tmp_path: Path, stale_name: str) -> None:
+    repo = copy_repo_slice(tmp_path)
+    docs = repo / "docs/architecture/modules/rust-app-server-protocol.md"
+    docs.write_text(docs.read_text(encoding="utf-8") + f"\n{stale_name}\n", encoding="utf-8")
+
+    result = run_guard(repo, "--changed-file", "docs/architecture/modules/rust-app-server-protocol.md")
+
+    assert result.returncode == 1
+    assert "rust-agent-host-stale-name" in result.stderr
+    assert stale_name in result.stderr
+
+
+@pytest.mark.parametrize(
+    "stale_name",
+    ("observation_id", "content_preview", "content_digest", "raw_result_ref"),
+)
+def test_guard_rejects_stale_rust_parity_fixture_tool_result_names(
+    tmp_path: Path, stale_name: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    fixture = repo / "tests/fixtures/rust_parity/python_oracle.json"
+    fixture.write_text(
+        fixture.read_text(encoding="utf-8") + f'\n{{"{stale_name}": "legacy"}}\n',
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo, "--changed-file", "tests/fixtures/rust_parity/python_oracle.json")
+
+    assert result.returncode == 1
+    assert "rust-parity-fixture-stale-tool-result-name" in result.stderr
+    assert stale_name in result.stderr
 
 
 @pytest.mark.parametrize("marker", TURN_LIFECYCLE_DOC_MARKERS)
@@ -315,6 +358,68 @@ def test_guard_rejects_relaxed_sandbox_process_execution(
     assert violation in result.stderr
 
 
+@pytest.mark.parametrize(
+    "marker",
+    (
+        "PROC_THREAD_ATTRIBUTE_HANDLE_LIST",
+        "COMMAND_SENSITIVE_PATH_DENIED",
+    ),
+)
+def test_guard_rejects_incomplete_windows_restricted_token_sandbox(
+    tmp_path: Path, marker: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    sandbox = repo / "crates/sandbox/src/lib.rs"
+    sandbox.write_text(sandbox.read_text(encoding="utf-8").replace(marker, ""), encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "windows-restricted-token-sandbox-incomplete" in result.stderr
+    assert marker in result.stderr
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
+        "std::process::Command",
+        "Command::new(\"python\")",
+        ".spawn()",
+    ),
+)
+def test_guard_rejects_tools_command_backend_host_process_spawn(
+    tmp_path: Path, marker: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    tools = repo / "crates/tools/src/lib.rs"
+    tools.write_text(tools.read_text(encoding="utf-8") + f"\n{marker}\n", encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "direct-tools-command-process-spawn" in result.stderr
+    assert "crates/tools/src/lib.rs" in result.stderr
+
+
+def test_guard_rejects_tools_command_backend_without_strict_capability_check(
+    tmp_path: Path,
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    tools = repo / "crates/tools/src/lib.rs"
+    tools.write_text(
+        tools.read_text(encoding="utf-8").replace(
+            "if !capabilities.supports_strict_command_execution()",
+            "if false",
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "tools-command-strict-capability-check-missing" in result.stderr
+
+
 def test_guard_rejects_handwritten_app_server_json_rpc_errors(tmp_path: Path) -> None:
     repo = copy_repo_slice(tmp_path)
     app_server = repo / "crates/app-server/src/main.rs"
@@ -426,15 +531,57 @@ def test_guard_rejects_missing_sidecar_resume_or_model_forwarding(
     assert violation in result.stderr
 
 
-def test_guard_rejects_no_sidecar_fake_agent_delta(tmp_path: Path) -> None:
+def test_guard_rejects_agent_delta_outside_terminal_projection(tmp_path: Path) -> None:
     repo = copy_repo_slice(tmp_path)
     app_server = repo / "crates/app-server/src/lib.rs"
-    app_server.write_text(app_server.read_text(encoding="utf-8") + '\nlet _ = "input accepted";\n', encoding="utf-8")
+    text = app_server.read_text(encoding="utf-8")
+    insertion = '        messages.push(AppEvent::item_agent_message_delta("item_fake".to_string(), "fake done".to_string()).to_notification().to_wire_value());\n'
+    app_server.write_text(
+        text.replace("        messages.extend(self.event_notification(AppEvent::turn_started(&turn)));\n", "        messages.extend(self.event_notification(AppEvent::turn_started(&turn)));\n" + insertion),
+        encoding="utf-8",
+    )
 
     result = run_guard(repo)
 
     assert result.returncode == 1
     assert "fake-agent-delta" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("run_status.status == AgentStatus::Completed", "true"),
+        (".filter(|answer| !answer.trim().is_empty())\n            ", ""),
+    ),
+)
+def test_guard_rejects_agent_delta_without_completed_non_empty_gate(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    app_server = repo / "crates/app-server/src/lib.rs"
+    app_server.write_text(app_server.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "fake-agent-delta" in result.stderr
+
+
+def test_guard_rejects_command_approval_resource_without_scope_normalization(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    agent = repo / "crates/agent/src/lib.rs"
+    agent.write_text(
+        agent.read_text(encoding="utf-8").replace(
+            "let resource =\n        command_scope_resource(&input.argv, &input.sandbox_mode(), &input.network_access());",
+            "let resource = fallback.to_string();",
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "command-approval-resource-drift" in result.stderr
 
 
 def test_guard_rejects_interrupt_that_updates_status_without_sidecar_cancel(tmp_path: Path) -> None:
@@ -548,15 +695,15 @@ def test_guard_rejects_unused_tokio_crate_dependency(tmp_path: Path, manifest_pa
     ("old", "new", "violation"),
     (
         ("pub struct AgentLoopCapability", "pub struct AgentLoopState", "native-agent-loop-capability-drift"),
-        ("available: false", "available: true", "native-agent-loop-status-drift"),
+        ("available: true", "available: false", "native-agent-loop-status-drift"),
         (
-            '"strict_command_sandbox"',
-            '"strict_sandbox_done"',
-            "native-agent-loop-blocker-drift",
+            "status: AgentStatus::Completed",
+            "status: AgentStatus::NotMigrated",
+            "native-agent-loop-status-drift",
         ),
         (
-            '"rust_evaluation_runner"',
-            '"rust_eval_done"',
+            "blockers: Vec::new()",
+            'blockers: vec!["approval_resume".to_string()]',
             "native-agent-loop-blocker-drift",
         ),
     ),
@@ -601,7 +748,7 @@ def test_guard_rejects_cli_native_path_without_partial_capability_gate(tmp_path:
     (
         ("NATIVE_AGENT_LOOP_NOT_READY", "NATIVE_AGENT_LOOP_DELAYED"),
         (
-            "capability.available && capability.missing_boundaries.is_empty()",
+            "capability.available && capability.blockers.is_empty()",
             "capability.available",
         ),
     ),
@@ -620,24 +767,24 @@ def test_guard_rejects_app_server_native_path_without_partial_capability_gate(
 
 
 @pytest.mark.parametrize("marker", FORBIDDEN_SIDECAR_TRACE_MARKERS)
-def test_guard_rejects_sidecar_trace_projection_leaks(tmp_path: Path, marker: str) -> None:
+def test_guard_rejects_sidecar_trace_payload_leaks(tmp_path: Path, marker: str) -> None:
     repo = copy_repo_slice(tmp_path)
     agent = repo / "crates/agent/src/lib.rs"
     text = agent.read_text(encoding="utf-8")
     agent.write_text(
-        text.replace('"trace_path": bridge.trace_path,', f'"trace_path": bridge.trace_path,\n        "{marker}": "leak",'),
+        text.replace('"trace_path": run_status.trace_path,', f'"trace_path": run_status.trace_path,\n        "{marker}": "leak",'),
         encoding="utf-8",
     )
 
     result = run_guard(repo)
 
     assert result.returncode == 1
-    assert "sidecar-trace-projection-leak" in result.stderr
+    assert "sidecar-trace-payload-leak" in result.stderr
     assert marker in result.stderr
 
 
-@pytest.mark.parametrize("marker", FORBIDDEN_TOOL_OBSERVATION_PAYLOAD_MARKERS)
-def test_guard_rejects_tool_observation_model_payload_leaks(tmp_path: Path, marker: str) -> None:
+@pytest.mark.parametrize("marker", FORBIDDEN_TOOL_RESULT_PAYLOAD_MARKERS)
+def test_guard_rejects_tool_result_payload_leaks(tmp_path: Path, marker: str) -> None:
     repo = copy_repo_slice(tmp_path)
     tools = repo / "crates/tools/src/lib.rs"
     text = tools.read_text(encoding="utf-8")
@@ -649,12 +796,12 @@ def test_guard_rejects_tool_observation_model_payload_leaks(tmp_path: Path, mark
     result = run_guard(repo)
 
     assert result.returncode == 1
-    assert "tool-observation-model-leak" in result.stderr
+    assert "tool-result-model-leak" in result.stderr
     assert marker in result.stderr
 
 
-@pytest.mark.parametrize("field", TOOL_OBSERVATION_INTERNAL_FIELDS)
-def test_guard_rejects_serialized_tool_observation_internal_fields(tmp_path: Path, field: str) -> None:
+@pytest.mark.parametrize("field", TOOL_RESULT_INTERNAL_FIELDS)
+def test_guard_rejects_serialized_tool_result_internal_fields(tmp_path: Path, field: str) -> None:
     repo = copy_repo_slice(tmp_path)
     tools = repo / "crates/tools/src/lib.rs"
     text = tools.read_text(encoding="utf-8")
@@ -663,5 +810,5 @@ def test_guard_rejects_serialized_tool_observation_internal_fields(tmp_path: Pat
     result = run_guard(repo)
 
     assert result.returncode == 1
-    assert "tool-observation-internal-field-serialized" in result.stderr
+    assert "tool-result-internal-field-serialized" in result.stderr
     assert field in result.stderr

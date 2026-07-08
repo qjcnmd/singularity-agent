@@ -3,11 +3,18 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singularity_core::contains_sensitive_text;
+pub use singularity_sandbox::{
+    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
+    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
+    WindowsRestrictedTokenSandboxBackend, command_permission_resource,
+};
 
 const TOOL_PROTOCOL_VERSION: &str = "1.0";
 const DEFAULT_TOOL_VERSION: &str = "0.0.1";
@@ -15,13 +22,17 @@ const REDACTED_TOOL_OUTPUT: &str = "[redacted sensitive tool output]";
 const UNKNOWN_TOOL_ERROR: &str = "unknown_tool";
 const TOOL_DENIED_ERROR: &str = "tool_denied";
 const TOOL_APPROVAL_REQUIRED_ERROR: &str = "approval_required";
+const TOOL_SANDBOX_UNAVAILABLE_ERROR: &str = "sandbox_unavailable";
 const WORKSPACE_MUTATION_NOT_APPROVED: &str = "workspace mutation requires allowed tool decision";
 const DEFAULT_READ_MAX_CHARS: usize = 8_192;
 const DEFAULT_LIST_MAX_ENTRIES: usize = 200;
 const DEFAULT_GREP_MAX_MATCHES: usize = 200;
 const LARGE_OUTPUT_ARTIFACT_THRESHOLD: usize = 4_096;
-const DEFAULT_OBSERVATION_PREVIEW_MAX_CHARS: usize = 4_096;
+const DEFAULT_RESULT_PREVIEW_MAX_CHARS: usize = 4_096;
 const BINARY_CONTENT_PREVIEW: &str = "[binary content omitted]";
+const DIGEST_PREFIX: &str = "hash:";
+const FNV64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV64_PRIME: u64 = 0x100000001b3;
 const DIFF_ARTIFACT_PREFIX: &str = "artifact://diff/";
 const RESULT_ARTIFACT_PREFIX: &str = "artifact://result/";
 const PROTECTED_PATH_EXACT_MARKERS: [&str; 13] = [
@@ -47,6 +58,7 @@ const PROMPT_INJECTION_MARKERS: [&str; 4] = [
     "reveal hidden",
     "system prompt",
 ];
+static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -83,10 +95,10 @@ impl ToolSpec {
         }
     }
 
-    pub fn to_model_spec_payload(&self) -> Value {
+    pub fn to_schema_payload(&self) -> Value {
         json!({
             "name": self.name,
-            "description": redact_model_visible_text(&self.description),
+            "description": redact_public_text(&self.description),
             "input_schema": self.input_schema,
         })
     }
@@ -111,10 +123,10 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
-    pub fn model_visible_specs(&self) -> Vec<Value> {
+    pub fn schema_payloads(&self) -> Vec<Value> {
         self.tools
             .values()
-            .map(ToolSpec::to_model_spec_payload)
+            .map(ToolSpec::to_schema_payload)
             .collect::<Vec<_>>()
     }
 }
@@ -144,15 +156,6 @@ impl ToolBrokerDecision {
 
     pub fn is_allowed(&self) -> bool {
         matches!(self, Self::Allow | Self::Approved { .. })
-    }
-
-    pub fn allows_protected_path(&self) -> bool {
-        matches!(
-            self,
-            Self::Approved {
-                approval_grant_id
-            } if !approval_grant_id.trim().is_empty()
-        )
     }
 
     pub fn approved(approval_grant_id: impl Into<String>) -> Self {
@@ -187,42 +190,38 @@ impl ToolBroker {
         self.registry.get(name)
     }
 
-    pub fn model_visible_tools(&self) -> Vec<Value> {
-        self.registry.model_visible_specs()
+    pub fn tool_schema_payloads(&self) -> Vec<Value> {
+        self.registry.schema_payloads()
     }
 
     pub fn execute<F>(
         &self,
-        envelope: &ToolCallEnvelope,
+        envelope: &ToolCallRequest,
         decision: ToolBrokerDecision,
         executor: F,
-    ) -> ToolObservation
+    ) -> ToolResult
     where
-        F: FnOnce(&ToolCallEnvelope) -> ToolResult,
+        F: FnOnce(&ToolCallRequest) -> ToolOutput,
     {
         if self.registry.get(&envelope.tool_name).is_none() {
-            return ToolObservation::failed(envelope, UNKNOWN_TOOL_ERROR, "tool is not registered");
+            return ToolResult::failed(envelope, UNKNOWN_TOOL_ERROR, "tool is not registered");
         }
         if let ToolBrokerDecision::Deny { reason } = decision {
-            return ToolObservation::failed(envelope, TOOL_DENIED_ERROR, reason);
+            return ToolResult::failed(envelope, TOOL_DENIED_ERROR, reason);
         }
         if let ToolBrokerDecision::Ask {
             approval_request_id,
             reason,
         } = decision
         {
-            return ToolObservation::approval_required(envelope, approval_request_id, reason);
+            return ToolResult::approval_required(envelope, approval_request_id, reason);
         }
-        ToolObservation::from_result(
-            envelope,
-            &executor(envelope),
-            ToolObservationVisibility::Summary,
-        )
+        ToolResult::from_result(envelope, &executor(envelope), ToolResultView::Summary)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ToolCallEnvelope {
+pub struct ToolCallRequest {
     pub protocol_version: String,
     pub run_id: String,
     pub session_id: String,
@@ -232,7 +231,7 @@ pub struct ToolCallEnvelope {
     pub raw_arguments: String,
 }
 
-impl ToolCallEnvelope {
+impl ToolCallRequest {
     pub fn new(
         run_id: impl Into<String>,
         session_id: impl Into<String>,
@@ -254,7 +253,7 @@ impl ToolCallEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ToolResult {
+pub struct ToolOutput {
     pub ok: bool,
     pub content: Value,
     pub error_code: Option<String>,
@@ -262,7 +261,7 @@ pub struct ToolResult {
     pub metadata: Value,
 }
 
-impl ToolResult {
+impl ToolOutput {
     pub fn success(content: Value) -> Self {
         Self {
             ok: true,
@@ -286,24 +285,24 @@ impl ToolResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolObservationVisibility {
+pub enum ToolResultView {
     Summary,
     ReferenceOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ToolObservation {
+pub struct ToolResult {
     pub tool_call_id: String,
     pub tool_name: String,
     pub ok: bool,
     pub status: String,
-    pub visibility: ToolObservationVisibility,
-    pub content_preview: String,
-    pub content_digest: String,
-    pub result_ref: Option<String>,
+    pub view: ToolResultView,
+    pub preview: String,
+    pub digest: String,
+    pub artifact_ref: Option<String>,
     pub error_code: Option<String>,
-    pub reference_ids: Vec<String>,
-    pub observation_id: Option<String>,
+    pub artifact_refs: Vec<String>,
+    pub result_id: Option<String>,
     pub approval_request_id: Option<String>,
     pub truncated: bool,
     pub redacted: bool,
@@ -312,39 +311,39 @@ pub struct ToolObservation {
     #[serde(skip)]
     approval_grant_id: Option<String>,
     #[serde(skip)]
-    internal_metadata: Option<Value>,
+    audit_metadata: Option<Value>,
 }
 
-impl ToolObservation {
+impl ToolResult {
     pub fn summary(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
         ok: bool,
-        content_preview: impl Into<String>,
-        content_digest: impl Into<String>,
+        preview: impl Into<String>,
+        digest: impl Into<String>,
     ) -> Self {
         Self {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             ok,
             status: if ok { "ok" } else { "error" }.to_string(),
-            visibility: ToolObservationVisibility::Summary,
-            content_preview: content_preview.into(),
-            content_digest: content_digest.into(),
-            result_ref: None,
+            view: ToolResultView::Summary,
+            preview: preview.into(),
+            digest: digest.into(),
+            artifact_ref: None,
             error_code: None,
-            reference_ids: Vec::new(),
-            observation_id: None,
+            artifact_refs: Vec::new(),
+            result_id: None,
             approval_request_id: None,
             truncated: false,
             redacted: true,
             policy_decision_id: None,
             approval_grant_id: None,
-            internal_metadata: None,
+            audit_metadata: None,
         }
     }
 
-    pub fn with_internal_metadata(
+    pub fn with_audit_metadata(
         mut self,
         policy_decision_id: impl Into<String>,
         approval_grant_id: impl Into<String>,
@@ -352,36 +351,43 @@ impl ToolObservation {
     ) -> Self {
         self.policy_decision_id = Some(policy_decision_id.into());
         self.approval_grant_id = Some(approval_grant_id.into());
-        self.internal_metadata = Some(metadata);
+        self.audit_metadata = Some(metadata);
         self
     }
 
     pub fn from_result(
-        envelope: &ToolCallEnvelope,
-        result: &ToolResult,
-        visibility: ToolObservationVisibility,
+        envelope: &ToolCallRequest,
+        result: &ToolOutput,
+        view: ToolResultView,
     ) -> Self {
         let result_content = result.content.to_string();
-        let (content_preview, preview_truncated) =
-            bounded_text(&result_content, DEFAULT_OBSERVATION_PREVIEW_MAX_CHARS);
-        Self {
-            visibility,
+        let (preview, preview_truncated) =
+            bounded_text(&result_content, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
+        let artifact_ref = result_artifact_ref(&result.content, &result.metadata);
+        let artifact_refs = result_artifact_refs(&result.content, &result.metadata);
+        let result_id = result_id(&result.content, &result.metadata);
+        let mut tool_result = Self {
+            view,
             error_code: result.error_code.clone(),
             truncated: result.truncated || preview_truncated,
             ..Self::summary(
                 envelope.tool_call_id.clone(),
                 envelope.tool_name.clone(),
                 result.ok,
-                content_preview,
-                "",
+                preview,
+                stable_digest(&result.content),
             )
-        }
+        };
+        tool_result.artifact_ref = artifact_ref;
+        tool_result.artifact_refs = artifact_refs;
+        tool_result.result_id = result_id;
+        tool_result
     }
 
     pub fn failed(
-        envelope: &ToolCallEnvelope,
+        envelope: &ToolCallRequest,
         error_code: impl Into<String>,
-        content_preview: impl Into<String>,
+        preview: impl Into<String>,
     ) -> Self {
         Self {
             error_code: Some(error_code.into()),
@@ -389,14 +395,14 @@ impl ToolObservation {
                 envelope.tool_call_id.clone(),
                 envelope.tool_name.clone(),
                 false,
-                content_preview,
+                preview,
                 "",
             )
         }
     }
 
     pub fn approval_required(
-        envelope: &ToolCallEnvelope,
+        envelope: &ToolCallRequest,
         approval_request_id: impl Into<String>,
         reason: impl Into<String>,
     ) -> Self {
@@ -406,36 +412,102 @@ impl ToolObservation {
         }
     }
 
-    pub fn to_model_payload(&self) -> Value {
-        let content_preview = redact_model_visible_text(&self.content_preview);
+    pub fn to_message_payload(&self) -> Value {
+        let preview = redact_public_text(&self.preview);
+        let artifact_ref = self.artifact_ref.as_deref().and_then(safe_reference);
+        let artifact_refs = self
+            .artifact_refs
+            .iter()
+            .filter_map(|value| safe_reference(value))
+            .collect::<Vec<_>>();
+        let result_id = self.result_id.as_deref().and_then(safe_reference);
         let mut payload = json!({
             "ok": self.ok,
             "tool_name": self.tool_name,
             "tool_call_id": self.tool_call_id,
             "status": self.status,
-            "content_digest": self.content_digest,
-            "result_ref": self.result_ref,
+            "digest": self.digest,
+            "artifact_ref": artifact_ref,
             "error_code": self.error_code,
-            "reference_ids": self.reference_ids,
-            "observation_id": self.observation_id,
+            "artifact_refs": artifact_refs,
+            "result_id": result_id,
             "truncated": self.truncated,
             "redacted": self.redacted,
         });
         if let Some(approval_request_id) = &self.approval_request_id {
             payload["approval_request_id"] = json!(approval_request_id);
         }
-        if self.visibility != ToolObservationVisibility::ReferenceOnly {
-            payload["content"] = json!(content_preview);
-            payload["content_preview"] = json!(content_preview);
+        if self.view != ToolResultView::ReferenceOnly {
+            payload["content"] = json!(preview);
+            payload["preview"] = json!(preview);
         }
         payload
     }
+}
+
+fn result_artifact_ref(content: &Value, metadata: &Value) -> Option<String> {
+    value_string(content.get("artifact_ref"))
+        .or_else(|| value_string(content.get("diff_ref")))
+        .or_else(|| value_string(metadata.get("artifact_ref")))
+        .or_else(|| value_string(metadata.get("diff_ref")))
+}
+
+fn result_artifact_refs(content: &Value, metadata: &Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    refs.extend(value_string(content.get("artifact_ref")));
+    refs.extend(value_string(content.get("diff_ref")));
+    refs.extend(value_string(metadata.get("artifact_ref")));
+    refs.extend(value_string(metadata.get("diff_ref")));
+    refs.extend(value_string_array(content.get("artifact_refs")));
+    refs.extend(value_string_array(metadata.get("artifact_refs")));
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn result_id(content: &Value, metadata: &Value) -> Option<String> {
+    value_string(metadata.get("result_id"))
+        .or_else(|| value_string(content.get("result_id")))
+        .or_else(|| value_string(metadata.get("output_digest")))
+        .or_else(|| value_string(content.get("output_digest")))
+}
+
+fn value_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn safe_reference(value: &str) -> Option<String> {
+    let lowered = value.to_ascii_lowercase();
+    if contains_sensitive_text(value)
+        || PROMPT_INJECTION_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker))
+    {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn value_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceToolError {
     OutsideWorkspace(String),
     ProtectedPath(String),
+    SandboxUnavailable,
     BinaryPattern,
     ReadFailed(String),
     ExpectedContentMissing(String),
@@ -449,6 +521,7 @@ impl fmt::Display for WorkspaceToolError {
             Self::ProtectedPath(path) => {
                 write!(formatter, "protected path requires approval: {path}")
             }
+            Self::SandboxUnavailable => write!(formatter, "strict sandbox backend unavailable"),
             Self::BinaryPattern => write!(formatter, "grep pattern must be valid utf-8 text"),
             Self::ReadFailed(message) => write!(formatter, "workspace tool read failed: {message}"),
             Self::ExpectedContentMissing(path) => {
@@ -501,27 +574,50 @@ pub struct WorkspacePatchChange {
     pub replacement: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkspaceTools {
     workspace_root: PathBuf,
+    sandbox_backend: Option<Arc<dyn SandboxBackend + Send + Sync>>,
+}
+
+impl fmt::Debug for WorkspaceTools {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceTools")
+            .field("workspace_root", &self.workspace_root)
+            .field(
+                "sandbox_backend",
+                &self.sandbox_backend.as_ref().map(|backend| backend.name()),
+            )
+            .finish()
+    }
 }
 
 impl WorkspaceTools {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            sandbox_backend: None,
         }
     }
 
-    pub fn read(&self, input: ReadToolInput) -> Result<ToolResult, WorkspaceToolError> {
+    pub fn with_sandbox_backend(
+        mut self,
+        sandbox_backend: impl SandboxBackend + Send + Sync + 'static,
+    ) -> Self {
+        self.sandbox_backend = Some(Arc::new(sandbox_backend));
+        self
+    }
+
+    pub fn read(&self, input: ReadToolInput) -> Result<ToolOutput, WorkspaceToolError> {
         let target = self.resolve_workspace_path(&input.path, false)?;
         let bytes = std::fs::read(&target).map_err(io_error)?;
         let relative = self.relative_path(&target);
         if is_binary(&bytes) {
-            return Ok(ToolResult::success(json!({
+            return Ok(ToolOutput::success(json!({
                 "path": relative,
                 "binary": true,
-                "content_preview": BINARY_CONTENT_PREVIEW,
+                "preview": BINARY_CONTENT_PREVIEW,
                 "truncated": true,
                 "artifact_ref": artifact_ref(RESULT_ARTIFACT_PREFIX, &relative),
             })));
@@ -531,10 +627,10 @@ impl WorkspaceTools {
         })?;
         let max_chars = input.max_chars.unwrap_or(DEFAULT_READ_MAX_CHARS);
         let (preview, truncated) = bounded_text(&content, max_chars);
-        Ok(ToolResult::success(json!({
+        Ok(ToolOutput::success(json!({
             "path": relative,
             "binary": false,
-            "content_preview": preview,
+            "preview": preview,
             "truncated": truncated,
             "artifact_ref": if truncated || content.len() > LARGE_OUTPUT_ARTIFACT_THRESHOLD {
                 Value::String(artifact_ref(RESULT_ARTIFACT_PREFIX, &relative))
@@ -544,7 +640,7 @@ impl WorkspaceTools {
         })))
     }
 
-    pub fn list(&self, input: ListToolInput) -> Result<ToolResult, WorkspaceToolError> {
+    pub fn list(&self, input: ListToolInput) -> Result<ToolOutput, WorkspaceToolError> {
         let target = self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), true)?;
         let mut entries = Vec::new();
         let mut redacted_entries = 0usize;
@@ -553,7 +649,7 @@ impl WorkspaceTools {
             let entry = entry.map_err(io_error)?;
             let path = entry.path();
             let relative = self.relative_path(&path);
-            if is_protected_relative(&relative) {
+            if is_protected_path(&relative) {
                 redacted_entries += 1;
                 continue;
             }
@@ -565,14 +661,14 @@ impl WorkspaceTools {
                 break;
             }
         }
-        Ok(ToolResult::success(json!({
+        Ok(ToolOutput::success(json!({
             "entries": entries,
             "redacted_entries": redacted_entries,
             "truncated": entries.len() >= max_entries,
         })))
     }
 
-    pub fn grep(&self, input: GrepToolInput) -> Result<ToolResult, WorkspaceToolError> {
+    pub fn grep(&self, input: GrepToolInput) -> Result<ToolOutput, WorkspaceToolError> {
         if input.pattern.is_empty() {
             return Err(WorkspaceToolError::InvalidInput(
                 "pattern must not be empty".to_string(),
@@ -584,7 +680,7 @@ impl WorkspaceTools {
         let mut matches = Vec::new();
         self.grep_path(&root, &input.pattern, max_matches, &mut matches)?;
         let truncated = matches.len() >= max_matches;
-        Ok(ToolResult::success(json!({
+        Ok(ToolOutput::success(json!({
             "matches": matches,
             "truncated": truncated,
         })))
@@ -594,7 +690,7 @@ impl WorkspaceTools {
         &self,
         input: EditToolInput,
         decision: &ToolBrokerDecision,
-    ) -> Result<ToolResult, WorkspaceToolError> {
+    ) -> Result<ToolOutput, WorkspaceToolError> {
         self.patch(
             WorkspacePatch {
                 changes: vec![WorkspacePatchChange {
@@ -611,7 +707,7 @@ impl WorkspaceTools {
         &self,
         patch: WorkspacePatch,
         decision: &ToolBrokerDecision,
-    ) -> Result<ToolResult, WorkspaceToolError> {
+    ) -> Result<ToolOutput, WorkspaceToolError> {
         if !decision.is_allowed() {
             return Err(WorkspaceToolError::InvalidInput(
                 WORKSPACE_MUTATION_NOT_APPROVED.to_string(),
@@ -624,8 +720,7 @@ impl WorkspaceTools {
         }
         let mut prepared = Vec::new();
         for change in &patch.changes {
-            let target =
-                self.resolve_workspace_path(&change.path, decision.allows_protected_path())?;
+            let target = self.resolve_workspace_path(&change.path, false)?;
             let relative = self.relative_path(&target);
             let original = existing_text_or_empty(&target)?;
             let updated = if let Some(expected) = &change.expected {
@@ -659,11 +754,36 @@ impl WorkspaceTools {
             .iter()
             .map(|(_path, relative, _original, _updated)| relative.clone())
             .collect::<Vec<_>>();
-        Ok(ToolResult::success(json!({
+        Ok(ToolOutput::success(json!({
             "changed_files": changed_files,
             "diff_ref": artifact_ref(DIFF_ARTIFACT_PREFIX, &changed_files.join(",")),
             "rolled_back": false,
         })))
+    }
+
+    pub fn command(&self, input: CommandToolInput) -> Result<ToolOutput, WorkspaceToolError> {
+        let Some(backend) = &self.sandbox_backend else {
+            return Err(WorkspaceToolError::SandboxUnavailable);
+        };
+        let capabilities = backend.capabilities();
+        if !capabilities.supports_strict_command_execution() {
+            return Err(WorkspaceToolError::SandboxUnavailable);
+        }
+        let filesystem_mode = input.sandbox_mode();
+        let network_mode = input.network_access();
+        let mut request = CommandRequest::project_verification(
+            next_command_id(),
+            input.argv,
+            input.cwd.unwrap_or_else(|| ".".to_string()),
+            self.workspace_root.to_string_lossy().into_owned(),
+        );
+        request.filesystem.mode = filesystem_mode;
+        request.network.mode = network_mode;
+        if let Some(timeout_seconds) = input.timeout_seconds {
+            request.timeout_seconds = timeout_seconds;
+        }
+        let result = backend.execute(&request);
+        Ok(command_tool_output(result))
     }
 
     fn grep_path(
@@ -683,7 +803,7 @@ impl WorkspaceTools {
         }
         let root = resolved.as_path();
         let relative = self.relative_path(root);
-        if is_protected_relative(&relative) {
+        if is_protected_path(&relative) {
             return Ok(());
         }
         if root.is_dir() {
@@ -749,7 +869,7 @@ impl WorkspaceTools {
             .to_string_lossy()
             .replace('\\', "/");
         if !allow_protected
-            && (is_protected_relative(&relative) || is_protected_relative(&intended_relative))
+            && (is_protected_path(&relative) || is_protected_path(&intended_relative))
         {
             return Err(WorkspaceToolError::ProtectedPath(intended_relative));
         }
@@ -768,6 +888,50 @@ impl WorkspaceTools {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CommandToolInput {
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub sandbox_mode: Option<SandboxFilesystemMode>,
+    pub network_access: Option<SandboxNetworkMode>,
+}
+
+impl CommandToolInput {
+    pub fn sandbox_mode(&self) -> SandboxFilesystemMode {
+        self.sandbox_mode
+            .clone()
+            .unwrap_or(SandboxFilesystemMode::ReadOnly)
+    }
+
+    pub fn network_access(&self) -> SandboxNetworkMode {
+        self.network_access
+            .clone()
+            .unwrap_or(SandboxNetworkMode::Denied)
+    }
+}
+
+pub fn command_scope_resource(
+    argv: &[String],
+    sandbox_mode: &SandboxFilesystemMode,
+    network_access: &SandboxNetworkMode,
+) -> String {
+    let command = command_permission_resource(argv);
+    if command.is_empty() {
+        String::new()
+    } else {
+        let sandbox = serde_json::to_value(sandbox_mode)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{sandbox_mode:?}"));
+        let network = serde_json::to_value(network_access)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{network_access:?}"));
+        format!("command:{command};sandbox:{sandbox};network:{network}")
+    }
+}
+
 fn validate_tool_name(name: &str) -> Result<(), String> {
     let parts = name.split('.').collect::<Vec<_>>();
     if parts.iter().any(|part| part.is_empty()) {
@@ -783,7 +947,7 @@ fn validate_tool_name(name: &str) -> Result<(), String> {
     }
 }
 
-fn redact_model_visible_text(text: &str) -> String {
+fn redact_public_text(text: &str) -> String {
     let lowered = text.to_ascii_lowercase();
     if contains_sensitive_text(text)
         || PROMPT_INJECTION_MARKERS
@@ -832,7 +996,7 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, WorkspaceTool
     Ok(normalize_path(&resolved))
 }
 
-fn is_protected_relative(path: &str) -> bool {
+pub fn is_protected_path(path: &str) -> bool {
     path.replace('\\', "/")
         .split('/')
         .map(str::to_ascii_lowercase)
@@ -863,6 +1027,15 @@ fn bounded_text(content: &str, max_chars: usize) -> (String, bool) {
     let preview = content.chars().take(max_chars).collect::<String>();
     let truncated = content.chars().count() > preview.chars().count();
     (preview, truncated)
+}
+
+fn stable_digest(value: &Value) -> String {
+    let mut digest = FNV64_OFFSET_BASIS;
+    for byte in value.to_string().as_bytes() {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(FNV64_PRIME);
+    }
+    format!("{DIGEST_PREFIX}{digest:016x}")
 }
 
 fn artifact_ref(prefix: &str, path: &str) -> String {
@@ -905,4 +1078,40 @@ fn rollback_originals(originals: &[(PathBuf, String, String, bool)]) {
 
 fn io_error(error: std::io::Error) -> WorkspaceToolError {
     WorkspaceToolError::ReadFailed(error.to_string())
+}
+
+fn next_command_id() -> String {
+    let sequence = COMMAND_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("command_{sequence}")
+}
+
+fn command_tool_output(result: CommandResult) -> ToolOutput {
+    let ok = result.execution_status == CommandExecutionStatus::Completed
+        && result.semantic_status == CommandSemanticStatus::Succeeded;
+    let content = serde_json::to_value(&result).expect("command result serializes");
+    if ok {
+        ToolOutput::success(content)
+    } else {
+        ToolOutput::failure(command_error_code(&result), content)
+    }
+}
+
+fn command_error_code(result: &CommandResult) -> &'static str {
+    match result.execution_status {
+        CommandExecutionStatus::PolicyDenied => "command_policy_denied",
+        CommandExecutionStatus::ReviewRequired => "command_review_required",
+        CommandExecutionStatus::Unsupported => "command_unsupported",
+        CommandExecutionStatus::SpawnFailed => "command_spawn_failed",
+        CommandExecutionStatus::TimedOut => "command_timed_out",
+        CommandExecutionStatus::BackendError => TOOL_SANDBOX_UNAVAILABLE_ERROR,
+        CommandExecutionStatus::Completed => match result.semantic_status {
+            CommandSemanticStatus::Succeeded => "command_succeeded",
+            CommandSemanticStatus::ExitNonzero => "command_exit_nonzero",
+            CommandSemanticStatus::TestsFailed => "command_tests_failed",
+            CommandSemanticStatus::BuildFailed => "command_build_failed",
+            CommandSemanticStatus::PolicyBlocked => "command_policy_blocked",
+            CommandSemanticStatus::Unsupported => "command_unsupported",
+            CommandSemanticStatus::TimedOut => "command_timed_out",
+        },
+    }
 }

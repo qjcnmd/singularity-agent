@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -11,13 +12,14 @@ use thiserror::Error;
 
 const DEFAULT_MAX_TOOL_CALLS: u32 = 8;
 const DEFAULT_MAX_RETRIES: u32 = 2;
-const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
+pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 const STREAM_EVENT_PREFIX: &str = "stream_event";
 const ENV_PROVIDER: &str = "SINGULARITY_MODEL_PROVIDER";
 const ENV_MODEL: &str = "SINGULARITY_MODEL";
 const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";
 const ENV_API_KEY: &str = "SINGULARITY_API_KEY";
+const PROJECT_ENV_FILE: &str = ".env";
 const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
@@ -27,6 +29,8 @@ const HTTP_STATUS_FORBIDDEN: u16 = 403;
 const HTTP_STATUS_NOT_FOUND: u16 = 404;
 const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
+const BUILTIN_TOOL_PREFIX: &str = "builtin.";
+const TOOL_NAME_FALLBACK: &str = "tool";
 
 const PERMISSION_DENIED_MARKERS: [&str; 4] = [
     "winerror 10013",
@@ -66,6 +70,8 @@ pub struct ModelMessage {
     pub content: Vec<ContentBlock>,
     pub name: Option<String>,
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ModelToolCall>,
     pub metadata: Value,
 }
 
@@ -76,6 +82,18 @@ impl ModelMessage {
             content: vec![ContentBlock::text(content)],
             name: None,
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            metadata: json!({}),
+        }
+    }
+
+    pub fn assistant_tool_calls(tool_calls: Vec<ModelToolCall>) -> Self {
+        Self {
+            role: ModelRole::Assistant,
+            content: Vec::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls,
             metadata: json!({}),
         }
     }
@@ -638,7 +656,7 @@ impl OpenAiProviderConfig {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let provider_name = value_from_env(&mut get_env, ENV_PROVIDER)
+        let provider_name = value_from_env_or_project_env(&mut get_env, ENV_PROVIDER)
             .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string());
         let model_name = required_env_value(&mut get_env, ENV_MODEL)?;
         let base_url = required_env_value(&mut get_env, ENV_BASE_URL)?;
@@ -790,10 +808,10 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     ModelProviderConfig {
-        provider_name: value_from_env(&mut get_env, ENV_PROVIDER),
-        model_name: value_from_env(&mut get_env, ENV_MODEL),
-        base_url_present: value_from_env(&mut get_env, ENV_BASE_URL).is_some(),
-        api_key_present: value_from_env(&mut get_env, ENV_API_KEY).is_some(),
+        provider_name: value_from_env_or_project_env(&mut get_env, ENV_PROVIDER),
+        model_name: value_from_env_or_project_env(&mut get_env, ENV_MODEL),
+        base_url_present: value_from_env_or_project_env(&mut get_env, ENV_BASE_URL).is_some(),
+        api_key_present: value_from_env_or_project_env(&mut get_env, ENV_API_KEY).is_some(),
     }
 }
 
@@ -831,7 +849,7 @@ fn openai_request_payload(request: &ModelTurnRequest, model_name: &str) -> Value
                 .map(openai_tool_payload)
                 .collect::<Vec<_>>()
         );
-        payload["tool_choice"] = openai_tool_choice_payload(&request.tool_choice);
+        payload["tool_choice"] = openai_tool_choice_payload(request);
     }
     payload
 }
@@ -843,37 +861,88 @@ fn openai_message_payload(message: &ModelMessage) -> Value {
         .unwrap_or_else(|| "user".to_string());
     let mut payload = json!({
         "role": role,
-        "content": message_text(message),
+        "content": openai_message_content(message),
     });
     if let Some(name) = &message.name {
-        payload["name"] = json!(name);
+        payload["name"] = json!(openai_wire_tool_name(name));
     }
     if let Some(tool_call_id) = &message.tool_call_id {
         payload["tool_call_id"] = json!(tool_call_id);
     }
+    if !message.tool_calls.is_empty() {
+        payload["tool_calls"] = json!(
+            message
+                .tool_calls
+                .iter()
+                .map(openai_tool_call_payload)
+                .collect::<Vec<_>>()
+        );
+    }
     payload
+}
+
+fn openai_message_content(message: &ModelMessage) -> Value {
+    let text = message_text(message);
+    if message.role == ModelRole::Assistant && !message.tool_calls.is_empty() && text.is_empty() {
+        Value::Null
+    } else {
+        json!(text)
+    }
+}
+
+fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
+    json!({
+        "id": tool_call.tool_call_id,
+        "type": "function",
+        "function": {
+            "name": openai_wire_tool_name(&tool_call.tool_name),
+            "arguments": tool_call.raw_arguments,
+        }
+    })
 }
 
 fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": tool.name,
+            "name": openai_wire_tool_name(&tool.name),
             "description": tool.description,
             "parameters": tool.parameters_schema,
         }
     })
 }
 
-fn openai_tool_choice_payload(tool_choice: &ToolChoicePolicy) -> Value {
-    match tool_choice.mode {
+fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Value {
+    match request.tool_choice.mode {
         ToolChoiceMode::None => json!("none"),
         ToolChoiceMode::Required => json!("required"),
-        ToolChoiceMode::SpecificTool => match &tool_choice.tool_name {
-            Some(name) => json!({"type": "function", "function": {"name": name}}),
+        ToolChoiceMode::SpecificTool => match &request.tool_choice.tool_name {
+            Some(name) => {
+                json!({"type": "function", "function": {"name": openai_wire_tool_name(name)}})
+            }
             None => json!("auto"),
         },
         ToolChoiceMode::Auto | ToolChoiceMode::AllowedTools => json!("auto"),
+    }
+}
+
+fn openai_wire_tool_name(name: &str) -> String {
+    let public_name = name.strip_prefix(BUILTIN_TOOL_PREFIX).unwrap_or(name);
+    let sanitized = public_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        TOOL_NAME_FALLBACK.to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -908,8 +977,11 @@ fn parse_openai_response(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let tool_calls = parse_openai_tool_calls(message);
-    let assistant_message = Some(ModelMessage::text(ModelRole::Assistant, content));
+    let tool_calls = parse_openai_tool_calls(request, message);
+    let assistant_message = Some(ModelMessage {
+        tool_calls: tool_calls.clone(),
+        ..ModelMessage::text(ModelRole::Assistant, content)
+    });
     let finish_reason = choice
         .get("finish_reason")
         .and_then(Value::as_str)
@@ -953,7 +1025,8 @@ fn parse_openai_response(
     Ok(response)
 }
 
-fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
+fn parse_openai_tool_calls(request: &ModelTurnRequest, message: &Value) -> Vec<ModelToolCall> {
+    let tool_name_map = openai_wire_tool_name_map(request);
     message
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -961,13 +1034,17 @@ fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
             calls
                 .iter()
                 .enumerate()
-                .map(|(index, call)| parse_openai_tool_call(index, call))
+                .map(|(index, call)| parse_openai_tool_call(index, call, &tool_name_map))
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn parse_openai_tool_call(index: usize, call: &Value) -> ModelToolCall {
+fn parse_openai_tool_call(
+    index: usize,
+    call: &Value,
+    tool_name_map: &[(String, String)],
+) -> ModelToolCall {
     let function = call.get("function").unwrap_or(&Value::Null);
     let raw_arguments = function
         .get("arguments")
@@ -975,23 +1052,36 @@ fn parse_openai_tool_call(index: usize, call: &Value) -> ModelToolCall {
         .unwrap_or("")
         .to_string();
     let (arguments, parse_status, validation_errors) = parse_tool_arguments(&raw_arguments);
+    let wire_tool_name = function.get("name").and_then(Value::as_str).unwrap_or("");
     ModelToolCall {
         tool_call_id: call
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("call_{index}")),
-        tool_name: function
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        tool_name: internal_tool_name(wire_tool_name, tool_name_map),
         arguments,
         raw_arguments,
         parse_status,
         validation_errors,
         provider_metadata: json!({}),
     }
+}
+
+fn openai_wire_tool_name_map(request: &ModelTurnRequest) -> Vec<(String, String)> {
+    request
+        .tools
+        .iter()
+        .map(|tool| (openai_wire_tool_name(&tool.name), tool.name.clone()))
+        .collect()
+}
+
+fn internal_tool_name(wire_name: &str, tool_name_map: &[(String, String)]) -> String {
+    tool_name_map
+        .iter()
+        .find(|(wire, _internal)| wire == wire_name)
+        .map(|(_wire, internal)| internal.clone())
+        .unwrap_or_else(|| wire_name.to_string())
 }
 
 fn parse_tool_arguments(raw_arguments: &str) -> (Value, ModelToolParseStatus, Vec<String>) {
@@ -1045,7 +1135,7 @@ fn required_env_value<F>(get_env: &mut F, name: &str) -> Result<String, Provider
 where
     F: FnMut(&str) -> Option<String>,
 {
-    value_from_env(get_env, name).ok_or_else(|| {
+    value_from_env_or_project_env(get_env, name).ok_or_else(|| {
         ProviderError::from_model_error(
             ModelError::new(
                 ModelErrorKind::InvalidRequest,
@@ -1064,7 +1154,12 @@ fn model_error_from_http_status(status: u16, provider_name: &str, model_name: &s
         status if status >= HTTP_STATUS_INTERNAL_SERVER_ERROR => ModelErrorKind::ProviderOverloaded,
         _ => ModelErrorKind::UnknownProviderError,
     };
-    ModelError::new(kind, format!("Provider returned HTTP {status}."))
+    let message = if status == HTTP_STATUS_NOT_FOUND {
+        format!("Provider returned HTTP {status}; model not found.")
+    } else {
+        format!("Provider returned HTTP {status}.")
+    };
+    ModelError::new(kind, message)
         .with_provider(provider_name.to_string())
         .with_model(model_name.to_string())
 }
@@ -1408,6 +1503,67 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     get_env(name).filter(|value| !value.trim().is_empty())
+}
+
+fn value_from_env_or_project_env<F>(get_env: &mut F, name: &str) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    value_from_env(get_env, name).or_else(|| project_env_value(name))
+}
+
+fn project_env_value(name: &str) -> Option<String> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let path = dir.join(PROJECT_ENV_FILE);
+        if let Some(value) = read_env_file_value(&path, name) {
+            return Some(value);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn read_env_file_value(path: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .filter_map(parse_env_line)
+        .find_map(|(key, value)| if key == name { Some(value) } else { None })
+}
+
+fn parse_env_line(line: &str) -> Option<(String, String)> {
+    let mut text = line.trim();
+    if text.is_empty() || text.starts_with('#') {
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("export ") {
+        text = rest.trim_start();
+    }
+    let (name, value) = text.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    let mut value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+        {
+            value = &value[1..value.len() - 1];
+        }
+    }
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some((name.to_string(), value.to_string()))
+    }
 }
 
 fn redacted_presence(present: bool) -> String {

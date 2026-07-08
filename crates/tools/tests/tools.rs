@@ -1,25 +1,28 @@
+use singularity_sandbox::{
+    CommandExecutionStatus, CommandRequest, CommandResult, SandboxBackend, SandboxCapabilities,
+};
 use singularity_tools::{
-    EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker, ToolBrokerDecision,
-    ToolCallEnvelope, ToolObservation, ToolObservationVisibility, ToolRegistry, ToolResult,
+    CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
+    ToolBrokerDecision, ToolCallRequest, ToolOutput, ToolRegistry, ToolResult, ToolResultView,
     ToolSpec, WorkspacePatch, WorkspacePatchChange, WorkspaceToolError, WorkspaceTools,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
-fn tool_observation_model_payload_hides_internal_metadata() {
-    let observation =
-        ToolObservation::summary("call_1", "builtin.read", true, "safe preview", "digest_1")
-            .with_internal_metadata(
+fn tool_result_payload_hides_audit_metadata() {
+    let tool_result =
+        ToolResult::summary("call_1", "builtin.read", true, "safe preview", "digest_1")
+            .with_audit_metadata(
                 "policy_1",
                 "grant_1",
                 serde_json::json!({"raw_arguments": {"path": ".env"}}),
             );
 
-    let payload = observation.to_model_payload();
+    let payload = tool_result.to_message_payload();
 
     assert_eq!(payload["tool_call_id"], "call_1");
-    assert_eq!(payload["content_preview"], "safe preview");
+    assert_eq!(payload["preview"], "safe preview");
     assert!(payload.get("policy_decision_id").is_none());
     assert!(payload.get("approval_grant_id").is_none());
     assert!(payload.get("metadata").is_none());
@@ -31,30 +34,26 @@ fn tool_observation_model_payload_hides_internal_metadata() {
 }
 
 #[test]
-fn tool_observation_model_payload_redacts_secret_like_preview() {
-    let observation =
-        ToolObservation::summary("call_1", "builtin.shell", true, "TOKEN=abc123", "digest_1");
+fn tool_result_payload_redacts_secret_like_preview() {
+    let tool_result =
+        ToolResult::summary("call_1", "builtin.shell", true, "TOKEN=abc123", "digest_1");
 
-    let payload = observation.to_model_payload();
+    let payload = tool_result.to_message_payload();
 
     assert_eq!(payload["content"], "[redacted sensitive tool output]");
-    assert_eq!(
-        payload["content_preview"],
-        "[redacted sensitive tool output]"
-    );
+    assert_eq!(payload["preview"], "[redacted sensitive tool output]");
     assert!(!serde_json::to_string(&payload).unwrap().contains("abc123"));
 }
 
 #[test]
-fn tool_observation_model_payload_redacts_standalone_secret_values() {
+fn tool_result_payload_redacts_standalone_secret_values() {
     for secret in [
         "sk-abcdefghijklmnopqrstuvwxyz",
         "ghp_abcdefghijklmnopqrstuvwxyz123456",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123",
     ] {
-        let observation =
-            ToolObservation::summary("call_1", "builtin.read", true, secret, "digest_1");
-        let payload = observation.to_model_payload();
+        let tool_result = ToolResult::summary("call_1", "builtin.read", true, secret, "digest_1");
+        let payload = tool_result.to_message_payload();
         let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
         assert_eq!(payload["content"], "[redacted sensitive tool output]");
@@ -63,8 +62,8 @@ fn tool_observation_model_payload_redacts_standalone_secret_values() {
 }
 
 #[test]
-fn tool_observation_model_payload_redacts_protected_path_names() {
-    let observation = ToolObservation::summary(
+fn tool_result_payload_redacts_protected_path_names() {
+    let tool_result = ToolResult::summary(
         "call_1",
         "builtin.patch",
         true,
@@ -72,7 +71,7 @@ fn tool_observation_model_payload_redacts_protected_path_names() {
         "digest_1",
     );
 
-    let payload = observation.to_model_payload();
+    let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
     assert_eq!(payload["content"], "[redacted sensitive tool output]");
@@ -80,8 +79,8 @@ fn tool_observation_model_payload_redacts_protected_path_names() {
 }
 
 #[test]
-fn tool_observation_model_payload_keeps_safe_token_metrics_text() {
-    let observation = ToolObservation::summary(
+fn tool_result_payload_keeps_safe_token_metrics_text() {
+    let tool_result = ToolResult::summary(
         "call_1",
         "builtin.read",
         true,
@@ -89,7 +88,7 @@ fn tool_observation_model_payload_keeps_safe_token_metrics_text() {
         "digest_1",
     );
 
-    let payload = observation.to_model_payload();
+    let payload = tool_result.to_message_payload();
 
     assert_eq!(
         payload["content"],
@@ -98,8 +97,8 @@ fn tool_observation_model_payload_keeps_safe_token_metrics_text() {
 }
 
 #[test]
-fn tool_observation_model_payload_redacts_raw_provider_and_evaluator_markers() {
-    let envelope = ToolCallEnvelope::new(
+fn tool_result_payload_redacts_raw_provider_and_evaluator_markers() {
+    let envelope = ToolCallRequest::new(
         "run_1",
         "session_1",
         "task_1",
@@ -107,7 +106,7 @@ fn tool_observation_model_payload_redacts_raw_provider_and_evaluator_markers() {
         "mcp.github.search",
         "{}",
     );
-    let result = ToolResult::success(serde_json::json!({
+    let result = ToolOutput::success(serde_json::json!({
         "raw_prompt": "developer-only prompt",
         "raw_response": "provider body",
         "provider": {"payload": "body"},
@@ -116,9 +115,8 @@ fn tool_observation_model_payload_redacts_raw_provider_and_evaluator_markers() {
         "evaluator_only": {"hidden": true}
     }));
 
-    let observation =
-        ToolObservation::from_result(&envelope, &result, ToolObservationVisibility::Summary);
-    let payload = observation.to_model_payload();
+    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::Summary);
+    let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
     assert_eq!(payload["content"], "[redacted sensitive tool output]");
@@ -136,8 +134,8 @@ fn tool_observation_model_payload_redacts_raw_provider_and_evaluator_markers() {
 }
 
 #[test]
-fn tool_observation_model_payload_keeps_non_secret_environment_word() {
-    let observation = ToolObservation::summary(
+fn tool_result_payload_keeps_non_secret_environment_word() {
+    let tool_result = ToolResult::summary(
         "call_1",
         "builtin.read",
         true,
@@ -145,14 +143,14 @@ fn tool_observation_model_payload_keeps_non_secret_environment_word() {
         "digest_1",
     );
 
-    let payload = observation.to_model_payload();
+    let payload = tool_result.to_message_payload();
 
     assert_eq!(payload["content"], "development environment is ready");
 }
 
 #[test]
-fn tool_observation_model_payload_keeps_non_secret_environment_variable_text() {
-    let observation = ToolObservation::summary(
+fn tool_result_payload_keeps_non_secret_environment_variable_text() {
+    let tool_result = ToolResult::summary(
         "call_1",
         "builtin.read",
         true,
@@ -160,7 +158,7 @@ fn tool_observation_model_payload_keeps_non_secret_environment_variable_text() {
         "digest_1",
     );
 
-    let payload = observation.to_model_payload();
+    let payload = tool_result.to_message_payload();
 
     assert_eq!(
         payload["content"],
@@ -183,7 +181,7 @@ fn registry_rejects_duplicate_tools() {
 
     assert!(registry.register(spec).is_err());
 
-    let envelope = ToolCallEnvelope::new(
+    let envelope = ToolCallRequest::new(
         "run_1",
         "session_1",
         "task_1",
@@ -191,10 +189,9 @@ fn registry_rejects_duplicate_tools() {
         "builtin.read",
         "{}",
     );
-    let result = ToolResult::success(serde_json::json!({"ok": true}));
-    let observation =
-        ToolObservation::from_result(&envelope, &result, ToolObservationVisibility::Summary);
-    assert_eq!(observation.tool_name, "builtin.read");
+    let result = ToolOutput::success(serde_json::json!({"ok": true}));
+    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::Summary);
+    assert_eq!(tool_result.tool_name, "builtin.read");
 }
 
 #[test]
@@ -226,7 +223,7 @@ fn registry_accepts_only_stable_tool_namespaces() {
 }
 
 #[test]
-fn broker_projects_model_visible_specs_without_injection_or_internal_fields() {
+fn broker_projects_schema_payloads_without_injection_or_internal_fields() {
     let mut broker = ToolBroker::default();
     broker
         .register(ToolSpec::new(
@@ -236,7 +233,7 @@ fn broker_projects_model_visible_specs_without_injection_or_internal_fields() {
         ))
         .expect("register tool");
 
-    let payloads = broker.model_visible_tools();
+    let payloads = broker.tool_schema_payloads();
     let payload = &payloads[0];
     let serialized = serde_json::to_string(payload).expect("serialize payload");
 
@@ -257,7 +254,7 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
             serde_json::json!({"type": "object"}),
         ))
         .expect("register tool");
-    let envelope = ToolCallEnvelope::new(
+    let envelope = ToolCallRequest::new(
         "run_1",
         "session_1",
         "task_1",
@@ -270,7 +267,7 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
         ToolBrokerDecision::deny("policy denied"),
         |_envelope| panic!("denied tool must not execute"),
     );
-    let denied_payload = denied.to_model_payload();
+    let denied_payload = denied.to_message_payload();
 
     assert!(!denied.ok);
     assert_eq!(denied.error_code.as_deref(), Some("tool_denied"));
@@ -281,7 +278,7 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
             .contains("token=secret")
     );
 
-    let missing = ToolCallEnvelope::new(
+    let missing = ToolCallRequest::new(
         "run_1",
         "session_1",
         "task_1",
@@ -297,7 +294,7 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
 }
 
 #[test]
-fn broker_executes_allowed_tool_and_observation_payload_stays_safe() {
+fn broker_executes_allowed_tool_and_tool_result_payload_stays_safe() {
     let mut broker = ToolBroker::default();
     broker
         .register(ToolSpec::new(
@@ -306,7 +303,7 @@ fn broker_executes_allowed_tool_and_observation_payload_stays_safe() {
             serde_json::json!({"type": "object"}),
         ))
         .expect("register tool");
-    let envelope = ToolCallEnvelope::new(
+    let envelope = ToolCallRequest::new(
         "run_1",
         "session_1",
         "task_1",
@@ -315,20 +312,20 @@ fn broker_executes_allowed_tool_and_observation_payload_stays_safe() {
         r#"{"path": ".env"}"#,
     );
 
-    let observation = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
-        ToolResult::success(serde_json::json!({"summary": "formatted"}))
+    let tool_result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
+        ToolOutput::success(serde_json::json!({"summary": "formatted"}))
     });
-    let payload = observation.to_model_payload();
+    let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
-    assert!(observation.ok);
+    assert!(tool_result.ok);
     assert_eq!(payload["tool_name"], "python.formatter.black");
     assert!(!serialized.contains("raw_arguments"));
     assert!(!serialized.contains(".env"));
 }
 
 #[test]
-fn broker_observation_preview_is_bounded_even_for_allowed_tool_results() {
+fn broker_tool_result_preview_is_bounded_even_for_allowed_tool_results() {
     let mut broker = ToolBroker::default();
     broker
         .register(ToolSpec::new(
@@ -337,7 +334,7 @@ fn broker_observation_preview_is_bounded_even_for_allowed_tool_results() {
             serde_json::json!({"type": "object"}),
         ))
         .expect("register tool");
-    let envelope = ToolCallEnvelope::new(
+    let envelope = ToolCallRequest::new(
         "run_1",
         "session_1",
         "task_1",
@@ -346,21 +343,21 @@ fn broker_observation_preview_is_bounded_even_for_allowed_tool_results() {
         r#"{"path": "README.md"}"#,
     );
 
-    let observation = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
-        ToolResult::success(serde_json::json!({"content": "x".repeat(10_000)}))
+    let tool_result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
+        ToolOutput::success(serde_json::json!({"content": "x".repeat(10_000)}))
     });
-    let payload = observation.to_model_payload();
+    let payload = tool_result.to_message_payload();
 
-    assert!(observation.truncated);
+    assert!(tool_result.truncated);
     assert_eq!(
-        payload["content_preview"].as_str().expect("preview").len(),
+        payload["preview"].as_str().expect("preview").len(),
         "x".repeat(4_096).len()
     );
 }
 
 #[test]
-fn reference_only_observation_payload_is_a_bounded_safe_snapshot() {
-    let envelope = ToolCallEnvelope::new(
+fn reference_only_tool_result_payload_is_a_bounded_safe_snapshot() {
+    let envelope = ToolCallRequest::new(
         "run_internal_1",
         "session_internal_1",
         "task_internal_1",
@@ -368,7 +365,7 @@ fn reference_only_observation_payload_is_a_bounded_safe_snapshot() {
         "mcp.github.search",
         r#"{"query": "token=abc123", "limit": 1000}"#,
     );
-    let mut result = ToolResult::success(serde_json::json!({
+    let mut result = ToolOutput::success(serde_json::json!({
         "stdout": "FULL_OUTPUT_SHOULD_NOT_BE_VISIBLE",
         "token": "abc123"
     }));
@@ -380,9 +377,8 @@ fn reference_only_observation_payload_is_a_bounded_safe_snapshot() {
         "task_id": envelope.task_id,
     });
 
-    let observation =
-        ToolObservation::from_result(&envelope, &result, ToolObservationVisibility::ReferenceOnly);
-    let payload = observation.to_model_payload();
+    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::ReferenceOnly);
+    let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
     assert_eq!(
@@ -392,17 +388,17 @@ fn reference_only_observation_payload_is_a_bounded_safe_snapshot() {
             "tool_name": "mcp.github.search",
             "tool_call_id": "call_1",
             "status": "ok",
-            "content_digest": "",
-            "result_ref": null,
+            "digest": tool_result.digest,
+            "artifact_ref": null,
             "error_code": null,
-            "reference_ids": [],
-            "observation_id": null,
+            "artifact_refs": [],
+            "result_id": null,
             "truncated": true,
             "redacted": true,
         })
     );
     assert!(payload.get("content").is_none());
-    assert!(payload.get("content_preview").is_none());
+    assert!(payload.get("preview").is_none());
     for leaked in [
         "raw_arguments",
         "run_internal_1",
@@ -414,6 +410,77 @@ fn reference_only_observation_payload_is_a_bounded_safe_snapshot() {
     ] {
         assert!(!serialized.contains(leaked), "{leaked} leaked to payload");
     }
+}
+
+#[test]
+fn tool_result_carries_artifact_and_result_refs_from_tool_output() {
+    let envelope = ToolCallRequest::new(
+        "run_1",
+        "session_1",
+        "task_1",
+        "call_1",
+        "builtin.patch",
+        r#"{"changes":[]}"#,
+    );
+    let mut result = ToolOutput::success(serde_json::json!({
+        "changed_files": ["README.md"],
+        "diff_ref": "artifact://diff/readme",
+        "artifact_refs": ["artifact://result/readme"]
+    }));
+    result.metadata = serde_json::json!({
+        "result_id": "tool_result_1",
+        "artifact_refs": ["artifact://audit/readme"]
+    });
+
+    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::Summary);
+    let payload = tool_result.to_message_payload();
+
+    assert!(tool_result.digest.starts_with("hash:"));
+    assert_eq!(
+        tool_result.artifact_ref.as_deref(),
+        Some("artifact://diff/readme")
+    );
+    assert_eq!(
+        tool_result.artifact_refs,
+        vec![
+            "artifact://audit/readme".to_string(),
+            "artifact://diff/readme".to_string(),
+            "artifact://result/readme".to_string()
+        ]
+    );
+    assert_eq!(tool_result.result_id.as_deref(), Some("tool_result_1"));
+    assert_eq!(payload["artifact_ref"], "artifact://diff/readme");
+    assert_eq!(payload["result_id"], "tool_result_1");
+}
+
+#[test]
+fn tool_result_payload_redacts_sensitive_artifact_refs() {
+    let envelope = ToolCallRequest::new(
+        "run_1",
+        "session_1",
+        "task_1",
+        "call_1",
+        "builtin.patch",
+        "{}",
+    );
+    let result = ToolOutput::success(serde_json::json!({
+        "artifact_ref": "artifact://result/.env",
+        "artifact_refs": ["artifact://result/readme", "artifact://result/.ssh/id_rsa"],
+        "result_id": "tool_result_1"
+    }));
+
+    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::Summary);
+    let payload = tool_result.to_message_payload();
+    let serialized = serde_json::to_string(&payload).expect("serialize payload");
+
+    assert!(payload["artifact_ref"].is_null());
+    assert_eq!(
+        payload["artifact_refs"],
+        serde_json::json!(["artifact://result/readme"])
+    );
+    assert_eq!(payload["result_id"], "tool_result_1");
+    assert!(!serialized.contains(".env"));
+    assert!(!serialized.contains("id_rsa"));
 }
 
 #[test]
@@ -435,7 +502,7 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
             max_chars: Some(5),
         })
         .expect("read");
-    assert_eq!(read.content["content_preview"], "alpha");
+    assert_eq!(read.content["preview"], "alpha");
     assert_eq!(read.content["truncated"], true);
     assert!(
         read.content["artifact_ref"]
@@ -451,10 +518,7 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
         })
         .expect("binary read");
     assert_eq!(binary.content["binary"], true);
-    assert_eq!(
-        binary.content["content_preview"],
-        "[binary content omitted]"
-    );
+    assert_eq!(binary.content["preview"], "[binary content omitted]");
 
     assert!(matches!(
         tools.read(ReadToolInput {
@@ -735,19 +799,20 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
         Err(WorkspaceToolError::ProtectedPath(_))
     ));
 
-    let approved = tools
-        .edit(
+    assert!(matches!(
+        tools.edit(
             EditToolInput {
                 path: ".env".to_string(),
                 expected: "TOKEN".to_string(),
                 replacement: "SAFE".to_string(),
             },
             &ToolBrokerDecision::approved("approval_1"),
-        )
-        .expect("approved protected edit");
+        ),
+        Err(WorkspaceToolError::ProtectedPath(_))
+    ));
     assert_eq!(
-        approved.content["changed_files"],
-        serde_json::json!([".env"])
+        std::fs::read_to_string(workspace.join(".env")).unwrap(),
+        "TOKEN=secret"
     );
 
     remove_workspace(&workspace);
@@ -823,7 +888,7 @@ fn workspace_patch_rolls_back_created_files_on_later_failure() {
 }
 
 #[test]
-fn broker_ask_decision_blocks_execution_with_safe_approval_observation() {
+fn broker_ask_decision_blocks_execution_with_safe_approval_tool_result() {
     let mut broker = ToolBroker::default();
     broker
         .register(ToolSpec::new(
@@ -832,7 +897,7 @@ fn broker_ask_decision_blocks_execution_with_safe_approval_observation() {
             serde_json::json!({"type": "object"}),
         ))
         .expect("register tool");
-    let envelope = ToolCallEnvelope::new(
+    let envelope = ToolCallRequest::new(
         "run_1",
         "session_1",
         "task_1",
@@ -841,19 +906,122 @@ fn broker_ask_decision_blocks_execution_with_safe_approval_observation() {
         r#"{"path": ".env", "replacement": "secret"}"#,
     );
 
-    let observation = broker.execute(
+    let tool_result = broker.execute(
         &envelope,
         ToolBrokerDecision::ask("approval_1", "operator approval required"),
         |_envelope| panic!("ask decision must not execute"),
     );
-    let payload = observation.to_model_payload();
+    let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
-    assert!(!observation.ok);
-    assert_eq!(observation.error_code.as_deref(), Some("approval_required"));
+    assert!(!tool_result.ok);
+    assert_eq!(tool_result.error_code.as_deref(), Some("approval_required"));
     assert_eq!(payload["approval_request_id"], "approval_1");
     assert!(!serialized.contains(".env"));
     assert!(!serialized.contains("secret"));
+}
+
+#[test]
+fn workspace_command_tool_fails_closed_without_sandbox_backend() {
+    let workspace = test_workspace("command-no-backend");
+    let tools = WorkspaceTools::new(&workspace);
+
+    let result = tools.command(CommandToolInput {
+        argv: python_command("print('should not run')"),
+        cwd: None,
+        timeout_seconds: Some(5),
+        sandbox_mode: None,
+        network_access: None,
+    });
+
+    assert!(matches!(
+        result,
+        Err(WorkspaceToolError::SandboxUnavailable)
+    ));
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_command_tool_rejects_non_strict_backend_without_execution() {
+    let workspace = test_workspace("command-non-strict");
+    let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(NonStrictSandboxBackend);
+
+    let result = tools.command(CommandToolInput {
+        argv: python_command("print('should not run')"),
+        cwd: None,
+        timeout_seconds: Some(5),
+        sandbox_mode: None,
+        network_access: None,
+    });
+
+    assert!(matches!(
+        result,
+        Err(WorkspaceToolError::SandboxUnavailable)
+    ));
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
+    let workspace = test_workspace("command-strict");
+    let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(RecordingSandboxBackend);
+
+    let result = tools
+        .command(CommandToolInput {
+            argv: python_command("print('command ok')"),
+            cwd: None,
+            timeout_seconds: Some(5),
+            sandbox_mode: None,
+            network_access: None,
+        })
+        .expect("command");
+
+    assert!(result.ok);
+    assert_eq!(
+        result.content["execution_status"],
+        serde_json::json!(CommandExecutionStatus::Completed)
+    );
+    assert!(
+        result.content["stdout_preview"]
+            .as_str()
+            .expect("stdout")
+            .contains("command ok")
+    );
+    assert!(result.content.get("argv").is_none());
+    assert!(result.content.get("env").is_none());
+    remove_workspace(&workspace);
+}
+
+struct RecordingSandboxBackend;
+
+impl SandboxBackend for RecordingSandboxBackend {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        CommandResult::completed(&request.command_id, "command ok")
+    }
+}
+
+struct NonStrictSandboxBackend;
+
+impl SandboxBackend for NonStrictSandboxBackend {
+    fn name(&self) -> &'static str {
+        "non_strict"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::unavailable()
+    }
+
+    fn execute(&self, _request: &CommandRequest) -> CommandResult {
+        panic!("non-strict command backend must not execute")
+    }
 }
 
 fn test_workspace(name: &str) -> PathBuf {
@@ -872,6 +1040,20 @@ fn remove_workspace(path: &Path) {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
+}
+
+fn python_command(code: &str) -> Vec<String> {
+    vec![python_bin(), "-c".to_string(), code.to_string()]
+}
+
+fn python_bin() -> String {
+    std::env::var("PYTHON").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    })
 }
 
 #[cfg(windows)]

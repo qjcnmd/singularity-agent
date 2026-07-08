@@ -11,5 +11,17 @@ serde.workspace = true
 serde_json.workspace = true
 singularity_core = { path = "../core" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true

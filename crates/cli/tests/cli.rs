@@ -4,6 +4,7 @@ use std::sync::Once;
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
+const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const PYTHON_SIDECAR_ENV: &str = "SINGULARITY_PYTHON_SIDECAR";
 const PYTHON_SIDECAR_PROJECT_ROOT_ENV: &str = "SINGULARITY_SIDECAR_PROJECT_ROOT";
 const FAKE_APP_SERVER_EXIT_CODE: i32 = 7;
@@ -18,9 +19,46 @@ fn cli_exposes_app_server_protocol_mode_without_direct_core_runtime() {
 fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
-    let app_server_bin = app_server_bin();
+    let app_server_bin = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
 
-    let run = cli_with_app_server(&app_server_bin, &db_path)
+THREAD = {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}
+TURN = {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "completed", "agent_loop_status": "completed"}
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"method": "thread/started", "params": {"thread": THREAD}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"thread": THREAD}}), flush=True)
+    elif method == "thread/read":
+        print(json.dumps({"id": request_id, "result": {"thread": THREAD}}), flush=True)
+    elif method == "thread/list":
+        print(json.dumps({"id": request_id, "result": {"threads": [THREAD]}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"method": "turn/started", "params": {"turn": TURN}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": TURN}}), flush=True)
+    elif method == "trace/tail":
+        print(json.dumps({"id": request_id, "result": {"events": [{"event_id": "trace_1", "component": "thread", "summary": "thread started"}]}}), flush=True)
+    elif method == "approval/list":
+        print(json.dumps({"id": request_id, "result": {"approvals": []}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let app_server_bin = path_str(&app_server_bin);
+
+    let run = cli_with_app_server(app_server_bin, &db_path)
         .args(["run", "write tests", "--model", "gpt-test"])
         .output()
         .expect("run cli");
@@ -36,34 +74,34 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
         .expect("thread id")
         .to_string();
 
-    let threads = cli_with_app_server(&app_server_bin, &db_path)
+    let threads = cli_with_app_server(app_server_bin, &db_path)
         .arg("threads")
         .output()
         .expect("threads cli");
     assert!(threads.status.success(), "stderr={}", stderr(&threads));
     assert!(stdout(&threads).contains(&thread_id));
 
-    let continued = cli_with_app_server(&app_server_bin, &db_path)
+    let continued = cli_with_app_server(app_server_bin, &db_path)
         .args(["continue", &thread_id, "add docs"])
         .output()
         .expect("continue cli");
     assert!(continued.status.success(), "stderr={}", stderr(&continued));
     assert!(stdout(&continued).contains("turn/started"));
 
-    let trace = cli_with_app_server(&app_server_bin, &db_path)
+    let trace = cli_with_app_server(app_server_bin, &db_path)
         .args(["trace", &thread_id, "--limit", "5"])
         .output()
         .expect("trace cli");
     assert!(trace.status.success(), "stderr={}", stderr(&trace));
     assert!(stdout(&trace).contains("thread started"));
 
-    let approvals = cli_with_app_server(&app_server_bin, &db_path)
+    let approvals = cli_with_app_server(app_server_bin, &db_path)
         .arg("approvals")
         .output()
         .expect("approvals cli");
     assert!(approvals.status.success(), "stderr={}", stderr(&approvals));
 
-    let doctor = cli_with_app_server(&app_server_bin, &db_path)
+    let doctor = cli_with_app_server(app_server_bin, &db_path)
         .args(["config", "doctor"])
         .output()
         .expect("doctor cli");
@@ -88,7 +126,7 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
     elif method == "agent/capability":
-        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": False, "status": "not_migrated", "reason": "not migrated", "missing_boundaries": ["model_provider_adapter"]}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "server/shutdown":
         print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
         break
@@ -106,9 +144,9 @@ for line in sys.stdin:
     assert!(doctor.status.success(), "stderr={}", stderr(&doctor));
     let stdout = stdout(&doctor);
     assert!(stdout.contains("client=protocol-only"));
-    assert!(stdout.contains("native_agent_loop=not_migrated"));
-    assert!(stdout.contains("sidecar_oracle=available"));
-    assert!(stdout.contains("evaluation=python_oracle"));
+    assert!(stdout.contains("native_agent_loop=completed"));
+    assert!(stdout.contains("sidecar_oracle=explicit"));
+    assert!(stdout.contains("evaluation=rust_native"));
     assert!(stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
     assert!(stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
     assert!(stdout.contains("SINGULARITY_MODEL=present(redacted)"));
@@ -138,7 +176,7 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
     elif method == "agent/capability":
-        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": False, "status": "not_migrated", "reason": "not migrated", "missing_boundaries": ["model_provider_adapter"]}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": False, "status": "not_migrated", "reason": "not migrated", "blockers": ["model_provider_adapter"]}}}), flush=True)
     elif method == "server/shutdown":
         print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
         break
@@ -179,7 +217,7 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
     elif method == "agent/capability":
-        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "running", "reason": "enabled", "missing_boundaries": []}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "running", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_native", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
@@ -226,7 +264,7 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
     elif method == "agent/capability":
-        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "running", "reason": "partial", "missing_boundaries": ["strict_command_sandbox"]}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "running", "reason": "partial", "blockers": ["strict_command_sandbox"]}}}), flush=True)
     elif method == "server/shutdown":
         print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
         break
@@ -251,7 +289,7 @@ fn cli_eval_command_is_script_friendly_and_validates_manifest() {
     let temp = tempfile::tempdir().expect("temp dir");
     let missing_manifest = temp.path().join("missing.json");
     let manifest = temp.path().join("eval.json");
-    std::fs::write(&manifest, "{}").expect("write manifest");
+    std::fs::write(&manifest, "not json").expect("write manifest");
 
     let output = Command::cargo_bin("sg")
         .expect("binary")
@@ -269,25 +307,115 @@ fn cli_eval_command_is_script_friendly_and_validates_manifest() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("eval manifest not found"));
 
-    let blocked = Command::cargo_bin("sg")
-        .expect("binary")
+    let db_path = temp.path().join("sessions.sqlite3");
+    let invalid = cli_with_app_server(&app_server_bin(), &db_path)
         .args([
             "eval",
             "run",
             path_str(&manifest),
             "--run-id",
-            "eval_blocked",
+            "eval_invalid",
             "--json",
         ])
         .output()
-        .expect("eval cli blocked");
+        .expect("eval cli invalid");
 
-    assert!(!blocked.status.success());
-    let value: serde_json::Value =
-        serde_json::from_str(&stdout(&blocked)).expect("blocked eval json");
-    assert_eq!(value["status"], "blocked");
-    assert_eq!(value["blocker"], "rust_evaluation_runner_not_migrated");
-    assert_eq!(value["evaluation_passed"], false);
+    assert!(!invalid.status.success());
+    assert!(stderr(&invalid).contains("invalid eval manifest"));
+}
+
+#[test]
+fn cli_eval_run_uses_native_app_server_and_reports_verification_result() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let eval_output = temp.path().join("eval-output");
+    let manifest = temp.path().join("eval.json");
+    let native_trace = temp.path().join("native-turn.json");
+    let sidecar_trace = temp.path().join("sidecar-env.txt");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{
+  "schema_version": "evaluation.task_set/v1",
+  "tasks": [{{
+    "task_id": "fixture_native",
+    "workspace": {{"type": "fixture", "files": {{"solution.py": "value = 0\n"}}}},
+    "user_task": "Change solution.py so value is 1.",
+    "allowed_paths": ["solution.py"],
+    "expected_file_changes": ["solution.py"],
+    "verification_command": "{} -c \"from solution import value; assert value == 1\"",
+    "public_verification_command": "{} -c \"from solution import value; assert value == 1\"",
+    "hidden_verification_command": "{} -c \"from solution import value; assert value == 1\"",
+    "success": {{"type": "verification_exit_code", "exit_code": 0}}
+  }}]
+}}"#,
+            python_bin(),
+            python_bin(),
+            python_bin()
+        ),
+    )
+    .expect("write manifest");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        &format!(
+            r#"
+import json
+import os
+import pathlib
+import sys
+
+native_trace = pathlib.Path(r"{}")
+sidecar_trace = pathlib.Path(r"{}")
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({{"id": request_id, "result": {{"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}}}), flush=True)
+    elif method == "eval/run":
+        native_trace.write_text(json.dumps(message["params"]), encoding="utf-8")
+        sidecar_trace.write_text(os.environ.get("SINGULARITY_PYTHON_SIDECAR", "unset"), encoding="utf-8")
+        print(json.dumps({{"id": request_id, "result": {{"run_id": "eval_native", "manifest": message["params"]["manifest"], "runner": "rust_native", "status": "completed", "blocker": None, "evaluation_passed": True, "tasks": [{{"task_id": "fixture_native", "agent_completed": True, "tests_passed": True, "evaluation_passed": True, "local_process_fallback_count": 0}}]}}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({{"id": request_id, "result": {{"shutdown": True}}}}), flush=True)
+        break
+"#,
+            native_trace.display(),
+            sidecar_trace.display()
+        ),
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args([
+            "eval",
+            "run",
+            path_str(&manifest),
+            "--run-id",
+            "eval_native",
+            "--json",
+        ])
+        .env(EVAL_OUTPUT_DIR_ENV, &eval_output)
+        .env(PYTHON_SIDECAR_ENV, "1")
+        .output()
+        .expect("eval cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("eval json");
+    assert_eq!(value["runner"], "rust_native");
+    assert_eq!(value["evaluation_passed"], true);
+    assert_eq!(value["tasks"][0]["agent_completed"], true);
+    assert_eq!(value["tasks"][0]["tests_passed"], true);
+    assert_eq!(value["tasks"][0]["local_process_fallback_count"], 0);
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(native_trace).expect("native trace"))
+            .expect("native turn params");
+    assert_eq!(params["runId"], "eval_native");
+    assert_eq!(params["manifest"], path_str(&manifest));
+    assert_eq!(params["outputRoot"], path_str(&eval_output));
+    assert_eq!(
+        std::fs::read_to_string(sidecar_trace).expect("sidecar trace"),
+        "unset"
+    );
 }
 
 #[test]
@@ -307,6 +435,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
@@ -345,6 +475,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
@@ -464,6 +596,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
@@ -510,7 +644,7 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
     elif method == "turn/status":
-        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": message["params"]["turnId"], "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": message["params"]["turnId"], "thread_id": "thread_fake", "status": "running", "agent_loop_status": "running"}}}), flush=True)
     elif method == "turn/interrupt":
         print(json.dumps({"id": request_id, "result": {"turnId": message["params"]["turnId"], "status": "interrupted"}}), flush=True)
     elif method == "approval/decision":
@@ -525,7 +659,7 @@ for line in sys.stdin:
         .output()
         .expect("turn status cli");
     assert!(status.status.success(), "stderr={}", stderr(&status));
-    assert!(stdout(&status).contains("turn turn_fake running agent_loop_status=not_migrated"));
+    assert!(stdout(&status).contains("turn turn_fake running agent_loop_status=running"));
 
     let interrupt = cli_with_app_server(path_str(&fake_server), &db_path)
         .args(["turn", "interrupt", "turn_fake"])
@@ -721,6 +855,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
@@ -753,6 +889,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
@@ -787,6 +925,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
@@ -826,6 +966,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
@@ -892,6 +1034,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start" and not thread_started:
@@ -928,6 +1072,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start" and not thread_started:
@@ -1098,6 +1244,16 @@ fn write_fake_app_server(dir: &Path, script: &str) -> PathBuf {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
+}
+
+fn python_bin() -> String {
+    std::env::var("PYTHON").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    })
 }
 
 fn workspace_root() -> PathBuf {

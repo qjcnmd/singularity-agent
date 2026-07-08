@@ -274,7 +274,7 @@ def build_fixtures() -> dict[str, object]:
             contract_id="verification_contract_1",
         ),
     )
-    tool_call_repair_boundary = {
+    tool_repair = {
         "repair_id": "tool_repair_1",
         "run_id": "run_1",
         "session_id": "session_1",
@@ -283,7 +283,7 @@ def build_fixtures() -> dict[str, object]:
         "failed_tool_call_id": failed_tool_result.tool_call_id,
         "failure_kind": str(failed_tool_result.error_kind or ""),
         "next_action": "repair_then_verify",
-        "failed_result": failed_tool_result.to_dict(),
+        "failed_result": _rust_tool_output(failed_tool_result),
         "recovery_report": ToolProtocolRecoveryReport(
             succeeded_but_not_appended_call_ids=[failed_tool_result.tool_call_id],
             warnings=["tool result failed before repair"],
@@ -350,7 +350,7 @@ def build_fixtures() -> dict[str, object]:
         final_answer="status: completed\nfiles_changed: src/app.py\nverification: ready",
         turn=7,
     )
-    finalization_mapping_boundary = {
+    final_report_mapping = {
         "mapping_id": "finalization_mapping_1",
         "run_id": "run_1",
         "session_id": "session_1",
@@ -368,8 +368,8 @@ def build_fixtures() -> dict[str, object]:
         "metadata": {"source": "python_oracle"},
     }
     return {
-        "tool_observation_model_payload": tool_result.to_observation_view().to_model_payload(),
-        "tool_protocol_result_envelope": tool_result.to_dict(),
+        "tool_result_payload": _rust_tool_result_payload(tool_result),
+        "tool_output": _rust_tool_output(tool_result),
         "trace_event": trace_event.to_dict(),
         "command_request": command_request.safe_metadata(),
         "command_result": command_result.to_dict(),
@@ -381,8 +381,8 @@ def build_fixtures() -> dict[str, object]:
         "planner_state": planner_state.__dict__.copy(),
         "context_bundle": context_bundle.to_dict(),
         "context_summary_envelope": context_summary_envelope.to_dict(),
-        "tool_call_repair_boundary": tool_call_repair_boundary,
-        "finalization_mapping_boundary": finalization_mapping_boundary,
+        "tool_repair": tool_repair,
+        "final_report_mapping": final_report_mapping,
     }
 
 
@@ -391,6 +391,43 @@ def _stable_permission_summary(profile: PermissionProfile) -> dict[str, Any]:
     if payload["writable_roots"]:
         payload["writable_roots"] = [FIXTURE_WORKSPACE_ROOT]
     return payload
+
+
+def _rust_tool_result_payload(envelope: ToolProtocolResultEnvelope) -> dict[str, Any]:
+    payload = envelope.to_observation_view().to_model_payload()
+    return _rename_rust_tool_result_fields(payload)
+
+
+def _rust_tool_output(envelope: ToolProtocolResultEnvelope) -> dict[str, Any]:
+    content: dict[str, Any] = {
+        "preview": envelope.content_preview,
+        "artifact_ref": envelope.raw_result_ref,
+        "artifact_refs": list(envelope.artifact_refs),
+        "result_id": envelope.observation_id,
+        "digest": envelope.content_digest,
+    }
+    return {
+        "ok": envelope.ok,
+        "content": content,
+        "error_code": envelope.error_code,
+        "truncated": envelope.truncated,
+        "metadata": {},
+    }
+
+
+def _rename_rust_tool_result_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    renamed = dict(payload)
+    if "content_digest" in renamed:
+        renamed["digest"] = renamed.pop("content_digest")
+    if "result_ref" in renamed:
+        renamed["artifact_ref"] = renamed.pop("result_ref")
+    if "reference_ids" in renamed:
+        renamed["artifact_refs"] = renamed.pop("reference_ids")
+    if "observation_id" in renamed:
+        renamed["result_id"] = renamed.pop("observation_id")
+    if "content_preview" in renamed:
+        renamed["preview"] = renamed.pop("content_preview")
+    return renamed
 
 
 def _stable_sandbox_policy(profile: SandboxProfile) -> dict[str, Any]:

@@ -18,6 +18,7 @@ pub enum Method {
     ThreadArchive,
     ThreadDelete,
     TurnStart,
+    EvalRun,
     AgentCapability,
     TurnInterrupt,
     TurnStatus,
@@ -47,6 +48,7 @@ impl Method {
             "thread/archive" => Self::ThreadArchive,
             "thread/delete" => Self::ThreadDelete,
             "turn/start" => Self::TurnStart,
+            "eval/run" => Self::EvalRun,
             "agent/capability" => Self::AgentCapability,
             "turn/interrupt" => Self::TurnInterrupt,
             "turn/status" => Self::TurnStatus,
@@ -77,6 +79,7 @@ impl Method {
             Self::ThreadArchive => "thread/archive",
             Self::ThreadDelete => "thread/delete",
             Self::TurnStart => "turn/start",
+            Self::EvalRun => "eval/run",
             Self::AgentCapability => "agent/capability",
             Self::TurnInterrupt => "turn/interrupt",
             Self::TurnStatus => "turn/status",
@@ -369,6 +372,31 @@ pub struct TurnStartResult {
 pub struct AgentCapabilityResult {
     #[serde(rename = "nativeAgentLoop")]
     pub native_agent_loop: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EvalRunParams {
+    pub manifest: String,
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    #[serde(rename = "outputRoot", skip_serializing_if = "Option::is_none")]
+    pub output_root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EvalRunResult {
+    pub run_id: String,
+    pub manifest: String,
+    pub runner: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+    pub tasks: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_path: Option<String>,
+    pub evaluation_passed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
