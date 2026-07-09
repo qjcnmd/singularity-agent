@@ -9,13 +9,13 @@
 
 Rust Windows command sandbox 的当前实现是 Codex-style restricted-token + low-integrity token + Job Object backend：低完整性 token 负责阻断 read-only 模式下的程序化 workspace 写入，Job Object 负责 timeout/process-tree cleanup，stdio handle allowlist 负责限制继承句柄；它不创建系统账户、不修改 firewall、不持久改 ACL，也不 shell out 到 `codex sandbox`。
 
-长期架构为 `Rust Core + App Server + CLI/TUI first`：`crates/core`、`protocol`、`store`、`policy`、`sandbox`、`tools`、`model`、`agent`、`app-server`、`cli` 是 workspace 边界；Rust package / library 名使用 `singularity_*`。`crates/app-server` 通过 JSON-RPC over stdio JSONL 暴露 initialize、thread、turn、approval、artifact、trace、`eval/run` 和 shutdown 方法。默认 `agentHost` 是 native，CLI 和 app-server 都会检查 `AgentLoopCapability::current()`；当前 capability 为 `available=true/status=completed/blockers=[]`。native path 通过 `OpenAiProvider`、`ToolBroker`、`PolicyEngine`、`WorkspaceTools` 和 Rust `AgentLoop` 执行，不调用 Python sidecar，不提供 local_process/no_sandbox/relaxed fallback。`eval/run` 是 Rust native evaluation runner，manifest 的 `smoke_command` 可以进入 AgentLoop，`public_verification_command` / `hidden_verification_command` 只由 eval runner 在 agent 后执行；runner 保持 `agent_completed`、`tests_passed`、`evaluation_passed` 和 `local_process_fallback_count` 分离。provider 配置缺失、workspace 准备失败、sandbox unsupported、agent 未完成或 verification 失败都会 fail closed，不伪造 pass。
+长期架构为 `Rust Core + App Server + CLI/TUI first`：`crates/core`、`protocol`、`store`、`policy`、`sandbox`、`tools`、`model`、`agent`、`app-server`、`cli` 是 workspace 边界；Rust package / library 名使用 `singularity_*`。`crates/app-server` 通过 JSON-RPC over stdio JSONL 暴露 initialize、thread、turn、approval、artifact、trace、`eval/run` 和 shutdown 方法。默认 `agentHost` 是 native，CLI 和 app-server 都会检查 `AgentLoopCapability::current()`；Windows 会先执行 restricted-token sandbox probe，probe 成功才返回 `available=true/status=completed/blockers=[]`，probe 失败返回 `available=false/status=blocked/blockers=["strict_command_sandbox_probe_failed:..."]`，非 Windows capability 为 `available=false/status=blocked/blockers=["strict_command_sandbox_unsupported_platform"]`。native path 通过 `OpenAiProvider`、`ToolBroker`、`PolicyEngine`、`WorkspaceTools` 和 Rust `AgentLoop` 执行，不调用 Python sidecar，不提供 local_process/no_sandbox/relaxed fallback。`eval/run` 是 Rust native evaluation runner，先复用 native capability gate；manifest 的 `smoke_command` 会进入 AgentLoop prompt，若模型未执行，eval runner 会在 agent 后通过同一个 Rust command sandbox 真实运行该 smoke；`public_verification_command` / `hidden_verification_command` 只由 eval runner 在 agent 后执行；runner 保持 `agent_completed`、`tests_passed`、`smoke_command_satisfied`、`evaluation_passed` 和 `local_process_fallback_count` 分离。provider 配置缺失、workspace 准备失败、sandbox unsupported、agent 未完成、smoke command 未通过 Rust command sandbox 或 verification 失败都会 fail closed，不伪造 pass。
 
 显式 `--agent-host python` 会让 CLI 设置 sidecar env；app-server 在 thread 校验通过后用 `SessionStore.create_turn_with_input_and_trace()` 持久化 Rust turn/user item/turn trace，再调用 `PythonSidecarClient -> python -m singularity.agent_host.sidecar -> AgentHost -> KernelBootstrap -> AgentKernel -> AgentLoop`。Python sidecar 是 oracle，不是默认生产路径。同一 Rust thread 上已有 `python_sidecar` trace 的 `session_id` 时，后续 sidecar turn 调用 `agent/resume`，否则调用 `agent/run`；thread 的 `model` 会转发给 Python `ProductionConfig`。sidecar 的 running/status/cancel/cleanup 只落安全字段，raw prompt、provider payload、tool args、secret/env/token 不进入 Rust trace 或 CLI 输出。
 
 `crates/tools` 提供 `ToolBroker`、`ToolRegistry`、`ToolCallRequest`、`ToolOutput` 和 `ToolResult`。`ToolResult` 是 agent loop 使用的工具调用结果；raw executor payload 是 `ToolOutput`，preview、artifact ref、redaction 和 result id 是其字段或关联对象，不再另起独立结果对象。工具 schema 只投影 name、redacted description 和 input schema；denied/unknown/ask 工具 fail closed。`crates/sandbox` 提供 `SandboxPolicy`、`SandboxBackend`、`CommandRequest`、`CommandResult`、Windows restricted-token backend 和 patch schema，不公开 relaxed local-process executor 或 host filesystem mutation executor。`crates/model` 提供 `ModelTurnRequest`、`ModelTurnResponse`、provider config presence、redacted provider status、provider error taxonomy 和 `OpenAiProvider` HTTP adapter，不执行工具。`crates/agent` 提供 `AgentLoop`、`AgentLoopInput`、`AgentLoopResult`、`AgentLoopCapability`、approval grant/resume、tool repair retry、final answer completion、empty-answer fail-closed、sensitive path deny-first 和 multi-change patch full-policy check。
 
-`scripts/verify_rust_migration_boundaries.py` 是迁移漂移检查入口：它阻断 CLI 绕过 app-server、app-server native gate 绕过、Python RuntimeHost 过渡层、desktop/Web 抢跑、未登记 Rust 依赖、sandbox relaxed/no-sandbox contract、app-server 手写 JSON error、CLI 固定 notification 等待或 post-response drain、重复 approval decision API、unused tokio 依赖、缺失 sidecar cancel lifecycle、native capability 不是 completed/no blockers，以及 `ToolResult.to_message_payload()` 泄漏 raw arguments、内部 approval/policy id、audit metadata 或 secret-like 文本。
+`scripts/verify_rust_migration_boundaries.py` 是迁移漂移检查入口：它阻断 CLI 绕过 app-server、app-server native gate 绕过、Python RuntimeHost 过渡层、desktop/Web 抢跑、未登记 Rust 依赖、sandbox relaxed/no-sandbox contract、app-server 手写 JSON error、CLI 固定 notification 等待或 post-response drain、重复 approval decision API、unused tokio 依赖、缺失 sidecar cancel lifecycle、Windows native capability 未先经过 restricted-token sandbox probe、非 Windows capability 没有明确 strict command sandbox unsupported blocker，以及 `ToolResult.to_message_payload()` 泄漏 raw arguments、内部 approval/policy id、audit metadata 或 secret-like 文本。
 
 `crates/cli` 的 `sg` 是第一个 app-server protocol client；`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` / `sg config doctor` 通过 stdio JSON-RPC 启动并调用同一个 app-server，不直接依赖 store、agent、model 或工具内部 crate。CLI request loop 写入 request 后循环读取 stdout，保留 matching response 之前到达的 notification，遇到 matching response 立即返回；JSON-RPC error、stdout EOF、child exit 或 read timeout 都返回明确错误，不依赖固定 notification 数量，也不在 response 后 drain 额外消息。CLI drop 会发送 `server/shutdown`，让 app-server 按协议执行 sidecar cleanup。未来 desktop 必须复用同一 protocol，不单独设计第二套 core。Python 当前实现冻结为 explicit oracle / parity fixture：允许新增 sidecar adapter、fixture export、parity check 和文档校验；不在 Python 主干继续新增默认 agent host 能力。
 
@@ -1981,14 +1981,13 @@ Use `cancel` for sidecar/AgentLoop cancel. Use `interrupt` only for the existing
     → Planner / CompletionGate 将其作为环境 blocker 证据消费，
       不进入普通业务代码 repair。
 
-  E4. capability regression evaluation 归约（真实 provider + AgentLoop 外层）
-    python -m singularity.cli eval run docs/evaluation/public-representative-task.json
-    → EvaluationRunner.run()
-    → 每个 task 启动真实 KernelBootstrap → AgentGraphBuilder
-      → AgentKernel → AgentLoop.run
+  E4. Rust native evaluation 归约（真实 provider + Rust AgentLoop 外层）
+    sg eval run docs/evaluation/public-representative-task.json --json
+    → Rust app-server eval/run
+    → 每个 task 启动 Rust AgentLoop
     → post-agent verification 只作为 evaluation scoring 证据，
       不回灌 AgentLoop completion。
-    → _task_result() 写 EvaluationTaskResult.evaluation_metrics:
+    → result.json 写 evaluation_metrics:
         schema_version = evaluation.metrics/v1
       resolved.value 只投影 evaluation_passed；
       FAIL_TO_PASS/PASS_TO_PASS、verification、patch、trajectory、

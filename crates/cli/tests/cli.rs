@@ -7,6 +7,7 @@ const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
 const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const PYTHON_SIDECAR_ENV: &str = "SINGULARITY_PYTHON_SIDECAR";
 const PYTHON_SIDECAR_PROJECT_ROOT_ENV: &str = "SINGULARITY_SIDECAR_PROJECT_ROOT";
+const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const FAKE_APP_SERVER_EXIT_CODE: i32 = 7;
 
 #[test]
@@ -153,6 +154,76 @@ for line in sys.stdin:
     assert!(!stdout.contains("secret-value"));
     assert!(!stdout.contains("https://provider.example/v1"));
     assert!(!stdout.contains("gpt-test"));
+}
+
+#[test]
+fn cli_prefers_sibling_app_server_over_path_lookup() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_path_dir = temp.path().join("fake-path");
+    std::fs::create_dir(&fake_path_dir).expect("fake path dir");
+    let fake_app_server = write_named_fake_app_server(
+        &fake_path_dir,
+        DEFAULT_APP_SERVER_BIN,
+        &format!(
+            "import sys\nprint('old app-server should not run', file=sys.stderr)\nsys.exit({FAKE_APP_SERVER_EXIT_CODE})\n"
+        ),
+    );
+    ensure_app_server_binary();
+
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_path_dir];
+    paths.extend(std::env::split_paths(&original_path));
+    let path = std::env::join_paths(paths).expect("join path");
+
+    let output = Command::cargo_bin("sg")
+        .expect("binary")
+        .args(["config", "doctor"])
+        .env_remove(APP_SERVER_BIN_ENV)
+        .env(APP_SERVER_DB_ENV, &db_path)
+        .env("PATH", path)
+        .output()
+        .expect("doctor cli");
+
+    assert!(
+        output.status.success(),
+        "fake_app_server={}\nstderr={}",
+        fake_app_server.display(),
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains(&format!(
+        "native_agent_loop={}",
+        expected_native_agent_loop_status()
+    )));
+    assert!(!stderr(&output).contains("old app-server should not run"));
+}
+
+#[test]
+fn cli_fails_closed_without_explicit_or_sibling_app_server() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let cli_dir = temp.path().join("isolated-cli");
+    let fake_path_dir = temp.path().join("fake-path");
+    std::fs::create_dir(&cli_dir).expect("cli dir");
+    std::fs::create_dir(&fake_path_dir).expect("fake path dir");
+    let copied_cli = copy_current_cli_to(&cli_dir);
+    write_named_fake_app_server(
+        &fake_path_dir,
+        DEFAULT_APP_SERVER_BIN,
+        "import sys\nprint('stale PATH app-server should not run', file=sys.stderr)\nsys.exit(7)\n",
+    );
+    let path = std::env::join_paths([fake_path_dir]).expect("join path");
+
+    let output = std::process::Command::new(copied_cli)
+        .args(["config", "doctor"])
+        .env_remove(APP_SERVER_BIN_ENV)
+        .env("PATH", path)
+        .output()
+        .expect("doctor cli");
+
+    let stderr = stderr(&output);
+    assert!(!output.status.success());
+    assert!(stderr.contains("not found beside sg"), "stderr={stderr}");
+    assert!(!stderr.contains("stale PATH app-server should not run"));
 }
 
 #[test]
@@ -1208,10 +1279,22 @@ for line in sys.stdin:
 }
 
 fn write_fake_app_server(dir: &Path, script: &str) -> PathBuf {
+    write_named_fake_app_server(dir, "fake_app_server", script)
+}
+
+fn expected_native_agent_loop_status() -> &'static str {
+    if cfg!(windows) {
+        "completed"
+    } else {
+        "blocked"
+    }
+}
+
+fn write_named_fake_app_server(dir: &Path, name: &str, script: &str) -> PathBuf {
     let script_path = dir.join("fake_app_server.py");
     std::fs::write(&script_path, script).expect("write fake app-server script");
     if cfg!(windows) {
-        let launcher = dir.join("fake_app_server.cmd");
+        let launcher = dir.join(format!("{name}.cmd"));
         std::fs::write(
             &launcher,
             format!(
@@ -1222,7 +1305,7 @@ fn write_fake_app_server(dir: &Path, script: &str) -> PathBuf {
         .expect("write fake app-server launcher");
         launcher
     } else {
-        let launcher = dir.join("fake_app_server");
+        let launcher = dir.join(name);
         std::fs::write(
             &launcher,
             format!("#!/bin/sh\nexec python3 '{}' \n", script_path.display()),
@@ -1244,6 +1327,23 @@ fn write_fake_app_server(dir: &Path, script: &str) -> PathBuf {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
+}
+
+fn copy_current_cli_to(dir: &Path) -> PathBuf {
+    let source = assert_cmd::cargo::cargo_bin("sg");
+    let target = dir.join(format!("sg{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(&source, &target).expect("copy sg binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(&target)
+            .expect("copied cli metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&target, permissions).expect("copied cli executable");
+    }
+    target
 }
 
 fn python_bin() -> String {

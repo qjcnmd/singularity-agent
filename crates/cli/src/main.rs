@@ -274,7 +274,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         Command::Config {
             command: ConfigCommand::Doctor,
         } => {
-            println!("app_server_bin={}", app_server_bin());
+            println!("app_server_bin={}", app_server_bin()?);
             println!("app_server_db={}", app_server_db_display());
             println!("client=protocol-only");
             print_readiness()?;
@@ -378,7 +378,7 @@ fn print_wire_request(message: JsonRpcMessage) -> Result<(), String> {
 }
 
 fn run_daemon(db: Option<PathBuf>) -> Result<(), String> {
-    let mut command = ProcessCommand::new(app_server_bin());
+    let mut command = ProcessCommand::new(app_server_bin()?);
     if let Some(db) = db {
         command.env(APP_SERVER_DB_ENV, db);
     }
@@ -403,7 +403,7 @@ struct AppServerClient {
 
 impl AppServerClient {
     fn spawn(agent_host: Option<AgentHost>) -> Result<Self, String> {
-        let mut command = ProcessCommand::new(app_server_bin());
+        let mut command = ProcessCommand::new(app_server_bin()?);
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
             command.env(APP_SERVER_DB_ENV, db);
@@ -956,11 +956,30 @@ fn required_str<'a>(value: &'a Value, path: &[&str]) -> Result<&'a str, String> 
         .ok_or_else(|| format!("missing string field {}", path.join(".")))
 }
 
-fn app_server_bin() -> String {
-    std::env::var(APP_SERVER_BIN_ENV).unwrap_or_else(|_| DEFAULT_APP_SERVER_BIN.to_string())
+fn app_server_bin() -> Result<String, String> {
+    if let Ok(path) = std::env::var(APP_SERVER_BIN_ENV) {
+        return Ok(path);
+    }
+    sibling_app_server_bin()
+        .map(|path| path.to_string_lossy().to_string())
+        .ok_or_else(|| {
+            format!(
+                "{DEFAULT_APP_SERVER_BIN} not found beside sg; set {APP_SERVER_BIN_ENV} to an explicit app-server binary"
+            )
+        })
 }
 
 fn app_server_db_display() -> String {
     std::env::var(APP_SERVER_DB_ENV)
         .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string())
+}
+
+fn sibling_app_server_bin() -> Option<PathBuf> {
+    let mut path = std::env::current_exe().ok()?;
+    path.pop();
+    path.push(format!(
+        "{DEFAULT_APP_SERVER_BIN}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    path.is_file().then_some(path)
 }

@@ -31,7 +31,7 @@ use singularity_store::{ActiveSidecarRun, SessionStore, StoreError};
 use singularity_tools::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
     SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolRegistry, ToolSpec,
-    WindowsRestrictedTokenSandboxBackend, WorkspaceTools,
+    WindowsRestrictedTokenSandboxBackend, WorkspaceTools, command_scope_digest,
 };
 use thiserror::Error;
 
@@ -55,6 +55,7 @@ const EVAL_RESULT_SCHEMA: &str = "evaluation.result/v1";
 const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const EVAL_PROVIDER_BLOCKER: &str = "provider_config_missing";
 const EVAL_WORKSPACE_BLOCKER: &str = "eval_workspace_failed";
+const EVAL_CAPABILITY_BLOCKER: &str = "native_agent_loop_unavailable";
 const EVAL_AGENT_BLOCKER: &str = "agent_loop_failed";
 const EVAL_VERIFICATION_BLOCKER: &str = "verification_failed";
 const EVAL_RUNNER_NAME: &str = "rust_native";
@@ -422,7 +423,11 @@ impl AppServer {
                 ErrorCode::invalid_request("invalid eval manifest: tasks must not be empty"),
             );
         }
-        let mut result = run_native_eval(&params, tasks);
+        let mut result = if native_agent_loop_ready() {
+            run_native_eval(&params, tasks)
+        } else {
+            run_native_eval_blocked_by_capability(&params, tasks)
+        };
         if let Err(error) = write_eval_artifacts(&mut result, params.output_root.as_deref()) {
             return json_error(
                 message.id,
@@ -1407,6 +1412,26 @@ fn run_native_eval(params: &EvalRunParams, tasks: &[Value]) -> EvalRunResult {
     }
 }
 
+fn run_native_eval_blocked_by_capability(params: &EvalRunParams, tasks: &[Value]) -> EvalRunResult {
+    let capability = AgentLoopCapability::current();
+    let message = format!("{}: {}", capability.status.as_str(), capability.reason);
+    let task_results = tasks
+        .iter()
+        .map(|task| blocked_eval_task_result(task, EVAL_CAPABILITY_BLOCKER, message.clone()))
+        .collect::<Vec<_>>();
+    EvalRunResult {
+        run_id: params.run_id.clone(),
+        manifest: params.manifest.clone(),
+        runner: EVAL_RUNNER_NAME.to_string(),
+        status: "blocked".to_string(),
+        blocker: Some(EVAL_CAPABILITY_BLOCKER.to_string()),
+        tasks: task_results,
+        result_path: None,
+        report_path: None,
+        evaluation_passed: false,
+    }
+}
+
 fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &PathBuf) -> Value {
     let task_id = eval_task_id(task);
     if let Err(error) = validate_eval_workspace(task) {
@@ -1456,6 +1481,7 @@ fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &PathBuf) -> Value 
             Some(error),
             json!({"passed": false, "status": "not_run"}),
             json!({"passed": false, "status": "not_run"}),
+            blocked_smoke_check_payload(task),
         );
     }
     let public_check = run_verification(task, &workspace, "public_verification_command")
@@ -1468,8 +1494,14 @@ fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &PathBuf) -> Value 
     let expected_change = expected_file_change_satisfied(task, &changed_files);
     let summary_ok = summary_requirement_satisfied(task, agent_result.final_answer.as_deref());
     let agent_completed = agent_result.completed;
-    let evaluation_passed =
-        agent_completed && public_passed && hidden_passed && expected_change && summary_ok;
+    let smoke_check = run_smoke_check(task, &workspace, &agent_result);
+    let smoke_command_satisfied = smoke_check.get("passed").and_then(Value::as_bool) == Some(true);
+    let evaluation_passed = agent_completed
+        && public_passed
+        && hidden_passed
+        && expected_change
+        && summary_ok
+        && smoke_command_satisfied;
     let blocker = if evaluation_passed {
         None
     } else if !agent_completed {
@@ -1487,6 +1519,7 @@ fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &PathBuf) -> Value 
         agent_result.error.clone(),
         public_check,
         hidden_check,
+        smoke_check,
     )
 }
 
@@ -1546,7 +1579,7 @@ fn prepare_eval_workspace(task: &Value, run_dir: &PathBuf) -> Result<EvalWorkspa
                         commit.to_string(),
                     ],
                     EVAL_GIT_TIMEOUT_SECONDS,
-                    SandboxNetworkMode::Denied,
+                    SandboxNetworkMode::Allowed,
                     SandboxFilesystemMode::WorkspaceWrite,
                 );
                 ensure_command_success(&checkout, "git checkout")?;
@@ -1609,7 +1642,7 @@ fn run_verification(task: &Value, workspace: &EvalWorkspace, field: &str) -> Opt
         workspace,
         command,
         timeout,
-        SandboxNetworkMode::Denied,
+        SandboxNetworkMode::Allowed,
         SandboxFilesystemMode::WorkspaceWrite,
     );
     Some(command_check_payload(result))
@@ -1630,7 +1663,7 @@ fn apply_eval_test_patch(task: &Value, workspace: &EvalWorkspace) -> Result<(), 
             EVAL_TEST_PATCH_FILE.to_string(),
         ],
         EVAL_DEFAULT_TIMEOUT_SECONDS,
-        SandboxNetworkMode::Denied,
+        SandboxNetworkMode::Allowed,
         SandboxFilesystemMode::WorkspaceWrite,
     );
     let _ = std::fs::remove_file(&patch_path);
@@ -1647,7 +1680,7 @@ fn git_changed_files(workspace: &EvalWorkspace) -> Result<Vec<String>, String> {
             "--name-only".to_string(),
         ],
         EVAL_DEFAULT_TIMEOUT_SECONDS,
-        SandboxNetworkMode::Denied,
+        SandboxNetworkMode::Allowed,
         SandboxFilesystemMode::WorkspaceWrite,
     );
     ensure_command_success(&result, "git diff")?;
@@ -1765,6 +1798,39 @@ fn command_check_payload(result: CommandResult) -> Value {
     })
 }
 
+fn run_smoke_check(
+    task: &Value,
+    workspace: &EvalWorkspace,
+    agent_result: &singularity_agent::AgentLoopResult,
+) -> Value {
+    if !smoke_command_required(task) {
+        return json!({"passed": true, "status": "not_required"});
+    }
+    if smoke_command_satisfied(task, agent_result) {
+        return json!({"passed": true, "status": "passed", "source": "agent_tool_result"});
+    }
+    let Some(command) = task.get("smoke_command").and_then(Value::as_str) else {
+        return json!({"passed": false, "status": "not_run"});
+    };
+    let Some(argv) = parse_smoke_command_argv(command.trim()) else {
+        return json!({"passed": false, "status": "not_run", "error": "invalid_smoke_command"});
+    };
+    let timeout = task
+        .get("verification_timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(EVAL_DEFAULT_TIMEOUT_SECONDS);
+    let mut payload = command_check_payload(run_eval_command(
+        &workspace.task_dir,
+        &workspace.repo_dir,
+        argv,
+        timeout,
+        SandboxNetworkMode::Allowed,
+        SandboxFilesystemMode::WorkspaceWrite,
+    ));
+    payload["source"] = json!("eval_runner_command");
+    payload
+}
+
 fn eval_task_result(
     task: &Value,
     agent_result: &singularity_agent::AgentLoopResult,
@@ -1775,15 +1841,21 @@ fn eval_task_result(
     error: Option<String>,
     public_check: Value,
     hidden_check: Value,
+    smoke_check: Value,
 ) -> Value {
-    let evaluation_passed =
-        blocker.is_none() && agent_result.completed && public_passed && hidden_passed;
+    let smoke_command_satisfied = smoke_check.get("passed").and_then(Value::as_bool) == Some(true);
+    let evaluation_passed = blocker.is_none()
+        && agent_result.completed
+        && public_passed
+        && hidden_passed
+        && smoke_command_satisfied;
     json!({
         "task_id": eval_task_id(task),
         "agent_completed": agent_result.completed,
         "tests_passed": public_passed && hidden_passed,
         "public_verification_passed": public_passed,
         "hidden_verification_passed": hidden_passed,
+        "smoke_command_satisfied": smoke_command_satisfied,
         "evaluation_passed": evaluation_passed,
         "local_process_fallback_count": 0,
         "status": if evaluation_passed { "completed" } else if blocker == Some(EVAL_WORKSPACE_BLOCKER) || blocker == Some(EVAL_PROVIDER_BLOCKER) { "blocked" } else { "failed" },
@@ -1796,6 +1868,7 @@ fn eval_task_result(
         "checks": {
             "public": public_check,
             "hidden": hidden_check,
+            "smoke": smoke_check,
         }
     })
 }
@@ -1807,6 +1880,7 @@ fn blocked_eval_task_result(task: &Value, blocker: &str, message: String) -> Val
         "tests_passed": false,
         "public_verification_passed": false,
         "hidden_verification_passed": false,
+        "smoke_command_satisfied": !smoke_command_required(task),
         "evaluation_passed": false,
         "local_process_fallback_count": 0,
         "status": "blocked",
@@ -1814,9 +1888,105 @@ fn blocked_eval_task_result(task: &Value, blocker: &str, message: String) -> Val
         "error": message,
         "checks": {
             "public": {"passed": false, "status": "not_run"},
-            "hidden": {"passed": false, "status": "not_run"}
+            "hidden": {"passed": false, "status": "not_run"},
+            "smoke": blocked_smoke_check_payload(task)
         }
     })
+}
+
+fn smoke_command_required(task: &Value) -> bool {
+    task.get("smoke_command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| !command.trim().is_empty())
+}
+
+fn smoke_command_satisfied(
+    task: &Value,
+    agent_result: &singularity_agent::AgentLoopResult,
+) -> bool {
+    let Some(expected_result_id) = expected_smoke_command_result_id(task) else {
+        return !smoke_command_required(task);
+    };
+    agent_result.tool_results.iter().any(|result| {
+        result.tool_name == TOOL_COMMAND
+            && result.ok
+            && result.result_id.as_deref() == Some(expected_result_id.as_str())
+    })
+}
+
+fn expected_smoke_command_result_id(task: &Value) -> Option<String> {
+    let command = task.get("smoke_command").and_then(Value::as_str)?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let argv = parse_smoke_command_argv(command)?;
+    Some(command_scope_digest(
+        &argv,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Allowed,
+    ))
+}
+
+fn parse_smoke_command_argv(command: &str) -> Option<Vec<String>> {
+    let mut argv = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match quote {
+            Some(marker) if ch == marker => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    argv.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        argv.push(current);
+    }
+    (!argv.is_empty()).then_some(argv)
+}
+
+#[cfg(test)]
+fn smoke_check_payload(task: &Value, satisfied: bool) -> Value {
+    if !smoke_command_required(task) {
+        return json!({"passed": true, "status": "not_required"});
+    }
+    let status = if satisfied {
+        "passed"
+    } else if expected_smoke_command_result_id(task).is_some() {
+        "failed"
+    } else {
+        "not_run"
+    };
+    json!({
+        "passed": satisfied,
+        "status": status
+    })
+}
+
+fn blocked_smoke_check_payload(task: &Value) -> Value {
+    if smoke_command_required(task) {
+        json!({"passed": false, "status": "not_run"})
+    } else {
+        json!({"passed": true, "status": "not_required"})
+    }
 }
 
 fn native_eval_workspace_tools(workspace_root: PathBuf, _task: &Value) -> WorkspaceTools {
@@ -1879,7 +2049,21 @@ fn eval_agent_prompt(task: &Value) -> String {
         }
     }
     if let Some(command) = task.get("smoke_command").and_then(Value::as_str) {
-        parts.push(format!("Use the command tool with argv to run this smoke command before the final answer: {command}"));
+        let instruction = if let Some(argv) = parse_smoke_command_argv(command.trim()) {
+            let payload = json!({
+                "argv": argv,
+                "sandbox_mode": "workspace_write",
+                "network_access": "allowed",
+            });
+            format!(
+                "Before the final answer, call the command tool exactly once with these arguments: {payload}. The evaluation fails if this command tool result is missing."
+            )
+        } else {
+            format!(
+                "Before the final answer, use the command tool with argv to run this smoke command: {command}. The evaluation fails if this command tool result is missing."
+            )
+        };
+        parts.push(instruction);
     }
     parts.push("Available tools are read, list, grep, edit, patch, and command. Finish with a concise final answer that mentions verification.".to_string());
     parts.join("\n\n")
@@ -2132,7 +2316,7 @@ fn native_workspace_tool_specs() -> Vec<ToolSpec> {
                     "cwd": {"type": "string"},
                     "timeout_seconds": {"type": "integer", "minimum": 1},
                     "sandbox_mode": {"type": "string", "enum": command_sandbox_modes},
-                    "network_access": {"type": "string", "enum": command_network_access}
+                    "network_access": {"type": "string", "enum": command_network_access, "default": "allowed"}
                 },
                 "required": ["argv"],
                 "additionalProperties": false
@@ -2244,12 +2428,12 @@ fn agent_completed_delta(run_status: &AgentRunStatus) -> Option<String> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use singularity_agent::PendingToolCall;
+    use singularity_agent::{AgentLoopResult, PendingToolCall};
     use singularity_model::{
         ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, Provider,
         ProviderError,
     };
-    use singularity_tools::command_scope_resource;
+    use singularity_tools::{ToolResult, command_scope_digest, command_scope_resource};
 
     use super::*;
 
@@ -2269,6 +2453,106 @@ mod tests {
                 .unwrap_or_else(|| self.responses.last().expect("static provider response"))
                 .clone())
         }
+    }
+
+    #[test]
+    fn native_eval_smoke_gate_requires_matching_command_scope_digest() {
+        let task = json!({"task_id": "smoke", "smoke_command": "python -m py_compile src/app.py"});
+        let expected_id = expected_smoke_command_result_id(&task).expect("expected smoke digest");
+        let wrong_id = command_scope_digest(
+            &[
+                "python".to_string(),
+                "-c".to_string(),
+                "print('ok')".to_string(),
+            ],
+            &SandboxFilesystemMode::ReadOnly,
+            &SandboxNetworkMode::Allowed,
+        );
+        let mut wrong_tool = ToolResult::summary(
+            "call_wrong",
+            TOOL_COMMAND,
+            true,
+            "wrong command ok",
+            "digest_wrong",
+        );
+        wrong_tool.result_id = Some(wrong_id);
+        let mut right_tool = ToolResult::summary(
+            "call_right",
+            TOOL_COMMAND,
+            true,
+            "smoke command ok",
+            "digest_right",
+        );
+        right_tool.result_id = Some(expected_id);
+        let base_result = AgentLoopResult {
+            status: AgentStatus::Completed,
+            completed: true,
+            final_answer: Some("done".to_string()),
+            model_turns: 1,
+            tool_calls: 1,
+            approval_count: 0,
+            approval_requests: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_results: vec![wrong_tool],
+            tool_repairs: Vec::new(),
+            error: None,
+        };
+
+        assert!(!smoke_command_satisfied(&task, &base_result));
+        assert_eq!(smoke_check_payload(&task, false)["status"], "failed");
+
+        let mut matching_result = base_result;
+        matching_result.tool_results = vec![right_tool];
+        assert!(smoke_command_satisfied(&task, &matching_result));
+        assert_eq!(smoke_check_payload(&task, true)["status"], "passed");
+    }
+
+    #[test]
+    fn native_eval_prompt_includes_exact_smoke_command_tool_arguments() {
+        let task = json!({
+            "user_task": "fix it",
+            "smoke_command": "python -m py_compile src/app.py"
+        });
+
+        let prompt = eval_agent_prompt(&task);
+
+        assert!(prompt.contains("\"argv\":[\"python\",\"-m\",\"py_compile\",\"src/app.py\"]"));
+        assert!(prompt.contains("\"sandbox_mode\":\"workspace_write\""));
+        assert!(prompt.contains("\"network_access\":\"allowed\""));
+        assert!(prompt.contains("evaluation fails if this command tool result is missing"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_eval_smoke_check_runs_real_command_when_agent_omits_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(repo_dir.join("src")).expect("src dir");
+        std::fs::write(repo_dir.join("src").join("app.py"), "print('ok')\n").expect("app file");
+        let workspace = EvalWorkspace {
+            task_dir: dir.path().to_path_buf(),
+            repo_dir,
+        };
+        let task = json!({"task_id": "smoke", "smoke_command": "python -m py_compile src/app.py"});
+        let agent_result = AgentLoopResult {
+            status: AgentStatus::Completed,
+            completed: true,
+            final_answer: Some("done".to_string()),
+            model_turns: 1,
+            tool_calls: 0,
+            approval_count: 0,
+            approval_requests: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            tool_repairs: Vec::new(),
+            error: None,
+        };
+
+        let payload = run_smoke_check(&task, &workspace, &agent_result);
+
+        assert_eq!(payload["passed"], true);
+        assert_eq!(payload["status"], "passed");
+        assert_eq!(payload["source"], "eval_runner_command");
     }
 
     #[test]
@@ -2461,7 +2745,7 @@ mod tests {
                 "echo app-server-sandbox-ok".to_string(),
             ],
             &SandboxFilesystemMode::ReadOnly,
-            &SandboxNetworkMode::Denied,
+            &SandboxNetworkMode::Allowed,
         );
         let grant = ApprovalGrant::allow(
             "approval_turn_1_call_1",

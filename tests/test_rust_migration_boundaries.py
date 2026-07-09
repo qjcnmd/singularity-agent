@@ -136,7 +136,9 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "crates/protocol/src/lib.rs",
         "crates/tools/src/lib.rs",
         "src/singularity/agent_host/sidecar.py",
+        "docs/evaluation/public-representative-task.json",
         "docs/singularity.md",
+        "docs/architecture/modules/evaluation-benchmark-runner.md",
         "docs/architecture/modules/rust-app-server-protocol.md",
         "docs/architecture/rust-agent-host.md",
         "scripts/verify_rust_cli_agent_host.py",
@@ -169,7 +171,26 @@ def test_guard_rejects_rust_agent_host_docs_without_logic_map_marker(tmp_path: P
 
     assert result.returncode == 1
     assert "rust-agent-host-docs-incomplete" in result.stderr
-    assert marker in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative", "needle"),
+    (
+        ("docs/evaluation/public-representative-task.json", '"model_visible_verification_command"'),
+        ("docs/architecture/rust-agent-host.md", "safe_for_model"),
+    ),
+)
+def test_guard_rejects_rust_public_nonstandard_names(
+    tmp_path: Path, relative: str, needle: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    path = repo / relative
+    path.write_text(path.read_text(encoding="utf-8") + f"\n{needle}\n", encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "rust-public-naming-drift" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -695,16 +716,21 @@ def test_guard_rejects_unused_tokio_crate_dependency(tmp_path: Path, manifest_pa
     ("old", "new", "violation"),
     (
         ("pub struct AgentLoopCapability", "pub struct AgentLoopState", "native-agent-loop-capability-drift"),
-        ("available: true", "available: false", "native-agent-loop-status-drift"),
+        ("probe_windows_command_sandbox()", "Ok(())", "native-agent-loop-status-drift"),
+        (
+            "CommandExecutionStatus::Completed",
+            "CommandExecutionStatus::SpawnFailed",
+            "native-agent-loop-status-drift",
+        ),
         (
             "status: AgentStatus::Completed",
             "status: AgentStatus::NotMigrated",
             "native-agent-loop-status-drift",
         ),
         (
-            "blockers: Vec::new()",
-            'blockers: vec!["approval_resume".to_string()]',
-            "native-agent-loop-blocker-drift",
+            "strict_command_sandbox_unsupported_platform",
+            "strict_command_sandbox_pending",
+            "native-agent-loop-platform-drift",
         ),
     ),
 )

@@ -149,6 +149,7 @@ fn agent_run_status_reports_not_migrated_without_claiming_completion() {
     assert!(run_status.final_answer.is_none());
 }
 
+#[cfg(windows)]
 #[test]
 fn agent_loop_capability_is_available_without_remaining_blockers() {
     let capability = AgentLoopCapability::current();
@@ -157,6 +158,20 @@ fn agent_loop_capability_is_available_without_remaining_blockers() {
     assert_eq!(capability.status, AgentStatus::Completed);
     assert!(capability.reason.contains("native Rust AgentLoop"));
     assert!(capability.blockers.is_empty());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn agent_loop_capability_reports_unsupported_platform_blocker() {
+    let capability = AgentLoopCapability::current();
+
+    assert!(!capability.available);
+    assert_eq!(capability.status, AgentStatus::Blocked);
+    assert!(
+        capability
+            .blockers
+            .contains(&"strict_command_sandbox_unsupported_platform".to_string())
+    );
 }
 
 #[test]
@@ -641,7 +656,7 @@ fn agent_loop_command_approval_grant_requires_exact_command_resource() {
     let command_resource = command_scope_resource(
         &argv,
         &SandboxFilesystemMode::ReadOnly,
-        &SandboxNetworkMode::Denied,
+        &SandboxNetworkMode::Allowed,
     );
     let input = AgentLoopInput {
         max_turns: 2,

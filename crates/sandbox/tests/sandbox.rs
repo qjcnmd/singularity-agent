@@ -69,7 +69,7 @@ fn command_request_and_result_are_schema_backed_boundaries() {
     let result_value = serde_json::to_value(&result).expect("serialize command result");
 
     assert_eq!(request_value["purpose"], "project_verification");
-    assert_eq!(request_value["network"]["mode"], "denied");
+    assert_eq!(request_value["network"]["mode"], "allowed");
     assert_eq!(result_value["semantic_status"], "succeeded");
     assert_eq!(result_value["redacted"], true);
     assert_eq!(request.permission_resource(), "python -m pytest");
@@ -621,7 +621,7 @@ fn windows_restricted_token_backend_allows_explicit_network_allowed_mode() {
 
 #[cfg(windows)]
 #[test]
-fn windows_restricted_token_backend_marks_hard_network_denied_mode_unsupported() {
+fn windows_restricted_token_backend_marks_network_denied_mode_unsupported() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut request = CommandRequest::project_verification(
         "command_network_denied",
@@ -634,7 +634,29 @@ fn windows_restricted_token_backend_marks_hard_network_denied_mode_unsupported()
         path_str(workspace.path()),
     );
     request.network.mode = SandboxNetworkMode::Denied;
-    request.network.require_hard_isolation = true;
+    let backend = WindowsRestrictedTokenSandboxBackend::new();
+
+    let result = backend.execute(&request);
+
+    assert_eq!(result.execution_status, CommandExecutionStatus::Unsupported);
+    assert_eq!(result.semantic_status, CommandSemanticStatus::Unsupported);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_restricted_token_backend_marks_network_allowlist_mode_unsupported() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut request = CommandRequest::project_verification(
+        "command_network_allowlist",
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo should-not-run".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request.network.mode = SandboxNetworkMode::Allowlist;
     let backend = WindowsRestrictedTokenSandboxBackend::new();
 
     let result = backend.execute(&request);

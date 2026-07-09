@@ -434,9 +434,6 @@ impl ToolResult {
             "truncated": self.truncated,
             "redacted": self.redacted,
         });
-        if let Some(approval_request_id) = &self.approval_request_id {
-            payload["approval_request_id"] = json!(approval_request_id);
-        }
         if self.view != ToolResultView::ReferenceOnly {
             payload["content"] = json!(preview);
             payload["preview"] = json!(preview);
@@ -782,8 +779,15 @@ impl WorkspaceTools {
         if let Some(timeout_seconds) = input.timeout_seconds {
             request.timeout_seconds = timeout_seconds;
         }
+        let scope_digest = command_scope_digest(
+            &request.argv,
+            &request.filesystem.mode,
+            &request.network.mode,
+        );
         let result = backend.execute(&request);
-        Ok(command_tool_output(result))
+        let mut output = command_tool_output(result);
+        output.metadata["result_id"] = json!(scope_digest);
+        Ok(output)
     }
 
     fn grep_path(
@@ -907,7 +911,7 @@ impl CommandToolInput {
     pub fn network_access(&self) -> SandboxNetworkMode {
         self.network_access
             .clone()
-            .unwrap_or(SandboxNetworkMode::Denied)
+            .unwrap_or(SandboxNetworkMode::Allowed)
     }
 }
 
@@ -930,6 +934,16 @@ pub fn command_scope_resource(
             .unwrap_or_else(|| format!("{network_access:?}"));
         format!("command:{command};sandbox:{sandbox};network:{network}")
     }
+}
+
+pub fn command_scope_digest(
+    argv: &[String],
+    sandbox_mode: &SandboxFilesystemMode,
+    network_access: &SandboxNetworkMode,
+) -> String {
+    stable_digest(&json!({
+        "command_scope": command_scope_resource(argv, sandbox_mode, network_access)
+    }))
 }
 
 fn validate_tool_name(name: &str) -> Result<(), String> {

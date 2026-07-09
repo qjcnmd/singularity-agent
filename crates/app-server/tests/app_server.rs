@@ -233,6 +233,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     assert_eq!(deleted[0]["result"]["deleted"], true);
 }
 
+#[cfg(windows)]
 #[test]
 fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -262,6 +263,40 @@ fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() 
             .as_array()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn app_server_reports_native_agent_loop_capability_as_unsupported_off_windows() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut server = AppServer::new(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    let capability = server
+        .handle_json(r#"{"method":"agent/capability","id":2,"params":{}}"#)
+        .unwrap();
+
+    assert_eq!(
+        capability[0]["result"]["nativeAgentLoop"]["available"],
+        false
+    );
+    assert_eq!(
+        capability[0]["result"]["nativeAgentLoop"]["status"],
+        "blocked"
+    );
+    assert!(
+        capability[0]["result"]["nativeAgentLoop"]["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker == "strict_command_sandbox_unsupported_platform")
     );
 }
 
@@ -313,6 +348,7 @@ fn app_server_eval_run_writes_blocked_native_result_artifacts_without_python_sid
     assert_eq!(result["evaluation_passed"], false);
     assert_eq!(result["tasks"][0]["agent_completed"], false);
     assert_eq!(result["tasks"][0]["tests_passed"], false);
+    assert_eq!(result["tasks"][0]["smoke_command_satisfied"], true);
     assert_eq!(result["tasks"][0]["local_process_fallback_count"], 0);
     let result_path = result["result_path"].as_str().expect("result path");
     let report_path = result["report_path"].as_str().expect("report path");
@@ -325,6 +361,110 @@ fn app_server_eval_run_writes_blocked_native_result_artifacts_without_python_sid
     assert_eq!(payload["runner"], "rust_native");
     assert_eq!(payload["tasks"][0]["blocker"], "eval_workspace_failed");
     assert_eq!(payload["tasks"][0]["checks"]["public"]["status"], "not_run");
+    assert_eq!(
+        payload["tasks"][0]["checks"]["smoke"]["status"],
+        "not_required"
+    );
+}
+
+#[test]
+fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut server = AppServer::new(store);
+    let manifest = dir.path().join("eval.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "schema_version": "evaluation.task_set/v1",
+  "tasks": [
+    {
+      "task_id": "fixture_eval",
+      "workspace": {"type": "unsupported"},
+      "user_task": "finish",
+      "verification_command": "python -c pass",
+      "smoke_command": "python -m py_compile src/app.py"
+    }
+  ]
+}"#,
+    )
+    .expect("manifest");
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    let request = serde_json::json!({
+        "method": "eval/run",
+        "id": 2,
+        "params": {
+            "manifest": manifest,
+            "runId": "eval_smoke_not_run",
+        }
+    })
+    .to_string();
+    let response = server.handle_json(&request).unwrap();
+    let result = result_message(&response);
+
+    assert_eq!(result["status"], "blocked");
+    assert_eq!(result["tasks"][0]["blocker"], "eval_workspace_failed");
+    assert_eq!(result["tasks"][0]["smoke_command_satisfied"], false);
+    assert_eq!(result["tasks"][0]["checks"]["smoke"]["status"], "not_run");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn app_server_eval_run_fails_closed_when_native_capability_is_unavailable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut server = AppServer::new(store);
+    let manifest = dir.path().join("eval.json");
+    let output_root = dir.path().join("eval-output");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "schema_version": "evaluation.task_set/v1",
+  "tasks": [
+    {
+      "task_id": "fixture_eval",
+      "workspace": {"type": "fixture", "files": {"README.md": "hello"}},
+      "user_task": "finish",
+      "verification_command": "python -c pass"
+    }
+  ]
+}"#,
+    )
+    .expect("manifest");
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    let request = serde_json::json!({
+        "method": "eval/run",
+        "id": 2,
+        "params": {
+            "manifest": manifest,
+            "runId": "eval_native_unavailable",
+            "outputRoot": output_root,
+        }
+    })
+    .to_string();
+    let response = server.handle_json(&request).unwrap();
+    let result = result_message(&response);
+
+    assert_eq!(result["runner"], "rust_native");
+    assert_eq!(result["status"], "blocked");
+    assert_eq!(result["blocker"], "native_agent_loop_unavailable");
+    assert_eq!(result["tasks"][0]["agent_completed"], false);
+    assert_eq!(
+        result["tasks"][0]["blocker"],
+        "native_agent_loop_unavailable"
+    );
 }
 
 #[test]
@@ -2735,7 +2875,7 @@ for line in sys.stdin:
         .unwrap();
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"long run"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"long run"}}]}}}}"#
         ))
         .unwrap();
     let turn_id = result_message(&turn)["turn"]["turn_id"]

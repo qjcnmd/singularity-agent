@@ -1,5 +1,6 @@
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, SandboxBackend, SandboxCapabilities,
+    SandboxNetworkMode,
 };
 use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
@@ -916,7 +917,11 @@ fn broker_ask_decision_blocks_execution_with_safe_approval_tool_result() {
 
     assert!(!tool_result.ok);
     assert_eq!(tool_result.error_code.as_deref(), Some("approval_required"));
-    assert_eq!(payload["approval_request_id"], "approval_1");
+    assert_eq!(
+        tool_result.approval_request_id.as_deref(),
+        Some("approval_1")
+    );
+    assert!(payload.get("approval_request_id").is_none());
     assert!(!serialized.contains(".env"));
     assert!(!serialized.contains("secret"));
 }
@@ -987,6 +992,12 @@ fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
             .expect("stdout")
             .contains("command ok")
     );
+    assert!(
+        result.metadata["result_id"]
+            .as_str()
+            .expect("command scope digest")
+            .starts_with("hash:")
+    );
     assert!(result.content.get("argv").is_none());
     assert!(result.content.get("env").is_none());
     remove_workspace(&workspace);
@@ -1004,6 +1015,7 @@ impl SandboxBackend for RecordingSandboxBackend {
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
+        assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
         CommandResult::completed(&request.command_id, "command ok")
     }
 }

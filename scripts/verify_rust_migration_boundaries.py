@@ -94,6 +94,7 @@ ALLOWED_CRATE_DEPENDENCIES = {
 
 ALLOWED_PYTHON_MIGRATION_PATHS = {
     "src/singularity/agent_host",
+    "src/singularity/evaluation/manifests.py",
     "src/singularity/model/runner.py",
     "scripts/export_rust_parity_fixtures.py",
     "tests/test_rust_parity_fixtures.py",
@@ -171,6 +172,17 @@ STALE_INTERNAL_METADATA_FIELD = "internal" + "_metadata"
 STALE_TOOL_OUTPUT_FIXTURE_KEY = "tool_protocol_result" + "_envelope"
 STALE_CAPABILITY_FIELD = "missing" + "_boundaries"
 STALE_PLAN_FIELD = "merge" + "_requirements"
+RUST_PUBLIC_NAMING_TARGETS = (
+    "docs/evaluation/public-representative-task.json",
+    "docs/architecture/modules/rust-app-server-protocol.md",
+    "docs/architecture/rust-agent-host.md",
+    "docs/singularity.md",
+)
+RUST_PUBLIC_FORBIDDEN_NAMING = (
+    "model" + "_visible",
+    "model-visible",
+    "safe" + "_for_model",
+)
 
 LIFECYCLE_NAME_TARGETS = (
     "docs/singularity.md",
@@ -225,6 +237,7 @@ def main() -> int:
     violations.extend(_check_forbidden_desktop_paths(repo_root))
     violations.extend(_check_agent_loop_status(repo_root))
     violations.extend(_check_rust_agent_host_docs(repo_root))
+    violations.extend(_check_rust_public_naming(repo_root))
     violations.extend(_check_turn_lifecycle_docs(repo_root))
     violations.extend(_check_forbidden_lifecycle_names(repo_root))
     violations.extend(_check_cli_sidecar_surface(repo_root))
@@ -379,33 +392,43 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
                 "AgentLoopCapability and AgentLoop must exist for the native AgentLoop path",
             )
         ]
-    if "available: true" not in agent_text or "status: AgentStatus::Completed" not in agent_text:
+    if (
+        "#[cfg(windows)]" not in agent_text
+        or "windows_agent_loop_capability" not in agent_text
+        or "probe_windows_command_sandbox()" not in agent_text
+        or "WindowsRestrictedTokenSandboxBackend::new().execute(&request)" not in agent_text
+        or "CommandExecutionStatus::Completed" not in agent_text
+        or "CommandSemanticStatus::Succeeded" not in agent_text
+        or "STRICT_COMMAND_SANDBOX_PROBE_FAILED" not in agent_text
+        or "available: true" not in agent_text
+        or "status: AgentStatus::Completed" not in agent_text
+    ):
         return [
             Violation(
                 "native-agent-loop-status-drift",
                 _relative(agent, repo_root),
-                "AgentLoopCapability must report completed native cutover with no blockers",
+                "AgentLoopCapability must report completed native cutover only after a Windows sandbox probe succeeds",
             )
         ]
-    for blocker in (
-        "approval_resume",
-        "strict_command_sandbox",
-        "rust_evaluation_runner",
+    if (
+        "#[cfg(not(windows))]" not in agent_text
+        or "available: false" not in agent_text
+        or "status: AgentStatus::Blocked" not in agent_text
+        or "strict_command_sandbox_unsupported_platform" not in agent_text
     ):
-        if f'"{blocker}"' in agent_text:
-            return [
-                Violation(
-                    "native-agent-loop-blocker-drift",
-                    _relative(agent, repo_root),
-                    f"AgentLoopCapability must not keep completed blocker: {blocker}",
-                )
-            ]
-    if "blockers: Vec::new()" not in agent_text:
+        return [
+            Violation(
+                "native-agent-loop-platform-drift",
+                _relative(agent, repo_root),
+                "AgentLoopCapability must fail closed off Windows until a strict command sandbox backend exists",
+            )
+        ]
+    if "blockers: Vec::new()" not in agent_text or "blockers: vec![blocker]" not in agent_text:
         return [
             Violation(
                 "native-agent-loop-status-drift",
                 _relative(agent, repo_root),
-                "AgentLoopCapability must report completed native cutover with no blockers",
+                "AgentLoopCapability must keep separate success and fail-closed blocker paths on Windows",
             )
         ]
     cli_text = (repo_root / "crates" / "cli" / "src" / "main.rs").read_text(encoding="utf-8")
@@ -484,6 +507,25 @@ def _rust_migration_doc_text(path: Path, repo_root: Path, text: str) -> str:
         return text
     end = text.find("\n---\n\n```", start + 1)
     return text[start:] if end < 0 else text[start:end]
+
+
+def _check_rust_public_naming(repo_root: Path) -> list[Violation]:
+    violations: list[Violation] = []
+    for relative in RUST_PUBLIC_NAMING_TARGETS:
+        path = repo_root / relative
+        if not path.exists():
+            continue
+        text = _rust_migration_doc_text(path, repo_root, path.read_text(encoding="utf-8"))
+        for name in RUST_PUBLIC_FORBIDDEN_NAMING:
+            if name in text:
+                violations.append(
+                    Violation(
+                        "rust-public-naming-drift",
+                        relative,
+                        f"Rust migration public surface must use neutral names such as smoke_command, not {name}",
+                    )
+                )
+    return violations
 
 
 def _check_turn_lifecycle_docs(repo_root: Path) -> list[Violation]:

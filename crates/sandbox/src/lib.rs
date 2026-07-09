@@ -205,7 +205,7 @@ impl CommandRequest {
             purpose: CommandPurpose::ProjectVerification,
             timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
             network: SandboxNetworkPolicy {
-                mode: SandboxNetworkMode::Denied,
+                mode: SandboxNetworkMode::Allowed,
                 allowed_hosts: Vec::new(),
                 denied_hosts: Vec::new(),
                 require_hard_isolation: false,
@@ -914,8 +914,7 @@ fn command_request_denial(request: &CommandRequest) -> Option<CommandResult> {
             ));
         }
     }
-    if request.network.mode == SandboxNetworkMode::Allowlist
-        || request.network.require_hard_isolation
+    if request.network.mode != SandboxNetworkMode::Allowed || request.network.require_hard_isolation
     {
         return Some(CommandResult::unsupported(
             &request.command_id,

@@ -82,6 +82,7 @@ class EvaluationTask:
     hidden_verification_command: str = ""
     verification_prepare_commands: list[str] = field(default_factory=list)
     verification_timeout_seconds: int = EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
+    smoke_command: str = ""
     model_visible_verification_command: str = ""
     fixture_metadata: dict[str, Any] = field(default_factory=dict)
     hidden_test_patch: dict[str, Any] = field(default_factory=dict)
@@ -124,6 +125,7 @@ class EvaluationTask:
                 payload.get("verification_timeout_seconds")
                 or EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
             ),
+            smoke_command=str(payload.get("smoke_command") or "").strip(),
             model_visible_verification_command=str(payload.get("model_visible_verification_command") or "").strip(),
             fixture_metadata=coerce_evaluation_dict(
                 payload.get("fixture_metadata") or {},
@@ -188,6 +190,8 @@ class EvaluationTask:
             payload["hidden_verification_command"] = self.hidden_verification_command
         if self.verification_prepare_commands:
             payload["verification_prepare_commands"] = list(self.verification_prepare_commands)
+        if self.smoke_command:
+            payload["smoke_command"] = self.smoke_command
         if self.model_visible_verification_command:
             payload["model_visible_verification_command"] = self.model_visible_verification_command
         if self.fixture_metadata:
@@ -384,7 +388,7 @@ def _apply_benchmark_constraints(kernel: Any, task: EvaluationTask) -> None:
 
 def _model_visible_benchmark_constraints(task: EvaluationTask) -> dict[str, Any]:
     verification_command = _model_visible_verification_command(task)
-    if _requires_baseline_verification(task) and not task.model_visible_verification_command:
+    if _requires_baseline_verification(task) and not task.smoke_command and not task.model_visible_verification_command:
         verification_command = ""
     return {
         "task_id": task.task_id,
@@ -409,6 +413,8 @@ def _hidden_verification_command(task: EvaluationTask) -> str:
 
 
 def _model_visible_verification_command(task: EvaluationTask) -> str:
+    if task.smoke_command:
+        return task.smoke_command
     if task.model_visible_verification_command:
         return task.model_visible_verification_command
     if task.verification_prepare_commands:

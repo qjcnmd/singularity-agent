@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -19,6 +21,11 @@ use singularity_model::{
 use singularity_policy::{
     ApprovalOutcome, ApprovalRequest, PermissionDecision, PermissionDecisionOutcome,
     PermissionOperation, PermissionRequest, PolicyEngine,
+};
+#[cfg(windows)]
+use singularity_tools::{
+    CommandExecutionStatus, CommandRequest, CommandSemanticStatus, SandboxBackend,
+    SandboxFilesystemMode, WindowsRestrictedTokenSandboxBackend,
 };
 use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
@@ -36,8 +43,22 @@ const SIDECAR_COMPONENT: &str = "python_sidecar";
 const DEFAULT_PYTHON_BIN: &str = "python";
 const DEFAULT_SIDECAR_MODULE: &str = "singularity.agent_host.sidecar";
 const DEFAULT_SIDECAR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(windows))]
+const STRICT_COMMAND_SANDBOX_UNSUPPORTED_PLATFORM: &str =
+    "strict_command_sandbox_unsupported_platform";
+#[cfg(windows)]
+const STRICT_COMMAND_SANDBOX_PROBE_FAILED: &str = "strict_command_sandbox_probe_failed";
+#[cfg(windows)]
 const NATIVE_AGENT_LOOP_READY_REASON: &str =
     "native Rust AgentLoop is available as the default runtime";
+#[cfg(windows)]
+const NATIVE_AGENT_LOOP_SANDBOX_BLOCKED_REASON: &str =
+    "native Rust AgentLoop requires a working Windows restricted-token command sandbox";
+#[cfg(not(windows))]
+const NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
+    "native Rust AgentLoop requires the Windows restricted-token command sandbox";
+#[cfg(windows)]
+const AGENT_LOOP_CAPABILITY_PROBE_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 4;
 const EMPTY_FINAL_ANSWER_ERROR: &str = "empty final answer";
 const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
@@ -56,6 +77,8 @@ const TOOL_GREP: &str = "builtin.grep";
 const TOOL_EDIT: &str = "builtin.edit";
 const TOOL_PATCH: &str = "builtin.patch";
 const TOOL_COMMAND: &str = "builtin.command";
+#[cfg(windows)]
+static AGENT_LOOP_CAPABILITY_CACHE: OnceLock<AgentLoopCapability> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -184,13 +207,86 @@ pub struct AgentLoopCapability {
 
 impl AgentLoopCapability {
     pub fn current() -> Self {
-        Self {
+        #[cfg(windows)]
+        {
+            AGENT_LOOP_CAPABILITY_CACHE
+                .get_or_init(windows_agent_loop_capability)
+                .clone()
+        }
+        #[cfg(not(windows))]
+        {
+            Self {
+                available: false,
+                status: AgentStatus::Blocked,
+                reason: NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON.to_string(),
+                blockers: vec![STRICT_COMMAND_SANDBOX_UNSUPPORTED_PLATFORM.to_string()],
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_agent_loop_capability() -> AgentLoopCapability {
+    match probe_windows_command_sandbox() {
+        Ok(()) => AgentLoopCapability {
             available: true,
             status: AgentStatus::Completed,
             reason: NATIVE_AGENT_LOOP_READY_REASON.to_string(),
             blockers: Vec::new(),
-        }
+        },
+        Err(blocker) => AgentLoopCapability {
+            available: false,
+            status: AgentStatus::Blocked,
+            reason: NATIVE_AGENT_LOOP_SANDBOX_BLOCKED_REASON.to_string(),
+            blockers: vec![blocker],
+        },
     }
+}
+
+#[cfg(windows)]
+fn probe_windows_command_sandbox() -> Result<(), String> {
+    let workspace = create_sandbox_probe_workspace()?;
+    let workspace_display = workspace.to_string_lossy().to_string();
+    let mut request = CommandRequest::project_verification(
+        "agent_loop_capability_probe",
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo singularity-sandbox-ready".to_string(),
+        ],
+        workspace_display.clone(),
+        workspace_display,
+    );
+    request.filesystem.mode = SandboxFilesystemMode::ReadOnly;
+    request.timeout_seconds = AGENT_LOOP_CAPABILITY_PROBE_TIMEOUT_SECONDS;
+    let result = WindowsRestrictedTokenSandboxBackend::new().execute(&request);
+    let _ = std::fs::remove_dir_all(&workspace);
+    if result.execution_status == CommandExecutionStatus::Completed
+        && result.semantic_status == CommandSemanticStatus::Succeeded
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{STRICT_COMMAND_SANDBOX_PROBE_FAILED}:{:?}:{:?}",
+            result.execution_status, result.semantic_status
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn create_sandbox_probe_workspace() -> Result<PathBuf, String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "singularity-agentloop-sandbox-probe-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).map_err(|error| {
+        format!("{STRICT_COMMAND_SANDBOX_PROBE_FAILED}:workspace_unavailable:{error}")
+    })?;
+    Ok(path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

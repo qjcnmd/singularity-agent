@@ -165,7 +165,9 @@ def test_evaluation_policy_blocks_falls_back_to_planner_denials() -> None:
 
 
 def test_load_public_representative_task_manifest_is_public_swe_bench() -> None:
-    manifest = load_evaluation_task_set(Path("docs/evaluation/public-representative-task.json"))
+    manifest_path = Path("docs/evaluation/public-representative-task.json")
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = load_evaluation_task_set(manifest_path)
 
     assert manifest.schema_version == EVALUATION_TASK_SET_SCHEMA_VERSION
     assert len(manifest.tasks) == 1
@@ -192,11 +194,11 @@ def test_load_public_representative_task_manifest_is_public_swe_bench() -> None:
     assert "PYTHONPATH" in task.public_verification_command
     assert "os.path.abspath('.')" in task.public_verification_command
     assert task.hidden_verification_command == task.public_verification_command
-    assert "src/sqlfluff/rules/L060.py" in task.model_visible_verification_command
-    assert "std_L060_test" not in task.model_visible_verification_command
-    assert "test_patch" not in task.model_visible_verification_command
-    assert "FAIL_TO_PASS" not in task.model_visible_verification_command
-    assert ".eval-venv" not in task.model_visible_verification_command
+    task_payload = manifest_payload["tasks"][0]
+    assert task_payload["smoke_command"] == "python -m py_compile src/sqlfluff/rules/L060.py"
+    assert task.smoke_command == "python -m py_compile src/sqlfluff/rules/L060.py"
+    assert "model_visible_verification_command" not in task_payload
+    assert "model_visible" not in task_payload["hidden_test_patch"]
     goal = _task_goal(task)
     assert "SQLFluff" in goal
     assert "src/sqlfluff/rules/L060.py" in goal
