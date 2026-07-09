@@ -1,6 +1,6 @@
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, SandboxBackend, SandboxCapabilities,
-    SandboxNetworkMode,
+    SandboxFilesystemMode, SandboxNetworkMode,
 };
 use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
@@ -1003,6 +1003,43 @@ fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
     remove_workspace(&workspace);
 }
 
+#[test]
+fn workspace_command_tool_records_audit_for_explicit_danger_full_access() {
+    let workspace = test_workspace("command-danger-audit");
+    let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(DangerAuditSandboxBackend);
+
+    let result = tools
+        .command(CommandToolInput {
+            argv: python_command("print('command ok')"),
+            cwd: None,
+            timeout_seconds: Some(5),
+            sandbox_mode: Some(SandboxFilesystemMode::DangerFullAccess),
+            network_access: Some(SandboxNetworkMode::Allowed),
+        })
+        .expect("command");
+
+    assert!(result.ok);
+    assert_eq!(
+        result.metadata["audit"]["sandbox_mode"],
+        "danger_full_access"
+    );
+    assert_eq!(result.metadata["audit"]["network_access"], "allowed");
+    assert_eq!(result.metadata["audit"]["sandbox_backend"], "danger_audit");
+    assert_eq!(result.metadata["audit"]["sandbox_enforcement"], "strict");
+    assert_eq!(
+        result.metadata["audit"]["command_provenance"],
+        "agent_requested"
+    );
+    assert!(
+        result.metadata["audit"]["command_scope_digest"]
+            .as_str()
+            .expect("command scope digest")
+            .starts_with("hash:")
+    );
+    assert!(result.content.get("argv").is_none());
+    remove_workspace(&workspace);
+}
+
 struct RecordingSandboxBackend;
 
 impl SandboxBackend for RecordingSandboxBackend {
@@ -1015,6 +1052,27 @@ impl SandboxBackend for RecordingSandboxBackend {
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
+        assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
+        CommandResult::completed(&request.command_id, "command ok")
+    }
+}
+
+struct DangerAuditSandboxBackend;
+
+impl SandboxBackend for DangerAuditSandboxBackend {
+    fn name(&self) -> &'static str {
+        "danger_audit"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        assert_eq!(
+            request.filesystem.mode,
+            SandboxFilesystemMode::DangerFullAccess
+        );
         assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
         CommandResult::completed(&request.command_id, "command ok")
     }

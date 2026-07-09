@@ -448,12 +448,16 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
                 "app-server must reject agentHost=native while AgentLoopCapability blockers remain",
             )
         ]
-    if "capability.available && capability.blockers.is_empty()" not in text:
+    if (
+        "capability.available" not in text
+        or "capability.blockers.is_empty()" not in text
+        or "capability.status == AgentStatus::Completed" not in text
+    ):
         return [
             Violation(
                 "native-agent-loop-app-server-gate-drift",
                 _relative(app_server, repo_root),
-                "app-server native gate must require available capability and empty blockers",
+                "app-server native gate must require available capability, completed status, and empty blockers",
             )
         ]
     protocol_text = protocol.read_text(encoding="utf-8")

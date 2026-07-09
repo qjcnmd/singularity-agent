@@ -707,13 +707,21 @@ fn approval_decision_allow_without_pending_tool_call_does_not_resume_native_turn
         std::fs::read_to_string(workspace.join("README.md")).expect("read readme"),
         "before"
     );
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let turn_after_decision = store.get_turn(&turn.turn_id).expect("turn");
     assert_eq!(
-        SessionStore::open(&db_path)
-            .expect("reopen store")
-            .get_turn(&turn.turn_id)
-            .expect("turn")
-            .status,
-        singularity_protocol::TurnStatus::Blocked
+        turn_after_decision.status,
+        singularity_protocol::TurnStatus::Failed
+    );
+    let native_trace = store
+        .list_trace(&thread.thread_id)
+        .expect("trace list")
+        .into_iter()
+        .find(|event| event.component == "agent_loop")
+        .expect("native trace");
+    assert_eq!(
+        native_trace.payload["audit_events"][0]["approval_decision"],
+        "unavailable"
     );
 
     let duplicate = server
@@ -815,13 +823,31 @@ fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_native_tur
             std::fs::read_to_string(workspace.join("README.md")).expect("read readme"),
             "before"
         );
+        let expected_status = match outcome {
+            ApprovalOutcome::Defer => singularity_protocol::TurnStatus::Blocked,
+            ApprovalOutcome::Allow | ApprovalOutcome::Deny => {
+                singularity_protocol::TurnStatus::Failed
+            }
+        };
+        let store = SessionStore::open(&db_path).expect("reopen store");
         assert_eq!(
-            SessionStore::open(&db_path)
-                .expect("reopen store")
-                .get_turn(&turn.turn_id)
-                .expect("turn")
-                .status,
-            singularity_protocol::TurnStatus::Blocked
+            store.get_turn(&turn.turn_id).expect("turn").status,
+            expected_status
+        );
+        let native_trace = store
+            .list_trace(thread_id)
+            .expect("trace list")
+            .into_iter()
+            .find(|event| event.component == "agent_loop")
+            .expect("native trace");
+        let expected_decision = match outcome {
+            ApprovalOutcome::Allow => "unavailable",
+            ApprovalOutcome::Deny => "denied",
+            ApprovalOutcome::Defer => "deferred",
+        };
+        assert_eq!(
+            native_trace.payload["audit_events"][0]["approval_decision"],
+            expected_decision
         );
     }
 }

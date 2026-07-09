@@ -605,6 +605,23 @@ def test_guard_rejects_command_approval_resource_without_scope_normalization(tmp
     assert "command-approval-resource-drift" in result.stderr
 
 
+def test_guard_rejects_native_gate_without_completed_status(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    app_server = repo / "crates/app-server/src/lib.rs"
+    app_server.write_text(
+        app_server.read_text(encoding="utf-8").replace(
+            "\n        && capability.status == AgentStatus::Completed",
+            "",
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "native-agent-loop-app-server-gate-drift" in result.stderr
+
+
 def test_guard_rejects_interrupt_that_updates_status_without_sidecar_cancel(tmp_path: Path) -> None:
     repo = copy_repo_slice(tmp_path)
     app_server = repo / "crates/app-server/src/lib.rs"
@@ -774,8 +791,8 @@ def test_guard_rejects_cli_native_path_without_partial_capability_gate(tmp_path:
     (
         ("NATIVE_AGENT_LOOP_NOT_READY", "NATIVE_AGENT_LOOP_DELAYED"),
         (
-            "capability.available && capability.blockers.is_empty()",
-            "capability.available",
+            "capability.blockers.is_empty()",
+            "true",
         ),
     ),
 )

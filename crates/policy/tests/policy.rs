@@ -164,6 +164,64 @@ fn approval_policy_never_turns_approval_requests_into_deny() {
 }
 
 #[test]
+fn approval_policy_untrusted_preserves_approval_requests() {
+    let mut profile = PermissionProfile::workspace_write("C:/repo");
+    profile.approval_policy = ApprovalPolicy::Untrusted;
+
+    let decision = PolicyEngine::new(profile)
+        .with_rule(rule(
+            "ask_tests",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Ask,
+            PermissionOperation::Execute,
+            "python -m pytest",
+        ))
+        .evaluate(&PermissionRequest::new(
+            "builtin.shell",
+            PermissionOperation::Execute,
+            "python -m pytest",
+        ));
+
+    assert_eq!(decision.outcome, PermissionDecisionOutcome::Ask);
+    assert_eq!(decision.rule_id.as_deref(), Some("ask_tests"));
+}
+
+#[allow(deprecated)]
+#[test]
+fn deprecated_on_failure_policy_is_rejected_as_native_approval_path() {
+    let mut profile = PermissionProfile::workspace_write("C:/repo");
+    profile.approval_policy = ApprovalPolicy::OnFailure;
+
+    let decision = PolicyEngine::new(profile).evaluate(&PermissionRequest::new(
+        "builtin.shell",
+        PermissionOperation::Execute,
+        "python -m pytest",
+    ));
+
+    assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(
+        decision.reason,
+        "deprecated on-failure approval policy does not allow native approval requests"
+    );
+}
+
+#[test]
+fn explicit_danger_full_access_profile_does_not_bypass_approval_policy() {
+    let mut profile = PermissionProfile::workspace_write("C:/repo");
+    profile.profile = PermissionProfileName::DangerFullAccess;
+    profile.approval_policy = ApprovalPolicy::Never;
+
+    let decision = PolicyEngine::new(profile).evaluate(&PermissionRequest::new(
+        "builtin.command",
+        PermissionOperation::Execute,
+        "python -m pytest",
+    ));
+
+    assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.reason, "approval policy forbids approval requests");
+}
+
+#[test]
 fn unmatched_permission_requests_require_approval() {
     let decision = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).evaluate(
         &PermissionRequest::new("builtin.git", PermissionOperation::Execute, "git status"),

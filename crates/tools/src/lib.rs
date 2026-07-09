@@ -355,6 +355,15 @@ impl ToolResult {
         self
     }
 
+    pub fn with_audit(mut self, metadata: Value) -> Self {
+        self.audit_metadata = Some(metadata);
+        self
+    }
+
+    pub fn audit_metadata(&self) -> Option<&Value> {
+        self.audit_metadata.as_ref()
+    }
+
     pub fn from_result(
         envelope: &ToolCallRequest,
         result: &ToolOutput,
@@ -381,6 +390,7 @@ impl ToolResult {
         tool_result.artifact_ref = artifact_ref;
         tool_result.artifact_refs = artifact_refs;
         tool_result.result_id = result_id;
+        tool_result.audit_metadata = result.metadata.get("audit").cloned();
         tool_result
     }
 
@@ -774,8 +784,8 @@ impl WorkspaceTools {
             input.cwd.unwrap_or_else(|| ".".to_string()),
             self.workspace_root.to_string_lossy().into_owned(),
         );
-        request.filesystem.mode = filesystem_mode;
-        request.network.mode = network_mode;
+        request.filesystem.mode = filesystem_mode.clone();
+        request.network.mode = network_mode.clone();
         if let Some(timeout_seconds) = input.timeout_seconds {
             request.timeout_seconds = timeout_seconds;
         }
@@ -787,6 +797,14 @@ impl WorkspaceTools {
         let result = backend.execute(&request);
         let mut output = command_tool_output(result);
         output.metadata["result_id"] = json!(scope_digest);
+        output.metadata["audit"] = json!({
+            "sandbox_mode": filesystem_mode,
+            "network_access": network_mode,
+            "sandbox_backend": backend.name(),
+            "sandbox_enforcement": "strict",
+            "command_scope_digest": scope_digest,
+            "command_provenance": "agent_requested",
+        });
         Ok(output)
     }
 

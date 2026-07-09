@@ -269,6 +269,48 @@ for line in sys.stdin:
 }
 
 #[test]
+fn cli_rejects_nonterminal_native_capability_without_blockers() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let trace_path = temp.path().join("native_running_methods.txt");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    with open(os.environ["METHOD_TRACE"], "a", encoding="utf-8") as trace:
+        trace.write(f"{method}\n")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "running", "reason": "probe still running", "blockers": []}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "native"])
+        .env("METHOD_TRACE", &trace_path)
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("native AgentLoop is not production-ready"));
+    let trace = std::fs::read_to_string(trace_path).expect("method trace");
+    assert!(trace.contains("initialize"));
+    assert!(trace.contains("agent/capability"));
+    assert!(!trace.contains("turn/start"));
+}
+
+#[test]
 fn cli_sends_native_agent_host_after_capability_allows_it() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
@@ -288,12 +330,12 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
     elif method == "agent/capability":
-        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "running", "reason": "enabled", "blockers": []}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_native", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
         pathlib.Path(os.environ["TURN_TRACE"]).write_text(json.dumps(message["params"]), encoding="utf-8")
-        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_native", "thread_id": "thread_native", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_native", "thread_id": "thread_native", "status": "completed", "agent_loop_status": "completed"}}}), flush=True)
     elif method == "server/shutdown":
         print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
         break
@@ -312,6 +354,140 @@ for line in sys.stdin:
             .expect("turn trace json");
     assert_eq!(params["agentHost"], "native");
     assert_eq!(params["threadId"], "thread_native");
+}
+
+#[test]
+fn cli_rejects_native_turn_without_agent_loop_terminal_status() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_native", "model": None, "cwd": None, "status": "active"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_native", "thread_id": "thread_native", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--agent-host", "native"])
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("error running: turn running"));
+}
+
+#[test]
+fn cli_run_json_outputs_turn_result_without_human_rendering() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+THREAD = {"thread_id": "thread_json", "model": None, "cwd": None, "status": "active"}
+TURN = {"turn_id": "turn_json", "thread_id": "thread_json", "status": "completed", "agent_loop_status": "completed"}
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": THREAD}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"method": "turn/started", "params": {"turn": TURN}}), flush=True)
+        print(json.dumps({"method": "turn/diff/updated", "params": {"patch": "SECRET_DIFF_SHOULD_NOT_LEAK"}}), flush=True)
+        print(json.dumps({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_json"}, "delta": "rust-native-ok"}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": TURN}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "Reply exactly: rust-native-ok", "--json"])
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
+    assert!(!stdout(&output).contains("SECRET_DIFF_SHOULD_NOT_LEAK"));
+    assert_eq!(value["thread"]["thread_id"], "thread_json");
+    assert_eq!(value["turn"]["turn_id"], "turn_json");
+    assert_eq!(value["turn"]["agent_loop_status"], "completed");
+    let events = value["events"].as_array().expect("events");
+    assert!(events.iter().all(|event| event["method"].is_string()));
+    let item_delta = events
+        .iter()
+        .find(|event| event["method"] == "item/agentMessage/delta")
+        .expect("agent delta event");
+    assert_eq!(item_delta["params"]["delta"], "rust-native-ok");
+    assert!(!stdout(&output).contains("turn turn_json completed"));
+}
+
+#[test]
+fn cli_run_json_preserves_fail_closed_turn_status() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = write_fake_app_server(
+        temp.path(),
+        r#"
+import json
+import sys
+
+THREAD = {"thread_id": "thread_json", "model": None, "cwd": None, "status": "active"}
+TURN = {"turn_id": "turn_json", "thread_id": "thread_json", "status": "blocked", "agent_loop_status": "blocked"}
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id": request_id, "result": {"thread": THREAD}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"id": request_id, "result": {"turn": TURN}}), flush=True)
+    elif method == "server/shutdown":
+        print(json.dumps({"id": request_id, "result": {"shutdown": True}}), flush=True)
+        break
+"#,
+    );
+
+    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["run", "write tests", "--json"])
+        .output()
+        .expect("run cli");
+
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("run json");
+    assert_eq!(value["turn"]["status"], "blocked");
+    assert_eq!(value["turn"]["agent_loop_status"], "blocked");
 }
 
 #[test]
@@ -931,7 +1107,7 @@ for line in sys.stdin:
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
-        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "completed", "agent_loop_status": "completed"}}}), flush=True)
 "#,
     );
 
@@ -965,7 +1141,7 @@ for line in sys.stdin:
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
-        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "completed", "agent_loop_status": "completed"}}}), flush=True)
         print(json.dumps({"id": 999, "result": {"late": True}}), flush=True)
 "#,
     );
@@ -1112,7 +1288,7 @@ for line in sys.stdin:
     elif method == "turn/start" and not thread_started:
         thread_started = True
         print(json.dumps({"id": 999, "result": {"turn": {"turn_id": "wrong_turn", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
-        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "completed", "agent_loop_status": "completed"}}}), flush=True)
 "#,
     );
 
@@ -1150,7 +1326,7 @@ for line in sys.stdin:
     elif method == "turn/start" and not thread_started:
         thread_started = True
         print(json.dumps({"id": 999, "error": {"code": -32000, "message": "stale failure"}}), flush=True)
-        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "running", "agent_loop_status": "not_migrated"}}}), flush=True)
+        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "completed", "agent_loop_status": "completed"}}}), flush=True)
 "#,
     );
 

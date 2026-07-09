@@ -29,9 +29,10 @@ use singularity_protocol::{
 };
 use singularity_store::{ActiveSidecarRun, SessionStore, StoreError};
 use singularity_tools::{
-    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
-    SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolRegistry, ToolSpec,
+    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, CommandToolInput,
+    SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolRegistry, ToolSpec,
     WindowsRestrictedTokenSandboxBackend, WorkspaceTools, command_scope_digest,
+    command_scope_resource,
 };
 use thiserror::Error;
 
@@ -461,6 +462,9 @@ impl AppServer {
         if !native_agent_loop_ready() {
             return Ok(None);
         }
+        if !matches!(decision.outcome, ApprovalOutcome::Allow) {
+            return Ok(None);
+        }
         if pending_tool_call.is_none() {
             return Ok(None);
         }
@@ -469,10 +473,16 @@ impl AppServer {
             Err(error) => {
                 let turn_id = &request.task_id;
                 let turn = self.store.get_turn(turn_id)?;
-                return Ok(Some((
-                    turn,
-                    AgentRunStatus::failed(error.message).with_status(AgentStatus::Failed),
-                )));
+                let run_status = native_approval_terminal_status(
+                    &turn,
+                    request,
+                    decision,
+                    pending_tool_call.as_ref(),
+                    AgentStatus::Failed,
+                    "unavailable",
+                    error.message,
+                );
+                return Ok(Some((turn, run_status)));
             }
         };
         self.resume_native_agent_loop_after_gate(request, decision, pending_tool_call, provider)
@@ -501,22 +511,32 @@ impl AppServer {
         let Some(pending_tool_call) = pending_tool_call else {
             return Ok(None);
         };
-        let pending = match serde_json::from_value::<PendingToolCall>(pending_tool_call) {
+        let pending = match serde_json::from_value::<PendingToolCall>(pending_tool_call.clone()) {
             Ok(pending) => pending,
             Err(error) => {
-                return Ok(Some((
-                    turn,
-                    AgentRunStatus::failed(format!("invalid pending tool call: {error}"))
-                        .with_status(AgentStatus::Failed),
-                )));
+                let run_status = native_approval_terminal_status(
+                    &turn,
+                    request,
+                    decision,
+                    Some(&pending_tool_call),
+                    AgentStatus::Failed,
+                    "unavailable",
+                    format!("invalid pending tool call: {error}"),
+                );
+                return Ok(Some((turn, run_status)));
             }
         };
         if pending.request_id != request.request_id {
-            return Ok(Some((
-                turn,
-                AgentRunStatus::failed("pending tool call request mismatch")
-                    .with_status(AgentStatus::Failed),
-            )));
+            let run_status = native_approval_terminal_status(
+                &turn,
+                request,
+                decision,
+                Some(&pending_tool_call),
+                AgentStatus::Failed,
+                "unavailable",
+                "pending tool call request mismatch",
+            );
+            return Ok(Some((turn, run_status)));
         }
         let thread = self.store.get_thread(&turn.thread_id)?;
         let user_input = self.store.get_turn_user_input(turn_id)?;
@@ -538,7 +558,23 @@ impl AppServer {
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
             .with_workspace_tools(native_workspace_tools(workspace_root))
             .resume_pending_tool_call(&loop_input, &pending);
-        Ok(Some((turn, result.to_run_status(&loop_input))))
+        let mut run_status = result.to_run_status(&loop_input);
+        if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
+            let audit_status = native_approval_terminal_status(
+                &turn,
+                request,
+                decision,
+                Some(&pending_tool_call),
+                run_status.status.clone(),
+                "unavailable",
+                run_status
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "approval resume did not execute command".to_string()),
+            );
+            run_status.audit_events = audit_status.audit_events;
+        }
+        Ok(Some((turn, run_status)))
     }
 
     fn run_native_agent_loop_with_provider<P>(
@@ -769,6 +805,7 @@ impl AppServer {
             "model_turns": run_status.model_turns,
             "tool_calls": run_status.tool_calls,
             "approval_count": run_status.approval_count,
+            "audit_events": run_status.audit_events,
             "error": run_status.error.as_deref().map(redact_app_server_text),
         });
         self.store.append_trace(&event)?;
@@ -1089,13 +1126,20 @@ impl AppServer {
                 };
             }
         };
-        let resumed = self.resume_native_agent_loop(
-            &recorded.request,
-            &decision,
-            recorded.pending_tool_call,
-        )?;
+        let pending_tool_call = recorded.pending_tool_call.clone();
+        let resumed =
+            self.resume_native_agent_loop(&recorded.request, &decision, pending_tool_call.clone())?;
         let mut messages = Vec::new();
-        if let Some((turn, run_status)) = resumed {
+        let terminal = if let Some(resumed) = resumed {
+            Some(resumed)
+        } else {
+            self.native_approval_no_resume_status(
+                &recorded.request,
+                &decision,
+                pending_tool_call.as_ref(),
+            )?
+        };
+        if let Some((turn, run_status)) = terminal {
             let turn = self.update_turn_from_run_status(turn, &run_status)?;
             self.append_native_trace(&turn.thread_id, &turn.turn_id, &run_status)?;
             messages.extend(self.agent_terminal_item_events(&run_status, &turn)?);
@@ -1104,6 +1148,46 @@ impl AppServer {
             JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
         );
         Ok(messages)
+    }
+
+    fn native_approval_no_resume_status(
+        &self,
+        request: &ApprovalRequest,
+        decision: &ApprovalDecision,
+        pending_tool_call: Option<&Value>,
+    ) -> AppServerResult<Option<(Turn, AgentRunStatus)>> {
+        let Ok(turn) = self.store.get_turn(&request.task_id) else {
+            return Ok(None);
+        };
+        if turn.status != TurnStatus::Blocked
+            || turn.agent_loop_status != AgentStatus::Blocked.as_str()
+        {
+            return Ok(None);
+        }
+        let (status, audit_decision, message) = match decision.outcome {
+            ApprovalOutcome::Allow if pending_tool_call.is_some() => (
+                AgentStatus::Failed,
+                "unavailable",
+                "approval allowed but native turn could not resume",
+            ),
+            ApprovalOutcome::Allow => (
+                AgentStatus::Failed,
+                "unavailable",
+                "approval allowed but pending tool call is unavailable",
+            ),
+            ApprovalOutcome::Deny => (AgentStatus::Failed, "denied", "approval denied"),
+            ApprovalOutcome::Defer => (AgentStatus::Blocked, "deferred", "approval deferred"),
+        };
+        let run_status = native_approval_terminal_status(
+            &turn,
+            request,
+            decision,
+            pending_tool_call,
+            status,
+            audit_decision,
+            message,
+        );
+        Ok(Some((turn, run_status)))
     }
 
     fn event_subscribe(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -1308,6 +1392,7 @@ impl AppServer {
                 tool_calls: 0,
                 approval_count: 0,
                 events: Vec::new(),
+                audit_events: Vec::new(),
                 trace_path: None,
                 error: None,
             };
@@ -1325,6 +1410,95 @@ fn json_response<T: serde::Serialize>(id: Option<Value>, result: T) -> AppServer
     Ok(vec![
         JsonRpcMessage::response(id, serde_json::to_value(result)?).to_wire_value(),
     ])
+}
+
+fn native_approval_terminal_status(
+    turn: &Turn,
+    request: &ApprovalRequest,
+    decision: &ApprovalDecision,
+    pending_tool_call: Option<&Value>,
+    status: AgentStatus,
+    audit_decision: &str,
+    message: impl Into<String>,
+) -> AgentRunStatus {
+    let mut run_status = AgentRunStatus::failed(message).with_status(status);
+    run_status.run_id = Some(turn.turn_id.clone());
+    run_status.session_id = Some(request.session_id.clone());
+    run_status.task_id = Some(turn.turn_id.clone());
+    run_status.approval_count = 1;
+    let mut audit_event = json!({
+        "approval_policy": ApprovalPolicy::OnRequest,
+        "approval_decision": audit_decision,
+        "approval_request_id": decision.request_id,
+        "approval_decision_id": decision.decision_id,
+        "command_provenance": "agent_requested",
+    });
+    if let Some(command_audit) = pending_command_audit_metadata(pending_tool_call) {
+        merge_json_object(&mut audit_event, command_audit);
+    }
+    run_status.audit_events.push(audit_event);
+    run_status
+}
+
+fn pending_command_audit_metadata(pending_tool_call: Option<&Value>) -> Option<Value> {
+    let pending_value = pending_tool_call?;
+    let (tool_name, raw_arguments) =
+        match serde_json::from_value::<PendingToolCall>(pending_value.clone()) {
+            Ok(pending) => (pending.tool_name, Some(pending.raw_arguments)),
+            Err(_error) => (
+                pending_value
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                pending_value
+                    .get("raw_arguments")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ),
+        };
+    if tool_name != TOOL_COMMAND {
+        return None;
+    }
+    let mut audit = json!({
+        "sandbox_backend": "not_executed",
+        "sandbox_enforcement": "strict",
+    });
+    let Some(raw_arguments) = raw_arguments else {
+        audit["sandbox_mode"] = json!("unknown");
+        audit["network_access"] = json!("unknown");
+        audit["command_scope_digest"] = json!("unavailable");
+        return Some(audit);
+    };
+    let Ok(input) = serde_json::from_str::<CommandToolInput>(&raw_arguments) else {
+        audit["sandbox_mode"] = json!("unknown");
+        audit["network_access"] = json!("unknown");
+        audit["command_scope_digest"] = json!("unavailable");
+        return Some(audit);
+    };
+    let sandbox_mode = input.sandbox_mode();
+    let network_access = input.network_access();
+    merge_json_object(
+        &mut audit,
+        json!({
+            "sandbox_mode": sandbox_mode,
+            "network_access": network_access,
+            "command_scope_digest": command_scope_digest(
+                &input.argv,
+                &sandbox_mode,
+                &network_access,
+            ),
+        }),
+    );
+    Some(audit)
+}
+
+fn merge_json_object(target: &mut Value, source: Value) {
+    if let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 fn native_workspace_registry() -> ToolRegistry {
@@ -1927,6 +2101,19 @@ fn expected_smoke_command_result_id(task: &Value) -> Option<String> {
     ))
 }
 
+fn expected_smoke_command_resource(task: &Value) -> Option<String> {
+    let command = task.get("smoke_command").and_then(Value::as_str)?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let argv = parse_smoke_command_argv(command)?;
+    Some(command_scope_resource(
+        &argv,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Allowed,
+    ))
+}
+
 fn parse_smoke_command_argv(command: &str) -> Option<Vec<String>> {
     let mut argv = Vec::new();
     let mut current = String::new();
@@ -1997,9 +2184,10 @@ fn native_eval_workspace_tools(workspace_root: PathBuf, _task: &Value) -> Worksp
 fn native_eval_policy(workspace_root: String, task: &Value) -> PolicyEngine {
     let mut profile = PermissionProfile::workspace_write(workspace_root);
     profile.approval_policy = ApprovalPolicy::Never;
-    let mut policy = PolicyEngine::new(profile)
-        .with_rule(native_read_tool_rule())
-        .with_rule(native_execute_tool_rule());
+    let mut policy = PolicyEngine::new(profile).with_rule(native_read_tool_rule());
+    if let Some(resource) = expected_smoke_command_resource(task) {
+        policy = policy.with_rule(native_execute_tool_rule(resource));
+    }
     if let Some(paths) = task.get("allowed_paths").and_then(Value::as_array) {
         for (index, path) in paths.iter().filter_map(Value::as_str).enumerate() {
             policy = policy.with_rule(native_write_tool_rule(index, path));
@@ -2024,13 +2212,14 @@ fn native_write_tool_rule(index: usize, path: &str) -> PermissionRule {
     }
 }
 
-fn native_execute_tool_rule() -> PermissionRule {
+fn native_execute_tool_rule(resource: String) -> PermissionRule {
     PermissionRule::new(
         "allow_native_eval_command_tools",
         SettingsScope::Project,
         PermissionDecisionOutcome::Allow,
     )
     .for_operation(PermissionOperation::Execute)
+    .for_resource(resource)
 }
 
 fn eval_agent_prompt(task: &Value) -> String {
@@ -2197,7 +2386,9 @@ fn safe_path_segment(value: &str) -> String {
 
 fn native_agent_loop_ready() -> bool {
     let capability = AgentLoopCapability::current();
-    capability.available && capability.blockers.is_empty()
+    capability.available
+        && capability.blockers.is_empty()
+        && capability.status == AgentStatus::Completed
 }
 
 fn agent_host_initial_status(agent_host: &AgentHost) -> &'static str {
@@ -2354,6 +2545,7 @@ fn cancelled_sidecar_status(active: &ActiveSidecarRun) -> AgentRunStatus {
         tool_calls: 0,
         approval_count: 0,
         events: Vec::new(),
+        audit_events: Vec::new(),
         trace_path: None,
         error: None,
     }
@@ -2372,6 +2564,7 @@ fn sidecar_run_status(status: PythonSidecarStatus) -> AgentRunStatus {
         tool_calls: 0,
         approval_count: 0,
         events: status.events,
+        audit_events: Vec::new(),
         trace_path: status.trace_path,
         error: None,
     }
@@ -2433,6 +2626,7 @@ mod tests {
         ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, Provider,
         ProviderError,
     };
+    use singularity_policy::PermissionRequest;
     use singularity_tools::{ToolResult, command_scope_digest, command_scope_resource};
 
     use super::*;
@@ -2520,6 +2714,52 @@ mod tests {
         assert!(prompt.contains("\"sandbox_mode\":\"workspace_write\""));
         assert!(prompt.contains("\"network_access\":\"allowed\""));
         assert!(prompt.contains("evaluation fails if this command tool result is missing"));
+    }
+
+    #[test]
+    fn native_eval_policy_only_allows_exact_smoke_command_resource() {
+        let task = json!({"task_id": "smoke", "smoke_command": "python -m py_compile src/app.py"});
+        let policy = native_eval_policy("C:/repo".to_string(), &task);
+        let expected_resource = expected_smoke_command_resource(&task).expect("smoke resource");
+        let wrong_resource = command_scope_resource(
+            &[
+                "python".to_string(),
+                "-c".to_string(),
+                "print('ok')".to_string(),
+            ],
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Allowed,
+        );
+        let wider_resource = command_scope_resource(
+            &[
+                "python".to_string(),
+                "-m".to_string(),
+                "py_compile".to_string(),
+                "src/app.py".to_string(),
+            ],
+            &SandboxFilesystemMode::DangerFullAccess,
+            &SandboxNetworkMode::Allowed,
+        );
+
+        let allowed = policy.evaluate(&PermissionRequest::new(
+            TOOL_COMMAND,
+            PermissionOperation::Execute,
+            expected_resource,
+        ));
+        let wrong = policy.evaluate(&PermissionRequest::new(
+            TOOL_COMMAND,
+            PermissionOperation::Execute,
+            wrong_resource,
+        ));
+        let wider = policy.evaluate(&PermissionRequest::new(
+            TOOL_COMMAND,
+            PermissionOperation::Execute,
+            wider_resource,
+        ));
+
+        assert_eq!(allowed.outcome, PermissionDecisionOutcome::Allow);
+        assert_eq!(wrong.outcome, PermissionDecisionOutcome::Deny);
+        assert_eq!(wider.outcome, PermissionDecisionOutcome::Deny);
     }
 
     #[cfg(windows)]
@@ -2611,6 +2851,207 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&file_path).expect("read readme"),
             "before"
+        );
+        assert!(seen_requests.lock().expect("seen requests").is_empty());
+    }
+
+    #[test]
+    fn native_approval_no_resume_status_records_session_and_command_audit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Blocked.as_str(),
+                json!([{"type": "text", "text": "run command"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                TurnStatus::Blocked,
+                AgentStatus::Blocked.as_str(),
+            )
+            .expect("blocked turn");
+        let request = ApprovalRequest::new(
+            format!("approval_{}_call_1", turn.turn_id),
+            turn.turn_id.clone(),
+            turn.turn_id.clone(),
+            TOOL_COMMAND,
+        );
+        let pending = PendingToolCall {
+            request_id: request.request_id.clone(),
+            tool_call_id: "call_1".to_string(),
+            tool_name: TOOL_COMMAND.to_string(),
+            raw_arguments: json!({
+                "argv": ["python", "-c", "print('ok')"],
+                "sandbox_mode": "workspace_write",
+                "network_access": "allowed"
+            })
+            .to_string(),
+            resources: Vec::new(),
+        };
+        let pending_payload = serde_json::to_value(&pending).expect("pending payload");
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        let server = AppServer::new(store);
+
+        let (_turn, run_status) = server
+            .native_approval_no_resume_status(&request, &decision, Some(&pending_payload))
+            .expect("status")
+            .expect("terminal status");
+
+        assert_eq!(
+            run_status.session_id.as_deref(),
+            Some(turn.turn_id.as_str())
+        );
+        assert_eq!(
+            run_status.audit_events[0]["sandbox_mode"],
+            "workspace_write"
+        );
+        assert_eq!(run_status.audit_events[0]["network_access"], "allowed");
+        assert_eq!(
+            run_status.audit_events[0]["sandbox_backend"],
+            "not_executed"
+        );
+        assert_eq!(run_status.audit_events[0]["sandbox_enforcement"], "strict");
+        assert!(
+            run_status.audit_events[0]["command_scope_digest"]
+                .as_str()
+                .expect("command scope digest")
+                .starts_with("hash:")
+        );
+        assert_eq!(
+            run_status.audit_events[0]["approval_decision"],
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn native_approval_resume_failures_record_command_audit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Blocked.as_str(),
+                json!([{"type": "text", "text": "run command"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                TurnStatus::Blocked,
+                AgentStatus::Blocked.as_str(),
+            )
+            .expect("blocked turn");
+        let request = ApprovalRequest::new(
+            format!("approval_{}_call_1", turn.turn_id),
+            turn.turn_id.clone(),
+            turn.turn_id.clone(),
+            TOOL_COMMAND,
+        );
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        let valid_command = json!({
+            "argv": ["python", "-c", "print('ok')"],
+            "sandbox_mode": "workspace_write",
+            "network_access": "allowed"
+        })
+        .to_string();
+        let mismatched_pending = PendingToolCall {
+            request_id: "approval_other_call_1".to_string(),
+            tool_call_id: "call_1".to_string(),
+            tool_name: TOOL_COMMAND.to_string(),
+            raw_arguments: valid_command.clone(),
+            resources: Vec::new(),
+        };
+        let invalid_args_pending = PendingToolCall {
+            request_id: request.request_id.clone(),
+            tool_call_id: "call_1".to_string(),
+            tool_name: TOOL_COMMAND.to_string(),
+            raw_arguments: "{not-json".to_string(),
+            resources: Vec::new(),
+        };
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let server = AppServer::new(store);
+
+        let (_turn, mismatch_status) = server
+            .resume_native_agent_loop_after_gate(
+                &request,
+                &decision,
+                Some(serde_json::to_value(&mismatched_pending).expect("pending payload")),
+                StaticProvider {
+                    responses: vec![ModelTurnResponse::completed(
+                        "model_request_turn_1_0",
+                        "response_1",
+                        "done",
+                    )],
+                    seen_requests: Arc::clone(&seen_requests),
+                },
+            )
+            .expect("resume")
+            .expect("terminal status");
+        assert_eq!(mismatch_status.status, AgentStatus::Failed);
+        assert_eq!(
+            mismatch_status.audit_events[0]["sandbox_backend"],
+            "not_executed"
+        );
+        assert!(
+            mismatch_status.audit_events[0]["command_scope_digest"]
+                .as_str()
+                .expect("command scope digest")
+                .starts_with("hash:")
+        );
+
+        let (_turn, invalid_args_status) = server
+            .resume_native_agent_loop_after_gate(
+                &request,
+                &decision,
+                Some(serde_json::to_value(&invalid_args_pending).expect("pending payload")),
+                StaticProvider {
+                    responses: vec![ModelTurnResponse::completed(
+                        "model_request_turn_1_0",
+                        "response_1",
+                        "done",
+                    )],
+                    seen_requests: Arc::clone(&seen_requests),
+                },
+            )
+            .expect("resume")
+            .expect("terminal status");
+        assert_eq!(invalid_args_status.status, AgentStatus::Failed);
+        assert_eq!(
+            invalid_args_status.audit_events[0]["approval_decision"],
+            "unavailable"
+        );
+        assert_eq!(
+            invalid_args_status.audit_events[0]["sandbox_enforcement"],
+            "strict"
+        );
+        assert_eq!(
+            invalid_args_status.audit_events[0]["command_scope_digest"],
+            "unavailable"
         );
         assert!(seen_requests.lock().expect("seen requests").is_empty());
     }

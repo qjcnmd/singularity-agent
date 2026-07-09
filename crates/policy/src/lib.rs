@@ -4,6 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const REASON_APPROVAL_POLICY_NEVER: &str = "approval policy forbids approval requests";
+const REASON_APPROVAL_POLICY_ON_FAILURE: &str =
+    "deprecated on-failure approval policy does not allow native approval requests";
 const REASON_MATCHED_PERMISSION_RULE: &str = "matched permission rule";
 const REASON_NO_RULE: &str = "no permission rule matched; approval required";
 const REASON_PROTECTED_RESOURCE_DENIED: &str = "protected resource is denied by default";
@@ -26,6 +28,11 @@ pub enum NetworkAccess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalPolicy {
+    Untrusted,
+    #[deprecated(
+        note = "Codex CLI keeps on-failure only as a deprecated historical mode; native runtime rejects approval escalation for it"
+    )]
+    OnFailure,
     OnRequest,
     Never,
 }
@@ -267,16 +274,24 @@ impl PolicyEngine {
     }
 
     fn apply_approval_policy(&self, decision: PermissionDecision) -> PermissionDecision {
-        if decision.outcome != PermissionDecisionOutcome::Ask
-            || self.profile.approval_policy == ApprovalPolicy::OnRequest
-        {
+        if decision.outcome != PermissionDecisionOutcome::Ask {
             return decision;
         }
-        PermissionDecision {
-            outcome: PermissionDecisionOutcome::Deny,
-            reason: REASON_APPROVAL_POLICY_NEVER.to_string(),
-            rule_id: decision.rule_id,
-            scope: decision.scope,
+        match self.profile.approval_policy {
+            ApprovalPolicy::Untrusted | ApprovalPolicy::OnRequest => decision,
+            ApprovalPolicy::Never => PermissionDecision {
+                outcome: PermissionDecisionOutcome::Deny,
+                reason: REASON_APPROVAL_POLICY_NEVER.to_string(),
+                rule_id: decision.rule_id,
+                scope: decision.scope,
+            },
+            #[allow(deprecated)]
+            ApprovalPolicy::OnFailure => PermissionDecision {
+                outcome: PermissionDecisionOutcome::Deny,
+                reason: REASON_APPROVAL_POLICY_ON_FAILURE.to_string(),
+                rule_id: decision.rule_id,
+                scope: decision.scope,
+            },
         }
     }
 }

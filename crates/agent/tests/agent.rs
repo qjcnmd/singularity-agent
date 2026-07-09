@@ -18,7 +18,7 @@ use singularity_policy::{
 use singularity_tools::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
     SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolRegistry,
-    ToolSpec, WorkspaceTools, command_scope_resource,
+    ToolSpec, WorkspaceTools, command_scope_digest, command_scope_resource,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -536,6 +536,17 @@ fn agent_loop_command_fails_closed_without_sandbox_backend() {
         result.tool_results[0].error_code.as_deref(),
         Some("sandbox_unavailable")
     );
+    let audit = result.tool_results[0]
+        .audit_metadata()
+        .expect("command audit metadata");
+    assert_eq!(
+        audit["command_scope_digest"],
+        command_scope_digest(
+            &python_command("print('command ok')"),
+            &SandboxFilesystemMode::ReadOnly,
+            &SandboxNetworkMode::Allowed,
+        )
+    );
     assert!(
         result
             .error
@@ -695,6 +706,76 @@ fn agent_loop_command_approval_grant_requires_exact_command_resource() {
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
         Some("approval_required")
+    );
+}
+
+#[test]
+fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = AgentLoopInput {
+        max_turns: 2,
+        ..AgentLoopInput::new("thread_1", "turn_1", "run command")
+    };
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    command_response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.command",
+        serde_json::json!({
+            "argv": python_command("print('command ok')"),
+            "sandbox_mode": "danger_full_access",
+            "network_access": "allowed",
+            "timeout_seconds": 5
+        }),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+        PermissionRule::new(
+            "allow_command",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute),
+    );
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![command_response, final_response],
+        policy,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
+    .run(&input);
+    let run_status = result.to_run_status(&input);
+
+    assert_eq!(run_status.status, AgentStatus::Completed);
+    assert_eq!(run_status.audit_events.len(), 1);
+    assert_eq!(
+        run_status.audit_events[0]["sandbox_mode"],
+        "danger_full_access"
+    );
+    assert_eq!(run_status.audit_events[0]["network_access"], "allowed");
+    assert_eq!(
+        run_status.audit_events[0]["sandbox_backend"],
+        "agent_strict_test"
+    );
+    assert_eq!(run_status.audit_events[0]["sandbox_enforcement"], "strict");
+    assert_eq!(
+        run_status.audit_events[0]["command_scope_digest"],
+        command_scope_digest(
+            &python_command("print('command ok')"),
+            &SandboxFilesystemMode::DangerFullAccess,
+            &SandboxNetworkMode::Allowed,
+        )
+    );
+    assert_eq!(run_status.audit_events[0]["approval_policy"], "on-request");
+    assert_eq!(
+        run_status.audit_events[0]["approval_decision"],
+        "allowed_by_policy"
+    );
+    assert_eq!(
+        run_status.audit_events[0]["command_provenance"],
+        "agent_requested"
     );
 }
 

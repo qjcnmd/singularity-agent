@@ -13,9 +13,9 @@ Rust Windows command sandbox 的当前实现是 Codex-style restricted-token + l
 
 显式 `--agent-host python` 会让 CLI 设置 sidecar env；app-server 在 thread 校验通过后用 `SessionStore.create_turn_with_input_and_trace()` 持久化 Rust turn/user item/turn trace，再调用 `PythonSidecarClient -> python -m singularity.agent_host.sidecar -> AgentHost -> KernelBootstrap -> AgentKernel -> AgentLoop`。Python sidecar 是 oracle，不是默认生产路径。同一 Rust thread 上已有 `python_sidecar` trace 的 `session_id` 时，后续 sidecar turn 调用 `agent/resume`，否则调用 `agent/run`；thread 的 `model` 会转发给 Python `ProductionConfig`。sidecar 的 running/status/cancel/cleanup 只落安全字段，raw prompt、provider payload、tool args、secret/env/token 不进入 Rust trace 或 CLI 输出。
 
-`crates/tools` 提供 `ToolBroker`、`ToolRegistry`、`ToolCallRequest`、`ToolOutput` 和 `ToolResult`。`ToolResult` 是 agent loop 使用的工具调用结果；raw executor payload 是 `ToolOutput`，preview、artifact ref、redaction 和 result id 是其字段或关联对象，不再另起独立结果对象。工具 schema 只投影 name、redacted description 和 input schema；denied/unknown/ask 工具 fail closed。`crates/sandbox` 提供 `SandboxPolicy`、`SandboxBackend`、`CommandRequest`、`CommandResult`、Windows restricted-token backend 和 patch schema，不公开 relaxed local-process executor 或 host filesystem mutation executor。`crates/model` 提供 `ModelTurnRequest`、`ModelTurnResponse`、provider config presence、redacted provider status、provider error taxonomy 和 `OpenAiProvider` HTTP adapter，不执行工具。`crates/agent` 提供 `AgentLoop`、`AgentLoopInput`、`AgentLoopResult`、`AgentLoopCapability`、approval grant/resume、tool repair retry、final answer completion、empty-answer fail-closed、sensitive path deny-first 和 multi-change patch full-policy check。
+`crates/tools` 提供 `ToolBroker`、`ToolRegistry`、`ToolCallRequest`、`ToolOutput` 和 `ToolResult`。`ToolResult` 是 agent loop 使用的工具调用结果；raw executor payload 是 `ToolOutput`，preview、artifact ref、redaction 和 result id 是其字段或关联对象，不再另起独立结果对象。工具 schema 只投影 name、redacted description 和 input schema；denied/unknown/ask 工具 fail closed。`crates/sandbox` 提供 `SandboxPolicy`、`SandboxBackend`、`CommandRequest`、`CommandResult`、Windows restricted-token backend 和 patch schema，不公开 relaxed local-process executor 或 host filesystem mutation executor。Rust native command tool 支持 Codex CLI 对齐的 read-only、workspace-write、danger-full-access 三种 sandbox mode；danger-full-access 是显式 sandbox mode，不是 approval bypass，也不会在 backend 不可用时 fallback 到 local_process/no_sandbox/relaxed。`approval_policy` 与 sandbox mode 正交：untrusted/on-request 可以产生 approval request，never 直接 deny request，deprecated on-failure 只作为历史模式识别并 fail closed。`crates/model` 提供 `ModelTurnRequest`、`ModelTurnResponse`、provider config presence、redacted provider status、provider error taxonomy 和 `OpenAiProvider` HTTP adapter，不执行工具。`crates/agent` 提供 `AgentLoop`、`AgentLoopInput`、`AgentLoopResult`、`AgentLoopCapability`、approval grant/resume、tool repair retry、final answer completion、empty-answer fail-closed、sensitive path deny-first 和 multi-change patch full-policy check。
 
-`scripts/verify_rust_migration_boundaries.py` 是迁移漂移检查入口：它阻断 CLI 绕过 app-server、app-server native gate 绕过、Python RuntimeHost 过渡层、desktop/Web 抢跑、未登记 Rust 依赖、sandbox relaxed/no-sandbox contract、app-server 手写 JSON error、CLI 固定 notification 等待或 post-response drain、重复 approval decision API、unused tokio 依赖、缺失 sidecar cancel lifecycle、Windows native capability 未先经过 restricted-token sandbox probe、非 Windows capability 没有明确 strict command sandbox unsupported blocker，以及 `ToolResult.to_message_payload()` 泄漏 raw arguments、内部 approval/policy id、audit metadata 或 secret-like 文本。
+`scripts/verify_rust_migration_boundaries.py` 是迁移漂移检查入口：它阻断 CLI 绕过 app-server、app-server native gate 绕过、Python RuntimeHost 过渡层、desktop/Web 抢跑、未登记 Rust 依赖、sandbox relaxed/no-sandbox contract、app-server 手写 JSON error、CLI 固定 notification 等待或 post-response drain、重复 approval decision API、unused tokio 依赖、缺失 sidecar cancel lifecycle、Windows native capability 未先经过 restricted-token sandbox probe、非 Windows capability 没有明确 strict command sandbox unsupported blocker、native gate 缺少 available/status=completed/blockers=[] 检查，以及 `ToolResult.to_message_payload()` 泄漏 raw arguments、内部 approval/policy id、audit metadata 或 secret-like 文本。
 
 `crates/cli` 的 `sg` 是第一个 app-server protocol client；`sg run` / `sg chat` / `sg continue` / `sg threads` / `sg trace` / `sg approvals` / `sg config doctor` 通过 stdio JSON-RPC 启动并调用同一个 app-server，不直接依赖 store、agent、model 或工具内部 crate。CLI request loop 写入 request 后循环读取 stdout，保留 matching response 之前到达的 notification，遇到 matching response 立即返回；JSON-RPC error、stdout EOF、child exit 或 read timeout 都返回明确错误，不依赖固定 notification 数量，也不在 response 后 drain 额外消息。CLI drop 会发送 `server/shutdown`，让 app-server 按协议执行 sidecar cleanup。未来 desktop 必须复用同一 protocol，不单独设计第二套 core。Python 当前实现冻结为 explicit oracle / parity fixture：允许新增 sidecar adapter、fixture export、parity check 和文档校验；不在 Python 主干继续新增默认 agent host 能力。
 
@@ -1895,76 +1895,36 @@ Use `cancel` for sidecar/AgentLoop cancel. Use `interrupt` only for the existing
     → 移除两个 current sandbox 账户在相同 runtime targets 上的全部显式 ACE
     → residual_audit 非零则 cleanup failed。
 
-  E2. Windows sandbox command runtime recheck（AgentLoop 内命令分支）
-    CommandExecutor.run()
-    → SandboxManager.run()
-    → 先执行 protected path preflight；命中 .env / credential /
-      runtime state 等 hard-deny 规则时直接 POLICY_BLOCKED。
-    → 集中 selector 按 permission_profile.profile 选择 backend：
-      read-only:
-         优先 windows_elevated；elevated 不可用时可用
-         windows_unelevated reduced backend；仍不允许写入，
-         不进入 local_process。
-      workspace-write:
-         优先 windows_elevated；elevated doctor 或 run-time
-         recheck 因 native_windows_elevated_sandbox_unavailable /
-         elevated_python_runtime_blocker /
-         python_c_extension_low_integrity_runtime_initialization_failed
-         等本机 blocker 不可用时，降级 windows_unelevated；
-         两者都不可用才返回 backend_unavailable /
-         error_code=sandbox_unavailable。
-      danger-full-access:
-         不强制 native sandbox；backend 不可用或能力不足时执行
-         relaxed local_process fallback。
-    → selector/result metadata 统一写入：
-      sandbox_mode、sandbox_backend、sandbox_enforcement、
-      enforcement_status、fallback_used、fallback_reason、
-      elevated_available、elevated_blocker_summary、execution_backend。
-      windows_elevated = strict / available /
-      execution_backend=account_restricted_token；
-      windows_unelevated = reduced / degraded /
-      execution_backend=current_user_process；
-      local_process = relaxed / relaxed。
-    → windows_unelevated 在当前用户上下文执行 staged workspace：
-      复用 workspace path 边界、protected path hard-deny、
-      policy/approval 顺序、timeout、output limit、artifact/change
-      detection；network_isolation=advisory，
-      filesystem_isolation=workspace_policy_enforced；
-      不声明 sandbox account、ACL/firewall/logon rights、
-      low-integrity、restricted token 或 native OS sandbox。
-    → danger-full-access local_process fallback：
-      SandboxResult.backend_name="local_process"；
-      metadata.sandbox_enforcement="relaxed"；
-      metadata.fallback_used=true；
-      metadata.used_local_process_fallback=true；
-      CommandResult.isolation_report.filesystem_isolation 保持
-      workspace_cwd_advisory，不声明 native_os_sandbox。
-    → WindowsSandboxBackend.run(prepared)  # windows_elevated
-    → 平台判断统一经 windows_platform.is_windows()，测试不 patch 全局 os.name
-    → 复用 prepare 阶段写入的 readiness snapshot；
-      snapshot 缺失、过期、unavailable 或网络隔离证据不足时再执行
-      uncached enforcement probe
-    → 若 blocking_requirements == ["execution:network_probe"]：
-         读取 PreparedSandbox.baseline.sandbox_role
-         只消费当前命令账户对应 offline/online 子状态；
-         当前角色 ready 时可忽略另一账户瞬时 network_probe 失败。
-      否则任一 setup、launcher、ACL、runner smoke、network filter
-      或其他 enforcement blocker 仍 fail closed → BACKEND_UNAVAILABLE。
-      manager 可在该 elevated runtime blocker 后重试一次
-      windows_unelevated，并把 elevated blocker 摘要透传到 trace/report。
-    → account runner timeout 且未写 result file 时：
-         WindowsRunnerResult.timed_out=true
-         metadata.error_code="account_runner_timeout"
-         不归类为普通 runner_result_missing。
-    → WindowsSandboxBackend.cleanup(prepared)
-      1) 复用 PreparedSandbox.baseline.sandbox_account / credential_target
-         启动同一 sandbox 账户的 Level-1 runner；
-      2) runner spec operation="workspace_cleanup"，只删除当前
-         runs/<sandbox_id>/workspace projection，不创建 Level-2
-         low-integrity child，不扩大 runtime ACL；
-      3) 宿主进程只对当前 runs/sandbox_* run root 执行 take ownership、
-         ACL reset、host SID full-control、medium integrity 和属性恢复；
-      4) 任一步失败 → cleanup_failed，不能把命令 success 伪装为完成。
+  E2. Rust native command sandbox（AgentLoop 内命令分支）
+    AgentLoop::execute_tool()
+    → ToolBroker::execute()
+    → WorkspaceTools.command()
+    → WindowsRestrictedTokenSandboxBackend.execute()
+    → command 只有在 policy allow / approval grant allow 后才执行。
+      denied / ask / approval denied / approval unavailable 不执行命令，
+      也不会被标记为成功。
+    → sandbox mode 与 Codex CLI 对齐：
+      read-only、workspace-write、danger-full-access。
+      danger-full-access 是显式用户/profile mode，不是危险 bypass；
+      它仍通过 Rust `SandboxBackend`、Job Object、受控 cwd/env、
+      stdout/stderr capture、timeout 和 workspace path admission。
+    → `--dangerously-bypass-approvals-and-sandbox` 是 Codex CLI 的独立
+      bypass 语义；当前 Rust native cutover 不引入该语义。
+    → backend 缺失、backend capabilities 非 strict、unsupported network
+      mode、cwd/path 不可用、spawn/timeout/exit nonzero 都 fail closed；
+      不 fallback 到 local_process、no_sandbox、relaxed 或更宽 sandbox mode。
+      workspace-write 失败不会自动升级到 danger-full-access。
+    → approval policy 与 sandbox mode 正交：
+      untrusted / on-request 保留 policy ask；
+      never 把 ask 转为 deny，并把失败返回模型/调用方；
+      deprecated on-failure 只作为历史模式识别并 fail closed，
+      不映射为 on-request、never 或 danger-full-access。
+    → command audit metadata 写入：
+      sandbox_mode、network_access、sandbox_backend、
+      sandbox_enforcement="strict"、approval_policy、
+      approval_decision、command_scope_digest、command_provenance。
+      该 metadata 不进入 model tool payload；app-server native trace
+      只保留脱敏 audit_events，不写 argv 原文、secret、env 或 provider body。
 
   E3. verification failure 分类（AgentLoop 内 run_verification 工具）
     run_verification tool

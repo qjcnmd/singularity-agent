@@ -410,6 +410,8 @@ TraceEvent在append前执行payload redaction并计算payload_hash；span/artifa
 
 Sandbox JSONL trace 由 `SandboxJsonlTraceRecorder.append()` 追加到 `<workspace>/.singularity/sandbox/trace.jsonl`，不是 `TraceEvent` schema 的替代物。每条 sandbox JSONL 记录除生命周期、capabilities、timing、artifact 和 violation 安全摘要外，还写入 `sandbox_mode`、`sandbox_backend`、`sandbox_enforcement`、`enforcement_status`、`execution_backend`、`fallback_used`、`fallback_reason`、`elevated_available`、`elevated_blocker_summary`、`used_local_process_fallback` 和 `local_process_fallback_reason`。`windows_unelevated` 必须以 `sandbox_enforcement="reduced"` / `enforcement_status="degraded"` 出现；`danger-full-access` 的 `local_process` fallback 必须以 `sandbox_enforcement="relaxed"` 出现；二者都不得被 trace 或 report 误标为 elevated/native OS sandbox。
 
+Rust app-server native trace 由 `SessionStore.append_trace()` 写入 `component="agent_loop"` 事件。`AgentRunStatus.audit_events` 只记录 command/approval 的审计摘要，例如 `sandbox_mode`、`network_access`、`sandbox_backend`、`sandbox_enforcement`、`approval_policy`、`approval_decision`、`command_scope_digest` 和 `command_provenance`；它不把 raw argv、env、provider request/response、API key、auth header 或完整 tool payload 写入模型可见消息。approval denied、deferred 或 resume unavailable 也必须写成失败/阻塞审计摘要，不能把失败 approval 标为 success。
+
 ## 失败路径
 
 非法run id抛`ValueError`，未知span抛`TraceStoreError`，artifact错误抛`TraceArtifactError`。`TraceRecorder.emit()`写失败降级返回`trace_write_failed` warning dict并输出脱敏stderr警告；业务执行继续，但final diagnostics应暴露trace不完整。

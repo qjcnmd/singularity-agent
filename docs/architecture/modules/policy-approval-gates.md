@@ -55,7 +55,8 @@ Policy 层把会话级权限边界、动作级策略决策和人工 approval 串
 |---|---|
 | `PermissionProfile` | Codex Permission Profiles 与通用 access-control profile 术语 |
 | `read-only` / `workspace-write` / `danger-full-access` | Codex sandbox modes |
-| `approval_policy` / `on-request` / `never` | Codex approvals 常见策略名 |
+| `approval_policy` / `untrusted` / `on-request` / `never` | Codex approval policy 主路径 |
+| `on-failure` | Codex CLI deprecated 历史 approval policy；Rust native 只识别并 fail closed，不作为新执行路径 |
 | `--add-dir` / additional writable directories | Codex CLI 额外可写目录语义 |
 | protected paths / deny 优先 | Codex permissions、NIST least privilege 与通用 deny-overrides access control |
 | `require_review` / `sandbox_required` | 沿用仓库既有动作级 `DecisionOutcome`，不是会话模式 |
@@ -73,7 +74,8 @@ Policy 层把会话级权限边界、动作级策略决策和人工 approval 串
 ## 关键类、函数、字段
 
 - `PermissionProfileName`: `READ_ONLY`, `WORKSPACE_WRITE`, `DANGER_FULL_ACCESS`
-- `ApprovalPolicy`: `ON_REQUEST`, `NEVER`
+- Python `ApprovalPolicy`: `ON_REQUEST`, `NEVER`
+- Rust `ApprovalPolicy`: `Untrusted`, `OnRequest`, `Never`; `OnFailure` 仅为 deprecated 历史 wire value，native approval request 会拒绝，不映射到其他策略
 - `NetworkAccess`: `DENIED`, `ALLOWED`
 - `ProtectedPathRule`: `pattern`, `allow_read`, `allow_write`, `allow_execute`, `hard_deny`, `description`
 - `PermissionSummary`: `profile`, `writable_roots`, `network_access`, `approval_policy`, `protected_paths_enforced`
@@ -96,6 +98,8 @@ Policy 层把会话级权限边界、动作级策略决策和人工 approval 串
 执行时，`ToolExecutor` 只做工具准入和 hard deny；对于 delegated command/mutation，它不提前消费 approval grant。`CommandExecutor._policy_request()`、`WorkspaceMutationManager._policy_request()`、`VerificationRunner._policy_request()` 在真正执行边界生成 `PolicyRequest`，调用 `PolicyEngine.enforce()` 得到 `PolicyDecision`。command 路径只用 `CommandPolicy.classify()` 补充 `risk_tags` 和 command metadata，再由 `CommandExecutor._command_policy_result()` 把 `PolicyDecision` 投影为 `CommandPolicyResult`。verification plan-time 的 `VerificationPolicy.evaluate()` 只阻塞缺少 command 的 required check；`PolicyEngine.evaluate()` 只允许用于预判、dry-run 或测试决策，不承担运行时 gate；可执行 check 的最终 allow/deny/review/sandbox 仍由 `_run_check()` 和 `CommandExecutor.run()` 中的 `PolicyEngine.enforce()` 决定。`REQUIRE_REVIEW` 由该执行边界调用 `ApprovalGate.authorize()` 消费单次授权；`SANDBOX_REQUIRED` 交给 `SandboxManager.run()` 执行已经构造好的 `SandboxRequest`。`approval_policy=never` 在 rules 层把 review 转为 deny。
 
 Windows sandbox backend 不改变 policy 语义：PolicyEngine 只决定普通本地验证命令在 `workspace-write` 下需要 sandbox，ApprovalGate 只处理 review/approval，不创建账户、不放宽到 `danger-full-access`。Sandbox 层随后验证 sandbox account、Credential Manager 凭据、ACL boundary、LocalUser firewall、private desktop、restricted low-integrity token、Job Object 和 network probe。缺任一能力时 command 结果是 sandbox/backend error，不回退到普通本地进程。
+
+Rust native path 使用 `crates/policy/src/lib.rs` 的轻量 `PolicyEngine`。`PermissionProfile.profile` 和 command `SandboxFilesystemMode` 是执行边界，`ApprovalPolicy` 是独立 approval gate：`untrusted` 与 `on-request` 会保留 `Ask`，`never` 会把 `Ask` 转成 `Deny`，deprecated `on-failure` 会明确 `Deny`，不会映射成 `on-request`、`never` 或 `danger-full-access`。显式 `danger-full-access` 是 Codex CLI 对齐的 sandbox mode，不代表自动 approve；`approval=never` 也不代表无 sandbox 执行。Rust command tool 的 allow/deny/ask 决策先经过 `ToolBroker`，被拒绝或待审批时不调用 sandbox backend。
 
 ## 真实任务中的对象流
 
@@ -296,6 +300,8 @@ Trace events.jsonl 只记录运行时强制路径上的 `TraceEventType.POLICY_R
 ## 失败路径
 
 受保护路径 hard-deny 优先。`approval_policy=never` 把 `REQUIRE_REVIEW` 转为 `DENY`。没有 `InteractionController`、grant store 不可信、grant 过期、scope 不匹配或 single-use 已消费时，`ApprovalGate` fail-closed。OS sandbox 不可用、Windows setup 未完成、account-scoped firewall 未验证或 runner smoke 失败时返回 `backend_unavailable`，不会回退为普通本地执行。
+
+Rust native approval 失败路径同样 fail closed：`approval=never` 不执行命令，deprecated `on-failure` 不触发 sandbox 失败后重跑或 unsandboxed escalation，approval denied/unavailable 只写失败或阻塞状态与审计摘要，不把结果标成 success。
 
 ## 当前结构问题
 

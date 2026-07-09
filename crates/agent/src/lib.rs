@@ -19,8 +19,8 @@ use singularity_model::{
     Provider, provider_error_response,
 };
 use singularity_policy::{
-    ApprovalOutcome, ApprovalRequest, PermissionDecision, PermissionDecisionOutcome,
-    PermissionOperation, PermissionRequest, PolicyEngine,
+    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecision,
+    PermissionDecisionOutcome, PermissionOperation, PermissionRequest, PolicyEngine,
 };
 #[cfg(windows)]
 use singularity_tools::{
@@ -30,7 +30,8 @@ use singularity_tools::{
 use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
     ToolBrokerDecision, ToolCallRequest, ToolOutput, ToolResult, WorkspacePatch,
-    WorkspaceToolError, WorkspaceTools, command_scope_resource, is_protected_path,
+    WorkspaceToolError, WorkspaceTools, command_scope_digest, command_scope_resource,
+    is_protected_path,
 };
 use thiserror::Error;
 
@@ -133,6 +134,7 @@ pub struct AgentRunStatus {
     pub tool_calls: u32,
     pub approval_count: u32,
     pub events: Vec<SidecarRunEvent>,
+    pub audit_events: Vec<Value>,
     pub trace_path: Option<String>,
     pub error: Option<String>,
 }
@@ -150,6 +152,7 @@ impl AgentRunStatus {
             tool_calls: 0,
             approval_count: 0,
             events: Vec::new(),
+            audit_events: Vec::new(),
             trace_path: None,
             error: None,
         }
@@ -167,6 +170,7 @@ impl AgentRunStatus {
             tool_calls: 0,
             approval_count: 0,
             events: result.events,
+            audit_events: Vec::new(),
             trace_path: result.trace_path,
             error: None,
             status,
@@ -185,6 +189,7 @@ impl AgentRunStatus {
             tool_calls: 0,
             approval_count: 0,
             events: Vec::new(),
+            audit_events: Vec::new(),
             trace_path: None,
             error: Some(message.into()),
         }
@@ -416,6 +421,7 @@ impl AgentLoopResult {
             tool_calls: self.tool_calls,
             approval_count: self.approval_count,
             events: Vec::new(),
+            audit_events: audit_events_from_tool_results(&self.tool_results),
             trace_path: None,
             error: self.error.clone(),
         }
@@ -924,9 +930,21 @@ where
             call.raw_arguments.clone(),
         );
         let executor_decision = decision.clone();
-        self.tool_broker.execute(&envelope, decision, |_envelope| {
-            self.execute_workspace_tool(call, &executor_decision)
-        })
+        let mut result = self
+            .tool_broker
+            .execute(&envelope, decision.clone(), |_envelope| {
+                self.execute_workspace_tool(call, &executor_decision)
+            });
+        if call.tool_name == TOOL_COMMAND {
+            let existing_audit = result.audit_metadata().cloned();
+            result = result.with_audit(command_audit_metadata(
+                existing_audit.as_ref(),
+                call,
+                &decision,
+                self.policy.profile.approval_policy,
+            ));
+        }
+        result
     }
 
     fn execute_workspace_tool(
@@ -951,8 +969,13 @@ where
                 .and_then(|input| workspace_tools.edit(input, decision).map_err(Into::into)),
             TOOL_PATCH => patch_tool_input(&call.arguments)
                 .and_then(|input| workspace_tools.patch(input, decision).map_err(Into::into)),
-            TOOL_COMMAND => command_tool_input(&call.arguments)
-                .and_then(|input| workspace_tools.command(input).map_err(Into::into)),
+            TOOL_COMMAND => match command_tool_input(&call.arguments) {
+                Ok(input) => Ok(workspace_tools
+                    .command(input.clone())
+                    .map_err(Into::into)
+                    .unwrap_or_else(|error| command_workspace_tool_failure(&input, error))),
+                Err(error) => Err(error),
+            },
             _ => Ok(ToolOutput::failure(
                 "backend_unavailable",
                 json!({"summary": "tool backend is unavailable"}),
@@ -1659,6 +1682,68 @@ fn tool_result_message(tool_result: &ToolResult) -> ModelMessage {
     message
 }
 
+fn audit_events_from_tool_results(tool_results: &[ToolResult]) -> Vec<Value> {
+    tool_results
+        .iter()
+        .filter_map(|result| result.audit_metadata().cloned())
+        .collect()
+}
+
+fn command_audit_metadata(
+    existing: Option<&Value>,
+    call: &ModelToolCall,
+    decision: &ToolBrokerDecision,
+    approval_policy: ApprovalPolicy,
+) -> Value {
+    let mut audit = existing.cloned().unwrap_or_else(|| json!({}));
+    if let Ok(input) = command_tool_input(&call.arguments) {
+        if audit.get("sandbox_mode").is_none() {
+            audit["sandbox_mode"] =
+                serde_json::to_value(input.sandbox_mode()).unwrap_or(json!("unknown"));
+        }
+        if audit.get("network_access").is_none() {
+            audit["network_access"] =
+                serde_json::to_value(input.network_access()).unwrap_or(json!("unknown"));
+        }
+        if audit.get("command_scope_digest").is_none() {
+            audit["command_scope_digest"] = json!(command_scope_digest(
+                &input.argv,
+                &input.sandbox_mode(),
+                &input.network_access(),
+            ));
+        }
+    }
+    audit["approval_policy"] = serde_json::to_value(approval_policy).unwrap_or(json!("unknown"));
+    match decision {
+        ToolBrokerDecision::Allow => {
+            audit["approval_decision"] = json!("allowed_by_policy");
+        }
+        ToolBrokerDecision::Approved { approval_grant_id } => {
+            audit["approval_decision"] = json!("approved");
+            audit["approval_grant_id"] = json!(approval_grant_id);
+        }
+        ToolBrokerDecision::Deny { reason } => {
+            audit["approval_decision"] = json!("denied");
+            audit["approval_denial_reason"] = json!(reason);
+        }
+        ToolBrokerDecision::Ask {
+            approval_request_id,
+            reason,
+        } => {
+            audit["approval_decision"] = json!("approval_required");
+            audit["approval_request_id"] = json!(approval_request_id);
+            audit["approval_reason"] = json!(reason);
+        }
+    }
+    if audit.get("command_provenance").is_none() {
+        audit["command_provenance"] = json!("agent_requested");
+    }
+    if audit.get("sandbox_backend").is_none() {
+        audit["sandbox_backend"] = json!("not_executed");
+    }
+    audit
+}
+
 fn is_repairable_tool_result(tool_result: &ToolResult) -> bool {
     tool_result.error_code.as_deref().is_some_and(|error_code| {
         REPAIRABLE_TOOL_ERROR_CODES
@@ -1820,6 +1905,26 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
         AgentLoopToolError::Workspace(WorkspaceToolError::InvalidInput(_)) => "invalid_tool_input",
     };
     ToolOutput::failure(error_code, json!({"summary": error.to_string()}))
+}
+
+fn command_workspace_tool_failure(
+    input: &CommandToolInput,
+    error: AgentLoopToolError,
+) -> ToolOutput {
+    let mut output = workspace_tool_failure(error);
+    output.metadata["audit"] = json!({
+        "sandbox_mode": input.sandbox_mode(),
+        "network_access": input.network_access(),
+        "sandbox_backend": "unavailable",
+        "sandbox_enforcement": "strict",
+        "command_scope_digest": command_scope_digest(
+            &input.argv,
+            &input.sandbox_mode(),
+            &input.network_access(),
+        ),
+        "command_provenance": "agent_requested",
+    });
+    output
 }
 
 fn action_matches(action: &Value, kind: &str, status: &str) -> bool {

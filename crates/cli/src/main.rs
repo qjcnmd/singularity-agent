@@ -62,6 +62,8 @@ enum Command {
         model: Option<String>,
         #[arg(long, value_enum)]
         agent_host: Option<AgentHost>,
+        #[arg(long)]
+        json: bool,
     },
     /// Alias for run with chat-oriented wording.
     Chat {
@@ -70,6 +72,8 @@ enum Command {
         model: Option<String>,
         #[arg(long, value_enum)]
         agent_host: Option<AgentHost>,
+        #[arg(long)]
+        json: bool,
     },
     /// Resume an existing thread and submit a new user turn.
     Continue {
@@ -193,26 +197,44 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             goal,
             model,
             agent_host,
+            json,
         }
         | Command::Chat {
             goal,
             model,
             agent_host,
+            json,
         } => {
             let agent_host = default_agent_host(agent_host);
             let mut client = AppServerClient::spawn(Some(agent_host))?;
             client.initialize()?;
             ensure_native_agent_loop_available(agent_host, &mut client)?;
-            let thread = client.thread_start(model)?;
-            println!(
-                "thread {}",
-                required_str(&thread, &["thread", "thread_id"])?
-            );
-            client.turn_start(
+            let (thread, thread_events) = client.thread_start(model, !json)?;
+            if !json {
+                println!(
+                    "thread {}",
+                    required_str(&thread, &["thread", "thread_id"])?
+                );
+            }
+            let (turn, turn_events) = client.turn_start(
                 required_str(&thread, &["thread", "thread_id"])?,
                 &goal,
                 Some(agent_host),
+                !json,
             )?;
+            if json {
+                let mut events = protocol_events(thread_events);
+                events.extend(protocol_events(turn_events));
+                println!(
+                    "{}",
+                    json!({
+                        "thread": thread["thread"],
+                        "turn": turn["turn"],
+                        "events": events,
+                    })
+                );
+            }
+            fail_for_failed_turn(&turn["turn"])?;
             Ok(())
         }
         Command::Continue {
@@ -226,7 +248,9 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             ensure_native_agent_loop_available(agent_host, &mut client)?;
             client.thread_read(&thread_id)?;
             println!("thread {thread_id}");
-            client.turn_start(&thread_id, &instruction, Some(agent_host))?;
+            let (turn, _events) =
+                client.turn_start(&thread_id, &instruction, Some(agent_host), true)?;
+            fail_for_failed_turn(&turn["turn"])?;
             Ok(())
         }
         Command::Turn { command } => {
@@ -300,13 +324,13 @@ fn ensure_native_agent_loop_available(
         let capability = client.agent_capability()?;
         let native = &capability["nativeAgentLoop"];
         let available = native["available"].as_bool().unwrap_or(false);
+        let status = native["status"].as_str().unwrap_or("unknown");
         let blockers_empty = native["blockers"]
             .as_array()
             .is_some_and(|blockers| blockers.is_empty());
-        if available && blockers_empty {
+        if available && blockers_empty && status == "completed" {
             return Ok(());
         }
-        let status = native["status"].as_str().unwrap_or("unknown");
         return Err(format!(
             "native AgentLoop is not production-ready: status={status}; use --agent-host python as oracle"
         ));
@@ -451,15 +475,22 @@ impl AppServerClient {
         self.notify(Method::Initialized, json!({}))
     }
 
-    fn thread_start(&mut self, model: Option<String>) -> Result<Value, String> {
+    fn thread_start(
+        &mut self,
+        model: Option<String>,
+        render: bool,
+    ) -> Result<(Value, Vec<Value>), String> {
         let id = self.next_request_id();
         let responses = self.request(JsonRpcMessage::request(
             Method::ThreadStart,
             json!(id),
             json!({"model": model}),
         ))?;
-        render_messages(&responses, false);
-        first_result(responses)
+        if render {
+            render_messages(&responses, false);
+        }
+        let result = first_result_ref(&responses)?.clone();
+        Ok((result, responses))
     }
 
     fn eval_run(&mut self, manifest: &Path, run_id: &str) -> Result<Value, String> {
@@ -496,7 +527,8 @@ impl AppServerClient {
         thread_id: &str,
         text: &str,
         agent_host: Option<AgentHost>,
-    ) -> Result<(), String> {
+        render: bool,
+    ) -> Result<(Value, Vec<Value>), String> {
         let id = self.next_request_id();
         let agent_host = agent_host.map(ProtocolAgentHost::from);
         let responses = self.request(JsonRpcMessage::request(
@@ -504,41 +536,41 @@ impl AppServerClient {
             json!(id),
             json!({"threadId": thread_id, "agentHost": agent_host, "input": [{"type": "text", "text": text}]}),
         ))?;
-        let turn = first_result_ref(&responses)?;
-        render_messages(&responses, should_render_assistant_alias(&turn["turn"]));
-        if should_render_response_turn(&responses, &turn["turn"]) {
-            render_turn(&turn["turn"]);
+        let mut turn = first_result_ref(&responses)?.clone();
+        if render {
+            render_messages(&responses, should_render_assistant_alias(&turn["turn"]));
+            if should_render_response_turn(&responses, &turn["turn"]) {
+                render_turn(&turn["turn"]);
+            }
         }
-        fail_for_failed_turn(&turn["turn"])?;
         if should_poll_running_turn(&turn["turn"]) {
-            self.wait_for_turn_terminal(required_str(&turn["turn"], &["turn_id"])?)?;
+            let terminal =
+                self.wait_for_turn_terminal(required_str(&turn["turn"], &["turn_id"])?, render)?;
+            turn["turn"]["status"] = json!(terminal.status);
+            if let Some(agent_loop_status) = terminal.agent_loop_status {
+                turn["turn"]["agent_loop_status"] = json!(agent_loop_status);
+            }
         }
-        Ok(())
+        Ok((turn, responses))
     }
 
-    fn wait_for_turn_terminal(&mut self, turn_id: &str) -> Result<(), String> {
+    fn wait_for_turn_terminal(&mut self, turn_id: &str, render: bool) -> Result<TurnView, String> {
         loop {
             thread::sleep(TURN_STATUS_POLL_INTERVAL);
             let turn = self.fetch_turn_status(turn_id)?;
             if turn.status != "running" {
-                println!(
-                    "turn {} {}{}",
-                    turn.turn_id,
-                    turn.status,
-                    turn.agent_loop_status
-                        .as_deref()
-                        .map(|status| format!(" agent_loop_status={status}"))
-                        .unwrap_or_default()
-                );
-                if turn.status != "completed"
-                    || matches!(
-                        turn.agent_loop_status.as_deref(),
-                        Some("failed" | "blocked")
-                    )
-                {
-                    return Err(format!("turn {} {}", turn.turn_id, turn.status));
+                if render {
+                    println!(
+                        "turn {} {}{}",
+                        turn.turn_id,
+                        turn.status,
+                        turn.agent_loop_status
+                            .as_deref()
+                            .map(|status| format!(" agent_loop_status={status}"))
+                            .unwrap_or_default()
+                    );
                 }
-                return Ok(());
+                return Ok(turn);
             }
         }
     }
@@ -843,6 +875,32 @@ fn has_method(messages: &[Value], method: &str) -> bool {
         .any(|message| message["method"].as_str() == Some(method))
 }
 
+fn protocol_events(messages: Vec<Value>) -> Vec<Value> {
+    messages
+        .into_iter()
+        .filter_map(safe_protocol_event)
+        .collect()
+}
+
+fn safe_protocol_event(message: Value) -> Option<Value> {
+    let method = message["method"].as_str()?;
+    let item_id = message["params"]["item"]["item_id"].as_str().unwrap_or("");
+    match method {
+        "item/agentMessage/delta" => Some(json!({
+            "method": method,
+            "params": {
+                "item_id": item_id,
+                "delta": message["params"]["delta"].as_str().unwrap_or(""),
+            },
+        })),
+        "item/started" | "item/completed" => Some(json!({
+            "method": method,
+            "params": {"item_id": item_id},
+        })),
+        _ => Some(json!({"method": method})),
+    }
+}
+
 fn render_messages(messages: &[Value], render_assistant_alias: bool) {
     for message in messages {
         if let Some(method) = message["method"].as_str() {
@@ -931,10 +989,21 @@ fn render_trace_event(event: &Value) {
 fn fail_for_failed_turn(turn: &Value) -> Result<(), String> {
     let status = turn["status"].as_str().unwrap_or("");
     let agent_loop_status = turn["agent_loop_status"].as_str().unwrap_or("");
-    if matches!(status, "failed" | "blocked" | "interrupted")
-        || matches!(agent_loop_status, "failed" | "blocked")
+    let non_terminal_running = status == "running" && !should_poll_running_turn(turn);
+    if non_terminal_running
+        || matches!(status, "failed" | "blocked" | "interrupted" | "cancelled")
+        || matches!(
+            agent_loop_status,
+            "failed" | "blocked" | "cancelled" | "not_migrated"
+        )
     {
-        return Err(format!("error {status}: turn {status}"));
+        let turn_id = turn["turn_id"].as_str().unwrap_or("");
+        if turn_id.is_empty() {
+            return Err(format!("error {status}: turn {status}"));
+        }
+        return Err(format!(
+            "error {status}: turn {status}; turn {turn_id} {status}"
+        ));
     }
     Ok(())
 }
