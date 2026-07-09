@@ -196,10 +196,7 @@ def test_pyproject_console_script_targets_cli_main() -> None:
 
     payload = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
-    assert payload["project"]["scripts"] == {
-        "singularity-agent": "singularity.cli:main",
-        "sg": "singularity.cli:main",
-    }
+    assert "scripts" not in payload["project"]
     assert "platformdirs>=4.2" in payload["project"]["dependencies"]
     assert "eval" in payload["project"]["optional-dependencies"]
     assert "test" in payload["dependency-groups"]

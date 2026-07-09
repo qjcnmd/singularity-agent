@@ -1,14 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 #[cfg(windows)]
 use std::sync::OnceLock;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -35,15 +30,6 @@ use singularity_tools::{
 };
 use thiserror::Error;
 
-const SIDECAR_METHOD_RUN: &str = "agent/run";
-const SIDECAR_METHOD_RESUME: &str = "agent/resume";
-const SIDECAR_METHOD_CANCEL: &str = "agent/cancel";
-const SIDECAR_METHOD_STATUS: &str = "agent/status";
-const SIDECAR_METHOD_HEALTH: &str = "agent/health";
-const SIDECAR_COMPONENT: &str = "python_sidecar";
-const DEFAULT_PYTHON_BIN: &str = "python";
-const DEFAULT_SIDECAR_MODULE: &str = "singularity.agent_host.sidecar";
-const DEFAULT_SIDECAR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(not(windows))]
 const STRICT_COMMAND_SANDBOX_UNSUPPORTED_PLATFORM: &str =
     "strict_command_sandbox_unsupported_platform";
@@ -133,7 +119,6 @@ pub struct AgentRunStatus {
     pub model_turns: u32,
     pub tool_calls: u32,
     pub approval_count: u32,
-    pub events: Vec<SidecarRunEvent>,
     pub audit_events: Vec<Value>,
     pub trace_path: Option<String>,
     pub error: Option<String>,
@@ -151,29 +136,9 @@ impl AgentRunStatus {
             model_turns: 0,
             tool_calls: 0,
             approval_count: 0,
-            events: Vec::new(),
             audit_events: Vec::new(),
             trace_path: None,
             error: None,
-        }
-    }
-
-    pub fn from_sidecar(result: PythonSidecarRunResult) -> Self {
-        let status = AgentStatus::from(result.status.as_str());
-        Self {
-            completed: status == AgentStatus::Completed,
-            final_answer: result.final_answer,
-            run_id: Some(result.run_id),
-            session_id: Some(result.session_id),
-            task_id: Some(result.task_id),
-            model_turns: 0,
-            tool_calls: 0,
-            approval_count: 0,
-            events: result.events,
-            audit_events: Vec::new(),
-            trace_path: result.trace_path,
-            error: None,
-            status,
         }
     }
 
@@ -188,7 +153,6 @@ impl AgentRunStatus {
             model_turns: 0,
             tool_calls: 0,
             approval_count: 0,
-            events: Vec::new(),
             audit_events: Vec::new(),
             trace_path: None,
             error: Some(message.into()),
@@ -420,7 +384,6 @@ impl AgentLoopResult {
             model_turns: self.model_turns,
             tool_calls: self.tool_calls,
             approval_count: self.approval_count,
-            events: Vec::new(),
             audit_events: audit_events_from_tool_results(&self.tool_results),
             trace_path: None,
             error: self.error.clone(),
@@ -1211,67 +1174,6 @@ pub fn final_mapping_from_status(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PythonSidecarConfig {
-    pub python_bin: String,
-    pub module: String,
-    pub project_root: PathBuf,
-    pub python_path: Option<PathBuf>,
-    pub env: Vec<(String, String)>,
-}
-
-impl PythonSidecarConfig {
-    pub fn new(project_root: impl Into<PathBuf>) -> Self {
-        Self {
-            python_bin: DEFAULT_PYTHON_BIN.to_string(),
-            module: DEFAULT_SIDECAR_MODULE.to_string(),
-            project_root: project_root.into(),
-            python_path: None,
-            env: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct PythonSidecarRunResult {
-    pub run_id: String,
-    pub session_id: String,
-    pub task_id: String,
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_answer: Option<String>,
-    #[serde(default)]
-    pub events: Vec<SidecarRunEvent>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trace_path: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct PythonSidecarStatus {
-    pub run_id: String,
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_answer: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trace_path: Option<String>,
-    #[serde(default)]
-    pub events: Vec<SidecarRunEvent>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct SidecarRunEvent {
-    pub event_id: String,
-    pub event_type: String,
-    pub summary: String,
-    pub component: String,
-    pub severity: String,
-    pub sequence: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PlannerState {
     pub task_id: String,
@@ -1353,216 +1255,6 @@ pub struct FinalReportMapping {
     pub contract_satisfaction: Value,
     pub created_at: String,
     pub metadata: Value,
-}
-
-#[derive(Debug)]
-pub struct PythonSidecarClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: Receiver<Result<String, String>>,
-    stdout_reader: Option<JoinHandle<()>>,
-    next_id: i64,
-    response_timeout: Duration,
-}
-
-impl PythonSidecarClient {
-    pub fn spawn(config: &PythonSidecarConfig) -> Result<Self, String> {
-        Self::spawn_with_response_timeout(config, DEFAULT_SIDECAR_RESPONSE_TIMEOUT)
-    }
-
-    pub fn spawn_with_response_timeout(
-        config: &PythonSidecarConfig,
-        response_timeout: Duration,
-    ) -> Result<Self, String> {
-        let mut command = Command::new(&config.python_bin);
-        command
-            .args(["-m", &config.module])
-            .env("SINGULARITY_SIDECAR_PROJECT_ROOT", &config.project_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if let Some(python_path) = &config.python_path {
-            command.env("PYTHONPATH", python_path);
-        }
-        for (name, value) in &config.env {
-            command.env(name, value);
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("failed to start Python sidecar: {error}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Python sidecar stdin unavailable".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Python sidecar stdout unavailable".to_string())?;
-        let (stdout, stdout_reader) = spawn_stdout_reader(stdout);
-        Ok(Self {
-            child,
-            stdin,
-            stdout,
-            stdout_reader: Some(stdout_reader),
-            next_id: 1,
-            response_timeout,
-        })
-    }
-
-    pub fn run_agent(
-        &mut self,
-        goal: &str,
-        model: Option<&str>,
-    ) -> Result<PythonSidecarRunResult, String> {
-        let value = self.request(SIDECAR_METHOD_RUN, sidecar_run_params(goal, model))?;
-        serde_json::from_value(value)
-            .map_err(|error| format!("invalid sidecar run result: {error}"))
-    }
-
-    pub fn resume_agent(
-        &mut self,
-        session_id: &str,
-        goal: &str,
-        model: Option<&str>,
-    ) -> Result<PythonSidecarRunResult, String> {
-        let mut params = sidecar_run_params(goal, model);
-        if let Some(object) = params.as_object_mut() {
-            object.insert("sessionId".to_string(), json!(session_id));
-        }
-        let value = self.request(SIDECAR_METHOD_RESUME, params)?;
-        serde_json::from_value(value)
-            .map_err(|error| format!("invalid sidecar run result: {error}"))
-    }
-
-    pub fn cancel(&mut self, run_id: &str) -> Result<PythonSidecarStatus, String> {
-        let value = self.request(SIDECAR_METHOD_CANCEL, json!({"runId": run_id}))?;
-        serde_json::from_value(value)
-            .map_err(|error| format!("invalid sidecar cancel result: {error}"))
-    }
-
-    pub fn status(&mut self, run_id: &str) -> Result<PythonSidecarStatus, String> {
-        let value = self.request(SIDECAR_METHOD_STATUS, json!({"runId": run_id}))?;
-        serde_json::from_value(value)
-            .map_err(|error| format!("invalid sidecar status result: {error}"))
-    }
-
-    pub fn health(&mut self) -> Result<Value, String> {
-        self.request(SIDECAR_METHOD_HEALTH, json!({}))
-    }
-
-    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        let id = self.next_request_id();
-        let message = json!({"id": id, "method": method, "params": params});
-        writeln!(self.stdin, "{message}")
-            .map_err(|error| format!("failed to write Python sidecar request: {error}"))?;
-        self.stdin
-            .flush()
-            .map_err(|error| format!("failed to flush Python sidecar request: {error}"))?;
-        let response = self.read_response()?;
-        if response.get("id").and_then(Value::as_i64) != Some(id) {
-            return Err("Python sidecar returned mismatched response id".to_string());
-        }
-        if let Some(error) = response.get("error") {
-            let message = error["message"].as_str().unwrap_or("Python sidecar error");
-            return Err(message.to_string());
-        }
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| "Python sidecar response missing result".to_string())
-    }
-
-    fn read_response(&mut self) -> Result<Value, String> {
-        let line = match self.stdout.recv_timeout(self.response_timeout) {
-            Ok(Ok(line)) => line,
-            Ok(Err(error)) => return Err(error),
-            Err(RecvTimeoutError::Timeout) => {
-                self.terminate_child();
-                return Err("timed out waiting for Python sidecar response".to_string());
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                if let Some(status) = self
-                    .child
-                    .try_wait()
-                    .map_err(|error| format!("failed to poll Python sidecar status: {error}"))?
-                {
-                    return Err(format!("Python sidecar exited before response: {status}"));
-                }
-                return Err("Python sidecar closed stdout".to_string());
-            }
-        };
-        serde_json::from_str(line.trim())
-            .map_err(|error| format!("invalid Python sidecar JSON: {error}"))
-    }
-
-    fn next_request_id(&mut self) -> i64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    fn terminate_child(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for PythonSidecarClient {
-    fn drop(&mut self) {
-        self.terminate_child();
-        if let Some(stdout_reader) = self.stdout_reader.take() {
-            let _ = stdout_reader.join();
-        }
-    }
-}
-
-fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<Result<String, String>>, JoinHandle<()>) {
-    let (sender, receiver) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if sender.send(Ok(line)).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(format!(
-                        "failed to read Python sidecar response: {error}"
-                    )));
-                    break;
-                }
-            }
-        }
-    });
-    (receiver, handle)
-}
-
-pub fn sidecar_trace_summary(run_status: &AgentRunStatus) -> Value {
-    json!({
-        "component": SIDECAR_COMPONENT,
-        "status": run_status.status.as_str(),
-        "run_id": run_status.run_id,
-        "session_id": run_status.session_id,
-        "task_id": run_status.task_id,
-        "model_turns": run_status.model_turns,
-        "tool_calls": run_status.tool_calls,
-        "approval_count": run_status.approval_count,
-        "trace_path": run_status.trace_path,
-    })
-}
-
-fn sidecar_run_params(goal: &str, model: Option<&str>) -> Value {
-    let mut params = json!({"goal": goal});
-    if let Some(model) = model {
-        if let Some(object) = params.as_object_mut() {
-            object.insert("model".to_string(), json!(model));
-        }
-    }
-    params
 }
 
 fn model_turn_request(
@@ -1797,6 +1489,8 @@ fn approval_request(
         input.task_id.clone(),
         call.tool_name.clone(),
     )
+    .with_thread_turn_binding(input.thread_id.clone(), input.turn_id.clone())
+    .with_tool_call_id(call.tool_call_id.clone())
     .with_resources(permission_resources_for_tool(call));
     request.reason = reason.to_string();
     request

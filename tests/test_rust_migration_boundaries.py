@@ -58,8 +58,9 @@ TOOL_RESULT_INTERNAL_FIELDS = (
 )
 
 RUST_AGENT_HOST_DOC_MARKERS = (
-    "Current Python owner",
-    "Rust owner after this stage",
+    "Rust public runtime",
+    "Python oracle/parity/dev-only",
+    "target-project Python commands",
     "Parity expectation",
     "Intentional divergence",
     "AgentRunStatus",
@@ -69,10 +70,23 @@ RUST_AGENT_HOST_DOC_MARKERS = (
 TURN_LIFECYCLE_DOC_MARKERS = (
     "turn lifecycle",
     "interrupted_requested",
-    "PythonSidecarClient::cancel",
     "AgentLoop cancel semantics",
     "SessionStore",
     "trace event",
+)
+
+PUBLIC_RUNTIME_FORBIDDEN_CASES = (
+    ("README.md", "--agent-host", "public-agent-host-surface"),
+    ("docs/singularity.md", "agentHost", "public-agent-host-surface"),
+    ("docs/architecture/rust-agent-host.md", "SINGULARITY_PYTHON_SIDECAR", "public-agent-host-surface"),
+    (
+        "docs/architecture/modules/rust-app-server-protocol.md",
+        "singularity.agent_host.sidecar",
+        "public-agent-host-surface",
+    ),
+    ("crates/cli/src/main.rs", "--agent-host", "public-agent-host-surface"),
+    ("crates/protocol/src/lib.rs", "agentHost", "public-agent-host-surface"),
+    ("scripts/verify_rust_cli_agent_host.py", "", "public-sidecar-smoke"),
 )
 
 FORBIDDEN_LIFECYCLE_NAMES = (
@@ -135,13 +149,15 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "crates/store/src/lib.rs",
         "crates/protocol/src/lib.rs",
         "crates/tools/src/lib.rs",
+        "pyproject.toml",
+        "README.md",
         "src/singularity/agent_host/sidecar.py",
         "docs/evaluation/public-representative-task.json",
+        "docs/testing.md",
         "docs/singularity.md",
         "docs/architecture/modules/evaluation-benchmark-runner.md",
         "docs/architecture/modules/rust-app-server-protocol.md",
         "docs/architecture/rust-agent-host.md",
-        "scripts/verify_rust_cli_agent_host.py",
         "scripts/export_rust_parity_fixtures.py",
         "tests/fixtures/rust_parity/python_oracle.json",
     ):
@@ -163,11 +179,15 @@ def test_current_repository_satisfies_rust_migration_boundaries() -> None:
 @pytest.mark.parametrize("marker", RUST_AGENT_HOST_DOC_MARKERS)
 def test_guard_rejects_rust_agent_host_docs_without_logic_map_marker(tmp_path: Path, marker: str) -> None:
     repo = copy_repo_slice(tmp_path)
-    for relative in ("docs/singularity.md", "docs/architecture/modules/rust-app-server-protocol.md"):
+    for relative in (
+        "docs/singularity.md",
+        "docs/architecture/modules/rust-app-server-protocol.md",
+        "docs/architecture/rust-agent-host.md",
+    ):
         path = repo / relative
         path.write_text(path.read_text(encoding="utf-8").replace(marker, ""), encoding="utf-8")
 
-    result = run_guard(repo, "--changed-file", "crates/app-server/src/lib.rs")
+    result = run_guard(repo, "--changed-file", "docs/singularity.md")
 
     assert result.returncode == 1
     assert "rust-agent-host-docs-incomplete" in result.stderr
@@ -191,6 +211,67 @@ def test_guard_rejects_rust_public_nonstandard_names(
 
     assert result.returncode == 1
     assert "rust-public-naming-drift" in result.stderr
+
+
+@pytest.mark.parametrize(("relative", "needle", "violation"), PUBLIC_RUNTIME_FORBIDDEN_CASES)
+def test_guard_rejects_public_agent_host_or_sidecar_surface(
+    tmp_path: Path, relative: str, needle: str, violation: str
+) -> None:
+    repo = copy_repo_slice(tmp_path)
+    path = repo / relative
+    if needle:
+        path.write_text(path.read_text(encoding="utf-8") + f"\n{needle}\n", encoding="utf-8")
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# old public sidecar smoke\n", encoding="utf-8")
+
+    result = run_guard(repo, "--changed-file", relative)
+
+    assert result.returncode == 1
+    assert violation in result.stderr
+
+
+def test_guard_scans_public_runtime_surface_without_changed_file_filter(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    readme = repo / "README.md"
+    readme.write_text(
+        readme.read_text(encoding="utf-8") + "\n--agent-host python\n",
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "public-agent-host-surface" in result.stderr
+
+
+def test_guard_rejects_python_public_console_scripts(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + '\n[project.scripts]\nsingularity-agent = "singularity.cli:main"\n',
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "public-python-cli-script" in result.stderr
+
+
+def test_guard_allows_target_project_python_pytest_commands(tmp_path: Path) -> None:
+    repo = copy_repo_slice(tmp_path)
+    docs = repo / "docs/testing.md"
+    docs.write_text(
+        docs.read_text(encoding="utf-8")
+        + "\nTarget-project Python commands remain valid through the Rust sandbox: python -m pytest tests/test_app.py\n",
+        encoding="utf-8",
+    )
+
+    result = run_guard(repo, "--changed-file", "docs/testing.md")
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
@@ -486,72 +567,6 @@ def test_guard_rejects_cli_notification_drain(tmp_path: Path) -> None:
     assert "cli-notification-drain" in result.stderr
 
 
-def test_guard_rejects_cli_requiring_raw_sidecar_env_as_user_setup(tmp_path: Path) -> None:
-    repo = copy_repo_slice(tmp_path)
-    cli = repo / "crates/cli/src/main.rs"
-    text = cli.read_text(encoding="utf-8")
-    text = text.replace("AgentHost::Python", "AgentHost::Disabled")
-    cli.write_text(text, encoding="utf-8")
-
-    result = run_guard(repo)
-
-    assert result.returncode == 1
-    assert "raw-sidecar-env-user-setup" in result.stderr
-
-
-def test_guard_rejects_cli_direct_python_sidecar_invocation(tmp_path: Path) -> None:
-    repo = copy_repo_slice(tmp_path)
-    cli = repo / "crates/cli/src/main.rs"
-    cli.write_text(cli.read_text(encoding="utf-8") + '\nCommand::new("python").arg("-m").arg("singularity.agent_host.sidecar");\n', encoding="utf-8")
-
-    result = run_guard(repo)
-
-    assert result.returncode == 1
-    assert "cli-direct-sidecar-invocation" in result.stderr
-
-
-@pytest.mark.parametrize(
-    ("relative", "old", "new", "violation"),
-    (
-        (
-            "crates/agent/src/lib.rs",
-            "SIDECAR_METHOD_RESUME",
-            "SIDECAR_METHOD_CONTINUE",
-            "sidecar-resume-missing",
-        ),
-        (
-            "crates/agent/src/lib.rs",
-            "sidecar_run_params(goal, model)",
-            "json!({\"goal\": goal})",
-            "sidecar-model-forwarding-missing",
-        ),
-        (
-            "crates/app-server/src/lib.rs",
-            "previous_python_session_id",
-            "previous_python_run_id",
-            "sidecar-resume-session-missing",
-        ),
-        (
-            "crates/app-server/src/lib.rs",
-            ".resume_agent(session_id, &goal, model)",
-            "client.run_agent(&goal, model)",
-            "sidecar-resume-call-missing",
-        ),
-    ),
-)
-def test_guard_rejects_missing_sidecar_resume_or_model_forwarding(
-    tmp_path: Path, relative: str, old: str, new: str, violation: str
-) -> None:
-    repo = copy_repo_slice(tmp_path)
-    path = repo / relative
-    path.write_text(path.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
-
-    result = run_guard(repo)
-
-    assert result.returncode == 1
-    assert violation in result.stderr
-
-
 def test_guard_rejects_agent_delta_outside_terminal_projection(tmp_path: Path) -> None:
     repo = copy_repo_slice(tmp_path)
     app_server = repo / "crates/app-server/src/lib.rs"
@@ -622,46 +637,19 @@ def test_guard_rejects_native_gate_without_completed_status(tmp_path: Path) -> N
     assert "native-agent-loop-app-server-gate-drift" in result.stderr
 
 
-def test_guard_rejects_interrupt_that_updates_status_without_sidecar_cancel(tmp_path: Path) -> None:
-    repo = copy_repo_slice(tmp_path)
-    app_server = repo / "crates/app-server/src/lib.rs"
-    text = app_server.read_text(encoding="utf-8")
-    turn_interrupt_start = text.index("    fn turn_interrupt")
-    text = text[:turn_interrupt_start] + text[turn_interrupt_start:].replace(".cancel(", ".request_cancel(")
-    app_server.write_text(text, encoding="utf-8")
-
-    result = run_guard(repo, "--changed-file", "crates/app-server/src/lib.rs")
-
-    assert result.returncode == 1
-    assert "turn-interrupt-missing-sidecar-cancel" in result.stderr
-
-
-@pytest.mark.parametrize("marker", ("prompt", "provider", "tool", "env"))
-def test_guard_rejects_active_sidecar_run_raw_persistence_fields(tmp_path: Path, marker: str) -> None:
+def test_guard_rejects_active_sidecar_run_persistence(tmp_path: Path) -> None:
     repo = copy_repo_slice(tmp_path)
     store = repo / "crates/store/src/lib.rs"
     store.write_text(
         store.read_text(encoding="utf-8")
-        + f"\ncreate table active_sidecar_runs_extra({marker} text not null);\n",
+        + "\ncreate table active_sidecar_runs(turn_id text primary key);\n",
         encoding="utf-8",
     )
 
     result = run_guard(repo)
 
     assert result.returncode == 1
-    assert "active-sidecar-raw-persistence" in result.stderr
-    assert marker in result.stderr
-
-
-def test_guard_rejects_rust_cli_smoke_copying_full_environment(tmp_path: Path) -> None:
-    repo = copy_repo_slice(tmp_path)
-    smoke = repo / "scripts/verify_rust_cli_agent_host.py"
-    smoke.write_text(smoke.read_text(encoding="utf-8") + "\nenv = os.environ.copy()\n", encoding="utf-8")
-
-    result = run_guard(repo)
-
-    assert result.returncode == 1
-    assert "rust-cli-smoke-env-copy" in result.stderr
+    assert "public-sidecar-persistence" in result.stderr
 
 
 def test_guard_rejects_duplicate_approval_decision_public_api(tmp_path: Path) -> None:
@@ -778,7 +766,10 @@ def test_guard_rejects_old_native_agent_loop_names(tmp_path: Path) -> None:
 def test_guard_rejects_cli_native_path_without_partial_capability_gate(tmp_path: Path) -> None:
     repo = copy_repo_slice(tmp_path)
     cli = repo / "crates/cli/src/main.rs"
-    cli.write_text(cli.read_text(encoding="utf-8").replace("blockers_empty", "native_ready"), encoding="utf-8")
+    cli.write_text(
+        cli.read_text(encoding="utf-8").replace('blockers == "none"', "true"),
+        encoding="utf-8",
+    )
 
     result = run_guard(repo)
 
@@ -788,11 +779,11 @@ def test_guard_rejects_cli_native_path_without_partial_capability_gate(tmp_path:
 
 @pytest.mark.parametrize(
     ("old", "new"),
-    (
-        ("NATIVE_AGENT_LOOP_NOT_READY", "NATIVE_AGENT_LOOP_DELAYED"),
         (
-            "capability.blockers.is_empty()",
-            "true",
+            ("native_capability_ready(&capability)", "true"),
+            (
+                "capability.blockers.is_empty()",
+                "true",
         ),
     ),
 )
@@ -815,13 +806,20 @@ def test_guard_rejects_sidecar_trace_payload_leaks(tmp_path: Path, marker: str) 
     agent = repo / "crates/agent/src/lib.rs"
     text = agent.read_text(encoding="utf-8")
     agent.write_text(
-        text.replace('"trace_path": run_status.trace_path,', f'"trace_path": run_status.trace_path,\n        "{marker}": "leak",'),
+        text
+        + f"""
+
+pub fn sidecar_trace_summary() -> serde_json::Value {{
+    serde_json::json!({{"{marker}": "leak"}})
+}}
+""",
         encoding="utf-8",
     )
 
     result = run_guard(repo)
 
     assert result.returncode == 1
+    assert "public-sidecar-trace-summary" in result.stderr
     assert "sidecar-trace-payload-leak" in result.stderr
     assert marker in result.stderr
 

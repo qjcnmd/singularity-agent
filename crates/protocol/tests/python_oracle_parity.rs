@@ -11,6 +11,7 @@ fn python_oracle_fixture_has_expected_safe_tool_result_shape() {
     .expect("parse python oracle fixture");
     let payload = &fixture["tool_result_payload"];
     let output = &fixture["tool_output"];
+    let reference_output = &fixture["reference_tool_output"];
 
     assert_eq!(payload["tool_call_id"], "call_1");
     assert_eq!(
@@ -28,6 +29,9 @@ fn python_oracle_fixture_has_expected_safe_tool_result_shape() {
     assert!(output.get("tool_call_id").is_none());
     assert!(output.get("tool_name").is_none());
     assert!(output.get("status").is_none());
+    assert!(reference_output["content"]["preview"].is_null());
+    assert_eq!(reference_output["content"]["artifact_ref"], "artifact_1");
+    assert_eq!(reference_output["truncated"], true);
     assert!(
         !serde_json::to_string(payload)
             .unwrap()

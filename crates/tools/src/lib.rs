@@ -216,7 +216,7 @@ impl ToolBroker {
         {
             return ToolResult::approval_required(envelope, approval_request_id, reason);
         }
-        ToolResult::from_result(envelope, &executor(envelope), ToolResultView::Summary)
+        ToolResult::from_result(envelope, &executor(envelope))
     }
 }
 
@@ -283,21 +283,14 @@ impl ToolOutput {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolResultView {
-    Summary,
-    ReferenceOnly,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolResult {
     pub tool_call_id: String,
     pub tool_name: String,
     pub ok: bool,
     pub status: String,
-    pub view: ToolResultView,
-    pub preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
     pub digest: String,
     pub artifact_ref: Option<String>,
     pub error_code: Option<String>,
@@ -327,8 +320,7 @@ impl ToolResult {
             tool_name: tool_name.into(),
             ok,
             status: if ok { "ok" } else { "error" }.to_string(),
-            view: ToolResultView::Summary,
-            preview: preview.into(),
+            preview: Some(redact_public_text(&preview.into())),
             digest: digest.into(),
             artifact_ref: None,
             error_code: None,
@@ -364,21 +356,17 @@ impl ToolResult {
         self.audit_metadata.as_ref()
     }
 
-    pub fn from_result(
-        envelope: &ToolCallRequest,
-        result: &ToolOutput,
-        view: ToolResultView,
-    ) -> Self {
+    pub fn from_result(envelope: &ToolCallRequest, result: &ToolOutput) -> Self {
         let result_content = result.content.to_string();
         let (preview, preview_truncated) =
             bounded_text(&result_content, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
+        let truncated = result.truncated || preview_truncated;
         let artifact_ref = result_artifact_ref(&result.content, &result.metadata);
         let artifact_refs = result_artifact_refs(&result.content, &result.metadata);
         let result_id = result_id(&result.content, &result.metadata);
         let mut tool_result = Self {
-            view,
             error_code: result.error_code.clone(),
-            truncated: result.truncated || preview_truncated,
+            truncated,
             ..Self::summary(
                 envelope.tool_call_id.clone(),
                 envelope.tool_name.clone(),
@@ -390,6 +378,13 @@ impl ToolResult {
         tool_result.artifact_ref = artifact_ref;
         tool_result.artifact_refs = artifact_refs;
         tool_result.result_id = result_id;
+        if truncated
+            && (tool_result.artifact_ref.is_some()
+                || !tool_result.artifact_refs.is_empty()
+                || tool_result.result_id.is_some())
+        {
+            tool_result.preview = None;
+        }
         tool_result.audit_metadata = result.metadata.get("audit").cloned();
         tool_result
     }
@@ -423,7 +418,6 @@ impl ToolResult {
     }
 
     pub fn to_message_payload(&self) -> Value {
-        let preview = redact_public_text(&self.preview);
         let artifact_ref = self.artifact_ref.as_deref().and_then(safe_reference);
         let artifact_refs = self
             .artifact_refs
@@ -444,7 +438,8 @@ impl ToolResult {
             "truncated": self.truncated,
             "redacted": self.redacted,
         });
-        if self.view != ToolResultView::ReferenceOnly {
+        if let Some(preview) = self.preview.as_deref() {
+            let preview = redact_public_text(preview);
             payload["content"] = json!(preview);
             payload["preview"] = json!(preview);
         }

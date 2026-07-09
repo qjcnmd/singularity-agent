@@ -413,7 +413,7 @@ class SandboxNetworkMode(str, Enum):
 ## 谁消费这些对象
 
 - `SandboxManager` 和 backend 消费 `SandboxRequest`、`SandboxProfile` 及 `PreparedSandbox`。
-- `singularity-agent sandbox doctor/setup/cleanup --json` 消费 `WindowsSandboxBackend` 的 doctor/setup/cleanup report 并原样输出 machine-readable JSON。
+- 内部诊断命令 `python -m singularity.cli sandbox doctor/setup/cleanup --json` 消费 `WindowsSandboxBackend` 的 doctor/setup/cleanup report 并原样输出 machine-readable JSON；Rust public CLI 当前不暴露 sandbox 管理命令。
 - `WindowsSandboxRunner` 消费 `runner-spec.json`，写 `runner-result.json`。
 - `CommandExecutor._result_from_sandbox()` 消费 `SandboxResult` 并产生 `CommandResult`。
 - `Planner.update_from_command()`、`VerificationRunner` 和 `Finalizer` 消费 command metadata / isolation report 中的 sandbox evidence。

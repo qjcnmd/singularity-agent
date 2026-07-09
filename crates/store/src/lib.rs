@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,11 +15,15 @@ use singularity_protocol::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
 const DURABLE_LEDGER_SCHEMA_MIGRATION: &str = "0002_durable_ledger";
-const ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION: &str = "0003_active_sidecar_runs";
 const PENDING_TOOL_CALL_SCHEMA_MIGRATION: &str = "0004_pending_tool_calls";
+const STORE_HARDENING_SCHEMA_MIGRATION: &str = "0005_store_hardening";
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+const SQLITE_FOREIGN_KEYS_PRAGMA: &str = "foreign_keys";
+const SQLITE_JOURNAL_MODE_PRAGMA: &str = "journal_mode";
+const SQLITE_JOURNAL_MODE_WAL: &str = "WAL";
 const REDACTED_ARTIFACT_VALUE: &str = "[redacted]";
 const SENSITIVE_ARTIFACT_MARKERS: [&str; 5] =
     ["api_key", "authorization", "password", "secret", "token"];
@@ -32,6 +38,10 @@ pub enum StoreError {
     NotFound(String),
     #[error("record already exists: {0}")]
     AlreadyExists(String),
+    #[error("unsupported schema version {found}; supported version is {supported}")]
+    UnsupportedSchema { found: u32, supported: u32 },
+    #[error("invalid store state: {0}")]
+    InvalidState(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -48,18 +58,6 @@ pub struct SessionStore {
     descriptor: SessionStoreDescriptor,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ActiveSidecarRun {
-    pub turn_id: String,
-    pub thread_id: String,
-    pub run_id: String,
-    pub session_id: String,
-    pub task_id: String,
-    pub status: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RecordedApprovalDecision {
     pub request: ApprovalRequest,
@@ -72,6 +70,7 @@ impl SessionStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
         let connection = Connection::open(path)?;
+        configure_connection(&connection)?;
         let store = Self {
             connection,
             descriptor: SessionStoreDescriptor {
@@ -138,17 +137,43 @@ impl SessionStore {
 
     pub fn delete_thread(&self, thread_id: &str) -> StoreResult<()> {
         let transaction = self.connection.unchecked_transaction()?;
-        let changed = transaction.execute(
-            "delete from threads where thread_id = ?1",
-            params![thread_id],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::NotFound(format!("thread {thread_id}")));
+        let mut approval_request_ids = BTreeSet::new();
+        {
+            let mut statement = transaction.prepare("select request_id, payload from approvals")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (request_id, payload) = row?;
+                let request: ApprovalRequest = serde_json::from_str(&payload)?;
+                if request.thread_id == thread_id {
+                    approval_request_ids.insert(request_id);
+                }
+            }
         }
-        transaction.execute(
-            "delete from active_sidecar_runs where thread_id = ?1",
-            params![thread_id],
-        )?;
+        {
+            let mut statement = transaction.prepare(
+                "select request_id from pending_tool_calls where thread_id = ?1 or turn_id in (select turn_id from turns where thread_id = ?1)",
+            )?;
+            let rows = statement.query_map(params![thread_id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                approval_request_ids.insert(row?);
+            }
+        }
+        for request_id in approval_request_ids {
+            transaction.execute(
+                "delete from approval_decisions where request_id = ?1",
+                params![request_id],
+            )?;
+            transaction.execute(
+                "delete from pending_tool_calls where request_id = ?1",
+                params![request_id],
+            )?;
+            transaction.execute(
+                "delete from approvals where request_id = ?1",
+                params![request_id],
+            )?;
+        }
         transaction.execute(
             "delete from pending_tool_calls where turn_id in (select turn_id from turns where thread_id = ?1)",
             params![thread_id],
@@ -166,6 +191,13 @@ impl SessionStore {
             "delete from artifact_refs where run_id = ?1",
             params![thread_id],
         )?;
+        let changed = transaction.execute(
+            "delete from threads where thread_id = ?1",
+            params![thread_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("thread {thread_id}")));
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -247,6 +279,7 @@ impl SessionStore {
     }
 
     pub fn update_turn_status(&self, turn_id: &str, status: TurnStatus) -> StoreResult<Turn> {
+        self.ensure_turn_status_update_allowed(turn_id, &status, None)?;
         let changed = self.connection.execute(
             "update turns set status = ?1 where turn_id = ?2",
             params![serde_json::to_string(&status)?, turn_id],
@@ -263,6 +296,7 @@ impl SessionStore {
         status: TurnStatus,
         agent_loop_status: &str,
     ) -> StoreResult<Turn> {
+        self.ensure_turn_status_update_allowed(turn_id, &status, Some(agent_loop_status))?;
         let changed = self.connection.execute(
             "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
             params![serde_json::to_string(&status)?, agent_loop_status, turn_id],
@@ -271,80 +305,6 @@ impl SessionStore {
             return Err(StoreError::NotFound(format!("turn {turn_id}")));
         }
         self.get_turn(turn_id)
-    }
-
-    pub fn register_active_sidecar_run(
-        &self,
-        turn_id: &str,
-        run_id: &str,
-        session_id: &str,
-        task_id: &str,
-        status: &str,
-    ) -> StoreResult<ActiveSidecarRun> {
-        let turn = self.get_turn(turn_id)?;
-        self.connection.execute(
-            "insert into active_sidecar_runs(
-                turn_id, thread_id, run_id, session_id, task_id, status, created_at, updated_at
-            ) values(?1, ?2, ?3, ?4, ?5, ?6, current_timestamp, current_timestamp)
-            on conflict(turn_id) do update set
-                thread_id = excluded.thread_id,
-                run_id = excluded.run_id,
-                session_id = excluded.session_id,
-                task_id = excluded.task_id,
-                status = excluded.status,
-                updated_at = current_timestamp",
-            params![
-                turn.turn_id,
-                turn.thread_id,
-                run_id,
-                session_id,
-                task_id,
-                status
-            ],
-        )?;
-        self.get_active_sidecar_run(turn_id)
-    }
-
-    pub fn get_active_sidecar_run(&self, turn_id: &str) -> StoreResult<ActiveSidecarRun> {
-        self.connection
-            .query_row(
-                "select turn_id, thread_id, run_id, session_id, task_id, status, created_at, updated_at
-                 from active_sidecar_runs where turn_id = ?1",
-                params![turn_id],
-                active_sidecar_run_from_row,
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    StoreError::NotFound(format!("active sidecar run {turn_id}"))
-                }
-                other => StoreError::Sqlite(other),
-            })
-    }
-
-    pub fn list_active_sidecar_runs(&self) -> StoreResult<Vec<ActiveSidecarRun>> {
-        let mut statement = self.connection.prepare(
-            "select turn_id, thread_id, run_id, session_id, task_id, status, created_at, updated_at
-             from active_sidecar_runs order by rowid",
-        )?;
-        let rows = statement.query_map([], active_sidecar_run_from_row)?;
-        let mut runs = Vec::new();
-        for row in rows {
-            runs.push(row?);
-        }
-        Ok(runs)
-    }
-
-    pub fn clear_active_sidecar_run(&self, turn_id: &str, _final_status: &str) -> StoreResult<()> {
-        let changed = self.connection.execute(
-            "delete from active_sidecar_runs where turn_id = ?1",
-            params![turn_id],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::NotFound(format!(
-                "active sidecar run {turn_id}"
-            )));
-        }
-        Ok(())
     }
 
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
@@ -469,22 +429,35 @@ impl SessionStore {
         let transaction = self.connection.unchecked_transaction()?;
         insert_approval(&transaction, request)?;
         if let Some(payload) = pending_tool_call {
+            let tool_call_id = pending_tool_call_id(&transaction, request, &payload)?;
+            ensure_request_turn_binding(&transaction, request)?;
             transaction.execute(
-                "insert into pending_tool_calls(request_id, turn_id, payload) values(?1, ?2, ?3)",
+                "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload) values(?1, ?2, ?3, ?4, ?5)",
                 params![
                     request.request_id,
-                    request.task_id,
+                    request.thread_id,
+                    request.turn_id,
+                    tool_call_id,
                     serde_json::to_string(&payload)?
                 ],
             )?;
         }
         let trace = TraceEvent::new(
             format!("trace_{}", request.request_id),
-            request.request_id.clone(),
-            request.session_id.clone(),
+            request.thread_id.clone(),
+            request.thread_id.clone(),
             component,
             summary,
         );
+        let trace = TraceEvent {
+            task_id: Some(request.turn_id.clone()),
+            payload: serde_json::json!({
+                "request_id": &request.request_id,
+                "action": &request.action,
+                "tool_call_id": &request.tool_call_id,
+            }),
+            ..trace
+        };
         Self::insert_trace(&transaction, &trace)?;
         transaction.commit()?;
         Ok(trace)
@@ -552,12 +525,29 @@ impl SessionStore {
             })?;
         let request: ApprovalRequest = serde_json::from_str(&request_payload)?;
         let pending_tool_call = match transaction.query_row(
-            "select payload from pending_tool_calls where request_id = ?1",
-            params![decision.request_id],
+            "select payload from pending_tool_calls where request_id = ?1 and turn_id = ?2",
+            params![decision.request_id, request.turn_id],
             |row| row.get::<_, String>(0),
         ) {
             Ok(payload) => Some(serde_json::from_str(&payload)?),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                if Self::exists_in_transaction(
+                    &transaction,
+                    "select 1 from pending_tool_calls where request_id = ?1",
+                    &decision.request_id,
+                )? {
+                    return Err(StoreError::InvalidState(
+                        "pending tool call turn_id must match approval request".to_string(),
+                    ));
+                }
+                if request.tool_call_id.is_some() {
+                    return Err(StoreError::NotFound(format!(
+                        "pending tool call {}",
+                        decision.request_id
+                    )));
+                }
+                None
+            }
             Err(error) => return Err(StoreError::Sqlite(error)),
         };
         let changed = transaction.execute(
@@ -590,13 +580,13 @@ impl SessionStore {
         )?;
         let trace = TraceEvent::new(
             format!("trace_{}", decision.decision_id),
-            request.session_id.clone(),
-            request.session_id.clone(),
+            request.thread_id.clone(),
+            request.thread_id.clone(),
             component,
             summary,
         );
         let trace = TraceEvent {
-            task_id: Some(request.task_id.clone()),
+            task_id: Some(request.turn_id.clone()),
             payload: serde_json::json!({
                 "request_id": decision.request_id,
                 "decision_id": decision.decision_id,
@@ -767,6 +757,14 @@ impl SessionStore {
     fn init_schema(&self) -> StoreResult<()> {
         self.connection.execute_batch(
             "
+            create table if not exists schema_meta(
+                schema_version integer not null
+            );
+            ",
+        )?;
+        self.fail_closed_on_future_schema()?;
+        self.connection.execute_batch(
+            "
             create table if not exists schema_migrations(
                 migration_id text primary key,
                 applied_at text not null default current_timestamp
@@ -781,14 +779,16 @@ impl SessionStore {
                 turn_id text primary key,
                 thread_id text not null,
                 status text not null,
-                agent_loop_status text not null
+                agent_loop_status text not null,
+                foreign key(thread_id) references threads(thread_id)
             );
             create table if not exists items(
                 item_id text primary key,
                 turn_id text not null,
                 kind text not null,
                 payload text not null,
-                status text not null
+                status text not null,
+                foreign key(turn_id) references turns(turn_id)
             );
             create table if not exists trace_events(
                 event_id text primary key,
@@ -807,7 +807,8 @@ impl SessionStore {
                 request_id text not null,
                 outcome text not null,
                 reason text not null,
-                payload text not null
+                payload text not null,
+                foreign key(request_id) references approvals(request_id)
             );
             create table if not exists artifact_refs(
                 artifact_id text primary key,
@@ -820,24 +821,22 @@ impl SessionStore {
                 metadata text not null,
                 redacted integer not null
             );
-            create table if not exists active_sidecar_runs(
-                turn_id text primary key,
-                thread_id text not null,
-                run_id text not null,
-                session_id text not null,
-                task_id text not null,
-                status text not null,
-                created_at text not null default current_timestamp,
-                updated_at text not null default current_timestamp
-            );
             create table if not exists pending_tool_calls(
                 request_id text primary key,
+                thread_id text not null,
                 turn_id text not null,
-                payload text not null
+                tool_call_id text not null,
+                payload text not null,
+                foreign key(request_id) references approvals(request_id),
+                foreign key(thread_id) references threads(thread_id),
+                foreign key(turn_id) references turns(turn_id)
             );
             ",
         )?;
         self.ensure_trace_session_id_column()?;
+        self.ensure_pending_tool_call_thread_id_column()?;
+        self.ensure_pending_tool_call_tool_call_id_column()?;
+        self.ensure_required_foreign_keys()?;
         self.connection.execute(
             "insert or ignore into schema_migrations(migration_id) values(?1)",
             params![INITIAL_SCHEMA_MIGRATION],
@@ -848,12 +847,36 @@ impl SessionStore {
         )?;
         self.connection.execute(
             "insert or ignore into schema_migrations(migration_id) values(?1)",
-            params![ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION],
+            params![PENDING_TOOL_CALL_SCHEMA_MIGRATION],
         )?;
         self.connection.execute(
             "insert or ignore into schema_migrations(migration_id) values(?1)",
-            params![PENDING_TOOL_CALL_SCHEMA_MIGRATION],
+            params![STORE_HARDENING_SCHEMA_MIGRATION],
         )?;
+        self.connection.execute("delete from schema_meta", [])?;
+        self.connection.execute(
+            "insert into schema_meta(schema_version) values(?1)",
+            params![SCHEMA_VERSION],
+        )?;
+        Ok(())
+    }
+
+    fn fail_closed_on_future_schema(&self) -> StoreResult<()> {
+        let schema_version = self
+            .connection
+            .query_row("select max(schema_version) from schema_meta", [], |row| {
+                row.get::<_, Option<u32>>(0)
+            })
+            .optional()?
+            .flatten();
+        if let Some(found) = schema_version {
+            if found > SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedSchema {
+                    found,
+                    supported: SCHEMA_VERSION,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -869,6 +892,185 @@ impl SessionStore {
             "alter table trace_events add column session_id text not null default ''",
             [],
         )?;
+        Ok(())
+    }
+
+    fn ensure_pending_tool_call_tool_call_id_column(&self) -> StoreResult<()> {
+        let mut statement = self
+            .connection
+            .prepare("pragma table_info(pending_tool_calls)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            if row? == "tool_call_id" {
+                return Ok(());
+            }
+        }
+        self.connection.execute(
+            "alter table pending_tool_calls add column tool_call_id text not null default ''",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_pending_tool_call_thread_id_column(&self) -> StoreResult<()> {
+        if self.table_has_column("pending_tool_calls", "thread_id")? {
+            return Ok(());
+        }
+        self.connection.execute(
+            "alter table pending_tool_calls add column thread_id text not null default ''",
+            [],
+        )?;
+        self.connection.execute(
+            "
+            update pending_tool_calls
+            set thread_id = (
+                select turns.thread_id from turns where turns.turn_id = pending_tool_calls.turn_id
+            )
+            where thread_id = ''
+            ",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_required_foreign_keys(&self) -> StoreResult<()> {
+        if self.table_references("turns", "threads")?
+            && self.table_references("items", "turns")?
+            && self.table_references("approval_decisions", "approvals")?
+            && self.table_references("pending_tool_calls", "approvals")?
+            && self.table_references("pending_tool_calls", "threads")?
+            && self.table_references("pending_tool_calls", "turns")?
+        {
+            return Ok(());
+        }
+        self.rebuild_foreign_key_tables()?;
+        self.fail_closed_on_foreign_key_violations()
+    }
+
+    fn rebuild_foreign_key_tables(&self) -> StoreResult<()> {
+        self.connection
+            .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "OFF")?;
+        self.connection.execute_batch(
+            "
+            create table turns_new(
+                turn_id text primary key,
+                thread_id text not null,
+                status text not null,
+                agent_loop_status text not null,
+                foreign key(thread_id) references threads(thread_id)
+            );
+            insert into turns_new(turn_id, thread_id, status, agent_loop_status)
+            select turn_id, thread_id, status, agent_loop_status from turns;
+            drop table turns;
+            alter table turns_new rename to turns;
+
+            create table items_new(
+                item_id text primary key,
+                turn_id text not null,
+                kind text not null,
+                payload text not null,
+                status text not null,
+                foreign key(turn_id) references turns(turn_id)
+            );
+            insert into items_new(item_id, turn_id, kind, payload, status)
+            select item_id, turn_id, kind, payload, status from items;
+            drop table items;
+            alter table items_new rename to items;
+
+            create table approval_decisions_new(
+                decision_id text primary key,
+                request_id text not null,
+                outcome text not null,
+                reason text not null,
+                payload text not null,
+                foreign key(request_id) references approvals(request_id)
+            );
+            insert into approval_decisions_new(decision_id, request_id, outcome, reason, payload)
+            select decision_id, request_id, outcome, reason, payload from approval_decisions;
+            drop table approval_decisions;
+            alter table approval_decisions_new rename to approval_decisions;
+
+            create table pending_tool_calls_new(
+                request_id text primary key,
+                thread_id text not null,
+                turn_id text not null,
+                tool_call_id text not null,
+                payload text not null,
+                foreign key(request_id) references approvals(request_id),
+                foreign key(thread_id) references threads(thread_id),
+                foreign key(turn_id) references turns(turn_id)
+            );
+            insert into pending_tool_calls_new(request_id, thread_id, turn_id, tool_call_id, payload)
+            select request_id, thread_id, turn_id, tool_call_id, payload from pending_tool_calls;
+            drop table pending_tool_calls;
+            alter table pending_tool_calls_new rename to pending_tool_calls;
+            ",
+        )?;
+        self.connection
+            .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")?;
+        Ok(())
+    }
+
+    fn fail_closed_on_foreign_key_violations(&self) -> StoreResult<()> {
+        let violation = self
+            .connection
+            .query_row("pragma foreign_key_check", [], |row| {
+                let table: String = row.get(0)?;
+                let row_id: i64 = row.get(1)?;
+                Ok(format!("{table}:{row_id}"))
+            })
+            .optional()?;
+        if let Some(violation) = violation {
+            return Err(StoreError::InvalidState(format!(
+                "store foreign key violation after migration: {violation}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn table_references(&self, table: &str, parent: &str) -> StoreResult<bool> {
+        let query = format!("pragma foreign_key_list({table})");
+        let mut statement = self.connection.prepare(&query)?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(2))?;
+        for row in rows {
+            if row? == parent {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn table_has_column(&self, table: &str, column: &str) -> StoreResult<bool> {
+        let query = format!("pragma table_info({table})");
+        let mut statement = self.connection.prepare(&query)?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            if row? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn ensure_turn_status_update_allowed(
+        &self,
+        turn_id: &str,
+        next_status: &TurnStatus,
+        next_agent_loop_status: Option<&str>,
+    ) -> StoreResult<()> {
+        let current = self.get_turn(turn_id)?;
+        if is_terminal_turn_status(&current.status) {
+            if current.status != *next_status {
+                return Err(StoreError::InvalidState(
+                    "terminal turn status cannot be overwritten".to_string(),
+                ));
+            }
+            if next_agent_loop_status.is_some_and(|status| status != current.agent_loop_status) {
+                return Err(StoreError::InvalidState(
+                    "terminal turn agent_loop_status cannot be overwritten".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -967,6 +1169,108 @@ impl SessionStore {
     }
 }
 
+fn configure_connection(connection: &Connection) -> StoreResult<()> {
+    connection.pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")?;
+    connection.pragma_update(None, SQLITE_JOURNAL_MODE_PRAGMA, SQLITE_JOURNAL_MODE_WAL)?;
+    connection.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+    Ok(())
+}
+
+fn pending_tool_call_id(
+    connection: &Connection,
+    request: &ApprovalRequest,
+    payload: &Value,
+) -> StoreResult<String> {
+    ensure_request_turn_binding(connection, request)?;
+    let payload_request_id = payload
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            StoreError::InvalidState("pending tool call request_id is required".to_string())
+        })?;
+    if payload_request_id != request.request_id {
+        return Err(StoreError::InvalidState(
+            "pending tool call request_id must match approval request".to_string(),
+        ));
+    }
+    let tool_call_id = payload
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            StoreError::InvalidState("pending tool call tool_call_id is required".to_string())
+        })?;
+    if request
+        .tool_call_id
+        .as_ref()
+        .is_some_and(|expected| expected != tool_call_id)
+    {
+        return Err(StoreError::InvalidState(
+            "pending tool call tool_call_id must match approval request".to_string(),
+        ));
+    }
+    Ok(tool_call_id.to_string())
+}
+
+fn ensure_request_turn_binding(
+    connection: &Connection,
+    request: &ApprovalRequest,
+) -> StoreResult<()> {
+    let thread_id = connection
+        .query_row(
+            "select thread_id from turns where turn_id = ?1",
+            params![request.turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => {
+                StoreError::NotFound(format!("turn {}", request.turn_id))
+            }
+            other => StoreError::Sqlite(other),
+        })?;
+    if thread_id != request.thread_id {
+        return Err(StoreError::InvalidState(
+            "approval request thread_id must match bound turn".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_terminal_turn_status(status: &TurnStatus) -> bool {
+    matches!(
+        status,
+        TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_configures_sqlite_connection_pragmas() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+        let foreign_keys: u32 = store
+            .connection
+            .query_row("pragma foreign_keys", [], |row| row.get(0))
+            .expect("foreign keys pragma");
+        let journal_mode: String = store
+            .connection
+            .query_row("pragma journal_mode", [], |row| row.get(0))
+            .expect("journal mode pragma");
+        let busy_timeout_ms: u64 = store
+            .connection
+            .query_row("pragma busy_timeout", [], |row| row.get(0))
+            .expect("busy timeout pragma");
+
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(busy_timeout_ms, SQLITE_BUSY_TIMEOUT_MS);
+    }
+}
+
 fn insert_approval(connection: &Connection, request: &ApprovalRequest) -> StoreResult<()> {
     connection
         .execute(
@@ -986,19 +1290,6 @@ fn insert_approval(connection: &Connection, request: &ApprovalRequest) -> StoreR
 
 fn short_id() -> String {
     Uuid::new_v4().simple().to_string()[..12].to_string()
-}
-
-fn active_sidecar_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveSidecarRun> {
-    Ok(ActiveSidecarRun {
-        turn_id: row.get(0)?,
-        thread_id: row.get(1)?,
-        run_id: row.get(2)?,
-        session_id: row.get(3)?,
-        task_id: row.get(4)?,
-        status: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
-    })
 }
 
 fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRef> {

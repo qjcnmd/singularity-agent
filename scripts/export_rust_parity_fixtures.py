@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export stable Python oracle fixtures for the Rust migration boundary."""
+"""Export stable internal Python oracle fixtures for Rust parity tests."""
 
 from __future__ import annotations
 
@@ -370,6 +370,7 @@ def build_fixtures() -> dict[str, object]:
     return {
         "tool_result_payload": _rust_tool_result_payload(tool_result),
         "tool_output": _rust_tool_output(tool_result),
+        "reference_tool_output": _rust_reference_tool_output(tool_result),
         "trace_event": trace_event.to_dict(),
         "command_request": command_request.safe_metadata(),
         "command_result": command_result.to_dict(),
@@ -394,6 +395,8 @@ def _stable_permission_summary(profile: PermissionProfile) -> dict[str, Any]:
 
 
 def _rust_tool_result_payload(envelope: ToolProtocolResultEnvelope) -> dict[str, Any]:
+    # The Python oracle still emits ToolProtocolResultEnvelope; the fixture exports
+    # the Rust-facing ToolResult field names used by parity tests.
     payload = envelope.to_observation_view().to_model_payload()
     return _rename_rust_tool_result_fields(payload)
 
@@ -413,6 +416,13 @@ def _rust_tool_output(envelope: ToolProtocolResultEnvelope) -> dict[str, Any]:
         "truncated": envelope.truncated,
         "metadata": {},
     }
+
+
+def _rust_reference_tool_output(envelope: ToolProtocolResultEnvelope) -> dict[str, Any]:
+    output = _rust_tool_output(envelope)
+    output["content"]["preview"] = None
+    output["truncated"] = True
+    return output
 
 
 def _rename_rust_tool_result_fields(payload: dict[str, Any]) -> dict[str, Any]:
@@ -442,7 +452,7 @@ def main() -> int:
     parser.add_argument(
         "--out",
         default="tests/fixtures/rust_parity/python_oracle.json",
-        help="Output JSON fixture path.",
+        help="Output internal oracle parity JSON fixture path.",
     )
     args = parser.parse_args()
     out_path = Path(args.out)

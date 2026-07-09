@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard CLI-first Rust Agent Host migration boundaries."""
+"""Guard Rust public runtime migration boundaries."""
 
 from __future__ import annotations
 
@@ -94,6 +94,7 @@ ALLOWED_CRATE_DEPENDENCIES = {
 
 ALLOWED_PYTHON_MIGRATION_PATHS = {
     "src/singularity/agent_host",
+    "src/singularity/diagnostics",
     "src/singularity/evaluation/manifests.py",
     "src/singularity/model/runner.py",
     "scripts/export_rust_parity_fixtures.py",
@@ -138,8 +139,9 @@ TOOL_RESULT_PAYLOAD_FORBIDDEN = {
 }
 
 RUST_AGENT_HOST_DOC_MARKERS = {
-    "Current Python owner",
-    "Rust owner after this stage",
+    "Rust public runtime",
+    "Python oracle/parity/dev-only",
+    "target-project Python commands",
     "Parity expectation",
     "Intentional divergence",
     "AgentRunStatus",
@@ -149,11 +151,38 @@ RUST_AGENT_HOST_DOC_MARKERS = {
 TURN_LIFECYCLE_DOC_MARKERS = {
     "turn lifecycle",
     "interrupted_requested",
-    "PythonSidecarClient::cancel",
     "AgentLoop cancel semantics",
     "SessionStore",
     "trace event",
 }
+
+PUBLIC_RUNTIME_SURFACE_TARGETS = {
+    "README.md",
+    "docs/INSTALL.md",
+    "docs/PLUGIN_MANAGEMENT.md",
+    "docs/testing.md",
+    "docs/singularity.md",
+    "docs/architecture/rust-agent-host.md",
+    "docs/architecture/modules/rust-app-server-protocol.md",
+    "docs/architecture/modules/sandbox-isolation.md",
+    "crates/protocol/src/lib.rs",
+    "crates/cli/src/main.rs",
+    "crates/app-server/src/lib.rs",
+}
+
+PUBLIC_RUNTIME_FORBIDDEN_MARKERS = {
+    "agentHost": "public turn/start params must not expose an agent host selector",
+    "agent_host": "public TurnStartParams must not expose an agent host selector",
+    "--agent-host": "public CLI must not expose a Python/Rust backend selector",
+    "AgentHost::Native": "public Rust enum variants must not expose backend selection",
+    "AgentHost::Python": "public Rust enum variants must not expose backend selection",
+    "SINGULARITY_PYTHON_SIDECAR": "ordinary users must not configure Python sidecar runtime selection",
+    "singularity.agent_host.sidecar": "public docs or CLI must not expose the Python sidecar module path",
+    "verify_rust_cli_agent_host.py": "public verification must not require the old Python sidecar smoke",
+    "singularity-agent": "public docs must not present the Python CLI as a user-facing runtime command",
+}
+
+PUBLIC_SIDECAR_SMOKE_SCRIPT = "scripts/verify_rust_cli_agent_host.py"
 
 FORBIDDEN_LIFECYCLE_NAMES = {
     "RuntimeControlManager",
@@ -237,16 +266,14 @@ def main() -> int:
     violations.extend(_check_forbidden_desktop_paths(repo_root))
     violations.extend(_check_agent_loop_status(repo_root))
     violations.extend(_check_rust_agent_host_docs(repo_root))
+    violations.extend(_check_public_runtime_surface(repo_root, changed_files))
+    violations.extend(_check_python_cli_public_scripts(repo_root))
     violations.extend(_check_rust_public_naming(repo_root))
     violations.extend(_check_turn_lifecycle_docs(repo_root))
     violations.extend(_check_forbidden_lifecycle_names(repo_root))
-    violations.extend(_check_cli_sidecar_surface(repo_root))
-    violations.extend(_check_cli_direct_sidecar_invocation(repo_root))
-    violations.extend(_check_sidecar_resume_and_model(repo_root))
     violations.extend(_check_no_fake_agent_delta(repo_root))
     violations.extend(_check_turn_interrupt_cancel_boundary(repo_root, changed_files))
     violations.extend(_check_active_sidecar_run_persistence(repo_root))
-    violations.extend(_check_rust_cli_smoke_env(repo_root))
     violations.extend(_check_sidecar_trace_payload(repo_root))
     violations.extend(_check_tool_result_payload(repo_root))
     violations.extend(_check_command_approval_resource_boundary(repo_root))
@@ -324,7 +351,7 @@ def _check_python_freeze(repo_root: Path, changed_files: list[str]) -> list[Viol
             Violation(
                 "python-core-freeze",
                 path,
-                "Python runtime changes must stay in sidecar/oracle/fixture/parity allowlist during Rust migration",
+                "Python runtime changes must stay in sidecar/oracle/fixture/parity/diagnostics allowlist during Rust migration",
             )
         )
     return violations
@@ -367,14 +394,6 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
     agent = repo_root / "crates" / "agent" / "src" / "lib.rs"
     protocol = repo_root / "crates" / "protocol" / "src" / "lib.rs"
     text = app_server.read_text(encoding="utf-8")
-    if "AgentRunStatus::not_migrated()" not in text:
-        return [
-            Violation(
-                "agent-loop-status-drift",
-                _relative(app_server, repo_root),
-                'default non-native turn/start must keep explicit not_migrated status',
-            )
-        ]
     agent_text = agent.read_text(encoding="utf-8")
     if "NativeAgentLoop" in agent_text:
         return [
@@ -432,20 +451,20 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
             )
         ]
     cli_text = (repo_root / "crates" / "cli" / "src" / "main.rs").read_text(encoding="utf-8")
-    if '"blockers"' not in cli_text or "blockers_empty" not in cli_text:
+    if '"blockers"' not in cli_text or "native_agent_loop_blockers" not in cli_text or 'blockers == "none"' not in cli_text:
         return [
             Violation(
                 "native-agent-loop-cli-gate-drift",
                 "crates/cli/src/main.rs",
-                "CLI --agent-host native must reject partial AgentLoop capability until blockers are empty",
+                "CLI native runtime must reject partial AgentLoop capability until blockers are empty",
             )
         ]
-    if "NATIVE_AGENT_LOOP_NOT_READY" not in text or "native_agent_loop_ready()" not in text:
+    if "native_capability_ready(&capability)" not in text or "native_agent_loop_unavailable_message(&capability)" not in text:
         return [
             Violation(
                 "native-agent-loop-app-server-gate-drift",
                 _relative(app_server, repo_root),
-                "app-server must reject agentHost=native while AgentLoopCapability blockers remain",
+                "app-server must reject public turn/start while AgentLoopCapability blockers remain",
             )
         ]
     if (
@@ -470,6 +489,44 @@ def _check_agent_loop_status(repo_root: Path) -> list[Violation]:
             )
         ]
     return []
+
+
+def _check_public_runtime_surface(repo_root: Path, changed_files: list[str]) -> list[Violation]:
+    violations: list[Violation] = []
+    if (repo_root / PUBLIC_SIDECAR_SMOKE_SCRIPT).exists():
+        violations.append(
+            Violation(
+                "public-sidecar-smoke",
+                PUBLIC_SIDECAR_SMOKE_SCRIPT,
+                PUBLIC_RUNTIME_FORBIDDEN_MARKERS["verify_rust_cli_agent_host.py"],
+            )
+        )
+    for relative in sorted(PUBLIC_RUNTIME_SURFACE_TARGETS):
+        path = Path(relative).as_posix()
+        target = repo_root / path
+        if not target.exists():
+            continue
+        text = target.read_text(encoding="utf-8")
+        for marker, detail in sorted(PUBLIC_RUNTIME_FORBIDDEN_MARKERS.items()):
+            if marker in text:
+                violations.append(Violation("public-agent-host-surface", path, detail))
+    return violations
+
+
+def _check_python_cli_public_scripts(repo_root: Path) -> list[Violation]:
+    path = repo_root / "pyproject.toml"
+    if not path.exists():
+        return []
+    scripts = tomllib.loads(path.read_text(encoding="utf-8")).get("project", {}).get("scripts", {})
+    if not scripts:
+        return []
+    return [
+        Violation(
+            "public-python-cli-script",
+            _relative(path, repo_root),
+            "Python package must not install public CLI console scripts during Rust-only public runtime migration",
+        )
+    ]
 
 
 def _check_rust_agent_host_docs(repo_root: Path) -> list[Violation]:
@@ -575,92 +632,6 @@ def _check_forbidden_lifecycle_names(repo_root: Path) -> list[Violation]:
     return violations
 
 
-def _check_cli_sidecar_surface(repo_root: Path) -> list[Violation]:
-    path = repo_root / "crates" / "cli" / "src" / "main.rs"
-    text = path.read_text(encoding="utf-8")
-    if "AgentHost::Python" in text and "SINGULARITY_PYTHON_SIDECAR" in text:
-        return []
-    return [
-        Violation(
-            "raw-sidecar-env-user-setup",
-            _relative(path, repo_root),
-            "CLI must expose a user-facing Python agent-host option instead of requiring raw SINGULARITY_PYTHON_SIDECAR setup",
-        )
-    ]
-
-
-def _check_cli_direct_sidecar_invocation(repo_root: Path) -> list[Violation]:
-    path = repo_root / "crates" / "cli" / "src" / "main.rs"
-    text = path.read_text(encoding="utf-8")
-    if "singularity.agent_host.sidecar" not in text and "python -m singularity.agent_host.sidecar" not in text:
-        return []
-    return [
-        Violation(
-            "cli-direct-sidecar-invocation",
-            _relative(path, repo_root),
-            "CLI must reach Python sidecar only through app-server agent-host protocol",
-        )
-    ]
-
-
-def _check_sidecar_resume_and_model(repo_root: Path) -> list[Violation]:
-    agent_path = repo_root / "crates" / "agent" / "src" / "lib.rs"
-    app_server_path = repo_root / "crates" / "app-server" / "src" / "lib.rs"
-    sidecar_path = repo_root / "src" / "singularity" / "agent_host" / "sidecar.py"
-    agent_text = agent_path.read_text(encoding="utf-8")
-    app_server_text = app_server_path.read_text(encoding="utf-8")
-    sidecar_text = sidecar_path.read_text(encoding="utf-8") if sidecar_path.exists() else ""
-    checks = [
-        (
-            agent_path,
-            agent_text,
-            "SIDECAR_METHOD_RESUME",
-            "sidecar-resume-missing",
-            "Rust sidecar client must expose agent/resume for sg continue --agent-host python",
-        ),
-        (
-            agent_path,
-            agent_text,
-            "sidecar_run_params(goal, model)",
-            "sidecar-model-forwarding-missing",
-            "Rust sidecar client must forward thread model to Python sidecar",
-        ),
-        (
-            app_server_path,
-            app_server_text,
-            "previous_python_session_id",
-            "sidecar-resume-session-missing",
-            "app-server must derive safe previous Python session_id for sidecar resume",
-        ),
-        (
-            app_server_path,
-            app_server_text,
-            ".resume_agent(session_id, &goal, model)",
-            "sidecar-resume-call-missing",
-            "app-server continue path must call Python sidecar agent/resume",
-        ),
-        (
-            sidecar_path,
-            sidecar_text,
-            "METHOD_RESUME",
-            "python-sidecar-resume-method-missing",
-            "Python sidecar must accept agent/resume",
-        ),
-        (
-            sidecar_path,
-            sidecar_text,
-            "model=_optional_str(params.get(\"model\"))",
-            "python-sidecar-model-forwarding-missing",
-            "Python sidecar must pass model into ProductionConfig",
-        ),
-    ]
-    return [
-        Violation(code, _relative(path, repo_root), detail)
-        for path, text, marker, code, detail in checks
-        if marker not in text
-    ]
-
-
 def _check_no_fake_agent_delta(repo_root: Path) -> list[Violation]:
     path = repo_root / "crates" / "app-server" / "src" / "lib.rs"
     text = path.read_text(encoding="utf-8")
@@ -726,7 +697,7 @@ def _check_no_fake_agent_delta(repo_root: Path) -> list[Violation]:
             )
         )
     else:
-        gate_index = turn_start_body.find("NATIVE_AGENT_LOOP_NOT_READY")
+        gate_index = turn_start_body.find("native_capability_ready(&capability)")
         create_index = turn_start_body.find("create_turn_with_input_and_trace")
         if gate_index == -1 or create_index == -1 or gate_index > create_index:
             violations.append(
@@ -766,72 +737,19 @@ def _check_command_approval_resource_boundary(repo_root: Path) -> list[Violation
 
 
 def _check_turn_interrupt_cancel_boundary(repo_root: Path, changed_files: list[str]) -> list[Violation]:
-    if "crates/app-server/src/lib.rs" not in changed_files:
-        return []
-    path = repo_root / "crates" / "app-server" / "src" / "lib.rs"
-    text = path.read_text(encoding="utf-8")
-    if not any(marker in text for marker in ("list_active_sidecar_runs", "get_active_sidecar_run", "register_active_sidecar_run")):
-        return []
-    body = _extract_rust_function_body(text, "turn_interrupt")
-    if body is None:
-        return []
-    if ".cancel(" in body:
-        return []
-    return [
-        Violation(
-            "turn-interrupt-missing-sidecar-cancel",
-            _relative(path, repo_root),
-            "turn/interrupt must not only update_turn_status; it must route active sidecar cancel through PythonSidecarClient::cancel(run_id)",
-        )
-    ]
+    return []
 
 
 def _check_active_sidecar_run_persistence(repo_root: Path) -> list[Violation]:
-    path = repo_root / "crates" / "store" / "src" / "lib.rs"
-    text = path.read_text(encoding="utf-8")
-    relative = _relative(path, repo_root)
     violations: list[Violation] = []
-    for table_body in _extract_sql_table_bodies(text, "active_sidecar_runs"):
-        lowered = table_body.lower()
-        for marker in ("prompt", "provider", "tool", "env"):
-            if marker in lowered:
-                violations.append(
-                    Violation(
-                        "active-sidecar-raw-persistence",
-                        relative,
-                        f"active sidecar run persistence must not store raw {marker} fields",
-                    )
-                )
-    return violations
-
-
-def _check_rust_cli_smoke_env(repo_root: Path) -> list[Violation]:
-    path = repo_root / "scripts" / "verify_rust_cli_agent_host.py"
-    if not path.exists():
-        return [
-            Violation(
-                "rust-cli-agent-host-smoke-missing",
-                _relative(path, repo_root),
-                "Rust CLI agent host smoke script is required",
-            )
-        ]
-    text = path.read_text(encoding="utf-8")
-    violations: list[Violation] = []
-    if "os.environ.copy()" in text:
-        violations.append(
-            Violation(
-                "rust-cli-smoke-env-copy",
-                _relative(path, repo_root),
-                "sidecar smoke must not copy the full process environment with provider secrets",
-            )
-        )
-    for marker in ("SECRET_ENV_MARKERS", "SAFE_ENV_ALLOWLIST", "_safe_smoke_env"):
-        if marker not in text:
+    for relative in ("crates/store/src/lib.rs", "crates/app-server/src/lib.rs"):
+        path = repo_root / relative
+        if path.exists() and "active_sidecar_runs" in path.read_text(encoding="utf-8"):
             violations.append(
                 Violation(
-                    "rust-cli-smoke-env-scrub-missing",
-                    _relative(path, repo_root),
-                    f"sidecar smoke must define {marker} to scrub provider secrets",
+                    "public-sidecar-persistence",
+                    relative,
+                    "public runtime must not retain active Python sidecar lifecycle persistence",
                 )
             )
     return violations
@@ -842,15 +760,16 @@ def _check_sidecar_trace_payload(repo_root: Path) -> list[Violation]:
     text = path.read_text(encoding="utf-8")
     body = _extract_rust_function_body(text, "sidecar_trace_summary")
     if body is None:
-        return [
-            Violation(
-                "sidecar-trace-summary-missing",
-                _relative(path, repo_root),
-                "sidecar_trace_summary not found",
-            )
-        ]
+        return []
+    violations = [
+        Violation(
+            "public-sidecar-trace-summary",
+            _relative(path, repo_root),
+            "Rust public agent runtime must not expose Python sidecar trace summaries",
+        )
+    ]
     lowered = body.lower()
-    return [
+    violations.extend(
         Violation(
             "sidecar-trace-payload-leak",
             _relative(path, repo_root),
@@ -858,7 +777,8 @@ def _check_sidecar_trace_payload(repo_root: Path) -> list[Violation]:
         )
         for marker in sorted(SIDECAR_TRACE_PROJECTION_FORBIDDEN)
         if marker in lowered
-    ]
+    )
+    return violations
 
 
 def _check_tool_result_payload(repo_root: Path) -> list[Violation]:

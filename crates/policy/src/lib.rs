@@ -309,6 +309,9 @@ pub struct ApprovalRequest {
     pub request_id: String,
     pub session_id: String,
     pub task_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub tool_call_id: Option<String>,
     pub action: String,
     #[serde(default)]
     pub resources: Vec<String>,
@@ -326,10 +329,14 @@ impl ApprovalRequest {
             request_id: request_id.into(),
             session_id: session_id.into(),
             task_id: task_id.into(),
+            thread_id: String::new(),
+            turn_id: String::new(),
+            tool_call_id: None,
             action: action.into(),
             resources: Vec::new(),
             reason: String::new(),
         }
+        .with_default_binding()
     }
 
     pub fn with_resources<I, S>(mut self, resources: I) -> Self
@@ -338,6 +345,27 @@ impl ApprovalRequest {
         S: Into<String>,
     {
         self.resources = resources.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_thread_turn_binding(
+        mut self,
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+    ) -> Self {
+        self.thread_id = thread_id.into();
+        self.turn_id = turn_id.into();
+        self
+    }
+
+    pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    fn with_default_binding(mut self) -> Self {
+        self.thread_id = self.session_id.clone();
+        self.turn_id = self.task_id.clone();
         self
     }
 }

@@ -11,6 +11,7 @@ def test_rust_parity_fixture_shape_and_tool_payload_boundary() -> None:
 
     payload = fixtures["tool_result_payload"]
     output = fixtures["tool_output"]
+    reference_output = fixtures["reference_tool_output"]
     serialized = json.dumps(payload, sort_keys=True)
 
     assert payload["tool_call_id"] == "call_1"
@@ -23,6 +24,9 @@ def test_rust_parity_fixture_shape_and_tool_payload_boundary() -> None:
         "digest",
     }
     assert output["ok"] is True
+    assert reference_output["content"]["preview"] is None
+    assert reference_output["content"]["artifact_ref"] == "artifact_1"
+    assert reference_output["truncated"] is True
     assert "policy_decision_id" not in payload
     assert "approval_grant_id" not in payload
     assert "metadata" not in payload
@@ -30,6 +34,10 @@ def test_rust_parity_fixture_shape_and_tool_payload_boundary() -> None:
     assert "tool_name" not in output
     assert "status" not in output
     assert "raw_arguments" not in serialized
+    assert "ToolObservation" not in serialized
+    assert "content_preview" not in serialized
+    assert "content_digest" not in serialized
+    assert "raw_result_ref" not in serialized
     assert "raw_arguments" not in json.dumps(output, sort_keys=True)
 
 

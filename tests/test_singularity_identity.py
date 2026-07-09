@@ -29,10 +29,7 @@ def test_pyproject_exposes_only_singularity_console_scripts() -> None:
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert data["project"]["name"] == "singularity-agent"
-    assert data["project"]["scripts"] == {
-        "singularity-agent": "singularity.cli:main",
-        "sg": "singularity.cli:main",
-    }
+    assert "scripts" not in data["project"]
 
 
 def test_tracked_files_do_not_use_retired_project_identity() -> None:

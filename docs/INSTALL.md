@@ -1,6 +1,6 @@
 # Singularity 安装说明
 
-Singularity 当前作为本地 Python CLI 运行。
+Singularity 当前 public runtime 是 Rust `sg`。Python 包只保留 internal oracle / parity / dev-only 代码，不安装 public console script。
 
 ## 安装
 
@@ -30,11 +30,10 @@ uv sync --group dev        # dev 依赖 (mypy, pytest, ruff, pytest-cov, PyYAML)
 uv sync --group test       # test 依赖 (pytest, pytest-cov, PyYAML)
 ```
 
-安装后可用入口：
+Rust public CLI 入口：
 
 ```bash
-singularity-agent --help
-sg --help
+cargo run -p singularity_cli --bin sg -- --help
 ```
 
 ## 配置
@@ -51,13 +50,11 @@ API key 只通过环境变量读取，不写入文档、trace、report 或 CLI �
 
 ## 本地状态
 
-运行时状态由 release、trace、context、memory、evaluation 和 plugin 组件管理。常用检查命令：
+运行时状态由 release、trace、context、memory、evaluation 和 plugin 组件管理。Rust public runtime 常用检查命令：
 
 ```bash
-singularity-agent doctor --json
-singularity-agent repair --dry-run --json
-singularity-agent system init --json
-singularity-agent system export --output singularity-export.zip --json
+cargo run -p singularity_cli --bin sg -- config doctor
+cargo run -p singularity_cli --bin sg -- eval run docs/evaluation/public-representative-task.json --run-id <run-id> --json
 ```
 
 生成的 trace、evaluation、context、memory 和插件状态不属于源码文档，应保存在 `.singularity/`、`work/` 或显式输出目录中。

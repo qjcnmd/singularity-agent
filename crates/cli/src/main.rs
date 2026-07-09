@@ -8,15 +8,13 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use singularity_core::ClientInfo;
-use singularity_protocol::{
-    AgentHost as ProtocolAgentHost, InitializeParams, JsonRpcMessage, Method,
-};
+use singularity_protocol::{InitializeParams, JsonRpcMessage, Method};
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
 const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
-const PYTHON_SIDECAR_ENV: &str = "SINGULARITY_PYTHON_SIDECAR";
-const PYTHON_SIDECAR_PROJECT_ROOT_ENV: &str = "SINGULARITY_SIDECAR_PROJECT_ROOT";
+const LEGACY_PYTHON_RUNTIME_ENV_PREFIXES: [&str; 2] =
+    ["SINGULARITY_PYTHON_", "SINGULARITY_SIDECAR_"];
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const CLI_CLIENT_NAME: &str = "singularity_cli";
 const CLI_CLIENT_TITLE: &str = "Singularity Rust CLI";
@@ -24,7 +22,7 @@ const CLI_CLIENT_VERSION: &str = "0.1.0";
 const DEFAULT_TRACE_TAIL_LIMIT: usize = 20;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const EVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
-const AGENT_HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
+const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PROVIDER_ENV_NAMES: [&str; 3] = [
@@ -60,8 +58,6 @@ enum Command {
         goal: String,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, value_enum)]
-        agent_host: Option<AgentHost>,
         #[arg(long)]
         json: bool,
     },
@@ -70,8 +66,6 @@ enum Command {
         goal: String,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, value_enum)]
-        agent_host: Option<AgentHost>,
         #[arg(long)]
         json: bool,
     },
@@ -79,8 +73,6 @@ enum Command {
     Continue {
         thread_id: String,
         instruction: String,
-        #[arg(long, value_enum)]
-        agent_host: Option<AgentHost>,
     },
     /// Inspect or interrupt a turn through the app-server protocol.
     Turn {
@@ -129,12 +121,6 @@ enum EvalCommand {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum AgentHost {
-    Native,
-    Python,
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,22 +179,11 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             json!({"model": model}),
         )),
         Command::Daemon { db } => run_daemon(db),
-        Command::Run {
-            goal,
-            model,
-            agent_host,
-            json,
-        }
-        | Command::Chat {
-            goal,
-            model,
-            agent_host,
-            json,
-        } => {
-            let agent_host = default_agent_host(agent_host);
-            let mut client = AppServerClient::spawn(Some(agent_host))?;
+        Command::Run { goal, model, json } | Command::Chat { goal, model, json } => {
+            let mut client = AppServerClient::spawn()?;
+            client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
-            ensure_native_agent_loop_available(agent_host, &mut client)?;
+            ensure_native_agent_loop_available(&mut client)?;
             let (thread, thread_events) = client.thread_start(model, !json)?;
             if !json {
                 println!(
@@ -219,7 +194,6 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             let (turn, turn_events) = client.turn_start(
                 required_str(&thread, &["thread", "thread_id"])?,
                 &goal,
-                Some(agent_host),
                 !json,
             )?;
             if json {
@@ -240,21 +214,19 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         Command::Continue {
             thread_id,
             instruction,
-            agent_host,
         } => {
-            let agent_host = default_agent_host(agent_host);
-            let mut client = AppServerClient::spawn(Some(agent_host))?;
+            let mut client = AppServerClient::spawn()?;
+            client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
-            ensure_native_agent_loop_available(agent_host, &mut client)?;
+            ensure_native_agent_loop_available(&mut client)?;
             client.thread_read(&thread_id)?;
             println!("thread {thread_id}");
-            let (turn, _events) =
-                client.turn_start(&thread_id, &instruction, Some(agent_host), true)?;
+            let (turn, _events) = client.turn_start(&thread_id, &instruction, true)?;
             fail_for_failed_turn(&turn["turn"])?;
             Ok(())
         }
         Command::Turn { command } => {
-            let mut client = AppServerClient::spawn(None)?;
+            let mut client = AppServerClient::spawn()?;
             client.initialize()?;
             match command {
                 TurnCommand::Status { turn_id } => client.turn_status(&turn_id),
@@ -262,13 +234,13 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             }
         }
         Command::Threads => {
-            let mut client = AppServerClient::spawn(None)?;
+            let mut client = AppServerClient::spawn()?;
             client.initialize()?;
             client.thread_list()?;
             Ok(())
         }
         Command::Trace(args) => {
-            let mut client = AppServerClient::spawn(None)?;
+            let mut client = AppServerClient::spawn()?;
             client.initialize()?;
             match args.command {
                 Some(TraceCommand::Show { event_id }) => client.trace_show(&event_id),
@@ -285,12 +257,12 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             decision,
             reason,
         } => {
-            let mut client = AppServerClient::spawn(None)?;
+            let mut client = AppServerClient::spawn()?;
             client.initialize()?;
             client.approval_decision(&request_id, decision, reason.as_deref().unwrap_or(""))
         }
         Command::Approvals => {
-            let mut client = AppServerClient::spawn(None)?;
+            let mut client = AppServerClient::spawn()?;
             client.initialize()?;
             client.approvals()?;
             Ok(())
@@ -316,35 +288,41 @@ fn run_cli(cli: Cli) -> Result<(), String> {
     }
 }
 
-fn ensure_native_agent_loop_available(
-    agent_host: AgentHost,
-    client: &mut AppServerClient,
-) -> Result<(), String> {
-    if matches!(agent_host, AgentHost::Native) {
-        let capability = client.agent_capability()?;
-        let native = &capability["nativeAgentLoop"];
-        let available = native["available"].as_bool().unwrap_or(false);
-        let status = native["status"].as_str().unwrap_or("unknown");
-        let blockers_empty = native["blockers"]
-            .as_array()
-            .is_some_and(|blockers| blockers.is_empty());
-        if available && blockers_empty && status == "completed" {
-            return Ok(());
-        }
-        return Err(format!(
-            "native AgentLoop is not production-ready: status={status}; use --agent-host python as oracle"
-        ));
+fn ensure_native_agent_loop_available(client: &mut AppServerClient) -> Result<(), String> {
+    let capability = client.agent_capability()?;
+    let native = &capability["nativeAgentLoop"];
+    let available = native["available"].as_bool().unwrap_or(false);
+    let status = native["status"].as_str().unwrap_or("unknown");
+    let blockers = native_agent_loop_blockers(native);
+    if available && blockers == "none" && status == "completed" {
+        return Ok(());
     }
-    Ok(())
+    Err(format!(
+        "Rust AgentLoop is not available: status={status}; blockers={blockers}"
+    ))
 }
 
-fn default_agent_host(agent_host: Option<AgentHost>) -> AgentHost {
-    agent_host.unwrap_or(AgentHost::Native)
+fn native_agent_loop_blockers(native: &Value) -> String {
+    let blockers = native["blockers"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    if blockers.is_empty() {
+        "none".to_string()
+    } else {
+        blockers
+    }
 }
 
 fn print_readiness() -> Result<(), String> {
-    let mut client = AppServerClient::spawn(None)?;
-    client.response_timeout = AGENT_HOST_RESPONSE_TIMEOUT;
+    let mut client = AppServerClient::spawn()?;
+    client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
     client.initialize()?;
     let capability = client.agent_capability()?;
     let native = &capability["nativeAgentLoop"];
@@ -352,7 +330,6 @@ fn print_readiness() -> Result<(), String> {
         "native_agent_loop={}",
         native["status"].as_str().unwrap_or("unknown")
     );
-    println!("sidecar_oracle=explicit");
     println!("evaluation=rust_native");
     Ok(())
 }
@@ -372,7 +349,7 @@ fn run_eval(manifest: PathBuf, run_id: &str, json_output: bool) -> Result<(), St
     if !manifest.exists() {
         return Err(format!("eval manifest not found: {}", manifest.display()));
     }
-    let mut client = AppServerClient::spawn(None)?;
+    let mut client = AppServerClient::spawn()?;
     client.response_timeout = EVAL_RESPONSE_TIMEOUT;
     client.initialize()?;
     let result = client.eval_run(&manifest, run_id)?;
@@ -406,6 +383,7 @@ fn run_daemon(db: Option<PathBuf>) -> Result<(), String> {
     if let Some(db) = db {
         command.env(APP_SERVER_DB_ENV, db);
     }
+    scrub_legacy_python_runtime_env(&mut command);
     let status = command
         .status()
         .map_err(|error| format!("failed to start app-server daemon: {error}"))?;
@@ -413,6 +391,18 @@ fn run_daemon(db: Option<PathBuf>) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("app-server daemon exited with {status}"))
+    }
+}
+
+fn scrub_legacy_python_runtime_env(command: &mut ProcessCommand) {
+    for (name, _) in std::env::vars_os() {
+        let name_upper = name.to_string_lossy().to_ascii_uppercase();
+        if LEGACY_PYTHON_RUNTIME_ENV_PREFIXES
+            .iter()
+            .any(|prefix| name_upper.starts_with(prefix))
+        {
+            command.env_remove(name);
+        }
     }
 }
 
@@ -426,27 +416,13 @@ struct AppServerClient {
 }
 
 impl AppServerClient {
-    fn spawn(agent_host: Option<AgentHost>) -> Result<Self, String> {
+    fn spawn() -> Result<Self, String> {
         let mut command = ProcessCommand::new(app_server_bin()?);
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
             command.env(APP_SERVER_DB_ENV, db);
         }
-        let response_timeout = if agent_host.is_some() {
-            AGENT_HOST_RESPONSE_TIMEOUT
-        } else {
-            RESPONSE_TIMEOUT
-        };
-        if matches!(agent_host, Some(AgentHost::Python)) {
-            command.env(PYTHON_SIDECAR_ENV, "1");
-            if std::env::var_os(PYTHON_SIDECAR_PROJECT_ROOT_ENV).is_none() {
-                let cwd = std::env::current_dir()
-                    .map_err(|error| format!("failed to resolve current directory: {error}"))?;
-                command.env(PYTHON_SIDECAR_PROJECT_ROOT_ENV, cwd);
-            }
-        } else {
-            command.env_remove(PYTHON_SIDECAR_ENV);
-        }
+        scrub_legacy_python_runtime_env(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start app-server: {error}"))?;
@@ -464,7 +440,7 @@ impl AppServerClient {
             stdin: Some(stdin),
             stdout,
             stdout_reader: Some(stdout_reader),
-            response_timeout,
+            response_timeout: RESPONSE_TIMEOUT,
             next_id: 1,
         })
     }
@@ -526,15 +502,13 @@ impl AppServerClient {
         &mut self,
         thread_id: &str,
         text: &str,
-        agent_host: Option<AgentHost>,
         render: bool,
     ) -> Result<(Value, Vec<Value>), String> {
         let id = self.next_request_id();
-        let agent_host = agent_host.map(ProtocolAgentHost::from);
         let responses = self.request(JsonRpcMessage::request(
             Method::TurnStart,
             json!(id),
-            json!({"threadId": thread_id, "agentHost": agent_host, "input": [{"type": "text", "text": text}]}),
+            json!({"threadId": thread_id, "input": [{"type": "text", "text": text}]}),
         ))?;
         let mut turn = first_result_ref(&responses)?.clone();
         if render {
@@ -776,15 +750,6 @@ impl AppServerClient {
         let id = self.next_id;
         self.next_id += 1;
         id
-    }
-}
-
-impl From<AgentHost> for ProtocolAgentHost {
-    fn from(agent_host: AgentHost) -> Self {
-        match agent_host {
-            AgentHost::Native => Self::Native,
-            AgentHost::Python => Self::Python,
-        }
     }
 }
 

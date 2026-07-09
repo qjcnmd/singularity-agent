@@ -18,6 +18,18 @@ fn json_rpc_accepts_omitted_jsonrpc_header_and_keeps_camel_case_params() {
 }
 
 #[test]
+fn turn_start_params_reject_agent_host_selector() {
+    let raw = r#"{"method":"turn/start","id":2,"params":{"threadId":"thread_1","agentHost":"python","input":[{"type":"text","text":"hi"}]}}"#;
+    let message: JsonRpcMessage = serde_json::from_str(raw).expect("parse json-rpc message");
+
+    let error = message
+        .params_as::<TurnStartParams>()
+        .expect_err("agentHost is not a public turn/start parameter");
+
+    assert!(error.to_string().contains("unknown field `agentHost`"));
+}
+
+#[test]
 fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
     let initialize = InitializeParams {
         client_info: ClientInfo::new("test", "Test", "0.1.0"),

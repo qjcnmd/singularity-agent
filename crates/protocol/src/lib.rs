@@ -290,19 +290,11 @@ pub struct ThreadDeleteResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TurnStartParams {
     #[serde(rename = "threadId")]
     pub thread_id: String,
     pub input: Vec<InputItem>,
-    #[serde(rename = "agentHost", default, skip_serializing_if = "Option::is_none")]
-    pub agent_host: Option<AgentHost>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentHost {
-    Native,
-    Python,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

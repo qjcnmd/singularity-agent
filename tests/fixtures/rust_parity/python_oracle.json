@@ -469,6 +469,21 @@
     "status": "repairing_failures",
     "task_id": "task_1"
   },
+  "reference_tool_output": {
+    "content": {
+      "artifact_ref": "artifact_1",
+      "artifact_refs": [
+        "artifact_1"
+      ],
+      "digest": "digest_1",
+      "preview": null,
+      "result_id": "obs_1"
+    },
+    "error_code": null,
+    "metadata": {},
+    "ok": true,
+    "truncated": true
+  },
   "sandbox_policy": {
     "description": "Verification under native OS sandbox enforcement.",
     "env": {

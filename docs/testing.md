@@ -130,15 +130,15 @@ python scripts/verify_stage.py
 
 Stage gate 执行 deterministic 检查：mypy、ruff、`compileall src scripts`、`scripts/verify_runtime_docs.py`、过滤后的 pytest，以及 evaluation runner / test impact / quality gate 专项测试。它输出 ruff/mypy/compileall/pytest/runtime docs 分项耗时，但不默认跑多个真实 provider eval。
 
-### Rust CLI Agent Host Smoke
+### Rust Public Runtime Boundary
 
-Rust CLI-first 迁移相关改动需要验证 Rust `sg` 仍只通过 app-server JSON-RPC 进入 Python sidecar，不依赖 CLI 直接调用 Python AgentLoop 内部对象。重复 smoke 命令：
+Rust migration 相关改动需要验证 public runtime 仍是 Rust `sg` -> app-server JSON-RPC -> Rust AgentLoop，并且普通 CLI / protocol 文档不暴露 Python 后端选择或 sidecar route。重复 guard 命令：
 
 ```bash
-python scripts/verify_rust_cli_agent_host.py
+python scripts/verify_rust_migration_boundaries.py
 ```
 
-该 smoke 使用 `SINGULARITY_SIDECAR_TEST_MODE=completed`，验证 `cargo run -p singularity_cli --bin sg -- run ... --agent-host python` 能启动 app-server、启动 Python sidecar、渲染 completed turn/assistant 输出，并通过 `sg trace <thread-id>` 看到 `python_sidecar` trace。它只证明 Rust transport/sidecar route，不替代真实 provider evaluation。
+该 guard 会拒绝 public `turn/start` 后端选择、普通 CLI 后端选择、面向用户的 sidecar route 和旧 sidecar smoke 依赖。Python oracle/parity/dev-only 测试仍可保留，但只能作为内部对照；Rust provider / AgentLoop / evaluation proof 必须通过 Rust public runtime。target-project Python commands 不是 Singularity Python runtime，例如 `python -m pytest` 仍可作为目标仓库验证命令经 Rust sandbox 执行。
 
 ### Capability Gate（核心链路变更）
 

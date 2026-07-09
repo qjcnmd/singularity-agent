@@ -79,7 +79,7 @@ class RepairEngine:
                     {
                         "check_id": finding.check_id,
                         "reason": "suggestion_requires_explicit_check",
-                        "suggested_fix": f"Run singularity-agent repair --apply --check {finding.check_id}.",
+                        "suggested_fix": f"Run python -m singularity.cli repair --apply --check {finding.check_id}.",
                     }
                 )
                 continue

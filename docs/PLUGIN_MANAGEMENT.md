@@ -2,14 +2,9 @@
 
 Singularity 插件是本地项目或用户扩展。插件发现、manifest 校验、权限审批、启用状态和工具贡献由 `src/singularity/plugins/` 与 `src/singularity/tools/registry.py` 处理。
 
-## 当前入口
+## 当前状态
 
-```bash
-singularity-agent plugin list --json
-singularity-agent plugin status --json
-```
-
-插件启用/禁用能力也由当前 CLI 提供，具体命令以 `singularity-agent plugin --help` 为准。
+插件发现、manifest 校验和启用状态仍由 Python oracle/dev-only 模块维护；Rust public CLI 当前不暴露插件管理命令。需要把插件能力接入 public runtime 时，必须先在 Rust protocol/app-server/CLI 中定义当前对象和验证路径，不能恢复 Python CLI 作为默认入口。
 
 ## Manifest
 

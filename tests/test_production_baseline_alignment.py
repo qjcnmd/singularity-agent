@@ -640,32 +640,29 @@ def test_readme_documents_v010_production_architecture() -> None:
     assert "本地优先的 CLI coding agent harness" in readme
     assert "docs/architecture/modules/" in readme
     assert (
-        "CLI\n"
-        "-> KernelBootstrap.boot()\n"
-        "-> AgentGraphBuilder.build()\n"
-        "-> AgentKernel.run_task()\n"
-        "-> AgentLoop.run()\n"
-        "-> RunController.start()\n"
-        "-> Planner.step()\n"
-        "-> ModelRunner.build_request_from_context()\n"
-        "-> ModelTurnRequestBuilder.build_request()\n"
-        "-> PromptAssemblyPipeline.build_for_model_turn()\n"
-        "-> ContextManager.build_bundle()\n"
-        "-> ModelRunner.run_turn()"
+        "Rust sg\n"
+        "-> AppServerClient\n"
+        "-> JSON-RPC over stdio\n"
+        "-> AppServer.handle_json()\n"
+        "-> SessionStore thread/turn/trace transaction\n"
+        "-> AgentLoopCapability gate\n"
+        "-> Rust AgentLoop.run()\n"
+        "-> OpenAiProvider\n"
+        "-> ToolBroker / PolicyEngine / WorkspaceTools / SandboxBackend"
     ) in readme
+    assert "Rust `sg` 是 public runtime 入口" in readme
+    assert "`turn/start` 没有公开后端选择字段" in readme
+    assert "Python oracle/parity/dev-only" in readme
     assert (
-        "ToolProtocolEngine.process_model_turn()\n"
-        "-> ToolExecutor.execute_request()\n"
-        "-> PolicyEngine.enforce() / ApprovalGate"
+        "cargo run -p singularity_cli --bin sg -- eval run "
+        "docs/evaluation/public-representative-task.json --run-id <run-id> --json"
     ) in readme
-    assert "PolicyEngine（策略引擎）" in readme
-    assert "ApprovalGate（审批闸门）" in readme
-    assert "EvaluationRunner（评估运行器）" in readme
-    assert "singularity-agent eval run docs/evaluation/public-representative-task.json --json" in readme
+    assert "--agent-host" not in readme
+    assert "singularity-agent eval run" not in readme
     assert "<trace-run-dir>/context.sqlite3" in readme
     assert "<trace-run-dir>/tool_protocol.sqlite3" in readme
-    assert "--strict" in readme
-    assert "--dry-run" in readme
+    assert "cargo run -p singularity_cli --bin sg -- run" in readme
+    assert "python scripts/verify_runtime_docs.py" in readme
     assert "agent_completed" in readme
     assert "evaluation_passed" in readme
     assert "miscompletion_count" in readme

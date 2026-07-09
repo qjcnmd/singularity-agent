@@ -4,8 +4,8 @@ use singularity_sandbox::{
 };
 use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
-    ToolBrokerDecision, ToolCallRequest, ToolOutput, ToolRegistry, ToolResult, ToolResultView,
-    ToolSpec, WorkspacePatch, WorkspacePatchChange, WorkspaceToolError, WorkspaceTools,
+    ToolBrokerDecision, ToolCallRequest, ToolOutput, ToolRegistry, ToolResult, ToolSpec,
+    WorkspacePatch, WorkspacePatchChange, WorkspaceToolError, WorkspaceTools,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,9 +21,12 @@ fn tool_result_payload_hides_audit_metadata() {
             );
 
     let payload = tool_result.to_message_payload();
+    let serialized_result = serde_json::to_value(&tool_result).expect("serialize tool result");
 
     assert_eq!(payload["tool_call_id"], "call_1");
     assert_eq!(payload["preview"], "safe preview");
+    assert_eq!(tool_result.preview.as_deref(), Some("safe preview"));
+    assert!(serialized_result.get("view").is_none());
     assert!(payload.get("policy_decision_id").is_none());
     assert!(payload.get("approval_grant_id").is_none());
     assert!(payload.get("metadata").is_none());
@@ -41,6 +44,10 @@ fn tool_result_payload_redacts_secret_like_preview() {
 
     let payload = tool_result.to_message_payload();
 
+    assert_eq!(
+        tool_result.preview.as_deref(),
+        Some("[redacted sensitive tool output]")
+    );
     assert_eq!(payload["content"], "[redacted sensitive tool output]");
     assert_eq!(payload["preview"], "[redacted sensitive tool output]");
     assert!(!serde_json::to_string(&payload).unwrap().contains("abc123"));
@@ -116,7 +123,7 @@ fn tool_result_payload_redacts_raw_provider_and_evaluator_markers() {
         "evaluator_only": {"hidden": true}
     }));
 
-    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::Summary);
+    let tool_result = ToolResult::from_result(&envelope, &result);
     let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
@@ -191,7 +198,7 @@ fn registry_rejects_duplicate_tools() {
         "{}",
     );
     let result = ToolOutput::success(serde_json::json!({"ok": true}));
-    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::Summary);
+    let tool_result = ToolResult::from_result(&envelope, &result);
     assert_eq!(tool_result.tool_name, "builtin.read");
 }
 
@@ -326,7 +333,7 @@ fn broker_executes_allowed_tool_and_tool_result_payload_stays_safe() {
 }
 
 #[test]
-fn broker_tool_result_preview_is_bounded_even_for_allowed_tool_results() {
+fn broker_tool_result_omits_preview_for_truncated_artifact_result() {
     let mut broker = ToolBroker::default();
     broker
         .register(ToolSpec::new(
@@ -345,19 +352,53 @@ fn broker_tool_result_preview_is_bounded_even_for_allowed_tool_results() {
     );
 
     let tool_result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
-        ToolOutput::success(serde_json::json!({"content": "x".repeat(10_000)}))
+        let mut output = ToolOutput::success(serde_json::json!({
+            "content": "x".repeat(10_000),
+            "artifact_ref": "artifact://result/readme"
+        }));
+        output.truncated = true;
+        output
     });
     let payload = tool_result.to_message_payload();
 
     assert!(tool_result.truncated);
-    assert_eq!(
-        payload["preview"].as_str().expect("preview").len(),
-        "x".repeat(4_096).len()
-    );
+    assert!(tool_result.preview.is_none());
+    assert!(payload.get("preview").is_none());
+    assert!(payload.get("content").is_none());
+    assert_eq!(payload["artifact_ref"], "artifact://result/readme");
 }
 
 #[test]
-fn reference_only_tool_result_payload_is_a_bounded_safe_snapshot() {
+fn truncated_tool_result_without_artifact_keeps_bounded_preview() {
+    const LARGE_ENTRY_COUNT: usize = 300;
+    let envelope = ToolCallRequest::new(
+        "run_1",
+        "session_1",
+        "task_1",
+        "call_1",
+        "builtin.list",
+        r#"{"path":"."}"#,
+    );
+    let mut result = ToolOutput::success(serde_json::json!({
+        "entries": (0..LARGE_ENTRY_COUNT)
+            .map(|index| serde_json::json!({"path": format!("file_{index}.txt")}))
+            .collect::<Vec<_>>(),
+        "truncated": true,
+    }));
+    result.truncated = true;
+
+    let tool_result = ToolResult::from_result(&envelope, &result);
+    let payload = tool_result.to_message_payload();
+
+    assert!(tool_result.truncated);
+    assert!(tool_result.preview.is_some());
+    assert!(payload.get("preview").is_some());
+    assert!(payload.get("content").is_some());
+    assert!(payload["artifact_ref"].is_null());
+}
+
+#[test]
+fn truncated_tool_result_payload_is_a_reference_only_safe_snapshot() {
     let envelope = ToolCallRequest::new(
         "run_internal_1",
         "session_internal_1",
@@ -368,7 +409,8 @@ fn reference_only_tool_result_payload_is_a_bounded_safe_snapshot() {
     );
     let mut result = ToolOutput::success(serde_json::json!({
         "stdout": "FULL_OUTPUT_SHOULD_NOT_BE_VISIBLE",
-        "token": "abc123"
+        "token": "abc123",
+        "artifact_ref": "artifact://result/full-output"
     }));
     result.truncated = true;
     result.metadata = serde_json::json!({
@@ -378,7 +420,7 @@ fn reference_only_tool_result_payload_is_a_bounded_safe_snapshot() {
         "task_id": envelope.task_id,
     });
 
-    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::ReferenceOnly);
+    let tool_result = ToolResult::from_result(&envelope, &result);
     let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
@@ -390,14 +432,15 @@ fn reference_only_tool_result_payload_is_a_bounded_safe_snapshot() {
             "tool_call_id": "call_1",
             "status": "ok",
             "digest": tool_result.digest,
-            "artifact_ref": null,
+            "artifact_ref": "artifact://result/full-output",
             "error_code": null,
-            "artifact_refs": [],
+            "artifact_refs": ["artifact://result/full-output"],
             "result_id": null,
             "truncated": true,
             "redacted": true,
         })
     );
+    assert!(tool_result.preview.is_none());
     assert!(payload.get("content").is_none());
     assert!(payload.get("preview").is_none());
     for leaked in [
@@ -433,7 +476,7 @@ fn tool_result_carries_artifact_and_result_refs_from_tool_output() {
         "artifact_refs": ["artifact://audit/readme"]
     });
 
-    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::Summary);
+    let tool_result = ToolResult::from_result(&envelope, &result);
     let payload = tool_result.to_message_payload();
 
     assert!(tool_result.digest.starts_with("hash:"));
@@ -470,7 +513,7 @@ fn tool_result_payload_redacts_sensitive_artifact_refs() {
         "result_id": "tool_result_1"
     }));
 
-    let tool_result = ToolResult::from_result(&envelope, &result, ToolResultView::Summary);
+    let tool_result = ToolResult::from_result(&envelope, &result);
     let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 

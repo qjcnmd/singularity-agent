@@ -3,13 +3,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentLoop, AgentLoopCapability, AgentLoopInput, AgentRunStatus, AgentStatus, ApprovalGrant,
-    PendingToolCall, PythonSidecarClient, PythonSidecarConfig, PythonSidecarStatus,
-    sidecar_trace_summary,
+    PendingToolCall,
 };
 use singularity_core::{ErrorCode, contains_sensitive_text};
 use singularity_model::{OpenAiProvider, Provider};
@@ -18,16 +16,15 @@ use singularity_policy::{
     PermissionOperation, PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
 };
 use singularity_protocol::{
-    AgentCapabilityResult, AgentHost, AppEvent, ApprovalCenterResult, ApprovalListResult,
-    ArtifactFetchParams, ArtifactFetchResult, EvalRunParams, EvalRunResult, EventSubscribeParams,
-    EventSubscribeResult, InitializeParams, InitializeResult, JsonRpcMessage, Method,
-    ServerCapabilitiesResult, Thread, ThreadDeleteResult, ThreadForkParams, ThreadForkResult,
-    ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult,
-    TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceTailParams,
-    TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
-    TurnStartResult, TurnStatus,
+    AgentCapabilityResult, AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams,
+    ArtifactFetchResult, EvalRunParams, EvalRunResult, EventSubscribeParams, EventSubscribeResult,
+    InitializeParams, InitializeResult, JsonRpcMessage, Method, ServerCapabilitiesResult, Thread,
+    ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
+    ThreadResult, ThreadStartParams, ThreadStartResult, TraceEvent, TraceListParams,
+    TraceListResult, TraceShowParams, TraceTailParams, TransportCapability, Turn, TurnIdParams,
+    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
-use singularity_store::{ActiveSidecarRun, SessionStore, StoreError};
+use singularity_store::{SessionStore, StoreError};
 use singularity_tools::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, CommandToolInput,
     SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolRegistry, ToolSpec,
@@ -41,7 +38,8 @@ const TURN_NOT_FOUND: &str = "Turn not found";
 const TRACE_RUN_NOT_FOUND: &str = "Trace run not found";
 const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
 const PENDING_APPROVAL_NOT_FOUND: &str = "Pending approval not found";
-const APPROVAL_ALREADY_EXISTS: &str = "Approval already exists";
+const APPROVAL_REQUEST_INTERNAL_ONLY: &str =
+    "approval/request is internal to the Rust AgentLoop approval ledger";
 const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
 const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
 const TOOL_READ: &str = "builtin.read";
@@ -50,7 +48,6 @@ const TOOL_GREP: &str = "builtin.grep";
 const TOOL_EDIT: &str = "builtin.edit";
 const TOOL_PATCH: &str = "builtin.patch";
 const TOOL_COMMAND: &str = "builtin.command";
-const NATIVE_AGENT_LOOP_NOT_READY: &str = "Native AgentLoop is not production-ready";
 const EVAL_TASK_SET_SCHEMA: &str = "evaluation.task_set/v1";
 const EVAL_RESULT_SCHEMA: &str = "evaluation.result/v1";
 const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
@@ -66,7 +63,6 @@ const EVAL_DEFAULT_MAX_TURNS: u32 = 24;
 const EVAL_DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 const EVAL_PREPARE_TIMEOUT_SECONDS: u64 = 900;
 const EVAL_GIT_TIMEOUT_SECONDS: u64 = 900;
-static TRACE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static EVAL_COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -83,15 +79,8 @@ pub struct AppServer {
     store: SessionStore,
     initialized: bool,
     initialized_acknowledged: bool,
-    python_sidecar: Option<PythonSidecarConfig>,
     event_filter: Option<Vec<String>>,
-    sidecar_runs: HashMap<String, SidecarRun>,
     shutdown_requested: bool,
-}
-
-struct SidecarRun {
-    client: PythonSidecarClient,
-    run_id: String,
 }
 
 impl AppServer {
@@ -100,16 +89,9 @@ impl AppServer {
             store,
             initialized: false,
             initialized_acknowledged: false,
-            python_sidecar: None,
             event_filter: None,
-            sidecar_runs: HashMap::new(),
             shutdown_requested: false,
         }
-    }
-
-    pub fn with_python_sidecar(mut self, config: PythonSidecarConfig) -> Self {
-        self.python_sidecar = Some(config);
-        self
     }
 
     pub fn shutdown_requested(&self) -> bool {
@@ -292,7 +274,6 @@ impl AppServer {
 
     fn thread_delete(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: ThreadIdParams = message.params_as()?;
-        self.cleanup_thread_sidecar_runs(&params.thread_id)?;
         match self.store.delete_thread(&params.thread_id) {
             Ok(()) => Ok(vec![
                 JsonRpcMessage::response(
@@ -310,7 +291,15 @@ impl AppServer {
     }
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TurnStartParams = message.params_as()?;
+        let params: TurnStartParams = match message.params_as() {
+            Ok(params) => params,
+            Err(error) => {
+                return json_error(
+                    message.id,
+                    ErrorCode::invalid_request(format!("invalid turn/start params: {error}")),
+                );
+            }
+        };
         let thread = match self.store.get_thread(&params.thread_id) {
             Ok(thread) => thread,
             Err(StoreError::NotFound(_)) => {
@@ -318,14 +307,17 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        let agent_host = params.agent_host.clone().unwrap_or(AgentHost::Native);
-        if matches!(agent_host, AgentHost::Native) && !native_agent_loop_ready() {
-            return invalid_request_response(message.id, NATIVE_AGENT_LOOP_NOT_READY);
+        let capability = AgentLoopCapability::current();
+        if !native_capability_ready(&capability) {
+            return invalid_request_response(
+                message.id,
+                native_agent_loop_unavailable_message(&capability),
+            );
         }
         let payload = serde_json::to_value(&params.input)?;
         let (turn, _item, _trace) = match self.store.create_turn_with_input_and_trace(
             &params.thread_id,
-            agent_host_initial_status(&agent_host),
+            AgentStatus::Running.as_str(),
             payload,
             "app_server",
             "turn started",
@@ -339,33 +331,9 @@ impl AppServer {
 
         let mut messages = Vec::new();
         messages.extend(self.event_notification(AppEvent::turn_started(&turn)));
-        if matches!(agent_host, AgentHost::Native) {
-            let status = self.run_native_agent_loop(&thread, &params, &turn.turn_id)?;
-            let turn = self.update_turn_from_run_status(turn, &status)?;
-            self.append_native_trace(&params.thread_id, &turn.turn_id, &status)?;
-            messages.extend(self.agent_terminal_item_events(&status, &turn)?);
-            messages.push(
-                JsonRpcMessage::response(
-                    message.id,
-                    serde_json::to_value(TurnStartResult { turn: turn.clone() })?,
-                )
-                .to_wire_value(),
-            );
-            return Ok(messages);
-        }
-
-        let previous_session_id = self.previous_python_session_id(&params.thread_id);
-        let status = self.run_python_sidecar_if_enabled(
-            &turn.turn_id,
-            &params,
-            thread.model.as_deref(),
-            previous_session_id.as_deref(),
-        );
-        if is_terminal_sidecar_status(&status.status) {
-            self.append_sidecar_trace(&params.thread_id, &turn.turn_id, &status)?;
-        }
+        let status = self.run_native_agent_loop(&thread, &params, &turn.turn_id)?;
         let turn = self.update_turn_from_run_status(turn, &status)?;
-
+        self.append_native_trace(&params.thread_id, &turn.turn_id, &status)?;
         messages.extend(self.agent_terminal_item_events(&status, &turn)?);
         messages.push(
             JsonRpcMessage::response(
@@ -471,7 +439,7 @@ impl AppServer {
         let provider = match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
             Ok(provider) => provider,
             Err(error) => {
-                let turn_id = &request.task_id;
+                let turn_id = &request.turn_id;
                 let turn = self.store.get_turn(turn_id)?;
                 let run_status = native_approval_terminal_status(
                     &turn,
@@ -501,7 +469,7 @@ impl AppServer {
         if !matches!(decision.outcome, ApprovalOutcome::Allow) {
             return Ok(None);
         }
-        let turn_id = &request.task_id;
+        let turn_id = &request.turn_id;
         let turn = self.store.get_turn(turn_id)?;
         if turn.status != TurnStatus::Blocked
             || turn.agent_loop_status != AgentStatus::Blocked.as_str()
@@ -543,7 +511,6 @@ impl AppServer {
         let params = TurnStartParams {
             thread_id: turn.thread_id.clone(),
             input: serde_json::from_value(user_input)?,
-            agent_host: Some(AgentHost::Native),
         };
         let grant = ApprovalGrant::allow(
             request.request_id.clone(),
@@ -623,83 +590,6 @@ impl AppServer {
         Ok(result.to_run_status(&loop_input))
     }
 
-    fn run_python_sidecar_if_enabled(
-        &mut self,
-        turn_id: &str,
-        params: &TurnStartParams,
-        model: Option<&str>,
-        previous_session_id: Option<&str>,
-    ) -> AgentRunStatus {
-        let Some(config) = &self.python_sidecar else {
-            return AgentRunStatus::not_migrated();
-        };
-        let goal = params
-            .input
-            .iter()
-            .map(|item| match item {
-                singularity_protocol::InputItem::Text { text } => text.as_str(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let result = PythonSidecarClient::spawn(config).and_then(|mut client| {
-            if let Some(session_id) = previous_session_id {
-                client
-                    .resume_agent(session_id, &goal, model)
-                    .map(|result| (client, result))
-            } else {
-                client
-                    .run_agent(&goal, model)
-                    .map(|result| (client, result))
-            }
-        });
-        match result {
-            Ok((client, result)) => {
-                let run_status = AgentRunStatus::from_sidecar(result);
-                if matches!(
-                    run_status.status,
-                    AgentStatus::Running | AgentStatus::CancelRequested
-                ) && let (Some(run_id), Some(session_id), Some(task_id)) = (
-                    run_status.run_id.as_deref(),
-                    run_status.session_id.as_deref(),
-                    run_status.task_id.as_deref(),
-                ) {
-                    if let Err(error) = self.store.register_active_sidecar_run(
-                        turn_id,
-                        run_id,
-                        session_id,
-                        task_id,
-                        run_status.status.as_str(),
-                    ) {
-                        return AgentRunStatus::failed(error.to_string());
-                    }
-                    if let Err(error) = self.append_lifecycle_trace(
-                        &params.thread_id,
-                        turn_id,
-                        run_id,
-                        session_id,
-                        task_id,
-                        "sidecar_started",
-                        run_status.status.as_str(),
-                    ) {
-                        let _ = self
-                            .store
-                            .clear_active_sidecar_run(turn_id, run_status.status.as_str());
-                        return AgentRunStatus::failed(error.to_string());
-                    }
-                    self.sidecar_runs.insert(
-                        turn_id.to_string(),
-                        SidecarRun {
-                            client,
-                            run_id: run_id.to_string(),
-                        },
-                    );
-                }
-                run_status
-            }
-            Err(error) => AgentRunStatus::failed(error),
-        }
-    }
-
     fn update_turn_from_run_status(
         &self,
         turn: Turn,
@@ -722,65 +612,6 @@ impl AppServer {
             )?);
         }
         Ok(turn)
-    }
-
-    fn previous_python_session_id(&self, thread_id: &str) -> Option<String> {
-        self.store
-            .list_trace(thread_id)
-            .ok()?
-            .into_iter()
-            .rev()
-            .find_map(|event| {
-                if event.component != "python_sidecar" {
-                    return None;
-                }
-                event
-                    .payload
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .filter(|session_id| !session_id.is_empty())
-                    .map(str::to_string)
-            })
-    }
-
-    fn append_sidecar_trace(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        run_status: &AgentRunStatus,
-    ) -> AppServerResult<()> {
-        if matches!(
-            run_status.status,
-            singularity_agent::AgentStatus::NotMigrated
-        ) {
-            return Ok(());
-        }
-        let mut summary = TraceEvent::new(
-            format!("trace_{turn_id}_python_sidecar"),
-            thread_id,
-            turn_id,
-            "python_sidecar",
-            "Python sidecar result translated",
-        );
-        summary.payload = redact_sidecar_trace_summary(sidecar_trace_summary(run_status));
-        self.store.append_trace(&summary)?;
-        for event in &run_status.events {
-            let mut translated = TraceEvent::new(
-                sidecar_event_trace_id(turn_id, event),
-                thread_id,
-                turn_id,
-                "python_sidecar",
-                redact_app_server_text(&event.summary),
-            );
-            translated.event_type = safe_sidecar_event_type(&event.event_type);
-            translated.severity = safe_sidecar_event_severity(&event.severity);
-            translated.payload = serde_json::json!({
-                "component": "python_sidecar",
-                "sequence": event.sequence,
-            });
-            self.store.append_trace(&translated)?;
-        }
-        Ok(())
     }
 
     fn append_native_trace(
@@ -814,81 +645,6 @@ impl AppServer {
 
     fn turn_interrupt(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnIdParams = message.params_as()?;
-        if let Ok(active) = self.store.get_active_sidecar_run(&params.turn_id) {
-            let Some(run) = self.sidecar_runs.get_mut(&params.turn_id) else {
-                let turn = self.store.get_turn(&params.turn_id)?;
-                return json_response(message.id, stale_active_run_interrupt_result(turn, &active));
-            };
-            let status = run.client.cancel(&active.run_id).map(sidecar_run_status);
-            let status = match status {
-                Ok(status) => status,
-                Err(error) => {
-                    return json_error(
-                        message.id,
-                        ErrorCode::new(
-                            singularity_core::JSON_RPC_INTERNAL_ERROR,
-                            redact_app_server_text(&error),
-                        ),
-                    );
-                }
-            };
-            if !is_cancel_ack_status(&status.status) {
-                return json_error(
-                    message.id,
-                    ErrorCode::new(
-                        singularity_core::JSON_RPC_INTERNAL_ERROR,
-                        format!(
-                            "sidecar cancel was not accepted: {}",
-                            status.status.as_str()
-                        ),
-                    ),
-                );
-            }
-            let _ = self.store.register_active_sidecar_run(
-                &params.turn_id,
-                active.run_id.as_str(),
-                active.session_id.as_str(),
-                active.task_id.as_str(),
-                status.status.as_str(),
-            )?;
-            let transition = if matches!(status.status, AgentStatus::CancelRequested) {
-                "cancel_requested"
-            } else {
-                "interrupted"
-            };
-            self.append_lifecycle_trace(
-                &active.thread_id,
-                &params.turn_id,
-                active.run_id.as_str(),
-                active.session_id.as_str(),
-                active.task_id.as_str(),
-                transition,
-                status.status.as_str(),
-            )?;
-            let turn = self.store.update_turn_state(
-                &params.turn_id,
-                TurnStatus::Interrupted,
-                status.status.as_str(),
-            )?;
-            if is_terminal_sidecar_status(&status.status) {
-                self.append_sidecar_trace(&active.thread_id, &params.turn_id, &status)?;
-                let _ = self
-                    .store
-                    .clear_active_sidecar_run(&params.turn_id, status.status.as_str());
-                self.sidecar_runs.remove(&params.turn_id);
-            }
-            return Ok(vec![
-                JsonRpcMessage::response(
-                    message.id,
-                    serde_json::to_value(TurnInterruptResult {
-                        turn_id: turn.turn_id,
-                        status: "interrupted".to_string(),
-                        agent_loop_status: Some(status.status.as_str().to_string()),
-                    })?,
-                )
-                .to_wire_value(),
-            ]);
-        }
         match self.store.get_turn(&params.turn_id) {
             Ok(turn) if is_terminal_turn_status(&turn.status) => Ok(vec![
                 JsonRpcMessage::response(
@@ -902,9 +658,26 @@ impl AppServer {
                 .to_wire_value(),
             ]),
             Ok(turn) => {
-                let turn = self
-                    .store
-                    .update_turn_status(&turn.turn_id, TurnStatus::Interrupted)?;
+                let thread_id = turn.thread_id.clone();
+                let turn = self.store.update_turn_state(
+                    &turn.turn_id,
+                    TurnStatus::Interrupted,
+                    "cancel_requested",
+                )?;
+                let trace = TraceEvent {
+                    payload: json!({
+                        "turn_id": turn.turn_id,
+                        "agent_loop_status": turn.agent_loop_status,
+                    }),
+                    ..TraceEvent::new(
+                        format!("trace_{}_interrupt_requested", turn.turn_id),
+                        thread_id,
+                        turn.turn_id.clone(),
+                        "app_server",
+                        "turn interrupt requested",
+                    )
+                };
+                self.store.append_trace(&trace)?;
                 Ok(vec![
                     JsonRpcMessage::response(
                         message.id,
@@ -924,105 +697,6 @@ impl AppServer {
 
     fn turn_status(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnIdParams = message.params_as()?;
-        if let Ok(active) = self.store.get_active_sidecar_run(&params.turn_id) {
-            let Some(run) = self.sidecar_runs.get_mut(&params.turn_id) else {
-                let turn = self.store.get_turn(&params.turn_id)?;
-                return json_response(message.id, stale_active_run_status_result(turn, &active));
-            };
-            let run_status = match run.client.status(&run.run_id) {
-                Ok(status) => sidecar_run_status(status),
-                Err(error) => {
-                    if is_cancelled_or_interrupted(active.status.as_str()) {
-                        self.finalize_active_sidecar_run(
-                            &params.turn_id,
-                            &active,
-                            TurnStatus::Interrupted,
-                            "cancelled",
-                            "interrupted",
-                            true,
-                        )?;
-                        return json_response(
-                            message.id,
-                            TurnResult {
-                                turn: self.store.get_turn(&params.turn_id)?,
-                            },
-                        );
-                    }
-                    let mut run_status = AgentRunStatus::failed(error);
-                    run_status.run_id = Some(active.run_id.clone());
-                    run_status.session_id = Some(active.session_id.clone());
-                    run_status.task_id = Some(active.task_id.clone());
-                    run_status
-                }
-            };
-            let current_turn = self.store.get_turn(&params.turn_id)?;
-            let current_turn_interrupted = current_turn.status == TurnStatus::Interrupted;
-            let terminal_after_interrupt =
-                current_turn_interrupted && is_terminal_sidecar_status(&run_status.status);
-            let turn = if current_turn_interrupted {
-                if terminal_after_interrupt {
-                    self.store.update_turn_state(
-                        &params.turn_id,
-                        TurnStatus::Interrupted,
-                        "cancelled",
-                    )?
-                } else {
-                    let active_status = if is_cancelled_or_interrupted(active.status.as_str()) {
-                        active.status.as_str()
-                    } else {
-                        run_status.status.as_str()
-                    };
-                    let _ = self.store.register_active_sidecar_run(
-                        &params.turn_id,
-                        active.run_id.as_str(),
-                        active.session_id.as_str(),
-                        active.task_id.as_str(),
-                        active_status,
-                    )?;
-                    current_turn
-                }
-            } else {
-                self.update_turn_from_run_status(current_turn, &run_status)?
-            };
-            if is_terminal_sidecar_status(&run_status.status) {
-                if terminal_after_interrupt {
-                    let cancelled_status = cancelled_sidecar_status(&active);
-                    self.append_sidecar_trace(
-                        &active.thread_id,
-                        &params.turn_id,
-                        &cancelled_status,
-                    )?;
-                } else {
-                    self.append_sidecar_trace(&active.thread_id, &params.turn_id, &run_status)?;
-                }
-                let _ = self
-                    .store
-                    .clear_active_sidecar_run(&params.turn_id, turn.agent_loop_status.as_str());
-                self.sidecar_runs.remove(&params.turn_id);
-            } else {
-                let active_status = if current_turn_interrupted
-                    || is_cancelled_or_interrupted(active.status.as_str())
-                {
-                    active.status.as_str()
-                } else {
-                    run_status.status.as_str()
-                };
-                let _ = self.store.register_active_sidecar_run(
-                    &params.turn_id,
-                    active.run_id.as_str(),
-                    active.session_id.as_str(),
-                    active.task_id.as_str(),
-                    active_status,
-                )?;
-            }
-            let mut messages = self
-                .agent_terminal_item_events(&run_status, &self.store.get_turn(&params.turn_id)?)?;
-            messages.push(
-                JsonRpcMessage::response(message.id, serde_json::to_value(TurnResult { turn })?)
-                    .to_wire_value(),
-            );
-            return Ok(messages);
-        }
         match self.store.get_turn(&params.turn_id) {
             Ok(turn) => json_response(message.id, TurnResult { turn }),
             Err(StoreError::NotFound(_)) => not_found_response(message.id, TURN_NOT_FOUND),
@@ -1030,40 +704,7 @@ impl AppServer {
         }
     }
 
-    fn append_lifecycle_trace(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        run_id: &str,
-        session_id: &str,
-        task_id: &str,
-        transition: &str,
-        status: &str,
-    ) -> AppServerResult<()> {
-        let mut event = TraceEvent::new(
-            format!("trace_{turn_id}_{transition}_{}", short_trace_id()),
-            thread_id,
-            turn_id,
-            "app_server",
-            format!("turn lifecycle {transition}"),
-        );
-        event.task_id = Some(task_id.to_string());
-        event.payload = json!({
-            "turn_id": turn_id,
-            "thread_id": thread_id,
-            "run_id": run_id,
-            "session_id": session_id,
-            "task_id": task_id,
-            "status": status,
-            "transition": transition,
-            "component": "app_server",
-        });
-        self.store.append_trace(&event)?;
-        Ok(())
-    }
-
     fn server_shutdown(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        self.cleanup_active_sidecar_runs()?;
         self.shutdown_requested = true;
         Ok(vec![
             JsonRpcMessage::response(message.id, json!({"shutdown": true})).to_wire_value(),
@@ -1092,21 +733,8 @@ impl AppServer {
     }
 
     fn approval_request(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let request: ApprovalRequest = message.params_as()?;
-        if let Err(error) =
-            self.store
-                .create_approval_with_trace(&request, "approval", "approval requested")
-        {
-            return match error {
-                StoreError::AlreadyExists(_) => {
-                    invalid_request_response(message.id, APPROVAL_ALREADY_EXISTS)
-                }
-                other => Err(other.into()),
-            };
-        }
-        Ok(vec![
-            JsonRpcMessage::response(message.id, json!({"approval": request})).to_wire_value(),
-        ])
+        let _request: ApprovalRequest = message.params_as()?;
+        invalid_request_response(message.id, APPROVAL_REQUEST_INTERNAL_ONLY)
     }
 
     fn approval_decision(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -1156,12 +784,15 @@ impl AppServer {
         decision: &ApprovalDecision,
         pending_tool_call: Option<&Value>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus)>> {
-        let Ok(turn) = self.store.get_turn(&request.task_id) else {
+        let Ok(turn) = self.store.get_turn(&request.turn_id) else {
             return Ok(None);
         };
         if turn.status != TurnStatus::Blocked
             || turn.agent_loop_status != AgentStatus::Blocked.as_str()
         {
+            return Ok(None);
+        }
+        if pending_tool_call.is_none() {
             return Ok(None);
         }
         let (status, audit_decision, message) = match decision.outcome {
@@ -1287,125 +918,6 @@ impl AppServer {
     }
 }
 
-impl Drop for AppServer {
-    fn drop(&mut self) {
-        let _ = self.cleanup_active_sidecar_runs();
-    }
-}
-
-impl AppServer {
-    fn cleanup_thread_sidecar_runs(&mut self, thread_id: &str) -> AppServerResult<()> {
-        let turn_ids = self
-            .store
-            .list_active_sidecar_runs()?
-            .into_iter()
-            .filter(|active| active.thread_id == thread_id)
-            .map(|active| active.turn_id)
-            .collect::<Vec<_>>();
-        for turn_id in turn_ids {
-            if let Ok(active) = self.store.get_active_sidecar_run(&turn_id) {
-                let (turn_status, agent_loop_status) = self.cleanup_status(&active);
-                let transition = if turn_status == TurnStatus::Interrupted {
-                    "interrupted"
-                } else {
-                    "cleanup"
-                };
-                self.finalize_active_sidecar_run(
-                    &turn_id,
-                    &active,
-                    turn_status,
-                    agent_loop_status,
-                    transition,
-                    false,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn cleanup_active_sidecar_runs(&mut self) -> AppServerResult<()> {
-        let turn_ids = self.sidecar_runs.keys().cloned().collect::<Vec<_>>();
-        for turn_id in turn_ids {
-            let Ok(active) = self.store.get_active_sidecar_run(&turn_id) else {
-                continue;
-            };
-            let (turn_status, agent_loop_status) = self.cleanup_status(&active);
-            let transition = if turn_status == TurnStatus::Interrupted {
-                "interrupted"
-            } else {
-                "cleanup"
-            };
-            self.finalize_active_sidecar_run(
-                &turn_id,
-                &active,
-                turn_status,
-                agent_loop_status,
-                transition,
-                false,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn cleanup_status(&self, active: &ActiveSidecarRun) -> (TurnStatus, &'static str) {
-        let interrupted = is_cancelled_or_interrupted(active.status.as_str())
-            || self
-                .store
-                .get_turn(active.turn_id.as_str())
-                .is_ok_and(|turn| turn.status == TurnStatus::Interrupted);
-        if interrupted {
-            (TurnStatus::Interrupted, "cancelled")
-        } else {
-            (TurnStatus::Failed, "failed")
-        }
-    }
-
-    fn finalize_active_sidecar_run(
-        &mut self,
-        turn_id: &str,
-        active: &ActiveSidecarRun,
-        turn_status: TurnStatus,
-        agent_loop_status: &str,
-        transition: &str,
-        append_sidecar_trace_event: bool,
-    ) -> AppServerResult<()> {
-        self.append_lifecycle_trace(
-            &active.thread_id,
-            turn_id,
-            active.run_id.as_str(),
-            active.session_id.as_str(),
-            active.task_id.as_str(),
-            transition,
-            agent_loop_status,
-        )?;
-        self.store
-            .update_turn_state(turn_id, turn_status, agent_loop_status)?;
-        if append_sidecar_trace_event {
-            let run_status = AgentRunStatus {
-                status: AgentStatus::Cancelled,
-                completed: false,
-                final_answer: None,
-                run_id: Some(active.run_id.clone()),
-                session_id: Some(active.session_id.clone()),
-                task_id: Some(active.task_id.clone()),
-                model_turns: 0,
-                tool_calls: 0,
-                approval_count: 0,
-                events: Vec::new(),
-                audit_events: Vec::new(),
-                trace_path: None,
-                error: None,
-            };
-            self.append_sidecar_trace(&active.thread_id, turn_id, &run_status)?;
-        }
-        let _ = self
-            .store
-            .clear_active_sidecar_run(turn_id, agent_loop_status);
-        self.sidecar_runs.remove(turn_id);
-        Ok(())
-    }
-}
-
 fn json_response<T: serde::Serialize>(id: Option<Value>, result: T) -> AppServerResult<Vec<Value>> {
     Ok(vec![
         JsonRpcMessage::response(id, serde_json::to_value(result)?).to_wire_value(),
@@ -1423,7 +935,7 @@ fn native_approval_terminal_status(
 ) -> AgentRunStatus {
     let mut run_status = AgentRunStatus::failed(message).with_status(status);
     run_status.run_id = Some(turn.turn_id.clone());
-    run_status.session_id = Some(request.session_id.clone());
+    run_status.session_id = Some(request.thread_id.clone());
     run_status.task_id = Some(turn.turn_id.clone());
     run_status.approval_count = 1;
     let mut audit_event = json!({
@@ -2386,18 +1898,26 @@ fn safe_path_segment(value: &str) -> String {
 
 fn native_agent_loop_ready() -> bool {
     let capability = AgentLoopCapability::current();
+    native_capability_ready(&capability)
+}
+
+fn native_capability_ready(capability: &AgentLoopCapability) -> bool {
     capability.available
         && capability.blockers.is_empty()
         && capability.status == AgentStatus::Completed
 }
 
-fn agent_host_initial_status(agent_host: &AgentHost) -> &'static str {
-    match agent_host {
-        AgentHost::Native => AgentStatus::Running.as_str(),
-        AgentHost::Python => AgentStatus::NotMigrated.as_str(),
-    }
+fn native_agent_loop_unavailable_message(capability: &AgentLoopCapability) -> String {
+    let blockers = if capability.blockers.is_empty() {
+        "none".to_string()
+    } else {
+        capability.blockers.join(",")
+    };
+    format!(
+        "Rust AgentLoop is not available: status={}; blockers={blockers}",
+        capability.status.as_str()
+    )
 }
-
 fn native_workspace_policy(workspace_root: String) -> PolicyEngine {
     PolicyEngine::new(PermissionProfile::workspace_write(workspace_root))
         .with_rule(native_read_tool_rule())
@@ -2520,66 +2040,6 @@ fn json_error(id: Option<Value>, error: ErrorCode) -> AppServerResult<Vec<Value>
     Ok(vec![JsonRpcMessage::error(id, error).to_wire_value()])
 }
 
-fn stale_active_run_interrupt_result(turn: Turn, active: &ActiveSidecarRun) -> TurnInterruptResult {
-    TurnInterruptResult {
-        turn_id: turn.turn_id,
-        status: turn_status_str(&turn.status).to_string(),
-        agent_loop_status: Some(active.status.clone()),
-    }
-}
-
-fn stale_active_run_status_result(mut turn: Turn, active: &ActiveSidecarRun) -> TurnResult {
-    turn.agent_loop_status = active.status.clone();
-    TurnResult { turn }
-}
-
-fn cancelled_sidecar_status(active: &ActiveSidecarRun) -> AgentRunStatus {
-    AgentRunStatus {
-        status: AgentStatus::Cancelled,
-        completed: false,
-        final_answer: None,
-        run_id: Some(active.run_id.clone()),
-        session_id: Some(active.session_id.clone()),
-        task_id: Some(active.task_id.clone()),
-        model_turns: 0,
-        tool_calls: 0,
-        approval_count: 0,
-        events: Vec::new(),
-        audit_events: Vec::new(),
-        trace_path: None,
-        error: None,
-    }
-}
-
-fn sidecar_run_status(status: PythonSidecarStatus) -> AgentRunStatus {
-    let host_status = AgentStatus::from(status.status.as_str());
-    AgentRunStatus {
-        status: host_status,
-        completed: status.status == "completed",
-        final_answer: status.final_answer,
-        run_id: Some(status.run_id),
-        session_id: status.session_id,
-        task_id: status.task_id,
-        model_turns: 0,
-        tool_calls: 0,
-        approval_count: 0,
-        events: status.events,
-        audit_events: Vec::new(),
-        trace_path: status.trace_path,
-        error: None,
-    }
-}
-
-fn is_terminal_sidecar_status(status: &AgentStatus) -> bool {
-    matches!(
-        status,
-        AgentStatus::Completed
-            | AgentStatus::Blocked
-            | AgentStatus::Cancelled
-            | AgentStatus::Failed
-    )
-}
-
 fn is_terminal_turn_status(status: &TurnStatus) -> bool {
     !matches!(status, TurnStatus::Running)
 }
@@ -2592,17 +2052,6 @@ fn turn_status_str(status: &TurnStatus) -> &'static str {
         TurnStatus::Failed => "failed",
         TurnStatus::Interrupted => "interrupted",
     }
-}
-
-fn is_cancelled_or_interrupted(status: &str) -> bool {
-    matches!(status, "cancel_requested" | "cancelled" | "canceled")
-}
-
-fn is_cancel_ack_status(status: &AgentStatus) -> bool {
-    matches!(
-        status,
-        AgentStatus::CancelRequested | AgentStatus::Cancelled
-    )
 }
 
 fn agent_completed_delta(run_status: &AgentRunStatus) -> Option<String> {
@@ -2829,6 +2278,8 @@ mod tests {
             turn.turn_id.clone(),
             TOOL_EDIT,
         )
+        .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
+        .with_tool_call_id("call_1")
         .with_resources(["README.md"]);
         let decision = ApprovalDecision::new(
             request.request_id.clone(),
@@ -2885,7 +2336,9 @@ mod tests {
             turn.turn_id.clone(),
             turn.turn_id.clone(),
             TOOL_COMMAND,
-        );
+        )
+        .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
+        .with_tool_call_id("call_1");
         let pending = PendingToolCall {
             request_id: request.request_id.clone(),
             tool_call_id: "call_1".to_string(),
@@ -2913,7 +2366,7 @@ mod tests {
 
         assert_eq!(
             run_status.session_id.as_deref(),
-            Some(turn.turn_id.as_str())
+            Some(thread.thread_id.as_str())
         );
         assert_eq!(
             run_status.audit_events[0]["sandbox_mode"],
@@ -2967,7 +2420,9 @@ mod tests {
             turn.turn_id.clone(),
             turn.turn_id.clone(),
             TOOL_COMMAND,
-        );
+        )
+        .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
+        .with_tool_call_id("call_1");
         let decision = ApprovalDecision::new(
             request.request_id.clone(),
             ApprovalOutcome::Allow,
@@ -3089,6 +2544,8 @@ mod tests {
             turn.turn_id.clone(),
             TOOL_EDIT,
         )
+        .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
+        .with_tool_call_id("call_1")
         .with_resources(["README.md"]);
         let pending = PendingToolCall {
             request_id: request.request_id.clone(),
@@ -3152,7 +2609,6 @@ mod tests {
             input: vec![singularity_protocol::InputItem::Text {
                 text: "run command".to_string(),
             }],
-            agent_host: Some(AgentHost::Native),
         };
         let mut command_response =
             ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
@@ -3212,55 +2668,6 @@ fn redact_app_server_text(text: &str) -> String {
     }
 }
 
-fn redact_sidecar_trace_summary(mut payload: Value) -> Value {
-    if let Some(object) = payload.as_object_mut() {
-        if let Some(Value::String(trace_path)) = object.get_mut("trace_path") {
-            *trace_path = redact_app_server_text(trace_path);
-        }
-    }
-    payload
-}
-
-fn sidecar_event_trace_id(turn_id: &str, event: &singularity_agent::SidecarRunEvent) -> String {
-    let event_id = safe_trace_id_segment(&event.event_id);
-    if event_id.is_empty() || contains_sensitive_text(&event.event_id) {
-        format!("trace_{turn_id}_python_sidecar_{}", event.sequence)
-    } else {
-        format!("trace_{turn_id}_{event_id}")
-    }
-}
-
-fn safe_trace_id_segment(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-        .collect()
-}
-
-fn safe_sidecar_event_type(event_type: &str) -> String {
-    if event_type.trim().is_empty() || contains_sensitive_text(event_type) {
-        "python_sidecar.event".to_string()
-    } else {
-        event_type.to_string()
-    }
-}
-
-fn safe_sidecar_event_severity(severity: &str) -> String {
-    match severity.to_ascii_lowercase().as_str() {
-        "debug" | "info" | "warning" | "error" => severity.to_ascii_lowercase(),
-        _ => "info".to_string(),
-    }
-}
-
-fn short_trace_id() -> String {
-    let micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_micros())
-        .unwrap_or_default();
-    let sequence = TRACE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{micros:x}_{sequence:x}")
-}
-
 fn not_found_response(id: Option<Value>, message: &'static str) -> AppServerResult<Vec<Value>> {
     Ok(vec![
         JsonRpcMessage::error(id, ErrorCode::not_found(message)).to_wire_value(),
@@ -3269,7 +2676,7 @@ fn not_found_response(id: Option<Value>, message: &'static str) -> AppServerResu
 
 fn invalid_request_response(
     id: Option<Value>,
-    message: &'static str,
+    message: impl Into<String>,
 ) -> AppServerResult<Vec<Value>> {
     Ok(vec![
         JsonRpcMessage::error(id, ErrorCode::invalid_request(message)).to_wire_value(),

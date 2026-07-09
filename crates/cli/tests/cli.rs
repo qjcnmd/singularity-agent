@@ -6,7 +6,8 @@ const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
 const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const PYTHON_SIDECAR_ENV: &str = "SINGULARITY_PYTHON_SIDECAR";
-const PYTHON_SIDECAR_PROJECT_ROOT_ENV: &str = "SINGULARITY_SIDECAR_PROJECT_ROOT";
+const SIDECAR_PROJECT_ROOT_ENV: &str = "SINGULARITY_SIDECAR_PROJECT_ROOT";
+const SIDECAR_TEST_MODE_ENV: &str = "SINGULARITY_SIDECAR_TEST_MODE";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const FAKE_APP_SERVER_EXIT_CODE: i32 = 7;
 
@@ -14,6 +15,18 @@ const FAKE_APP_SERVER_EXIT_CODE: i32 = 7;
 fn cli_exposes_app_server_protocol_mode_without_direct_core_runtime() {
     let mut command = Command::cargo_bin("sg").expect("binary");
     command.arg("--help").assert().success();
+}
+
+#[test]
+fn cli_help_does_not_expose_agent_host_selector() {
+    let output = Command::cargo_bin("sg")
+        .expect("binary")
+        .args(["run", "--help"])
+        .output()
+        .expect("run help");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(!stdout(&output).contains("--agent-host"));
 }
 
 #[test]
@@ -111,7 +124,7 @@ for line in sys.stdin:
 }
 
 #[test]
-fn cli_config_doctor_reports_redacted_native_sidecar_and_eval_readiness() {
+fn cli_config_doctor_reports_redacted_native_and_eval_readiness() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let fake_server = write_fake_app_server(
@@ -146,7 +159,6 @@ for line in sys.stdin:
     let stdout = stdout(&doctor);
     assert!(stdout.contains("client=protocol-only"));
     assert!(stdout.contains("native_agent_loop=completed"));
-    assert!(stdout.contains("sidecar_oracle=explicit"));
     assert!(stdout.contains("evaluation=rust_native"));
     assert!(stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
     assert!(stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
@@ -255,13 +267,15 @@ for line in sys.stdin:
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "native"])
+        .args(["run", "write tests"])
         .env("METHOD_TRACE", &trace_path)
         .output()
         .expect("run cli");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("native AgentLoop is not production-ready"));
+    assert!(stderr(&output).contains(
+        "Rust AgentLoop is not available: status=not_migrated; blockers=model_provider_adapter"
+    ));
     let trace = std::fs::read_to_string(trace_path).expect("method trace");
     assert!(trace.contains("initialize"));
     assert!(trace.contains("agent/capability"));
@@ -297,13 +311,15 @@ for line in sys.stdin:
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "native"])
+        .args(["run", "write tests"])
         .env("METHOD_TRACE", &trace_path)
         .output()
         .expect("run cli");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("native AgentLoop is not production-ready"));
+    assert!(
+        stderr(&output).contains("Rust AgentLoop is not available: status=running; blockers=none")
+    );
     let trace = std::fs::read_to_string(trace_path).expect("method trace");
     assert!(trace.contains("initialize"));
     assert!(trace.contains("agent/capability"));
@@ -311,7 +327,7 @@ for line in sys.stdin:
 }
 
 #[test]
-fn cli_sends_native_agent_host_after_capability_allows_it() {
+fn cli_sends_turn_start_without_agent_host_after_capability_allows_it() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let trace_path = temp.path().join("native_enabled_turn.json");
@@ -343,7 +359,7 @@ for line in sys.stdin:
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "native"])
+        .args(["run", "write tests"])
         .env("TURN_TRACE", &trace_path)
         .output()
         .expect("run cli");
@@ -352,7 +368,7 @@ for line in sys.stdin:
     let params: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(trace_path).expect("turn trace"))
             .expect("turn trace json");
-    assert_eq!(params["agentHost"], "native");
+    assert!(params.get("agentHost").is_none());
     assert_eq!(params["threadId"], "thread_native");
 }
 
@@ -385,7 +401,7 @@ for line in sys.stdin:
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "native"])
+        .args(["run", "write tests"])
         .output()
         .expect("run cli");
 
@@ -519,13 +535,15 @@ for line in sys.stdin:
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "native"])
+        .args(["run", "write tests"])
         .env("METHOD_TRACE", &trace_path)
         .output()
         .expect("run cli");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("native AgentLoop is not production-ready"));
+    assert!(stderr(&output).contains(
+        "Rust AgentLoop is not available: status=running; blockers=strict_command_sandbox"
+    ));
     let trace = std::fs::read_to_string(trace_path).expect("method trace");
     assert!(trace.contains("agent/capability"));
     assert!(!trace.contains("turn/start"));
@@ -666,43 +684,15 @@ for line in sys.stdin:
 }
 
 #[test]
-fn cli_run_can_enable_python_sidecar_without_raw_env_plumbing() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let fake_server = write_fake_app_server(
-        temp.path(),
-        r#"
-import json
-import os
-import sys
-
-for line in sys.stdin:
-    message = json.loads(line)
-    method = message.get("method")
-    request_id = message.get("id")
-    if method == "initialize":
-        print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
-    elif method == "agent/capability":
-        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
-    elif method == "thread/start":
-        print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
-    elif method == "turn/start":
-        enabled = os.environ.get("SINGULARITY_PYTHON_SIDECAR") == "1"
-        project_root = bool(os.environ.get("SINGULARITY_SIDECAR_PROJECT_ROOT"))
-        status = "completed" if enabled and project_root else "failed"
-        print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": status, "agent_loop_status": status}}}), flush=True)
-"#,
-    );
-
-    let output = cli_with_app_server(path_str(&fake_server), &db_path)
+fn cli_run_rejects_agent_host_selector() {
+    let output = Command::cargo_bin("sg")
+        .expect("binary")
         .args(["run", "write tests", "--agent-host", "python"])
-        .env_remove(PYTHON_SIDECAR_ENV)
-        .env_remove(PYTHON_SIDECAR_PROJECT_ROOT_ENV)
         .output()
         .expect("run cli");
 
-    assert!(output.status.success(), "stderr={}", stderr(&output));
-    assert!(stdout(&output).contains("agent_loop_status=completed"));
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("unexpected argument '--agent-host'"));
 }
 
 #[test]
@@ -727,7 +717,7 @@ for line in sys.stdin:
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
-        inherited = os.environ.get("SINGULARITY_PYTHON_SIDECAR") == "1"
+        inherited = any(os.environ.get(name) for name in ["SINGULARITY_PYTHON_SIDECAR", "SINGULARITY_SIDECAR_PROJECT_ROOT", "SINGULARITY_SIDECAR_TEST_MODE"])
         status = "failed" if inherited else "completed"
         print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": status, "agent_loop_status": status}}}), flush=True)
 "#,
@@ -736,6 +726,8 @@ for line in sys.stdin:
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
         .args(["run", "write tests"])
         .env(PYTHON_SIDECAR_ENV, "1")
+        .env(SIDECAR_PROJECT_ROOT_ENV, path_str(temp.path()))
+        .env(SIDECAR_TEST_MODE_ENV, "completed")
         .output()
         .expect("run cli");
 
@@ -744,7 +736,7 @@ for line in sys.stdin:
 }
 
 #[test]
-fn cli_continue_can_enable_python_sidecar_without_raw_env_plumbing() {
+fn cli_continue_does_not_inherit_python_sidecar_env() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let fake_server = write_fake_app_server(
@@ -760,26 +752,22 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/read":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
-        enabled = os.environ.get("SINGULARITY_PYTHON_SIDECAR") == "1"
-        project_root = bool(os.environ.get("SINGULARITY_SIDECAR_PROJECT_ROOT"))
-        status = "completed" if enabled and project_root else "failed"
+        inherited = any(os.environ.get(name) for name in ["SINGULARITY_PYTHON_SIDECAR", "SINGULARITY_SIDECAR_PROJECT_ROOT", "SINGULARITY_SIDECAR_TEST_MODE"])
+        status = "failed" if inherited else "completed"
         print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": status, "agent_loop_status": status}}}), flush=True)
 "#,
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args([
-            "continue",
-            "thread_fake",
-            "add docs",
-            "--agent-host",
-            "python",
-        ])
-        .env_remove(PYTHON_SIDECAR_ENV)
-        .env_remove(PYTHON_SIDECAR_PROJECT_ROOT_ENV)
+        .args(["continue", "thread_fake", "add docs"])
+        .env(PYTHON_SIDECAR_ENV, "1")
+        .env(SIDECAR_PROJECT_ROOT_ENV, path_str(temp.path()))
+        .env(SIDECAR_TEST_MODE_ENV, "completed")
         .output()
         .expect("continue cli");
 
@@ -788,7 +776,7 @@ for line in sys.stdin:
 }
 
 #[test]
-fn cli_renders_agent_host_status_and_sidecar_answer() {
+fn cli_renders_native_status_and_answer() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let fake_server = write_fake_app_server(
@@ -804,18 +792,20 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({"id": request_id, "result": {"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({"id": request_id, "result": {"nativeAgentLoop": {"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"method": "thread/started", "params": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
         print(json.dumps({"method": "turn/started", "params": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "completed", "agent_loop_status": "completed"}}}), flush=True)
-        print(json.dumps({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "sidecar completed"}}), flush=True)
+        print(json.dumps({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "native completed"}}), flush=True)
         print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_fake", "thread_id": "thread_fake", "status": "completed", "agent_loop_status": "completed"}}}), flush=True)
 "#,
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "python"])
+        .args(["run", "write tests"])
         .output()
         .expect("run cli");
 
@@ -823,11 +813,11 @@ for line in sys.stdin:
     let stdout = stdout(&output);
     assert!(stdout.contains("thread thread_fake"));
     assert!(stdout.contains("turn turn_fake completed agent_loop_status=completed"));
-    assert!(stdout.contains("assistant sidecar completed"));
+    assert!(stdout.contains("assistant native completed"));
 }
 
 #[test]
-fn cli_exits_nonzero_for_sidecar_failed_turn_without_raw_payload() {
+fn cli_exits_nonzero_for_failed_turn_without_raw_payload() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let fake_server = write_fake_app_server(
@@ -848,13 +838,13 @@ for line in sys.stdin:
     elif method == "thread/start":
         print(json.dumps({"id": request_id, "result": {"thread": {"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}), flush=True)
     elif method == "turn/start":
-        print(json.dumps({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "sidecar failed"}}), flush=True)
+        print(json.dumps({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "native failed"}}), flush=True)
         print(json.dumps({"id": request_id, "result": {"turn": {"turn_id": "turn_failed", "thread_id": "thread_fake", "status": "failed", "agent_loop_status": "failed"}}}), flush=True)
 "#,
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "python"])
+        .args(["run", "write tests"])
         .output()
         .expect("run cli");
 
@@ -1156,7 +1146,7 @@ for line in sys.stdin:
 }
 
 #[test]
-fn cli_run_polls_active_sidecar_turn_before_shutdown() {
+fn cli_run_polls_running_turn_before_shutdown() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let fake_server = write_fake_app_server(
@@ -1189,7 +1179,7 @@ for line in sys.stdin:
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "python"])
+        .args(["run", "write tests"])
         .output()
         .expect("run cli");
 
@@ -1228,7 +1218,7 @@ for line in sys.stdin:
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "python"])
+        .args(["run", "write tests"])
         .output()
         .expect("run cli");
 
@@ -1431,6 +1421,8 @@ for line in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         print(json.dumps({{"id": request_id, "result": {{"userAgent": "fake", "platformFamily": "local", "platformOs": "test"}}}}), flush=True)
+    elif method == "agent/capability":
+        print(json.dumps({{"id": request_id, "result": {{"nativeAgentLoop": {{"available": True, "status": "completed", "reason": "enabled", "blockers": []}}}}}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({{"id": request_id, "result": {{"thread": {{"thread_id": "thread_fake", "model": None, "cwd": None, "status": "active"}}}}}}), flush=True)
     elif method == "turn/start":
@@ -1443,7 +1435,7 @@ for line in sys.stdin:
     );
 
     let output = cli_with_app_server(path_str(&fake_server), &db_path)
-        .args(["run", "write tests", "--agent-host", "python"])
+        .args(["run", "write tests"])
         .output()
         .expect("run cli");
 

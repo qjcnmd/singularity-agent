@@ -1,42 +1,29 @@
 # Singularity v0.1.0
 
-Singularity 是本地优先的 CLI coding agent harness。当前工作树只描述当前 Python 源码中真实存在的结构、命令、schema、trace 和评估入口；历史设计、路线图和阶段报告由 git history 保留。
+Singularity 是本地优先的 CLI coding agent harness。当前 public runtime 是 Rust `sg` -> app-server JSON-RPC -> Rust AgentLoop；Python 代码只保留为 Python oracle/parity/dev-only 对照，不作为普通运行方式。历史设计、路线图和阶段报告由 git history 保留。
 
 ## 当前身份
 
 - 产品名：`Singularity`
-- Python 包：`singularity`
-- Rust CLI-first 入口：Cargo/build artifact 中的 `sg`，通过 `crates/app-server` 的 JSON-RPC 协议运行
-- Python legacy/oracle 入口：`singularity-agent`、Python console script `sg`
+- Rust public runtime：Cargo/build artifact 中的 `sg`，通过 `crates/app-server` 的 JSON-RPC 协议运行
+- Python 包：`singularity`，仅用于 internal oracle / parity fixture / dev-only 维护；`pyproject.toml` 不安装 Python console script
 - 环境变量前缀：`SINGULARITY_`
 - 项目本地状态目录：`.singularity/`
 
 ## 源码入口
 
-- CLI：`src/singularity/cli.py`
-- KernelBootstrap（内核启动）：`src/singularity/kernel/bootstrap.py`
-- AgentGraphBuilder（智能体图构建）：`src/singularity/kernel/graph.py`
-- AgentKernel（智能体内核）：`src/singularity/kernel/agent_kernel.py`
-- AgentLoop（智能体主循环）：`src/singularity/agent_loop.py`
-- ModelRunner（模型运行器）：`src/singularity/model/runner.py`
-- PromptAssemblyPipeline（提示词组装管线）：`src/singularity/instructions/prompt_assembly.py`
-- ContextManager（上下文管理器）：`src/singularity/context/manager.py`
-- ToolProtocolEngine（工具协议引擎）：`src/singularity/tool_protocol/engine.py`
-- ToolExecutor（工具执行器）：`src/singularity/tools/executor.py`
-- PolicyEngine（策略引擎）：`src/singularity/policy/engine.py`
-- ApprovalGate（审批闸门）：`src/singularity/policy/approval.py`
-- CommandExecutor（命令执行器）：`src/singularity/command/executor.py`
-- SandboxManager（沙箱管理器）：`src/singularity/sandbox/manager.py`
-- VerificationRunner（验证运行器）：`src/singularity/verification/runner.py`
-- EvaluationRunner（评估运行器）：`src/singularity/evaluation/runner.py`
+- Rust CLI：`crates/cli/src/main.rs`
+- Rust app-server：`crates/app-server/src/lib.rs`
+- Rust protocol：`crates/protocol/src/lib.rs`
+- Rust AgentLoop：`crates/agent/src/lib.rs`
+- Rust tools / policy / sandbox / model / store：`crates/tools/`、`crates/policy/`、`crates/sandbox/`、`crates/model/`、`crates/store/`
+- Python oracle/parity/dev-only 参考：`src/singularity/`，用于对照、fixture export 和迁移期验证，不作为 public runtime
 
 核心模块数据流文档位于 `docs/architecture/modules/`。这些文档以源码为唯一事实来源，列出当前对象完整字段、调用链、生成者、消费者、落盘路径、trace/audit 行为、失败路径和维护规则。
 
 ## 基本安装
 
-```bash
-pip install -e .
-```
+Python editable install 只安装内部库和测试依赖，不提供 public CLI。Rust public runtime 通过 Cargo 构建并运行 `sg`。
 
 OpenAI-compatible provider 通过环境变量配置。API key 不接受 CLI 参数。
 
@@ -74,15 +61,6 @@ export SINGULARITY_MODEL=gpt-4.1-mini
 
 会话权限通过行业通用的 permission profile 表达：
 
-```bash
-singularity-agent "inspect and verify this project" \
-  --permission-profile workspace-write \
-  --approval-policy on-request \
-  --network-access denied \
-  --add-dir ../shared-output \
-  --windows-sandbox elevated
-```
-
 - `read-only`、`workspace-write`、`danger-full-access`描述会话 filesystem 边界。
 - `--add-dir`显式增加可写目录，不要求提升为`danger-full-access`。
 - `on-request`允许高风险动作进入审批；`never`把需要审批的动作转为拒绝。
@@ -92,76 +70,37 @@ singularity-agent "inspect and verify this project" \
 
 ## CLI
 
-Rust CLI-first 路径通过 app-server 协议运行。默认只创建 Rust thread/turn 并显示 `agent_loop_status=not_migrated`；需要进入当前 Python AgentLoop sidecar 时使用 `--agent-host python`，不要求手动设置 `SINGULARITY_PYTHON_SIDECAR=1`：
+Rust `sg` 是 public runtime 入口。`sg run`、`sg chat`、`sg continue` 和 `sg eval run` 只通过 app-server JSON-RPC 进入 Rust AgentLoop；`turn/start` 没有公开后端选择字段。Rust capability 不满足时 fail closed，并返回结构化 blocker，而不是切到 Python。target-project Python commands 仍然可以作为项目验证命令经 Rust sandbox 执行，例如模型或 evaluation runner 可以运行 `python -m pytest` 来验证目标仓库。
 
 ```bash
-cargo run -p singularity_cli --bin sg -- run "inspect the current project" --model gpt-4.1-mini --agent-host python
-cargo run -p singularity_cli --bin sg -- continue <thread-id> "follow up" --agent-host python
+cargo run -p singularity_cli --bin sg -- run "inspect the current project" --model gpt-4.1-mini
+cargo run -p singularity_cli --bin sg -- continue <thread-id> "follow up"
 cargo run -p singularity_cli --bin sg -- turn status <turn-id>
 cargo run -p singularity_cli --bin sg -- trace <thread-or-run-id> --limit 20
 cargo run -p singularity_cli --bin sg -- trace show <event-id>
 cargo run -p singularity_cli --bin sg -- approvals
 cargo run -p singularity_cli --bin sg -- approve <request-id> --decision allow --reason "operator approved"
+cargo run -p singularity_cli --bin sg -- eval run docs/evaluation/public-representative-task.json --run-id <run-id> --json
 ```
 
-Python sidecar lifecycle 由 Rust app-server 包一层 durable turn envelope：`turn/start` 会先把 Rust turn、user item 和 turn trace 写入 SQLite，再调用 `agent/run` 或 `agent/resume`；sidecar 返回 `running` 时，app-server 记录 active run 的安全 ID 字段并允许持有该 sidecar handle 的同一 app-server 进程通过 `turn/status` 查询、通过 `turn/interrupt` 调用 `PythonSidecarClient::cancel(run_id)` 请求取消。`turn/interrupt` 的 durable turn status 为 `interrupted`，`agent_loop_status=cancel_requested` 表示 Python AgentLoop 已收到取消请求但可能仍在 unwind；后续 status/cleanup 会保持 interrupted，不用 completed/failed 覆盖取消结果。CLI 进程退出前会先发送 `server/shutdown`，让 app-server 清理当前进程持有的 active run；`thread/delete` 也会先清理该 thread 的 active run 元数据。新的短生命周期 CLI 进程只能读取 durable status，不能重连已经运行的 sidecar handle。同一 Rust thread 上已有 `python_sidecar` trace 的 `session_id` 时，后续 `sg continue --agent-host python` 调用 `agent/resume`。`--model` 写入 Rust thread，并作为 sidecar `model` 参数进入 Python `ProductionConfig`。默认 no-sidecar 路径只显示 `not_migrated` turn，不输出伪 assistant delta。
-
-Python legacy/oracle 路径仍用于迁移期对照和真实 evaluation。运行一次 Python agent：
-
-```bash
-singularity-agent "inspect the current project" \
-  --project-root . \
-  --max-turns 12 \
-  --approval-mode auto_safe \
-  --trace-dir work/traces/runs \
-  --context-db work/traces/runs/session/context.sqlite3 \
-  --model gpt-4.1-mini \
-  --base-url https://api.openai.com/v1 \
-  --no-raw-artifacts \
-  --dry-run \
-  --strict
-```
-
-常用命令：
-
-```bash
-singularity-agent doctor --json
-singularity-agent repair --dry-run --json
-singularity-agent trace list --trace-dir work/traces/runs
-singularity-agent trace show <run_id> --trace-dir work/traces/runs
-singularity-agent index build --json
-singularity-agent git status --json
-singularity-agent memory list
-singularity-agent approval remote export-request request.json decision.json --output approval-request.json --json
-singularity-agent plugin list --json
-singularity-agent eval run docs/evaluation/public-representative-task.json --json
-singularity-agent eval provider-smoke --json
-```
+Python oracle/parity/dev-only 路径仍用于迁移期对照、fixture export 和 schema parity，不作为普通运行方式，也不作为 Rust public runtime proof。
 
 `eval` 是当前唯一的评估 CLI 命令组；`benchmark` 只表示基准任务、任务集或报告这一领域概念，不是 CLI alias。新增 evaluation 文档、manifest 和 CLI 示例必须使用 `eval` / `evaluation` / `benchmark` / `task` / `task set` / `result` / `report` / `runner` 等主流命名，不得恢复 `live` 命名。
 
 ## 运行链路
 
 ```text
-CLI
--> KernelBootstrap.boot()
--> AgentGraphBuilder.build()
--> AgentKernel.run_task()
--> AgentLoop.run()
--> RunController.start()
--> Planner.step()
--> ModelRunner.build_request_from_context()
--> ModelTurnRequestBuilder.build_request()
--> PromptAssemblyPipeline.build_for_model_turn()
--> ContextManager.build_bundle()
--> ModelRunner.run_turn()
--> ToolProtocolEngine.process_model_turn()
--> ToolExecutor.execute_request()
--> PolicyEngine.enforce() / ApprovalGate
--> WorkspaceMutationManager / CommandExecutor / VerificationRunner
--> ContextManager.add_tool_protocol_result()
--> WorkspaceStateManager
--> TraceRecorder / AuditLog / FinalReport
+Rust sg
+-> AppServerClient
+-> JSON-RPC over stdio
+-> AppServer.handle_json()
+-> SessionStore thread/turn/trace transaction
+-> AgentLoopCapability gate
+-> Rust AgentLoop.run()
+-> OpenAiProvider
+-> ToolBroker / PolicyEngine / WorkspaceTools / SandboxBackend
+-> AgentLoopResult
+-> Turn / Item / TraceEvent / Approval / ArtifactRef
 ```
 
 ## Evaluation
@@ -173,7 +112,7 @@ CLI
 真实模型评估命令：
 
 ```bash
-python -m singularity.cli eval run docs/evaluation/public-representative-task.json --run-id <run-id> --json
+cargo run -p singularity_cli --bin sg -- eval run docs/evaluation/public-representative-task.json --run-id <run-id> --json
 ```
 
 评估结果使用当前字段：
