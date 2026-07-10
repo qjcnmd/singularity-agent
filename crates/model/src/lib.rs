@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -252,6 +252,27 @@ pub struct ModelProviderConfig {
     pub model_name: Option<String>,
     pub base_url_present: bool,
     pub api_key_present: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderConfigSource {
+    ProcessEnvironment,
+    ProjectEnvFile,
+}
+
+impl ProviderConfigSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessEnvironment => "process_env",
+            Self::ProjectEnvFile => "project_env",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderConfigResolution {
+    pub source: Option<ProviderConfigSource>,
+    pub config: ModelProviderConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -637,6 +658,7 @@ pub struct OpenAiProviderConfig {
     pub model_name: String,
     pub base_url: String,
     pub api_key: String,
+    pub source: ProviderConfigSource,
 }
 
 impl fmt::Debug for OpenAiProviderConfig {
@@ -647,25 +669,38 @@ impl fmt::Debug for OpenAiProviderConfig {
             .field("model_name", &self.model_name)
             .field("base_url", &"[redacted]")
             .field("api_key", &"[redacted]")
+            .field("source", &self.source)
             .finish()
     }
 }
 
 impl OpenAiProviderConfig {
-    pub fn from_env<F>(mut get_env: F) -> Result<Self, ProviderError>
+    pub fn from_env<F>(get_env: F) -> Result<Self, ProviderError>
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let provider_name = value_from_env_or_project_env(&mut get_env, ENV_PROVIDER)
+        let project_dir = std::env::current_dir().ok();
+        let values = resolve_provider_values(get_env, project_dir.as_deref());
+        let source = values.source;
+        let provider_name = values
+            .provider_name
             .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string());
-        let model_name = required_env_value(&mut get_env, ENV_MODEL)?;
-        let base_url = required_env_value(&mut get_env, ENV_BASE_URL)?;
-        let api_key = required_env_value(&mut get_env, ENV_API_KEY)?;
+        let model_name = values
+            .model_name
+            .ok_or_else(|| missing_provider_config_error(ENV_MODEL, source))?;
+        let base_url = values
+            .base_url
+            .ok_or_else(|| missing_provider_config_error(ENV_BASE_URL, source))?;
+        let api_key = values
+            .api_key
+            .ok_or_else(|| missing_provider_config_error(ENV_API_KEY, source))?;
+        let source = source.ok_or_else(provider_source_missing_error)?;
         Ok(Self {
             provider_name,
             model_name,
             base_url,
             api_key,
+            source,
         })
     }
 
@@ -803,16 +838,34 @@ pub fn provider_error_response(
     }
 }
 
-pub fn provider_config_from_env<F>(mut get_env: F) -> ModelProviderConfig
+pub fn resolve_provider_config<F>(get_env: F) -> ProviderConfigResolution
 where
     F: FnMut(&str) -> Option<String>,
 {
-    ModelProviderConfig {
-        provider_name: value_from_env_or_project_env(&mut get_env, ENV_PROVIDER),
-        model_name: value_from_env_or_project_env(&mut get_env, ENV_MODEL),
-        base_url_present: value_from_env_or_project_env(&mut get_env, ENV_BASE_URL).is_some(),
-        api_key_present: value_from_env_or_project_env(&mut get_env, ENV_API_KEY).is_some(),
+    let project_dir = std::env::current_dir().ok();
+    let values = resolve_provider_values(get_env, project_dir.as_deref());
+    let provider_name = values.source.map(|_| {
+        values
+            .provider_name
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string())
+    });
+    ProviderConfigResolution {
+        source: values.source,
+        config: ModelProviderConfig {
+            provider_name,
+            model_name: values.model_name,
+            base_url_present: values.base_url.is_some(),
+            api_key_present: values.api_key.is_some(),
+        },
     }
+}
+
+pub fn provider_config_from_env<F>(get_env: F) -> ModelProviderConfig
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    resolve_provider_config(get_env).config
 }
 
 fn openai_request_payload(request: &ModelTurnRequest, model_name: &str) -> Value {
@@ -1131,19 +1184,28 @@ fn parse_openai_usage(usage: Option<&Value>) -> ModelUsage {
     }
 }
 
-fn required_env_value<F>(get_env: &mut F, name: &str) -> Result<String, ProviderError>
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    value_from_env_or_project_env(get_env, name).ok_or_else(|| {
-        ProviderError::from_model_error(
-            ModelError::new(
-                ModelErrorKind::InvalidRequest,
-                format!("required provider configuration is missing: {name}"),
-            )
-            .retryable(false),
+fn missing_provider_config_error(
+    name: &str,
+    source: Option<ProviderConfigSource>,
+) -> ProviderError {
+    let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::InvalidRequest,
+            format!("required provider configuration is missing: {name} (source={source})"),
         )
-    })
+        .retryable(false),
+    )
+}
+
+fn provider_source_missing_error() -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::InvalidRequest,
+            "provider configuration source is missing",
+        )
+        .retryable(false),
+    )
 }
 
 fn model_error_from_http_status(status: u16, provider_name: &str, model_name: &str) -> ModelError {
@@ -1498,26 +1560,90 @@ fn missing(value: &Option<String>) -> bool {
     value.as_deref().map(str::trim).unwrap_or("").is_empty()
 }
 
-fn value_from_env<F>(get_env: &mut F, name: &str) -> Option<String>
+#[derive(Default)]
+struct ProviderConfigLayer {
+    provider_name: Option<String>,
+    model_name: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+}
+
+impl ProviderConfigLayer {
+    fn from_process_env<F>(get_env: &mut F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        Self {
+            provider_name: get_env(ENV_PROVIDER),
+            model_name: get_env(ENV_MODEL),
+            base_url: get_env(ENV_BASE_URL),
+            api_key: get_env(ENV_API_KEY),
+        }
+    }
+
+    fn any_present(&self) -> bool {
+        self.provider_name.is_some()
+            || self.model_name.is_some()
+            || self.base_url.is_some()
+            || self.api_key.is_some()
+    }
+
+    fn into_values(self, source: ProviderConfigSource) -> ResolvedProviderValues {
+        ResolvedProviderValues {
+            source: Some(source),
+            provider_name: normalized_provider_value(self.provider_name),
+            model_name: normalized_provider_value(self.model_name),
+            base_url: normalized_provider_value(self.base_url),
+            api_key: normalized_provider_value(self.api_key),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResolvedProviderValues {
+    source: Option<ProviderConfigSource>,
+    provider_name: Option<String>,
+    model_name: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+}
+
+fn resolve_provider_values<F>(mut get_env: F, project_dir: Option<&Path>) -> ResolvedProviderValues
 where
     F: FnMut(&str) -> Option<String>,
 {
-    get_env(name).filter(|value| !value.trim().is_empty())
+    let process_layer = ProviderConfigLayer::from_process_env(&mut get_env);
+    if process_layer.any_present() {
+        return process_layer.into_values(ProviderConfigSource::ProcessEnvironment);
+    }
+    let Some(project_dir) = project_dir else {
+        return ResolvedProviderValues::default();
+    };
+    let project_layer = project_env_layer(project_dir);
+    if project_layer.any_present() {
+        project_layer.into_values(ProviderConfigSource::ProjectEnvFile)
+    } else {
+        ResolvedProviderValues::default()
+    }
 }
 
-fn value_from_env_or_project_env<F>(get_env: &mut F, name: &str) -> Option<String>
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    value_from_env(get_env, name).or_else(|| project_env_value(name))
+fn normalized_provider_value(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
-fn project_env_value(name: &str) -> Option<String> {
-    let mut dir = std::env::current_dir().ok()?;
+fn project_env_layer(project_dir: &Path) -> ProviderConfigLayer {
+    let Some(path) = find_project_env_file(project_dir) else {
+        return ProviderConfigLayer::default();
+    };
+    read_project_env_layer(&path)
+}
+
+fn find_project_env_file(project_dir: &Path) -> Option<PathBuf> {
+    let mut dir = project_dir.to_path_buf();
     loop {
         let path = dir.join(PROJECT_ENV_FILE);
-        if let Some(value) = read_env_file_value(&path, name) {
-            return Some(value);
+        if path.is_file() {
+            return Some(path);
         }
         if !dir.pop() {
             return None;
@@ -1525,11 +1651,24 @@ fn project_env_value(name: &str) -> Option<String> {
     }
 }
 
-fn read_env_file_value(path: &Path, name: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    text.lines()
-        .filter_map(parse_env_line)
-        .find_map(|(key, value)| if key == name { Some(value) } else { None })
+fn read_project_env_layer(path: &Path) -> ProviderConfigLayer {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return ProviderConfigLayer::default();
+    };
+    let mut layer = ProviderConfigLayer::default();
+    for (name, value) in text.lines().filter_map(parse_env_line) {
+        let target = match name.as_str() {
+            ENV_PROVIDER => &mut layer.provider_name,
+            ENV_MODEL => &mut layer.model_name,
+            ENV_BASE_URL => &mut layer.base_url,
+            ENV_API_KEY => &mut layer.api_key,
+            _ => continue,
+        };
+        if target.is_none() {
+            *target = Some(value);
+        }
+    }
+    layer
 }
 
 fn parse_env_line(line: &str) -> Option<(String, String)> {
@@ -1559,11 +1698,7 @@ fn parse_env_line(line: &str) -> Option<(String, String)> {
             value = &value[1..value.len() - 1];
         }
     }
-    if value.trim().is_empty() {
-        None
-    } else {
-        Some((name.to_string(), value.to_string()))
-    }
+    Some((name.to_string(), value.to_string()))
 }
 
 fn redacted_presence(present: bool) -> String {

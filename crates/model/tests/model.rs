@@ -3,16 +3,38 @@ use singularity_model::{
     ModelBlockerKind, ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind,
     ModelMessage, ModelProviderConfig, ModelProviderStatus, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
-    ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider, ProviderStreamEvent,
-    ProviderStreamEventType, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
-    classify_model_error, provider_config_from_env, retry_decision, validate_model_request,
-    validate_model_response, validate_model_turn_response, validate_provider_config,
-    validate_stream_events,
+    ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider, ProviderConfigSource,
+    ProviderStreamEvent, ProviderStreamEventType, ToolChoiceMode, ToolChoicePolicy,
+    chat_completions_endpoint, classify_model_error, provider_config_from_env,
+    resolve_provider_config, retry_decision, validate_model_request, validate_model_response,
+    validate_model_turn_response, validate_provider_config, validate_stream_events,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::sync::mpsc::{self, Receiver};
+use std::path::PathBuf;
+use std::sync::{
+    Mutex,
+    mpsc::{self, Receiver},
+};
 use std::thread;
+
+static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+struct CurrentDirRestore(PathBuf);
+
+impl Drop for CurrentDirRestore {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.0).expect("restore current dir");
+    }
+}
+
+fn in_current_dir<T>(path: &std::path::Path, action: impl FnOnce() -> T) -> T {
+    let _lock = CURRENT_DIR_LOCK.lock().expect("current dir lock");
+    let original_dir = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(path).expect("enter synthetic project");
+    let _restore = CurrentDirRestore(original_dir);
+    action()
+}
 
 fn stream_event(event_type: ProviderStreamEventType) -> ProviderStreamEvent {
     ProviderStreamEvent {
@@ -45,6 +67,7 @@ fn provider_test_config(base_url: String) -> OpenAiProviderConfig {
         model_name: "gpt-test".to_string(),
         base_url,
         api_key: "sk-secret-value".to_string(),
+        source: ProviderConfigSource::ProcessEnvironment,
     }
 }
 
@@ -293,6 +316,107 @@ fn provider_config_loads_presence_from_env_without_secret_values() {
 }
 
 #[test]
+fn process_env_api_key_cannot_mix_with_project_env_model_and_base_url() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        temp.path().join(".env"),
+        "SINGULARITY_MODEL=project-model\nSINGULARITY_BASE_URL=https://project-provider.example/v1\n",
+    )
+    .expect("write synthetic project env");
+    let result = in_current_dir(temp.path(), || {
+        OpenAiProviderConfig::from_env(|name| match name {
+            "SINGULARITY_API_KEY" => Some("process-secret".to_string()),
+            _ => None,
+        })
+        .map_err(Box::new)
+    });
+
+    let error = result.expect_err("mixed provider sources must be rejected");
+    assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
+    assert!(error.message.contains("SINGULARITY_MODEL"));
+    assert!(!error.message.contains("project-model"));
+    assert!(!error.message.contains("project-provider.example"));
+    assert!(!error.message.contains("process-secret"));
+}
+
+#[test]
+fn provider_status_does_not_fill_process_layer_from_project_env() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        temp.path().join(".env"),
+        "SINGULARITY_MODEL=project-model\nSINGULARITY_BASE_URL=https://project-provider.example/v1\n",
+    )
+    .expect("write synthetic project env");
+    let resolution = in_current_dir(temp.path(), || {
+        resolve_provider_config(|name| match name {
+            "SINGULARITY_API_KEY" => Some("process-secret".to_string()),
+            _ => None,
+        })
+    });
+
+    assert_eq!(
+        resolution.source,
+        Some(ProviderConfigSource::ProcessEnvironment)
+    );
+    let config = resolution.config;
+    assert_eq!(config.model_name, None);
+    assert!(!config.base_url_present);
+    assert!(config.api_key_present);
+    assert_eq!(config.provider_name.as_deref(), Some("openai_compatible"));
+}
+
+#[test]
+fn complete_project_env_configuration_has_project_file_provenance() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        temp.path().join(".env"),
+        concat!(
+            "SINGULARITY_MODEL_PROVIDER=openai_compatible\n",
+            "SINGULARITY_MODEL=project-model\n",
+            "SINGULARITY_BASE_URL=https://project-provider.example/v1\n",
+            "SINGULARITY_API_KEY=project-secret\n",
+        ),
+    )
+    .expect("write synthetic project env");
+    let result = in_current_dir(temp.path(), || {
+        OpenAiProviderConfig::from_env(|_| None).map_err(Box::new)
+    });
+
+    let config = result.expect("project provider config");
+    assert_eq!(config.source, ProviderConfigSource::ProjectEnvFile);
+    assert_eq!(config.provider_name, "openai_compatible");
+    assert_eq!(config.model_name, "project-model");
+}
+
+#[test]
+fn project_env_fields_are_not_combined_across_env_files() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        temp.path().join(".env"),
+        concat!(
+            "SINGULARITY_MODEL=parent-model\n",
+            "SINGULARITY_BASE_URL=https://parent-provider.example/v1\n",
+        ),
+    )
+    .expect("write parent synthetic env");
+    let child = temp.path().join("child");
+    std::fs::create_dir(&child).expect("create child project");
+    std::fs::write(child.join(".env"), "SINGULARITY_API_KEY=child-secret\n")
+        .expect("write child synthetic env");
+
+    let result = in_current_dir(&child, || {
+        OpenAiProviderConfig::from_env(|_| None).map_err(Box::new)
+    });
+
+    let error = result.expect_err("project env files must not be combined");
+    assert!(error.message.contains("SINGULARITY_MODEL"));
+    assert!(error.message.contains("source=project_env"));
+    assert!(!error.message.contains("parent-model"));
+    assert!(!error.message.contains("parent-provider.example"));
+    assert!(!error.message.contains("child-secret"));
+}
+
+#[test]
 fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
     assert_eq!(
         chat_completions_endpoint("https://provider.example/v1"),
@@ -318,6 +442,7 @@ fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
     let serialized = serde_json::to_string(&status).expect("serialize status");
 
     assert_eq!(config.provider_name, "openai_compatible");
+    assert_eq!(config.source, ProviderConfigSource::ProcessEnvironment);
     assert!(status.ready);
     assert_eq!(status.api_key_status, "present(redacted)");
     assert!(!serialized.contains("sk-secret-value"));

@@ -147,8 +147,19 @@ for line in sys.stdin:
 "#,
     );
 
+    std::fs::write(
+        temp.path().join(".env"),
+        concat!(
+            "SINGULARITY_MODEL=project-model\n",
+            "SINGULARITY_BASE_URL=https://project-provider.example/v1\n",
+            "SINGULARITY_API_KEY=project-secret\n",
+        ),
+    )
+    .expect("write synthetic project env");
+
     let doctor = cli_with_app_server(path_str(&fake_server), &db_path)
         .args(["config", "doctor"])
+        .current_dir(temp.path())
         .env("SINGULARITY_API_KEY", "secret-value")
         .env("SINGULARITY_BASE_URL", "https://provider.example/v1")
         .env("SINGULARITY_MODEL", "gpt-test")
@@ -156,16 +167,58 @@ for line in sys.stdin:
         .expect("doctor cli");
 
     assert!(doctor.status.success(), "stderr={}", stderr(&doctor));
-    let stdout = stdout(&doctor);
-    assert!(stdout.contains("client=protocol-only"));
-    assert!(stdout.contains("native_agent_loop=completed"));
-    assert!(stdout.contains("evaluation=rust_native"));
-    assert!(stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
-    assert!(stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
-    assert!(stdout.contains("SINGULARITY_MODEL=present(redacted)"));
-    assert!(!stdout.contains("secret-value"));
-    assert!(!stdout.contains("https://provider.example/v1"));
-    assert!(!stdout.contains("gpt-test"));
+    let doctor_stdout = stdout(&doctor);
+    assert!(doctor_stdout.contains("client=protocol-only"));
+    assert!(doctor_stdout.contains("native_agent_loop=completed"));
+    assert!(doctor_stdout.contains("evaluation=rust_native"));
+    assert!(doctor_stdout.contains("provider_config_source=process_env"));
+    assert!(doctor_stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
+    assert!(doctor_stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
+    assert!(doctor_stdout.contains("SINGULARITY_MODEL=present(redacted)"));
+    assert!(!doctor_stdout.contains("secret-value"));
+    assert!(!doctor_stdout.contains("https://provider.example/v1"));
+    assert!(!doctor_stdout.contains("gpt-test"));
+
+    let mixed = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["config", "doctor"])
+        .current_dir(temp.path())
+        .env("SINGULARITY_API_KEY", "process-secret")
+        .env_remove("SINGULARITY_MODEL_PROVIDER")
+        .env_remove("SINGULARITY_BASE_URL")
+        .env_remove("SINGULARITY_MODEL")
+        .output()
+        .expect("mixed-source doctor cli");
+
+    assert!(mixed.status.success(), "stderr={}", stderr(&mixed));
+    let mixed_stdout = stdout(&mixed);
+    assert!(mixed_stdout.contains("provider_config_source=process_env"));
+    assert!(mixed_stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
+    assert!(mixed_stdout.contains("SINGULARITY_BASE_URL=missing"));
+    assert!(mixed_stdout.contains("SINGULARITY_MODEL=missing"));
+    assert!(!mixed_stdout.contains("project-model"));
+    assert!(!mixed_stdout.contains("project-provider.example"));
+    assert!(!mixed_stdout.contains("project-secret"));
+    assert!(!mixed_stdout.contains("process-secret"));
+
+    let project = cli_with_app_server(path_str(&fake_server), &db_path)
+        .args(["config", "doctor"])
+        .current_dir(temp.path())
+        .env_remove("SINGULARITY_MODEL_PROVIDER")
+        .env_remove("SINGULARITY_API_KEY")
+        .env_remove("SINGULARITY_BASE_URL")
+        .env_remove("SINGULARITY_MODEL")
+        .output()
+        .expect("project-source doctor cli");
+
+    assert!(project.status.success(), "stderr={}", stderr(&project));
+    let project_stdout = stdout(&project);
+    assert!(project_stdout.contains("provider_config_source=project_env"));
+    assert!(project_stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
+    assert!(project_stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
+    assert!(project_stdout.contains("SINGULARITY_MODEL=present(redacted)"));
+    assert!(!project_stdout.contains("project-model"));
+    assert!(!project_stdout.contains("project-provider.example"));
+    assert!(!project_stdout.contains("project-secret"));
 }
 
 #[test]

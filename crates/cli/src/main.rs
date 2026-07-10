@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use singularity_core::ClientInfo;
+use singularity_model::resolve_provider_config;
 use singularity_protocol::{InitializeParams, JsonRpcMessage, Method};
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
@@ -25,11 +26,9 @@ const EVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const PROVIDER_ENV_NAMES: [&str; 3] = [
-    "SINGULARITY_API_KEY",
-    "SINGULARITY_BASE_URL",
-    "SINGULARITY_MODEL",
-];
+const PROVIDER_API_KEY_ENV: &str = "SINGULARITY_API_KEY";
+const PROVIDER_BASE_URL_ENV: &str = "SINGULARITY_BASE_URL";
+const PROVIDER_MODEL_ENV: &str = "SINGULARITY_MODEL";
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
@@ -335,8 +334,18 @@ fn print_readiness() -> Result<(), String> {
 }
 
 fn print_redacted_provider_status() {
-    for name in PROVIDER_ENV_NAMES {
-        let status = if std::env::var_os(name).is_some() {
+    let resolution = resolve_provider_config(|name| std::env::var(name).ok());
+    let source = resolution
+        .source
+        .map(|source| source.as_str())
+        .unwrap_or("unconfigured");
+    println!("provider_config_source={source}");
+    for (name, present) in [
+        (PROVIDER_API_KEY_ENV, resolution.config.api_key_present),
+        (PROVIDER_BASE_URL_ENV, resolution.config.base_url_present),
+        (PROVIDER_MODEL_ENV, resolution.config.model_name.is_some()),
+    ] {
+        let status = if present {
             "present(redacted)"
         } else {
             "missing"

@@ -1132,6 +1132,7 @@ dependencies = [
  "clap",
  "serde_json",
  "singularity_core",
+ "singularity_model",
  "singularity_protocol",
  "tempfile",
 ]
@@ -1156,6 +1157,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
