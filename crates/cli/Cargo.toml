@@ -13,6 +13,11 @@ workspace = true
 name = "sg"
 path = "src/main.rs"
 
+[[test]]
+name = "cli_test_fake_app_server"
+path = "tests/support/fake_app_server.rs"
+harness = false
+
 [dependencies]
 clap.workspace = true
 serde_json.workspace = true
