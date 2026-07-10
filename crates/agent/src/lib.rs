@@ -287,6 +287,9 @@ pub struct AgentLoopInput {
     pub session_id: String,
     pub task_id: String,
     pub model_preferences: ModelPreferences,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_instructions: Option<String>,
     pub input: Vec<AgentContextItem>,
     pub interrupted: bool,
     pub max_turns: u32,
@@ -307,6 +310,7 @@ impl AgentLoopInput {
             task_id: turn_id.clone(),
             turn_id,
             model_preferences: ModelPreferences::default(),
+            project_instructions: None,
             input: vec![AgentContextItem::user("input_1", goal.into())],
             interrupted: false,
             max_turns: DEFAULT_MAX_AGENT_LOOP_TURNS,
@@ -321,6 +325,12 @@ impl AgentLoopInput {
 
     pub fn with_max_turns(mut self, max_turns: u32) -> Self {
         self.max_turns = max_turns;
+        self
+    }
+
+    pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
+        let instructions = instructions.into();
+        self.project_instructions = (!instructions.trim().is_empty()).then_some(instructions);
         self
     }
 
@@ -490,7 +500,7 @@ where
         let mut pending_tool_calls = Vec::new();
         let mut used_approval_grants = HashSet::new();
         let context = assemble_context_items(&input.input, DEFAULT_MAX_CONTEXT_TOKENS);
-        let mut messages = model_messages_from_context(&context);
+        let mut messages = model_messages_from_input(input, &context);
         let max_turns = input.max_turns.max(1);
         for turn_index in 0..max_turns {
             let request = model_turn_request(
@@ -685,7 +695,7 @@ where
             }
         };
         let context = assemble_context_items(&input.input, DEFAULT_MAX_CONTEXT_TOKENS);
-        let mut messages = model_messages_from_context(&context);
+        let mut messages = model_messages_from_input(input, &context);
         messages.push(ModelMessage::assistant_tool_calls(vec![call.clone()]));
         let mut used_approval_grants = HashSet::new();
         let decision = self.tool_decision(input, &call, &mut used_approval_grants);
@@ -1300,6 +1310,15 @@ fn model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
             })
         })
         .collect()
+}
+
+fn model_messages_from_input(input: &AgentLoopInput, context: &ContextBundle) -> Vec<ModelMessage> {
+    let mut messages = Vec::new();
+    if let Some(instructions) = input.project_instructions.as_deref() {
+        messages.push(ModelMessage::text(ModelRole::Developer, instructions));
+    }
+    messages.extend(model_messages_from_context(context));
+    messages
 }
 
 fn model_messages_from_context(context: &ContextBundle) -> Vec<ModelMessage> {

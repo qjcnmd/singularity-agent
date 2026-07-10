@@ -265,6 +265,59 @@ fn agent_loop_ask_decision_blocks_without_executing_tool() {
 }
 
 #[test]
+fn agent_loop_sends_project_instructions_as_developer_message_without_serializing_them() {
+    let project_instructions = "root instructions\n\nchild instructions";
+    let input = AgentLoopInput::new("thread_1", "turn_1", "user goal")
+        .with_project_instructions(project_instructions);
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "done"),
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    let requests = seen_requests.lock().expect("seen requests lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].messages.len(), 2);
+    assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
+    assert_eq!(requests[0].messages[1].role, ModelRole::User);
+    assert_eq!(
+        requests[0].messages[0].content[0].text.as_deref(),
+        Some(project_instructions)
+    );
+    assert_eq!(
+        requests[0].messages[1].content[0].text.as_deref(),
+        Some("user goal")
+    );
+    assert!(
+        !requests[0].messages[1].content[0]
+            .text
+            .as_deref()
+            .unwrap_or_default()
+            .contains(project_instructions)
+    );
+    assert!(!requests[0].tools.iter().any(|tool| {
+        serde_json::to_string(tool)
+            .expect("serialize tool")
+            .contains(project_instructions)
+    }));
+    assert!(
+        !requests[0]
+            .trace_metadata
+            .to_string()
+            .contains(project_instructions)
+    );
+    assert!(
+        !serde_json::to_string(&input)
+            .expect("serialize input")
+            .contains(project_instructions)
+    );
+}
+
+#[test]
 fn agent_loop_projects_registered_tools_to_provider_request() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
         .with_model_name(Some("gpt-test".to_string()));

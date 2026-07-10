@@ -9,7 +9,9 @@ use singularity_agent::{
     AgentLoop, AgentLoopCapability, AgentLoopInput, AgentRunStatus, AgentStatus, ApprovalGrant,
     PendingToolCall,
 };
-use singularity_core::{ErrorCode, contains_sensitive_text};
+use singularity_core::{
+    ErrorCode, ProjectInstructionError, contains_sensitive_text, load_project_instructions_from_cwd,
+};
 use singularity_model::{OpenAiProvider, Provider};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecisionOutcome,
@@ -71,6 +73,8 @@ pub enum AppServerError {
     InvalidJson(#[from] serde_json::Error),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("project instructions error: {0}")]
+    ProjectInstructions(#[from] ProjectInstructionError),
 }
 
 pub type AppServerResult<T> = Result<T, AppServerError>;
@@ -418,7 +422,12 @@ impl AppServer {
                 return Ok(AgentRunStatus::failed(error.message).with_status(AgentStatus::Failed));
             }
         };
-        self.run_native_agent_loop_with_provider(provider, thread, params, turn_id, None)
+        match self.run_native_agent_loop_with_provider(provider, thread, params, turn_id, None) {
+            Err(AppServerError::ProjectInstructions(error)) => {
+                Ok(AgentRunStatus::failed(error.to_string()).with_status(AgentStatus::Failed))
+            }
+            result => result,
+        }
     }
 
     fn resume_native_agent_loop(
@@ -521,7 +530,21 @@ impl AppServer {
         let workspace_root = native_workspace_root(&thread);
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
         let policy = native_workspace_policy(workspace_root_display);
-        let loop_input = native_loop_input(&thread, &params, turn_id).with_approval_grant(grant);
+        let loop_input = match native_loop_input(&thread, &params, turn_id, &workspace_root) {
+            Ok(input) => input.with_approval_grant(grant),
+            Err(error) => {
+                let run_status = native_approval_terminal_status(
+                    &turn,
+                    request,
+                    decision,
+                    Some(&pending_tool_call),
+                    AgentStatus::Failed,
+                    "unavailable",
+                    error.to_string(),
+                );
+                return Ok(Some((turn, run_status)));
+            }
+        };
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
             .with_workspace_tools(native_workspace_tools(workspace_root))
             .resume_pending_tool_call(&loop_input, &pending);
@@ -559,7 +582,7 @@ impl AppServer {
         let workspace_root = native_workspace_root(thread);
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
         let policy = native_workspace_policy(workspace_root_display);
-        let mut loop_input = native_loop_input(thread, params, turn_id);
+        let mut loop_input = native_loop_input(thread, params, turn_id, &workspace_root)?;
         if let Some(grant) = approval_grant {
             loop_input = loop_input.with_approval_grant(grant);
         }
@@ -1038,7 +1061,12 @@ fn native_workspace_tools(workspace_root: PathBuf) -> WorkspaceTools {
         .with_sandbox_backend(WindowsRestrictedTokenSandboxBackend::new())
 }
 
-fn native_loop_input(thread: &Thread, params: &TurnStartParams, turn_id: &str) -> AgentLoopInput {
+fn native_loop_input(
+    thread: &Thread,
+    params: &TurnStartParams,
+    turn_id: &str,
+    cwd: &std::path::Path,
+) -> Result<AgentLoopInput, ProjectInstructionError> {
     let goal = params
         .input
         .iter()
@@ -1047,7 +1075,12 @@ fn native_loop_input(thread: &Thread, params: &TurnStartParams, turn_id: &str) -
         })
         .collect::<Vec<_>>()
         .join("\n");
-    AgentLoopInput::new(&params.thread_id, turn_id, goal).with_model_name(thread.model.clone())
+    let mut input =
+        AgentLoopInput::new(&params.thread_id, turn_id, goal).with_model_name(thread.model.clone());
+    if let Some(instructions) = load_project_instructions_from_cwd(cwd)? {
+        input = input.with_project_instructions(instructions.content);
+    }
+    Ok(input)
 }
 
 struct EvalWorkspace {
@@ -1139,12 +1172,21 @@ fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &PathBuf) -> Value 
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(EVAL_DEFAULT_MAX_TURNS);
-    let agent_input = AgentLoopInput::new(
+    let project_instructions = match load_project_instructions_from_cwd(&workspace.repo_dir) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            return blocked_eval_task_result(task, EVAL_WORKSPACE_BLOCKER, error.to_string());
+        }
+    };
+    let mut agent_input = AgentLoopInput::new(
         &task_id,
         format!("{run_id}_{task_id}"),
         eval_agent_prompt(task),
     )
     .with_max_turns(max_turns);
+    if let Some(instructions) = project_instructions {
+        agent_input = agent_input.with_project_instructions(instructions.content);
+    }
     let agent_result = AgentLoop::new(
         provider,
         ToolBroker::new(native_workspace_registry()),
@@ -2072,8 +2114,8 @@ mod tests {
 
     use singularity_agent::{AgentLoopResult, PendingToolCall};
     use singularity_model::{
-        ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, Provider,
-        ProviderError,
+        ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
+        Provider, ProviderError,
     };
     use singularity_policy::PermissionRequest;
     use singularity_tools::{ToolResult, command_scope_digest, command_scope_resource};
@@ -2096,6 +2138,81 @@ mod tests {
                 .unwrap_or_else(|| self.responses.last().expect("static provider response"))
                 .clone())
         }
+    }
+
+    #[test]
+    fn native_agent_loop_loads_hierarchical_agents_md_from_thread_cwd() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp
+            .path()
+            .join("SINGULARITY_API_KEY=must-not-leak")
+            .join("workspace");
+        let cwd = workspace.join("crates").join("agent");
+        std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&cwd).expect("nested cwd");
+        std::fs::write(workspace.join("AGENTS.md"), "root instructions").expect("root agents");
+        std::fs::write(
+            workspace.join("crates").join("AGENTS.md"),
+            "crate instructions",
+        )
+        .expect("crate agents");
+        std::fs::write(cwd.join("AGENTS.md"), "agent instructions").expect("agent agents");
+        let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&cwd.to_string_lossy()))
+            .expect("thread");
+        let params = TurnStartParams {
+            thread_id: thread.thread_id.clone(),
+            input: vec![singularity_protocol::InputItem::Text {
+                text: "user goal".to_string(),
+            }],
+        };
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = StaticProvider {
+            responses: vec![ModelTurnResponse::completed(
+                "model_request_turn_1_0",
+                "response_1",
+                "done",
+            )],
+            seen_requests: Arc::clone(&seen_requests),
+        };
+        let server = AppServer::new(store);
+
+        let status = server
+            .run_native_agent_loop_with_provider(provider, &thread, &params, "turn_1", None)
+            .expect("native loop");
+
+        assert_eq!(status.status, AgentStatus::Completed);
+        let requests = seen_requests.lock().expect("seen requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].messages.len(), 2);
+        assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
+        assert_eq!(requests[0].messages[1].role, ModelRole::User);
+        assert_eq!(
+            requests[0].messages[0].content[0].text.as_deref(),
+            Some("root instructions\n\ncrate instructions\n\nagent instructions")
+        );
+        assert_eq!(
+            requests[0].messages[1].content[0].text.as_deref(),
+            Some("user goal")
+        );
+        let hidden_workspace_marker = workspace.to_string_lossy();
+        assert!(!requests[0].tools.iter().any(|tool| {
+            serde_json::to_string(tool)
+                .expect("serialize tool")
+                .contains(hidden_workspace_marker.as_ref())
+        }));
+        assert!(
+            !requests[0]
+                .trace_metadata
+                .to_string()
+                .contains(hidden_workspace_marker.as_ref())
+        );
+        assert!(
+            !serde_json::to_string(&status)
+                .expect("serialize status")
+                .contains(hidden_workspace_marker.as_ref())
+        );
     }
 
     #[test]

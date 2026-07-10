@@ -1,5 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod project_instructions;
+
+pub use project_instructions::{
+    PROJECT_INSTRUCTIONS_FILE_NAME, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
+    PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES, ProjectInstructionError, ProjectInstructionErrorCode,
+    ProjectInstructions, load_project_instructions, load_project_instructions_from_cwd,
+};
+
 use std::fmt::{Display, Formatter};
 
 use schemars::JsonSchema;
