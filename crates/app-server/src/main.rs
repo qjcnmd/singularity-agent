@@ -10,28 +10,48 @@ use singularity_protocol::{JsonRpcMessage, Method};
 use singularity_store::SessionStore;
 
 fn main() {
+    if let Err(error) = run() {
+        eprintln!("app-server error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
     let db_path = std::env::var("SINGULARITY_APP_SERVER_DB")
         .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string());
-    if let Some(parent) = std::path::Path::new(&db_path).parent() {
-        std::fs::create_dir_all(parent).expect("create app-server state directory");
+    if let Some(parent) = std::path::Path::new(&db_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create app-server state directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
-    let store = SessionStore::open(&db_path).expect("open app-server store");
+    let store = SessionStore::open(&db_path)
+        .map_err(|error| format!("failed to open app-server store {db_path}: {error}"))?;
     let provider_snapshot = ProviderConfigSnapshot::capture(|name| std::env::var(name).ok());
     let mut server = AppServer::new(store, provider_snapshot);
     let (output_tx, output_rx) = mpsc::channel::<Value>();
-    let writer = thread::spawn(move || {
+    let writer = thread::spawn(move || -> Result<(), String> {
         let mut stdout = io::stdout().lock();
         for message in output_rx {
-            write_json_line(&mut stdout, &message).expect("write response");
-            stdout.flush().expect("flush response");
+            write_json_line(&mut stdout, &message)
+                .map_err(|error| format!("failed to write response: {error}"))?;
+            stdout
+                .flush()
+                .map_err(|error| format!("failed to flush response: {error}"))?;
         }
+        Ok(())
     });
     let mut turn_workers = Vec::new();
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
-        reap_finished_workers(&mut turn_workers);
-        let line = line.expect("read stdin line");
+        reap_finished_workers(&mut turn_workers)?;
+        let line = line.map_err(|error| format!("failed to read stdin: {error}"))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -82,24 +102,34 @@ fn main() {
 
     server
         .cancel_active_turns()
-        .expect("cancel active turns during shutdown");
+        .map_err(|error| format!("failed to cancel active turns during shutdown: {error}"))?;
     for worker in turn_workers {
-        worker.join().expect("turn worker joins");
+        join_turn_worker(worker)?;
     }
     drop(output_tx);
-    writer.join().expect("stdout writer joins");
+    writer
+        .join()
+        .map_err(|_| "stdout writer panicked".to_string())??;
+    Ok(())
 }
 
-fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
+fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) -> Result<(), String> {
     let mut active = Vec::with_capacity(workers.len());
     for worker in workers.drain(..) {
         if worker.is_finished() {
-            worker.join().expect("turn worker joins");
+            join_turn_worker(worker)?;
         } else {
             active.push(worker);
         }
     }
     *workers = active;
+    Ok(())
+}
+
+fn join_turn_worker(worker: JoinHandle<()>) -> Result<(), String> {
+    worker
+        .join()
+        .map_err(|_| "turn worker panicked".to_string())
 }
 
 fn send_output(sender: &Sender<Value>, message: Value) {

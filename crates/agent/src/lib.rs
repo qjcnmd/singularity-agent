@@ -369,7 +369,6 @@ impl PendingToolCall {
             arguments,
             parse_status: ModelToolParseStatus::Valid,
             validation_errors: Vec::new(),
-            provider_metadata: json!({}),
         })
     }
 }
@@ -1324,7 +1323,6 @@ fn model_turn_request(
         tools: model_tool_schemas(loop_tools),
         tool_choice: Default::default(),
         model_preferences: input.model_preferences.clone(),
-        budget: Default::default(),
         context_metadata: context_metadata(context),
         policy_metadata: json!({
             "approval_grants": input

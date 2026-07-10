@@ -1,12 +1,9 @@
 use schemars::schema_for;
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
-    SandboxBackendDescriptor, SandboxBackendEnforcement, SandboxCapabilities,
-    SandboxFilesystemMode, SandboxNetworkMode, SandboxPolicy, UnavailableSandboxBackend,
-    WindowsSandboxBackend, bound_command_output, changed_files_inside_workspace, git_diff_request,
-    git_status_request, redacted_child_env,
+    SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
+    WindowsSandboxBackend, bound_command_output,
 };
-use std::collections::BTreeMap;
 use std::path::Path;
 
 const SANDBOX_SRC: &str = include_str!("../src/lib.rs");
@@ -25,35 +22,6 @@ const FORBIDDEN_LOCAL_PROCESS_SURFACES: [&str; 11] = [
 ];
 const FORBIDDEN_RELAXED_SANDBOX_CONTRACTS: [&str; 2] = ["HostWorkspace", "Relaxed"];
 
-struct TestBackend;
-
-impl SandboxBackend for TestBackend {
-    fn name(&self) -> &'static str {
-        "test"
-    }
-
-    fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::strict()
-    }
-
-    fn execute(&self, request: &CommandRequest) -> CommandResult {
-        CommandResult::sandbox_backend_unavailable(&request.command_id)
-    }
-}
-
-#[test]
-fn sandbox_policy_and_backend_contract_are_serializable() {
-    let policy = SandboxPolicy::isolated_verification("C:/repo");
-    let value = serde_json::to_value(&policy).expect("serialize sandbox policy");
-
-    assert_eq!(value["profile"], "isolated_verification");
-    assert_eq!(value["network"]["mode"], "denied");
-    assert_eq!(TestBackend.name(), "test");
-    assert!(TestBackend.capabilities().restricted_token);
-    assert!(TestBackend.capabilities().job_object);
-    assert!(TestBackend.capabilities().path_admission);
-}
-
 #[test]
 fn command_request_and_result_are_schema_backed_boundaries() {
     let request = CommandRequest::project_verification(
@@ -67,7 +35,6 @@ fn command_request_and_result_are_schema_backed_boundaries() {
     let request_value = serde_json::to_value(&request).expect("serialize command request");
     let result_value = serde_json::to_value(&result).expect("serialize command result");
 
-    assert_eq!(request_value["purpose"], "project_verification");
     assert_eq!(request_value["network"]["mode"], "denied");
     assert_eq!(result_value["semantic_status"], "succeeded");
     assert_eq!(result_value["redacted"], true);
@@ -150,17 +117,6 @@ fn command_boundary_does_not_expose_host_workspace_local_process_executor() {
 }
 
 #[test]
-fn git_helpers_create_sandboxed_command_requests_not_git_execution_wrappers() {
-    let status = git_status_request("git_status", ".", "C:/repo");
-    let diff = git_diff_request("git_diff", ".", "C:/repo");
-
-    assert_eq!(status.permission_resource(), "git status --porcelain=v1");
-    assert_eq!(diff.permission_resource(), "git diff --");
-    assert!(status.requires_sandbox());
-    assert!(diff.requires_sandbox());
-}
-
-#[test]
 fn command_policy_denied_result_does_not_require_process_or_backend_execution() {
     let result = CommandResult::policy_denied("command_1", "policy denied command execution");
 
@@ -170,50 +126,6 @@ fn command_policy_denied_result_does_not_require_process_or_backend_execution() 
     );
     assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
     assert!(result.stderr_preview.contains("policy denied"));
-}
-
-#[test]
-fn patch_schema_objects_are_snapshotted() {
-    assert_eq!(
-        schema_for!(singularity_sandbox::PatchChange)
-            .schema
-            .metadata
-            .unwrap()
-            .title
-            .unwrap(),
-        "PatchChange"
-    );
-    assert_eq!(
-        schema_for!(singularity_sandbox::PatchResult)
-            .schema
-            .metadata
-            .unwrap()
-            .title
-            .unwrap(),
-        "PatchResult"
-    );
-}
-
-#[test]
-fn sandbox_backend_descriptor_is_a_serializable_contract() {
-    let descriptor = SandboxBackendDescriptor::strict("windows_elevated");
-    let value = serde_json::to_value(&descriptor).expect("serialize backend descriptor");
-    let schema = schema_for!(SandboxBackendDescriptor);
-    let schema_text = serde_json::to_string(&schema).expect("serialize schema");
-
-    assert_eq!(value["backend"], "windows_elevated");
-    assert_eq!(value["enforcement"], "strict");
-    assert!(!schema_text.contains("reduced"));
-    assert!(value["capabilities"]["restricted_token"].as_bool().unwrap());
-    assert_eq!(
-        schema_for!(SandboxBackendDescriptor)
-            .schema
-            .metadata
-            .unwrap()
-            .title
-            .unwrap(),
-        "SandboxBackendDescriptor"
-    );
 }
 
 #[test]
@@ -236,19 +148,13 @@ fn sandbox_capabilities_report_actual_enforcement_strength() {
 }
 
 #[test]
-fn command_output_and_child_environment_are_safe_bounded_payloads() {
+fn command_output_is_a_safe_bounded_payload() {
     let output = bound_command_output("abcdef", 3);
     let redacted_result =
         CommandResult::completed("command_secret", "Authorization: Bearer abc123");
     let bounded_result = CommandResult::completed("command_long", "x".repeat(40_010));
     let blocked_result =
         CommandResult::policy_denied("command_blocked", "raw_prompt provider_response abc123");
-    let mut env = BTreeMap::new();
-    env.insert("PATH".to_string(), "C:/Windows".to_string());
-    env.insert("SINGULARITY_API_KEY".to_string(), "secret".to_string());
-
-    let child_env = redacted_child_env(&env);
-
     assert_eq!(output.preview, "abc");
     assert!(output.truncated);
     assert_eq!(
@@ -294,48 +200,6 @@ fn command_output_and_child_environment_are_safe_bounded_payloads() {
         .stdout_preview,
         "token count is 42 and token budget is 100"
     );
-    assert_eq!(
-        child_env.get("PATH").map(String::as_str),
-        Some("C:/Windows")
-    );
-    assert!(!child_env.contains_key("SINGULARITY_API_KEY"));
-}
-
-#[test]
-fn changed_file_detection_never_reports_paths_outside_workspace() {
-    let files = changed_files_inside_workspace(
-        "C:/repo",
-        &[
-            "C:/repo/src/lib.rs".to_string(),
-            "C:/repo/../secrets.txt".to_string(),
-            "D:/outside.txt".to_string(),
-        ],
-    );
-
-    assert_eq!(files, vec!["src/lib.rs"]);
-}
-
-#[test]
-fn unavailable_sandbox_backend_fails_closed_without_spawning() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let request = CommandRequest::project_verification(
-        "command_echo",
-        vec!["test-program".to_string(), "success".to_string()],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    let backend = UnavailableSandboxBackend;
-
-    let result = backend.execute(&request);
-
-    assert_eq!(
-        result.execution_status,
-        CommandExecutionStatus::BackendError
-    );
-    assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
-    assert_eq!(result.exit_code, None);
-    assert!(result.stderr_preview.contains("sandbox backend"));
-    assert!(result.redacted);
 }
 
 #[cfg(windows)]
@@ -409,32 +273,6 @@ fn windows_backend_denies_parent_traversal_before_execution() {
 
 #[cfg(windows)]
 #[test]
-fn windows_backend_rejects_network_allowlist_without_execution() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let mut request = CommandRequest::project_verification(
-        "command_network_allowlist",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo denied".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    request.network.mode = SandboxNetworkMode::Allowlist;
-
-    let result = WindowsSandboxBackend::new().execute(&request);
-
-    assert_eq!(
-        result.execution_status,
-        CommandExecutionStatus::BackendError
-    );
-    assert!(result.stderr_preview.contains("allowlist"));
-    assert!(!result.sandbox.local_process_fallback);
-}
-
-#[cfg(windows)]
-#[test]
 fn windows_backend_rejects_danger_full_access_without_implicit_fallback() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut request = CommandRequest::project_verification(
@@ -457,34 +295,6 @@ fn windows_backend_rejects_danger_full_access_without_implicit_fallback() {
     );
     assert!(result.stderr_preview.contains("danger-full-access"));
     assert!(!result.sandbox.local_process_fallback);
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_backend_rejects_custom_root_lists_instead_of_silently_ignoring_them() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let mut request = CommandRequest::project_verification(
-        "command_custom_roots",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo denied".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    request
-        .filesystem
-        .readonly_paths
-        .push(path_str(workspace.path()).to_string());
-
-    let result = WindowsSandboxBackend::new().execute(&request);
-
-    assert_eq!(
-        result.execution_status,
-        CommandExecutionStatus::BackendError
-    );
-    assert!(result.stderr_preview.contains("custom writable_paths"));
 }
 
 #[cfg(windows)]

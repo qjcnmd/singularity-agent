@@ -195,7 +195,7 @@ CommandToolInput
 - `read-only` 和 `workspace-write` 可映射；`danger-full-access` 在 sandbox backend 中明确拒绝。
 - network denied 映射到 restricted network，必须使用 elevated offline identity；不能走 unelevated fallback。
 - network allowed 可以在 elevated 路径失败且 restricted token 足够时走 unelevated 路径。
-- network allowlist 和额外 writable/readonly roots 当前不支持，直接返回 backend error。
+- 产品层只表达单一 workspace root 与 `denied` / `allowed` 两种网络模式，不暴露 allowlist 或额外读写根目录配置。
 - child environment 删除 secret-like 变量；输出有界并再次做敏感标记检查。
 - timeout 或 cancel 会终止 Job Object 中的进程树。
 - `local_process_fallback` 始终为 false；没有无沙箱 executor。

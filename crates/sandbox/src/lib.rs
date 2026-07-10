@@ -1,6 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use schemars::JsonSchema;
@@ -21,7 +20,6 @@ const COMMAND_READ_ONLY_WRITE_DENIED: &str = "sandbox command write denied in re
 const COMMAND_SENSITIVE_PATH_DENIED: &str = "sandbox command path denied";
 const COMMAND_ENV_PATH_UNSUPPORTED: &str = "sandbox command env-expanded path is unsupported";
 const COMMAND_UNSUPPORTED: &str = "sandbox command mode unsupported";
-const PATH_ENV_NAME: &str = "PATH";
 const SHELL_COMMAND_FLAGS: [&str; 3] = ["/c", "-c", "-command"];
 const WRITE_COMMAND_WORDS: [&str; 13] = [
     "copy",
@@ -38,8 +36,6 @@ const WRITE_COMMAND_WORDS: [&str; 13] = [
     "rename",
     "set-content",
 ];
-const GIT_STATUS_ARGS: [&str; 3] = ["git", "status", "--porcelain=v1"];
-const GIT_DIFF_ARGS: [&str; 3] = ["git", "diff", "--"];
 const REDACTED_COMMAND_OUTPUT: &str = "[redacted sensitive command output]";
 const SECRET_ENV_MARKERS: [&str; 6] = [
     "API_KEY",
@@ -68,16 +64,6 @@ const SENSITIVE_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum SandboxProfileName {
-    ReadonlyAnalysis,
-    IsolatedVerification,
-    GeneratedCode,
-    PackageOperation,
-    LongRunningService,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
 pub enum SandboxFilesystemMode {
     ReadOnly,
     WorkspaceWrite,
@@ -89,71 +75,17 @@ pub enum SandboxFilesystemMode {
 pub enum SandboxNetworkMode {
     Denied,
     Allowed,
-    Allowlist,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxFilesystemPolicy {
     pub mode: SandboxFilesystemMode,
     pub workspace_root: String,
-    pub writable_paths: Vec<String>,
-    pub readonly_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxNetworkPolicy {
     pub mode: SandboxNetworkMode,
-    pub allowed_hosts: Vec<String>,
-    pub denied_hosts: Vec<String>,
-    pub require_hard_isolation: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SandboxResourceLimits {
-    pub timeout_seconds: u64,
-    pub max_output_chars: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SandboxPolicy {
-    pub profile: SandboxProfileName,
-    pub filesystem: SandboxFilesystemPolicy,
-    pub network: SandboxNetworkPolicy,
-    pub resources: SandboxResourceLimits,
-}
-
-impl SandboxPolicy {
-    pub fn isolated_verification(workspace_root: impl Into<String>) -> Self {
-        Self {
-            profile: SandboxProfileName::IsolatedVerification,
-            filesystem: SandboxFilesystemPolicy {
-                mode: SandboxFilesystemMode::WorkspaceWrite,
-                workspace_root: workspace_root.into(),
-                writable_paths: Vec::new(),
-                readonly_paths: Vec::new(),
-            },
-            network: SandboxNetworkPolicy {
-                mode: SandboxNetworkMode::Denied,
-                allowed_hosts: Vec::new(),
-                denied_hosts: Vec::new(),
-                require_hard_isolation: false,
-            },
-            resources: SandboxResourceLimits {
-                timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
-                max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandPurpose {
-    ReadOnlyCommand,
-    ProjectVerification,
-    Build,
-    PackageManager,
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -187,7 +119,6 @@ pub struct CommandRequest {
     pub command_id: String,
     pub argv: Vec<String>,
     pub cwd: String,
-    pub purpose: CommandPurpose,
     pub timeout_seconds: u64,
     pub network: SandboxNetworkPolicy,
     pub filesystem: SandboxFilesystemPolicy,
@@ -204,19 +135,13 @@ impl CommandRequest {
             command_id: command_id.into(),
             argv,
             cwd: cwd.into(),
-            purpose: CommandPurpose::ProjectVerification,
             timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
             network: SandboxNetworkPolicy {
                 mode: SandboxNetworkMode::Denied,
-                allowed_hosts: Vec::new(),
-                denied_hosts: Vec::new(),
-                require_hard_isolation: false,
             },
             filesystem: SandboxFilesystemPolicy {
                 mode: SandboxFilesystemMode::WorkspaceWrite,
                 workspace_root: workspace_root.into(),
-                writable_paths: Vec::new(),
-                readonly_paths: Vec::new(),
             },
         }
     }
@@ -228,22 +153,6 @@ impl CommandRequest {
     pub fn permission_resource(&self) -> String {
         command_permission_resource(&self.argv)
     }
-}
-
-pub fn git_status_request(
-    command_id: impl Into<String>,
-    cwd: impl Into<String>,
-    workspace_root: impl Into<String>,
-) -> CommandRequest {
-    project_command_request(command_id, &GIT_STATUS_ARGS, cwd, workspace_root)
-}
-
-pub fn git_diff_request(
-    command_id: impl Into<String>,
-    cwd: impl Into<String>,
-    workspace_root: impl Into<String>,
-) -> CommandRequest {
-    project_command_request(command_id, &GIT_DIFF_ARGS, cwd, workspace_root)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -292,7 +201,6 @@ pub struct CommandResult {
     pub output_truncated: bool,
     pub redacted: bool,
     pub sandbox: SandboxExecutionMetadata,
-    pub changed_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -305,33 +213,6 @@ pub fn bound_command_output(output: &str, max_chars: usize) -> BoundedCommandOut
     let preview = output.chars().take(max_chars).collect::<String>();
     let truncated = output.chars().count() > preview.chars().count();
     BoundedCommandOutput { preview, truncated }
-}
-
-pub fn redacted_child_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    env.iter()
-        .filter(|(name, _value)| {
-            name.eq_ignore_ascii_case(PATH_ENV_NAME) || !is_secret_env_name(name)
-        })
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
-}
-
-pub fn changed_files_inside_workspace(
-    workspace_root: impl AsRef<Path>,
-    changed_paths: &[String],
-) -> Vec<String> {
-    let workspace = normalize_path(workspace_root.as_ref());
-    changed_paths
-        .iter()
-        .filter_map(|path| {
-            let normalized = normalize_path(Path::new(path));
-            normalized
-                .strip_prefix(&workspace)
-                .ok()
-                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-                .filter(|relative| !relative.is_empty())
-        })
-        .collect()
 }
 
 impl CommandResult {
@@ -349,7 +230,6 @@ impl CommandResult {
             output_truncated: stdout.truncated,
             redacted: true,
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
-            changed_files: Vec::new(),
         }
     }
 
@@ -443,7 +323,6 @@ impl CommandResult {
             output_truncated: captured_truncated || stdout.truncated || stderr.truncated,
             redacted: true,
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
-            changed_files: Vec::new(),
         }
     }
 
@@ -475,7 +354,6 @@ impl CommandResult {
             output_truncated: stderr.truncated,
             redacted: true,
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
-            changed_files: Vec::new(),
         }
     }
 }
@@ -612,24 +490,6 @@ pub trait SandboxBackend {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct UnavailableSandboxBackend;
-
-impl SandboxBackend for UnavailableSandboxBackend {
-    fn name(&self) -> &'static str {
-        "unavailable"
-    }
-
-    fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::unavailable()
-    }
-
-    fn execute(&self, request: &CommandRequest) -> CommandResult {
-        CommandResult::sandbox_backend_unavailable(&request.command_id)
-            .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable)
-    }
-}
-
 #[cfg(windows)]
 pub use windows_backend::WindowsSandboxBackend;
 
@@ -658,60 +518,6 @@ impl SandboxBackend for WindowsSandboxBackend {
         CommandResult::sandbox_backend_unavailable(&request.command_id)
             .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SandboxBackendDescriptor {
-    pub backend: String,
-    pub enforcement: SandboxBackendEnforcement,
-    pub capabilities: SandboxCapabilities,
-}
-
-impl SandboxBackendDescriptor {
-    pub fn strict(backend: impl Into<String>) -> Self {
-        Self {
-            backend: backend.into(),
-            enforcement: SandboxBackendEnforcement::Strict,
-            capabilities: SandboxCapabilities::strict(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct PatchChange {
-    pub path: String,
-    pub expected: Option<String>,
-    pub replacement: String,
-}
-
-impl PatchChange {
-    pub fn replace(
-        path: impl Into<String>,
-        expected: impl Into<String>,
-        replacement: impl Into<String>,
-    ) -> Self {
-        Self {
-            path: path.into(),
-            expected: Some(expected.into()),
-            replacement: replacement.into(),
-        }
-    }
-
-    pub fn create(path: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            expected: None,
-            replacement: content.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct PatchResult {
-    pub applied: bool,
-    pub changed_files: Vec<String>,
-    pub rolled_back: bool,
-    pub error: Option<String>,
 }
 
 pub fn command_permission_resource(argv: &[String]) -> String {
@@ -877,20 +683,6 @@ fn redirection_target_is_non_file(target: &str) -> bool {
     matches!(lower.as_str(), "nul" | "nul:" | "/dev/null" | "&1" | "&2")
 }
 
-fn project_command_request(
-    command_id: impl Into<String>,
-    args: &[&str],
-    cwd: impl Into<String>,
-    workspace_root: impl Into<String>,
-) -> CommandRequest {
-    CommandRequest::project_verification(
-        command_id,
-        args.iter().map(|part| part.to_string()).collect(),
-        cwd,
-        workspace_root,
-    )
-}
-
 fn is_secret_env_name(name: &str) -> bool {
     let upper_name = name.to_ascii_uppercase();
     SECRET_ENV_MARKERS
@@ -952,26 +744,6 @@ fn command_request_denial(request: &CommandRequest) -> Option<CommandResult> {
             &request.command_id,
             COMMAND_CWD_OUTSIDE_WORKSPACE,
         ));
-    }
-    for path in request
-        .filesystem
-        .writable_paths
-        .iter()
-        .chain(request.filesystem.readonly_paths.iter())
-    {
-        let resolved = resolve_existing_or_parent_command_path(&workspace, path);
-        if path_has_sensitive_component(&resolved) {
-            return Some(CommandResult::policy_denied(
-                &request.command_id,
-                COMMAND_SENSITIVE_PATH_DENIED,
-            ));
-        }
-        if workspace_bound && !resolved.starts_with(&workspace) {
-            return Some(CommandResult::policy_denied(
-                &request.command_id,
-                COMMAND_PATH_OUTSIDE_WORKSPACE,
-            ));
-        }
     }
     let executable = Path::new(&request.argv[0]);
     if executable.components().count() > 1 && path_has_sensitive_component(executable) {
@@ -1118,8 +890,6 @@ mod windows_backend {
     const DEFAULT_HOME_DIR_NAME: &str = ".singularity";
     const ELEVATED_FAILURE_PREFIX: &str = "elevated Windows sandbox failed";
     const RESTRICTED_FAILURE_PREFIX: &str = "restricted-token Windows sandbox failed";
-    const CUSTOM_ROOTS_UNSUPPORTED: &str =
-        "custom writable_paths and readonly_paths are not supported by the Windows sandbox adapter";
     const DANGER_FULL_ACCESS_UNSUPPORTED: &str = "danger-full-access requires an explicit unsandboxed executor and is unavailable in the sandbox backend";
 
     #[derive(Debug, Clone, Default)]
@@ -1177,11 +947,6 @@ mod windows_backend {
 
     impl PreparedCommand {
         fn from_request(request: &CommandRequest) -> Result<Self, String> {
-            if !request.filesystem.writable_paths.is_empty()
-                || !request.filesystem.readonly_paths.is_empty()
-            {
-                return Err(CUSTOM_ROOTS_UNSUPPORTED.to_string());
-            }
             let workspace_root =
                 canonical_directory(Path::new(&request.filesystem.workspace_root))?;
             let cwd = canonical_directory(Path::new(&request.cwd))?;
@@ -1191,9 +956,6 @@ mod windows_backend {
             let network = match request.network.mode {
                 SandboxNetworkMode::Denied => NetworkSandboxPolicy::Restricted,
                 SandboxNetworkMode::Allowed => NetworkSandboxPolicy::Enabled,
-                SandboxNetworkMode::Allowlist => {
-                    return Err("network allowlist mode is unsupported".to_string());
-                }
             };
             let permission_profile = match request.filesystem.mode {
                 SandboxFilesystemMode::ReadOnly => PermissionProfile::Managed {

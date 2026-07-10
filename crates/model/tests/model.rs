@@ -4,10 +4,9 @@ use singularity_model::{
     ModelMessage, ModelProviderConfig, ModelProviderStatus, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
     ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider, ProviderConfigSnapshot,
-    ProviderConfigSource, ProviderStreamEvent, ProviderStreamEventType, ToolChoiceMode,
-    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, provider_config_from_env,
-    resolve_provider_config, retry_decision, validate_model_request, validate_model_response,
-    validate_model_turn_response, validate_provider_config, validate_stream_events,
+    ProviderConfigSource, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
+    classify_model_error, resolve_provider_config, validate_model_request, validate_model_response,
+    validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -37,19 +36,6 @@ fn in_current_dir<T>(path: &std::path::Path, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-fn stream_event(event_type: ProviderStreamEventType) -> ProviderStreamEvent {
-    ProviderStreamEvent {
-        event_type,
-        text_delta: None,
-        tool_call_id: None,
-        tool_name: None,
-        arguments_delta: None,
-        usage_delta: None,
-        error: None,
-        metadata: serde_json::json!({}),
-    }
-}
-
 fn tool_call(id: &str, name: &str) -> ModelToolCall {
     ModelToolCall {
         tool_call_id: id.to_string(),
@@ -58,7 +44,6 @@ fn tool_call(id: &str, name: &str) -> ModelToolCall {
         raw_arguments: r#"{"path":"README.md"}"#.to_string(),
         parse_status: ModelToolParseStatus::Valid,
         validation_errors: Vec::new(),
-        provider_metadata: serde_json::json!({}),
     }
 }
 
@@ -183,8 +168,6 @@ fn model_turn_schema_carries_runtime_boundary_fields() {
     assert_eq!(value["action_id"], "request_1");
     assert_eq!(value["tools"], serde_json::json!([]));
     assert_eq!(value["tool_choice"]["mode"], "auto");
-    assert_eq!(value["budget"]["max_retries"], 2);
-    assert!(value["model_preferences"]["stream"].as_bool().is_some());
     assert!(value["context_metadata"].is_object());
     assert!(value["policy_metadata"].is_object());
     assert!(value["trace_metadata"].is_object());
@@ -216,29 +199,6 @@ fn provider_config_validation_reports_missing_boundary_fields() {
             "provider_name_required"
         ]
     );
-}
-
-#[test]
-fn provider_config_loads_presence_from_env_without_secret_values() {
-    let config = provider_config_from_env(|name| match name {
-        "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
-        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
-        "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
-        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
-        _ => None,
-    });
-    let status = ModelProviderStatus::from_config(&config);
-    let serialized = serde_json::to_string(&status).expect("serialize provider status");
-
-    assert_eq!(config.provider_name.as_deref(), Some("openai_compatible"));
-    assert_eq!(config.model_name.as_deref(), Some("gpt-test"));
-    assert!(config.base_url_present);
-    assert!(config.api_key_present);
-    assert!(status.ready);
-    assert_eq!(status.api_key_status, "present(redacted)");
-    assert_eq!(status.base_url_status, "present(redacted)");
-    assert!(!serialized.contains("sk-secret-value"));
-    assert!(!serialized.contains("provider.example"));
 }
 
 #[test]
@@ -495,10 +455,6 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
         response.tool_calls[0].arguments,
         serde_json::json!({"path": "README.md"})
     );
-    assert_eq!(
-        response.raw_response_ref.as_deref(),
-        Some("provider_response_ref:resp_1")
-    );
     assert!(!serialized.contains("sk-secret-value"));
     assert!(!serialized.contains("choices"));
 }
@@ -550,7 +506,6 @@ fn openai_provider_cancels_an_inflight_http_request() {
         .expect_err("provider request cancelled");
 
     assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
-    assert!(!error.error.retryable);
 }
 
 #[test]
@@ -801,13 +756,10 @@ fn model_errors_classify_provider_failures_without_transport_calls() {
         classify_model_error(&auth),
         ModelErrorCategory::Authentication
     );
-    assert!(!auth.retryable);
-
     let permission_denied = ModelError::new(
         ModelErrorKind::NetworkError,
         "[WinError 10013] socket access denied",
-    )
-    .retryable(false);
+    );
 
     assert_eq!(
         permission_denied.category(),
@@ -822,27 +774,6 @@ fn model_errors_classify_provider_failures_without_transport_calls() {
     assert_eq!(
         model_missing.category(),
         ModelErrorCategory::ModelConfiguration
-    );
-}
-
-#[test]
-fn retry_decision_is_bounded_to_retryable_provider_errors() {
-    let rate_limited = ModelError::new(ModelErrorKind::RateLimited, "Provider returned HTTP 429.");
-    let validation = ModelError::new(ModelErrorKind::JsonSchemaViolation, "schema mismatch");
-
-    let retry = retry_decision(&rate_limited, 0, 2);
-    let exhausted = retry_decision(&rate_limited, 2, 2);
-    let non_retryable = retry_decision(&validation, 0, 2);
-
-    assert!(retry.retry);
-    assert_eq!(retry.next_attempt, Some(1));
-    assert_eq!(retry.reason.as_deref(), Some("retryable_model_error"));
-    assert!(!exhausted.retry);
-    assert_eq!(exhausted.reason.as_deref(), Some("retry_budget_exhausted"));
-    assert!(!non_retryable.retry);
-    assert_eq!(
-        non_retryable.reason.as_deref(),
-        Some("non_retryable_model_error")
     );
 }
 
@@ -871,93 +802,15 @@ fn request_and_response_validation_helpers_reject_empty_or_mismatched_envelopes(
 #[test]
 fn model_error_serializes_redacted_boundary_fields() {
     let failure = ModelError::new(ModelErrorKind::RateLimited, "Provider returned HTTP 429.")
-        .retryable(true)
         .with_provider("openai_compatible")
         .with_model("gpt-test");
 
     let value = serde_json::to_value(&failure).expect("serialize provider failure");
 
     assert_eq!(value["kind"], "rate_limited");
-    assert_eq!(value["retryable"], true);
     assert_eq!(value["provider_name"], "openai_compatible");
     assert_eq!(value["model_name"], "gpt-test");
-    assert!(value["raw_error_ref"].is_null());
     assert!(!value.to_string().contains("sk-"));
-}
-
-#[test]
-fn streaming_events_validate_minimal_envelope_schema() {
-    let events = vec![
-        ProviderStreamEvent {
-            text_delta: Some("he".to_string()),
-            ..stream_event(ProviderStreamEventType::TextDelta)
-        },
-        ProviderStreamEvent {
-            text_delta: Some("llo".to_string()),
-            ..stream_event(ProviderStreamEventType::TextDelta)
-        },
-        ProviderStreamEvent {
-            tool_call_id: Some("call_1".to_string()),
-            tool_name: Some("builtin.read_file".to_string()),
-            arguments_delta: Some(r#"{"path":"#.to_string()),
-            ..stream_event(ProviderStreamEventType::ToolCallDelta)
-        },
-        ProviderStreamEvent {
-            tool_call_id: Some("call_1".to_string()),
-            ..stream_event(ProviderStreamEventType::ToolCallCompleted)
-        },
-        ProviderStreamEvent {
-            usage_delta: Some(Default::default()),
-            ..stream_event(ProviderStreamEventType::UsageDelta)
-        },
-        stream_event(ProviderStreamEventType::ResponseCompleted),
-    ];
-
-    assert!(validate_stream_events(&events).valid);
-
-    let value = serde_json::to_value(&events[0]).expect("serialize stream event");
-    assert_eq!(value["type"], "text_delta");
-    assert_eq!(value["text_delta"], "he");
-}
-
-#[test]
-fn streaming_events_reject_bad_envelopes_and_events_after_completion() {
-    let events = vec![
-        ProviderStreamEvent {
-            tool_name: Some("builtin.read_file".to_string()),
-            ..stream_event(ProviderStreamEventType::ToolCallDelta)
-        },
-        stream_event(ProviderStreamEventType::ResponseCompleted),
-        ProviderStreamEvent {
-            text_delta: Some("late".to_string()),
-            ..stream_event(ProviderStreamEventType::TextDelta)
-        },
-    ];
-
-    let result = validate_stream_events(&events);
-
-    assert!(!result.valid);
-    assert_eq!(
-        result.errors,
-        vec![
-            "stream_event[0].tool_call_id_required",
-            "stream_event[2].event_after_response_completed",
-        ]
-    );
-}
-
-#[test]
-fn streaming_events_require_delta_before_tool_completion() {
-    let result = validate_stream_events(&[ProviderStreamEvent {
-        tool_call_id: Some("call_1".to_string()),
-        ..stream_event(ProviderStreamEventType::ToolCallCompleted)
-    }]);
-
-    assert!(!result.valid);
-    assert_eq!(
-        result.errors,
-        vec!["stream_event[0].tool_call_delta_required"]
-    );
 }
 
 #[test]
@@ -1051,30 +904,21 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
     let model_error = ModelError::new(ModelErrorKind::Timeout, "provider timed out")
         .with_provider("openai_compatible")
         .with_model("gpt-test");
-    let stream = ProviderStreamEvent {
-        text_delta: Some("hello".to_string()),
-        ..stream_event(ProviderStreamEventType::TextDelta)
-    };
-
     let restored_schema: ModelToolSchema =
         serde_json::from_value(serde_json::to_value(&tool_schema).unwrap()).unwrap();
     let restored_config: ModelProviderConfig =
         serde_json::from_value(serde_json::to_value(&provider_config).unwrap()).unwrap();
     let restored_error: ModelError =
         serde_json::from_value(serde_json::to_value(&model_error).unwrap()).unwrap();
-    let restored_stream: ProviderStreamEvent =
-        serde_json::from_value(serde_json::to_value(&stream).unwrap()).unwrap();
 
     assert_eq!(restored_schema, tool_schema);
     assert_eq!(restored_config, provider_config);
     assert_eq!(restored_error, model_error);
-    assert_eq!(restored_stream, stream);
     assert_eq!(schema_title::<ModelToolSchema>(), "ModelToolSchema");
     assert_eq!(schema_title::<ModelToolCall>(), "ModelToolCall");
     assert_eq!(schema_title::<ModelCapabilities>(), "ModelCapabilities");
     assert_eq!(schema_title::<ModelProviderConfig>(), "ModelProviderConfig");
     assert_eq!(schema_title::<ModelUsage>(), "ModelUsage");
-    assert_eq!(schema_title::<ProviderStreamEvent>(), "ProviderStreamEvent");
     assert_eq!(schema_title::<ModelTurnRequest>(), "ModelTurnRequest");
     assert_eq!(schema_title::<ModelTurnResponse>(), "ModelTurnResponse");
 }

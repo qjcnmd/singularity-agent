@@ -14,10 +14,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const DEFAULT_MAX_TOOL_CALLS: u32 = 8;
-const DEFAULT_MAX_RETRIES: u32 = 2;
 pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
-const STREAM_EVENT_PREFIX: &str = "stream_event";
 const ENV_PROVIDER: &str = "SINGULARITY_MODEL_PROVIDER";
 const ENV_MODEL: &str = "SINGULARITY_MODEL";
 const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";
@@ -186,7 +184,6 @@ pub struct ModelToolCall {
     pub raw_arguments: String,
     pub parse_status: ModelToolParseStatus,
     pub validation_errors: Vec<String>,
-    pub provider_metadata: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -230,9 +227,6 @@ pub struct ModelPreferences {
     pub top_p: Option<f32>,
     pub max_output_tokens: Option<u32>,
     pub json_mode: bool,
-    pub structured_output_schema: Option<Value>,
-    pub stream: bool,
-    pub fallback_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -393,29 +387,6 @@ impl ModelProviderStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ModelBudget {
-    pub max_input_tokens: Option<u32>,
-    pub max_output_tokens: Option<u32>,
-    pub max_total_tokens: Option<u32>,
-    pub max_retries: u32,
-    pub max_latency_ms: Option<u64>,
-    pub max_cost_estimate: Option<f64>,
-}
-
-impl Default for ModelBudget {
-    fn default() -> Self {
-        Self {
-            max_input_tokens: None,
-            max_output_tokens: None,
-            max_total_tokens: None,
-            max_retries: DEFAULT_MAX_RETRIES,
-            max_latency_ms: None,
-            max_cost_estimate: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelUsage {
     pub input_tokens: u64,
@@ -455,13 +426,6 @@ impl ModelValidationResult {
             repair_message: None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ModelRetryDecision {
-    pub retry: bool,
-    pub next_attempt: Option<u32>,
-    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -506,30 +470,20 @@ pub enum ModelErrorCategory {
 pub struct ModelError {
     pub kind: ModelErrorKind,
     pub message: String,
-    pub retryable: bool,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
-    pub raw_error_ref: Option<String>,
     pub metadata: Value,
 }
 
 impl ModelError {
     pub fn new(kind: ModelErrorKind, message: impl Into<String>) -> Self {
-        let retryable = default_retryable(&kind);
         Self {
             kind,
             message: message.into(),
-            retryable,
             provider_name: None,
             model_name: None,
-            raw_error_ref: None,
             metadata: json!({}),
         }
-    }
-
-    pub fn retryable(mut self, retryable: bool) -> Self {
-        self.retryable = retryable;
-        self
     }
 
     pub fn with_provider(mut self, provider_name: impl Into<String>) -> Self {
@@ -539,11 +493,6 @@ impl ModelError {
 
     pub fn with_model(mut self, model_name: impl Into<String>) -> Self {
         self.model_name = Some(model_name.into());
-        self
-    }
-
-    pub fn with_raw_ref(mut self, raw_error_ref: impl Into<String>) -> Self {
-        self.raw_error_ref = Some(raw_error_ref.into());
         self
     }
 
@@ -583,7 +532,6 @@ pub struct ModelTurnRequest {
     pub tools: Vec<ModelToolSchema>,
     pub tool_choice: ToolChoicePolicy,
     pub model_preferences: ModelPreferences,
-    pub budget: ModelBudget,
     pub context_metadata: Value,
     pub policy_metadata: Value,
     pub trace_metadata: Value,
@@ -610,7 +558,6 @@ impl ModelTurnRequest {
             tools: Vec::new(),
             tool_choice: ToolChoicePolicy::default(),
             model_preferences: ModelPreferences::default(),
-            budget: ModelBudget::default(),
             context_metadata: json!({}),
             policy_metadata: json!({}),
             trace_metadata: json!({}),
@@ -651,7 +598,6 @@ pub struct ModelTurnResponse {
     pub model_name: Option<String>,
     pub latency_ms: Option<u64>,
     pub trace_event_ids: Vec<String>,
-    pub raw_response_ref: Option<String>,
     pub metadata: Value,
 }
 
@@ -675,34 +621,9 @@ impl ModelTurnResponse {
             model_name: None,
             latency_ms: None,
             trace_event_ids: Vec::new(),
-            raw_response_ref: None,
             metadata: json!({}),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderStreamEventType {
-    TextDelta,
-    ToolCallDelta,
-    ToolCallCompleted,
-    UsageDelta,
-    ResponseCompleted,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ProviderStreamEvent {
-    #[serde(rename = "type")]
-    pub event_type: ProviderStreamEventType,
-    pub text_delta: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub tool_name: Option<String>,
-    pub arguments_delta: Option<String>,
-    pub usage_delta: Option<ModelUsage>,
-    pub error: Option<String>,
-    pub metadata: Value,
 }
 
 pub trait Provider {
@@ -853,8 +774,7 @@ impl Provider for OpenAiProvider {
                     status.as_u16(),
                     &self.config.provider_name,
                     &self.config.model_name,
-                )
-                .with_raw_ref(format!("provider_http_status_{}", status.as_u16())),
+                ),
             ));
         }
         let payload = block_on_provider_future(&runtime, cancellation, || response.json::<Value>())
@@ -914,7 +834,6 @@ pub fn provider_error_response(
         model_name: request.model_preferences.model_name.clone(),
         latency_ms: None,
         trace_event_ids: Vec::new(),
-        raw_response_ref: None,
         metadata: json!({}),
     }
 }
@@ -926,13 +845,6 @@ where
     let project_dir = std::env::current_dir().ok();
     let values = resolve_provider_values(get_env, project_dir.as_deref());
     provider_config_resolution(&values)
-}
-
-pub fn provider_config_from_env<F>(get_env: F) -> ModelProviderConfig
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    resolve_provider_config(get_env).config
 }
 
 fn openai_request_payload(request: &ModelTurnRequest, model_name: &str) -> Value {
@@ -1087,8 +999,7 @@ fn parse_openai_response(
                     "provider response missing choices",
                 )
                 .with_provider(config.provider_name.clone())
-                .with_model(config.model_name.clone())
-                .with_raw_ref(format!("provider_response_ref:{response_id}")),
+                .with_model(config.model_name.clone()),
             )
         })?;
     let message = choice.get("message").unwrap_or(&Value::Null);
@@ -1120,7 +1031,6 @@ fn parse_openai_response(
         model_name: Some(config.model_name.clone()),
         latency_ms: None,
         trace_event_ids: Vec::new(),
-        raw_response_ref: Some(format!("provider_response_ref:{response_id}")),
         metadata: json!({}),
     };
     let allowed_tool_names = request
@@ -1137,8 +1047,7 @@ fn parse_openai_response(
                 "provider response validation failed",
             )
             .with_provider(config.provider_name.clone())
-            .with_model(config.model_name.clone())
-            .with_raw_ref(format!("provider_response_ref:{response_id}")),
+            .with_model(config.model_name.clone()),
         );
     }
     response.validation = Some(validation);
@@ -1184,7 +1093,6 @@ fn parse_openai_tool_call(
         raw_arguments,
         parse_status,
         validation_errors,
-        provider_metadata: json!({}),
     }
 }
 
@@ -1256,23 +1164,17 @@ fn missing_provider_config_error(
     source: Option<ProviderConfigSource>,
 ) -> ProviderError {
     let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
-    ProviderError::from_model_error(
-        ModelError::new(
-            ModelErrorKind::InvalidRequest,
-            format!("required provider configuration is missing: {name} (source={source})"),
-        )
-        .retryable(false),
-    )
+    ProviderError::from_model_error(ModelError::new(
+        ModelErrorKind::InvalidRequest,
+        format!("required provider configuration is missing: {name} (source={source})"),
+    ))
 }
 
 fn provider_source_missing_error() -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(
-            ModelErrorKind::InvalidRequest,
-            "provider configuration source is missing",
-        )
-        .retryable(false),
-    )
+    ProviderError::from_model_error(ModelError::new(
+        ModelErrorKind::InvalidRequest,
+        "provider configuration source is missing",
+    ))
 }
 
 fn model_error_from_http_status(status: u16, provider_name: &str, model_name: &str) -> ModelError {
@@ -1299,30 +1201,21 @@ fn provider_transport_error(error: reqwest::Error) -> ProviderError {
     } else {
         ModelErrorKind::NetworkError
     };
-    ProviderError::from_model_error(
-        ModelError::new(kind, "provider transport failed")
-            .retryable(true)
-            .with_raw_ref("provider_transport_error"),
-    )
+    ProviderError::from_model_error(ModelError::new(kind, "provider transport failed"))
 }
 
 fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(
-            ModelErrorKind::UnknownProviderError,
-            "provider runtime initialization failed",
-        )
-        .retryable(false)
-        .with_raw_ref("provider_runtime_error"),
-    )
+    ProviderError::from_model_error(ModelError::new(
+        ModelErrorKind::UnknownProviderError,
+        "provider runtime initialization failed",
+    ))
 }
 
 fn provider_cancelled_error() -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled")
-            .retryable(false)
-            .with_raw_ref("provider_request_cancelled"),
-    )
+    ProviderError::from_model_error(ModelError::new(
+        ModelErrorKind::Cancelled,
+        "provider request cancelled",
+    ))
 }
 
 fn block_on_provider_future<C, F, T>(
@@ -1360,8 +1253,6 @@ fn provider_response_json_error() -> ModelError {
         ModelErrorKind::JsonSchemaViolation,
         "provider response was not valid JSON",
     )
-    .retryable(false)
-    .with_raw_ref("provider_json_error")
 }
 
 pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidationResult {
@@ -1507,45 +1398,6 @@ pub fn validate_model_response(
     validation_result(errors, warnings)
 }
 
-pub fn retry_decision(error: &ModelError, attempt: u32, max_retries: u32) -> ModelRetryDecision {
-    if !error.retryable {
-        return ModelRetryDecision {
-            retry: false,
-            next_attempt: None,
-            reason: Some("non_retryable_model_error".to_string()),
-        };
-    }
-    if attempt >= max_retries {
-        return ModelRetryDecision {
-            retry: false,
-            next_attempt: None,
-            reason: Some("retry_budget_exhausted".to_string()),
-        };
-    }
-    ModelRetryDecision {
-        retry: true,
-        next_attempt: Some(attempt + 1),
-        reason: Some("retryable_model_error".to_string()),
-    }
-}
-
-pub fn validate_stream_events(events: &[ProviderStreamEvent]) -> ModelValidationResult {
-    let mut errors = Vec::new();
-    let mut response_completed = false;
-    let mut seen_tool_calls = HashSet::new();
-    for (index, event) in events.iter().enumerate() {
-        if response_completed {
-            errors.push(stream_error(index, "event_after_response_completed"));
-            continue;
-        }
-        validate_stream_event(index, event, &mut errors, &mut seen_tool_calls);
-        if event.event_type == ProviderStreamEventType::ResponseCompleted {
-            response_completed = true;
-        }
-    }
-    validation_result(errors, Vec::new())
-}
-
 fn validate_tool_choice_name(
     call: &ModelToolCall,
     tool_choice: &ToolChoicePolicy,
@@ -1567,16 +1419,6 @@ fn validate_tool_choice_name(
         }
         _ => {}
     }
-}
-
-fn default_retryable(kind: &ModelErrorKind) -> bool {
-    matches!(
-        kind,
-        ModelErrorKind::NetworkError
-            | ModelErrorKind::Timeout
-            | ModelErrorKind::RateLimited
-            | ModelErrorKind::ProviderOverloaded
-    )
 }
 
 fn model_error_category(error: &ModelError) -> ModelErrorCategory {
@@ -1609,42 +1451,6 @@ fn model_error_category(error: &ModelError) -> ModelErrorCategory {
     }
 }
 
-fn validate_stream_event(
-    index: usize,
-    event: &ProviderStreamEvent,
-    errors: &mut Vec<String>,
-    seen_tool_calls: &mut HashSet<String>,
-) {
-    match event.event_type {
-        ProviderStreamEventType::TextDelta if missing(&event.text_delta) => {
-            errors.push(stream_error(index, "text_delta_required"));
-        }
-        ProviderStreamEventType::ToolCallDelta => {
-            if missing(&event.tool_call_id) {
-                errors.push(stream_error(index, "tool_call_id_required"));
-            } else if let Some(tool_call_id) = &event.tool_call_id {
-                seen_tool_calls.insert(tool_call_id.clone());
-            }
-        }
-        ProviderStreamEventType::ToolCallCompleted => {
-            if missing(&event.tool_call_id) {
-                errors.push(stream_error(index, "tool_call_id_required"));
-            } else if let Some(tool_call_id) = &event.tool_call_id
-                && !seen_tool_calls.contains(tool_call_id)
-            {
-                errors.push(stream_error(index, "tool_call_delta_required"));
-            }
-        }
-        ProviderStreamEventType::UsageDelta if event.usage_delta.is_none() => {
-            errors.push(stream_error(index, "usage_delta_required"));
-        }
-        ProviderStreamEventType::Error if missing(&event.error) => {
-            errors.push(stream_error(index, "error_required"));
-        }
-        _ => {}
-    }
-}
-
 fn validation_result(mut errors: Vec<String>, warnings: Vec<String>) -> ModelValidationResult {
     errors.sort();
     errors.dedup();
@@ -1659,10 +1465,6 @@ fn validation_result(mut errors: Vec<String>, warnings: Vec<String>) -> ModelVal
             ..ModelValidationResult::invalid(errors)
         }
     }
-}
-
-fn stream_error(index: usize, code: &str) -> String {
-    format!("{STREAM_EVENT_PREFIX}[{index}].{code}")
 }
 
 fn message_text(message: &ModelMessage) -> String {

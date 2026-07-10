@@ -2429,7 +2429,6 @@ mod tests {
             .to_string(),
             parse_status: ModelToolParseStatus::Valid,
             validation_errors: Vec::new(),
-            provider_metadata: json!({}),
         });
         let final_response =
             ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
@@ -2618,7 +2617,6 @@ mod tests {
             .to_string(),
             parse_status: ModelToolParseStatus::Valid,
             validation_errors: Vec::new(),
-            provider_metadata: json!({}),
         });
         let final_response =
             ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");

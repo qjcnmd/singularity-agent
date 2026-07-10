@@ -1480,6 +1480,23 @@ fn app_server_binary_errors_are_valid_json_rpc_lines() {
     );
 }
 
+#[test]
+fn app_server_reports_startup_errors_without_panicking() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let invalid_db_path = dir.path().join("database-directory");
+    std::fs::create_dir(&invalid_db_path).expect("create invalid database path");
+
+    let output = Command::new(app_server_bin())
+        .env("SINGULARITY_APP_SERVER_DB", &invalid_db_path)
+        .output()
+        .expect("run app-server");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("app-server error:"), "stderr={stderr}");
+    assert!(!stderr.contains("panicked at"), "stderr={stderr}");
+}
+
 struct JsonOutput {
     receiver: Receiver<serde_json::Value>,
     buffered: VecDeque<serde_json::Value>,

@@ -146,7 +146,6 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ModelToolCal
         arguments,
         parse_status: ModelToolParseStatus::Valid,
         validation_errors: Vec::new(),
-        provider_metadata: serde_json::json!({}),
     }
 }
 
