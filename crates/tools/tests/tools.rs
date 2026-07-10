@@ -707,7 +707,9 @@ fn workspace_grep_skips_symlinked_directories() {
 fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
     let workspace = test_workspace("edit-patch");
     let app = workspace.join("app.txt");
+    let other = workspace.join("other.txt");
     std::fs::write(&app, "status = old\n").expect("write app");
+    std::fs::write(&other, "other\n").expect("write other");
     std::fs::write(workspace.join(".env"), "TOKEN=secret").expect("write env");
     let tools = WorkspaceTools::new(&workspace);
 
@@ -753,7 +755,7 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
                     replacement: "changed".to_string(),
                 },
                 WorkspacePatchChange {
-                    path: "app.txt".to_string(),
+                    path: "other.txt".to_string(),
                     expected: Some("missing".to_string()),
                     replacement: "unreachable".to_string(),
                 },
@@ -766,6 +768,7 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
         Err(WorkspaceToolError::ExpectedContentMissing(_))
     ));
     assert_eq!(std::fs::read_to_string(&app).unwrap(), "status = new\n");
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "other\n");
 
     assert!(matches!(
         tools.edit(
@@ -859,6 +862,63 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
         "TOKEN=secret"
     );
 
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_patch_rejects_duplicate_canonical_targets_before_writing() {
+    let workspace = test_workspace("patch-duplicate-target");
+    let target = workspace.join("app.txt");
+    std::fs::write(&target, "before").expect("write target");
+    let tools = WorkspaceTools::new(&workspace);
+
+    let result = tools.patch(
+        WorkspacePatch {
+            changes: vec![
+                WorkspacePatchChange {
+                    path: "app.txt".to_string(),
+                    expected: Some("before".to_string()),
+                    replacement: "first".to_string(),
+                },
+                WorkspacePatchChange {
+                    path: "./app.txt".to_string(),
+                    expected: Some("before".to_string()),
+                    replacement: "second".to_string(),
+                },
+            ],
+        },
+        &ToolBrokerDecision::Allow,
+    );
+
+    assert!(matches!(result, Err(WorkspaceToolError::InvalidInput(_))));
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "before");
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_patch_uses_unique_temp_files_without_overwriting_user_files() {
+    let workspace = test_workspace("patch-unique-temp");
+    let target = workspace.join("app.txt");
+    let legacy_temp = workspace.join("app.tmp-write");
+    std::fs::write(&target, "before").expect("write target");
+    std::fs::write(&legacy_temp, "user-owned").expect("write user temp");
+    let tools = WorkspaceTools::new(&workspace);
+
+    tools
+        .patch(
+            WorkspacePatch {
+                changes: vec![WorkspacePatchChange {
+                    path: "app.txt".to_string(),
+                    expected: Some("before".to_string()),
+                    replacement: "after".to_string(),
+                }],
+            },
+            &ToolBrokerDecision::Allow,
+        )
+        .expect("patch");
+
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "after");
+    assert_eq!(std::fs::read_to_string(legacy_temp).unwrap(), "user-owned");
     remove_workspace(&workspace);
 }
 
@@ -970,6 +1030,17 @@ fn broker_ask_decision_blocks_execution_with_safe_approval_tool_result() {
 }
 
 #[test]
+fn command_tool_defaults_to_read_only_filesystem_and_denied_network() {
+    let input: CommandToolInput = serde_json::from_value(serde_json::json!({
+        "argv": ["git", "status"]
+    }))
+    .expect("command input");
+
+    assert_eq!(input.sandbox_mode(), SandboxFilesystemMode::ReadOnly);
+    assert_eq!(input.network_access(), SandboxNetworkMode::Denied);
+}
+
+#[test]
 fn workspace_command_tool_fails_closed_without_sandbox_backend() {
     let workspace = test_workspace("command-no-backend");
     let tools = WorkspaceTools::new(&workspace);
@@ -1069,6 +1140,7 @@ fn workspace_command_tool_records_audit_for_explicit_danger_full_access() {
     assert_eq!(result.metadata["audit"]["network_access"], "allowed");
     assert_eq!(result.metadata["audit"]["sandbox_backend"], "danger_audit");
     assert_eq!(result.metadata["audit"]["sandbox_enforcement"], "strict");
+    assert_eq!(result.metadata["audit"]["local_process_fallback"], false);
     assert_eq!(
         result.metadata["audit"]["command_provenance"],
         "agent_requested"
@@ -1095,8 +1167,11 @@ impl SandboxBackend for RecordingSandboxBackend {
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
-        assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
-        CommandResult::completed(&request.command_id, "command ok")
+        assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
+        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
+            self.name(),
+            singularity_tools::SandboxBackendEnforcement::Strict,
+        )
     }
 }
 
@@ -1117,7 +1192,10 @@ impl SandboxBackend for DangerAuditSandboxBackend {
             SandboxFilesystemMode::DangerFullAccess
         );
         assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
-        CommandResult::completed(&request.command_id, "command ok")
+        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
+            self.name(),
+            singularity_tools::SandboxBackendEnforcement::Strict,
+        )
     }
 }
 

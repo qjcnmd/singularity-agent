@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,8 +14,8 @@ use serde_json::{Value, json};
 use singularity_core::contains_sensitive_text;
 pub use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
-    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    WindowsRestrictedTokenSandboxBackend, command_permission_resource,
+    SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
+    WindowsSandboxBackend, command_permission_resource,
 };
 
 const TOOL_PROTOCOL_VERSION: &str = "1.0";
@@ -24,6 +26,8 @@ const TOOL_DENIED_ERROR: &str = "tool_denied";
 const TOOL_APPROVAL_REQUIRED_ERROR: &str = "approval_required";
 const TOOL_SANDBOX_UNAVAILABLE_ERROR: &str = "sandbox_unavailable";
 const WORKSPACE_MUTATION_NOT_APPROVED: &str = "workspace mutation requires allowed tool decision";
+const DUPLICATE_PATCH_TARGET: &str = "patch contains duplicate canonical target";
+const MUTATION_TEMP_FILE_ATTEMPTS: usize = 64;
 const DEFAULT_READ_MAX_CHARS: usize = 8_192;
 const DEFAULT_LIST_MAX_ENTRIES: usize = 200;
 const DEFAULT_GREP_MAX_MATCHES: usize = 200;
@@ -59,6 +63,7 @@ const PROMPT_INJECTION_MARKERS: [&str; 4] = [
     "system prompt",
 ];
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -512,6 +517,7 @@ pub enum WorkspaceToolError {
     SandboxUnavailable,
     BinaryPattern,
     ReadFailed(String),
+    RollbackFailed(String),
     ExpectedContentMissing(String),
     InvalidInput(String),
 }
@@ -526,6 +532,9 @@ impl fmt::Display for WorkspaceToolError {
             Self::SandboxUnavailable => write!(formatter, "strict sandbox backend unavailable"),
             Self::BinaryPattern => write!(formatter, "grep pattern must be valid utf-8 text"),
             Self::ReadFailed(message) => write!(formatter, "workspace tool read failed: {message}"),
+            Self::RollbackFailed(message) => {
+                write!(formatter, "workspace mutation rollback failed: {message}")
+            }
             Self::ExpectedContentMissing(path) => {
                 write!(formatter, "expected content not found in {path}")
             }
@@ -604,10 +613,17 @@ impl WorkspaceTools {
     }
 
     pub fn with_sandbox_backend(
-        mut self,
+        self,
         sandbox_backend: impl SandboxBackend + Send + Sync + 'static,
     ) -> Self {
-        self.sandbox_backend = Some(Arc::new(sandbox_backend));
+        self.with_shared_sandbox_backend(Arc::new(sandbox_backend))
+    }
+
+    pub fn with_shared_sandbox_backend(
+        mut self,
+        sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
+    ) -> Self {
+        self.sandbox_backend = Some(sandbox_backend);
         self
     }
 
@@ -721,9 +737,15 @@ impl WorkspaceTools {
             ));
         }
         let mut prepared = Vec::new();
+        let mut targets = BTreeSet::new();
         for change in &patch.changes {
             let target = self.resolve_workspace_path(&change.path, false)?;
             let relative = self.relative_path(&target);
+            if !targets.insert(target.clone()) {
+                return Err(WorkspaceToolError::InvalidInput(format!(
+                    "{DUPLICATE_PATCH_TARGET}: {relative}"
+                )));
+            }
             let original = existing_text_or_empty(&target)?;
             let updated = if let Some(expected) = &change.expected {
                 if !original.contains(expected) {
@@ -747,9 +769,13 @@ impl WorkspaceTools {
             })
             .collect::<Vec<_>>();
         for (path, _relative, _original, updated) in &prepared {
-            if let Err(error) = atomic_write(path, updated) {
-                rollback_originals(&originals);
-                return Err(error);
+            if let Err(write_error) = atomic_write(path, updated) {
+                if let Err(rollback_error) = rollback_originals(&originals) {
+                    return Err(WorkspaceToolError::RollbackFailed(format!(
+                        "write error: {write_error}; rollback error: {rollback_error}"
+                    )));
+                }
+                return Err(write_error);
             }
         }
         let changed_files = prepared
@@ -768,7 +794,7 @@ impl WorkspaceTools {
             return Err(WorkspaceToolError::SandboxUnavailable);
         };
         let capabilities = backend.capabilities();
-        if !capabilities.supports_strict_command_execution() {
+        if !capabilities.supports_command_execution() {
             return Err(WorkspaceToolError::SandboxUnavailable);
         }
         let filesystem_mode = input.sandbox_mode();
@@ -790,13 +816,15 @@ impl WorkspaceTools {
             &request.network.mode,
         );
         let result = backend.execute(&request);
+        let execution = result.sandbox.clone();
         let mut output = command_tool_output(result);
         output.metadata["result_id"] = json!(scope_digest);
         output.metadata["audit"] = json!({
             "sandbox_mode": filesystem_mode,
             "network_access": network_mode,
-            "sandbox_backend": backend.name(),
-            "sandbox_enforcement": "strict",
+            "sandbox_backend": execution.backend,
+            "sandbox_enforcement": execution.enforcement,
+            "local_process_fallback": execution.local_process_fallback,
             "command_scope_digest": scope_digest,
             "command_provenance": "agent_requested",
         });
@@ -924,7 +952,7 @@ impl CommandToolInput {
     pub fn network_access(&self) -> SandboxNetworkMode {
         self.network_access
             .clone()
-            .unwrap_or(SandboxNetworkMode::Allowed)
+            .unwrap_or(SandboxNetworkMode::Denied)
     }
 }
 
@@ -1075,12 +1103,48 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), WorkspaceToolError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io_error)?;
     }
-    let temp_path = path.with_extension("tmp-write");
-    std::fs::write(&temp_path, content).map_err(io_error)?;
+    let (temp_path, mut temp_file) = create_unique_temp_file(path)?;
+    if let Err(error) = temp_file
+        .write_all(content.as_bytes())
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(io_error(error));
+    }
+    drop(temp_file);
     std::fs::rename(&temp_path, path).map_err(|error| {
         let _ = std::fs::remove_file(&temp_path);
         io_error(error)
     })
+}
+
+fn create_unique_temp_file(path: &Path) -> Result<(PathBuf, File), WorkspaceToolError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace-file");
+    for _ in 0..MUTATION_TEMP_FILE_ATTEMPTS {
+        let sequence = MUTATION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.singularity-tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(io_error(error)),
+        }
+    }
+    Err(WorkspaceToolError::ReadFailed(format!(
+        "failed to allocate unique temporary file for {}",
+        path.display()
+    )))
 }
 
 fn existing_text_or_empty(path: &Path) -> Result<String, WorkspaceToolError> {
@@ -1091,13 +1155,26 @@ fn existing_text_or_empty(path: &Path) -> Result<String, WorkspaceToolError> {
     }
 }
 
-fn rollback_originals(originals: &[(PathBuf, String, String, bool)]) {
-    for (path, _relative, original, existed) in originals {
-        if *existed {
-            let _ = std::fs::write(path, original);
+fn rollback_originals(
+    originals: &[(PathBuf, String, String, bool)],
+) -> Result<(), WorkspaceToolError> {
+    let mut failures = Vec::new();
+    for (path, relative, original, existed) in originals {
+        let result = if *existed {
+            atomic_write(path, original)
+        } else if path.exists() {
+            std::fs::remove_file(path).map_err(io_error)
         } else {
-            let _ = std::fs::remove_file(path);
+            Ok(())
+        };
+        if let Err(error) = result {
+            failures.push(format!("{relative}: {error}"));
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(WorkspaceToolError::RollbackFailed(failures.join("; ")))
     }
 }
 

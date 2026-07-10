@@ -171,6 +171,12 @@ pub fn native_capability(available: bool, status: &str, reason: &str, blockers: 
             "status": status,
             "reason": reason,
             "blockers": blockers,
+        },
+        "providerReadiness": {
+            "source": "project_env",
+            "apiKeyPresent": true,
+            "baseUrlPresent": true,
+            "modelPresent": true,
         }
     })
 }

@@ -1,20 +1,19 @@
 use schemars::schema_for;
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
-    SandboxBackendDescriptor, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    SandboxPolicy, UnavailableSandboxBackend, WindowsRestrictedTokenSandboxBackend,
-    bound_command_output, changed_files_inside_workspace, git_diff_request, git_status_request,
-    redacted_child_env,
+    SandboxBackendDescriptor, SandboxBackendEnforcement, SandboxCapabilities,
+    SandboxFilesystemMode, SandboxNetworkMode, SandboxPolicy, UnavailableSandboxBackend,
+    WindowsSandboxBackend, bound_command_output, changed_files_inside_workspace, git_diff_request,
+    git_status_request, redacted_child_env,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
 
 const SANDBOX_SRC: &str = include_str!("../src/lib.rs");
-const FORBIDDEN_LOCAL_PROCESS_SURFACES: [&str; 12] = [
+const FORBIDDEN_LOCAL_PROCESS_SURFACES: [&str; 11] = [
     "CommandExecutor",
     "PatchExecutor",
     "ProcessManager",
-    "local_process",
     "run_local",
     "capture_pipe",
     "kill_process_tree",
@@ -187,12 +186,12 @@ fn patch_schema_objects_are_snapshotted() {
 
 #[test]
 fn sandbox_backend_descriptor_is_a_serializable_contract() {
-    let descriptor = SandboxBackendDescriptor::strict("windows_restricted_token");
+    let descriptor = SandboxBackendDescriptor::strict("windows_elevated");
     let value = serde_json::to_value(&descriptor).expect("serialize backend descriptor");
     let schema = schema_for!(SandboxBackendDescriptor);
     let schema_text = serde_json::to_string(&schema).expect("serialize schema");
 
-    assert_eq!(value["backend"], "windows_restricted_token");
+    assert_eq!(value["backend"], "windows_elevated");
     assert_eq!(value["enforcement"], "strict");
     assert!(!schema_text.contains("reduced"));
     assert!(value["capabilities"]["restricted_token"].as_bool().unwrap());
@@ -208,9 +207,22 @@ fn sandbox_backend_descriptor_is_a_serializable_contract() {
 }
 
 #[test]
-fn sandbox_capabilities_distinguish_strict_command_execution_support() {
-    assert!(SandboxCapabilities::strict().supports_strict_command_execution());
-    assert!(!SandboxCapabilities::unavailable().supports_strict_command_execution());
+fn sandbox_capabilities_report_actual_enforcement_strength() {
+    assert!(SandboxCapabilities::strict().supports_command_execution());
+    assert_eq!(
+        SandboxCapabilities::strict().enforcement(),
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(SandboxCapabilities::restricted_token().supports_command_execution());
+    assert_eq!(
+        SandboxCapabilities::restricted_token().enforcement(),
+        SandboxBackendEnforcement::RestrictedToken
+    );
+    assert!(!SandboxCapabilities::unavailable().supports_command_execution());
+    assert_eq!(
+        SandboxCapabilities::unavailable().enforcement(),
+        SandboxBackendEnforcement::Unavailable
+    );
 }
 
 #[test]
@@ -322,402 +334,185 @@ fn unavailable_sandbox_backend_fails_closed_without_spawning() {
 
 #[cfg(windows)]
 #[test]
-fn windows_restricted_token_backend_captures_output_with_controlled_process() {
+fn windows_backend_reports_strict_maximum_capabilities() {
+    let backend = WindowsSandboxBackend::new();
+
+    assert_eq!(backend.name(), "windows");
+    assert_eq!(
+        backend.capabilities().enforcement(),
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(backend.capabilities().filesystem_isolation);
+    assert!(backend.capabilities().network_isolation);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_backend_denies_sensitive_cwd_before_execution() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let sensitive = workspace.path().join(".ssh");
+    std::fs::create_dir(&sensitive).expect("sensitive dir");
+    let request = CommandRequest::project_verification(
+        "command_sensitive_cwd",
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo denied".to_string(),
+        ],
+        path_str(&sensitive),
+        path_str(workspace.path()),
+    );
+
+    let result = WindowsSandboxBackend::new().execute(&request);
+
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::PolicyDenied
+    );
+    assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
+    assert_eq!(result.sandbox.backend, "windows");
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Unavailable
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_backend_denies_parent_traversal_before_execution() {
     let workspace = tempfile::tempdir().expect("workspace");
     let request = CommandRequest::project_verification(
-        "command_echo",
+        "command_parent_escape",
         vec![
             "cmd.exe".to_string(),
             "/C".to_string(),
-            "echo sandbox-ok".to_string(),
+            "type ..\\outside.txt".to_string(),
         ],
         path_str(workspace.path()),
         path_str(workspace.path()),
     );
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
 
-    let result = backend.execute(&request);
-
-    assert_eq!(backend.name(), "windows_restricted_token");
-    assert!(backend.capabilities().restricted_token);
-    assert!(backend.capabilities().job_object);
-    assert!(backend.capabilities().path_admission);
-    assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
-    assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
-    assert_eq!(result.exit_code, Some(0));
-    assert!(result.stdout_preview.contains("sandbox-ok"));
-    assert!(result.redacted);
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_runs_cmd_from_verbatim_cwd() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let workspace_path = path_str(workspace.path());
-    let verbatim_workspace = format!(r"\\?\{workspace_path}");
-    let request = CommandRequest::project_verification(
-        "command_verbatim_cwd",
-        vec!["cmd.exe".to_string(), "/C".to_string(), "cd".to_string()],
-        verbatim_workspace.clone(),
-        verbatim_workspace,
-    );
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
-    assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
-    assert!(result.stdout_preview.contains(workspace_path));
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_times_out_and_kills_job() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let mut request = CommandRequest::project_verification(
-        "command_timeout",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "ping -n 6 127.0.0.1 >NUL".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    request.timeout_seconds = 1;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(result.execution_status, CommandExecutionStatus::TimedOut);
-    assert_eq!(result.semantic_status, CommandSemanticStatus::TimedOut);
-    assert!(result.timed_out);
-    assert!(result.stderr_preview.contains("timed out"));
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_denies_sensitive_cwd_before_spawn() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let secret_dir = workspace.path().join(".ssh");
-    std::fs::create_dir(&secret_dir).expect("secret dir");
-    let mut request = CommandRequest::project_verification(
-        "command_denied",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo should-not-run".to_string(),
-        ],
-        path_str(&secret_dir),
-        path_str(workspace.path()),
-    );
-    request.filesystem.mode = SandboxFilesystemMode::ReadOnly;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
+    let result = WindowsSandboxBackend::new().execute(&request);
 
     assert_eq!(
         result.execution_status,
         CommandExecutionStatus::PolicyDenied
     );
     assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
-    assert!(result.stdout_preview.is_empty());
-    assert!(!result.stderr_preview.contains(".ssh"));
 }
 
 #[cfg(windows)]
 #[test]
-fn windows_restricted_token_backend_denies_write_allowlist_escape() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let outside = tempfile::tempdir().expect("outside");
-    let mut request = CommandRequest::project_verification(
-        "command_denied",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo ok".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    request.filesystem.writable_paths = vec![path_str(outside.path()).to_string()];
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(
-        result.execution_status,
-        CommandExecutionStatus::PolicyDenied
-    );
-    assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
-    assert!(result.stderr_preview.contains("outside workspace"));
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_denies_shell_parent_traversal_before_spawn() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let outside = tempfile::tempdir().expect("outside");
-    let outside_file = outside.path().join("outside.txt");
-    std::fs::write(&outside_file, "outside-secret").expect("outside file");
-    let mut request = CommandRequest::project_verification(
-        "command_denied",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            format!("type {}", outside_file.display()),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    request.filesystem.mode = SandboxFilesystemMode::ReadOnly;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(
-        result.execution_status,
-        CommandExecutionStatus::PolicyDenied
-    );
-    assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
-    assert!(result.stderr_preview.contains("outside workspace"));
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_denies_workspace_symlink_escape_before_spawn() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let outside = tempfile::tempdir().expect("outside");
-    let outside_file = outside.path().join("outside.txt");
-    std::fs::write(&outside_file, "outside-secret").expect("outside file");
-    let link = workspace.path().join("link_to_outside.txt");
-    if std::os::windows::fs::symlink_file(&outside_file, &link).is_err() {
-        return;
-    }
-    let request = CommandRequest::project_verification(
-        "command_denied",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "type link_to_outside.txt".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(
-        result.execution_status,
-        CommandExecutionStatus::PolicyDenied
-    );
-    assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
-    assert!(result.stderr_preview.contains("outside workspace"));
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_denies_sensitive_shell_path_before_spawn() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let request = CommandRequest::project_verification(
-        "command_denied",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "type %USERPROFILE%\\.ssh\\id_rsa".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(
-        result.execution_status,
-        CommandExecutionStatus::PolicyDenied
-    );
-    assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
-    assert!(!result.stderr_preview.contains("id_rsa"));
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_denies_read_only_redirection_before_spawn() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let written = workspace.path().join("write.txt");
-    let mut request = CommandRequest::project_verification(
-        "command_denied",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo should-not-write > write.txt".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    request.filesystem.mode = SandboxFilesystemMode::ReadOnly;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(
-        result.execution_status,
-        CommandExecutionStatus::PolicyDenied
-    );
-    assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
-    assert!(!written.exists());
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_blocks_programmatic_workspace_write_in_read_only_mode() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let written = workspace.path().join("py_write.txt");
-    let request = CommandRequest::project_verification(
-        "command_write",
-        vec![
-            python_bin(),
-            "-c".to_string(),
-            "open('py_write.txt','w').write('x')".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    let mut request = request;
-    request.filesystem.mode = SandboxFilesystemMode::ReadOnly;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_ne!(result.semantic_status, CommandSemanticStatus::Succeeded);
-    assert!(!written.exists());
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_allows_explicit_network_allowed_mode() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let mut request = CommandRequest::project_verification(
-        "command_network_allowed",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo network-mode-ok".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    request.network.mode = SandboxNetworkMode::Allowed;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
-    assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
-    assert!(result.stdout_preview.contains("network-mode-ok"));
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_marks_network_denied_mode_unsupported() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let mut request = CommandRequest::project_verification(
-        "command_network_denied",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo should-not-run".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    request.network.mode = SandboxNetworkMode::Denied;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(result.execution_status, CommandExecutionStatus::Unsupported);
-    assert_eq!(result.semantic_status, CommandSemanticStatus::Unsupported);
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_marks_network_allowlist_mode_unsupported() {
+fn windows_backend_rejects_network_allowlist_without_execution() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut request = CommandRequest::project_verification(
         "command_network_allowlist",
         vec![
             "cmd.exe".to_string(),
             "/C".to_string(),
-            "echo should-not-run".to_string(),
+            "echo denied".to_string(),
         ],
         path_str(workspace.path()),
         path_str(workspace.path()),
     );
     request.network.mode = SandboxNetworkMode::Allowlist;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
 
-    let result = backend.execute(&request);
+    let result = WindowsSandboxBackend::new().execute(&request);
 
-    assert_eq!(result.execution_status, CommandExecutionStatus::Unsupported);
-    assert_eq!(result.semantic_status, CommandSemanticStatus::Unsupported);
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_restricted_token_backend_allows_programmatic_workspace_write_in_workspace_write_mode() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let written = workspace.path().join("py_write.txt");
-    let mut request = CommandRequest::project_verification(
-        "command_workspace_write",
-        vec![
-            python_bin(),
-            "-c".to_string(),
-            "open('py_write.txt','w').write('x')".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::BackendError
     );
-    request.filesystem.mode = SandboxFilesystemMode::WorkspaceWrite;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
-
-    let result = backend.execute(&request);
-
-    assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
-    assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
-    assert!(written.exists());
+    assert!(result.stderr_preview.contains("allowlist"));
+    assert!(!result.sandbox.local_process_fallback);
 }
 
 #[cfg(windows)]
 #[test]
-fn windows_restricted_token_backend_executes_danger_full_access_with_job_and_capture() {
+fn windows_backend_rejects_danger_full_access_without_implicit_fallback() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut request = CommandRequest::project_verification(
         "command_danger",
         vec![
             "cmd.exe".to_string(),
             "/C".to_string(),
-            "echo danger-mode-ok".to_string(),
+            "echo denied".to_string(),
         ],
         path_str(workspace.path()),
         path_str(workspace.path()),
     );
     request.filesystem.mode = SandboxFilesystemMode::DangerFullAccess;
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
 
-    let result = backend.execute(&request);
+    let result = WindowsSandboxBackend::new().execute(&request);
 
-    assert!(backend.capabilities().job_object);
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::BackendError
+    );
+    assert!(result.stderr_preview.contains("danger-full-access"));
+    assert!(!result.sandbox.local_process_fallback);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_backend_rejects_custom_root_lists_instead_of_silently_ignoring_them() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut request = CommandRequest::project_verification(
+        "command_custom_roots",
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo denied".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request
+        .filesystem
+        .readonly_paths
+        .push(path_str(workspace.path()).to_string());
+
+    let result = WindowsSandboxBackend::new().execute(&request);
+
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::BackendError
+    );
+    assert!(result.stderr_preview.contains("custom writable_paths"));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_elevated_backend_executes_network_denied_command() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut request = CommandRequest::project_verification(
+        "command_elevated",
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo windows-elevated-ok".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request.network.mode = SandboxNetworkMode::Denied;
+
+    let result = WindowsSandboxBackend::new().execute(&request);
+
     assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
     assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
-    assert!(result.stdout_preview.contains("danger-mode-ok"));
+    assert_eq!(result.sandbox.backend, "windows_elevated");
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result.sandbox.local_process_fallback);
 }
 
 #[cfg(not(windows))]
 #[test]
-fn windows_restricted_token_backend_is_unavailable_off_windows() {
+fn windows_backend_is_unavailable_off_windows() {
     let workspace = tempfile::tempdir().expect("workspace");
     let request = CommandRequest::project_verification(
         "command_echo",
@@ -725,12 +520,12 @@ fn windows_restricted_token_backend_is_unavailable_off_windows() {
         path_str(workspace.path()),
         path_str(workspace.path()),
     );
-    let backend = WindowsRestrictedTokenSandboxBackend::new();
+    let backend = WindowsSandboxBackend::new();
 
     let result = backend.execute(&request);
 
-    assert_eq!(backend.name(), "windows_restricted_token");
-    assert!(!backend.capabilities().supports_strict_command_execution());
+    assert_eq!(backend.name(), "windows");
+    assert!(!backend.capabilities().supports_command_execution());
     assert_eq!(
         result.execution_status,
         CommandExecutionStatus::BackendError
@@ -740,9 +535,4 @@ fn windows_restricted_token_backend_is_unavailable_off_windows() {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
-}
-
-#[cfg(windows)]
-fn python_bin() -> String {
-    std::env::var("PYTHON").unwrap_or_else(|_| "python".to_string())
 }

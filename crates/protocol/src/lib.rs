@@ -361,10 +361,21 @@ pub struct TurnStartResult {
     pub turn: Turn,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderReadiness {
+    pub source: Option<String>,
+    pub api_key_present: bool,
+    pub base_url_present: bool,
+    pub model_present: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentCapabilityResult {
     #[serde(rename = "nativeAgentLoop")]
     pub native_agent_loop: Value,
+    #[serde(rename = "providerReadiness")]
+    pub provider_readiness: ProviderReadiness,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -549,7 +560,7 @@ impl TraceEvent {
             transaction_id: None,
             verification_id: None,
             span_id: None,
-            redaction_applied: true,
+            redaction_applied: false,
             payload_hash: String::new(),
         }
     }

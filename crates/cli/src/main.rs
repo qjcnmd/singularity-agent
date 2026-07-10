@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use singularity_core::ClientInfo;
-use singularity_model::resolve_provider_config;
 use singularity_protocol::{InitializeParams, JsonRpcMessage, Method};
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
@@ -26,9 +25,6 @@ const EVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const PROVIDER_API_KEY_ENV: &str = "SINGULARITY_API_KEY";
-const PROVIDER_BASE_URL_ENV: &str = "SINGULARITY_BASE_URL";
-const PROVIDER_MODEL_ENV: &str = "SINGULARITY_MODEL";
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
@@ -273,7 +269,6 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             println!("app_server_db={}", app_server_db_display());
             println!("client=protocol-only");
             print_readiness()?;
-            print_redacted_provider_status();
             Ok(())
         }
         Command::Eval {
@@ -330,21 +325,27 @@ fn print_readiness() -> Result<(), String> {
         native["status"].as_str().unwrap_or("unknown")
     );
     println!("evaluation=rust_native");
-    Ok(())
+    print_provider_readiness(&capability["providerReadiness"])
 }
 
-fn print_redacted_provider_status() {
-    let resolution = resolve_provider_config(|name| std::env::var(name).ok());
-    let source = resolution
-        .source
-        .map(|source| source.as_str())
-        .unwrap_or("unconfigured");
+fn print_provider_readiness(provider: &Value) -> Result<(), String> {
+    let source = match provider["source"].as_str() {
+        Some("process_env") => "process_env",
+        Some("project_env") => "project_env",
+        None if provider["source"].is_null() => "unconfigured",
+        _ => {
+            return Err("invalid agent capability: providerReadiness.source".to_string());
+        }
+    };
     println!("provider_config_source={source}");
-    for (name, present) in [
-        (PROVIDER_API_KEY_ENV, resolution.config.api_key_present),
-        (PROVIDER_BASE_URL_ENV, resolution.config.base_url_present),
-        (PROVIDER_MODEL_ENV, resolution.config.model_name.is_some()),
+    for (name, field) in [
+        ("SINGULARITY_API_KEY", "apiKeyPresent"),
+        ("SINGULARITY_BASE_URL", "baseUrlPresent"),
+        ("SINGULARITY_MODEL", "modelPresent"),
     ] {
+        let present = provider[field]
+            .as_bool()
+            .ok_or_else(|| format!("invalid agent capability: providerReadiness.{field}"))?;
         let status = if present {
             "present(redacted)"
         } else {
@@ -352,6 +353,7 @@ fn print_redacted_provider_status() {
         };
         println!("{name}={status}");
     }
+    Ok(())
 }
 
 fn run_eval(manifest: PathBuf, run_id: &str, json_output: bool) -> Result<(), String> {

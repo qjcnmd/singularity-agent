@@ -22,7 +22,6 @@ harness = false
 clap.workspace = true
 serde_json.workspace = true
 singularity_core = { path = "../core" }
-singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }
 
 [dev-dependencies]

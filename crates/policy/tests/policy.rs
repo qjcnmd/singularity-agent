@@ -1,7 +1,8 @@
 use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecision,
-    PermissionDecisionOutcome, PermissionOperation, PermissionProfile, PermissionProfileName,
-    PermissionRequest, PermissionRule, PolicyEngine, PreToolUseHook, SettingsScope,
+    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess,
+    PermissionDecision, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
+    PermissionProfileName, PermissionRequest, PermissionRule, PolicyEngine, PreToolUseHook,
+    SettingsScope,
 };
 
 fn rule(
@@ -34,6 +35,58 @@ fn permission_profile_and_approval_objects_keep_wire_names() {
     assert_eq!(profile.profile, PermissionProfileName::WorkspaceWrite);
     assert_eq!(decision.outcome, ApprovalOutcome::Deny);
     assert_eq!(decision.reason, "protected path");
+}
+
+#[test]
+fn denied_profile_network_cannot_be_enabled_by_permission_rule() {
+    let profile = PermissionProfile::workspace_write("C:/repo");
+    let decision = PolicyEngine::new(profile)
+        .with_rule(rule(
+            "allow_network",
+            SettingsScope::Managed,
+            PermissionDecisionOutcome::Allow,
+            PermissionOperation::Network,
+            "command:curl https://example.com",
+        ))
+        .evaluate(&PermissionRequest::new(
+            "builtin.command",
+            PermissionOperation::Network,
+            "command:curl https://example.com",
+        ));
+
+    assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.rule_id, None);
+    assert_eq!(
+        decision.reason,
+        "network access is denied by the permission profile"
+    );
+}
+
+#[test]
+fn allowed_profile_network_still_requires_a_matching_rule() {
+    let mut profile = PermissionProfile::workspace_write("C:/repo");
+    profile.network_access = NetworkAccess::Allowed;
+    let engine = PolicyEngine::new(profile).with_rule(rule(
+        "allow_network",
+        SettingsScope::Project,
+        PermissionDecisionOutcome::Allow,
+        PermissionOperation::Network,
+        "command:curl https://example.com",
+    ));
+
+    let allowed = engine.evaluate(&PermissionRequest::new(
+        "builtin.command",
+        PermissionOperation::Network,
+        "command:curl https://example.com",
+    ));
+    let unmatched = engine.evaluate(&PermissionRequest::new(
+        "builtin.command",
+        PermissionOperation::Network,
+        "command:curl https://other.example",
+    ));
+
+    assert_eq!(allowed.outcome, PermissionDecisionOutcome::Allow);
+    assert_eq!(unmatched.outcome, PermissionDecisionOutcome::Ask);
 }
 
 #[test]

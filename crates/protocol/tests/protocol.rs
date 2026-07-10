@@ -1,8 +1,8 @@
 use singularity_core::ClientInfo;
 use singularity_protocol::{
     AppEvent, ArtifactFetchParams, ArtifactRef, EventSubscribeParams, InitializeParams, ItemKind,
-    JsonRpcMessage, Method, ThreadIdParams, ThreadStartParams, TraceListParams, TraceShowParams,
-    TraceTailParams, TurnIdParams, TurnStartParams,
+    JsonRpcMessage, Method, ProviderReadiness, ThreadIdParams, ThreadStartParams, TraceListParams,
+    TraceShowParams, TraceTailParams, TurnIdParams, TurnStartParams,
 };
 
 #[test]
@@ -173,6 +173,35 @@ fn item_kind_uses_codex_style_wire_names() {
     assert_eq!(
         serde_json::to_value(ItemKind::McpToolCall).unwrap(),
         "mcpToolCall"
+    );
+}
+
+#[test]
+fn new_trace_is_unredacted_until_the_store_sanitizes_it() {
+    let trace =
+        singularity_protocol::TraceEvent::new("trace_1", "run_1", "session_1", "test", "summary");
+
+    assert!(!trace.redaction_applied);
+    assert!(trace.payload_hash.is_empty());
+}
+
+#[test]
+fn provider_readiness_uses_camel_case_redacted_wire_fields() {
+    let readiness = ProviderReadiness {
+        source: Some("process_env".to_string()),
+        api_key_present: true,
+        base_url_present: false,
+        model_present: true,
+    };
+
+    assert_eq!(
+        serde_json::to_value(readiness).unwrap(),
+        serde_json::json!({
+            "source": "process_env",
+            "apiKeyPresent": true,
+            "baseUrlPresent": false,
+            "modelPresent": true
+        })
     );
 }
 

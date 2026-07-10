@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
@@ -12,26 +13,27 @@ use singularity_agent::{
 use singularity_core::{
     ErrorCode, ProjectInstructionError, contains_sensitive_text, load_project_instructions_from_cwd,
 };
-use singularity_model::{OpenAiProvider, Provider};
+use singularity_model::{OpenAiProvider, Provider, resolve_provider_config};
 use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecisionOutcome,
-    PermissionOperation, PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
+    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess,
+    PermissionDecisionOutcome, PermissionOperation, PermissionProfile, PermissionRule,
+    PolicyEngine, SettingsScope,
 };
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams,
     ArtifactFetchResult, EvalRunParams, EvalRunResult, EventSubscribeParams, EventSubscribeResult,
-    InitializeParams, InitializeResult, JsonRpcMessage, Method, ServerCapabilitiesResult, Thread,
-    ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
-    ThreadResult, ThreadStartParams, ThreadStartResult, TraceEvent, TraceListParams,
-    TraceListResult, TraceShowParams, TraceTailParams, TransportCapability, Turn, TurnIdParams,
-    TurnInterruptResult, TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
+    InitializeParams, InitializeResult, JsonRpcMessage, Method, ProviderReadiness,
+    ServerCapabilitiesResult, Thread, ThreadDeleteResult, ThreadForkParams, ThreadForkResult,
+    ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult,
+    TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceTailParams,
+    TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
+    TurnStartResult, TurnStatus,
 };
 use singularity_store::{SessionStore, StoreError};
 use singularity_tools::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, CommandToolInput,
     SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolRegistry, ToolSpec,
-    WindowsRestrictedTokenSandboxBackend, WorkspaceTools, command_scope_digest,
-    command_scope_resource,
+    WindowsSandboxBackend, WorkspaceTools, command_scope_digest, command_scope_resource,
 };
 use thiserror::Error;
 
@@ -85,6 +87,7 @@ pub struct AppServer {
     initialized_acknowledged: bool,
     event_filter: Option<Vec<String>>,
     shutdown_requested: bool,
+    sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
 }
 
 impl AppServer {
@@ -95,7 +98,16 @@ impl AppServer {
             initialized_acknowledged: false,
             event_filter: None,
             shutdown_requested: false,
+            sandbox_backend: Arc::new(WindowsSandboxBackend::new()),
         }
+    }
+
+    pub fn with_sandbox_backend(
+        mut self,
+        sandbox_backend: impl SandboxBackend + Send + Sync + 'static,
+    ) -> Self {
+        self.sandbox_backend = Arc::new(sandbox_backend);
+        self
     }
 
     pub fn shutdown_requested(&self) -> bool {
@@ -354,6 +366,7 @@ impl AppServer {
             message.id,
             AgentCapabilityResult {
                 native_agent_loop: serde_json::to_value(AgentLoopCapability::current())?,
+                provider_readiness: current_provider_readiness(),
             },
         )
     }
@@ -546,7 +559,10 @@ impl AppServer {
             }
         };
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-            .with_workspace_tools(native_workspace_tools(workspace_root))
+            .with_workspace_tools(native_workspace_tools(
+                workspace_root,
+                Arc::clone(&self.sandbox_backend),
+            ))
             .resume_pending_tool_call(&loop_input, &pending);
         let mut run_status = result.to_run_status(&loop_input);
         if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
@@ -587,7 +603,10 @@ impl AppServer {
             loop_input = loop_input.with_approval_grant(grant);
         }
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-            .with_workspace_tools(native_workspace_tools(workspace_root))
+            .with_workspace_tools(native_workspace_tools(
+                workspace_root,
+                Arc::clone(&self.sandbox_backend),
+            ))
             .run(&loop_input);
         let pending_by_request = result
             .pending_tool_calls
@@ -997,7 +1016,7 @@ fn pending_command_audit_metadata(pending_tool_call: Option<&Value>) -> Option<V
     }
     let mut audit = json!({
         "sandbox_backend": "not_executed",
-        "sandbox_enforcement": "strict",
+        "sandbox_enforcement": "not_executed",
     });
     let Some(raw_arguments) = raw_arguments else {
         audit["sandbox_mode"] = json!("unknown");
@@ -1056,9 +1075,11 @@ fn native_workspace_root(thread: &Thread) -> PathBuf {
         .unwrap_or_else(|| ".".into())
 }
 
-fn native_workspace_tools(workspace_root: PathBuf) -> WorkspaceTools {
-    WorkspaceTools::new(workspace_root)
-        .with_sandbox_backend(WindowsRestrictedTokenSandboxBackend::new())
+fn native_workspace_tools(
+    workspace_root: PathBuf,
+    sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
+) -> WorkspaceTools {
+    WorkspaceTools::new(workspace_root).with_shared_sandbox_backend(sandbox_backend)
 }
 
 fn native_loop_input(
@@ -1151,7 +1172,7 @@ fn run_native_eval_blocked_by_capability(params: &EvalRunParams, tasks: &[Value]
     }
 }
 
-fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &PathBuf) -> Value {
+fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &Path) -> Value {
     let task_id = eval_task_id(task);
     if let Err(error) = validate_eval_workspace(task) {
         return blocked_eval_task_result(task, EVAL_WORKSPACE_BLOCKER, error);
@@ -1203,13 +1224,13 @@ fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &PathBuf) -> Value 
             task,
             &agent_result,
             changed_files,
-            false,
-            false,
             Some(EVAL_WORKSPACE_BLOCKER),
             Some(error),
-            json!({"passed": false, "status": "not_run"}),
-            json!({"passed": false, "status": "not_run"}),
-            blocked_smoke_check_payload(task),
+            EvalTaskChecks {
+                public: json!({"passed": false, "status": "not_run"}),
+                hidden: json!({"passed": false, "status": "not_run"}),
+                smoke: blocked_smoke_check_payload(task),
+            },
         );
     }
     let public_check = run_verification(task, &workspace, "public_verification_command")
@@ -1241,17 +1262,17 @@ fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &PathBuf) -> Value 
         task,
         &agent_result,
         changed_files,
-        public_passed,
-        hidden_passed,
         blocker,
         agent_result.error.clone(),
-        public_check,
-        hidden_check,
-        smoke_check,
+        EvalTaskChecks {
+            public: public_check,
+            hidden: hidden_check,
+            smoke: smoke_check,
+        },
     )
 }
 
-fn prepare_eval_workspace(task: &Value, run_dir: &PathBuf) -> Result<EvalWorkspace, String> {
+fn prepare_eval_workspace(task: &Value, run_dir: &Path) -> Result<EvalWorkspace, String> {
     let task_dir = run_dir.join(safe_path_segment(&eval_task_id(task)));
     if task_dir.exists() {
         std::fs::remove_dir_all(&task_dir).map_err(|error| error.to_string())?;
@@ -1352,7 +1373,7 @@ fn run_prepare_commands(task: &Value, workspace: &EvalWorkspace) -> Result<(), S
             workspace,
             command,
             EVAL_PREPARE_TIMEOUT_SECONDS,
-            SandboxNetworkMode::Allowed,
+            eval_network_mode(task),
             SandboxFilesystemMode::WorkspaceWrite,
         );
         ensure_command_success(&result, "prepare command")?;
@@ -1370,7 +1391,7 @@ fn run_verification(task: &Value, workspace: &EvalWorkspace, field: &str) -> Opt
         workspace,
         command,
         timeout,
-        SandboxNetworkMode::Allowed,
+        eval_network_mode(task),
         SandboxFilesystemMode::WorkspaceWrite,
     );
     Some(command_check_payload(result))
@@ -1497,7 +1518,7 @@ fn run_eval_command(
     request.timeout_seconds = timeout_seconds;
     request.network.mode = network_mode;
     request.filesystem.mode = filesystem_mode;
-    WindowsRestrictedTokenSandboxBackend::new().execute(&request)
+    WindowsSandboxBackend::new().execute(&request)
 }
 
 fn ensure_command_success(result: &CommandResult, label: &str) -> Result<(), String> {
@@ -1552,26 +1573,30 @@ fn run_smoke_check(
         &workspace.repo_dir,
         argv,
         timeout,
-        SandboxNetworkMode::Allowed,
+        eval_network_mode(task),
         SandboxFilesystemMode::WorkspaceWrite,
     ));
     payload["source"] = json!("eval_runner_command");
     payload
 }
 
+struct EvalTaskChecks {
+    public: Value,
+    hidden: Value,
+    smoke: Value,
+}
+
 fn eval_task_result(
     task: &Value,
     agent_result: &singularity_agent::AgentLoopResult,
     changed_files: Vec<String>,
-    public_passed: bool,
-    hidden_passed: bool,
     blocker: Option<&str>,
     error: Option<String>,
-    public_check: Value,
-    hidden_check: Value,
-    smoke_check: Value,
+    checks: EvalTaskChecks,
 ) -> Value {
-    let smoke_command_satisfied = smoke_check.get("passed").and_then(Value::as_bool) == Some(true);
+    let public_passed = checks.public.get("passed").and_then(Value::as_bool) == Some(true);
+    let hidden_passed = checks.hidden.get("passed").and_then(Value::as_bool) == Some(true);
+    let smoke_command_satisfied = checks.smoke.get("passed").and_then(Value::as_bool) == Some(true);
     let evaluation_passed = blocker.is_none()
         && agent_result.completed
         && public_passed
@@ -1594,9 +1619,9 @@ fn eval_task_result(
         "tool_calls": agent_result.tool_calls,
         "approval_count": agent_result.approval_count,
         "checks": {
-            "public": public_check,
-            "hidden": hidden_check,
-            "smoke": smoke_check,
+            "public": checks.public,
+            "hidden": checks.hidden,
+            "smoke": checks.smoke,
         }
     })
 }
@@ -1651,7 +1676,7 @@ fn expected_smoke_command_result_id(task: &Value) -> Option<String> {
     Some(command_scope_digest(
         &argv,
         &SandboxFilesystemMode::WorkspaceWrite,
-        &SandboxNetworkMode::Allowed,
+        &eval_network_mode(task),
     ))
 }
 
@@ -1664,8 +1689,18 @@ fn expected_smoke_command_resource(task: &Value) -> Option<String> {
     Some(command_scope_resource(
         &argv,
         &SandboxFilesystemMode::WorkspaceWrite,
-        &SandboxNetworkMode::Allowed,
+        &eval_network_mode(task),
     ))
+}
+
+fn eval_network_mode(task: &Value) -> SandboxNetworkMode {
+    match task
+        .pointer("/strategy/network_access")
+        .and_then(Value::as_str)
+    {
+        Some("allowed") => SandboxNetworkMode::Allowed,
+        _ => SandboxNetworkMode::Denied,
+    }
 }
 
 fn parse_smoke_command_argv(command: &str) -> Option<Vec<String>> {
@@ -1731,16 +1766,21 @@ fn blocked_smoke_check_payload(task: &Value) -> Value {
 }
 
 fn native_eval_workspace_tools(workspace_root: PathBuf, _task: &Value) -> WorkspaceTools {
-    WorkspaceTools::new(workspace_root)
-        .with_sandbox_backend(WindowsRestrictedTokenSandboxBackend::new())
+    WorkspaceTools::new(workspace_root).with_sandbox_backend(WindowsSandboxBackend::new())
 }
 
 fn native_eval_policy(workspace_root: String, task: &Value) -> PolicyEngine {
     let mut profile = PermissionProfile::workspace_write(workspace_root);
     profile.approval_policy = ApprovalPolicy::Never;
+    if eval_network_mode(task) == SandboxNetworkMode::Allowed {
+        profile.network_access = NetworkAccess::Allowed;
+    }
     let mut policy = PolicyEngine::new(profile).with_rule(native_read_tool_rule());
     if let Some(resource) = expected_smoke_command_resource(task) {
-        policy = policy.with_rule(native_execute_tool_rule(resource));
+        policy = policy.with_rule(native_execute_tool_rule(resource.clone()));
+        if eval_network_mode(task) != SandboxNetworkMode::Denied {
+            policy = policy.with_rule(native_network_tool_rule(resource));
+        }
     }
     if let Some(paths) = task.get("allowed_paths").and_then(Value::as_array) {
         for (index, path) in paths.iter().filter_map(Value::as_str).enumerate() {
@@ -1776,6 +1816,16 @@ fn native_execute_tool_rule(resource: String) -> PermissionRule {
     .for_resource(resource)
 }
 
+fn native_network_tool_rule(resource: String) -> PermissionRule {
+    PermissionRule::new(
+        "allow_native_eval_command_network",
+        SettingsScope::Project,
+        PermissionDecisionOutcome::Allow,
+    )
+    .for_operation(PermissionOperation::Network)
+    .for_resource(resource)
+}
+
 fn eval_agent_prompt(task: &Value) -> String {
     let mut parts = Vec::new();
     if let Some(user_task) = task.get("user_task").and_then(Value::as_str) {
@@ -1793,11 +1843,7 @@ fn eval_agent_prompt(task: &Value) -> String {
     }
     if let Some(command) = task.get("smoke_command").and_then(Value::as_str) {
         let instruction = if let Some(argv) = parse_smoke_command_argv(command.trim()) {
-            let payload = json!({
-                "argv": argv,
-                "sandbox_mode": "workspace_write",
-                "network_access": "allowed",
-            });
+            let payload = json!({"argv": argv});
             format!(
                 "Before the final answer, call the command tool exactly once with these arguments: {payload}. The evaluation fails if this command tool result is missing."
             )
@@ -1839,7 +1885,7 @@ fn summary_requirement_satisfied(task: &Value, final_answer: Option<&str>) -> bo
         .unwrap_or(false)
 }
 
-fn write_eval_workspace_file(root: &PathBuf, relative: &str, content: &str) -> Result<(), String> {
+fn write_eval_workspace_file(root: &Path, relative: &str, content: &str) -> Result<(), String> {
     if relative.contains("..") || relative.starts_with('/') || relative.starts_with('\\') {
         return Err(format!(
             "fixture file path is outside workspace: {relative}"
@@ -1943,6 +1989,16 @@ fn native_agent_loop_ready() -> bool {
     native_capability_ready(&capability)
 }
 
+fn current_provider_readiness() -> ProviderReadiness {
+    let resolution = resolve_provider_config(|name| std::env::var(name).ok());
+    ProviderReadiness {
+        source: resolution.source.map(|source| source.as_str().to_string()),
+        api_key_present: resolution.config.api_key_present,
+        base_url_present: resolution.config.base_url_present,
+        model_present: resolution.config.model_name.is_some(),
+    }
+}
+
 fn native_capability_ready(capability: &AgentLoopCapability) -> bool {
     capability.available
         && capability.blockers.is_empty()
@@ -1975,8 +2031,6 @@ fn native_read_tool_rule() -> PermissionRule {
 }
 
 fn native_workspace_tool_specs() -> Vec<ToolSpec> {
-    let command_sandbox_modes = ["read_only", "workspace_write", "danger_full_access"];
-    let command_network_access = ["denied", "allowed"];
     vec![
         ToolSpec::new(
             TOOL_READ,
@@ -2067,9 +2121,7 @@ fn native_workspace_tool_specs() -> Vec<ToolSpec> {
                         "minItems": 1
                     },
                     "cwd": {"type": "string"},
-                    "timeout_seconds": {"type": "integer", "minimum": 1},
-                    "sandbox_mode": {"type": "string", "enum": command_sandbox_modes},
-                    "network_access": {"type": "string", "enum": command_network_access, "default": "allowed"}
+                    "timeout_seconds": {"type": "integer", "minimum": 1}
                 },
                 "required": ["argv"],
                 "additionalProperties": false
@@ -2106,6 +2158,29 @@ fn agent_completed_delta(run_status: &AgentRunStatus) -> Option<String> {
     } else {
         None
     }
+}
+
+fn redact_app_server_text(text: &str) -> String {
+    if contains_sensitive_text(text) {
+        "[redacted sensitive app-server output]".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn not_found_response(id: Option<Value>, message: &'static str) -> AppServerResult<Vec<Value>> {
+    Ok(vec![
+        JsonRpcMessage::error(id, ErrorCode::not_found(message)).to_wire_value(),
+    ])
+}
+
+fn invalid_request_response(
+    id: Option<Value>,
+    message: impl Into<String>,
+) -> AppServerResult<Vec<Value>> {
+    Ok(vec![
+        JsonRpcMessage::error(id, ErrorCode::invalid_request(message)).to_wire_value(),
+    ])
 }
 
 #[cfg(test)]
@@ -2277,9 +2352,50 @@ mod tests {
         let prompt = eval_agent_prompt(&task);
 
         assert!(prompt.contains("\"argv\":[\"python\",\"-m\",\"py_compile\",\"src/app.py\"]"));
-        assert!(prompt.contains("\"sandbox_mode\":\"workspace_write\""));
-        assert!(prompt.contains("\"network_access\":\"allowed\""));
+        assert!(!prompt.contains("sandbox_mode"));
+        assert!(!prompt.contains("network_access"));
         assert!(prompt.contains("evaluation fails if this command tool result is missing"));
+    }
+
+    #[test]
+    fn native_command_schema_does_not_expose_permission_expansion_fields() {
+        let command = native_workspace_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == TOOL_COMMAND)
+            .expect("command tool spec");
+        let properties = command
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("command properties");
+
+        assert!(!properties.contains_key("sandbox_mode"));
+        assert!(!properties.contains_key("network_access"));
+    }
+
+    #[test]
+    fn native_eval_network_policy_is_denied_by_default_and_exact_when_enabled() {
+        let denied_task =
+            json!({"task_id": "smoke", "smoke_command": "python -m py_compile src/app.py"});
+        let denied_resource =
+            expected_smoke_command_resource(&denied_task).expect("denied smoke resource");
+        let denied = native_eval_policy("C:/repo".to_string(), &denied_task).evaluate(
+            &PermissionRequest::new(TOOL_COMMAND, PermissionOperation::Network, denied_resource),
+        );
+
+        let allowed_task = json!({
+            "task_id": "smoke",
+            "smoke_command": "python -m py_compile src/app.py",
+            "strategy": {"network_access": "allowed"}
+        });
+        let allowed_resource =
+            expected_smoke_command_resource(&allowed_task).expect("allowed smoke resource");
+        let allowed = native_eval_policy("C:/repo".to_string(), &allowed_task).evaluate(
+            &PermissionRequest::new(TOOL_COMMAND, PermissionOperation::Network, allowed_resource),
+        );
+
+        assert_eq!(denied.outcome, PermissionDecisionOutcome::Deny);
+        assert_eq!(allowed.outcome, PermissionDecisionOutcome::Allow);
     }
 
     #[test]
@@ -2339,7 +2455,11 @@ mod tests {
             task_dir: dir.path().to_path_buf(),
             repo_dir,
         };
-        let task = json!({"task_id": "smoke", "smoke_command": "python -m py_compile src/app.py"});
+        let task = json!({
+            "task_id": "smoke",
+            "smoke_command": "python -m py_compile src/app.py",
+            "strategy": {"network_access": "allowed"}
+        });
         let agent_result = AgentLoopResult {
             status: AgentStatus::Completed,
             completed: true,
@@ -2492,7 +2612,10 @@ mod tests {
             run_status.audit_events[0]["sandbox_backend"],
             "not_executed"
         );
-        assert_eq!(run_status.audit_events[0]["sandbox_enforcement"], "strict");
+        assert_eq!(
+            run_status.audit_events[0]["sandbox_enforcement"],
+            "not_executed"
+        );
         assert!(
             run_status.audit_events[0]["command_scope_digest"]
                 .as_str()
@@ -2616,7 +2739,7 @@ mod tests {
         );
         assert_eq!(
             invalid_args_status.audit_events[0]["sandbox_enforcement"],
-            "strict"
+            "not_executed"
         );
         assert_eq!(
             invalid_args_status.audit_events[0]["command_scope_digest"],
@@ -2707,9 +2830,28 @@ mod tests {
         assert_eq!(seen_requests.lock().expect("seen requests").len(), 1);
     }
 
-    #[cfg(windows)]
+    struct CompletedSandboxBackend;
+
+    impl SandboxBackend for CompletedSandboxBackend {
+        fn name(&self) -> &'static str {
+            "completed_test"
+        }
+
+        fn capabilities(&self) -> singularity_tools::SandboxCapabilities {
+            singularity_tools::SandboxCapabilities::strict()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            CommandResult::completed(&request.command_id, "app-server-sandbox-ok")
+                .with_sandbox_execution(
+                    self.name(),
+                    singularity_tools::SandboxBackendEnforcement::Strict,
+                )
+        }
+    }
+
     #[test]
-    fn native_agent_loop_command_uses_restricted_token_backend_after_gate() {
+    fn native_agent_loop_command_uses_bound_sandbox_backend_after_gate() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -2747,15 +2889,15 @@ mod tests {
             responses: vec![command_response, final_response],
             seen_requests: Arc::new(Mutex::new(Vec::new())),
         };
-        let server = AppServer::new(store);
+        let server = AppServer::new(store).with_sandbox_backend(CompletedSandboxBackend);
         let command_resource = command_scope_resource(
             &[
                 "cmd.exe".to_string(),
                 "/C".to_string(),
                 "echo app-server-sandbox-ok".to_string(),
             ],
-            &SandboxFilesystemMode::ReadOnly,
-            &SandboxNetworkMode::Allowed,
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Denied,
         );
         let grant = ApprovalGrant::allow(
             "approval_turn_1_call_1",
@@ -2771,27 +2913,4 @@ mod tests {
         assert_eq!(status.final_answer.as_deref(), Some("done"));
         assert_eq!(status.tool_calls, 1);
     }
-}
-
-fn redact_app_server_text(text: &str) -> String {
-    if contains_sensitive_text(text) {
-        "[redacted sensitive app-server output]".to_string()
-    } else {
-        text.to_string()
-    }
-}
-
-fn not_found_response(id: Option<Value>, message: &'static str) -> AppServerResult<Vec<Value>> {
-    Ok(vec![
-        JsonRpcMessage::error(id, ErrorCode::not_found(message)).to_wire_value(),
-    ])
-}
-
-fn invalid_request_response(
-    id: Option<Value>,
-    message: impl Into<String>,
-) -> AppServerResult<Vec<Value>> {
-    Ok(vec![
-        JsonRpcMessage::error(id, ErrorCode::invalid_request(message)).to_wire_value(),
-    ])
 }

@@ -8,6 +8,7 @@ const REASON_APPROVAL_POLICY_ON_FAILURE: &str =
     "deprecated on-failure approval policy does not allow native approval requests";
 const REASON_MATCHED_PERMISSION_RULE: &str = "matched permission rule";
 const REASON_NO_RULE: &str = "no permission rule matched; approval required";
+const REASON_NETWORK_ACCESS_DENIED: &str = "network access is denied by the permission profile";
 const REASON_PROTECTED_RESOURCE_DENIED: &str = "protected resource is denied by default";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -230,6 +231,14 @@ impl PolicyEngine {
     }
 
     pub fn evaluate(&self, request: &PermissionRequest) -> PermissionDecision {
+        if request.operation == PermissionOperation::Network
+            && self.profile.network_access == NetworkAccess::Denied
+        {
+            return PermissionDecision::new(
+                PermissionDecisionOutcome::Deny,
+                REASON_NETWORK_ACCESS_DENIED,
+            );
+        }
         let hook_decision = self
             .hooks
             .iter()

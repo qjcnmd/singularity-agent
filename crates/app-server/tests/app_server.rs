@@ -188,6 +188,55 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     assert_eq!(deleted[0]["result"]["deleted"], true);
 }
 
+#[test]
+fn app_server_binary_reports_only_redacted_provider_readiness() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let api_key = "sentinel-provider-api-key";
+    let base_url = "https://sentinel-provider.example/v1";
+    let model = "sentinel-provider-model";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_singularity_app_server"))
+        .current_dir(dir.path())
+        .env(
+            "SINGULARITY_APP_SERVER_DB",
+            dir.path().join("sessions.sqlite3"),
+        )
+        .env("SINGULARITY_API_KEY", api_key)
+        .env("SINGULARITY_BASE_URL", base_url)
+        .env("SINGULARITY_MODEL", model)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn app-server");
+    let mut stdin = child.stdin.take().expect("app-server stdin");
+    for line in [
+        r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+        r#"{"method":"initialized","params":{}}"#,
+        r#"{"method":"agent/capability","id":2,"params":{}}"#,
+        r#"{"method":"server/shutdown","id":3,"params":{}}"#,
+    ] {
+        writeln!(stdin, "{line}").expect("write app-server request");
+    }
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("wait for app-server");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 app-server output");
+    let capability = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|message| message["id"] == 2)
+        .expect("agent capability response");
+    let provider = &capability["result"]["providerReadiness"];
+
+    assert_eq!(provider["source"], "process_env");
+    assert_eq!(provider["apiKeyPresent"], true);
+    assert_eq!(provider["baseUrlPresent"], true);
+    assert_eq!(provider["modelPresent"], true);
+    for sentinel in [api_key, base_url, model] {
+        assert!(!stdout.contains(sentinel));
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() {
@@ -219,6 +268,11 @@ fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() 
             .unwrap()
             .is_empty()
     );
+    let provider = &capability[0]["result"]["providerReadiness"];
+    assert!(provider["source"].is_null() || provider["source"].is_string());
+    assert!(provider["apiKeyPresent"].is_boolean());
+    assert!(provider["baseUrlPresent"].is_boolean());
+    assert!(provider["modelPresent"].is_boolean());
 }
 
 #[cfg(not(windows))]
@@ -589,7 +643,7 @@ fn approval_decisions_consume_pending_requests_once_for_all_outcomes() {
             "approval_1"
         );
 
-        let decision = ApprovalDecision::new("approval_1", outcome.clone(), "operator decision");
+        let decision = ApprovalDecision::new("approval_1", outcome, "operator decision");
         let decision_message = serde_json::json!({
             "method": "approval/decision",
             "id": 3,

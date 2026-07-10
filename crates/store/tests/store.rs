@@ -752,6 +752,118 @@ fn trace_list_supports_pagination_and_tail() {
 }
 
 #[test]
+fn trace_storage_redacts_recursively_and_hashes_canonical_payload() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut first = TraceEvent::new(
+        "trace_redacted_1",
+        "run_redacted",
+        "session_redacted",
+        "test",
+        "Authorization: Bearer sentinel-secret-value",
+    );
+    first.payload = serde_json::json!({
+        "z": 1,
+        "nested": {
+            "authorization": "Bearer sentinel-secret-value",
+            "safe": "ok"
+        }
+    });
+    let mut second = TraceEvent::new(
+        "trace_redacted_2",
+        "run_redacted",
+        "session_redacted",
+        "test",
+        "safe summary",
+    );
+    second.payload = serde_json::json!({
+        "nested": {
+            "safe": "ok",
+            "authorization": "different-secret-value"
+        },
+        "z": 1
+    });
+
+    store.append_trace(&first).expect("first trace");
+    store.append_trace(&second).expect("second trace");
+    let first = store.show_trace("trace_redacted_1").expect("stored first");
+    let second = store.show_trace("trace_redacted_2").expect("stored second");
+
+    assert_eq!(first.summary, "[redacted]");
+    assert_eq!(first.payload["nested"]["authorization"], "[redacted]");
+    assert_eq!(first.payload["nested"]["safe"], "ok");
+    assert!(first.redaction_applied);
+    assert!(first.payload_hash.starts_with("sha256:"));
+    assert_eq!(first.payload_hash.len(), "sha256:".len() + 64);
+    assert_eq!(first.payload_hash, second.payload_hash);
+    let serialized = serde_json::to_string(&first).expect("serialize trace");
+    assert!(!serialized.contains("sentinel-secret-value"));
+}
+
+#[test]
+fn tampered_trace_payload_hash_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let mut trace = TraceEvent::new(
+        "trace_tampered",
+        "run_tampered",
+        "session_tampered",
+        "test",
+        "safe",
+    );
+    trace.payload = serde_json::json!({"safe": "before"});
+    store.append_trace(&trace).expect("append trace");
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open tamper connection");
+    let payload: String = connection
+        .query_row(
+            "select payload from trace_events where event_id = 'trace_tampered'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read payload");
+    let mut payload: serde_json::Value = serde_json::from_str(&payload).expect("parse payload");
+    payload["payload"]["safe"] = serde_json::json!("after");
+    connection
+        .execute(
+            "update trace_events set payload = ?1 where event_id = 'trace_tampered'",
+            [serde_json::to_string(&payload).expect("serialize tampered payload")],
+        )
+        .expect("tamper payload");
+
+    let error = store
+        .show_trace("trace_tampered")
+        .expect_err("tampered trace must fail closed");
+    assert!(error.to_string().contains("trace integrity"));
+}
+
+#[test]
+fn trace_tail_returns_the_bounded_latest_window_in_chronological_order() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    for index in 0..100 {
+        store
+            .append_trace(&TraceEvent::new(
+                format!("trace_window_{index}"),
+                "run_window",
+                "session_window",
+                "test",
+                format!("event {index}"),
+            ))
+            .expect("append trace");
+    }
+
+    let tail = store.tail_trace("run_window", 3, Some(2)).expect("tail");
+    assert_eq!(
+        tail.into_iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>(),
+        vec!["trace_window_95", "trace_window_96", "trace_window_97"]
+    );
+}
+
+#[test]
 fn artifact_refs_are_durable_and_redact_secret_like_metadata() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -8,6 +8,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use singularity_core::contains_sensitive_text;
 use singularity_policy::{ApprovalDecision, ApprovalRequest};
 use singularity_protocol::{
     ArtifactRef, Item, ItemKind, ItemStatus, Thread, ThreadStatus, TraceEvent, Turn, TurnStatus,
@@ -25,6 +27,7 @@ const SQLITE_FOREIGN_KEYS_PRAGMA: &str = "foreign_keys";
 const SQLITE_JOURNAL_MODE_PRAGMA: &str = "journal_mode";
 const SQLITE_JOURNAL_MODE_WAL: &str = "WAL";
 const REDACTED_ARTIFACT_VALUE: &str = "[redacted]";
+const TRACE_HASH_PREFIX: &str = "sha256:";
 const SENSITIVE_ARTIFACT_MARKERS: [&str; 5] =
     ["api_key", "authorization", "password", "secret", "token"];
 const APPROVAL_BINDING_REQUIRED: &str =
@@ -49,6 +52,8 @@ pub enum StoreError {
     AlreadyExists(String),
     #[error("unsupported schema version {found}; supported version is {supported}")]
     UnsupportedSchema { found: u32, supported: u32 },
+    #[error("trace integrity check failed: {0}")]
+    TraceIntegrity(String),
     #[error("invalid store state: {0}")]
     InvalidState(String),
 }
@@ -238,7 +243,7 @@ impl SessionStore {
             component,
             summary,
         );
-        Self::insert_trace(&transaction, &trace)?;
+        let trace = Self::insert_trace(&transaction, &trace)?;
         transaction.commit()?;
         Ok((thread, trace))
     }
@@ -279,7 +284,7 @@ impl SessionStore {
             component,
             summary,
         );
-        Self::insert_trace(&transaction, &trace)?;
+        let trace = Self::insert_trace(&transaction, &trace)?;
         transaction.commit()?;
         Ok((turn, item, trace))
     }
@@ -353,7 +358,7 @@ impl SessionStore {
     }
 
     pub fn append_trace(&self, event: &TraceEvent) -> StoreResult<()> {
-        Self::insert_trace(&self.connection, event)?;
+        let _ = Self::insert_trace(&self.connection, event)?;
         Ok(())
     }
 
@@ -379,7 +384,7 @@ impl SessionStore {
         })?;
         let mut events = Vec::new();
         for row in rows {
-            events.push(serde_json::from_str(&row?)?);
+            events.push(decode_trace_payload(&row?)?);
         }
         if events.is_empty() {
             if self.trace_run_exists(run_id)? {
@@ -396,14 +401,22 @@ impl SessionStore {
         limit: usize,
         offset: Option<usize>,
     ) -> StoreResult<Vec<TraceEvent>> {
-        let mut events = self.list_trace(run_id)?;
-        if let Some(offset) = offset {
-            let keep = events.len().saturating_sub(offset);
-            events.truncate(keep);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset = i64::try_from(offset.unwrap_or(0)).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(
+            "select payload from trace_events where run_id = ?1 order by rowid desc limit ?2 offset ?3",
+        )?;
+        let rows = statement.query_map(params![run_id, limit, offset], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(decode_trace_payload(&row?)?);
         }
-        if events.len() > limit {
-            events = events.split_off(events.len() - limit);
+        if events.is_empty() && !self.trace_run_exists(run_id)? {
+            return Err(StoreError::NotFound(format!("trace run {run_id}")));
         }
+        events.reverse();
         Ok(events)
     }
 
@@ -421,7 +434,7 @@ impl SessionStore {
                 }
                 other => StoreError::Sqlite(other),
             })?;
-        Ok(serde_json::from_str(&payload)?)
+        decode_trace_payload(&payload)
     }
 
     pub fn create_approval(&self, request: &ApprovalRequest) -> StoreResult<()> {
@@ -477,7 +490,7 @@ impl SessionStore {
             }),
             ..trace
         };
-        Self::insert_trace(&transaction, &trace)?;
+        let trace = Self::insert_trace(&transaction, &trace)?;
         transaction.commit()?;
         Ok(trace)
     }
@@ -630,7 +643,7 @@ impl SessionStore {
             }),
             ..trace
         };
-        Self::insert_trace(&transaction, &trace)?;
+        let trace = Self::insert_trace(&transaction, &trace)?;
         transaction.commit()?;
         Ok(RecordedApprovalDecision {
             request,
@@ -1181,17 +1194,18 @@ impl SessionStore {
         Ok(())
     }
 
-    fn insert_trace(connection: &Connection, event: &TraceEvent) -> StoreResult<()> {
+    fn insert_trace(connection: &Connection, event: &TraceEvent) -> StoreResult<TraceEvent> {
+        let event = sanitize_trace_event(event);
         connection.execute(
             "insert into trace_events(event_id, run_id, session_id, payload) values(?1, ?2, ?3, ?4)",
             params![
                 event.event_id,
                 event.run_id,
                 event.session_id,
-                serde_json::to_string(event)?
+                serde_json::to_string(&event)?
             ],
         )?;
-        Ok(())
+        Ok(event)
     }
 
     fn exists_in_transaction(
@@ -1334,6 +1348,74 @@ fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRef> {
     })
 }
 
+fn decode_trace_payload(payload: &str) -> StoreResult<TraceEvent> {
+    let event: TraceEvent = serde_json::from_str(payload)?;
+    if !event.redaction_applied {
+        return Err(StoreError::TraceIntegrity(
+            "stored trace was not sanitized".to_string(),
+        ));
+    }
+    let expected_hash = trace_payload_hash(&event.payload);
+    if event.payload_hash != expected_hash {
+        return Err(StoreError::TraceIntegrity(format!(
+            "payload hash mismatch for {}",
+            event.event_id
+        )));
+    }
+    Ok(event)
+}
+
+fn sanitize_trace_event(event: &TraceEvent) -> TraceEvent {
+    let mut sanitized = event.clone();
+    sanitized.summary = redact_secret_like_text(&sanitized.summary);
+    sanitized.payload = redact_secret_like_value(sanitized.payload);
+    sanitized.artifact_refs = sanitized
+        .artifact_refs
+        .into_iter()
+        .map(|artifact_ref| redact_secret_like_text(&artifact_ref))
+        .collect();
+    sanitized.redaction_applied = true;
+    sanitized.payload_hash = trace_payload_hash(&sanitized.payload);
+    sanitized
+}
+
+fn trace_payload_hash(payload: &Value) -> String {
+    let canonical = canonical_json(payload);
+    let digest = Sha256::digest(canonical.as_bytes());
+    format!("{TRACE_HASH_PREFIX}{digest:x}")
+}
+
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_string(value).expect("JSON scalar serialization cannot fail")
+        }
+        Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(fields) => {
+            let ordered = fields.iter().collect::<BTreeMap<_, _>>();
+            let entries = ordered
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("JSON key serialization cannot fail"),
+                        canonical_json(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{entries}}}")
+        }
+    }
+}
+
 fn redact_secret_like_value(value: Value) -> Value {
     match value {
         Value::String(text) => Value::String(redact_secret_like_text(&text)),
@@ -1383,9 +1465,10 @@ fn redact_secret_like_text(text: &str) -> String {
 
 fn contains_secret_like(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
-    SENSITIVE_ARTIFACT_MARKERS
-        .iter()
-        .any(|marker| lowered.contains(marker))
+    contains_sensitive_text(text)
+        || SENSITIVE_ARTIFACT_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker))
 }
 
 #[cfg(test)]

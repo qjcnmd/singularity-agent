@@ -128,18 +128,34 @@ fn cli_config_doctor_reports_redacted_native_and_eval_readiness() {
     let db_path = temp.path().join("sessions.sqlite3");
     let fake_server = FakeAppServer::new(
         temp.path(),
-        Scenario::new().initialized().native_ready().shutdown(),
+        Scenario::new()
+            .initialized()
+            .respond(
+                "agent/capability",
+                json!({
+                    "nativeAgentLoop": {
+                        "available": true,
+                        "status": "completed",
+                        "reason": "enabled",
+                        "blockers": [],
+                    },
+                    "providerReadiness": {
+                        "source": "project_env",
+                        "apiKeyPresent": false,
+                        "baseUrlPresent": true,
+                        "modelPresent": false,
+                    },
+                }),
+            )
+            .shutdown(),
     );
 
     std::fs::write(
         temp.path().join(".env"),
         concat!(
-            "SINGULARITY_MODEL=project-model
-",
-            "SINGULARITY_BASE_URL=https://project-provider.example/v1
-",
-            "SINGULARITY_API_KEY=project-secret
-",
+            "SINGULARITY_MODEL=project-model\n",
+            "SINGULARITY_BASE_URL=https://project-provider.example/v1\n",
+            "SINGULARITY_API_KEY=project-secret\n",
         ),
     )
     .expect("write synthetic project env");
@@ -158,54 +174,20 @@ fn cli_config_doctor_reports_redacted_native_and_eval_readiness() {
     assert!(doctor_stdout.contains("client=protocol-only"));
     assert!(doctor_stdout.contains("native_agent_loop=completed"));
     assert!(doctor_stdout.contains("evaluation=rust_native"));
-    assert!(doctor_stdout.contains("provider_config_source=process_env"));
-    assert!(doctor_stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
+    assert!(doctor_stdout.contains("provider_config_source=project_env"));
+    assert!(doctor_stdout.contains("SINGULARITY_API_KEY=missing"));
     assert!(doctor_stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
-    assert!(doctor_stdout.contains("SINGULARITY_MODEL=present(redacted)"));
-    assert!(!doctor_stdout.contains("secret-value"));
-    assert!(!doctor_stdout.contains("https://provider.example/v1"));
-    assert!(!doctor_stdout.contains("gpt-test"));
-
-    let mixed = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["config", "doctor"])
-        .current_dir(temp.path())
-        .env("SINGULARITY_API_KEY", "process-secret")
-        .env_remove("SINGULARITY_MODEL_PROVIDER")
-        .env_remove("SINGULARITY_BASE_URL")
-        .env_remove("SINGULARITY_MODEL")
-        .output()
-        .expect("mixed-source doctor cli");
-
-    assert!(mixed.status.success(), "stderr={}", stderr(&mixed));
-    let mixed_stdout = stdout(&mixed);
-    assert!(mixed_stdout.contains("provider_config_source=process_env"));
-    assert!(mixed_stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
-    assert!(mixed_stdout.contains("SINGULARITY_BASE_URL=missing"));
-    assert!(mixed_stdout.contains("SINGULARITY_MODEL=missing"));
-    assert!(!mixed_stdout.contains("project-model"));
-    assert!(!mixed_stdout.contains("project-provider.example"));
-    assert!(!mixed_stdout.contains("project-secret"));
-    assert!(!mixed_stdout.contains("process-secret"));
-
-    let project = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["config", "doctor"])
-        .current_dir(temp.path())
-        .env_remove("SINGULARITY_MODEL_PROVIDER")
-        .env_remove("SINGULARITY_API_KEY")
-        .env_remove("SINGULARITY_BASE_URL")
-        .env_remove("SINGULARITY_MODEL")
-        .output()
-        .expect("project-source doctor cli");
-
-    assert!(project.status.success(), "stderr={}", stderr(&project));
-    let project_stdout = stdout(&project);
-    assert!(project_stdout.contains("provider_config_source=project_env"));
-    assert!(project_stdout.contains("SINGULARITY_API_KEY=present(redacted)"));
-    assert!(project_stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
-    assert!(project_stdout.contains("SINGULARITY_MODEL=present(redacted)"));
-    assert!(!project_stdout.contains("project-model"));
-    assert!(!project_stdout.contains("project-provider.example"));
-    assert!(!project_stdout.contains("project-secret"));
+    assert!(doctor_stdout.contains("SINGULARITY_MODEL=missing"));
+    for secret in [
+        "secret-value",
+        "https://provider.example/v1",
+        "gpt-test",
+        "project-model",
+        "project-provider.example",
+        "project-secret",
+    ] {
+        assert!(!doctor_stdout.contains(secret));
+    }
 }
 
 #[test]
@@ -1370,16 +1352,17 @@ fn stderr(output: &std::process::Output) -> String {
 fn app_server_bin() -> String {
     std::env::var("CARGO_BIN_EXE_singularity_app_server").unwrap_or_else(|_| {
         ensure_app_server_binary();
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.pop();
-        path.pop();
-        path.push("target");
-        path.push("debug");
-        path.push(format!(
-            "singularity_app_server{}",
-            std::env::consts::EXE_SUFFIX
-        ));
-        path.to_string_lossy().to_string()
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace_root().join("target"));
+        target_dir
+            .join("debug")
+            .join(format!(
+                "singularity_app_server{}",
+                std::env::consts::EXE_SUFFIX
+            ))
+            .to_string_lossy()
+            .into_owned()
     })
 }
 
@@ -1393,6 +1376,7 @@ fn ensure_app_server_binary() {
                 "singularity_app_server",
                 "--bin",
                 "singularity_app_server",
+                "--locked",
             ])
             .current_dir(workspace_root())
             .status()

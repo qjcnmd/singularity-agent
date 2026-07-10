@@ -1,9 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
-use std::path::PathBuf;
-#[cfg(windows)]
-use std::sync::OnceLock;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -14,19 +11,15 @@ use singularity_model::{
     Provider, provider_error_response,
 };
 use singularity_policy::{
-    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecision,
-    PermissionDecisionOutcome, PermissionOperation, PermissionRequest, PolicyEngine,
-};
-#[cfg(windows)]
-use singularity_tools::{
-    CommandExecutionStatus, CommandRequest, CommandSemanticStatus, SandboxBackend,
-    SandboxFilesystemMode, WindowsRestrictedTokenSandboxBackend,
+    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
+    PermissionDecisionOutcome, PermissionOperation, PermissionProfile, PermissionProfileName,
+    PermissionRequest, PolicyEngine,
 };
 use singularity_tools::{
-    CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
-    ToolBrokerDecision, ToolCallRequest, ToolOutput, ToolResult, WorkspacePatch,
-    WorkspaceToolError, WorkspaceTools, command_scope_digest, command_scope_resource,
-    is_protected_path,
+    CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput,
+    SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolBrokerDecision, ToolCallRequest,
+    ToolOutput, ToolResult, WorkspacePatch, WorkspaceToolError, WorkspaceTools,
+    command_scope_digest, command_scope_resource, is_protected_path,
 };
 use thiserror::Error;
 
@@ -34,20 +27,16 @@ use thiserror::Error;
 const STRICT_COMMAND_SANDBOX_UNSUPPORTED_PLATFORM: &str =
     "strict_command_sandbox_unsupported_platform";
 #[cfg(windows)]
-const STRICT_COMMAND_SANDBOX_PROBE_FAILED: &str = "strict_command_sandbox_probe_failed";
-#[cfg(windows)]
-const NATIVE_AGENT_LOOP_READY_REASON: &str =
-    "native Rust AgentLoop is available as the default runtime";
-#[cfg(windows)]
-const NATIVE_AGENT_LOOP_SANDBOX_BLOCKED_REASON: &str =
-    "native Rust AgentLoop requires a working Windows restricted-token command sandbox";
+const NATIVE_AGENT_LOOP_READY_REASON: &str = "native Rust AgentLoop uses automatic Windows elevated sandbox setup with restricted-token fallback only for network-enabled profiles";
 #[cfg(not(windows))]
 const NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
     "native Rust AgentLoop requires the Windows restricted-token command sandbox";
-#[cfg(windows)]
-const AGENT_LOOP_CAPABILITY_PROBE_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 4;
 const EMPTY_FINAL_ANSWER_ERROR: &str = "empty final answer";
+const COMMAND_SANDBOX_PROFILE_DENIED: &str =
+    "command sandbox mode cannot exceed the permission profile";
+const COMMAND_NETWORK_PROFILE_DENIED: &str =
+    "command network access cannot exceed the permission profile";
 const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
     "invalid_tool_arguments",
     "invalid_tool_input",
@@ -64,8 +53,6 @@ const TOOL_GREP: &str = "builtin.grep";
 const TOOL_EDIT: &str = "builtin.edit";
 const TOOL_PATCH: &str = "builtin.patch";
 const TOOL_COMMAND: &str = "builtin.command";
-#[cfg(windows)]
-static AGENT_LOOP_CAPABILITY_CACHE: OnceLock<AgentLoopCapability> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -178,9 +165,12 @@ impl AgentLoopCapability {
     pub fn current() -> Self {
         #[cfg(windows)]
         {
-            AGENT_LOOP_CAPABILITY_CACHE
-                .get_or_init(windows_agent_loop_capability)
-                .clone()
+            Self {
+                available: true,
+                status: AgentStatus::Completed,
+                reason: NATIVE_AGENT_LOOP_READY_REASON.to_string(),
+                blockers: Vec::new(),
+            }
         }
         #[cfg(not(windows))]
         {
@@ -192,70 +182,6 @@ impl AgentLoopCapability {
             }
         }
     }
-}
-
-#[cfg(windows)]
-fn windows_agent_loop_capability() -> AgentLoopCapability {
-    match probe_windows_command_sandbox() {
-        Ok(()) => AgentLoopCapability {
-            available: true,
-            status: AgentStatus::Completed,
-            reason: NATIVE_AGENT_LOOP_READY_REASON.to_string(),
-            blockers: Vec::new(),
-        },
-        Err(blocker) => AgentLoopCapability {
-            available: false,
-            status: AgentStatus::Blocked,
-            reason: NATIVE_AGENT_LOOP_SANDBOX_BLOCKED_REASON.to_string(),
-            blockers: vec![blocker],
-        },
-    }
-}
-
-#[cfg(windows)]
-fn probe_windows_command_sandbox() -> Result<(), String> {
-    let workspace = create_sandbox_probe_workspace()?;
-    let workspace_display = workspace.to_string_lossy().to_string();
-    let mut request = CommandRequest::project_verification(
-        "agent_loop_capability_probe",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo singularity-sandbox-ready".to_string(),
-        ],
-        workspace_display.clone(),
-        workspace_display,
-    );
-    request.filesystem.mode = SandboxFilesystemMode::ReadOnly;
-    request.timeout_seconds = AGENT_LOOP_CAPABILITY_PROBE_TIMEOUT_SECONDS;
-    let result = WindowsRestrictedTokenSandboxBackend::new().execute(&request);
-    let _ = std::fs::remove_dir_all(&workspace);
-    if result.execution_status == CommandExecutionStatus::Completed
-        && result.semantic_status == CommandSemanticStatus::Succeeded
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "{STRICT_COMMAND_SANDBOX_PROBE_FAILED}:{:?}:{:?}",
-            result.execution_status, result.semantic_status
-        ))
-    }
-}
-
-#[cfg(windows)]
-fn create_sandbox_probe_workspace() -> Result<PathBuf, String> {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let path = std::env::temp_dir().join(format!(
-        "singularity-agentloop-sandbox-probe-{}-{nonce}",
-        std::process::id()
-    ));
-    std::fs::create_dir(&path).map_err(|error| {
-        format!("{STRICT_COMMAND_SANDBOX_PROBE_FAILED}:workspace_unavailable:{error}")
-    })?;
-    Ok(path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -567,7 +493,16 @@ where
                 .cloned()
                 .unwrap_or_else(|| ModelMessage::assistant_tool_calls(response.tool_calls.clone()));
             messages.push(assistant_tool_message);
-            for call in &response.tool_calls {
+            for provider_call in &response.tool_calls {
+                let (bound_call, forced_decision) =
+                    match bind_tool_call_to_profile(provider_call, &self.policy.profile) {
+                        Ok(call) => (call, None),
+                        Err(reason) => (
+                            provider_call.clone(),
+                            Some(ToolBrokerDecision::deny(reason)),
+                        ),
+                    };
+                let call = &bound_call;
                 if input.interrupted {
                     return AgentLoopResult {
                         status: AgentStatus::Cancelled,
@@ -583,7 +518,8 @@ where
                         error: None,
                     };
                 }
-                let decision = self.tool_decision(input, call, &mut used_approval_grants);
+                let decision = forced_decision
+                    .unwrap_or_else(|| self.tool_decision(input, call, &mut used_approval_grants));
                 if let ToolBrokerDecision::Ask {
                     approval_request_id,
                     reason,
@@ -676,7 +612,11 @@ where
                 error: None,
             };
         }
-        let call = match pending.to_model_tool_call() {
+        let call = match pending
+            .to_model_tool_call()
+            .map_err(|error| format!("invalid pending tool call arguments: {error}"))
+            .and_then(|call| bind_tool_call_to_profile(&call, &self.policy.profile))
+        {
             Ok(call) => call,
             Err(error) => {
                 return AgentLoopResult {
@@ -690,7 +630,7 @@ where
                     pending_tool_calls: Vec::new(),
                     tool_results: Vec::new(),
                     tool_repairs: Vec::new(),
-                    error: Some(format!("invalid pending tool call arguments: {error}")),
+                    error: Some(error),
                 };
             }
         };
@@ -842,24 +782,34 @@ where
     }
 
     fn tool_permission_decision(&self, call: &ModelToolCall) -> PermissionDecision {
-        let operation = permission_operation_for_tool(&call.tool_name);
         let resources = permission_resources_for_tool(call);
+        let mut operations = vec![permission_operation_for_tool(&call.tool_name)];
+        if call.tool_name == TOOL_COMMAND
+            && command_tool_input(&call.arguments)
+                .is_ok_and(|input| input.network_access() != SandboxNetworkMode::Denied)
+        {
+            operations.push(PermissionOperation::Network);
+        }
         let mut first_allow = None;
         let mut first_ask = None;
-        for resource in resources {
-            let mut request =
-                PermissionRequest::new(call.tool_name.clone(), operation, resource.clone());
-            if is_protected_path(&resource) {
-                request = request.with_sensitive_resource();
-            }
-            let decision = self.policy.evaluate(&request);
-            match decision.outcome {
-                PermissionDecisionOutcome::Deny => return decision,
-                PermissionDecisionOutcome::Ask if first_ask.is_none() => first_ask = Some(decision),
-                PermissionDecisionOutcome::Allow if first_allow.is_none() => {
-                    first_allow = Some(decision);
+        for operation in operations {
+            for resource in &resources {
+                let mut request =
+                    PermissionRequest::new(call.tool_name.clone(), operation, resource.clone());
+                if is_protected_path(resource) {
+                    request = request.with_sensitive_resource();
                 }
-                _ => {}
+                let decision = self.policy.evaluate(&request);
+                match decision.outcome {
+                    PermissionDecisionOutcome::Deny => return decision,
+                    PermissionDecisionOutcome::Ask if first_ask.is_none() => {
+                        first_ask = Some(decision);
+                    }
+                    PermissionDecisionOutcome::Allow if first_allow.is_none() => {
+                        first_allow = Some(decision);
+                    }
+                    _ => {}
+                }
             }
         }
         first_ask.or(first_allow).unwrap_or_else(|| {
@@ -1495,6 +1445,70 @@ fn approval_request_id(input: &AgentLoopInput, call: &ModelToolCall) -> String {
     format!("approval_{}_{}", input.turn_id, call.tool_call_id)
 }
 
+fn bind_tool_call_to_profile(
+    call: &ModelToolCall,
+    profile: &PermissionProfile,
+) -> Result<ModelToolCall, String> {
+    if call.tool_name != TOOL_COMMAND {
+        return Ok(call.clone());
+    }
+    let mut input = command_tool_input(&call.arguments).map_err(|error| error.to_string())?;
+    let (sandbox_mode, network_access) = effective_command_policy(profile, &input)?;
+    input.sandbox_mode = Some(sandbox_mode);
+    input.network_access = Some(network_access);
+    let arguments = serde_json::to_value(input).map_err(|error| error.to_string())?;
+    let mut bound = call.clone();
+    bound.raw_arguments = arguments.to_string();
+    bound.arguments = arguments;
+    Ok(bound)
+}
+
+fn effective_command_policy(
+    profile: &PermissionProfile,
+    input: &CommandToolInput,
+) -> Result<(SandboxFilesystemMode, SandboxNetworkMode), String> {
+    let session_filesystem = match profile.profile {
+        PermissionProfileName::ReadOnly => SandboxFilesystemMode::ReadOnly,
+        PermissionProfileName::WorkspaceWrite => SandboxFilesystemMode::WorkspaceWrite,
+        PermissionProfileName::DangerFullAccess => SandboxFilesystemMode::DangerFullAccess,
+    };
+    let requested_filesystem = input
+        .sandbox_mode
+        .clone()
+        .unwrap_or(session_filesystem.clone());
+    if !filesystem_request_within_profile(&session_filesystem, &requested_filesystem) {
+        return Err(COMMAND_SANDBOX_PROFILE_DENIED.to_string());
+    }
+
+    let session_network = match profile.network_access {
+        NetworkAccess::Denied => SandboxNetworkMode::Denied,
+        NetworkAccess::Allowed => SandboxNetworkMode::Allowed,
+    };
+    let requested_network = input
+        .network_access
+        .clone()
+        .unwrap_or(session_network.clone());
+    if session_network == SandboxNetworkMode::Denied
+        && requested_network != SandboxNetworkMode::Denied
+    {
+        return Err(COMMAND_NETWORK_PROFILE_DENIED.to_string());
+    }
+    Ok((requested_filesystem, requested_network))
+}
+
+fn filesystem_request_within_profile(
+    profile: &SandboxFilesystemMode,
+    requested: &SandboxFilesystemMode,
+) -> bool {
+    match profile {
+        SandboxFilesystemMode::ReadOnly => requested == &SandboxFilesystemMode::ReadOnly,
+        SandboxFilesystemMode::WorkspaceWrite => {
+            requested != &SandboxFilesystemMode::DangerFullAccess
+        }
+        SandboxFilesystemMode::DangerFullAccess => true,
+    }
+}
+
 fn permission_operation_for_tool(tool_name: &str) -> PermissionOperation {
     match tool_name {
         TOOL_EDIT | TOOL_PATCH => PermissionOperation::Write,
@@ -1588,6 +1602,9 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
         }
         AgentLoopToolError::Workspace(WorkspaceToolError::BinaryPattern) => "binary_pattern",
         AgentLoopToolError::Workspace(WorkspaceToolError::ReadFailed(_)) => "tool_read_failed",
+        AgentLoopToolError::Workspace(WorkspaceToolError::RollbackFailed(_)) => {
+            "workspace_rollback_failed"
+        }
         AgentLoopToolError::Workspace(WorkspaceToolError::ExpectedContentMissing(_)) => {
             "expected_content_missing"
         }
@@ -1605,7 +1622,7 @@ fn command_workspace_tool_failure(
         "sandbox_mode": input.sandbox_mode(),
         "network_access": input.network_access(),
         "sandbox_backend": "unavailable",
-        "sandbox_enforcement": "strict",
+        "sandbox_enforcement": "unavailable",
         "command_scope_digest": command_scope_digest(
             &input.argv,
             &input.sandbox_mode(),

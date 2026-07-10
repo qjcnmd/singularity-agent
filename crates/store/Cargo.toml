@@ -14,6 +14,7 @@ rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 singularity_core = { path = "../core" }
 singularity_policy = { path = "../policy" }
 singularity_protocol = { path = "../protocol" }
