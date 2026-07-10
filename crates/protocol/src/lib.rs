@@ -205,7 +205,8 @@ pub struct InitializeResult {
 impl InitializeResult {
     pub fn local() -> Self {
         Self {
-            user_agent: "singularity-rust-app-server/0.1.0".to_string(),
+            user_agent: concat!("singularity-rust-app-server/", env!("CARGO_PKG_VERSION"))
+                .to_string(),
             platform_family: "local".to_string(),
             platform_os: std::env::consts::OS.to_string(),
         }

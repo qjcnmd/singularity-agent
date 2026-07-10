@@ -1031,9 +1031,7 @@ pub fn is_protected_path(path: &str) -> bool {
 }
 
 fn is_protected_component(component: &str) -> bool {
-    PROTECTED_PATH_EXACT_MARKERS
-        .iter()
-        .any(|marker| component == *marker)
+    PROTECTED_PATH_EXACT_MARKERS.contains(&component)
         || PROTECTED_PATH_PREFIXES.iter().any(|prefix| {
             component == *prefix
                 || component

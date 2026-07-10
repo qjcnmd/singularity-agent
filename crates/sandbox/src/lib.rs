@@ -985,9 +985,7 @@ fn path_has_sensitive_component(path: &Path) -> bool {
 }
 
 fn sensitive_path_component(component: &str) -> bool {
-    SENSITIVE_PATH_EXACT_MARKERS
-        .iter()
-        .any(|marker| component == *marker)
+    SENSITIVE_PATH_EXACT_MARKERS.contains(&component)
         || SENSITIVE_PATH_PREFIXES.iter().any(|prefix| {
             component == *prefix
                 || component
@@ -1240,8 +1238,7 @@ mod windows_restricted_token {
             terminate_job(&job);
             return Err(error);
         }
-        let wait = wait_for_process(request, &process, &job, stdout_read, stderr_read, start);
-        wait
+        wait_for_process(request, &process, &job, stdout_read, stderr_read, start)
     }
 
     fn restricted_primary_token(read_only: bool) -> Result<Handle, WindowsError> {
@@ -1542,8 +1539,8 @@ mod windows_restricted_token {
             &request.command_id,
             exit_code_to_i32(exit_code),
             elapsed_ms(start),
-            stdout.to_string(),
-            stderr.to_string(),
+            stdout.to_lossy_string(),
+            stderr.to_lossy_string(),
             stdout.truncated || stderr.truncated,
         ))
     }
@@ -1565,7 +1562,7 @@ mod windows_restricted_token {
             }
         }
 
-        fn to_string(&self) -> String {
+        fn to_lossy_string(&self) -> String {
             String::from_utf8_lossy(&self.bytes).into_owned()
         }
     }
