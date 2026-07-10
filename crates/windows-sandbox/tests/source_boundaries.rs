@@ -14,8 +14,8 @@ const FORBIDDEN_CODEX_OR_PTY_REFERENCES: &[&str] = &[
     "wrapper::",
 ];
 const CENTRALIZED_PRODUCT_IDENTITY_LITERALS: &[&str] = &[
-    "SingularitySandboxOffline",
-    "SingularitySandboxOnline",
+    "SgSandboxOffline",
+    "SgSandboxOnline",
     "SingularitySandboxUsers",
     "SingularitySandboxDesktop",
     "singularity-windows-sandbox-setup.exe",

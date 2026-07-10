@@ -6,8 +6,8 @@
 pub const PRODUCT_NAME: &str = "Singularity Windows Sandbox";
 pub const PRODUCT_VENDOR: &str = "Singularity";
 
-pub const OFFLINE_ACCOUNT_NAME: &str = "SingularitySandboxOffline";
-pub const ONLINE_ACCOUNT_NAME: &str = "SingularitySandboxOnline";
+pub const OFFLINE_ACCOUNT_NAME: &str = "SgSandboxOffline";
+pub const ONLINE_ACCOUNT_NAME: &str = "SgSandboxOnline";
 pub const SANDBOX_USERS_GROUP_NAME: &str = "SingularitySandboxUsers";
 pub const SANDBOX_USERS_GROUP_COMMENT: &str = "Singularity sandbox internal group (managed)";
 

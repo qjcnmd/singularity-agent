@@ -316,7 +316,11 @@ fn windows_elevated_backend_executes_network_denied_command() {
 
     let result = WindowsSandboxBackend::new().execute(&request);
 
-    assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result:#?}"
+    );
     assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
     assert_eq!(result.sandbox.backend, "windows_elevated");
     assert_eq!(
