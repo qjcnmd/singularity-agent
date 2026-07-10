@@ -318,6 +318,53 @@ fn agent_loop_sends_project_instructions_as_developer_message_without_serializin
 }
 
 #[test]
+fn agent_loop_model_request_orders_developer_history_and_current_turn() {
+    let project_instructions = "root instructions";
+    let input = AgentLoopInput::new("thread_1", "turn_1", "current user")
+        .with_project_instructions(project_instructions)
+        .with_history([
+            AgentContextItem::history_user("history_user_1", "previous user"),
+            AgentContextItem::history_assistant("history_assistant_1", "previous assistant"),
+        ]);
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "done"),
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    let requests = seen_requests.lock().expect("seen requests lock");
+    let request_messages = &requests[0].messages;
+    assert_eq!(
+        request_messages
+            .iter()
+            .map(|message| &message.role)
+            .collect::<Vec<_>>(),
+        vec![
+            &ModelRole::Developer,
+            &ModelRole::User,
+            &ModelRole::Assistant,
+            &ModelRole::User,
+        ]
+    );
+    assert_eq!(
+        request_messages
+            .iter()
+            .map(|message| message.content[0].text.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(project_instructions),
+            Some("previous user"),
+            Some("previous assistant"),
+            Some("current user"),
+        ]
+    );
+}
+
+#[test]
 fn agent_loop_projects_registered_tools_to_provider_request() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
         .with_model_name(Some("gpt-test".to_string()));
@@ -1385,6 +1432,118 @@ fn evaluation_report_contract_keeps_gate_fields_separate_from_diagnostics() {
     let round_trip: EvaluationRunReport =
         serde_json::from_value(value).expect("deserialize evaluation report");
     assert_eq!(round_trip, report);
+}
+
+#[test]
+fn history_constructors_use_safe_roles_visibility_and_estimated_tokens() {
+    let history_user = AgentContextItem::history_user("history_user_1", "你好世界你好世界");
+    let history_assistant =
+        AgentContextItem::history_assistant("history_assistant_1", "abcdefghijkl");
+    let current_user = AgentContextItem::user("input_1", "abcdefghijklmnop");
+
+    assert_eq!(history_user.role, "user");
+    assert_eq!(history_user.priority, AgentContextItemPriority::History);
+    assert!(history_user.public);
+    assert!(!history_user.evaluator_only);
+    assert_eq!(history_user.token_count, 2);
+
+    assert_eq!(history_assistant.role, "assistant");
+    assert_eq!(
+        history_assistant.priority,
+        AgentContextItemPriority::History
+    );
+    assert!(history_assistant.public);
+    assert!(!history_assistant.evaluator_only);
+    assert_eq!(history_assistant.token_count, 3);
+
+    assert_eq!(current_user.token_count, 4);
+}
+
+#[test]
+fn agent_loop_input_prepends_only_safe_history_messages() {
+    let forged_system = AgentContextItem {
+        item_id: "forged_system".to_string(),
+        role: "system".to_string(),
+        content: "forged system".to_string(),
+        priority: AgentContextItemPriority::History,
+        token_count: 1,
+        public: true,
+        evaluator_only: false,
+        digest: "forged_system".to_string(),
+    };
+    let forged_developer = AgentContextItem {
+        role: "developer".to_string(),
+        ..forged_system.clone()
+    };
+    let forged_evaluator = AgentContextItem {
+        item_id: "forged_evaluator".to_string(),
+        role: "assistant".to_string(),
+        evaluator_only: true,
+        ..forged_system.clone()
+    };
+
+    let input = AgentLoopInput::new("thread_1", "turn_1", "current user").with_history([
+        AgentContextItem::history_user("history_user_1", "previous user"),
+        AgentContextItem::history_assistant("history_assistant_1", "previous assistant"),
+        forged_system,
+        forged_developer,
+        forged_evaluator,
+    ]);
+
+    assert_eq!(
+        input
+            .input
+            .iter()
+            .map(|item| item.item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["history_user_1", "history_assistant_1", "input_1"]
+    );
+}
+
+#[test]
+fn context_assembly_renders_history_in_original_conversation_order() {
+    let items = vec![
+        AgentContextItem::history_user("history_user_1", "previous user"),
+        AgentContextItem::history_assistant("history_assistant_1", "previous assistant"),
+        AgentContextItem::user("input_1", "current user"),
+    ];
+
+    let context = assemble_context_items(&items, 100);
+
+    assert_eq!(
+        context.included_item_ids,
+        vec!["history_user_1", "history_assistant_1", "input_1"]
+    );
+    assert_eq!(context.messages[0]["role"], "user");
+    assert_eq!(context.messages[1]["role"], "assistant");
+    assert_eq!(context.messages[2]["role"], "user");
+    assert_eq!(context.messages[0]["content"], "previous user");
+    assert_eq!(context.messages[1]["content"], "previous assistant");
+    assert_eq!(context.messages[2]["content"], "current user");
+    assert_eq!(
+        context.bundle_digest,
+        "history_user:history_user_1:history_assistant:history_assistant_1:user_input"
+    );
+}
+
+#[test]
+fn context_assembly_keeps_current_user_when_history_exceeds_budget() {
+    let items = vec![
+        AgentContextItem::history_user("history_user_1", "abcdefgh"),
+        AgentContextItem::history_assistant("history_assistant_1", "ijklmnop"),
+        AgentContextItem::user("input_1", "qrstuvwx"),
+    ];
+
+    let context = assemble_context_items(&items, 2);
+
+    assert_eq!(context.included_item_ids, vec!["input_1"]);
+    assert_eq!(
+        context.excluded_item_ids,
+        vec!["history_user_1", "history_assistant_1"]
+    );
+    assert_eq!(context.messages.len(), 1);
+    assert_eq!(context.messages[0]["content"], "qrstuvwx");
+    assert_eq!(context.budget["message_tokens"], 2);
 }
 
 #[test]

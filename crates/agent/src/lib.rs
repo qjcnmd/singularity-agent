@@ -32,6 +32,9 @@ const NATIVE_AGENT_LOOP_READY_REASON: &str = "native Rust AgentLoop uses automat
 const NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
     "native Rust AgentLoop requires the Windows restricted-token command sandbox";
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 4;
+const APPROXIMATE_CHARS_PER_TOKEN: usize = 4;
+const USER_MESSAGE_ROLE: &str = "user";
+const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
 const EMPTY_FINAL_ANSWER_ERROR: &str = "empty final answer";
 const COMMAND_SANDBOX_PROFILE_DENIED: &str =
     "command sandbox mode cannot exceed the permission profile";
@@ -257,6 +260,16 @@ impl AgentLoopInput {
     pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
         let instructions = instructions.into();
         self.project_instructions = (!instructions.trim().is_empty()).then_some(instructions);
+        self
+    }
+
+    pub fn with_history(mut self, history: impl IntoIterator<Item = AgentContextItem>) -> Self {
+        let mut history: Vec<AgentContextItem> = history
+            .into_iter()
+            .filter(AgentContextItem::is_safe_history)
+            .collect();
+        history.extend(self.input);
+        self.input = history;
         self
     }
 
@@ -949,15 +962,53 @@ impl AgentContextItem {
         let content = content.into();
         Self {
             item_id: item_id.into(),
-            role: "user".to_string(),
+            role: USER_MESSAGE_ROLE.to_string(),
+            token_count: approximate_token_count(&content),
             content,
             priority: AgentContextItemPriority::CurrentTurn,
-            token_count: 1,
             public: true,
             evaluator_only: false,
             digest: "user_input".to_string(),
         }
     }
+
+    pub fn history_user(item_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::history(item_id, content, USER_MESSAGE_ROLE)
+    }
+
+    pub fn history_assistant(item_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::history(item_id, content, ASSISTANT_MESSAGE_ROLE)
+    }
+
+    fn history(item_id: impl Into<String>, content: impl Into<String>, role: &'static str) -> Self {
+        let item_id = item_id.into();
+        let content = content.into();
+        let digest = format!("history_{role}:{item_id}");
+        Self {
+            item_id,
+            role: role.to_string(),
+            token_count: approximate_token_count(&content),
+            content,
+            priority: AgentContextItemPriority::History,
+            public: true,
+            evaluator_only: false,
+            digest,
+        }
+    }
+
+    fn is_safe_history(&self) -> bool {
+        self.priority == AgentContextItemPriority::History
+            && self.public
+            && !self.evaluator_only
+            && (self.role == USER_MESSAGE_ROLE || self.role == ASSISTANT_MESSAGE_ROLE)
+    }
+}
+
+fn approximate_token_count(content: &str) -> u32 {
+    let char_count = content.chars().count();
+    let estimated =
+        char_count.saturating_add(APPROXIMATE_CHARS_PER_TOKEN - 1) / APPROXIMATE_CHARS_PER_TOKEN;
+    u32::try_from(estimated.max(1)).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -994,21 +1045,24 @@ pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> Co
     candidates.sort_by_key(|(index, item)| (item.priority.rank(), *index));
 
     let mut used_tokens = 0;
+    let mut included_indices = HashSet::new();
+    for (index, item) in candidates {
+        if item.token_count > max_tokens.saturating_sub(used_tokens) {
+            continue;
+        }
+        used_tokens = used_tokens.saturating_add(item.token_count);
+        included_indices.insert(index);
+    }
+
     let mut included_item_ids = Vec::new();
-    let mut excluded_item_ids: Vec<String> = items
-        .iter()
-        .filter(|item| !item.public || item.evaluator_only)
-        .map(|item| item.item_id.clone())
-        .collect();
+    let mut excluded_item_ids = Vec::new();
     let mut messages = Vec::new();
     let mut digest_parts = Vec::new();
-
-    for (_, item) in candidates {
-        if used_tokens + item.token_count > max_tokens {
+    for (index, item) in items.iter().enumerate() {
+        if !included_indices.contains(&index) {
             excluded_item_ids.push(item.item_id.clone());
             continue;
         }
-        used_tokens += item.token_count;
         included_item_ids.push(item.item_id.clone());
         digest_parts.push(item.digest.clone());
         messages.push(json!({
