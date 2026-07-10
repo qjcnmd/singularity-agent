@@ -17,6 +17,7 @@ use std::sync::{
     mpsc::{self, Receiver},
 };
 use std::thread;
+use std::time::Duration;
 
 static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
 
@@ -557,7 +558,9 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
         metadata: serde_json::json!({}),
     });
 
-    let response = provider.complete(&request).expect("provider response");
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("provider response");
     let serialized = serde_json::to_string(&response).expect("serialize response");
 
     assert_eq!(response.status, ModelTurnStatus::Success);
@@ -573,6 +576,56 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
     );
     assert!(!serialized.contains("sk-secret-value"));
     assert!(!serialized.contains("choices"));
+}
+
+#[test]
+fn openai_provider_cancels_an_inflight_http_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging provider");
+    let address = listener.local_addr().expect("provider address");
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept provider request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut first_line = String::new();
+        reader
+            .read_line(&mut first_line)
+            .expect("read request line");
+        assert!(first_line.contains("/v1/chat/completions"));
+        accepted_tx.send(()).expect("signal accepted request");
+        thread::sleep(Duration::from_secs(2));
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+        );
+    });
+    let provider =
+        OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_cancel",
+        "run_cancel",
+        "session_cancel",
+        "task_cancel",
+        vec![ModelMessage::text(ModelRole::User, "wait")],
+    );
+    let cancellation = singularity_core::CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        result_tx
+            .send(provider.complete(&request, &worker_cancellation))
+            .expect("send provider result");
+    });
+
+    accepted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("provider request started");
+    cancellation.cancel();
+    let error = result_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("provider cancellation was bounded")
+        .expect_err("provider request cancelled");
+
+    assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+    assert!(!error.error.retryable);
 }
 
 #[test]
@@ -601,7 +654,9 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
         ],
     );
 
-    let response = provider.complete(&request).expect("provider response");
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("provider response");
     let captured: serde_json::Value = serde_json::from_str(
         &captured_request
             .recv()
@@ -659,7 +714,9 @@ fn openai_provider_maps_internal_tool_names_to_wire_names_and_back() {
         metadata: serde_json::json!({}),
     });
 
-    let response = provider.complete(&request).expect("provider response");
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("provider response");
     let captured: serde_json::Value = serde_json::from_str(
         &captured_request
             .recv()
@@ -687,7 +744,9 @@ fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
 
-    let error = provider.complete(&request).expect_err("auth error");
+    let error = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect_err("auth error");
     let serialized = serde_json::to_string(&error.error).expect("serialize error");
 
     assert_eq!(error.error.kind, ModelErrorKind::AuthError);
@@ -729,7 +788,9 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
             vec![ModelMessage::text(ModelRole::User, "hello")],
         );
 
-        let error = provider.complete(&request).expect_err("http error");
+        let error = provider
+            .complete(&request, &singularity_core::CancellationToken::new())
+            .expect_err("http error");
         let serialized = serde_json::to_string(&error.error).expect("serialize error");
 
         assert_eq!(error.error.kind, expected_kind);
@@ -773,7 +834,9 @@ fn openai_provider_validation_rejects_non_object_tool_arguments() {
         metadata: serde_json::json!({}),
     });
 
-    let response = provider.complete(&request).expect("provider response");
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("provider response");
 
     assert_eq!(response.status, ModelTurnStatus::Invalid);
     assert_eq!(

@@ -502,6 +502,70 @@ fn terminal_turn_status_is_not_overwritten_by_later_updates() {
 }
 
 #[test]
+fn cancellation_request_is_atomic_and_rejects_late_completion() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let trace = TraceEvent::new(
+        "trace_cancel_requested",
+        &thread.thread_id,
+        &turn.turn_id,
+        "app_server",
+        "turn interrupt requested",
+    );
+
+    let cancel_requested = store
+        .request_turn_cancellation(&turn.turn_id, &trace)
+        .expect("request cancellation");
+
+    assert_eq!(cancel_requested.status, TurnStatus::Running);
+    assert_eq!(cancel_requested.agent_loop_status, "cancel_requested");
+    assert!(matches!(
+        store.commit_turn_outcome(
+            &turn.turn_id,
+            TurnStatus::Completed,
+            "completed",
+            Some("too late"),
+            &TraceEvent::new(
+                "trace_too_late",
+                &thread.thread_id,
+                &turn.turn_id,
+                "agent_loop",
+                "late completion",
+            ),
+        ),
+        Err(StoreError::InvalidState(message))
+            if message == "cancel-requested turn can only finalize as interrupted"
+    ));
+    let interrupted = store
+        .commit_turn_outcome(
+            &turn.turn_id,
+            TurnStatus::Interrupted,
+            "cancelled",
+            None,
+            &TraceEvent::new(
+                "trace_cancelled",
+                &thread.thread_id,
+                &turn.turn_id,
+                "agent_loop",
+                "turn cancelled",
+            ),
+        )
+        .expect("finalize cancellation");
+    assert_eq!(interrupted.turn.status, TurnStatus::Interrupted);
+    let trace_ids = store
+        .list_trace(&thread.thread_id)
+        .expect("trace list")
+        .into_iter()
+        .map(|trace| trace.event_id)
+        .collect::<Vec<_>>();
+    assert_eq!(trace_ids, vec!["trace_cancel_requested", "trace_cancelled"]);
+}
+
+#[test]
 fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
     for outcome in [
         ApprovalOutcome::Allow,

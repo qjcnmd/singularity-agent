@@ -4,7 +4,10 @@ mod evaluation;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use singularity_agent::{
@@ -12,7 +15,8 @@ use singularity_agent::{
     ApprovalGrant, PendingToolCall,
 };
 use singularity_core::{
-    ErrorCode, ProjectInstructionError, contains_sensitive_text, load_project_instructions_from_cwd,
+    CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
+    load_project_instructions_from_cwd,
 };
 use singularity_model::{Provider, ProviderConfigSnapshot};
 use singularity_policy::{
@@ -57,6 +61,7 @@ const TOOL_PATCH: &str = "builtin.patch";
 const TOOL_COMMAND: &str = "builtin.command";
 const DEFAULT_THREAD_HISTORY_TURN_LIMIT: usize = 64;
 const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
+const TURN_CANCELLATION_POLL_MS: u64 = 25;
 
 #[derive(Debug, Error)]
 pub enum AppServerError {
@@ -82,6 +87,26 @@ pub struct AppServer {
     shutdown_requested: bool,
     sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
     provider_snapshot: ProviderConfigSnapshot,
+    active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+}
+
+struct ActiveTurnGuard {
+    turn_id: String,
+    active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    monitor_stop: Arc<AtomicBool>,
+    monitor: Option<JoinHandle<()>>,
+}
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        self.monitor_stop.store(true, Ordering::SeqCst);
+        if let Some(monitor) = self.monitor.take() {
+            let _ = monitor.join();
+        }
+        if let Ok(mut active_turns) = self.active_turns.lock() {
+            active_turns.remove(&self.turn_id);
+        }
+    }
 }
 
 impl AppServer {
@@ -94,6 +119,7 @@ impl AppServer {
             shutdown_requested: false,
             sandbox_backend: Arc::new(WindowsSandboxBackend::new()),
             provider_snapshot,
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -107,6 +133,68 @@ impl AppServer {
 
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
+    }
+
+    pub fn ready_for_turn_worker(&self) -> bool {
+        self.initialized_acknowledged
+    }
+
+    pub fn cancel_active_turns(&self) -> AppServerResult<()> {
+        for cancellation in self
+            .active_turns
+            .lock()
+            .map_err(|_| AppServerError::Workspace("active turn registry poisoned".into()))?
+            .values()
+        {
+            cancellation.cancel();
+        }
+        Ok(())
+    }
+
+    pub fn turn_worker(&self) -> AppServerResult<Self> {
+        Ok(Self {
+            store: SessionStore::open(&self.store.descriptor().path)?,
+            initialized: true,
+            initialized_acknowledged: true,
+            event_filter: self.event_filter.clone(),
+            shutdown_requested: false,
+            sandbox_backend: Arc::clone(&self.sandbox_backend),
+            provider_snapshot: self.provider_snapshot.clone(),
+            active_turns: Arc::clone(&self.active_turns),
+        })
+    }
+
+    fn activate_turn(
+        &self,
+        turn_id: &str,
+    ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
+        let cancellation = CancellationToken::new();
+        {
+            let mut active_turns = self
+                .active_turns
+                .lock()
+                .map_err(|_| AppServerError::Workspace("active turn registry poisoned".into()))?;
+            if active_turns.contains_key(turn_id) {
+                return Err(AppServerError::Workspace(format!(
+                    "turn {turn_id} is already active"
+                )));
+            }
+            active_turns.insert(turn_id.to_string(), cancellation.clone());
+        }
+        let monitor_stop = Arc::new(AtomicBool::new(false));
+        let monitor = cancellation_monitor(
+            &self.store.descriptor().path,
+            turn_id,
+            cancellation.clone(),
+            Arc::clone(&monitor_stop),
+        );
+        let guard = ActiveTurnGuard {
+            turn_id: turn_id.to_string(),
+            active_turns: Arc::clone(&self.active_turns),
+            monitor_stop,
+            monitor,
+        };
+        Ok((cancellation, guard))
     }
 
     pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {
@@ -371,26 +459,51 @@ impl AppServer {
     }
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let mut messages = Vec::new();
+        self.handle_turn_start_streaming(message, |message| messages.push(message))?;
+        Ok(messages)
+    }
+
+    pub fn handle_turn_start_streaming(
+        &mut self,
+        message: JsonRpcMessage,
+        mut emit: impl FnMut(Value),
+    ) -> AppServerResult<()> {
+        if message.method.as_deref() != Some(Method::TurnStart.as_str()) {
+            return Err(AppServerError::InvalidParams(
+                "streaming handler requires turn/start".to_string(),
+            ));
+        }
         let params: TurnStartParams = parse_params(&message)?;
         let thread = match self.store.get_thread(&params.thread_id) {
             Ok(thread) => thread,
             Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.id, THREAD_NOT_FOUND);
+                emit_messages(&mut emit, not_found_response(message.id, THREAD_NOT_FOUND)?);
+                return Ok(());
             }
             Err(error) => return Err(error.into()),
         };
         if thread.status != singularity_protocol::ThreadStatus::Active {
-            return invalid_request_response(message.id, THREAD_ARCHIVED);
+            emit_messages(
+                &mut emit,
+                invalid_request_response(message.id, THREAD_ARCHIVED)?,
+            );
+            return Ok(());
         }
         if let Err(error) = native_workspace_root(&thread) {
-            return invalid_request_response(message.id, error);
+            emit_messages(&mut emit, invalid_request_response(message.id, error)?);
+            return Ok(());
         }
         let capability = AgentLoopCapability::current();
         if !native_capability_ready(&capability) {
-            return invalid_request_response(
-                message.id,
-                native_agent_loop_unavailable_message(&capability),
+            emit_messages(
+                &mut emit,
+                invalid_request_response(
+                    message.id,
+                    native_agent_loop_unavailable_message(&capability),
+                )?,
             );
+            return Ok(());
         }
         let payload = serde_json::to_value(&params.input)?;
         let started = match self.store.create_turn_with_input_trace_and_history(
@@ -403,27 +516,37 @@ impl AppServer {
         ) {
             Ok(result) => result,
             Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.id, THREAD_NOT_FOUND);
+                emit_messages(&mut emit, not_found_response(message.id, THREAD_NOT_FOUND)?);
+                return Ok(());
             }
             Err(error) => return Err(error.into()),
         };
         let turn = started.turn;
-
-        let mut messages = Vec::new();
-        messages.extend(self.event_notification(AppEvent::turn_started(&turn)));
-        let status =
-            self.run_native_agent_loop(&thread, &params, &turn.turn_id, &started.history.messages)?;
-        let committed = self.commit_turn_run_status(turn, &status)?;
+        let (cancellation, _active_turn) = self.activate_turn(&turn.turn_id)?;
+        if let Some(event) = self.event_notification(AppEvent::turn_started(&turn)) {
+            emit(event);
+        }
+        let status = self.run_native_agent_loop(
+            &thread,
+            &params,
+            &turn.turn_id,
+            &started.history.messages,
+            &cancellation,
+        )?;
+        let committed = self.commit_turn_run_status(turn, &status, &cancellation)?;
         let turn = committed.turn;
-        messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
-        messages.push(
-            JsonRpcMessage::response(
-                message.id,
-                serde_json::to_value(TurnStartResult { turn: turn.clone() })?,
-            )
-            .to_wire_value(),
+        emit_messages(
+            &mut emit,
+            self.agent_terminal_item_events(committed.assistant_item.as_ref())?,
         );
-        Ok(messages)
+        if let Some(event) = self.event_notification(AppEvent::turn_completed(&turn)) {
+            emit(event);
+        }
+        emit(
+            JsonRpcMessage::response(message.id, serde_json::to_value(TurnStartResult { turn })?)
+                .to_wire_value(),
+        );
+        Ok(())
     }
 
     fn agent_capability(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -454,6 +577,7 @@ impl AppServer {
         params: &TurnStartParams,
         turn_id: &str,
         history: &[ConversationMessage],
+        cancellation: &CancellationToken,
     ) -> AppServerResult<AgentRunStatus> {
         let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
@@ -461,9 +585,14 @@ impl AppServer {
                 return Ok(AgentRunStatus::failed(error.message).with_status(AgentStatus::Failed));
             }
         };
-        match self
-            .run_native_agent_loop_with_provider(provider, thread, params, turn_id, history, None)
-        {
+        match self.run_native_agent_loop_with_provider(
+            provider,
+            thread,
+            params,
+            turn_id,
+            history,
+            cancellation,
+        ) {
             Err(AppServerError::ProjectInstructions(error)) => {
                 Ok(AgentRunStatus::failed(error.to_string()).with_status(AgentStatus::Failed))
             }
@@ -479,6 +608,7 @@ impl AppServer {
         request: &ApprovalRequest,
         decision: &ApprovalDecision,
         pending_tool_call: Option<Value>,
+        cancellation: &CancellationToken,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus)>> {
         if !native_agent_loop_ready() {
             return Ok(None);
@@ -506,7 +636,13 @@ impl AppServer {
                 return Ok(Some((turn, run_status)));
             }
         };
-        self.resume_native_agent_loop_after_gate(request, decision, pending_tool_call, provider)
+        self.resume_native_agent_loop_after_gate(
+            request,
+            decision,
+            pending_tool_call,
+            provider,
+            cancellation,
+        )
     }
 
     fn resume_native_agent_loop_after_gate<P>(
@@ -515,6 +651,7 @@ impl AppServer {
         decision: &ApprovalDecision,
         pending_tool_call: Option<Value>,
         provider: P,
+        cancellation: &CancellationToken,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus)>>
     where
         P: Provider,
@@ -622,7 +759,12 @@ impl AppServer {
                 workspace_root,
                 Arc::clone(&self.sandbox_backend),
             ))
+            .with_cancellation_token(cancellation.clone())
             .resume_pending_tool_call(&loop_input, &pending);
+        self.persist_agent_approval_requests(
+            &result.approval_requests,
+            &result.pending_tool_calls,
+        )?;
         let mut run_status = result.to_run_status(&loop_input);
         if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
             let audit_status = native_approval_terminal_status(
@@ -649,7 +791,7 @@ impl AppServer {
         params: &TurnStartParams,
         turn_id: &str,
         history: &[ConversationMessage],
-        approval_grant: Option<ApprovalGrant>,
+        cancellation: &CancellationToken,
     ) -> AppServerResult<AgentRunStatus>
     where
         P: Provider,
@@ -658,22 +800,31 @@ impl AppServer {
         let workspace_root = native_workspace_root(thread).map_err(AppServerError::Workspace)?;
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
         let policy = native_workspace_policy(workspace_root_display);
-        let mut loop_input = native_loop_input(thread, params, turn_id, &workspace_root, history)?;
-        if let Some(grant) = approval_grant {
-            loop_input = loop_input.with_approval_grant(grant);
-        }
+        let loop_input = native_loop_input(thread, params, turn_id, &workspace_root, history)?;
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
             .with_workspace_tools(native_workspace_tools(
                 workspace_root,
                 Arc::clone(&self.sandbox_backend),
             ))
+            .with_cancellation_token(cancellation.clone())
             .run(&loop_input);
-        let pending_by_request = result
-            .pending_tool_calls
+        self.persist_agent_approval_requests(
+            &result.approval_requests,
+            &result.pending_tool_calls,
+        )?;
+        Ok(result.to_run_status(&loop_input))
+    }
+
+    fn persist_agent_approval_requests(
+        &self,
+        approval_requests: &[ApprovalRequest],
+        pending_tool_calls: &[PendingToolCall],
+    ) -> AppServerResult<()> {
+        let pending_by_request = pending_tool_calls
             .iter()
             .map(|pending| (pending.request_id.as_str(), pending))
             .collect::<HashMap<_, _>>();
-        for request in &result.approval_requests {
+        for request in approval_requests {
             let pending_tool_call = pending_by_request
                 .get(request.request_id.as_str())
                 .map(|pending| serde_json::to_value(*pending))
@@ -689,50 +840,46 @@ impl AppServer {
                 Err(error) => return Err(error.into()),
             }
         }
-        Ok(result.to_run_status(&loop_input))
+        Ok(())
     }
 
     fn commit_turn_run_status(
         &self,
         turn: Turn,
         run_status: &AgentRunStatus,
+        cancellation: &CancellationToken,
     ) -> AppServerResult<CommittedTurnOutcome> {
-        let status = match run_status.status {
-            singularity_agent::AgentStatus::Completed => TurnStatus::Completed,
-            singularity_agent::AgentStatus::Blocked => TurnStatus::Blocked,
-            singularity_agent::AgentStatus::Failed => TurnStatus::Failed,
-            singularity_agent::AgentStatus::CancelRequested => TurnStatus::Interrupted,
-            singularity_agent::AgentStatus::Cancelled => TurnStatus::Interrupted,
-            singularity_agent::AgentStatus::Running => TurnStatus::Running,
-            singularity_agent::AgentStatus::NotMigrated => TurnStatus::Failed,
-        };
+        let mut effective_status = run_status.clone();
+        if cancellation.is_cancelled() {
+            mark_run_cancelled(&mut effective_status);
+        }
+        match self.commit_effective_turn_status(&turn, &effective_status) {
+            Ok(committed) => Ok(committed),
+            Err(StoreError::InvalidState(message))
+                if message == "cancel-requested turn can only finalize as interrupted" =>
+            {
+                mark_run_cancelled(&mut effective_status);
+                self.commit_effective_turn_status(&turn, &effective_status)
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn commit_effective_turn_status(
+        &self,
+        turn: &Turn,
+        run_status: &AgentRunStatus,
+    ) -> Result<CommittedTurnOutcome, StoreError> {
         let assistant_delta = agent_completed_delta(run_status);
-        let mut event = TraceEvent::new(
-            format!("trace_{}_native_agent_loop", turn.turn_id),
-            &turn.thread_id,
+        let event = native_agent_loop_trace(turn, run_status);
+        self.store.commit_turn_outcome(
             &turn.turn_id,
-            "agent_loop",
-            "Rust native AgentLoop result translated",
-        );
-        event.payload = json!({
-            "component": "agent_loop",
-            "status": run_status.status.as_str(),
-            "run_id": run_status.run_id,
-            "session_id": run_status.session_id,
-            "task_id": run_status.task_id,
-            "model_turns": run_status.model_turns,
-            "tool_calls": run_status.tool_calls,
-            "approval_count": run_status.approval_count,
-            "audit_events": run_status.audit_events,
-            "error": run_status.error.as_deref().map(redact_app_server_text),
-        });
-        Ok(self.store.commit_turn_outcome(
-            &turn.turn_id,
-            status,
+            turn_status_for_agent(&run_status.status),
             run_status.status.as_str(),
             assistant_delta.as_deref(),
             &event,
-        )?)
+        )
     }
 
     fn turn_interrupt(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -751,15 +898,19 @@ impl AppServer {
             ]),
             Ok(turn) => {
                 let thread_id = turn.thread_id.clone();
-                let turn = self.store.update_turn_state(
-                    &turn.turn_id,
-                    TurnStatus::Interrupted,
-                    "cancel_requested",
-                )?;
+                if let Some(cancellation) = self
+                    .active_turns
+                    .lock()
+                    .map_err(|_| AppServerError::Workspace("active turn registry poisoned".into()))?
+                    .get(&turn.turn_id)
+                    .cloned()
+                {
+                    cancellation.cancel();
+                }
                 let trace = TraceEvent {
                     payload: json!({
                         "turn_id": turn.turn_id,
-                        "agent_loop_status": turn.agent_loop_status,
+                        "agent_loop_status": AgentStatus::CancelRequested.as_str(),
                     }),
                     ..TraceEvent::new(
                         format!("trace_{}_interrupt_requested", turn.turn_id),
@@ -769,13 +920,20 @@ impl AppServer {
                         "turn interrupt requested",
                     )
                 };
-                self.store.append_trace(&trace)?;
+                let turn = self
+                    .store
+                    .request_turn_cancellation(&turn.turn_id, &trace)?;
+                let status = if turn.agent_loop_status == AgentStatus::CancelRequested.as_str() {
+                    AgentStatus::CancelRequested.as_str()
+                } else {
+                    turn_status_str(&turn.status)
+                };
                 Ok(vec![
                     JsonRpcMessage::response(
                         message.id,
                         serde_json::to_value(TurnInterruptResult {
                             turn_id: turn.turn_id,
-                            status: "interrupted".to_string(),
+                            status: status.to_string(),
                             agent_loop_status: Some(turn.agent_loop_status),
                         })?,
                     )
@@ -798,6 +956,7 @@ impl AppServer {
 
     fn server_shutdown(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         self.shutdown_requested = true;
+        self.cancel_active_turns()?;
         Ok(vec![
             JsonRpcMessage::response(message.id, json!({"shutdown": true})).to_wire_value(),
         ])
@@ -866,8 +1025,22 @@ impl AppServer {
             }
         };
         let pending_tool_call = recorded.pending_tool_call.clone();
-        let resumed =
-            self.resume_native_agent_loop(&recorded.request, &decision, pending_tool_call.clone())?;
+        let active_turn =
+            if matches!(decision.outcome, ApprovalOutcome::Allow) && pending_tool_call.is_some() {
+                Some(self.activate_turn(&recorded.request.turn_id)?)
+            } else {
+                None
+            };
+        let cancellation = active_turn
+            .as_ref()
+            .map(|(cancellation, _guard)| cancellation.clone())
+            .unwrap_or_default();
+        let resumed = self.resume_native_agent_loop(
+            &recorded.request,
+            &decision,
+            pending_tool_call.clone(),
+            &cancellation,
+        )?;
         let mut messages = Vec::new();
         let terminal = if let Some(resumed) = resumed {
             Some(resumed)
@@ -879,8 +1052,9 @@ impl AppServer {
             )?
         };
         if let Some((turn, run_status)) = terminal {
-            let committed = self.commit_turn_run_status(turn, &run_status)?;
+            let committed = self.commit_turn_run_status(turn, &run_status, &cancellation)?;
             messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
+            messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
         }
         messages.push(
             JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
@@ -1035,6 +1209,48 @@ fn json_response<T: serde::Serialize>(id: Option<Value>, result: T) -> AppServer
     Ok(vec![
         JsonRpcMessage::response(id, serde_json::to_value(result)?).to_wire_value(),
     ])
+}
+
+fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
+    for message in messages {
+        emit(message);
+    }
+}
+
+fn cancellation_monitor(
+    store_path: &str,
+    turn_id: &str,
+    cancellation: CancellationToken,
+    stop: Arc<AtomicBool>,
+) -> Option<JoinHandle<()>> {
+    if store_path == ":memory:" {
+        return None;
+    }
+    let store_path = store_path.to_string();
+    let turn_id = turn_id.to_string();
+    Some(std::thread::spawn(move || {
+        let store = match SessionStore::open(store_path) {
+            Ok(store) => store,
+            Err(_) => {
+                cancellation.cancel();
+                return;
+            }
+        };
+        while !stop.load(Ordering::SeqCst) && !cancellation.is_cancelled() {
+            match store.get_turn(&turn_id) {
+                Ok(turn) if turn.agent_loop_status == AgentStatus::CancelRequested.as_str() => {
+                    cancellation.cancel();
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    cancellation.cancel();
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(TURN_CANCELLATION_POLL_MS));
+        }
+    }))
 }
 
 fn native_approval_terminal_status(
@@ -1271,6 +1487,7 @@ fn native_agent_loop_unavailable_message(capability: &AgentLoopCapability) -> St
 fn native_workspace_policy(workspace_root: String) -> PolicyEngine {
     PolicyEngine::new(PermissionProfile::workspace_write(workspace_root))
         .with_rule(native_read_tool_rule())
+        .with_rule(native_sandbox_command_rule())
 }
 
 fn native_read_tool_rule() -> PermissionRule {
@@ -1280,6 +1497,15 @@ fn native_read_tool_rule() -> PermissionRule {
         PermissionDecisionOutcome::Allow,
     )
     .for_operation(PermissionOperation::Read)
+}
+
+fn native_sandbox_command_rule() -> PermissionRule {
+    PermissionRule::new(
+        "allow_native_sandbox_commands",
+        SettingsScope::Project,
+        PermissionDecisionOutcome::Allow,
+    )
+    .for_operation(PermissionOperation::Execute)
 }
 
 fn native_workspace_tool_specs() -> Vec<ToolSpec> {
@@ -1409,6 +1635,47 @@ fn turn_status_str(status: &TurnStatus) -> &'static str {
     }
 }
 
+fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
+    match status {
+        AgentStatus::Completed => TurnStatus::Completed,
+        AgentStatus::Blocked => TurnStatus::Blocked,
+        AgentStatus::CancelRequested | AgentStatus::Cancelled => TurnStatus::Interrupted,
+        AgentStatus::Running => TurnStatus::Running,
+        AgentStatus::Failed | AgentStatus::NotMigrated => TurnStatus::Failed,
+    }
+}
+
+fn mark_run_cancelled(status: &mut AgentRunStatus) {
+    status.status = AgentStatus::Cancelled;
+    status.completed = false;
+    status.final_answer = None;
+    status.error = None;
+}
+
+fn native_agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
+    let mut event = TraceEvent::new(
+        format!("trace_{}_native_agent_loop", turn.turn_id),
+        &turn.thread_id,
+        &turn.turn_id,
+        "agent_loop",
+        "Rust native AgentLoop result translated",
+    );
+    event.payload = json!({
+        "component": "agent_loop",
+        "status": status.status.as_str(),
+        "run_id": &status.run_id,
+        "session_id": &status.session_id,
+        "task_id": &status.task_id,
+        "model_turns": status.model_turns,
+        "tool_calls": status.tool_calls,
+        "approval_count": status.approval_count,
+        "audit_events": &status.audit_events,
+        "verification": &status.verification,
+        "error": status.error.as_deref().map(redact_app_server_text),
+    });
+    event
+}
+
 fn agent_completed_delta(run_status: &AgentRunStatus) -> Option<String> {
     if run_status.status == AgentStatus::Completed {
         run_status
@@ -1454,15 +1721,25 @@ mod tests {
         Provider, ProviderError,
     };
     use singularity_protocol::ItemKind;
-    use singularity_tools::{
-        CommandRequest, CommandResult, SandboxFilesystemMode, SandboxNetworkMode,
-        command_scope_resource,
-    };
+    use singularity_tools::{CommandRequest, CommandResult};
 
     use super::*;
 
     fn app_server(store: SessionStore) -> AppServer {
         AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
+    }
+
+    #[test]
+    fn duplicate_turn_activation_keeps_the_original_cancellation_token_registered() {
+        let server = app_server(SessionStore::open(":memory:").expect("store"));
+        let (original, _guard) = server.activate_turn("turn_1").expect("activate turn");
+
+        let duplicate = server.activate_turn("turn_1");
+
+        assert!(matches!(duplicate, Err(AppServerError::Workspace(_))));
+        assert!(!original.is_cancelled());
+        server.cancel_active_turns().expect("cancel active turn");
+        assert!(original.is_cancelled());
     }
 
     struct StaticProvider {
@@ -1471,7 +1748,11 @@ mod tests {
     }
 
     impl Provider for StaticProvider {
-        fn complete(&self, request: &ModelTurnRequest) -> Result<ModelTurnResponse, ProviderError> {
+        fn complete(
+            &self,
+            request: &ModelTurnRequest,
+            _cancellation: &singularity_core::CancellationToken,
+        ) -> Result<ModelTurnResponse, ProviderError> {
             let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
             let response_index = seen_requests.len();
             seen_requests.push(request.clone());
@@ -1522,7 +1803,14 @@ mod tests {
         let server = app_server(store);
 
         let status = server
-            .run_native_agent_loop_with_provider(provider, &thread, &params, "turn_1", &[], None)
+            .run_native_agent_loop_with_provider(
+                provider,
+                &thread,
+                &params,
+                "turn_1",
+                &[],
+                &CancellationToken::new(),
+            )
             .expect("native loop");
 
         assert_eq!(status.status, AgentStatus::Completed);
@@ -1531,10 +1819,14 @@ mod tests {
         assert_eq!(requests[0].messages.len(), 2);
         assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
         assert_eq!(requests[0].messages[1].role, ModelRole::User);
-        assert_eq!(
-            requests[0].messages[0].content[0].text.as_deref(),
-            Some("root instructions\n\ncrate instructions\n\nagent instructions")
-        );
+        let developer = requests[0].messages[0].content[0]
+            .text
+            .as_deref()
+            .expect("developer instructions");
+        assert!(developer.starts_with("You are a coding agent working in the current workspace."));
+        assert!(developer.ends_with(
+            "Project instructions:\nroot instructions\n\ncrate instructions\n\nagent instructions"
+        ));
         assert_eq!(
             requests[0].messages[1].content[0].text.as_deref(),
             Some("user goal")
@@ -1682,7 +1974,7 @@ mod tests {
                 &params,
                 &started.turn.turn_id,
                 &started.history.messages,
-                None,
+                &CancellationToken::new(),
             )
             .expect("native loop");
 
@@ -1702,14 +1994,18 @@ mod tests {
                 ModelRole::User,
             ]
         );
+        let developer = requests[0].messages[0].content[0]
+            .text
+            .as_deref()
+            .expect("developer instructions");
+        assert!(developer.starts_with("You are a coding agent working in the current workspace."));
+        assert!(developer.ends_with("Project instructions:\nproject instructions"));
         assert_eq!(
-            requests[0]
-                .messages
+            requests[0].messages[1..]
                 .iter()
                 .map(|message| message.content[0].text.as_deref())
                 .collect::<Vec<_>>(),
             vec![
-                Some("project instructions"),
                 Some("previous user"),
                 Some("previous assistant"),
                 Some("current user"),
@@ -1793,7 +2089,13 @@ mod tests {
         };
 
         let resumed = server
-            .resume_native_agent_loop_after_gate(&request, &decision, None, provider)
+            .resume_native_agent_loop_after_gate(
+                &request,
+                &decision,
+                None,
+                provider,
+                &CancellationToken::new(),
+            )
             .expect("resume");
 
         assert!(resumed.is_none());
@@ -1963,6 +2265,7 @@ mod tests {
                     )],
                     seen_requests: Arc::clone(&seen_requests),
                 },
+                &CancellationToken::new(),
             )
             .expect("resume")
             .expect("terminal status");
@@ -1991,6 +2294,7 @@ mod tests {
                     )],
                     seen_requests: Arc::clone(&seen_requests),
                 },
+                &CancellationToken::new(),
             )
             .expect("resume")
             .expect("terminal status");
@@ -2109,14 +2413,32 @@ mod tests {
             ApprovalOutcome::Allow,
             "approved",
         );
+        let mut verification_response =
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+        verification_response.tool_calls.push(ModelToolCall {
+            tool_call_id: "call_verify".to_string(),
+            tool_name: TOOL_COMMAND.to_string(),
+            arguments: json!({
+                "argv": ["cmd.exe", "/C", "echo verified"],
+                "timeout_seconds": 5
+            }),
+            raw_arguments: json!({
+                "argv": ["cmd.exe", "/C", "echo verified"],
+                "timeout_seconds": 5
+            })
+            .to_string(),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+            provider_metadata: json!({}),
+        });
         let final_response =
-            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+            ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
         let seen_requests = Arc::new(Mutex::new(Vec::new()));
         let provider = StaticProvider {
-            responses: vec![final_response],
+            responses: vec![verification_response, final_response],
             seen_requests: Arc::clone(&seen_requests),
         };
-        let server = app_server(store);
+        let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
 
         let resumed = server
             .resume_native_agent_loop_after_gate(
@@ -2124,6 +2446,7 @@ mod tests {
                 &decision,
                 Some(pending_payload),
                 provider,
+                &CancellationToken::new(),
             )
             .expect("resume")
             .expect("resumed");
@@ -2131,25 +2454,29 @@ mod tests {
         assert_eq!(resumed.0.turn_id, turn.turn_id);
         assert_eq!(resumed.1.status, AgentStatus::Completed);
         assert_eq!(resumed.1.final_answer.as_deref(), Some("done"));
+        assert!(resumed.1.verification.required);
+        assert!(resumed.1.verification.passed);
+        assert_eq!(resumed.1.verification.successful_command_count, 1);
         assert_eq!(
             std::fs::read_to_string(&file_path).expect("read readme"),
             "after"
         );
         let requests = seen_requests.lock().expect("seen requests");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].messages[0].role, ModelRole::User);
-        assert_eq!(
-            requests[0].messages[0].content[0].text.as_deref(),
-            Some("previous approval user")
-        );
-        assert_eq!(requests[0].messages[1].role, ModelRole::Assistant);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
+        assert_eq!(requests[0].messages[1].role, ModelRole::User);
         assert_eq!(
             requests[0].messages[1].content[0].text.as_deref(),
-            Some("previous approval assistant")
+            Some("previous approval user")
         );
-        assert_eq!(requests[0].messages[2].role, ModelRole::User);
+        assert_eq!(requests[0].messages[2].role, ModelRole::Assistant);
         assert_eq!(
             requests[0].messages[2].content[0].text.as_deref(),
+            Some("previous approval assistant")
+        );
+        assert_eq!(requests[0].messages[3].role, ModelRole::User);
+        assert_eq!(
+            requests[0].messages[3].content[0].text.as_deref(),
             Some("edit readme")
         );
         let request_json = serde_json::to_string(&requests[0]).expect("request json");
@@ -2228,6 +2555,7 @@ mod tests {
                 &decision,
                 Some(serde_json::to_value(pending).expect("pending payload")),
                 provider,
+                &CancellationToken::new(),
             )
             .expect("resume check");
 
@@ -2260,7 +2588,7 @@ mod tests {
     }
 
     #[test]
-    fn native_agent_loop_command_uses_bound_sandbox_backend_after_gate() {
+    fn native_agent_loop_command_uses_bound_sandbox_backend_without_approval() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -2299,22 +2627,6 @@ mod tests {
             seen_requests: Arc::new(Mutex::new(Vec::new())),
         };
         let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
-        let command_resource = command_scope_resource(
-            &[
-                "cmd.exe".to_string(),
-                "/C".to_string(),
-                "echo app-server-sandbox-ok".to_string(),
-            ],
-            ".",
-            5,
-            &SandboxFilesystemMode::WorkspaceWrite,
-            &SandboxNetworkMode::Denied,
-        );
-        let grant = ApprovalGrant::allow(
-            "approval_turn_1_call_1",
-            "builtin.command",
-            [command_resource],
-        );
 
         let status = server
             .run_native_agent_loop_with_provider(
@@ -2323,12 +2635,13 @@ mod tests {
                 &params,
                 "turn_1",
                 &[],
-                Some(grant),
+                &CancellationToken::new(),
             )
             .expect("native loop");
 
         assert_eq!(status.status, AgentStatus::Completed);
         assert_eq!(status.final_answer.as_deref(), Some("done"));
         assert_eq!(status.tool_calls, 1);
+        assert_eq!(status.approval_count, 0);
     }
 }

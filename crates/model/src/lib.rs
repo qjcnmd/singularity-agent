@@ -2,12 +2,14 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use singularity_core::CancellationToken;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -25,6 +27,7 @@ const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
+const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
@@ -464,6 +467,7 @@ pub struct ModelRetryDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorKind {
+    Cancelled,
     NetworkError,
     Timeout,
     RateLimited,
@@ -482,6 +486,7 @@ pub enum ModelErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorCategory {
+    Cancelled,
     Authentication,
     Network,
     SandboxPermission,
@@ -701,7 +706,11 @@ pub struct ProviderStreamEvent {
 }
 
 pub trait Provider {
-    fn complete(&self, request: &ModelTurnRequest) -> Result<ModelTurnResponse, ProviderError>;
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError>;
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -776,7 +785,7 @@ impl OpenAiProviderConfig {
 #[derive(Clone)]
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -791,7 +800,7 @@ impl fmt::Debug for OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(config: OpenAiProviderConfig) -> Result<Self, ProviderError> {
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
             .build()
             .map_err(provider_transport_error)?;
@@ -807,7 +816,14 @@ impl OpenAiProvider {
 }
 
 impl Provider for OpenAiProvider {
-    fn complete(&self, request: &ModelTurnRequest) -> Result<ModelTurnResponse, ProviderError> {
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error());
+        }
         let request_validation = validate_model_request(request);
         if !request_validation.valid {
             return Err(ProviderError::from_model_error(
@@ -819,13 +835,17 @@ impl Provider for OpenAiProvider {
                 .with_model(self.config.model_name.clone()),
             ));
         }
-        let response = self
-            .client
-            .post(self.config.endpoint())
-            .bearer_auth(&self.config.api_key)
-            .json(&openai_request_payload(request, &self.config.model_name))
-            .send()
-            .map_err(provider_transport_error)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(provider_runtime_error)?;
+        let response = block_on_provider_future(&runtime, cancellation, || {
+            self.client
+                .post(self.config.endpoint())
+                .bearer_auth(&self.config.api_key)
+                .json(&openai_request_payload(request, &self.config.model_name))
+                .send()
+        })?;
         let status = response.status();
         if !status.is_success() {
             return Err(ProviderError::from_model_error(
@@ -837,9 +857,14 @@ impl Provider for OpenAiProvider {
                 .with_raw_ref(format!("provider_http_status_{}", status.as_u16())),
             ));
         }
-        let payload = response.json::<Value>().map_err(|error| {
-            ProviderError::from_model_error(provider_response_json_error(error))
-        })?;
+        let payload = block_on_provider_future(&runtime, cancellation, || response.json::<Value>())
+            .map_err(|error| {
+                if error.error.kind == ModelErrorKind::Cancelled {
+                    error
+                } else {
+                    ProviderError::from_model_error(provider_response_json_error())
+                }
+            })?;
         parse_openai_response(request, &self.config, payload)
     }
 }
@@ -1281,7 +1306,56 @@ fn provider_transport_error(error: reqwest::Error) -> ProviderError {
     )
 }
 
-fn provider_response_json_error(_error: reqwest::Error) -> ModelError {
+fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::UnknownProviderError,
+            "provider runtime initialization failed",
+        )
+        .retryable(false)
+        .with_raw_ref("provider_runtime_error"),
+    )
+}
+
+fn provider_cancelled_error() -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled")
+            .retryable(false)
+            .with_raw_ref("provider_request_cancelled"),
+    )
+}
+
+fn block_on_provider_future<C, F, T>(
+    runtime: &tokio::runtime::Runtime,
+    cancellation: &CancellationToken,
+    create_future: C,
+) -> Result<T, ProviderError>
+where
+    C: FnOnce() -> F,
+    F: Future<Output = Result<T, reqwest::Error>>,
+{
+    let mut future = {
+        let _runtime_context = runtime.enter();
+        Box::pin(create_future())
+    };
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error());
+        }
+        match runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS),
+                future.as_mut(),
+            )
+            .await
+        }) {
+            Ok(result) => return result.map_err(provider_transport_error),
+            Err(_) => continue,
+        }
+    }
+}
+
+fn provider_response_json_error() -> ModelError {
     ModelError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider response was not valid JSON",
@@ -1507,6 +1581,7 @@ fn default_retryable(kind: &ModelErrorKind) -> bool {
 
 fn model_error_category(error: &ModelError) -> ModelErrorCategory {
     match error.kind {
+        ModelErrorKind::Cancelled => ModelErrorCategory::Cancelled,
         ModelErrorKind::AuthError => ModelErrorCategory::Authentication,
         ModelErrorKind::NetworkError | ModelErrorKind::Timeout => {
             if contains_any_marker(&error.message, &PERMISSION_DENIED_MARKERS) {

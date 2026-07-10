@@ -515,6 +515,44 @@ impl SessionStore {
         })
     }
 
+    pub fn request_turn_cancellation(
+        &self,
+        turn_id: &str,
+        trace: &TraceEvent,
+    ) -> StoreResult<Turn> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let mut turn = transaction
+            .query_row(
+                "select turn_id, thread_id, status, agent_loop_status from turns where turn_id = ?1",
+                params![turn_id],
+                |row| self.turn_from_row(row),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("turn {turn_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        if is_terminal_turn_status(&turn.status) || turn.agent_loop_status == "cancel_requested" {
+            transaction.commit()?;
+            return Ok(turn);
+        }
+        if trace.run_id != turn.thread_id || trace.session_id != turn.turn_id {
+            return Err(StoreError::InvalidState(
+                "turn cancellation trace must be bound to the same thread and turn".to_string(),
+            ));
+        }
+        transaction.execute(
+            "update turns set agent_loop_status = 'cancel_requested' where turn_id = ?1",
+            params![turn_id],
+        )?;
+        Self::insert_trace(&transaction, trace)?;
+        turn.agent_loop_status = "cancel_requested".to_string();
+        transaction.commit()?;
+        Ok(turn)
+    }
+
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -2102,6 +2140,11 @@ fn validate_turn_status_update(
     next_status: &TurnStatus,
     next_agent_loop_status: Option<&str>,
 ) -> StoreResult<()> {
+    if current.agent_loop_status == "cancel_requested" && *next_status != TurnStatus::Interrupted {
+        return Err(StoreError::InvalidState(
+            "cancel-requested turn can only finalize as interrupted".to_string(),
+        ));
+    }
     if is_terminal_turn_status(&current.status) {
         if current.status != *next_status {
             return Err(StoreError::InvalidState(

@@ -1487,6 +1487,7 @@ mod tests {
             pending_tool_calls: Vec::new(),
             tool_results,
             tool_repairs: Vec::new(),
+            verification: singularity_agent::AgentVerification::default(),
             error: None,
         }
     }

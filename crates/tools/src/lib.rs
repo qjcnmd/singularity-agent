@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use singularity_core::contains_sensitive_text;
+use singularity_core::{CancellationToken, contains_sensitive_text};
 pub use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus,
     DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend, SandboxBackendEnforcement,
@@ -792,6 +792,14 @@ impl WorkspaceTools {
     }
 
     pub fn command(&self, input: CommandToolInput) -> Result<ToolOutput, WorkspaceToolError> {
+        self.command_cancellable(input, &CancellationToken::new())
+    }
+
+    pub fn command_cancellable(
+        &self,
+        input: CommandToolInput,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolOutput, WorkspaceToolError> {
         let Some(backend) = &self.sandbox_backend else {
             return Err(WorkspaceToolError::SandboxUnavailable);
         };
@@ -819,7 +827,7 @@ impl WorkspaceTools {
             &request.filesystem.mode,
             &request.network.mode,
         );
-        let result = backend.execute(&request);
+        let result = backend.execute_cancellable(&request, cancellation);
         let execution = result.sandbox.clone();
         let mut output = command_tool_output(result);
         output.metadata["result_id"] = json!(scope_digest);

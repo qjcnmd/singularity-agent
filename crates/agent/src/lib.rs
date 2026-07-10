@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use singularity_core::CancellationToken;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelMessage, ModelPreferences,
     ModelPurpose, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
@@ -32,6 +33,7 @@ const NATIVE_AGENT_LOOP_READY_REASON: &str = "native Rust AgentLoop uses automat
 const NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
     "native Rust AgentLoop requires the Windows restricted-token command sandbox";
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 4;
+const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Use the available tools to inspect real files before making claims. Make requested changes through tools, keep all writes inside the workspace, and run a relevant verification command after the last workspace mutation. Report only work and verification that actually completed. Read-only questions may be answered without changing files or running verification.";
 const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -40,6 +42,8 @@ const MODEL_REQUEST_FIXED_OVERHEAD_TOKENS: u32 = 256;
 const EMPTY_FINAL_ANSWER_ERROR: &str = "empty final answer";
 const CURRENT_TURN_CONTEXT_OVERFLOW_ERROR: &str = "current turn exceeds the model context budget";
 const MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR: &str = "model request exceeds the model context budget";
+const POST_MUTATION_VERIFICATION_REQUIRED: &str =
+    "completion gate rejected final answer: verification required after workspace mutation";
 const COMMAND_SANDBOX_PROFILE_DENIED: &str =
     "command sandbox mode cannot exceed the permission profile";
 const COMMAND_NETWORK_PROFILE_DENIED: &str =
@@ -102,6 +106,14 @@ impl From<&str> for AgentStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub struct AgentVerification {
+    pub required: bool,
+    pub passed: bool,
+    pub successful_command_count: u32,
+    pub unresolved_failures: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRunStatus {
     pub status: AgentStatus,
@@ -115,6 +127,7 @@ pub struct AgentRunStatus {
     pub approval_count: u32,
     pub audit_events: Vec<Value>,
     pub trace_path: Option<String>,
+    pub verification: AgentVerification,
     pub error: Option<String>,
 }
 
@@ -132,6 +145,7 @@ impl AgentRunStatus {
             approval_count: 0,
             audit_events: Vec::new(),
             trace_path: None,
+            verification: AgentVerification::default(),
             error: None,
         }
     }
@@ -149,6 +163,7 @@ impl AgentRunStatus {
             approval_count: 0,
             audit_events: Vec::new(),
             trace_path: None,
+            verification: AgentVerification::default(),
             error: Some(message.into()),
         }
     }
@@ -322,6 +337,7 @@ pub struct AgentLoopResult {
     pub pending_tool_calls: Vec<PendingToolCall>,
     pub tool_results: Vec<ToolResult>,
     pub tool_repairs: Vec<ToolRepair>,
+    pub verification: AgentVerification,
     pub error: Option<String>,
 }
 
@@ -339,6 +355,7 @@ impl AgentLoopResult {
             approval_count: self.approval_count,
             audit_events: audit_events_from_tool_results(&self.tool_results),
             trace_path: None,
+            verification: self.verification.clone(),
             error: self.error.clone(),
         }
     }
@@ -378,11 +395,150 @@ impl PendingToolCall {
     }
 }
 
+#[derive(Default)]
+struct CompletionTracker {
+    workspace_mutated: bool,
+    verified_after_last_mutation: bool,
+    successful_command_count: u32,
+    unresolved_failures: BTreeSet<String>,
+}
+
+impl CompletionTracker {
+    fn observe(&mut self, tool_result: &ToolResult) {
+        let failure_group = match tool_result.tool_name.as_str() {
+            TOOL_EDIT | TOOL_PATCH => "workspace_mutation",
+            TOOL_COMMAND => "verification",
+            tool_name => tool_name,
+        };
+        if tool_result.ok {
+            self.unresolved_failures
+                .retain(|failure| !failure.starts_with(failure_group));
+            if matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH) {
+                self.workspace_mutated = true;
+                self.verified_after_last_mutation = false;
+            } else if tool_result.tool_name == TOOL_COMMAND {
+                self.successful_command_count = self.successful_command_count.saturating_add(1);
+                if self.workspace_mutated {
+                    self.verified_after_last_mutation = true;
+                }
+            }
+        } else if is_repairable_tool_result(tool_result) {
+            let error_code = tool_result
+                .error_code
+                .as_deref()
+                .unwrap_or("tool_execution_failed");
+            self.unresolved_failures
+                .insert(format!("{failure_group}:{error_code}"));
+        }
+    }
+
+    fn allows_final(&self) -> bool {
+        self.unresolved_failures.is_empty()
+            && (!self.workspace_mutated || self.verified_after_last_mutation)
+    }
+
+    fn rejection_reason(&self) -> String {
+        if !self.unresolved_failures.is_empty() {
+            return format!(
+                "completion gate rejected final answer: unresolved failures: {}",
+                self.unresolved_failures
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        POST_MUTATION_VERIFICATION_REQUIRED.to_string()
+    }
+
+    fn feedback(&self) -> String {
+        if !self.unresolved_failures.is_empty() {
+            return format!(
+                "Do not finalize yet. Resolve these failures and rerun the relevant verification: {}.",
+                self.unresolved_failures
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        "Do not finalize yet. Run a relevant verification command after the latest workspace mutation, inspect its result, and only then provide the final answer."
+            .to_string()
+    }
+
+    fn summary(&self) -> AgentVerification {
+        AgentVerification {
+            required: self.workspace_mutated,
+            passed: self.workspace_mutated
+                && self.verified_after_last_mutation
+                && self.unresolved_failures.is_empty(),
+            successful_command_count: self.successful_command_count,
+            unresolved_failures: self.unresolved_failures.iter().cloned().collect(),
+        }
+    }
+}
+
+struct AgentLoopState {
+    messages: Vec<ModelMessage>,
+    tool_results: Vec<ToolResult>,
+    tool_repairs: Vec<ToolRepair>,
+    approval_requests: Vec<ApprovalRequest>,
+    pending_tool_calls: Vec<PendingToolCall>,
+    used_approval_grants: HashSet<String>,
+    prior_approval_count: u32,
+    completion: CompletionTracker,
+    last_completion_error: Option<String>,
+}
+
+impl AgentLoopState {
+    fn new(messages: Vec<ModelMessage>) -> Self {
+        Self {
+            messages,
+            tool_results: Vec::new(),
+            tool_repairs: Vec::new(),
+            approval_requests: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            used_approval_grants: HashSet::new(),
+            prior_approval_count: 0,
+            completion: CompletionTracker::default(),
+            last_completion_error: None,
+        }
+    }
+
+    fn finish(
+        self,
+        status: AgentStatus,
+        completed: bool,
+        final_answer: Option<String>,
+        model_turns: u32,
+        error: Option<String>,
+    ) -> AgentLoopResult {
+        let approval_count = self
+            .prior_approval_count
+            .saturating_add(self.approval_requests.len() as u32);
+        AgentLoopResult {
+            status,
+            completed,
+            final_answer,
+            model_turns,
+            tool_calls: self.tool_results.len() as u32,
+            approval_count,
+            approval_requests: self.approval_requests,
+            pending_tool_calls: self.pending_tool_calls,
+            tool_results: self.tool_results,
+            tool_repairs: self.tool_repairs,
+            verification: self.completion.summary(),
+            error,
+        }
+    }
+}
+
 pub struct AgentLoop<P> {
     provider: P,
     tool_broker: ToolBroker,
     policy: PolicyEngine,
     workspace_tools: Option<WorkspaceTools>,
+    cancellation: CancellationToken,
 }
 
 impl<P> AgentLoop<P>
@@ -395,11 +551,17 @@ where
             tool_broker,
             policy,
             workspace_tools: None,
+            cancellation: CancellationToken::new(),
         }
     }
 
     pub fn with_workspace_tools(mut self, workspace_tools: WorkspaceTools) -> Self {
         self.workspace_tools = Some(workspace_tools);
+        self
+    }
+
+    pub fn with_cancellation_token(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
         self
     }
 
@@ -422,26 +584,6 @@ where
     }
 
     pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
-        if input.interrupted {
-            return AgentLoopResult {
-                status: AgentStatus::Cancelled,
-                completed: false,
-                final_answer: None,
-                model_turns: 0,
-                tool_calls: 0,
-                approval_count: 0,
-                approval_requests: Vec::new(),
-                pending_tool_calls: Vec::new(),
-                tool_results: Vec::new(),
-                tool_repairs: Vec::new(),
-                error: None,
-            };
-        }
-        let mut tool_results = Vec::new();
-        let mut tool_repairs = Vec::new();
-        let mut approval_requests = Vec::new();
-        let mut pending_tool_calls = Vec::new();
-        let mut used_approval_grants = HashSet::new();
         let context = assemble_context_items(
             &input.input,
             context_input_token_budget(input, &self.tool_broker),
@@ -449,80 +591,87 @@ where
         if current_turn_excluded(input, &context) {
             return context_overflow_result();
         }
-        let mut messages = model_messages_from_input(input, &context);
+        let state = AgentLoopState::new(model_messages_from_input(input, &context));
+        if self.is_cancelled(input) {
+            return state.finish(AgentStatus::Cancelled, false, None, 0, None);
+        }
+        self.continue_run(input, &context, state)
+    }
+
+    fn continue_run(
+        &self,
+        input: &AgentLoopInput,
+        context: &ContextBundle,
+        mut state: AgentLoopState,
+    ) -> AgentLoopResult {
         let max_turns = input.max_turns.max(1);
         for turn_index in 0..max_turns {
-            if !model_request_fits_context(input, &self.tool_broker, &messages) {
-                return AgentLoopResult {
-                    status: AgentStatus::Failed,
-                    completed: false,
-                    final_answer: None,
-                    model_turns: turn_index,
-                    tool_calls: tool_results.len() as u32,
-                    approval_count: approval_requests.len() as u32,
-                    approval_requests,
-                    pending_tool_calls,
-                    tool_results,
-                    tool_repairs,
-                    error: Some(MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR.to_string()),
-                };
+            if self.is_cancelled(input) {
+                return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
+            }
+            if !model_request_fits_context(input, &self.tool_broker, &state.messages) {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some(MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR.to_string()),
+                );
             }
             let request = model_turn_request(
                 &self.tool_broker,
                 input,
-                &context,
+                context,
                 turn_index,
-                messages.clone(),
+                state.messages.clone(),
             );
-            let response = match self.provider.complete(&request) {
+            let response = match self.provider.complete(&request, &self.cancellation) {
                 Ok(response) => response,
                 Err(error) => provider_error_response(&request, error),
             };
+            if self.is_cancelled(input) {
+                return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
+            }
             if response.status != ModelTurnStatus::Success {
-                return AgentLoopResult {
-                    status: AgentStatus::Failed,
-                    completed: false,
-                    final_answer: None,
-                    model_turns: turn_index + 1,
-                    tool_calls: tool_results.len() as u32,
-                    approval_count: 0,
-                    approval_requests,
-                    pending_tool_calls,
-                    tool_results,
-                    tool_repairs,
-                    error: response.error.map(|error| error.message),
-                };
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index + 1,
+                    response.error.map(|error| error.message),
+                );
             }
             if response.tool_calls.is_empty() {
                 let final_answer = assistant_message_text(response.assistant_message.as_ref());
                 if final_answer.trim().is_empty() {
-                    return AgentLoopResult {
-                        status: AgentStatus::Failed,
-                        completed: false,
-                        final_answer: None,
-                        model_turns: turn_index + 1,
-                        tool_calls: tool_results.len() as u32,
-                        approval_count: 0,
-                        approval_requests,
-                        pending_tool_calls,
-                        tool_results,
-                        tool_repairs,
-                        error: Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
-                    };
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        turn_index + 1,
+                        Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
+                    );
                 }
-                return AgentLoopResult {
-                    status: AgentStatus::Completed,
-                    completed: true,
-                    final_answer: Some(final_answer),
-                    model_turns: turn_index + 1,
-                    tool_calls: tool_results.len() as u32,
-                    approval_count: 0,
-                    approval_requests,
-                    pending_tool_calls,
-                    tool_results,
-                    tool_repairs,
-                    error: None,
-                };
+                if state.completion.allows_final() {
+                    return state.finish(
+                        AgentStatus::Completed,
+                        true,
+                        Some(final_answer),
+                        turn_index + 1,
+                        None,
+                    );
+                }
+                state.last_completion_error = Some(state.completion.rejection_reason());
+                state.messages.push(
+                    response
+                        .assistant_message
+                        .unwrap_or_else(|| ModelMessage::text(ModelRole::Assistant, final_answer)),
+                );
+                state.messages.push(ModelMessage::text(
+                    ModelRole::Developer,
+                    state.completion.feedback(),
+                ));
+                continue;
             }
             let assistant_tool_message = response
                 .assistant_message
@@ -530,7 +679,7 @@ where
                 .filter(|message| !message.tool_calls.is_empty())
                 .cloned()
                 .unwrap_or_else(|| ModelMessage::assistant_tool_calls(response.tool_calls.clone()));
-            messages.push(assistant_tool_message);
+            state.messages.push(assistant_tool_message);
             for provider_call in &response.tool_calls {
                 let (bound_call, forced_decision) =
                     match bind_tool_call_to_profile(provider_call, &self.policy.profile) {
@@ -541,93 +690,64 @@ where
                         ),
                     };
                 let call = &bound_call;
-                if input.interrupted {
-                    return AgentLoopResult {
-                        status: AgentStatus::Cancelled,
-                        completed: false,
-                        final_answer: None,
-                        model_turns: turn_index + 1,
-                        tool_calls: tool_results.len() as u32,
-                        approval_count: approval_requests.len() as u32,
-                        approval_requests,
-                        pending_tool_calls,
-                        tool_results,
-                        tool_repairs,
-                        error: None,
-                    };
+                if self.is_cancelled(input) {
+                    return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
                 }
-                let decision = forced_decision
-                    .unwrap_or_else(|| self.tool_decision(input, call, &mut used_approval_grants));
+                let decision = forced_decision.unwrap_or_else(|| {
+                    self.tool_decision(input, call, &mut state.used_approval_grants)
+                });
                 if let ToolBrokerDecision::Ask {
                     approval_request_id,
                     reason,
                 } = &decision
                 {
-                    approval_requests.push(approval_request(
+                    state.approval_requests.push(approval_request(
                         input,
                         approval_request_id,
                         call,
                         reason,
                     ));
-                    pending_tool_calls.push(PendingToolCall::new(input, call));
+                    state
+                        .pending_tool_calls
+                        .push(PendingToolCall::new(input, call));
                     let tool_result = self.execute_tool(input, call, decision);
-                    tool_results.push(tool_result);
-                    return AgentLoopResult {
-                        status: AgentStatus::Blocked,
-                        completed: false,
-                        final_answer: None,
-                        model_turns: turn_index + 1,
-                        tool_calls: tool_results.len() as u32,
-                        approval_count: approval_requests.len() as u32,
-                        approval_requests,
-                        pending_tool_calls,
-                        tool_results,
-                        tool_repairs,
-                        error: None,
-                    };
+                    state.tool_results.push(tool_result);
+                    return state.finish(AgentStatus::Blocked, false, None, turn_index + 1, None);
                 }
                 let tool_result = self.execute_tool(input, call, decision);
                 let failed_tool_result = !tool_result.ok;
-                tool_results.push(tool_result.clone());
-                messages.push(tool_result_message(&tool_result));
+                state.completion.observe(&tool_result);
+                state.tool_results.push(tool_result.clone());
+                state.messages.push(tool_result_message(&tool_result));
+                if self.is_cancelled(input) {
+                    return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
+                }
                 if failed_tool_result {
                     if is_repairable_tool_result(&tool_result) {
-                        tool_repairs.push(tool_repair(input, turn_index, &tool_result));
-                        break;
+                        state
+                            .tool_repairs
+                            .push(tool_repair(input, turn_index, &tool_result));
+                        continue;
                     }
                     let error_code = tool_result
                         .error_code
                         .as_deref()
                         .unwrap_or("tool_execution_failed");
-                    return AgentLoopResult {
-                        status: AgentStatus::Failed,
-                        completed: false,
-                        final_answer: None,
-                        model_turns: turn_index + 1,
-                        tool_calls: tool_results.len() as u32,
-                        approval_count: 0,
-                        approval_requests,
-                        pending_tool_calls,
-                        tool_results,
-                        tool_repairs,
-                        error: Some(format!("tool execution failed: {error_code}")),
-                    };
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        turn_index + 1,
+                        Some(format!("tool execution failed: {error_code}")),
+                    );
                 }
             }
         }
-        AgentLoopResult {
-            status: AgentStatus::Failed,
-            completed: false,
-            final_answer: None,
-            model_turns: max_turns,
-            tool_calls: tool_results.len() as u32,
-            approval_count: 0,
-            approval_requests,
-            pending_tool_calls,
-            tool_results,
-            tool_repairs,
-            error: Some("max turns exceeded".to_string()),
-        }
+        let error = state
+            .last_completion_error
+            .take()
+            .unwrap_or_else(|| "max turns exceeded".to_string());
+        state.finish(AgentStatus::Failed, false, None, max_turns, Some(error))
     }
 
     pub fn resume_pending_tool_call(
@@ -635,20 +755,14 @@ where
         input: &AgentLoopInput,
         pending: &PendingToolCall,
     ) -> AgentLoopResult {
-        if input.interrupted {
-            return AgentLoopResult {
-                status: AgentStatus::Cancelled,
-                completed: false,
-                final_answer: None,
-                model_turns: 0,
-                tool_calls: 0,
-                approval_count: 0,
-                approval_requests: Vec::new(),
-                pending_tool_calls: Vec::new(),
-                tool_results: Vec::new(),
-                tool_repairs: Vec::new(),
-                error: None,
-            };
+        if self.is_cancelled(input) {
+            return AgentLoopState::new(Vec::new()).finish(
+                AgentStatus::Cancelled,
+                false,
+                None,
+                0,
+                None,
+            );
         }
         let call = match pending
             .to_model_tool_call()
@@ -657,19 +771,13 @@ where
         {
             Ok(call) => call,
             Err(error) => {
-                return AgentLoopResult {
-                    status: AgentStatus::Failed,
-                    completed: false,
-                    final_answer: None,
-                    model_turns: 0,
-                    tool_calls: 0,
-                    approval_count: 0,
-                    approval_requests: Vec::new(),
-                    pending_tool_calls: Vec::new(),
-                    tool_results: Vec::new(),
-                    tool_repairs: Vec::new(),
-                    error: Some(error),
-                };
+                return AgentLoopState::new(Vec::new()).finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    0,
+                    Some(error),
+                );
             }
         };
         let context = assemble_context_items(
@@ -679,132 +787,53 @@ where
         if current_turn_excluded(input, &context) {
             return context_overflow_result();
         }
-        let mut messages = model_messages_from_input(input, &context);
-        messages.push(ModelMessage::assistant_tool_calls(vec![call.clone()]));
+        let mut state = AgentLoopState::new(model_messages_from_input(input, &context));
+        state
+            .messages
+            .push(ModelMessage::assistant_tool_calls(vec![call.clone()]));
+        state.prior_approval_count = 1;
         let mut used_approval_grants = HashSet::new();
         let decision = self.tool_decision(input, &call, &mut used_approval_grants);
         if !matches!(decision, ToolBrokerDecision::Approved { .. }) {
-            return AgentLoopResult {
-                status: AgentStatus::Failed,
-                completed: false,
-                final_answer: None,
-                model_turns: 0,
-                tool_calls: 0,
-                approval_count: 0,
-                approval_requests: Vec::new(),
-                pending_tool_calls: Vec::new(),
-                tool_results: Vec::new(),
-                tool_repairs: Vec::new(),
-                error: Some("pending tool call approval did not match".to_string()),
-            };
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                0,
+                Some("pending tool call approval did not match".to_string()),
+            );
         }
+        state.used_approval_grants = used_approval_grants;
         let tool_result = self.execute_tool(input, &call, decision);
         let failed_tool_result = !tool_result.ok;
-        messages.push(tool_result_message(&tool_result));
-        let tool_results = vec![tool_result.clone()];
-        let mut tool_repairs = Vec::new();
+        state.completion.observe(&tool_result);
+        state.messages.push(tool_result_message(&tool_result));
+        state.tool_results.push(tool_result.clone());
+        if self.is_cancelled(input) {
+            return state.finish(AgentStatus::Cancelled, false, None, 0, None);
+        }
         if failed_tool_result {
             if is_repairable_tool_result(&tool_result) {
-                tool_repairs.push(tool_repair(input, 0, &tool_result));
+                state.tool_repairs.push(tool_repair(input, 0, &tool_result));
+            } else {
+                let error_code = tool_result
+                    .error_code
+                    .as_deref()
+                    .unwrap_or("tool_execution_failed");
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    0,
+                    Some(format!("tool execution failed: {error_code}")),
+                );
             }
-            let error_code = tool_result
-                .error_code
-                .as_deref()
-                .unwrap_or("tool_execution_failed");
-            return AgentLoopResult {
-                status: AgentStatus::Failed,
-                completed: false,
-                final_answer: None,
-                model_turns: 0,
-                tool_calls: tool_results.len() as u32,
-                approval_count: 1,
-                approval_requests: Vec::new(),
-                pending_tool_calls: Vec::new(),
-                tool_results,
-                tool_repairs,
-                error: Some(format!("tool execution failed: {error_code}")),
-            };
         }
-        let turn_index = 0;
-        if !model_request_fits_context(input, &self.tool_broker, &messages) {
-            return AgentLoopResult {
-                status: AgentStatus::Failed,
-                completed: false,
-                final_answer: None,
-                model_turns: 0,
-                tool_calls: tool_results.len() as u32,
-                approval_count: 1,
-                approval_requests: Vec::new(),
-                pending_tool_calls: Vec::new(),
-                tool_results,
-                tool_repairs,
-                error: Some(MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR.to_string()),
-            };
-        }
-        let request = model_turn_request(&self.tool_broker, input, &context, turn_index, messages);
-        let response = match self.provider.complete(&request) {
-            Ok(response) => response,
-            Err(error) => provider_error_response(&request, error),
-        };
-        if response.status != ModelTurnStatus::Success {
-            return AgentLoopResult {
-                status: AgentStatus::Failed,
-                completed: false,
-                final_answer: None,
-                model_turns: turn_index + 1,
-                tool_calls: tool_results.len() as u32,
-                approval_count: 1,
-                approval_requests: Vec::new(),
-                pending_tool_calls: Vec::new(),
-                tool_results,
-                tool_repairs,
-                error: response.error.map(|error| error.message),
-            };
-        }
-        if response.tool_calls.is_empty() {
-            let final_answer = assistant_message_text(response.assistant_message.as_ref());
-            if final_answer.trim().is_empty() {
-                return AgentLoopResult {
-                    status: AgentStatus::Failed,
-                    completed: false,
-                    final_answer: None,
-                    model_turns: turn_index + 1,
-                    tool_calls: tool_results.len() as u32,
-                    approval_count: 1,
-                    approval_requests: Vec::new(),
-                    pending_tool_calls: Vec::new(),
-                    tool_results,
-                    tool_repairs,
-                    error: Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
-                };
-            }
-            return AgentLoopResult {
-                status: AgentStatus::Completed,
-                completed: true,
-                final_answer: Some(final_answer),
-                model_turns: turn_index + 1,
-                tool_calls: tool_results.len() as u32,
-                approval_count: 1,
-                approval_requests: Vec::new(),
-                pending_tool_calls: Vec::new(),
-                tool_results,
-                tool_repairs,
-                error: None,
-            };
-        }
-        AgentLoopResult {
-            status: AgentStatus::Failed,
-            completed: false,
-            final_answer: None,
-            model_turns: turn_index + 1,
-            tool_calls: tool_results.len() as u32,
-            approval_count: 1,
-            approval_requests: Vec::new(),
-            pending_tool_calls: Vec::new(),
-            tool_results,
-            tool_repairs,
-            error: Some("tool call after approval resume is not supported".to_string()),
-        }
+        self.continue_run(input, &context, state)
+    }
+
+    fn is_cancelled(&self, input: &AgentLoopInput) -> bool {
+        input.interrupted || self.cancellation.is_cancelled()
     }
 
     fn tool_decision(
@@ -913,6 +942,12 @@ where
         call: &ModelToolCall,
         decision: &ToolBrokerDecision,
     ) -> ToolOutput {
+        if self.cancellation.is_cancelled() {
+            return ToolOutput::failure(
+                "tool_cancelled",
+                json!({"summary": "tool execution cancelled"}),
+            );
+        }
         let Some(workspace_tools) = &self.workspace_tools else {
             return ToolOutput::failure(
                 "backend_unavailable",
@@ -932,7 +967,7 @@ where
                 .and_then(|input| workspace_tools.patch(input, decision).map_err(Into::into)),
             TOOL_COMMAND => match command_tool_input(&call.arguments) {
                 Ok(input) => Ok(workspace_tools
-                    .command(input.clone())
+                    .command_cancellable(input.clone(), &self.cancellation)
                     .map_err(Into::into)
                     .unwrap_or_else(|error| command_workspace_tool_failure(&input, error))),
                 Err(error) => Err(error),
@@ -1097,20 +1132,10 @@ pub struct CompletionGateInput {
 }
 
 fn context_input_token_budget(input: &AgentLoopInput, loop_tools: &ToolBroker) -> u32 {
-    let project_instruction_tokens = input
-        .project_instructions
-        .as_deref()
-        .map(approximate_token_count)
-        .unwrap_or_default();
+    let developer_instruction_tokens = approximate_token_count(&developer_instructions(input));
     let tool_tokens = serde_json::to_string(&model_tool_schemas(loop_tools))
         .map_or(u32::MAX, |tools| approximate_token_count(&tools));
-    let message_count = u32::try_from(
-        input
-            .input
-            .len()
-            .saturating_add(usize::from(input.project_instructions.is_some())),
-    )
-    .unwrap_or(u32::MAX);
+    let message_count = u32::try_from(input.input.len().saturating_add(1)).unwrap_or(u32::MAX);
     let framing_tokens = message_count.saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
     let output_tokens = input
         .model_preferences
@@ -1118,7 +1143,7 @@ fn context_input_token_budget(input: &AgentLoopInput, loop_tools: &ToolBroker) -
         .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let reserved_tokens = output_tokens
         .saturating_add(MODEL_REQUEST_FIXED_OVERHEAD_TOKENS)
-        .saturating_add(project_instruction_tokens)
+        .saturating_add(developer_instruction_tokens)
         .saturating_add(tool_tokens)
         .saturating_add(framing_tokens);
     DEFAULT_MAX_CONTEXT_TOKENS.saturating_sub(reserved_tokens)
@@ -1303,6 +1328,7 @@ fn context_overflow_result() -> AgentLoopResult {
         pending_tool_calls: Vec::new(),
         tool_results: Vec::new(),
         tool_repairs: Vec::new(),
+        verification: AgentVerification::default(),
         error: Some(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string()),
     }
 }
@@ -1526,12 +1552,21 @@ fn model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
 }
 
 fn model_messages_from_input(input: &AgentLoopInput, context: &ContextBundle) -> Vec<ModelMessage> {
-    let mut messages = Vec::new();
-    if let Some(instructions) = input.project_instructions.as_deref() {
-        messages.push(ModelMessage::text(ModelRole::Developer, instructions));
-    }
+    let mut messages = vec![ModelMessage::text(
+        ModelRole::Developer,
+        developer_instructions(input),
+    )];
     messages.extend(model_messages_from_context(context));
     messages
+}
+
+fn developer_instructions(input: &AgentLoopInput) -> String {
+    match input.project_instructions.as_deref() {
+        Some(project) => {
+            format!("{AGENT_DEVELOPER_INSTRUCTIONS}\n\nProject instructions:\n{project}")
+        }
+        None => AGENT_DEVELOPER_INSTRUCTIONS.to_string(),
+    }
 }
 
 fn model_messages_from_context(context: &ContextBundle) -> Vec<ModelMessage> {

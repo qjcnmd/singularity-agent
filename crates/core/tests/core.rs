@@ -1,4 +1,6 @@
-use singularity_core::{ClientInfo, ErrorCode, RequestId, Timestamp, contains_sensitive_text};
+use singularity_core::{
+    CancellationToken, ClientInfo, ErrorCode, RequestId, Timestamp, contains_sensitive_text,
+};
 
 #[test]
 fn client_metadata_and_ids_round_trip_as_json() {
@@ -33,4 +35,14 @@ fn sensitive_text_detects_common_secret_label_formats() {
     assert!(!contains_sensitive_text(
         "token count is 42 and token budget is 100"
     ));
+}
+
+#[test]
+fn cloned_cancellation_tokens_share_one_monotonic_state() {
+    let token = CancellationToken::new();
+    let clone = token.clone();
+
+    assert!(!token.is_cancelled());
+    clone.cancel();
+    assert!(token.is_cancelled());
 }

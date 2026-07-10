@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use singularity_core::contains_sensitive_text;
+use singularity_core::{CancellationToken, contains_sensitive_text};
 
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
@@ -599,6 +599,17 @@ pub trait SandboxBackend {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> SandboxCapabilities;
     fn execute(&self, request: &CommandRequest) -> CommandResult;
+
+    fn execute_cancellable(
+        &self,
+        request: &CommandRequest,
+        cancellation: &CancellationToken,
+    ) -> CommandResult {
+        if cancellation.is_cancelled() {
+            return CommandResult::cancelled(&request.command_id, 0);
+        }
+        self.execute(request)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1089,13 +1100,14 @@ mod windows_backend {
     use singularity_windows_sandbox::{
         AbsolutePathBuf, ElevatedSandboxProfileCaptureRequest, FileSystemSandboxPolicy,
         ManagedFileSystemPermissions, NetworkSandboxPolicy, PermissionProfile,
-        run_windows_sandbox_capture, run_windows_sandbox_capture_for_permission_profile_elevated,
+        WindowsSandboxCancellationToken, run_windows_sandbox_capture,
+        run_windows_sandbox_capture_for_permission_profile_elevated,
     };
 
     use super::{
-        CommandRequest, CommandResult, SandboxBackend, SandboxBackendEnforcement,
-        SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, command_request_denial,
-        is_secret_env_name,
+        CancellationToken, CommandRequest, CommandResult, SandboxBackend,
+        SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
+        command_request_denial, is_secret_env_name,
     };
 
     const BACKEND_NAME: &str = "windows";
@@ -1129,11 +1141,23 @@ mod windows_backend {
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
+            self.execute_cancellable(request, &CancellationToken::new())
+        }
+
+        fn execute_cancellable(
+            &self,
+            request: &CommandRequest,
+            cancellation: &CancellationToken,
+        ) -> CommandResult {
+            if cancellation.is_cancelled() {
+                return CommandResult::cancelled(&request.command_id, 0)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
             if let Some(denied) = command_request_denial(request) {
                 return denied
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
-            match execute_windows_sandbox(request) {
+            match execute_windows_sandbox(request, cancellation) {
                 Ok(result) => result,
                 Err(error) => CommandResult::backend_error(&request.command_id, error)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable),
@@ -1204,9 +1228,16 @@ mod windows_backend {
         }
     }
 
-    fn execute_windows_sandbox(request: &CommandRequest) -> Result<CommandResult, String> {
+    fn execute_windows_sandbox(
+        request: &CommandRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CommandResult, String> {
         let prepared = PreparedCommand::from_request(request)?;
         let started = Instant::now();
+        let windows_cancellation = WindowsSandboxCancellationToken::new({
+            let cancellation = cancellation.clone();
+            move || cancellation.is_cancelled()
+        });
         let elevated = run_windows_sandbox_capture_for_permission_profile_elevated({
             let mut elevated = ElevatedSandboxProfileCaptureRequest::new(
                 &prepared.permission_profile,
@@ -1217,6 +1248,7 @@ mod windows_backend {
                 prepared.env_map.clone(),
             );
             elevated.timeout_ms = Some(prepared.timeout_ms);
+            elevated.cancellation = Some(windows_cancellation.clone());
             elevated
         });
         match elevated {
@@ -1231,7 +1263,7 @@ mod windows_backend {
                     &prepared.cwd,
                     prepared.env_map,
                     Some(prepared.timeout_ms),
-                    None,
+                    Some(windows_cancellation),
                     true,
                 )
                 .map_err(|restricted_error| {

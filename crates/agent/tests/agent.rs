@@ -6,6 +6,7 @@ use singularity_agent::{
     completion_gate_allows_final, final_mapping_from_status, planner_next_action,
     repair_next_action,
 };
+use singularity_core::CancellationToken;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
     ModelTurnResponse, Provider, ProviderError,
@@ -19,7 +20,11 @@ use singularity_tools::{
     SandboxNetworkMode, ToolBroker, ToolRegistry, ToolSpec, WorkspaceTools, command_scope_digest,
     command_scope_resource,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 struct StaticProvider {
     responses: Vec<ModelTurnResponse>,
@@ -27,7 +32,11 @@ struct StaticProvider {
 }
 
 impl Provider for StaticProvider {
-    fn complete(&self, request: &ModelTurnRequest) -> Result<ModelTurnResponse, ProviderError> {
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &singularity_core::CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
         let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
         let response_index = seen_requests.len();
         seen_requests.push(request.clone());
@@ -36,6 +45,30 @@ impl Provider for StaticProvider {
             .get(response_index)
             .unwrap_or_else(|| self.responses.last().expect("static provider response"))
             .clone())
+    }
+}
+
+struct BlockingProvider {
+    started: Mutex<Option<mpsc::Sender<()>>>,
+}
+
+impl Provider for BlockingProvider {
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        if let Some(started) = self.started.lock().expect("started lock").take() {
+            started.send(()).expect("signal provider start");
+        }
+        while !cancellation.is_cancelled() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(ModelTurnResponse::completed(
+            request.request_id.clone(),
+            "response_after_cancel",
+            "must not complete",
+        ))
     }
 }
 
@@ -193,7 +226,7 @@ fn agent_loop_plan_lists_real_integration_steps() {
 }
 
 #[test]
-fn agent_loop_final_answer_completes_without_completion_gate_scaffold() {
+fn agent_loop_read_only_final_answer_completes_without_verification() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello");
     let result = agent_loop_with_response(
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "done"),
@@ -212,6 +245,94 @@ fn agent_loop_final_answer_completes_without_completion_gate_scaffold() {
     assert_eq!(run_status.run_id.as_deref(), Some("turn_1"));
     assert_eq!(run_status.model_turns, 1);
     assert_eq!(run_status.tool_calls, 0);
+    assert!(!run_status.verification.required);
+    assert!(!run_status.verification.passed);
+}
+
+#[test]
+fn agent_loop_cancels_while_waiting_for_provider_and_discards_late_completion() {
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        AgentLoop::new(
+            BlockingProvider {
+                started: Mutex::new(Some(started_tx)),
+            },
+            ToolBroker::new(ToolRegistry::default()),
+            allow_read_policy(),
+        )
+        .with_cancellation_token(worker_cancellation)
+        .run(&AgentLoopInput::new("thread_1", "turn_1", "wait"))
+    });
+
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("provider started");
+    cancellation.cancel();
+    let result = worker.join().expect("agent worker joins");
+
+    assert_eq!(result.status, AgentStatus::Cancelled);
+    assert!(!result.completed);
+    assert!(result.final_answer.is_none());
+    assert_eq!(result.model_turns, 1);
+}
+
+#[test]
+fn agent_loop_rejects_final_after_mutation_without_verification() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
+    let input = AgentLoopInput {
+        max_turns: 2,
+        ..AgentLoopInput::new("thread_1", "turn_1", "change the file")
+    };
+    let mut edit = ModelTurnResponse::completed("request_1", "response_1", "");
+    edit.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let final_response = ModelTurnResponse::completed("request_2", "response_2", "done");
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+        .with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        )
+        .with_rule(
+            PermissionRule::new(
+                "allow_execute",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Execute),
+        );
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![edit, final_response],
+        policy,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(
+        result.error.as_deref(),
+        Some(
+            "completion gate rejected final answer: verification required after workspace mutation"
+        )
+    );
+    assert!(result.verification.required);
+    assert!(!result.verification.passed);
+    assert_eq!(result.verification.successful_command_count, 0);
 }
 
 #[test]
@@ -284,10 +405,12 @@ fn agent_loop_sends_project_instructions_as_developer_message_without_serializin
     assert_eq!(requests[0].messages.len(), 2);
     assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
     assert_eq!(requests[0].messages[1].role, ModelRole::User);
-    assert_eq!(
-        requests[0].messages[0].content[0].text.as_deref(),
-        Some(project_instructions)
-    );
+    let developer = requests[0].messages[0].content[0]
+        .text
+        .as_deref()
+        .expect("developer instructions");
+    assert!(developer.contains("You are a coding agent working in the current workspace."));
+    assert!(developer.ends_with(project_instructions));
     assert_eq!(
         requests[0].messages[1].content[0].text.as_deref(),
         Some("user goal")
@@ -353,14 +476,21 @@ fn agent_loop_model_request_orders_developer_history_and_current_turn() {
     assert_eq!(
         request_messages
             .iter()
+            .skip(1)
             .map(|message| message.content[0].text.as_deref())
             .collect::<Vec<_>>(),
         vec![
-            Some(project_instructions),
             Some("previous user"),
             Some("previous assistant"),
             Some("current user"),
         ]
+    );
+    assert!(
+        request_messages[0].content[0]
+            .text
+            .as_deref()
+            .expect("developer instructions")
+            .ends_with(project_instructions)
     );
 }
 
@@ -480,6 +610,7 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "before").expect("write file");
     let input = AgentLoopInput {
+        max_turns: 3,
         ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
             ApprovalGrant::allow("approval_turn_1_call_1", "builtin.edit", ["README.md"]),
         )
@@ -495,37 +626,55 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
             "replacement": "after"
         }),
     ));
+    let mut verification_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    verification_response.tool_calls.push(tool_call(
+        "call_2",
+        "builtin.command",
+        serde_json::json!({"argv": ["cargo", "test"], "timeout_seconds": 5}),
+    ));
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
 
     let result = agent_loop_with_responses_and_requests(
-        vec![tool_response, final_response],
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        vec![tool_response, verification_response, final_response],
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+            PermissionRule::new(
+                "allow_execute",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Execute),
+        ),
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
     .run(&input);
 
     assert!(result.error.is_none(), "error={:?}", result.error);
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.approval_count, 0);
-    assert_eq!(result.model_turns, 2);
+    assert_eq!(result.model_turns, 3);
     assert!(result.approval_requests.is_empty());
     assert!(result.tool_results[0].ok);
+    assert!(result.tool_results[1].ok);
+    assert!(result.verification.required);
+    assert!(result.verification.passed);
+    assert_eq!(result.verification.successful_command_count, 1);
     assert_eq!(result.final_answer.as_deref(), Some("done"));
     assert_eq!(
         std::fs::read_to_string(file_path).expect("read file"),
         "after"
     );
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].messages[1].role, ModelRole::Assistant);
-    assert_eq!(requests[1].messages[1].tool_calls.len(), 1);
-    assert_eq!(requests[1].messages[1].tool_calls[0].tool_call_id, "call_1");
-    assert_eq!(requests[1].messages[2].role, ModelRole::Tool);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].messages[2].role, ModelRole::Assistant);
+    assert_eq!(requests[1].messages[2].tool_calls.len(), 1);
+    assert_eq!(requests[1].messages[2].tool_calls[0].tool_call_id, "call_1");
+    assert_eq!(requests[1].messages[3].role, ModelRole::Tool);
     assert_eq!(
-        requests[1].messages[2].tool_call_id.as_deref(),
+        requests[1].messages[3].tool_call_id.as_deref(),
         Some("call_1")
     );
 }
@@ -536,7 +685,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "before").expect("write file");
     let input = AgentLoopInput {
-        max_turns: 3,
+        max_turns: 4,
         ..AgentLoopInput::new("thread_1", "turn_1", "hello")
     };
     let mut failing_tool_response =
@@ -561,33 +710,50 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
             "replacement": "after"
         }),
     ));
+    let mut verification_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    verification_response.tool_calls.push(tool_call(
+        "call_3",
+        "builtin.command",
+        serde_json::json!({"argv": ["cargo", "test"], "timeout_seconds": 5}),
+    ));
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
-        PermissionRule::new(
-            "allow_write",
-            SettingsScope::Project,
-            PermissionDecisionOutcome::Allow,
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+        .with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
         )
-        .for_operation(PermissionOperation::Write),
-    );
+        .with_rule(
+            PermissionRule::new(
+                "allow_execute",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Execute),
+        );
 
     let result = agent_loop_with_responses_and_requests(
         vec![
             failing_tool_response,
             repaired_tool_response,
+            verification_response,
             final_response,
         ],
         policy,
         seen_requests.clone(),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
-    assert_eq!(result.model_turns, 3);
-    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(result.model_turns, 4);
+    assert_eq!(result.tool_results.len(), 3);
     assert_eq!(result.tool_repairs.len(), 1);
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
@@ -610,13 +776,15 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
         serde_json::json!(1)
     );
     assert!(result.tool_results[1].ok);
+    assert!(result.tool_results[2].ok);
+    assert!(result.verification.passed);
     assert_eq!(result.final_answer.as_deref(), Some("done"));
     assert_eq!(
         std::fs::read_to_string(file_path).expect("read file"),
         "after"
     );
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert_eq!(requests[1].messages.last().unwrap().role, ModelRole::Tool);
     assert!(
         requests[1]
@@ -747,7 +915,7 @@ fn agent_loop_command_uses_strict_sandbox_backend_when_injected() {
 fn agent_loop_returns_command_nonzero_to_model_for_repair() {
     let dir = tempfile::tempdir().expect("temp dir");
     let input = AgentLoopInput {
-        max_turns: 2,
+        max_turns: 3,
         ..AgentLoopInput::new("thread_1", "turn_1", "run command")
     };
     let mut command_response =
@@ -760,8 +928,18 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
             "timeout_seconds": 5
         }),
     ));
+    let mut repaired_command_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    repaired_command_response.tool_calls.push(tool_call(
+        "call_2",
+        "builtin.command",
+        serde_json::json!({
+            "argv": python_command("print('repaired')"),
+            "timeout_seconds": 5
+        }),
+    ));
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "handled failure");
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "handled failure");
     let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
         PermissionRule::new(
             "allow_command",
@@ -773,32 +951,83 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
 
     let result = agent_loop_with_responses_and_requests(
-        vec![command_response, final_response],
+        vec![command_response, repaired_command_response, final_response],
         policy,
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentNonzeroBackend))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(
+        AgentFailThenSucceedBackend {
+            calls: AtomicUsize::new(0),
+        },
+    ))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
-    assert_eq!(result.model_turns, 2);
-    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(result.model_turns, 3);
+    assert_eq!(result.tool_results.len(), 2);
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
         Some("command_exit_nonzero")
     );
     assert_eq!(result.tool_repairs.len(), 1);
+    assert!(result.tool_results[1].ok);
+    assert!(result.verification.unresolved_failures.is_empty());
     assert_eq!(
         result.tool_repairs[0].failure_kind.as_str(),
         "command_exit_nonzero"
     );
     assert_eq!(result.final_answer.as_deref(), Some("handled failure"));
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].messages[2].role, ModelRole::Tool);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].messages.last().unwrap().role, ModelRole::Tool);
     assert_eq!(
-        requests[1].messages[2].tool_call_id.as_deref(),
+        requests[1].messages.last().unwrap().tool_call_id.as_deref(),
         Some("call_1")
+    );
+}
+
+#[test]
+fn agent_loop_cancels_a_running_sandbox_command() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut command_response = ModelTurnResponse::completed("request_1", "response_1", "");
+    command_response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.command",
+        serde_json::json!({"argv": ["cargo", "test"], "timeout_seconds": 30}),
+    ));
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+        PermissionRule::new(
+            "allow_execute",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute),
+    );
+    let workspace = WorkspaceTools::new(dir.path()).with_sandbox_backend(BlockingCommandBackend {
+        started: Mutex::new(Some(started_tx)),
+    });
+    let worker = thread::spawn(move || {
+        agent_loop_with_response(command_response, policy)
+            .with_workspace_tools(workspace)
+            .with_cancellation_token(worker_cancellation)
+            .run(&AgentLoopInput::new("thread_1", "turn_1", "run command"))
+    });
+
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("sandbox command started");
+    cancellation.cancel();
+    let result = worker.join().expect("agent worker joins");
+
+    assert_eq!(result.status, AgentStatus::Cancelled);
+    assert!(!result.completed);
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("command_cancelled")
     );
 }
 
@@ -1039,11 +1268,13 @@ impl SandboxBackend for AgentStrictBackend {
     }
 }
 
-struct AgentNonzeroBackend;
+struct BlockingCommandBackend {
+    started: Mutex<Option<mpsc::Sender<()>>>,
+}
 
-impl SandboxBackend for AgentNonzeroBackend {
+impl SandboxBackend for BlockingCommandBackend {
     fn name(&self) -> &'static str {
-        "agent_nonzero_test"
+        "blocking_command_test"
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
@@ -1051,18 +1282,53 @@ impl SandboxBackend for AgentNonzeroBackend {
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
-        CommandResult::executed(
-            &request.command_id,
-            1,
-            1,
-            String::new(),
-            "command failed",
-            false,
-        )
-        .with_sandbox_execution(
+        CommandResult::backend_error(&request.command_id, "cancellable execution required")
+    }
+
+    fn execute_cancellable(
+        &self,
+        request: &CommandRequest,
+        cancellation: &CancellationToken,
+    ) -> CommandResult {
+        if let Some(started) = self.started.lock().expect("started lock").take() {
+            started.send(()).expect("signal command start");
+        }
+        while !cancellation.is_cancelled() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        CommandResult::cancelled(&request.command_id, 1).with_sandbox_execution(
             self.name(),
             singularity_tools::SandboxBackendEnforcement::Strict,
         )
+    }
+}
+
+struct AgentFailThenSucceedBackend {
+    calls: AtomicUsize,
+}
+
+impl SandboxBackend for AgentFailThenSucceedBackend {
+    fn name(&self) -> &'static str {
+        "agent_fail_then_succeed_test"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            CommandResult::executed(&request.command_id, 1, 1, "", "failed", false)
+                .with_sandbox_execution(
+                    self.name(),
+                    singularity_tools::SandboxBackendEnforcement::Strict,
+                )
+        } else {
+            CommandResult::completed(&request.command_id, "repaired").with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+        }
     }
 }
 

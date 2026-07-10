@@ -2,8 +2,13 @@ use singularity_app_server::AppServer;
 use singularity_model::ProviderConfigSnapshot;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_store::SessionStore;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1315,6 +1320,136 @@ fn turn_lifecycle_interrupt_on_terminal_turn_is_idempotent() {
 }
 
 #[test]
+fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_stdio() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let (base_url, accepted, release, provider_worker) = hanging_provider();
+    let (mut child, mut input, mut output) = spawn_app_server(&db_path, &workspace, &base_url);
+    initialize_process(&mut input, &mut output);
+    let thread_id = start_process_thread(&mut input, &mut output, &workspace, 2);
+
+    send_json(
+        &mut input,
+        serde_json::json!({
+            "method": "turn/start",
+            "id": 3,
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "wait for cancellation"}]
+            }
+        }),
+    );
+    let started = output.recv_method("turn/started", Duration::from_secs(2));
+    let turn_id = started["params"]["turn"]["turn_id"]
+        .as_str()
+        .expect("started turn id")
+        .to_string();
+    accepted
+        .recv_timeout(Duration::from_secs(2))
+        .expect("provider request started");
+
+    send_json(
+        &mut input,
+        serde_json::json!({
+            "method": "turn/interrupt",
+            "id": 4,
+            "params": {"turnId": turn_id}
+        }),
+    );
+    let interrupt = output.recv_id(4, Duration::from_secs(2));
+    assert_eq!(interrupt["result"]["status"], "cancel_requested");
+    assert_eq!(interrupt["result"]["agent_loop_status"], "cancel_requested");
+    let terminal = output.recv_id(3, Duration::from_secs(2));
+    assert_eq!(terminal["result"]["turn"]["status"], "interrupted");
+    assert_eq!(terminal["result"]["turn"]["agent_loop_status"], "cancelled");
+
+    release.send(()).expect("release provider");
+    provider_worker.join().expect("provider worker joins");
+    shutdown_process(&mut child, &mut input, &mut output, 5);
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let persisted = store.get_turn(&turn_id).expect("persisted turn");
+    assert_eq!(
+        persisted.status,
+        singularity_protocol::TurnStatus::Interrupted
+    );
+    assert_eq!(persisted.agent_loop_status, "cancelled");
+    let traces = store.list_trace(&thread_id).expect("turn trace");
+    let terminal_trace = traces
+        .iter()
+        .find(|trace| trace.component == "agent_loop")
+        .expect("terminal agent trace");
+    assert_eq!(terminal_trace.payload["status"], "cancelled");
+    assert!(
+        !terminal_trace
+            .payload
+            .to_string()
+            .contains("late completion")
+    );
+}
+
+#[test]
+fn app_server_worker_observes_interrupt_written_by_another_process() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let (base_url, accepted, release, provider_worker) = hanging_provider();
+    let (mut primary, mut primary_input, mut primary_output) =
+        spawn_app_server(&db_path, &workspace, &base_url);
+    initialize_process(&mut primary_input, &mut primary_output);
+    let thread_id = start_process_thread(&mut primary_input, &mut primary_output, &workspace, 2);
+    send_json(
+        &mut primary_input,
+        serde_json::json!({
+            "method": "turn/start",
+            "id": 3,
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "wait for external cancellation"}]
+            }
+        }),
+    );
+    let started = primary_output.recv_method("turn/started", Duration::from_secs(2));
+    let turn_id = started["params"]["turn"]["turn_id"]
+        .as_str()
+        .expect("started turn id")
+        .to_string();
+    accepted
+        .recv_timeout(Duration::from_secs(2))
+        .expect("provider request started");
+
+    let (mut secondary, mut secondary_input, mut secondary_output) =
+        spawn_app_server(&db_path, &workspace, &base_url);
+    initialize_process(&mut secondary_input, &mut secondary_output);
+    send_json(
+        &mut secondary_input,
+        serde_json::json!({
+            "method": "turn/interrupt",
+            "id": 12,
+            "params": {"turnId": turn_id}
+        }),
+    );
+    let interrupt = secondary_output.recv_id(12, Duration::from_secs(2));
+    assert_eq!(interrupt["result"]["status"], "cancel_requested");
+    shutdown_process(
+        &mut secondary,
+        &mut secondary_input,
+        &mut secondary_output,
+        13,
+    );
+
+    let terminal = primary_output.recv_id(3, Duration::from_secs(2));
+    assert_eq!(terminal["result"]["turn"]["status"], "interrupted");
+    assert_eq!(terminal["result"]["turn"]["agent_loop_status"], "cancelled");
+    release.send(()).expect("release provider");
+    provider_worker.join().expect("provider worker joins");
+    shutdown_process(&mut primary, &mut primary_input, &mut primary_output, 6);
+}
+
+#[test]
 fn app_server_binary_errors_are_valid_json_rpc_lines() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
@@ -1343,6 +1478,178 @@ fn app_server_binary_errors_are_valid_json_rpc_lines() {
             .unwrap()
             .contains("invalid type")
     );
+}
+
+struct JsonOutput {
+    receiver: Receiver<serde_json::Value>,
+    buffered: VecDeque<serde_json::Value>,
+}
+
+impl JsonOutput {
+    fn recv_id(&mut self, id: i64, timeout: Duration) -> serde_json::Value {
+        self.recv_where(timeout, |message| message["id"] == id)
+    }
+
+    fn recv_method(&mut self, method: &str, timeout: Duration) -> serde_json::Value {
+        self.recv_where(timeout, |message| message["method"] == method)
+    }
+
+    fn recv_where(
+        &mut self,
+        timeout: Duration,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        if let Some(index) = self.buffered.iter().position(&predicate) {
+            return self.buffered.remove(index).expect("buffered message");
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("timed out waiting for app-server message");
+            let message = self
+                .receiver
+                .recv_timeout(remaining)
+                .expect("app-server output message");
+            if predicate(&message) {
+                return message;
+            }
+            self.buffered.push_back(message);
+        }
+    }
+}
+
+fn spawn_app_server(
+    db_path: &std::path::Path,
+    workspace: &std::path::Path,
+    base_url: &str,
+) -> (Child, ChildStdin, JsonOutput) {
+    let mut child = Command::new(app_server_bin())
+        .current_dir(workspace)
+        .env("SINGULARITY_APP_SERVER_DB", db_path)
+        .env("SINGULARITY_MODEL_PROVIDER", "openai_compatible")
+        .env("SINGULARITY_MODEL", "gpt-test")
+        .env("SINGULARITY_BASE_URL", base_url)
+        .env("SINGULARITY_API_KEY", "test-secret")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn app-server");
+    let input = child.stdin.take().expect("app-server stdin");
+    let stdout = child.stdout.take().expect("app-server stdout");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("read app-server output");
+            sender
+                .send(serde_json::from_str(&line).expect("app-server json line"))
+                .expect("send app-server output");
+        }
+    });
+    (
+        child,
+        input,
+        JsonOutput {
+            receiver,
+            buffered: VecDeque::new(),
+        },
+    )
+}
+
+fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
+    send_json(
+        input,
+        serde_json::json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {"clientInfo": {"name": "test", "title": "Test", "version": "0.1.0"}}
+        }),
+    );
+    let initialized = output.recv_id(1, Duration::from_secs(2));
+    assert!(initialized.get("result").is_some());
+    send_json(
+        input,
+        serde_json::json!({"method": "initialized", "params": {}}),
+    );
+}
+
+fn start_process_thread(
+    input: &mut ChildStdin,
+    output: &mut JsonOutput,
+    workspace: &std::path::Path,
+    id: i64,
+) -> String {
+    send_json(
+        input,
+        serde_json::json!({
+            "method": "thread/start",
+            "id": id,
+            "params": {"model": "gpt-test", "cwd": workspace}
+        }),
+    );
+    output.recv_id(id, Duration::from_secs(2))["result"]["thread"]["thread_id"]
+        .as_str()
+        .expect("thread id")
+        .to_string()
+}
+
+fn send_json(input: &mut impl Write, message: serde_json::Value) {
+    writeln!(input, "{message}").expect("write app-server request");
+    input.flush().expect("flush app-server request");
+}
+
+fn shutdown_process(child: &mut Child, input: &mut ChildStdin, output: &mut JsonOutput, id: i64) {
+    send_json(
+        input,
+        serde_json::json!({"method": "server/shutdown", "id": id, "params": {}}),
+    );
+    assert_eq!(
+        output.recv_id(id, Duration::from_secs(2))["result"]["shutdown"],
+        true
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll app-server") {
+            assert!(status.success(), "app-server exited with {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill stuck app-server");
+            child.wait().expect("reap stuck app-server");
+            panic!("app-server did not exit after shutdown");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn hanging_provider() -> (
+    String,
+    Receiver<()>,
+    mpsc::Sender<()>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging provider");
+    let address = listener.local_addr().expect("provider address");
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept provider request");
+        accepted_tx.send(()).expect("signal provider request");
+        release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release hanging provider");
+        let body = r#"{
+            "id":"late_response",
+            "choices":[{"message":{"role":"assistant","content":"late completion"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+        }"#;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+    });
+    (format!("http://{address}"), accepted_rx, release_tx, worker)
 }
 
 fn app_server_bin() -> String {
