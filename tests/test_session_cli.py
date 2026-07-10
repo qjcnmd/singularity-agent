@@ -5,7 +5,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from singularity.cli import _session_status_from_run_status, app
+from singularity.oracle.cli import _session_status_from_run_status, app
 from singularity.kernel.models import RunStatus
 from singularity.session import (
     RecoveryGateDecision,
@@ -129,7 +129,7 @@ def test_continue_and_resume_cli_use_session_launch_path(tmp_path: Path, monkeyp
             return FakeKernel()
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.oracle.cli.KernelBootstrap", FakeBootstrap)
 
     continued = runner.invoke(app, ["continue", "session_continue", "Do the next step"])
     resumed = runner.invoke(app, ["resume", "session_continue"])
@@ -238,7 +238,7 @@ def test_cli_marks_recovery_gate_blocked_run_as_needs_review(tmp_path: Path, mon
             return FakeKernel()
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.oracle.cli.KernelBootstrap", FakeBootstrap)
 
     result = runner.invoke(app, ["resume", "session_gate"])
     launch = store.prepare_launch(
@@ -357,7 +357,7 @@ def test_cli_records_workspace_checkpoint_and_conflict_events(
             return FakeKernel()
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.oracle.cli.KernelBootstrap", FakeBootstrap)
 
     result = runner.invoke(app, ["run", "Inspect workspace"])
     detail = SessionStore(tmp_path).show_session("session_workspace")

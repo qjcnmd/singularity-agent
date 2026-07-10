@@ -65,6 +65,10 @@ def stable_hash_payload(value: Any) -> str:
     return stable_hash_text(text)
 
 
+def json_dumps(payload: object) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+
+
 def enum_value(value: Any) -> Any:
     return value.value if isinstance(value, Enum) else value
 

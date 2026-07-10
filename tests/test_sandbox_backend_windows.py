@@ -22,7 +22,7 @@ import singularity.sandbox.windows_firewall as windows_firewall
 import singularity.sandbox.windows_identity as windows_identity
 import singularity.sandbox.windows_runner as windows_runner
 import singularity.sandbox.windows_runtime as windows_runtime
-from singularity.cli import app
+from singularity.oracle.cli import app
 from singularity.sandbox import (
     PreparedSandbox,
     SandboxCapabilityError,

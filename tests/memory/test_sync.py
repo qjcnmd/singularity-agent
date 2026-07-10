@@ -5,7 +5,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from singularity.cli import app
+from singularity.oracle.cli import app
 from singularity.memory.models import (
     Confidence,
     MemoryEntry,

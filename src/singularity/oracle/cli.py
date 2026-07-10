@@ -1,3 +1,9 @@
+"""Internal Python oracle/dev CLI for migration parity only.
+
+This module is not Singularity's public runtime. The public runtime is Rust sg
+through crates/app-server and Rust AgentLoop.
+"""
+
 from __future__ import annotations
 
 import subprocess
@@ -59,6 +65,7 @@ from singularity.session.history import SessionHistoryReader
 from singularity.session.models import SessionCheckpointKind, SessionRunMode, SessionStatus
 from singularity.session.store import SessionStore
 from singularity.utils.attributes import nested_getattr
+from singularity.utils.serialization import json_dumps
 from singularity.verification import VerificationRunner
 from singularity.workspace_state import (
     WorkspaceHealthReport,
@@ -1977,12 +1984,6 @@ def trace_artifacts(
             f"{artifact.artifact_id} {artifact.kind.value} "
             f"{artifact.size_bytes} bytes handle={artifact.relative_path}"
         )
-
-
-def json_dumps(payload: object) -> str:
-    import json
-
-    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
 
 
 def main() -> None:

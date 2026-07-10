@@ -140,7 +140,6 @@ _INTEGRATION_FILE_STEMS: set[str] = {
     # Agent simulation (full AgentLoop wiring with MockProvider)
     "test_agent",
     "test_agent_task_outcome",
-    "test_agent_host",
     "test_agent_graph",
     "test_execution_primitives_phase1b",
     "test_cancellation",

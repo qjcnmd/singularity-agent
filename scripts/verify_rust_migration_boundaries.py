@@ -94,9 +94,13 @@ ALLOWED_CRATE_DEPENDENCIES = {
 
 ALLOWED_PYTHON_MIGRATION_PATHS = {
     "src/singularity/agent_host",
+    "src/singularity/cli.py",
     "src/singularity/diagnostics",
     "src/singularity/evaluation/manifests.py",
+    "src/singularity/memory/cli.py",
     "src/singularity/model/runner.py",
+    "src/singularity/oracle",
+    "src/singularity/utils/serialization.py",
     "scripts/export_rust_parity_fixtures.py",
     "tests/test_rust_parity_fixtures.py",
     "tests/test_rust_migration_boundaries.py",

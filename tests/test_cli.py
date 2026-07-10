@@ -7,7 +7,7 @@ import pytest
 from typer.main import get_command
 from typer.testing import CliRunner
 
-from singularity.cli import _run_provider_smoke_benchmark, app, workspace_health_summary
+from singularity.oracle.cli import _run_provider_smoke_benchmark, app, workspace_health_summary
 from singularity.evaluation import (
     BenchmarkTask,
     ExpectedOutcome,
@@ -54,7 +54,7 @@ def test_sandbox_doctor_json_emits_machine_readable_report(monkeypatch) -> None:
         def doctor(self) -> WindowsSandboxDoctorReport:
             return WindowsSandboxDoctorReport.ready_for_tests()
 
-    monkeypatch.setattr("singularity.cli.WindowsSandboxBackend", FakeWindowsSandboxBackend)
+    monkeypatch.setattr("singularity.oracle.cli.WindowsSandboxBackend", FakeWindowsSandboxBackend)
 
     result = runner.invoke(app, ["sandbox", "doctor", "--json"])
 
@@ -184,7 +184,7 @@ def test_cli_runs_through_kernel_bootstrap(monkeypatch, tmp_path: Path) -> None:
             return FakeKernel()
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.oracle.cli.KernelBootstrap", FakeBootstrap)
 
     result = runner.invoke(
         app,
@@ -297,7 +297,7 @@ def test_cli_run_accepts_project_root(monkeypatch, tmp_path: Path) -> None:
             return FakeKernel()
 
     monkeypatch.chdir(cwd)
-    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.oracle.cli.KernelBootstrap", FakeBootstrap)
 
     result = runner.invoke(app, ["run", "hello", "--project-root", str(project_root), "--dry-run"])
 
@@ -380,7 +380,7 @@ def test_eval_provider_smoke_uses_kernel_and_independent_smoke(monkeypatch, tmp_
         def boot(self, goal: str) -> FakeKernel:
             return FakeKernel(self.project_root)
 
-    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.oracle.cli.KernelBootstrap", FakeBootstrap)
 
     result = _run_provider_smoke_benchmark(
         output_dir=tmp_path / "provider",
@@ -458,7 +458,7 @@ def test_eval_provider_smoke_accepts_verified_artifact_when_agent_blocks_late(
         def boot(self, goal: str) -> FakeKernel:
             return FakeKernel(self.project_root)
 
-    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.oracle.cli.KernelBootstrap", FakeBootstrap)
 
     result = _run_provider_smoke_benchmark(
         output_dir=tmp_path / "provider",
@@ -563,7 +563,7 @@ def test_cli_converts_kernel_cancellation_to_exit(monkeypatch, tmp_path: Path) -
             return FakeKernel()
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("singularity.cli.KernelBootstrap", FakeBootstrap)
+    monkeypatch.setattr("singularity.oracle.cli.KernelBootstrap", FakeBootstrap)
 
     result = runner.invoke(app, ["main", "hello", "--dry-run"])
 
@@ -930,7 +930,7 @@ def test_cli_eval_private_uses_private_benchmark_adapter(tmp_path: Path, monkeyp
                 "tasks": [],
             }
 
-    monkeypatch.setattr("singularity.cli.EvaluationRunner", FakeRunner)
+    monkeypatch.setattr("singularity.oracle.cli.EvaluationRunner", FakeRunner)
 
     result = runner.invoke(
         app,
@@ -998,7 +998,7 @@ def test_cli_eval_run_rejects_unsupported_manifest_schema(
                 "tasks": [],
             }
 
-    monkeypatch.setattr("singularity.cli.EvaluationRunner", FakeRunner)
+    monkeypatch.setattr("singularity.oracle.cli.EvaluationRunner", FakeRunner)
 
     result = runner.invoke(app, ["eval", "run", str(task_set), "--json"])
 
@@ -1011,7 +1011,7 @@ def test_cli_eval_run_rejects_unsupported_manifest_schema(
 def test_evaluation_task_set_runners_share_cli_runner_body() -> None:
     import inspect
 
-    from singularity import cli
+    from singularity.oracle import cli
 
     source = inspect.getsource(cli)
     assert "def _run_loaded_evaluation_task_set" in source

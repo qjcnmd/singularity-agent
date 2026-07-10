@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -8,6 +9,8 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path("scripts/verify_rust_migration_boundaries.py")
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
 
 FORBIDDEN_CLI_DEPENDENCIES = (
     "singularity_agent",
@@ -66,6 +69,24 @@ RUST_AGENT_HOST_DOC_MARKERS = (
     "AgentRunStatus",
     "SessionStore.create_turn_with_input_and_trace",
 )
+
+def test_python_sidecar_module_is_not_public_runtime_entrypoint() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "singularity.agent_host.sidecar"],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(SRC)},
+        text=True,
+        input='{"id":1,"method":"agent/health","params":{}}\n',
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "python_sidecar" not in combined
+    assert "agent/health" not in combined
+
 
 TURN_LIFECYCLE_DOC_MARKERS = (
     "turn lifecycle",
@@ -151,7 +172,6 @@ def copy_repo_slice(tmp_path: Path) -> Path:
         "crates/tools/src/lib.rs",
         "pyproject.toml",
         "README.md",
-        "src/singularity/agent_host/sidecar.py",
         "docs/evaluation/public-representative-task.json",
         "docs/testing.md",
         "docs/singularity.md",

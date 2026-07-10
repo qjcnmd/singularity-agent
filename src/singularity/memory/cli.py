@@ -174,7 +174,7 @@ def _memory_pipeline(*, read_only: bool = False, project_root: Path | None = Non
 
 
 def _print(payload: object, *, json_output: bool, title: str) -> None:
-    from singularity.cli import json_dumps
+    from singularity.utils.serialization import json_dumps
 
     text = json_dumps(payload)
     if json_output:

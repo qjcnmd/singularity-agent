@@ -1,28 +1,34 @@
 from __future__ import annotations
 
 import importlib
+import os
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
 
 
-def test_singularity_package_and_cli_module_are_primary_identity() -> None:
+def test_python_cli_module_is_not_public_runtime_entrypoint() -> None:
     module = importlib.import_module("singularity")
     assert module.__name__ == "singularity"
 
     result = subprocess.run(
         [sys.executable, "-m", "singularity.cli", "--help"],
         cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(SRC)},
         text=True,
         capture_output=True,
         check=False,
     )
 
-    assert result.returncode == 0
-    assert "Singularity" in result.stdout
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "run" not in combined
+    assert "eval" not in combined
+    assert "sandbox" not in combined
 
 
 def test_pyproject_exposes_only_singularity_console_scripts() -> None:

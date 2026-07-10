@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from singularity.cli import app
+from singularity.oracle.cli import app
 from singularity.command import (
     CommandDecision,
     CommandExecutor,

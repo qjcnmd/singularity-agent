@@ -8,7 +8,7 @@ from typer.main import get_command
 from typer.testing import CliRunner
 
 from singularity.agent_loop import AgentLoopStatus
-from singularity.cli import app
+from singularity.oracle.cli import app
 from singularity.config import ProductionConfig, adaptive_default_max_turns
 from singularity.context import ContextManager
 from singularity.context.models import ContextItemType, ContextSource

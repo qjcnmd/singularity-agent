@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from singularity.cli import app
+from singularity.oracle.cli import app
 from singularity.release.init import initialize_user_data, load_config
 from singularity.release.migrations import Migration, apply_migrations, load_manifest
 from singularity.release.models import atomic_write_json, read_json
