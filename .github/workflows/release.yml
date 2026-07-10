@@ -7,20 +7,26 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
   windows-x86_64:
     runs-on: windows-latest
+    outputs:
+      package-name: ${{ steps.package.outputs.name }}
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
 
       - name: Build release binaries
         run: cargo build --workspace --bins --release --locked
@@ -64,7 +70,7 @@ jobs:
           "archive=$archive" >> $env:GITHUB_OUTPUT
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.package.outputs.name }}
           path: |
@@ -72,13 +78,29 @@ jobs:
             dist/SHA256SUMS.txt
           if-no-files-found: error
 
+  publish:
+    if: github.ref_type == 'tag'
+    needs: windows-x86_64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: ${{ needs.windows-x86_64.outputs.package-name }}
+          path: dist
+
       - name: Publish tagged release
-        if: github.ref_type == 'tag'
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $archive = "${{ steps.package.outputs.archive }}"
+          $archive = Get-ChildItem -LiteralPath dist -Filter "*.zip" -File
+          if ($archive.Count -ne 1) {
+            throw "expected one release archive, found $($archive.Count)"
+          }
+          $archive = $archive.FullName
           if (gh release view $env:GITHUB_REF_NAME *> $null) {
             gh release upload $env:GITHUB_REF_NAME $archive dist/SHA256SUMS.txt --clobber
           } else {
