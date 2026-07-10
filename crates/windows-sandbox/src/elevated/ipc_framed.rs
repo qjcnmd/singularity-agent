@@ -23,7 +23,7 @@ use std::path::PathBuf;
 const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 
 /// Protocol version shared by the parent process and elevated command runner.
-pub const IPC_PROTOCOL_VERSION: u8 = 1;
+pub const IPC_PROTOCOL_VERSION: u8 = 2;
 
 /// Length-prefixed, JSON-encoded frame.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -90,6 +90,7 @@ pub enum OutputStream {
 pub struct ExitPayload {
     pub exit_code: i32,
     pub timed_out: bool,
+    pub cancelled: bool,
 }
 
 /// Error payload sent when the runner fails to spawn or stream.
@@ -221,6 +222,29 @@ mod tests {
         };
         assert_eq!(PermissionProfile::read_only(), payload.permission_profile);
         assert_eq!(workspace_roots, payload.workspace_roots);
+    }
+
+    #[test]
+    fn exit_payload_preserves_timeout_and_cancellation_independently() {
+        let message = FramedMessage {
+            version: IPC_PROTOCOL_VERSION,
+            message: Message::Exit {
+                payload: ExitPayload {
+                    exit_code: 1,
+                    timed_out: false,
+                    cancelled: true,
+                },
+            },
+        };
+
+        let encoded = serde_json::to_vec(&message).expect("serialize exit");
+        let decoded: FramedMessage = serde_json::from_slice(&encoded).expect("deserialize exit");
+        let Message::Exit { payload } = decoded.message else {
+            panic!("unexpected message");
+        };
+        assert_eq!(payload.exit_code, 1);
+        assert!(!payload.timed_out);
+        assert!(payload.cancelled);
     }
 
     #[test]

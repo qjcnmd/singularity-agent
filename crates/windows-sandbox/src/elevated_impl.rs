@@ -253,8 +253,10 @@ mod windows_impl {
             let (pipe_write, mut pipe_read) = transport.into_files();
             let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;
 
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
+            let mut stdout =
+                crate::BoundedCapture::new(crate::DEFAULT_MAX_CAPTURE_BYTES_PER_STREAM);
+            let mut stderr =
+                crate::BoundedCapture::new(crate::DEFAULT_MAX_CAPTURE_BYTES_PER_STREAM);
             let result = loop {
                 let msg = match read_frame(&mut pipe_read) {
                     Ok(Some(msg)) => msg,
@@ -265,14 +267,16 @@ mod windows_impl {
                     Message::SpawnReady { .. } => {}
                     Message::Output { payload } => match decode_bytes(&payload.data_b64) {
                         Ok(bytes) => match payload.stream {
-                            OutputStream::Stdout => stdout.extend_from_slice(&bytes),
-                            OutputStream::Stderr => stderr.extend_from_slice(&bytes),
+                            OutputStream::Stdout => stdout.extend(&bytes),
+                            OutputStream::Stderr => stderr.extend(&bytes),
                         },
                         Err(err) => {
                             break Err(err);
                         }
                     },
-                    Message::Exit { payload } => break Ok((payload.exit_code, payload.timed_out)),
+                    Message::Exit { payload } => {
+                        break Ok((payload.exit_code, payload.timed_out, payload.cancelled));
+                    }
                     Message::Error { payload } => {
                         break Err(anyhow::anyhow!("runner error: {}", payload.message));
                     }
@@ -289,7 +293,9 @@ mod windows_impl {
                 let _ = cancel_handle.join();
             }
             drop(pipe_write);
-            let (exit_code, timed_out) = result?;
+            let (exit_code, timed_out, cancelled) = result?;
+            let (stdout, stdout_truncated) = stdout.into_parts();
+            let (stderr, stderr_truncated) = stderr.into_parts();
 
             if exit_code == 0 {
                 log_success(&command, logs_base_dir);
@@ -302,6 +308,8 @@ mod windows_impl {
                 stdout,
                 stderr,
                 timed_out,
+                cancelled,
+                output_truncated: stdout_truncated || stderr_truncated,
             })
         })()
     }
@@ -322,6 +330,8 @@ mod stub {
         pub stdout: Vec<u8>,
         pub stderr: Vec<u8>,
         pub timed_out: bool,
+        pub cancelled: bool,
+        pub output_truncated: bool,
     }
 
     /// Stub implementation for non-Windows targets; sandboxing only works on Windows.

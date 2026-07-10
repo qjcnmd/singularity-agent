@@ -47,6 +47,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
@@ -342,6 +343,7 @@ fn spawn_output_reader(
 fn spawn_control_loop(
     mut reader: File,
     process_handle: Arc<StdMutex<Option<HANDLE>>>,
+    cancel_requested: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
@@ -349,12 +351,14 @@ fn spawn_control_loop(
                 Ok(Some(message)) => message,
                 Ok(None) | Err(_) => break,
             };
-            if matches!(message.message, Message::Terminate { .. })
-                && let Ok(guard) = process_handle.lock()
-                && let Some(handle) = guard.as_ref()
-            {
-                unsafe {
-                    let _ = TerminateProcess(*handle, 1);
+            if matches!(message.message, Message::Terminate { .. }) {
+                cancel_requested.store(true, Ordering::SeqCst);
+                if let Ok(guard) = process_handle.lock()
+                    && let Some(handle) = guard.as_ref()
+                {
+                    unsafe {
+                        let _ = TerminateProcess(*handle, 1);
+                    }
                 }
             }
         }
@@ -468,11 +472,17 @@ pub fn main() -> Result<()> {
         None
     };
 
-    let _control_thread = spawn_control_loop(pipe_read, Arc::clone(&process_handle));
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+    let _control_thread = spawn_control_loop(
+        pipe_read,
+        Arc::clone(&process_handle),
+        Arc::clone(&cancel_requested),
+    );
 
     let timeout = req.timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
     let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
     let timed_out = wait_res == WAIT_TIMEOUT;
+    let cancelled = !timed_out && cancel_requested.load(Ordering::SeqCst);
 
     let exit_code: i32;
     if let Ok(mut guard) = process_handle.lock() {
@@ -510,6 +520,7 @@ pub fn main() -> Result<()> {
             payload: ExitPayload {
                 exit_code,
                 timed_out,
+                cancelled,
             },
         },
     };

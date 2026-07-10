@@ -1205,6 +1205,7 @@ fn command_error_code(result: &CommandResult) -> &'static str {
         CommandExecutionStatus::Unsupported => "command_unsupported",
         CommandExecutionStatus::SpawnFailed => "command_spawn_failed",
         CommandExecutionStatus::TimedOut => "command_timed_out",
+        CommandExecutionStatus::Cancelled => "command_cancelled",
         CommandExecutionStatus::BackendError => TOOL_SANDBOX_UNAVAILABLE_ERROR,
         CommandExecutionStatus::Completed => match result.semantic_status {
             CommandSemanticStatus::Succeeded => "command_succeeded",
@@ -1214,6 +1215,7 @@ fn command_error_code(result: &CommandResult) -> &'static str {
             CommandSemanticStatus::PolicyBlocked => "command_policy_blocked",
             CommandSemanticStatus::Unsupported => "command_unsupported",
             CommandSemanticStatus::TimedOut => "command_timed_out",
+            CommandSemanticStatus::Cancelled => "command_cancelled",
         },
     }
 }

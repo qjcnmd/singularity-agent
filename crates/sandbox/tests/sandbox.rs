@@ -68,7 +68,7 @@ fn command_request_and_result_are_schema_backed_boundaries() {
     let result_value = serde_json::to_value(&result).expect("serialize command result");
 
     assert_eq!(request_value["purpose"], "project_verification");
-    assert_eq!(request_value["network"]["mode"], "allowed");
+    assert_eq!(request_value["network"]["mode"], "denied");
     assert_eq!(result_value["semantic_status"], "succeeded");
     assert_eq!(result_value["redacted"], true);
     assert_eq!(request.permission_resource(), "python -m pytest");
@@ -124,6 +124,17 @@ fn command_executor_fails_closed_when_sandbox_is_required_without_backend() {
     );
     assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
     assert!(result.stderr_preview.contains("sandbox-required"));
+}
+
+#[test]
+fn cancelled_command_result_is_distinct_from_timeout() {
+    let result = CommandResult::cancelled("command_cancelled", 25);
+
+    assert_eq!(result.execution_status, CommandExecutionStatus::Cancelled);
+    assert_eq!(result.semantic_status, CommandSemanticStatus::Cancelled);
+    assert_eq!(result.duration_ms, 25);
+    assert!(!result.timed_out);
+    assert!(result.stderr_preview.contains("cancelled"));
 }
 
 #[test]

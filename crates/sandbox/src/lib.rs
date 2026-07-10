@@ -12,6 +12,7 @@ pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
 const SANDBOX_BACKEND_UNAVAILABLE: &str = "sandbox-required command has no sandbox backend";
 const COMMAND_SPAWN_FAILED: &str = "sandbox command spawn failed";
 const COMMAND_TIMED_OUT: &str = "sandbox command timed out";
+const COMMAND_CANCELLED: &str = "sandbox command cancelled";
 const COMMAND_EMPTY_ARGV: &str = "sandbox command argv is empty";
 const COMMAND_CWD_OUTSIDE_WORKSPACE: &str = "sandbox command cwd is outside workspace";
 const COMMAND_CWD_UNAVAILABLE: &str = "sandbox command cwd is unavailable";
@@ -164,6 +165,7 @@ pub enum CommandExecutionStatus {
     Unsupported,
     SpawnFailed,
     TimedOut,
+    Cancelled,
     BackendError,
 }
 
@@ -177,6 +179,7 @@ pub enum CommandSemanticStatus {
     PolicyBlocked,
     Unsupported,
     TimedOut,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -204,7 +207,7 @@ impl CommandRequest {
             purpose: CommandPurpose::ProjectVerification,
             timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
             network: SandboxNetworkPolicy {
-                mode: SandboxNetworkMode::Allowed,
+                mode: SandboxNetworkMode::Denied,
                 allowed_hosts: Vec::new(),
                 denied_hosts: Vec::new(),
                 require_hard_isolation: false,
@@ -399,6 +402,17 @@ impl CommandResult {
         );
         result.duration_ms = duration_ms;
         result.timed_out = true;
+        result
+    }
+
+    pub fn cancelled(command_id: impl Into<String>, duration_ms: u64) -> Self {
+        let mut result = Self::blocked(
+            command_id,
+            CommandExecutionStatus::Cancelled,
+            CommandSemanticStatus::Cancelled,
+            COMMAND_CANCELLED,
+        );
+        result.duration_ms = duration_ms;
         result
     }
 
@@ -1242,6 +1256,9 @@ mod windows_backend {
         started: Instant,
     ) -> CommandResult {
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        if capture.cancelled {
+            return CommandResult::cancelled(&request.command_id, duration_ms);
+        }
         if capture.timed_out {
             return CommandResult::timed_out(&request.command_id, duration_ms);
         }
@@ -1251,7 +1268,7 @@ mod windows_backend {
             duration_ms,
             String::from_utf8_lossy(&capture.stdout),
             String::from_utf8_lossy(&capture.stderr),
-            false,
+            capture.output_truncated,
         )
     }
 

@@ -48,6 +48,63 @@ impl fmt::Debug for WindowsSandboxCancellationToken {
     }
 }
 
+const DEFAULT_MAX_CAPTURE_BYTES_PER_STREAM: usize = 256 * 1024;
+
+#[derive(Debug)]
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    limit: usize,
+    truncated: bool,
+}
+
+impl BoundedCapture {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            truncated: false,
+        }
+    }
+
+    fn extend(&mut self, chunk: &[u8]) {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        self.truncated |= chunk.len() > remaining;
+    }
+
+    fn into_parts(self) -> (Vec<u8>, bool) {
+        (self.bytes, self.truncated)
+    }
+}
+
+#[cfg(test)]
+mod bounded_capture_tests {
+    use super::BoundedCapture;
+
+    #[test]
+    fn capture_stops_growing_after_limit_while_accepting_more_chunks() {
+        let mut capture = BoundedCapture::new(5);
+        capture.extend(b"abc");
+        capture.extend(b"defgh");
+        capture.extend(b"ignored");
+
+        let (bytes, truncated) = capture.into_parts();
+        assert_eq!(bytes, b"abcde");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn capture_at_exact_limit_is_not_truncated() {
+        let mut capture = BoundedCapture::new(5);
+        capture.extend(b"abcde");
+
+        let (bytes, truncated) = capture.into_parts();
+        assert_eq!(bytes, b"abcde");
+        assert!(!truncated);
+    }
+}
+
 /// Controls whether a Windows sandbox launch reconciles persistent proxy
 /// firewall settings or preserves the settings established by another launch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -366,6 +423,34 @@ mod windows_impl {
         Cancelled,
     }
 
+    fn spawn_capture_reader(handle: HANDLE) -> std::thread::JoinHandle<crate::BoundedCapture> {
+        std::thread::spawn(move || {
+            let mut capture =
+                crate::BoundedCapture::new(crate::DEFAULT_MAX_CAPTURE_BYTES_PER_STREAM);
+            let mut chunk = [0u8; 8192];
+            loop {
+                let mut read_bytes = 0u32;
+                let ok = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::ReadFile(
+                        handle,
+                        chunk.as_mut_ptr(),
+                        chunk.len() as u32,
+                        &mut read_bytes,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || read_bytes == 0 {
+                    break;
+                }
+                capture.extend(&chunk[..read_bytes as usize]);
+            }
+            unsafe {
+                CloseHandle(handle);
+            }
+            capture
+        })
+    }
+
     fn wait_for_process(
         process: HANDLE,
         timeout_ms: Option<u64>,
@@ -437,6 +522,8 @@ mod windows_impl {
         pub stdout: Vec<u8>,
         pub stderr: Vec<u8>,
         pub timed_out: bool,
+        pub cancelled: bool,
+        pub output_truncated: bool,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -586,50 +673,8 @@ mod windows_impl {
             CloseHandle(err_w);
         }
 
-        let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
-        let t_out = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = unsafe {
-                    windows_sys::Win32::Storage::FileSystem::ReadFile(
-                        out_r,
-                        tmp.as_mut_ptr(),
-                        tmp.len() as u32,
-                        &mut read_bytes,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..read_bytes as usize]);
-            }
-            let _ = tx_out.send(buf);
-        });
-        let t_err = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = unsafe {
-                    windows_sys::Win32::Storage::FileSystem::ReadFile(
-                        err_r,
-                        tmp.as_mut_ptr(),
-                        tmp.len() as u32,
-                        &mut read_bytes,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..read_bytes as usize]);
-            }
-            let _ = tx_err.send(buf);
-        });
+        let stdout_reader = spawn_capture_reader(out_r);
+        let stderr_reader = spawn_capture_reader(err_r);
 
         let wait_outcome = wait_for_process(pi.hProcess, timeout_ms, cancellation.as_ref());
         let timed_out = matches!(wait_outcome, WaitOutcome::TimedOut);
@@ -654,10 +699,14 @@ mod windows_impl {
             }
             CloseHandle(security.h_token);
         }
-        let _ = t_out.join();
-        let _ = t_err.join();
-        let stdout = rx_out.recv().unwrap_or_default();
-        let stderr = rx_err.recv().unwrap_or_default();
+        let stdout_capture = stdout_reader.join().unwrap_or_else(|_| {
+            crate::BoundedCapture::new(crate::DEFAULT_MAX_CAPTURE_BYTES_PER_STREAM)
+        });
+        let stderr_capture = stderr_reader.join().unwrap_or_else(|_| {
+            crate::BoundedCapture::new(crate::DEFAULT_MAX_CAPTURE_BYTES_PER_STREAM)
+        });
+        let (stdout, stdout_truncated) = stdout_capture.into_parts();
+        let (stderr, stderr_truncated) = stderr_capture.into_parts();
         let exit_code = if timed_out {
             128 + 64
         } else {
@@ -675,6 +724,8 @@ mod windows_impl {
             stdout,
             stderr,
             timed_out,
+            cancelled,
+            output_truncated: stdout_truncated || stderr_truncated,
         })
     }
 
@@ -799,6 +850,8 @@ mod stub {
         pub stdout: Vec<u8>,
         pub stderr: Vec<u8>,
         pub timed_out: bool,
+        pub cancelled: bool,
+        pub output_truncated: bool,
     }
 
     #[allow(clippy::too_many_arguments)]
