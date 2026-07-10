@@ -96,4 +96,4 @@ The port does not depend on `codex-utils-pty`, `codex-otel`, the upstream protoc
 8. Changed the strict world-writable audit path to propagate incomplete ACL scans and deny-ACE failures instead of treating them as success.
 9. Replaced upstream protocol and absolute-path dependencies with the bounded local types listed above.
 
-No adapter into the existing `singularity_sandbox` crate is included; that integration is intentionally deferred to the parent task.
+`singularity_sandbox::WindowsSandboxBackend` is the product adapter for this crate. It maps the runtime filesystem and network policy into the permission profile above, tries the elevated path first, permits the restricted-token path only when it can enforce the requested profile, and otherwise fails closed.

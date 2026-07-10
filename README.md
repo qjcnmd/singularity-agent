@@ -1,177 +1,122 @@
-# Singularity v0.1.0
+# Singularity
 
-Singularity 是本地优先的 CLI coding agent harness。当前 public runtime 是 Rust `sg` -> app-server JSON-RPC -> Rust AgentLoop；Python 代码只保留为 Python oracle/parity/dev-only 对照，不作为普通运行方式。历史设计、路线图和阶段报告由 git history 保留。
+Singularity 是一个面向 Windows 的本地命令行编码代理。产品运行时、协议、模型调用、工具、评估和测试均由 Rust 实现；命令执行采用源自 OpenAI Codex CLI 的 Windows 原生沙箱，并在不能满足请求权限时关闭失败（fail closed）。
 
-## 当前身份
+当前支持 Windows x86-64。其他平台可以编译和运行确定性测试，但由于没有严格命令沙箱，AgentLoop 不会声明可用。
 
-- 产品名：`Singularity`
-- Rust public runtime：Cargo/build artifact 中的 `sg`，通过 `crates/app-server` 的 JSON-RPC 协议运行
-- Python 包：`singularity`，仅用于 internal oracle / parity fixture / dev-only 维护；`pyproject.toml` 不安装 Python console script
-- 环境变量前缀：`SINGULARITY_`
-- 项目本地状态目录：`.singularity/`
+## 运行结构
 
-## 源码入口
+```text
+sg
+  -> singularity_app_server (stdio JSON-RPC)
+     -> AgentLoop -> ToolBroker -> WorkspaceTools
+        -> WindowsSandboxBackend
+     -> OpenAiProvider
+     -> SessionStore (SQLite)
+```
 
-- Rust CLI：`crates/cli/src/main.rs`
-- Rust app-server：`crates/app-server/src/lib.rs`
-- Rust protocol：`crates/protocol/src/lib.rs`
-- Rust AgentLoop：`crates/agent/src/lib.rs`
-- Rust tools / policy / sandbox / model / store：`crates/tools/`、`crates/policy/`、`crates/sandbox/`、`crates/model/`、`crates/store/`
-- Python oracle/parity/dev-only 参考：`src/singularity/`，用于对照、fixture export 和迁移期验证，不作为 public runtime
+详细边界、对象、状态流和失败路径见 [`docs/singularity.md`](docs/singularity.md)。
 
-核心模块数据流文档位于 `docs/architecture/modules/`。这些文档以源码为唯一事实来源，列出当前对象完整字段、调用链、生成者、消费者、落盘路径、trace/audit 行为、失败路径和维护规则。
+## 安装
 
-## 基本安装
+从 GitHub Release 下载 `singularity-<version>-windows-x86_64.zip`，校验 `SHA256SUMS.txt` 后解压。压缩包内四个可执行文件必须保留在同一目录：
 
-Python editable install 只安装内部库和测试依赖，不提供 public CLI。Rust public runtime 通过 Cargo 构建并运行 `sg`。
+```text
+sg.exe
+singularity_app_server.exe
+singularity-command-runner.exe
+singularity-windows-sandbox-setup.exe
+```
 
-OpenAI-compatible provider 通过环境变量配置。API key 不接受 CLI 参数。
+将该目录加入 `PATH` 即可，不需要单独安装或选择 sandbox backend。第一次执行需要离线命令沙箱的任务时，系统可能显示一次 Windows UAC 提权提示；setup helper 会建立受限账户、访问控制列表和网络隔离，之后自动复用。用户拒绝提权或 setup 失败时命令不会退回本地进程执行。
 
-PowerShell：
+完整安装、源码构建和更新说明见 [`docs/INSTALL.md`](docs/INSTALL.md)。
+
+## Provider 配置
+
+在目标仓库或其父目录创建 `.env`，也可以设置同名进程环境变量：
+
+```dotenv
+SINGULARITY_BASE_URL=https://provider.example/v1
+SINGULARITY_API_KEY=replace-with-your-api-key
+SINGULARITY_MODEL=your-model-name
+```
+
+只要进程环境中出现任一 provider 变量，Singularity 就只使用该环境层；否则从当前目录向父目录查找最近的 `.env`。`SINGULARITY_MODEL_PROVIDER` 可选，默认值为 `openai_compatible`。密钥不会通过 CLI 参数接收，doctor 只显示脱敏的 present/missing 状态。
+
+检查配置：
 
 ```powershell
-$env:SINGULARITY_BASE_URL = "https://api.openai.com/v1"
-$env:SINGULARITY_API_KEY = "..."
-$env:SINGULARITY_MODEL = "gpt-4.1-mini"
+sg config doctor
 ```
 
-cmd.exe：
+## 常用命令
 
-```bat
-set SINGULARITY_BASE_URL=https://api.openai.com/v1
-set SINGULARITY_API_KEY=...
-set SINGULARITY_MODEL=gpt-4.1-mini
+启动新任务：
+
+```powershell
+sg run "审查并修复当前仓库中的失败测试"
+sg run "只读解释当前模块的数据流" --model gpt-example
 ```
 
-POSIX shell：
+继续已有任务：
 
-```bash
-export SINGULARITY_BASE_URL=https://api.openai.com/v1
-export SINGULARITY_API_KEY=...
-export SINGULARITY_MODEL=gpt-4.1-mini
+```powershell
+sg threads
+sg continue <thread-id> "继续完成剩余修改"
 ```
 
-配置优先级：
+状态、取消和审批：
 
-```text
-显式 CLI 参数 > SINGULARITY_* 环境变量 > .singularity/config.toml > 默认值
+```powershell
+sg turn status <turn-id>
+sg turn interrupt <turn-id>
+sg approvals
+sg approve <request-id> --decision allow --reason "已核对操作范围"
 ```
 
-## Permission 与 Sandbox 边界
+追踪：
 
-会话权限通过行业通用的 permission profile 表达：
-
-- `read-only`、`workspace-write`、`danger-full-access`描述会话 filesystem 边界。
-- `--add-dir`显式增加可写目录，不要求提升为`danger-full-access`。
-- `on-request`允许高风险动作进入审批；`never`把需要审批的动作转为拒绝。
-- protected paths由Policy、command、tool和workspace mutation边界执行，不能由模型提供的参数关闭。
-
-当前 sandbox 只注册OS-native方向的`WindowsSandboxBackend`。Windows实现是account-backed OS sandbox：elevated setup创建并加固`SingularityOffline`与`SingularityOnline`两个专用本地账户、独立Credential Manager凭据、登录UI隐藏项、logon rights、受限Users组成员关系和state dir ACL；`network=denied`只使用受account-scoped outbound firewall约束的offline账户，`network=allowed`只使用不被该规则命中的online账户。runner随后用restricted low-integrity token、private desktop和Job Object运行命令。该结构只对齐OpenAI Codex公开的dedicated principal与firewall设计原则，不声称实现与Codex App相同。缺少任一doctor/setup/execution能力时仍报告`backend_unavailable`并fail closed，不回退到普通本地进程；workspace projection或文件复制也不会被表述为强隔离。非Windows平台在实现对应native backend前同样明确不可用。
-
-## CLI
-
-Rust `sg` 是 public runtime 入口。`sg run`、`sg chat`、`sg continue` 和 `sg eval run` 只通过 app-server JSON-RPC 进入 Rust AgentLoop；`turn/start` 没有公开后端选择字段。Rust capability 不满足时 fail closed，并返回结构化 blocker，而不是切到 Python。target-project Python commands 仍然可以作为项目验证命令经 Rust sandbox 执行，例如模型或 evaluation runner 可以运行 `python -m pytest` 来验证目标仓库。
-
-```bash
-cargo run -p singularity_cli --bin sg -- run "inspect the current project" --model gpt-4.1-mini
-cargo run -p singularity_cli --bin sg -- continue <thread-id> "follow up"
-cargo run -p singularity_cli --bin sg -- turn status <turn-id>
-cargo run -p singularity_cli --bin sg -- trace <thread-or-run-id> --limit 20
-cargo run -p singularity_cli --bin sg -- trace show <event-id>
-cargo run -p singularity_cli --bin sg -- approvals
-cargo run -p singularity_cli --bin sg -- approve <request-id> --decision allow --reason "operator approved"
-cargo run -p singularity_cli --bin sg -- eval run docs/evaluation/public-representative-task.json --run-id <run-id> --json
+```powershell
+sg trace <run-id> --limit 20
+sg trace show <event-id>
 ```
 
-Python oracle/parity/dev-only 路径仍用于迁移期对照、fixture export 和 schema parity，不作为普通运行方式，也不作为 Rust public runtime proof。
+运行真实评估：
 
-`eval` 是当前唯一的评估 CLI 命令组；`benchmark` 只表示基准任务、任务集或报告这一领域概念，不是 CLI alias。新增 evaluation 文档、manifest 和 CLI 示例必须使用 `eval` / `evaluation` / `benchmark` / `task` / `task set` / `result` / `report` / `runner` 等主流命名，不得恢复 `live` 命名。
-
-## 运行链路
-
-```text
-Rust sg
--> AppServerClient
--> JSON-RPC over stdio
--> AppServer.handle_json()
--> SessionStore thread/turn/trace transaction
--> AgentLoopCapability gate
--> Rust AgentLoop.run()
--> OpenAiProvider
--> ToolBroker / PolicyEngine / WorkspaceTools / SandboxBackend
--> AgentLoopResult
--> Turn / Item / TraceEvent / Approval / ArtifactRef
+```powershell
+sg eval run docs/evaluation/public-representative-task.json --run-id representative-001 --json
 ```
 
-## Evaluation
+默认状态库位于当前工作目录的 `.singularity/rust-app-server.sqlite3`。sandbox 自身的受限账户元数据和 helper 缓存默认位于 `%USERPROFILE%\.singularity`；只有需要改变该位置时才设置 `SINGULARITY_HOME`。
 
-当前公开 manifest 位于 `docs/evaluation/`：
+## 安全边界
 
-- `public-representative-task.json`
+- 工作区写入前进行规范化路径检查；符号链接、junction 和 `..` 不能绕过根目录边界。
+- `.git`、`.singularity`、环境文件、密钥和其他受保护路径默认拒绝模型写入。
+- 命令默认无网络，且必须经过 restricted token、Job Object、进程树终止、超时和有界输出捕获。
+- 网络被拒绝时只接受 elevated offline identity；不能执行时直接失败，不使用本地进程或无沙箱后端。
+- provider 原始响应、密钥、原始工具参数和内部审计字段不会投影到公共工具结果。
+- 修改工作区后，AgentLoop 必须观察到成功命令验证，且不能带着未解决的可修复失败直接完成。
 
-真实模型评估命令：
+## 从源码验证
 
-```bash
-cargo run -p singularity_cli --bin sg -- eval run docs/evaluation/public-representative-task.json --run-id <run-id> --json
+需要 Rust 1.96.0。为减少系统盘占用，可在单次 PowerShell 7 会话中设置非系统盘 target：
+
+```powershell
+$env:CARGO_TARGET_DIR = "D:\Temp\singularity-target"
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
+cargo test --workspace --all-targets --locked --no-fail-fast
 ```
 
-评估结果使用当前字段：
+完整 release 构建：
 
-- `agent_completed`：AgentLoop / FinalReport 自认为完成
-- `evaluation_passed`：独立 evaluator 判定通过
-- `miscompletion_count`：`agent_completed and not evaluation_passed`
-- `evaluation_metrics`：诊断 scorecard，包含 resolved、FAIL_TO_PASS/PASS_TO_PASS、verification、patch、trajectory、tools、context/compaction、efficiency、cost 和 safety；不改变硬通过语义
-
-不要把 `evaluation_passed` 写回旧的 `completed` / `success` result alias。capability gate 仍只以现有 evaluator 结果和命令退出码作为硬判断；`evaluation_metrics`、cost 和 pricing unknown 只用于诊断/回归分析，不会让 gate 通过或失败。
-
-Phase 8 后本地验证分为三层，CI Quality matrix 不降级，既有全量测试仍保留：
-
-- `fast` gate：Codex 日常小改默认运行 `python scripts/verify_fast.py --git`。它执行 ruff、当前 mypy、changed-scope compileall 和 `scripts/test_impact.py` 推荐的受影响 pytest；低置信度或无明确测试时输出 `fallback_required=stage` 与 `skipped_reason`，不静默跳过，不跑真实 provider eval。
-- `stage` gate：阶段收口运行 `python scripts/verify_stage.py`。它执行 deterministic mypy/ruff/compileall/runtime docs、过滤后的 pytest 和关键模块专项测试，不默认跑真实 provider eval。
-- `capability` gate：只有 AgentLoop、ToolProtocol、sandbox、context、compaction、verification、CompletionGate、FinalReport 或 evaluation runner 变更时运行 `python scripts/verify_capability.py --force --run-id <run-id>`，默认使用单个公共任务 `docs/evaluation/public-representative-task.json`，并在 JSON 输出中附带 `evaluation_metrics` 摘要。
-
-公共代表性任务来自 SWE-bench Lite dev split：`sqlfluff__sqlfluff-2419`，repo 为 `sqlfluff/sqlfluff`，base commit 为 `f1dba0e1dd764ae72d67c3d5e1471cf14d3db030`，FAIL_TO_PASS 目标为 `test/rules/std_L060_test.py::test__rules__std_L060_raised`。manifest 只把 issue 摘要、允许范围、模型可见 local smoke 和完成标准交给模型；evaluator `test_patch` 只在 baseline/verification workspace 中应用，gold patch 不存储也不进入 `ModelTurnRequest`。
-
-## 运行时状态
-
-默认 trace run 目录结构：
-
-```text
-<trace-run-dir>/
-  events.jsonl
-  spans.jsonl
-  artifacts.jsonl
-  artifacts/
-  context.sqlite3
-  tool_protocol.sqlite3
+```powershell
+cargo build --workspace --bins --release --locked
 ```
 
-默认 context 数据库路径是 `<trace-run-dir>/context.sqlite3`，默认工具协议状态库路径是 `<trace-run-dir>/tool_protocol.sqlite3`。
+## 许可证
 
-这些文件是运行时状态，不是源码 fixture。生成物应位于 `work/`、`.singularity/` 或测试临时目录中，不应提交。
-
-## 文档维护
-
-- 核心模块文档只放在 `docs/architecture/modules/`。
-- 修改核心运行对象、字段、调用链、CLI、schema、manifest、trace event、report schema 或 evaluation result 时，必须同步更新对应模块数据流文档。
-- 展示真实对象时必须列完整字段，不允许只列子集。
-- 不允许为了文档或测试增加无运行价值字段。
-- 不保留旧阶段报告、旧优先级报告、旧生产审查报告、旧路线图报告、旧 ADR、旧评估兼容清单、旧运行时文档或兼容说明。
-
-校验命令：
-
-```bash
-python scripts/verify_runtime_docs.py
-```
-
-## 开发验证
-
-```bash
-python -m ruff check .
-python -m mypy
-python -m compileall src scripts
-python scripts/verify_runtime_docs.py
-python -m pytest tests --basetemp work/pytest-tmp
-```
-
-`python -m mypy` 是 `pyproject.toml` 中声明的聚焦类型检查。`python -m mypy src/singularity` 是全包类型债检查，若未通过需要单独报告。
+项目主体使用 [MIT License](LICENSE)。`crates/windows-sandbox` 的来源和 Apache-2.0 许可见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 与该 crate 内的 `UPSTREAM.md`、`LICENSE`、`NOTICE`。
