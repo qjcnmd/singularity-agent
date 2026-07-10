@@ -321,22 +321,23 @@ pub struct ApprovalRequest {
 impl ApprovalRequest {
     pub fn new(
         request_id: impl Into<String>,
-        session_id: impl Into<String>,
-        task_id: impl Into<String>,
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
         action: impl Into<String>,
     ) -> Self {
+        let thread_id = thread_id.into();
+        let turn_id = turn_id.into();
         Self {
             request_id: request_id.into(),
-            session_id: session_id.into(),
-            task_id: task_id.into(),
-            thread_id: String::new(),
-            turn_id: String::new(),
+            session_id: thread_id.clone(),
+            task_id: turn_id.clone(),
+            thread_id,
+            turn_id,
             tool_call_id: None,
             action: action.into(),
             resources: Vec::new(),
             reason: String::new(),
         }
-        .with_default_binding()
     }
 
     pub fn with_resources<I, S>(mut self, resources: I) -> Self
@@ -348,24 +349,8 @@ impl ApprovalRequest {
         self
     }
 
-    pub fn with_thread_turn_binding(
-        mut self,
-        thread_id: impl Into<String>,
-        turn_id: impl Into<String>,
-    ) -> Self {
-        self.thread_id = thread_id.into();
-        self.turn_id = turn_id.into();
-        self
-    }
-
     pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
-        self
-    }
-
-    fn with_default_binding(mut self) -> Self {
-        self.thread_id = self.session_id.clone();
-        self.turn_id = self.task_id.clone();
         self
     }
 }

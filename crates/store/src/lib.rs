@@ -27,6 +27,15 @@ const SQLITE_JOURNAL_MODE_WAL: &str = "WAL";
 const REDACTED_ARTIFACT_VALUE: &str = "[redacted]";
 const SENSITIVE_ARTIFACT_MARKERS: [&str; 5] =
     ["api_key", "authorization", "password", "secret", "token"];
+const APPROVAL_BINDING_REQUIRED: &str =
+    "approval request must include explicit thread_id and turn_id";
+const APPROVAL_TURN_THREAD_MISMATCH: &str = "approval request thread_id must match bound turn";
+const PENDING_TOOL_CALL_ID_MISMATCH: &str =
+    "pending tool call tool_call_id must match approval request";
+const PENDING_TOOL_CALL_TURN_MISMATCH: &str =
+    "pending tool call turn_id must match approval request";
+const PENDING_TOOL_CALL_THREAD_MISMATCH: &str =
+    "pending tool call thread_id must match approval request";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -524,22 +533,40 @@ impl SessionStore {
                 other => StoreError::Sqlite(other),
             })?;
         let request: ApprovalRequest = serde_json::from_str(&request_payload)?;
-        let pending_tool_call = match transaction.query_row(
-            "select payload from pending_tool_calls where request_id = ?1 and turn_id = ?2",
-            params![decision.request_id, request.turn_id],
-            |row| row.get::<_, String>(0),
-        ) {
-            Ok(payload) => Some(serde_json::from_str(&payload)?),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                if Self::exists_in_transaction(
-                    &transaction,
-                    "select 1 from pending_tool_calls where request_id = ?1",
-                    &decision.request_id,
-                )? {
+        let pending_tool_call = match transaction
+            .query_row(
+                "select thread_id, turn_id, tool_call_id, payload from pending_tool_calls where request_id = ?1",
+                params![decision.request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            Some((thread_id, turn_id, tool_call_id, payload)) => {
+                if thread_id != request.thread_id {
                     return Err(StoreError::InvalidState(
-                        "pending tool call turn_id must match approval request".to_string(),
+                        PENDING_TOOL_CALL_THREAD_MISMATCH.to_string(),
                     ));
                 }
+                if turn_id != request.turn_id {
+                    return Err(StoreError::InvalidState(
+                        PENDING_TOOL_CALL_TURN_MISMATCH.to_string(),
+                    ));
+                }
+                if request.tool_call_id.as_deref() != Some(tool_call_id.as_str()) {
+                    return Err(StoreError::InvalidState(
+                        PENDING_TOOL_CALL_ID_MISMATCH.to_string(),
+                    ));
+                }
+                Some(serde_json::from_str(&payload)?)
+            }
+            None => {
                 if request.tool_call_id.is_some() {
                     return Err(StoreError::NotFound(format!(
                         "pending tool call {}",
@@ -548,7 +575,6 @@ impl SessionStore {
                 }
                 None
             }
-            Err(error) => return Err(StoreError::Sqlite(error)),
         };
         let changed = transaction.execute(
             "update approvals set decision_outcome = ?1, decision_reason = ?2 where request_id = ?3 and decision_outcome is null",
@@ -1201,16 +1227,24 @@ fn pending_tool_call_id(
         .ok_or_else(|| {
             StoreError::InvalidState("pending tool call tool_call_id is required".to_string())
         })?;
-    if request
-        .tool_call_id
-        .as_ref()
-        .is_some_and(|expected| expected != tool_call_id)
-    {
+    if request.tool_call_id.as_deref() != Some(tool_call_id) {
         return Err(StoreError::InvalidState(
-            "pending tool call tool_call_id must match approval request".to_string(),
+            PENDING_TOOL_CALL_ID_MISMATCH.to_string(),
         ));
     }
     Ok(tool_call_id.to_string())
+}
+
+fn ensure_approval_request_binding(
+    connection: &Connection,
+    request: &ApprovalRequest,
+) -> StoreResult<()> {
+    if request.thread_id.trim().is_empty() || request.turn_id.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            APPROVAL_BINDING_REQUIRED.to_string(),
+        ));
+    }
+    ensure_request_turn_binding(connection, request)
 }
 
 fn ensure_request_turn_binding(
@@ -1231,7 +1265,7 @@ fn ensure_request_turn_binding(
         })?;
     if thread_id != request.thread_id {
         return Err(StoreError::InvalidState(
-            "approval request thread_id must match bound turn".to_string(),
+            APPROVAL_TURN_THREAD_MISMATCH.to_string(),
         ));
     }
     Ok(())
@@ -1272,6 +1306,7 @@ mod tests {
 }
 
 fn insert_approval(connection: &Connection, request: &ApprovalRequest) -> StoreResult<()> {
+    ensure_approval_request_binding(connection, request)?;
     connection
         .execute(
             "insert into approvals(request_id, payload, decision_outcome, decision_reason) values(?1, ?2, null, null)",

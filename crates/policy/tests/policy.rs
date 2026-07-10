@@ -24,7 +24,7 @@ fn permission_profile_and_approval_objects_keep_wire_names() {
     assert_eq!(value["profile"], "workspace-write");
     assert_eq!(value["workspace_roots"][0], "C:/repo");
 
-    let request = ApprovalRequest::new("approval_1", "session_1", "task_1", "write_file");
+    let request = ApprovalRequest::new("approval_1", "thread_1", "turn_1", "write_file");
     let decision = ApprovalDecision::new(
         request.request_id.clone(),
         ApprovalOutcome::Deny,
@@ -131,7 +131,7 @@ fn explicit_ask_rule_creates_approval_flow() {
         ))
         .evaluate(&request);
 
-    let approval = ApprovalRequest::new("approval_1", "session_1", "task_1", request.tool_name);
+    let approval = ApprovalRequest::new("approval_1", "thread_1", "turn_1", request.tool_name);
     let approved = ApprovalDecision::new("approval_1", ApprovalOutcome::Allow, "operator approved");
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Ask);

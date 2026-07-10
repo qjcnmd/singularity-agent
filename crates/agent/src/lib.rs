@@ -1485,11 +1485,10 @@ fn approval_request(
 ) -> ApprovalRequest {
     let mut request = ApprovalRequest::new(
         approval_request_id,
-        input.session_id.clone(),
-        input.task_id.clone(),
+        input.thread_id.clone(),
+        input.turn_id.clone(),
         call.tool_name.clone(),
     )
-    .with_thread_turn_binding(input.thread_id.clone(), input.turn_id.clone())
     .with_tool_call_id(call.tool_call_id.clone())
     .with_resources(permission_resources_for_tool(call));
     request.reason = reason.to_string();

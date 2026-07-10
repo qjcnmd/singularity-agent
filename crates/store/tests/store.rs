@@ -51,7 +51,12 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
         "thread started",
     );
     store.append_trace(&trace).expect("trace");
-    let approval = ApprovalRequest::new("approval_1", "session_1", "task_1", "write_file");
+    let approval = ApprovalRequest::new(
+        "approval_1",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "write_file",
+    );
     store.create_approval(&approval).expect("approval");
     let decision = ApprovalDecision::new("approval_1", ApprovalOutcome::Allow, "ok");
     store
@@ -269,11 +274,10 @@ fn pending_tool_call_binding_rejects_request_mismatch() {
         .expect("turn");
     let request = ApprovalRequest::new(
         "approval_turn_call_1",
-        turn.turn_id.clone(),
+        thread.thread_id.clone(),
         turn.turn_id.clone(),
         "builtin.patch",
     )
-    .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
     .with_tool_call_id("call_1");
     let pending_tool_call = serde_json::json!({
         "request_id": "approval_other",
@@ -296,16 +300,95 @@ fn pending_tool_call_binding_rejects_request_mismatch() {
 }
 
 #[test]
+fn approval_creation_requires_explicit_existing_thread_turn_binding() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let request = ApprovalRequest {
+        request_id: "approval_1".to_string(),
+        session_id: "session_legacy".to_string(),
+        task_id: "task_legacy".to_string(),
+        thread_id: String::new(),
+        turn_id: String::new(),
+        tool_call_id: None,
+        action: "builtin.edit".to_string(),
+        resources: Vec::new(),
+        reason: String::new(),
+    };
+
+    assert!(matches!(
+        store.create_approval(&request),
+        Err(StoreError::InvalidState(message))
+            if message == "approval request must include explicit thread_id and turn_id"
+    ));
+}
+
+#[test]
+fn approval_creation_rejects_turn_bound_to_another_thread() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let expected_thread = store.create_thread(None, None).expect("expected thread");
+    let other_thread = store.create_thread(None, None).expect("other thread");
+    let turn = store
+        .create_turn(&other_thread.thread_id, "blocked")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_1",
+        expected_thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "builtin.edit",
+    );
+
+    assert!(matches!(
+        store.create_approval(&request),
+        Err(StoreError::InvalidState(message))
+            if message == "approval request thread_id must match bound turn"
+    ));
+}
+
+#[test]
+fn pending_tool_call_binding_requires_request_tool_call_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "blocked")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_turn_call_1",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "builtin.patch",
+    );
+    let pending_tool_call = serde_json::json!({
+        "request_id": "approval_turn_call_1",
+        "tool_call_id": "call_1",
+        "tool_name": "builtin.patch",
+        "raw_arguments": "{}",
+        "resources": []
+    });
+
+    assert!(matches!(
+        store.create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(pending_tool_call),
+            "approval",
+            "approval requested",
+        ),
+        Err(StoreError::InvalidState(message))
+            if message == "pending tool call tool_call_id must match approval request"
+    ));
+}
+
+#[test]
 fn pending_tool_call_binding_requires_existing_turn() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let request = ApprovalRequest::new(
         "approval_missing_turn_call_1",
-        "missing_turn",
+        "missing_thread",
         "missing_turn",
         "builtin.patch",
     )
-    .with_thread_turn_binding("missing_thread", "missing_turn")
     .with_tool_call_id("call_1");
     let pending_tool_call = serde_json::json!({
         "request_id": "approval_missing_turn_call_1",
@@ -340,11 +423,10 @@ fn approval_decision_rejects_pending_tool_call_turn_mismatch() {
         .expect("other turn");
     let request = ApprovalRequest::new(
         "approval_turn_call_1",
-        expected_turn.turn_id.clone(),
+        thread.thread_id.clone(),
         expected_turn.turn_id.clone(),
         "builtin.patch",
     )
-    .with_thread_turn_binding(thread.thread_id.clone(), expected_turn.turn_id.clone())
     .with_tool_call_id("call_1");
     store.create_approval(&request).expect("approval");
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
@@ -424,7 +506,16 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
     ] {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-        let request = ApprovalRequest::new("approval_1", "session_1", "task_1", "write_file");
+        let thread = store.create_thread(None, None).expect("thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "blocked")
+            .expect("turn");
+        let request = ApprovalRequest::new(
+            "approval_1",
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            "write_file",
+        );
         store.create_approval(&request).expect("approval");
         let decision = ApprovalDecision::new("approval_1", outcome, "operator decision");
 
@@ -435,9 +526,9 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
 
         assert_eq!(recorded.request, request);
         assert_eq!(recorded.decision, decision);
-        assert_eq!(trace.run_id, "session_1");
-        assert_eq!(trace.session_id, "session_1");
-        assert_eq!(trace.task_id.as_deref(), Some("task_1"));
+        assert_eq!(trace.run_id, thread.thread_id);
+        assert_eq!(trace.session_id, thread.thread_id);
+        assert_eq!(trace.task_id.as_deref(), Some(turn.turn_id.as_str()));
         assert_eq!(trace.payload["request_id"], "approval_1");
         assert_eq!(trace.payload["decision_id"], decision.decision_id);
         assert_eq!(
@@ -445,7 +536,7 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
             serde_json::to_value(outcome).expect("serialize outcome")
         );
         assert_eq!(
-            store.list_trace("session_1").expect("trace list")[0].event_id,
+            store.list_trace(&thread.thread_id).expect("trace list")[0].event_id,
             trace.event_id
         );
         assert_eq!(
@@ -477,11 +568,10 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
         .expect("turn");
     let request = ApprovalRequest::new(
         "approval_turn_call_1",
-        turn.turn_id.clone(),
+        thread.thread_id.clone(),
         turn.turn_id.clone(),
         "builtin.patch",
     )
-    .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
     .with_tool_call_id("call_1");
     let pending_tool_call = serde_json::json!({
         "request_id": "approval_turn_call_1",

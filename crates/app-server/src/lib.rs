@@ -2274,11 +2274,10 @@ mod tests {
         let server = AppServer::new(store);
         let request = ApprovalRequest::new(
             format!("approval_{}_call_1", turn.turn_id),
-            turn.turn_id.clone(),
+            thread.thread_id.clone(),
             turn.turn_id.clone(),
             TOOL_EDIT,
         )
-        .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
         .with_tool_call_id("call_1")
         .with_resources(["README.md"]);
         let decision = ApprovalDecision::new(
@@ -2333,11 +2332,10 @@ mod tests {
             .expect("blocked turn");
         let request = ApprovalRequest::new(
             format!("approval_{}_call_1", turn.turn_id),
-            turn.turn_id.clone(),
+            thread.thread_id.clone(),
             turn.turn_id.clone(),
             TOOL_COMMAND,
         )
-        .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
         .with_tool_call_id("call_1");
         let pending = PendingToolCall {
             request_id: request.request_id.clone(),
@@ -2417,11 +2415,10 @@ mod tests {
             .expect("blocked turn");
         let request = ApprovalRequest::new(
             format!("approval_{}_call_1", turn.turn_id),
-            turn.turn_id.clone(),
+            thread.thread_id.clone(),
             turn.turn_id.clone(),
             TOOL_COMMAND,
         )
-        .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
         .with_tool_call_id("call_1");
         let decision = ApprovalDecision::new(
             request.request_id.clone(),
@@ -2540,11 +2537,10 @@ mod tests {
             .expect("blocked turn");
         let request = ApprovalRequest::new(
             format!("approval_{}_call_1", turn.turn_id),
-            turn.turn_id.clone(),
+            thread.thread_id.clone(),
             turn.turn_id.clone(),
             TOOL_EDIT,
         )
-        .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
         .with_tool_call_id("call_1")
         .with_resources(["README.md"]);
         let pending = PendingToolCall {

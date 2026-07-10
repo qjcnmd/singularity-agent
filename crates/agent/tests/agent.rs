@@ -1095,6 +1095,12 @@ fn agent_loop_patch_approval_request_covers_unapproved_change_path() {
         result.approval_requests[0].request_id,
         "approval_turn_1_call_1"
     );
+    assert_eq!(result.approval_requests[0].thread_id, "thread_1");
+    assert_eq!(result.approval_requests[0].turn_id, "turn_1");
+    assert_eq!(
+        result.approval_requests[0].tool_call_id.as_deref(),
+        Some("call_1")
+    );
     assert_eq!(
         std::fs::read_to_string(first_path).expect("read first"),
         "one"

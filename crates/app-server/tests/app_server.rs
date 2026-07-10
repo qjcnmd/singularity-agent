@@ -558,8 +558,17 @@ fn approval_decisions_consume_pending_requests_once_for_all_outcomes() {
                 .is_empty()
         );
 
-        let request = ApprovalRequest::new("approval_1", "session_1", "task_1", "write_file");
         let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("reopen store");
+        let thread = store.create_thread(None, None).expect("thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "blocked")
+            .expect("turn");
+        let request = ApprovalRequest::new(
+            "approval_1",
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            "write_file",
+        );
         store
             .create_approval_with_trace(&request, "approval", "approval requested")
             .expect("approval");
@@ -650,11 +659,10 @@ fn approval_decision_allow_without_pending_tool_call_is_rejected() {
         .expect("blocked state");
     let request = ApprovalRequest::new(
         format!("approval_{}_call_1", turn.turn_id),
-        turn.turn_id.clone(),
+        thread.thread_id.clone(),
         turn.turn_id.clone(),
         "builtin.edit",
     )
-    .with_thread_turn_binding(thread.thread_id.clone(), turn.turn_id.clone())
     .with_tool_call_id("call_1")
     .with_resources(["README.md"]);
     store
@@ -758,11 +766,10 @@ fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_native_tur
             .expect("blocked state");
         let request = ApprovalRequest::new(
             format!("approval_{}_call_1", turn.turn_id),
-            turn.turn_id.clone(),
+            thread_id.to_string(),
             turn.turn_id.clone(),
             "builtin.edit",
         )
-        .with_thread_turn_binding(thread_id.to_string(), turn.turn_id.clone())
         .with_tool_call_id("call_1")
         .with_resources([request_resource]);
         store
@@ -833,7 +840,7 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
         "Thread not found"
     );
 
-    let request = ApprovalRequest::new("approval_public", "session_1", "task_1", "write_file");
+    let request = ApprovalRequest::new("approval_public", "thread_1", "turn_1", "write_file");
     let request_message = serde_json::json!({
         "method": "approval/request",
         "id": 3,
