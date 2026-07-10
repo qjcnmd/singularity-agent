@@ -120,7 +120,6 @@ COMPLETE_FIELD_CHECKS = {
         "ContextBundle",
         "ContextUsageReport",
         "ContextSnapshot",
-        "ToolObservation",
         "PlannerState",
         "PolicyObservation",
         "VerificationEvidence",
@@ -134,7 +133,6 @@ COMPLETE_FIELD_CHECKS = {
     },
     "context-compaction-observation-store": {
         "ContextSnapshot",
-        "ToolObservation",
         "RecoveredContext",
         "PartialCompactionRange",
     },

@@ -3,6 +3,8 @@
 模块数据流文档 ID: evaluation-benchmark-runner
 
 源码证据路径:
+- crates/cli/src/main.rs
+- crates/app-server/src/lib.rs
 - src/singularity/evaluation/runner.py
 - src/singularity/evaluation/manifests.py
 - src/singularity/evaluation/results.py
@@ -11,7 +13,6 @@
 - src/singularity/evaluation/reports.py
 - src/singularity/evaluation/failure_case_replay.py
 - src/singularity/evaluation/targeted_replay.py
-- src/singularity/cli.py
 - src/singularity/runtime/resources.py
 
 关键符号:
@@ -28,7 +29,7 @@
 字段清单:
 - TaskExecutionEvidence: verification, assertions, diff, heuristics, trace_metrics, diff_summary, hook_results, snapshot, agent_config_overrides, golden_contract, failure_reasons
 - EvaluationWorkspace: kind, path, files, start_commit
-- EvaluationTask: task_id, workspace, user_task, allowed_paths, verification_command, success, task_type, description, allowed_tools, tool_policy, strategy, expected_file_changes, completion_standard, risk_tags, prepare_commands, public_verification_command, hidden_verification_command, verification_prepare_commands, verification_timeout_seconds, smoke_command, model_visible_verification_command, fixture_metadata, hidden_test_patch, test_patch
+- EvaluationTask: task_id, workspace, user_task, allowed_paths, verification_command, success, task_type, description, allowed_tools, tool_policy, strategy, expected_file_changes, completion_standard, risk_tags, prepare_commands, public_verification_command, hidden_verification_command, verification_prepare_commands, verification_timeout_seconds, smoke_command, fixture_metadata, hidden_test_patch, test_patch
 - EvaluationTaskSet: tasks, base_dir, schema_version
 - CommandEvalResult: command, exit_code, duration_seconds, timed_out, error_summary, raw_command, resolved_argv, interpreter_strategy, failure_category
 - EvaluationTaskResult: task_id, tests_passed, infrastructure_blocked, prompt_tokens, cached_tokens, request_cache_hit_rate, run_cache_hit_rate, tool_calls, files_changed, duration_seconds, error_summary, workspace, trace, verification_workspace, patch, checks, verification, agent_completed, evaluation_passed, patch_applicable, allowed_scope_passed, public_verification_passed, hidden_verification_passed, sandbox_enforcement_passed, evaluator_visibility_audit_passed, local_process_fallback_count, repair_attempt_count, repair_execution_count, miscompletion_count, blocked_reason, failure_category, request_cache_hit_rates, status, turn_count, verification_result, contract_satisfaction, final_report_status, policy_blocks, token_usage, cache_usage, trace_artifact_refs, reproducible_environment, capability_summary, capability_sla, timing, baseline_failed, baseline_checks, patch_applied, fail_to_pass_satisfied, verification_misconfiguration_reason, evaluation_metrics
@@ -40,6 +41,8 @@ Evaluation runner 读取 task set manifest，在隔离 workspace 中启动真实
 
 ## 当前源码位置
 
+- crates/cli/src/main.rs
+- crates/app-server/src/lib.rs
 - src/singularity/evaluation/runner.py
 - src/singularity/evaluation/manifests.py
 - src/singularity/evaluation/results.py
@@ -48,7 +51,6 @@ Evaluation runner 读取 task set manifest，在隔离 workspace 中启动真实
 - src/singularity/evaluation/reports.py
 - src/singularity/evaluation/failure_case_replay.py
 - src/singularity/evaluation/targeted_replay.py
-- src/singularity/cli.py
 - src/singularity/runtime/resources.py
 
 ## 关键类、函数、字段
@@ -57,9 +59,9 @@ Evaluation runner 读取 task set manifest，在隔离 workspace 中启动真实
 
 ## 真实运行时调用链
 
-`python -m singularity.cli eval run <manifest>` -> `load_evaluation_task_set()` -> `_run_loaded_evaluation_task_set()` -> `EvaluationTaskSet.from_dict()` -> `EvaluationRunner.run()` -> per task `KernelBootstrap.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()` -> verification workspace checks -> `EvaluationTaskResult.to_dict()` -> result/report artifacts。`python -m singularity.cli eval private <task-set>` 先用 `SingularityPrivateBenchmarkAdapter.load()` 生成同一 `EvaluationTaskSet` 对象，再进入同一个 `_run_loaded_evaluation_task_set()`；public/private CLI 分支只保留 manifest loader 差异。
+`sg eval run <manifest>` -> Rust CLI JSON-RPC `eval/run` -> Rust app-server manifest loader -> Rust native eval runner -> per task `KernelBootstrap.boot()` -> `AgentKernel.run_task()` -> `AgentLoop.run()` -> verification workspace checks -> `EvaluationTaskResult.to_dict()` -> result/report artifacts。Python evaluation objects remain internal oracle/dev reference only and are not public runtime launchers.
 
-benchmark scoring path: `python -m singularity.cli eval benchmark <task-set>` -> `SingularityPrivateBenchmarkAdapter.load()` -> `EvaluationHarness._evaluate_task()` -> `BenchmarkTaskExecutor.evaluate()` -> `TaskExecutionEvidence.to_dict()` -> `TaskEvaluationResult.execution_evidence` -> `ProfileEvaluationReport`/`EvaluationReport` -> `report.json`/`report.md`。
+benchmark scoring path remains evaluator-owned: `SingularityPrivateBenchmarkAdapter.load()` -> `EvaluationHarness._evaluate_task()` -> `BenchmarkTaskExecutor.evaluate()` -> `TaskExecutionEvidence.to_dict()` -> `TaskEvaluationResult.execution_evidence` -> `ProfileEvaluationReport`/`EvaluationReport` -> `report.json`/`report.md`。
 
 ## 真实任务中的对象流
 
@@ -102,7 +104,6 @@ class EvaluationTask:
     verification_prepare_commands: list[str] = field(default_factory=list)
     verification_timeout_seconds: int = 120
     smoke_command: str = ""
-    model_visible_verification_command: str = ""
     fixture_metadata: dict[str, Any] = field(default_factory=dict)
     hidden_test_patch: dict[str, Any] = field(default_factory=dict)
     test_patch: str = ""

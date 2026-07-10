@@ -93,10 +93,9 @@ ALLOWED_CRATE_DEPENDENCIES = {
 }
 
 ALLOWED_PYTHON_MIGRATION_PATHS = {
-    "src/singularity/agent_host",
-    "src/singularity/cli.py",
     "src/singularity/diagnostics",
     "src/singularity/evaluation/manifests.py",
+    "src/singularity/evaluation/runner.py",
     "src/singularity/memory/cli.py",
     "src/singularity/model/runner.py",
     "src/singularity/oracle",
@@ -106,6 +105,14 @@ ALLOWED_PYTHON_MIGRATION_PATHS = {
     "tests/test_rust_migration_boundaries.py",
     "tests/test_model_runner.py",
 }
+
+FORBIDDEN_PUBLIC_PYTHON_RUNTIME_PATHS = (
+    "src/singularity/cli.py",
+    "src/singularity/agent_host/__init__.py",
+    "src/singularity/agent_host/host.py",
+    "src/singularity/agent_host/models.py",
+    "src/singularity/agent_host/sidecar.py",
+)
 
 FORBIDDEN_PYTHON_RUNTIME_NAMES = {
     "RuntimeHost",
@@ -181,7 +188,9 @@ PUBLIC_RUNTIME_FORBIDDEN_MARKERS = {
     "AgentHost::Native": "public Rust enum variants must not expose backend selection",
     "AgentHost::Python": "public Rust enum variants must not expose backend selection",
     "SINGULARITY_PYTHON_SIDECAR": "ordinary users must not configure Python sidecar runtime selection",
+    "singularity.cli:main": "public docs must not describe the removed Python CLI module as a runtime or oracle entrypoint",
     "singularity.agent_host.sidecar": "public docs or CLI must not expose the Python sidecar module path",
+    "Python CLI remains": "public docs must state that the old Python CLI module path is removed",
     "verify_rust_cli_agent_host.py": "public verification must not require the old Python sidecar smoke",
     "singularity-agent": "public docs must not present the Python CLI as a user-facing runtime command",
 }
@@ -265,6 +274,7 @@ def main() -> int:
     violations: list[Violation] = []
     violations.extend(_check_crate_dependencies(repo_root))
     violations.extend(_check_cli_dependencies(repo_root))
+    violations.extend(_check_removed_public_python_runtime_paths(repo_root))
     violations.extend(_check_python_freeze(repo_root, changed_files))
     violations.extend(_check_forbidden_python_runtime_names(repo_root))
     violations.extend(_check_forbidden_desktop_paths(repo_root))
@@ -341,6 +351,20 @@ def _check_cli_dependencies(repo_root: Path) -> list[Violation]:
         Violation("forbidden-cli-dependency", _relative(manifest_path, repo_root), f"crates/cli depends on {name}")
         for name in forbidden
     ]
+
+
+def _check_removed_public_python_runtime_paths(repo_root: Path) -> list[Violation]:
+    violations: list[Violation] = []
+    for relative in FORBIDDEN_PUBLIC_PYTHON_RUNTIME_PATHS:
+        if (repo_root / relative).exists():
+            violations.append(
+                Violation(
+                    "public-python-runtime-path",
+                    relative,
+                    "old Python public runtime module path must not be restored; use explicit oracle/parity/dev-only names",
+                )
+            )
+    return violations
 
 
 def _check_python_freeze(repo_root: Path, changed_files: list[str]) -> list[Violation]:

@@ -8,7 +8,6 @@ from typer.main import get_command
 from typer.testing import CliRunner
 
 from singularity.agent_loop import AgentLoopStatus
-from singularity.oracle.cli import app
 from singularity.config import ProductionConfig, adaptive_default_max_turns
 from singularity.context import ContextManager
 from singularity.context.models import ContextItemType, ContextSource
@@ -26,6 +25,7 @@ from singularity.model import (
 from singularity.observability import TraceRecorder
 from singularity.observability.artifacts import TraceArtifactStore
 from singularity.observability.models import TraceArtifactKind
+from singularity.oracle.cli import app
 from singularity.policy import DecisionOutcome
 from singularity.tool_protocol.engine import ToolProtocolEngine
 from singularity.tool_protocol.models import (

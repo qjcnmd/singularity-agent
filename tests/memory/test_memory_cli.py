@@ -5,7 +5,6 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from singularity.oracle.cli import app
 from singularity.memory.models import (
     MemoryCandidate,
     MemoryEvidenceRef,
@@ -16,6 +15,7 @@ from singularity.memory.models import (
 )
 from singularity.memory.pipeline import MemoryLearningPipeline
 from singularity.memory.store import MemoryStore
+from singularity.oracle.cli import app
 
 runner = CliRunner()
 

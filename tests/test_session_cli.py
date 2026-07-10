@@ -5,8 +5,8 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from singularity.oracle.cli import _session_status_from_run_status, app
 from singularity.kernel.models import RunStatus
+from singularity.oracle.cli import _session_status_from_run_status, app
 from singularity.session import (
     RecoveryGateDecision,
     RecoveryGateStatus,

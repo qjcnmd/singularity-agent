@@ -1,176 +1,192 @@
-# AgentLoop 主循环模块数据流
+# Rust AgentLoop 主循环模块数据流
 
 模块数据流文档 ID: agent-loop
 
 源码证据路径:
-- src/singularity/agent_loop.py
-- src/singularity/agent_loop_completion.py
-- src/singularity/agent_loop_failure_recovery.py
-- src/singularity/agent_loop_turns.py
-- src/singularity/error_codes.py
-- src/singularity/error_mapping.py
-- src/singularity/status_mapping.py
+- crates/agent/src/lib.rs
+- crates/app-server/src/lib.rs
 
 关键符号:
-- AgentLoop
-- AgentLoop.run
+- AgentStatus
+- AgentRunStatus
+- AgentLoopCapability
+- AgentLoopPlan
+- AgentLoopStep
+- AgentLoopInput
+- ApprovalGrant
 - AgentLoopResult
-- AgentLoopStatus
-- CompletionGate
-- FailureRecoveryCoordinator
-- TurnCoordinator
-- TurnCoordinatorCallbacks
-- TurnRuntimeDependencies
-- ProtocolOutcomeMapping
+- PendingToolCall
+- AgentLoop
+- ToolRepair
+- AppServer
 
 字段清单:
-- AgentLoopResult: status, final_answer, turn, error_code, diagnostics
-- TurnCoordinatorCallbacks: publish_progress, record_model_failure, outcome_from_model_failure, terminal_result_from_outcome, record_outcome_context, assistant_message_from_result, attempt_finalize, maybe_analyze_failure, should_auto_finalize_after_tools
-- TurnRuntimeDependencies: model_runner, tools, tool_executor, tool_protocol
+- AgentLoopResult: status, completed, final_answer, model_turns, tool_calls, approval_count, approval_requests, pending_tool_calls, tool_results, tool_repairs, error
+- AgentLoopInput: thread_id, turn_id, run_id, session_id, task_id, model_preferences, input, interrupted, max_turns, approval_grants
+- AgentRunStatus: status, completed, final_answer, run_id, session_id, task_id, model_turns, tool_calls, approval_count, audit_events, trace_path, error
+- AgentLoopCapability: available, status, reason, blockers
+- ApprovalGrant: request_id, tool_name, resources, outcome
+- PendingToolCall: request_id, tool_call_id, tool_name, raw_arguments, resources
 
 ## 这一层解决什么问题
 
-AgentLoop（智能体主循环）负责把 planner 状态、上下文、模型单轮请求、工具协议结果和最终报告串成一个可中断、可重试、可追踪的执行循环。
+Rust AgentLoop 层负责把一个已创建的 turn 转换成真实模型请求、工具调用、approval request、tool repair、最终答案和安全状态摘要。它是当前 public runtime 的主循环；Python AgentLoop 只保留为 oracle/parity/dev-only 参考，不是普通 CLI、app-server 或 evaluation 的执行后端。
 
 ## 当前源码位置
 
-- src/singularity/agent_loop.py
-- src/singularity/agent_loop_completion.py
-- src/singularity/agent_loop_failure_recovery.py
-- src/singularity/agent_loop_turns.py
-- src/singularity/error_codes.py
-- src/singularity/error_mapping.py
-- src/singularity/status_mapping.py
+- crates/agent/src/lib.rs
+- crates/app-server/src/lib.rs
 
 ## 关键类、函数、字段
 
-关键符号和字段清单按源码声明顺序列出，便于和对象流小节对照。
+关键符号和字段清单按 Rust public runtime 的源码对象列出。`AgentLoop` 是执行对象，`AgentLoopInput` 是 turn/run 输入边界，`AgentLoopResult` 是主循环输出边界，`AgentRunStatus` 是 app-server-facing 终态投影，`AgentLoopCapability` 是 turn/eval 入口的 fail-closed capability gate。
 
 ## 真实运行时调用链
 
-`AgentKernel.run_task()` 构造 `AgentLoop` -> `AgentLoop.run()` 创建 `RunController` 并启动 planner 状态；`AgentLoop._turn_coordinator()` 把模型、工具注册表、工具执行器和工具协议引擎收进 `TurnRuntimeDependencies`，把进度发布、模型失败记录、outcome 归约、终止结果构造、completion gate 和 failure analysis 回调收进 `TurnCoordinatorCallbacks`，再委托 `TurnCoordinator.run_turn()` 逐 turn 调用 `planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion/final review 由 `CompletionGate.attempt_finalize()` 调用 `Planner.finalize()` 或生成 completion outcome；工具、验证和 completion 失败的 repair/replan 由 `FailureRecoveryCoordinator.maybe_analyze_failure()` 协调。
+普通 turn：`sg run` / `sg chat` / `sg continue` -> Rust CLI JSON-RPC `turn/start` -> `AppServer::turn_start()` -> `native_capability_ready()` -> `SessionStore.create_turn_with_input_and_trace()` -> `AppServer::run_native_agent_loop()` -> `OpenAiProvider::from_env()` -> `AgentLoop::new()` -> `AgentLoop::run()` -> `AgentLoopResult::to_run_status()` -> `AppServer::append_native_trace()` -> `SessionStore.update_turn_state()` / `SessionStore.append_item()`。
+
+Evaluation：`sg eval run` -> Rust CLI JSON-RPC `eval/run` -> app-server native eval runner -> per task `AgentLoop::new()` -> `AgentLoop::run()` -> smoke command / public verification / hidden verification -> result/report artifact 写入 `work/evaluations/<run-id>/`。
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`AgentKernel.run_task()` -> `AgentLoop.run()` -> `TurnCoordinator.run_turn()` -> `ModelRunner.build_request_from_context()` 先生成对象 `ModelTurnRequest`，`ModelRunner.run_turn()` 返回 `ModelTurnResult` 后交给 `ToolProtocolEngine.process_model_turn()`。每个 turn 在构造模型请求前先生成 `turn_action_id="turn_N"` 并传给 `Planner.filtered_tools()`；Planner 先通过 `PlannerPolicy.is_allowed()` 对当前 phase 的 allowed tools、allowed actions、permission level、mutation manager 和 command executor 要求求交，得到与 `authorize_tool_call()` 同源的可授权集合，再叠加 benchmark constraints 与 repair contract 生成同一份 deterministic projection，并把 `tool.exposure_decided` trace event 与 `ModelTurnRequest.action_id` 绑定。模型可见 tool schema、`ToolChoicePolicy.allowed_tool_names` 和 `tool.exposure_decided.selected_tools` 必须来自同一 selected tool 集合；semantic rolling plan 只能进入 planner context，不会扩大当前 phase 可暴露工具。工具结果通过 `ContextManager.add_tool_protocol_result()` 和 `Planner.update_from_tool_result()` 写入 `context.sqlite3`、planner evidence 和 trace 事件；关键 tool/verification/policy/sandbox/task outcome evidence 由 `EvidenceLedger.add_*()` typed helper 写入 JSON 投影。当 completion gate 通过时，`CompletionGate.attempt_finalize()` 调用 `Planner.finalize()`，`Finalizer.build()` 通过 typed evidence helper 生成 `FinalReport`，然后写入 `final_answer` trace event。若模型失败，`AgentLoop._outcome_from_model_failure()` 归类 provider 错误，`AgentLoop._terminal_result_from_outcome()` 返回带 `error_code` 的 `AgentLoopResult`。
+以用户要求修复 `quicksort.py` 为例：`AppServer.turn_start()` -> `AgentLoopCapability.current()` -> `SessionStore.create_turn_with_input_and_trace()` -> `native_loop_input()` -> `AgentLoop.run()` -> `OpenAiProvider.complete()` -> `ToolBroker.execute()` -> `AgentLoopResult.to_run_status()` -> `AppServer.append_native_trace()`。`AppServer.turn_start()` 先读取 thread 并校验 Windows restricted-token command sandbox capability；capability 不满足时直接返回 JSON-RPC error，不生成 turn、trace 或 provider request。校验通过后，`SessionStore.create_turn_with_input_and_trace()` 生成对象并写入 sqlite store：turn、用户输入 item 和 app-server trace。随后 `native_loop_input()` 生成 `AgentLoopInput`，`AgentLoop.run()` 生成 `ModelTurnRequest`，通过 `OpenAiProvider` 调用真实 provider，解析 assistant message / tool calls，再由 `ToolBroker`、`PolicyEngine` 和 `WorkspaceTools` 执行被允许的 workspace tool 或 command tool。工具结果生成 `ToolResult` 并回送给后续模型 turn；需要人工或 policy approval 时生成 `ApprovalRequest` 与 `PendingToolCall`，由 app-server 持久化到 approval / pending_tool_calls 表。完成时 `AgentLoopResult.to_run_status()` 生成 `AgentRunStatus`，app-server 写入 `agent_loop` trace 摘要并更新 turn 状态；最终答案只在 `completed` 且非空时写为 agent message item，失败、blocked、cancelled 不伪造 assistant delta。
 
 ## 真实对象完整结构
 
-### AgentLoopResult（智能体主循环结果）
+### AgentLoopResult（主循环结果）
 
-AgentLoop 执行的最终返回值。**边界**：内部治理对象，不落盘为独立文件；投影进 evaluation `result.json`、`report.json`、`report.md` 和 trace `final_answer` event。
+Rust AgentLoop 返回给 app-server 的完整结果。**边界**：不直接落盘；由 `AgentLoopResult::to_run_status()` 投影为 `AgentRunStatus`，再由 app-server 写入 turn status、trace summary、approval ledger 或 agent message item。
 
-```python
-@dataclass(frozen=True, eq=False)
-class AgentLoopResult:
-    status: AgentLoopStatus
-    final_answer: str
-    turn: int
-    error_code: str | None = None
-    diagnostics: dict[str, Any] | None = None
+```rust
+pub struct AgentLoopResult {
+    pub status: AgentStatus,
+    pub completed: bool,
+    pub final_answer: Option<String>,
+    pub model_turns: u32,
+    pub tool_calls: u32,
+    pub approval_count: u32,
+    pub approval_requests: Vec<ApprovalRequest>,
+    pub pending_tool_calls: Vec<PendingToolCall>,
+    pub tool_results: Vec<ToolResult>,
+    pub tool_repairs: Vec<ToolRepair>,
+    pub error: Option<String>,
+}
 ```
 
-### AgentLoopStatus（主循环状态枚举）
+### AgentStatus（主循环状态）
 
-`AgentLoopResult.status` 的枚举类型，由 `AgentLoop` 内部各终止分支选择。
+`AgentStatus` 的 wire value 使用 snake_case；枚举值包括 `not_migrated`、`running`、`cancel_requested`、`completed`、`blocked`、`cancelled`、`failed`。public turn 状态由 app-server 映射到 `TurnStatus`，不会把 Python backend selector 暴露给 protocol。
 
-```python
-class AgentLoopStatus(StrEnum):
-    COMPLETED = "completed"
-    BLOCKED = "blocked"
-    MAX_TURNS_EXCEEDED = "max_turns_exceeded"
-    FAILED = "failed"
+```rust
+pub enum AgentStatus {
+    NotMigrated = "not_migrated",
+    Running = "running",
+    CancelRequested = "cancel_requested",
+    Completed = "completed",
+    Blocked = "blocked",
+    Cancelled = "cancelled",
+    Failed = "failed",
+}
 ```
 
-### ErrorCode（错误码注册表）
+### AgentLoopInput（主循环输入）
 
-`AgentLoop` 不再在终止分支中维护分散的错误码字面量集合。`max_turns_exceeded`、`completion_rejected`、`final_review_rejected`、`model_runner_failed`、`repair_budget_exceeded` 以及 failure-analysis 排除集合来自 `singularity.error_codes.ErrorCode` 和 `FAILURE_ANALYSIS_EXCLUDED_ERROR_CODES`；对外仍序列化为同名字符串。Tool Protocol validation 的内部 `ToolCallFailureKind` 先由 `error_mapping.tool_protocol_validation_error_kind()` 保留为 `error_kind`，再由 `tool_protocol_validation_error_code()` 投影成 canonical `ErrorCode` 字符串；例如 `missing_tool_call_id` 和 `duplicate_tool_call_id` 作为内部 failure kind 保留，但对外 `error_code` 为 `protocol_violation`。工具 observation 的 canonical `error_code` 由 `status_mapping.protocol_error_code_to_outcome()` 归类为 waiting、blocked、replan 或 retry，不在 `AgentLoop.run()` 内重复判定。
+`AgentLoopInput` 由 app-server 从 Rust thread/turn/user input 生成。**边界**：只在 native loop 内存中使用；不把原始 provider request、raw prompt 或 secret 写入 trace。
 
-### ProtocolOutcomeMapping（协议结果到执行结果映射）
-
-`RunOutcomeReducer.protocol_result_to_outcome()` 使用的只读映射对象。**边界**：内部治理对象，不落盘，不进入模型请求。
-
-```python
-@dataclass(frozen=True)
-class ProtocolOutcomeMapping:
-    status: ExecutionOutcomeStatus
-    source: str
-    error_code: str
-    next_action: str
-    retry_allowed: bool
+```rust
+pub struct AgentLoopInput {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub model_preferences: ModelPreferences,
+    pub input: Vec<AgentContextItem>,
+    pub interrupted: bool,
+    pub max_turns: u32,
+    pub approval_grants: Vec<ApprovalGrant>,
+}
 ```
 
-### TurnCoordinatorCallbacks（单 turn 回调集合）
+### AgentRunStatus（app-server 终态投影）
 
-`TurnCoordinator` 接收的回调集合。**边界**：内部依赖传递对象，不落盘，不进入模型请求；由 `AgentLoop._turn_coordinator()` 组装，目的是让 `TurnCoordinator.__init__()` 不再直接暴露大量分散 callback 参数。
+`AgentRunStatus` 是 app-server 用来更新 SQLite turn 状态和 trace summary 的安全投影。
 
-```python
-@dataclass(frozen=True)
-class TurnCoordinatorCallbacks:
-    publish_progress: Callable[[int], None]
-    record_model_failure: Callable[..., None]
-    outcome_from_model_failure: Callable[[Any], ExecutionOutcome]
-    terminal_result_from_outcome: Callable[..., Any]
-    record_outcome_context: Callable[[ContextManager, Planner, ExecutionOutcome], None]
-    assistant_message_from_result: Callable[[Any], dict[str, Any]]
-    attempt_finalize: Callable[..., Any]
-    maybe_analyze_failure: Callable[..., ExecutionOutcome | None]
-    should_auto_finalize_after_tools: Callable[[Planner, Any], bool]
+```rust
+pub struct AgentRunStatus {
+    pub status: AgentStatus,
+    pub completed: bool,
+    pub final_answer: Option<String>,
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub model_turns: u32,
+    pub tool_calls: u32,
+    pub approval_count: u32,
+    pub audit_events: Vec<Value>,
+    pub trace_path: Option<String>,
+    pub error: Option<String>,
+}
 ```
 
-### TurnRuntimeDependencies（单 turn 运行时依赖集合）
+### ApprovalGrant 与 PendingToolCall
 
-`TurnCoordinator` 接收的运行时依赖集合。**边界**：内部依赖传递对象，不落盘，不进入模型请求；由 `AgentLoop._turn_coordinator()` 从 `AgentLoop.__init__()` 保留的公开构造依赖组装，目的是让 coordinator 内部只接收一个 runtime dependency bundle，而不改变 `AgentLoop` 对外构造签名。
+approval resume 只消费与 pending request 匹配的 Rust-native pending tool call；`thread_id`、`turn_id` 和 `tool_call_id` 由 store 边界强校验。
 
-```python
-@dataclass(frozen=True)
-class TurnRuntimeDependencies:
-    model_runner: ModelRunner
-    tools: ToolRegistry
-    tool_executor: ToolExecutor
-    tool_protocol: ToolProtocolEngine
+```rust
+pub struct ApprovalGrant {
+    pub request_id: String,
+    pub tool_name: String,
+    pub resources: Vec<String>,
+    pub outcome: ApprovalOutcome,
+}
+
+pub struct PendingToolCall {
+    pub request_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub raw_arguments: String,
+    pub resources: Vec<String>,
+}
 ```
-
-### 数据流概述
-
-`AgentKernel.run_task()` 构造 `AgentLoop`，其 `run()` 内部创建 `RunController`，再通过 `AgentLoop._turn_coordinator()` 组装 `TurnRuntimeDependencies` 和 `TurnCoordinatorCallbacks` 并委托 `TurnCoordinator.run_turn()`：`planner.step()`、`ModelRunner.build_request_from_context()`、`ModelRunner.run_turn()`、`ToolProtocolEngine.process_model_turn()`。completion gate 通过时 `CompletionGate.attempt_finalize()` 通过 `AgentLoop` 注入的 result factory 构造 `status=completed` 的 `AgentLoopResult`；不可重试失败由 `AgentLoop._terminal_result_from_outcome()` 构造 `blocked`/`failed`；turn 达上限由 `on_max_turns()` 构造 `max_turns_exceeded`。`AgentLoopResult` 不进入模型请求；evaluation 运行投影进 `result.json`/`report.json`/`report.md`，CLI 输出 `final_answer` 给用户。
-
-完成判定只消费 AgentLoop 内部 evidence：`Planner.update_from_verification()` 通过 `EvidenceLedger.add_verification_result()` 写入的最新 `completion_assessment.status` 必须为 `ready` 或 `ready_with_warnings`，`Planner.assess_completion()` 必须没有 unmet，`Planner.finalize()` 的 final review 必须没有 blocking finding 且 `FinalReport.status=completed`。`Finalizer.build()` 通过 `latest_verification_result()`、`policy_records()`、`sandbox_records()`、`tool_result_records()` 汇总 completion/report 关键 bucket，避免从裸 dict 随意读取缺字段。 当这些条件满足时，`Planner.finalize()` 会清理已经被最新 final report 解决的 completion blocker（例如 `required_verifications_passed`、`unresolved_failures_empty`、旧的 sandbox backend unavailable 记录），再由 `CompletionGate.attempt_finalize()` 返回 `AgentLoopStatus.COMPLETED`。未被最新证据解决的 policy、approval、workspace conflict、sandbox/backend unavailable 当前失败仍保持 fail-closed，不会被 reducer 或 finalizer 改写成 completed。
 
 ## 谁生成这些对象
 
-- `AgentLoop._turn_coordinator()` 生成 `TurnRuntimeDependencies` 和 `TurnCoordinatorCallbacks` 并传给 `TurnCoordinator.run_turn()`；当 completion gate 通过时，`CompletionGate.attempt_finalize()` 通过注入的 result factory 构造 `status=completed` 的 `AgentLoopResult`；`on_max_turns()` 构造 `status=max_turns_exceeded` 的结果。
-- `_terminal_result_from_outcome()` 把不可重试的 `ExecutionOutcome` 映射成 `blocked` 或 `failed`，同时把 `outcome.to_dict()` 放入 `diagnostics`。`AgentLoopStatus` 由这些构造点直接选择，不存在第二套字符串状态 alias。
+- `native_loop_input()` 生成 `AgentLoopInput`；`AgentLoopInput.new()` 设置 thread/turn/run/session/task identity、模型偏好、最大 turn 数和初始用户输入。
+- `AgentLoopCapability.current()` 生成 capability gate；Windows 先运行 restricted-token sandbox probe，非 Windows返回 strict command sandbox unsupported blocker。
+- `AgentLoop.run()` 生成 `AgentLoopResult`、`ToolResult`、`ToolRepair`、`ApprovalRequest` 和 `PendingToolCall`。
+- `AgentLoopResult.to_run_status()` 生成 `AgentRunStatus`，app-server 再把它映射到 durable turn status 和 trace summary。
 
 ## 谁消费这些对象
 
-- `AgentKernel.run_task()` 接收 `AgentLoopResult`，更新 `AgentRun`/`AgentSession` 生命周期并返回 CLI；`EvaluationRunner.run_task()` 读取其 `status`、`turn`、`final_answer` 和 `error_code` 生成 `EvaluationTaskResult`。
-- `AgentLoopResult` 不进入模型请求。模型只在结果生成前接收 `ModelRunner.build_request_from_context()` 构造的 request；结果生成后执行已经终止。
-- `RunOutcomeReducer` 只把 `ExecutionOutcomeStatus.SUCCESS` 且 `next_action="finalize"` 的 outcome 归约为 terminal completed；terminal 判定来自 `status_mapping.EXECUTION_OUTCOME_TERMINAL_MAP`。`sandbox_unavailable`、policy denied、protected path、cwd denied 等 runtime error code 仍经 `status_mapping.protocol_error_code_to_outcome()` 归约为 blocked。
-- CLI 将 `final_answer` 输出给用户，并依据最终状态/内核错误确定退出；targeted replay 读取同一结果生成 `TargetedFailureReplayResult`。
+- `AppServer.turn_start()` 和 native eval runner 消费 `AgentLoopCapability`；capability 不满足时 fail closed。
+- `AgentLoop.run()` 消费 `AgentLoopInput`、`OpenAiProvider`、`ToolBroker`、`PolicyEngine` 和 `WorkspaceTools`。
+- `AppServer.run_native_agent_loop_with_provider()` 消费 `AgentLoopResult`，再写 approval request、pending tool call、trace、turn state 和 agent message item。
+- `AppServer.resume_native_agent_loop_after_gate()` 消费已经持久化的 approval / pending tool call，再用 `ApprovalGrant` 继续同一 Rust AgentLoop 路径。
 
 ## 是否落盘
 
-- `AgentLoopResult` 没有独立 store。`CompletionGate.attempt_finalize()` / `_terminal_result_from_outcome()` / `on_max_turns()` 先写 `final_answer` trace event；evaluation 运行再把结果投影进 `<evaluation_run>/result.json`、`report.json` 和 `report.md`。
-- 主循环创建或复用的 `ContextManager` 把消息、观察和 bundle 写入当前 trace run 目录下的 `context.sqlite3`；该数据库保存的是循环输入证据，不是 `AgentLoopResult` 序列化副本。
+- `AgentLoopInput` 和 `AgentLoopResult` 本体不作为独立文件落盘。
+- app-server 在 SQLite 中落盘 thread、turn、item、approval、approval decision、pending tool call、trace event 和 artifact ref。
+- eval runner 把 native result/report artifact 写入 `work/evaluations/<run-id>/result.json` 和 `report.json`，其中保留 `agent_completed`、`tests_passed`、`evaluation_passed`、blocker 和 verification 结果的分离字段。
 
 ## 是否进入 trace / audit
 
-- `_record_outcome_context()` 写 `execution_outcome` event，并把同一 outcome 加入 planner context；模型失败由 `_record_model_failure()` 写 `model_failure`，超 turn 另写 `error(type=MaxTurnsExceeded)`。
-- `Planner.filtered_tools()` 在每个模型 turn 前写 `tool.exposure_decided` trace event，payload 只包含 `selected_tools`、blocked/deferred/suppressed tool 名称、`reason_code`、`stage_basis`、phase、policy/sandbox/constraint factors 和 action id；不包含 raw prompt、raw response、raw patch text、secret、文件内容或 evaluator-only metadata。
-- 所有终止分支写 `final_answer` event，payload 来源是 `turn` 与最终文本；trace 记录的是这些事件和 outcome，而不是完整 `AgentLoopResult` 对象。
-- AgentLoop 自身不写 policy audit。tool/command/verification 触发的 `PolicyRequest`/`PolicyDecision` 由相应执行器和 policy audit ledger 记录。
+- app-server 写 `component="agent_loop"` 的 trace summary，只包含 status、completed、run_id、session_id、task_id、model_turns、tool_calls、approval_count、audit_events 和已脱敏 error。
+- `audit_events` 来自 tool result 的安全审计摘要，记录 sandbox mode、approval policy、command provenance、strict backend 名称和 scope digest；不包含 raw prompt、raw provider response、raw tool arguments、secret、token 或 `.env` 值。
+- approval request/decision trace 使用 `thread_id` / `turn_id` 定位，tool-call approval 还绑定 `tool_call_id`。
 
 ## 失败路径
 
-- 模型失败先由 `_outcome_from_model_failure()` 区分 retryable、外部依赖阻塞与 fatal，并设置 `model_runner_failed`、`invalid_json`、`unknown_tool` 或 `schema_mismatch`；retryable/replan 不终止，blocked/fatal 经 `_terminal_result_from_outcome()` 返回结果。
-- completion evidence 不足生成 `completion_rejected` 并继续；final review 未通过生成 `final_review_rejected`，可继续时 replan，不可继续时返回 `blocked`。repair contract 不满足可返回带具体 error code 的 blocked outcome。
-- turn 达到上限返回 `max_turns_exceeded`。未在这些 outcome 分支内转换的异常继续向 `AgentKernel.run_task()` 传播，由 kernel 生成失败 lifecycle/final report，而不是伪造 completed 结果。
+- `AgentLoopCapability` 不满足时，app-server 在 turn 创建前 fail closed。
+- provider 配置缺失、认证失败、网络失败或模型配置错误由 `OpenAiProvider` 归类为 provider/model error，最终形成 failed/blocked status，不打印 secret。
+- unknown tool、policy deny、strict sandbox backend unavailable、command nonzero、workspace patch conflict 或 max turns 都保持 fail closed；不会 fallback 到 Python、local process、no_sandbox 或 relaxed executor。
+- approval resume 只有 pending request 的 `thread_id`、`turn_id`、`tool_call_id` 与当前 decision 匹配时才继续，否则写入安全失败状态。
 
 ## 当前结构问题
 
-`AgentLoop.run()` 仍是对外 facade，负责 context/controller 生命周期和 max-turn callback；单 turn 编排已由 `TurnCoordinator` 承担，runtime dependency 通过 `TurnRuntimeDependencies` 传递，分散回调通过 `TurnCoordinatorCallbacks` 传递，completion/final review 已由 `CompletionGate` 承担，failure-analysis/replan 已由 `FailureRecoveryCoordinator` 承担。新增状态时仍必须同时检查 kernel、evaluation 和 targeted replay 的消费分支，避免状态存在但报告层无法分类。
+Rust AgentLoop 已经承担 public runtime 的普通 turn 和 eval runner 主路径，但仍是最小 native loop：它没有长期后台 daemon、PTY/TUI、provider registry 或完整 planner/context Rust 重写。Python oracle/parity/dev-only 仍可作为 fixture 和 schema 对照，但不得通过旧 `singularity.cli` 或 `agent_host` 路径恢复为 public runtime。
 
 ## 维护规则
 
-修改本模块相关类、字段、函数、调用链、CLI、schema、manifest、trace event、report schema 或 evaluation result 时，必须同步更新本文件并运行 `python scripts/verify_runtime_docs.py`。展示真实对象时必须列完整字段，不允许只列子集，不允许新增仅服务文档说明的运行时字段。
+修改 `AgentLoopInput`、`AgentLoopResult`、`AgentRunStatus`、approval/pending tool call、native eval runner、turn status 映射、tool result payload、provider error taxonomy 或 capability gate 时，必须同步更新本文件、`docs/singularity.md` 和 `docs/architecture/modules/rust-app-server-protocol.md` 的对应段落，并运行 `python scripts/verify_runtime_docs.py`、`python scripts/verify_rust_migration_boundaries.py` 和相关 Cargo 测试。

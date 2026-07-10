@@ -105,6 +105,12 @@ PUBLIC_RUNTIME_FORBIDDEN_CASES = (
         "singularity.agent_host.sidecar",
         "public-agent-host-surface",
     ),
+    ("docs/singularity.md", "singularity.cli:main", "public-agent-host-surface"),
+    (
+        "docs/architecture/modules/rust-app-server-protocol.md",
+        "Python CLI remains",
+        "public-agent-host-surface",
+    ),
     ("crates/cli/src/main.rs", "--agent-host", "public-agent-host-surface"),
     ("crates/protocol/src/lib.rs", "agentHost", "public-agent-host-surface"),
     ("scripts/verify_rust_cli_agent_host.py", "", "public-sidecar-smoke"),
@@ -278,6 +284,27 @@ def test_guard_rejects_python_public_console_scripts(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "public-python-cli-script" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "src/singularity/cli.py",
+        "src/singularity/agent_host/__init__.py",
+        "src/singularity/agent_host/sidecar.py",
+    ),
+)
+def test_guard_rejects_removed_python_public_runtime_paths(tmp_path: Path, relative: str) -> None:
+    repo = copy_repo_slice(tmp_path)
+    path = repo / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# restored old public runtime path\n", encoding="utf-8")
+
+    result = run_guard(repo)
+
+    assert result.returncode == 1
+    assert "public-python-runtime-path" in result.stderr
+    assert relative in result.stderr
 
 
 def test_guard_allows_target_project_python_pytest_commands(tmp_path: Path) -> None:

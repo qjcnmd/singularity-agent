@@ -8,7 +8,7 @@
 - src/singularity/session/store.py
 - src/singularity/session/history.py
 - src/singularity/session/recovery.py
-- src/singularity/cli.py
+- src/singularity/oracle/cli.py
 - src/singularity/kernel/bootstrap.py
 
 关键符号:
@@ -56,7 +56,7 @@ Session Recovery 层把一次用户可打开的历史会话和每次执行尝试
 - src/singularity/session/store.py
 - src/singularity/session/history.py
 - src/singularity/session/recovery.py
-- src/singularity/cli.py
+- src/singularity/oracle/cli.py
 - src/singularity/kernel/bootstrap.py
 
 ## 关键类、函数、字段

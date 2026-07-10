@@ -81,7 +81,7 @@ Fake provider、mock provider、unit tests 和 synthetic harness tests 只能作
 6. Evaluation/benchmark 工作优先运行真实 evaluation benchmark：
 
 ```text
-python -m singularity.cli eval run docs/evaluation/public-representative-task.json --run-id <meaningful-run-id> --json
+cargo run -p singularity_cli --bin sg -- eval run docs/evaluation/public-representative-task.json --run-id <meaningful-run-id> --json
 ```
 
 7. 非 evaluation 的 agent 变更运行能覆盖变更路径的最小真实任务，但仍必须使用真实模型 provider 和真实 AgentLoop。

@@ -261,12 +261,7 @@ python -m pytest tests -k sandbox -m "not evaluation and not provider_eval and n
 
 当前 Windows 测试覆盖 v2 doctor/setup/cleanup schema、offline/online账户路由、登录UI隐藏、logon deny rights、受限组成员、独立credential、offline firewall与online排除、runner身份hash、denied/allowed network probe、legacy迁移、超长legacy账户删除、state dir ACL/完整性/只读属性恢复、幂等cleanup、cleanup residual audit、未完成elevated setup时的fail-closed、backend unavailable不启动进程、`CommandExecutor -> SandboxManager -> WindowsSandboxBackend`的fake-ready成功链路、protected path preflight、timeout/Job Object evidence、输出脱敏与runner evidence不能被硬编码伪造。
 
-真实 Windows account-backed sandbox 需要先在 elevated shell 运行：
-
-```bash
-python -m singularity.cli sandbox setup --json
-python -m singularity.cli sandbox doctor --json
-```
+真实 Windows account-backed sandbox 不再通过公开 Python CLI 管理。公开运行时只暴露 Rust `sg config doctor` 作为能力诊断入口；账户创建、doctor/setup/cleanup 只保留在内部 sandbox backend 诊断与测试链路中。
 
 setup 必须创建/验证`SingularityOffline`与`SingularityOnline`两个本地账户及独立Windows Credential Manager凭据；两者都必须隐藏于标准登录用户列表，保留runner所需interactive logon right，同时拒绝RDP/network/service/batch logon并限制直接本地组为内置Users。`Singularity Sandbox`firewall group的outbound block只绑定offline SID；doctor还必须证明offline网络被拒绝、online网络可用、两个runner身份与SID hash匹配。`SingularitySandbox`和`SingularitySandboxRunner`只作为迁移清理目标，不进入运行路径；任一当前能力缺失或legacy资产残留都保持`backend_unavailable`。
 

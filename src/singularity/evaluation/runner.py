@@ -28,13 +28,13 @@ from singularity.evaluation.manifests import (
     _apply_benchmark_constraints,
     _approval_policy_for_task,
     _hidden_verification_command,
-    _model_visible_benchmark_constraints,
     _network_access_for_task,
     _permission_profile_for_task,
     _public_verification_command,
     _requires_baseline_verification,
     _strategy_max_turns_for_task,
     _task_goal,
+    _task_goal_benchmark_constraints,
 )
 from singularity.evaluation.manifests import (
     SingularityPrivateBenchmarkAdapter as SingularityPrivateBenchmarkAdapter,
@@ -1856,11 +1856,11 @@ def _evaluator_visibility_audit(
         return {
             "passed": False,
             "status": "unavailable",
-            "reason": "model-visible trace was unavailable for evaluator visibility audit",
+            "reason": "agent prompt trace was unavailable for evaluator visibility audit",
         }
     projection = {
         "goal": _task_goal(task),
-        "constraints": _model_visible_benchmark_constraints(task),
+        "constraints": _task_goal_benchmark_constraints(task),
     }
     serialized_projection = json.dumps(projection, ensure_ascii=False, sort_keys=True, default=str)
     serialized_trace = json.dumps(_read_trace_events(trace), ensure_ascii=False, sort_keys=True, default=str)
@@ -1883,7 +1883,7 @@ def _evaluator_visibility_audit(
         "status": "passed" if not leaked else "leak_detected",
         "reason": ""
         if not leaked
-        else "evaluator-only metadata appeared in model-visible projection or trace",
+        else "evaluator-only metadata appeared in agent prompt projection or trace",
     }
 
 

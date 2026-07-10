@@ -19,6 +19,7 @@ from singularity.utils.attributes import nested_getattr
 from singularity.utils.serialization import coerce_evaluation_dict
 
 EVALUATION_TASK_SET_SCHEMA_VERSION = "evaluation.task_set/v1"
+RETIRED_VISIBLE_VERIFICATION_FIELD = "model" + "_visible_verification_command"
 
 
 class EvaluationSetupError(RuntimeError):
@@ -83,13 +84,16 @@ class EvaluationTask:
     verification_prepare_commands: list[str] = field(default_factory=list)
     verification_timeout_seconds: int = EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
     smoke_command: str = ""
-    model_visible_verification_command: str = ""
     fixture_metadata: dict[str, Any] = field(default_factory=dict)
     hidden_test_patch: dict[str, Any] = field(default_factory=dict)
     test_patch: str = ""
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> EvaluationTask:
+        if RETIRED_VISIBLE_VERIFICATION_FIELD in payload:
+            raise ValueError(
+                "evaluation task uses a retired visible verification field; use smoke_command."
+            )
         workspace_payload = _workspace_payload(payload)
         prepare_commands = payload.get("prepare_commands")
         if prepare_commands is None:
@@ -126,7 +130,6 @@ class EvaluationTask:
                 or EVALUATION_TASK_VERIFICATION_TIMEOUT_SECONDS
             ),
             smoke_command=str(payload.get("smoke_command") or "").strip(),
-            model_visible_verification_command=str(payload.get("model_visible_verification_command") or "").strip(),
             fixture_metadata=coerce_evaluation_dict(
                 payload.get("fixture_metadata") or {},
                 "fixture_metadata",
@@ -192,8 +195,6 @@ class EvaluationTask:
             payload["verification_prepare_commands"] = list(self.verification_prepare_commands)
         if self.smoke_command:
             payload["smoke_command"] = self.smoke_command
-        if self.model_visible_verification_command:
-            payload["model_visible_verification_command"] = self.model_visible_verification_command
         if self.fixture_metadata:
             payload["fixture_metadata"] = dict(self.fixture_metadata)
         if self.hidden_test_patch:
@@ -314,7 +315,7 @@ def _task_goal(task: EvaluationTask) -> str:
     tools = ", ".join(task.allowed_tools) if task.allowed_tools else "default Singularity coding tools"
     risks = ", ".join(task.risk_tags) if task.risk_tags else "none declared"
     expected_changes = ", ".join(task.expected_file_changes) if task.expected_file_changes else "no required file changes declared"
-    visible_command = _model_visible_verification_command(task)
+    visible_command = _task_smoke_command(task)
     if _requires_baseline_verification(task) and not visible_command:
         verification_instruction = (
             "Before finishing, run the relevant local checks you can infer from the changed code. "
@@ -383,12 +384,12 @@ def _apply_benchmark_constraints(kernel: Any, task: EvaluationTask) -> None:
     apply_constraints = getattr(planner, "apply_benchmark_constraints", None)
     if not callable(apply_constraints):
         return
-    apply_constraints(_model_visible_benchmark_constraints(task))
+    apply_constraints(_task_goal_benchmark_constraints(task))
 
 
-def _model_visible_benchmark_constraints(task: EvaluationTask) -> dict[str, Any]:
-    verification_command = _model_visible_verification_command(task)
-    if _requires_baseline_verification(task) and not task.smoke_command and not task.model_visible_verification_command:
+def _task_goal_benchmark_constraints(task: EvaluationTask) -> dict[str, Any]:
+    verification_command = _task_smoke_command(task)
+    if _requires_baseline_verification(task) and not task.smoke_command:
         verification_command = ""
     return {
         "task_id": task.task_id,
@@ -412,11 +413,9 @@ def _hidden_verification_command(task: EvaluationTask) -> str:
     return task.hidden_verification_command or task.verification_command
 
 
-def _model_visible_verification_command(task: EvaluationTask) -> str:
+def _task_smoke_command(task: EvaluationTask) -> str:
     if task.smoke_command:
         return task.smoke_command
-    if task.model_visible_verification_command:
-        return task.model_visible_verification_command
     if task.verification_prepare_commands:
         return task.public_verification_command
     return task.verification_command

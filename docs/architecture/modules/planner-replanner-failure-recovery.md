@@ -132,7 +132,7 @@ class AgentAction:
 
 ### _ToolScope（工具范围）
 
-Planner 内部的工具范围快照，统一 phase policy、active repair contract、repair evidence block 和 benchmark constraints 对工具集合的收敛。**边界**：仅为 `Planner._active_tool_scope()` 的内存对象，不落盘，不进入模型请求，不直接进入 trace；消费者只使用它投影出的 model-visible tool schemas、ToolChoicePolicy allowed names、`tool.exposure_decided.selected_tools` 和授权判断。
+Planner 内部的工具范围快照，统一 phase policy、active repair contract、repair evidence block 和 benchmark constraints 对工具集合的收敛。**边界**：仅为 `Planner._active_tool_scope()` 的内存对象，不落盘，不进入模型请求，不直接进入 trace；消费者只使用它投影出的 provider tool schemas、ToolChoicePolicy allowed names、`tool.exposure_decided.selected_tools` 和授权判断。
 
 ```python
 @dataclass(frozen=True)

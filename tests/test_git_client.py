@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from singularity.oracle.cli import app
 from singularity.git_client import GitClient
+from singularity.oracle.cli import app
 
 runner = CliRunner()
 

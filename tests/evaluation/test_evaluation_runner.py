@@ -1770,7 +1770,7 @@ def test_evaluator_visibility_audit_detects_hidden_payload_in_trace(tmp_path: Pa
 
     assert audit["passed"] is False
     assert audit["status"] == "leak_detected"
-    assert audit["reason"] == "evaluator-only metadata appeared in model-visible projection or trace"
+    assert audit["reason"] == "evaluator-only metadata appeared in agent prompt projection or trace"
 
 
 def test_evaluation_sanitized_result_shape_is_safe_and_current() -> None:

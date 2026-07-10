@@ -23,7 +23,7 @@ Python oracle/parity/dev-only 内容只用于迁移期对照、fixture export �
 
 | Runtime concern | Python oracle/parity/dev-only reference | Rust public runtime owner | Protocol object or method | Store/trace side effect | Parity expectation | Intentional divergence |
 | --- | --- | --- | --- | --- | --- | --- |
-| User command parsing | `singularity.cli:main` legacy/oracle | `crates/cli::Command` for default Rust path | CLI args -> `thread/start` / `turn/start` | No direct store write | Same user goal/instruction reaches AgentLoop | Python CLI stays legacy/oracle |
+| User command parsing | `singularity.oracle.cli` internal oracle/dev CLI | `crates/cli::Command` for default Rust path | CLI args -> `thread/start` / `turn/start` | No direct store write | Same user goal/instruction reaches AgentLoop | Old `singularity.cli` module path is removed; oracle CLI is internal only |
 | Thread/session identity | `KernelBootstrap` / Python `SessionStore` for oracle | `crates/app-server::AppServer::thread_start` + `singularity_store::SessionStore` | `thread/start`, `ThreadStartResult` | `SessionStore.create_thread_with_trace()` writes thread + trace | Rust thread id is durable app-server identity | Python run/session ids remain oracle internals |
 | Turn creation | `KernelBootstrap` and `AgentKernel` for oracle | `AppServer::turn_start` | `turn/start`, `TurnStartParams`, `TurnStartResult` | `SessionStore.create_turn_with_input_and_trace()` writes turn, input item, trace | One Rust turn represents one submitted user instruction | Python oracle turn state is dev-only evidence |
 | AgentLoop execution | `AgentKernel -> AgentLoop.run` for oracle | `AppServer::run_native_agent_loop` is default production path | `turn/start`, `AgentLoopInput`, `AgentLoopResult` | Native appends `agent_loop` trace | Native final/tool/failure paths are covered by Rust tests and real-provider validation | Python oracle stays fixture/dev-only, not a public backend |
@@ -1849,9 +1849,8 @@ Use `cancel` for AgentLoop cancel. Use `interrupt` only for the existing JSON-RP
       Rust 方向以 Codex-style restricted-token backend 为准，不做系统
       账户、firewall 或持久 ACL setup，除非后续单独确认。
 
-  E1. sandbox doctor / setup / cleanup（CLI 能力诊断，不进入 AgentLoop）
-    python -m singularity.cli sandbox doctor --json
-    → WindowsSandboxBackend.doctor()
+  E1. sandbox doctor / setup / cleanup（内部 backend 能力诊断，不进入 AgentLoop）
+    WindowsSandboxBackend.doctor()
     → windows.py public backend facade / windows_common shared primitives
     → windows_doctor.probe_windows_sandbox()
     → offline / online 双账户检查：
@@ -1872,8 +1871,7 @@ Use `cancel` for AgentLoop cancel. Use `interrupt` only for the existing JSON-RP
       enforcement available 计算；runtime ACL 只覆盖明确发现的
       Python/OpenSSL target，不恢复 base 根目录 RX。
 
-    python -m singularity.cli sandbox setup --json
-    → setup_windows_sandbox()
+    setup_windows_sandbox()
     → windows_doctor.setup_windows_sandbox()
     → windows_identity._ensure_sandbox_identity()
     → windows_acl._apply_sandbox_control_dir_acl()
@@ -1884,8 +1882,7 @@ Use `cancel` for AgentLoop cancel. Use `interrupt` only for the existing JSON-RP
     → 只恢复 base 根目录 RX 和精确 runtime targets RX/(OI)(CI)RX
       不递归授权整个 Anaconda/base install、包缓存、用户目录或配置目录。
 
-    python -m singularity.cli sandbox cleanup --json
-    → windows_cleanup.cleanup_windows_sandbox_assets()
+    windows_cleanup.cleanup_windows_sandbox_assets()
     → 删除 credential / firewall / login UI / attestation
     → 移除两个 current sandbox 账户在相同 runtime targets 上的全部显式 ACE
     → residual_audit 非零则 cleanup failed。

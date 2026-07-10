@@ -8,7 +8,6 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from singularity.oracle.cli import app
 from singularity.command import (
     CommandDecision,
     CommandExecutor,
@@ -21,6 +20,7 @@ from singularity.command import (
 from singularity.context.manager import ContextManager
 from singularity.observability.models import TraceEventType
 from singularity.observability.recorder import TraceRecorder
+from singularity.oracle.cli import app
 from singularity.planner import Planner, TaskStatus
 from singularity.planner.finalizer import Finalizer
 from singularity.policy import (

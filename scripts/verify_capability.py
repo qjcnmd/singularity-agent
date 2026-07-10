@@ -85,9 +85,13 @@ def main() -> int:
         return 0
 
     command = [
-        python(),
-        "-m",
-        "singularity.cli",
+        "cargo",
+        "run",
+        "-p",
+        "singularity_cli",
+        "--bin",
+        "sg",
+        "--",
         "eval",
         "run",
         args.manifest,

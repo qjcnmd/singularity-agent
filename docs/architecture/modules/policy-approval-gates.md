@@ -309,4 +309,4 @@ Windows account-backed sandbox backend 已接入 runtime，但 elevated setup �
 
 ## 维护规则
 
-修改权限 profile、policy request/decision、approval grant、sandbox request、CLI/config、trace/report schema、model-visible context 或执行边界时，必须同步本文件并运行 `python scripts/verify_runtime_docs.py`。文档只描述当前源码真实结构，不保留旧模式枚举、容器 sandbox backend 或未执行的兼容字段。
+修改权限 profile、policy request/decision、approval grant、sandbox request、CLI/config、trace/report schema、provider prompt context 或执行边界时，必须同步本文件并运行 `python scripts/verify_runtime_docs.py`。文档只描述当前源码真实结构，不保留旧模式枚举、容器 sandbox backend 或未执行的兼容字段。

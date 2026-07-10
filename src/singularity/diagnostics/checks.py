@@ -30,7 +30,7 @@ from singularity.release.models import (
 )
 
 LEGACY_PYTHON_CONSOLE_SCRIPTS = ("singularity-agent", "sg")
-INTERNAL_PYTHON_CLI = "python -m singularity.cli"
+INTERNAL_PYTHON_ORACLE_CLI = "python -m singularity.oracle.cli"
 
 
 def default_checks() -> list[DiagnosticCheck]:
@@ -149,7 +149,7 @@ def _entry_point_check(context: DiagnosticContext) -> DiagnosticFinding:
         if ok
         else (
             "Reinstall the package; use Rust sg for public runtime or "
-            f"{INTERNAL_PYTHON_CLI} for internal diagnostics."
+            f"{INTERNAL_PYTHON_ORACLE_CLI} for internal oracle diagnostics."
         ),
         details={"entry_points": matches},
     )
@@ -200,7 +200,7 @@ def _config_file_check(context: DiagnosticContext) -> DiagnosticFinding:
             "failed",
             "Singularity config file is missing.",
             f"{context.paths.config_file} does not exist.",
-            f"Run {INTERNAL_PYTHON_CLI} repair --apply or {INTERNAL_PYTHON_CLI} system init.",
+            f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply or {INTERNAL_PYTHON_ORACLE_CLI} system init.",
             auto_repairable=True,
             details={"repair": "write_default_config", "path": str(context.paths.config_file)},
         )
@@ -277,7 +277,7 @@ def _provider_check(context: DiagnosticContext) -> DiagnosticFinding:
             "failed",
             "Provider config is missing required environment variable references.",
             "missing references: " + ", ".join([*missing_refs, "SINGULARITY_API_KEY"]),
-            f"Run {INTERNAL_PYTHON_CLI} repair --apply to merge default provider/model fields.",
+            f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to merge default provider/model fields.",
             auto_repairable=True,
             details={"repair": "merge_default_config", "missing_refs": missing_refs, "refs": refs},
         )
@@ -328,7 +328,7 @@ def _user_data_dirs_check(context: DiagnosticContext) -> DiagnosticFinding:
             "failed",
             "One or more user data directories are missing or inaccessible.",
             f"missing={missing}; not_dirs={not_dirs}; unwritable={unwritable}",
-        f"Run {INTERNAL_PYTHON_CLI} repair --apply to create missing directories." if repairable else "Fix path types or permissions manually.",
+        f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to create missing directories." if repairable else "Fix path types or permissions manually.",
             auto_repairable=repairable,
             details={
                 "repair": "create_dirs" if repairable else None,
@@ -414,7 +414,7 @@ def _migration_check(context: DiagnosticContext) -> DiagnosticFinding:
             "failed",
             "Installation manifest is missing.",
             f"{context.paths.manifest_file} does not exist.",
-            f"Run {INTERNAL_PYTHON_CLI} repair --apply to create the manifest.",
+            f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to create the manifest.",
             auto_repairable=True,
             details={"repair": "write_manifest", "path": str(context.paths.manifest_file)},
         )
@@ -460,7 +460,7 @@ def _migration_check(context: DiagnosticContext) -> DiagnosticFinding:
             "failed",
             "Installation migrations are pending.",
             "pending=" + ", ".join(item.version for item in pending),
-            f"Run {INTERNAL_PYTHON_CLI} repair --apply to apply migrations with backup.",
+            f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to apply migrations with backup.",
             auto_repairable=True,
             details={"repair": "apply_migrations", "pending": [item.version for item in pending]},
         )
@@ -488,7 +488,7 @@ def _memory_index_check(context: DiagnosticContext) -> DiagnosticFinding:
             "failed",
             "Workspace memory index is missing.",
             f"{index} does not exist.",
-            f"Run {INTERNAL_PYTHON_CLI} repair --apply to rebuild the derived memory index.",
+            f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to rebuild the derived memory index.",
             auto_repairable=True,
             details={"repair": "rebuild_memory_index", "path": str(index)},
         )
@@ -503,7 +503,7 @@ def _memory_index_check(context: DiagnosticContext) -> DiagnosticFinding:
             "failed",
             "Workspace memory index is unreadable.",
             f"{type(exc).__name__}: {exc}",
-            f"Run {INTERNAL_PYTHON_CLI} repair --apply to rebuild the derived memory index.",
+            f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to rebuild the derived memory index.",
             auto_repairable=True,
             details={"repair": "rebuild_memory_index", "path": str(index)},
         )
@@ -516,7 +516,7 @@ def _memory_index_check(context: DiagnosticContext) -> DiagnosticFinding:
         "passed" if ok else "failed",
         "Workspace memory index schema is current." if ok else "Workspace memory index schema is unsupported.",
         f"schema_version={payload.get('schema_version')}; expected={MEMORY_ENTRY_SCHEMA_VERSION}",
-        "No action needed." if ok else f"Run {INTERNAL_PYTHON_CLI} repair --apply to rebuild the derived memory index.",
+        "No action needed." if ok else f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to rebuild the derived memory index.",
         auto_repairable=not ok,
         details={"repair": None if ok else "rebuild_memory_index", "path": str(index)},
     )
@@ -533,7 +533,7 @@ def _project_index_check(context: DiagnosticContext) -> DiagnosticFinding:
             "failed",
             "Project index database is missing.",
             f"{db_path} does not exist.",
-            f"Run {INTERNAL_PYTHON_CLI} repair --apply to rebuild the derived project index.",
+            f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to rebuild the derived project index.",
             auto_repairable=True,
             details={"repair": "rebuild_project_index", "path": str(db_path)},
         )
@@ -550,7 +550,7 @@ def _project_index_check(context: DiagnosticContext) -> DiagnosticFinding:
             "failed",
             "Project index database is unreadable.",
             f"{type(exc).__name__}: {exc}",
-            f"Run {INTERNAL_PYTHON_CLI} repair --apply to rebuild the derived project index.",
+            f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to rebuild the derived project index.",
             auto_repairable=True,
             details={"repair": "rebuild_project_index", "path": str(db_path)},
         )
@@ -563,7 +563,7 @@ def _project_index_check(context: DiagnosticContext) -> DiagnosticFinding:
         "passed" if ok else "failed",
         "Project index schema is current." if ok else "Project index schema is unsupported.",
         f"schema_version={schema_version}; expected={INDEX_SCHEMA_VERSION}",
-        "No action needed." if ok else f"Run {INTERNAL_PYTHON_CLI} repair --apply to rebuild the derived project index.",
+        "No action needed." if ok else f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to rebuild the derived project index.",
         auto_repairable=not ok,
         details={"repair": None if ok else "rebuild_project_index", "path": str(db_path)},
     )
@@ -644,7 +644,7 @@ def _trace_indexes_check(context: DiagnosticContext) -> DiagnosticFinding:
             + ", ".join(orphan_indexes)
             + "; invalid_payloads="
             + ", ".join(invalid_payloads),
-            f"Run {INTERNAL_PYTHON_CLI} repair --apply to rebuild missing derived trace indexes."
+            f"Run {INTERNAL_PYTHON_ORACLE_CLI} repair --apply to rebuild missing derived trace indexes."
             if repairable
             else "Inspect trace payloads or orphan trace indexes manually; automatic repair will not delete or rewrite them.",
             auto_repairable=repairable,

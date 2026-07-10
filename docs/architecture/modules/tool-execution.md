@@ -166,7 +166,7 @@ class ToolCallRecord(SerializableDataclass):
 
 ### ToolProtocolResultEnvelope（工具协议结果信封）
 
-进入 context/tool message 前的结果边界。**边界**：落盘到 `tool_protocol.sqlite3` 的 `tool_result_bindings` 表；其安全投影 `ToolObservationView.to_model_payload()` 作为 tool message 进入下一轮模型请求。
+进入 context/tool message 前的结果边界。**边界**：落盘到 `tool_protocol.sqlite3` 的 `tool_result_bindings` 表；其 redacted tool-result message payload 作为 tool message 进入下一轮模型请求。
 
 ```python
 @dataclass
@@ -242,7 +242,7 @@ class ToolProtocolTurnStatus(str, Enum): # ToolProtocolTurnResult.status
 
 ### 数据流概述
 
-`ModelTurnResult.tool_calls` -> `ToolProtocolValidator.validate_assistant_message()` 生成 `ToolCallEnvelope` 和 `ToolCallBatch`。`ToolProtocolScheduler.schedule()` 根据 side_effect/并行安全性生成 `ToolExecutionPlan`（sequential/parallel_readonly/blocked）。`ToolProtocolEngine` 只负责 facade 和计划委托；`ToolProtocolPlanExecutor` 对 serial 和 parallel readonly 共用 `_prepare_call()` / `_complete_call()` 生命周期核心。`ToolExecutor.execute_request()` 或 `ParallelToolExecutor.execute()` 只提供调度方式和 `ToolResult` 来源；parallel readonly 的 planner observation 不在 worker 线程写入，而是在 `ToolProtocolPlanExecutor` 中按原 tool call 顺序串行写入。`ToolProtocolResultBuilder.build()` 生成真实执行 result envelope，`ToolProtocolSyntheticResultFactory.create()` 生成 rejected/replay-blocked synthetic envelope。`ToolProtocolContextProjector.append_result()` 调用 `ContextManager.add_tool_protocol_result()`，只把 redacted `ToolObservationView.to_model_payload()` 作为 tool message 加入下一轮模型请求。provider tool-call dict 的格式由模型层 helper 统一生成，tool protocol 不维护第二份硬编码结构。
+`ModelTurnResult.tool_calls` -> `ToolProtocolValidator.validate_assistant_message()` 生成 `ToolCallEnvelope` 和 `ToolCallBatch`。`ToolProtocolScheduler.schedule()` 根据 side_effect/并行安全性生成 `ToolExecutionPlan`（sequential/parallel_readonly/blocked）。`ToolProtocolEngine` 只负责 facade 和计划委托；`ToolProtocolPlanExecutor` 对 serial 和 parallel readonly 共用 `_prepare_call()` / `_complete_call()` 生命周期核心。`ToolExecutor.execute_request()` 或 `ParallelToolExecutor.execute()` 只提供调度方式和 `ToolResult` 来源；parallel readonly 的 planner observation 不在 worker 线程写入，而是在 `ToolProtocolPlanExecutor` 中按原 tool call 顺序串行写入。`ToolProtocolResultBuilder.build()` 生成真实执行 result envelope，`ToolProtocolSyntheticResultFactory.create()` 生成 rejected/replay-blocked synthetic envelope。`ToolProtocolContextProjector.append_result()` 调用 `ContextManager.add_tool_protocol_result()`，只把 redacted tool-result message payload 作为 tool message 加入下一轮模型请求。provider tool-call dict 的格式由模型层 helper 统一生成，tool protocol 不维护第二份硬编码结构。
 
 ## 谁生成这些对象
 
@@ -254,7 +254,7 @@ class ToolProtocolTurnStatus(str, Enum): # ToolProtocolTurnResult.status
 ## 谁消费这些对象
 
 - scheduler、state store、engine 与 `ToolExecutor.execute_request()` 消费 envelope/batch/plan；这些对象来自模型响应，不回送为下一次模型请求。
-- state binding 与 `ToolProtocolContextProjector.append_result()` 消费 `ToolProtocolResultEnvelope`。Context projector 只在 context 中不存在同 call/digest 的 tool message 时调用 `ContextManager.add_tool_protocol_result()`；ContextManager 只把 redacted `ToolObservationView.to_model_payload()` 作为 tool message 加入下一轮模型请求，不发送 raw arguments、raw result 或完整协议元数据。
+- state binding 与 `ToolProtocolContextProjector.append_result()` 消费 `ToolProtocolResultEnvelope`。Context projector 只在 context 中不存在同 call/digest 的 tool message 时调用 `ContextManager.add_tool_protocol_result()`；ContextManager 只把 redacted tool-result message payload 加入下一轮模型请求，不发送 raw arguments、raw result 或完整协议元数据。
 - `AgentLoop`/`RunController` 消费 `ToolProtocolTurnResult`；recovery/controller 消费 recovery report；state query/recovery 消费 `ToolProtocolEvent` 和 `ToolProtocolResultBinding`。validation/plan/turn/recovery 对象本身不进模型。
 
 ## 是否落盘

@@ -2,7 +2,18 @@
 
 Singularity 当前 public runtime 是 Rust `sg`。Python 包只保留 internal oracle / parity / dev-only 代码，不安装 public console script。
 
-## 安装
+## Rust public runtime
+
+构建并运行公开 CLI：
+
+```bash
+cargo build -p singularity_app_server -p singularity_cli
+cargo run -p singularity_cli --bin sg -- --help
+```
+
+## Internal Python dev/test setup
+
+Python editable install 只用于内部 oracle、parity fixture、诊断和测试，不提供 public CLI。
 
 使用 uv（推荐，项目提供 `uv.lock`）：
 
@@ -10,7 +21,7 @@ Singularity 当前 public runtime 是 Rust `sg`。Python 包只保留 internal o
 uv sync
 ```
 
-或使用 pip：
+或仅在内部开发环境使用 pip：
 
 ```bash
 pip install -e .
@@ -30,7 +41,7 @@ uv sync --group dev        # dev 依赖 (mypy, pytest, ruff, pytest-cov, PyYAML)
 uv sync --group test       # test 依赖 (pytest, pytest-cov, PyYAML)
 ```
 
-Rust public CLI 入口：
+确认 Python 包不会安装 public console script；公开 runtime 仍是 Rust `sg`：
 
 ```bash
 cargo run -p singularity_cli --bin sg -- --help

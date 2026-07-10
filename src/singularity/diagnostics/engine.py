@@ -47,7 +47,7 @@ class DoctorEngine:
                 status="failed",
                 message="No diagnostic checks matched the requested filter.",
                 technical_detail=f"requested={missing}",
-                suggested_fix="Run python -m singularity.cli doctor without filters to list available checks.",
+                suggested_fix="Run `sg config doctor` for public runtime diagnostics.",
                 auto_repairable=False,
                 details={"check_id": check_id, "group": group},
             )

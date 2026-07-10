@@ -19,7 +19,6 @@
 - ContextBudgetPlan
 - ContextBundle
 - ContextSnapshot
-- ToolObservation
 - PlannerState
 - PolicyObservation
 - VerificationEvidence
@@ -40,7 +39,6 @@
 - ContextRenderPolicy: include_raw_tool_outputs, include_policy_details, include_secret_content, include_full_diff, include_failed_attempts, max_tool_preview_tokens, max_evidence_items, max_recent_turns, require_references_for_claims, redact_sensitive, phase_aware
 - ContextBundle: bundle_id, run_id, task_id, phase_id, model, provider, messages, included_item_ids, excluded_item_ids, budget, compression_snapshot_id, retrieval_query, render_policy, created_at, bundle_digest, metadata
 - ContextSnapshot: snapshot_id, run_id, session_id, task_id, goal, summary, retained_item_ids, known_observation_ids, version, created_at, retained_messages, metadata
-- ToolObservation: id, tool_name, tool_call_id, ok, raw_result, preview, truncated, metadata, run_id, turn, created_at, input_tokens, preview_tokens, raw_digest, source_refs, cache_hit, duration_seconds, error_code, tool_version, truncation_reason, sensitivity
 - PlannerState: task_id, current_phase, status, current_plan, completion_criteria, open_actions, blocked_actions, risk_escalations, evidence_refs
 - PolicyObservation: decision_id, request_id, outcome, risk_level, reason, constraints_summary, user_decision, approval_grant_id, component, operation, resource, reference
 - VerificationEvidence: check_id, command, status, failure_summary, parsed_failures, repair_hints, logs_ref, confidence
@@ -55,7 +53,7 @@
 
 ## 这一层解决什么问题
 
-Context 层把系统提示、用户目标、planner 状态、memory、project index、工具观察和验证证据整理为可进入模型请求的上下文 bundle。
+Context 层把系统提示、用户目标、planner 状态、memory、project index、工具结果记录和验证证据整理为可进入模型请求的上下文 bundle。
 
 ## 当前源码位置
 
@@ -79,7 +77,7 @@ Context 层把系统提示、用户目标、planner 状态、memory、project in
 
 ## 真实任务中的对象流
 
-以用户要求修复 `quicksort.py` 为例：`ContextManager.add_user_message()`、`add_assistant_message()`、`add_tool_result()`、`add_tool_protocol_result()`、`add_synthetic_tool_error()`、`add_trace_summary()`、`add_policy_observation()`、`add_planner_state()`、`add_mutation_evidence()`、`add_command_observation()`、`add_verification_evidence()`、`add_workspace_state()`、`add_edit_result()`、`add_project_index()`、`add_memory_context_block()` 与 `add_failure()` 把组件观察投影成 `ContextItem`、`ContextReference` 或专门 observation dataclass，并通过 `ObservationStore.append_message()` / `append_item()` 写入 `context.sqlite3`。写入和渲染前由 `ContextRedactor.redact_text()` / `redact_value()` 执行 context profile redaction；`ContextRedactor` 保留 `<redacted:{digest}>` 模型可见 marker，内部委托 `RedactionProvider(marker=RedactionMarker.DIGEST)` 复用统一规则。`add_tool_protocol_result()` 只消费 `ToolProtocolResultEnvelope` 的 `ToolObservationView` 投影；该投影的 `observation_id` 会同步成为安全 tool message payload、`ContextItem.item_id` 和 artifact reference 的 observation/source id。随后 `ModelRunner.build_request_from_context()` -> `ContextManager.build_bundle()` -> `ContextAssembler.build_bundle()` 读取这些 item，生成 `ContextBundle` 与 `ContextUsageReport`；同一 request 构建过程调用 `PromptAssemblyPipeline.build_for_model_turn()`，它内部通过 `collect_sources()`、`resolve()`、`build_prompt_bundle()` 和 `compile_prompt()` 生成 `PromptBundle` 与 `PromptManifest`，再由 `ModelTurnRequestBuilder.build_request()` 合并为 `ModelTurnRequest.messages`。溢出时 `ContextAssembler.needs_compression()` 触发 compaction；失败返回 `ContextOverflowError` 或带 excluded item 的 usage report，不把所有 context 无界送入 provider。
+以用户要求修复 `quicksort.py` 为例：`ContextManager.add_user_message()`、`add_assistant_message()`、`add_tool_result()`、`add_tool_protocol_result()`、`add_synthetic_tool_error()`、`add_trace_summary()`、`add_policy_observation()`、`add_planner_state()`、`add_mutation_evidence()`、`add_command_observation()`、`add_verification_evidence()`、`add_workspace_state()`、`add_edit_result()`、`add_project_index()`、`add_memory_context_block()` 与 `add_failure()` 把组件观察投影成 `ContextItem`、`ContextReference` 或专门 observation dataclass，并通过 `ObservationStore.append_message()` / `append_item()` 写入 `context.sqlite3`。写入和渲染前由 `ContextRedactor.redact_text()` / `redact_value()` 执行 context profile redaction；`ContextRedactor` 保留 `<redacted:{digest}>` 模型可见 marker，内部委托 `RedactionProvider(marker=RedactionMarker.DIGEST)` 复用统一规则。`add_tool_protocol_result()` 只消费 `ToolProtocolResultEnvelope` 的安全 tool-result 投影；该投影的 `observation_id` 会同步成为安全 tool message payload、`ContextItem.item_id` 和 artifact reference 的 observation/source id。随后 `ModelRunner.build_request_from_context()` -> `ContextManager.build_bundle()` -> `ContextAssembler.build_bundle()` 读取这些 item，生成 `ContextBundle` 与 `ContextUsageReport`；同一 request 构建过程调用 `PromptAssemblyPipeline.build_for_model_turn()`，它内部通过 `collect_sources()`、`resolve()`、`build_prompt_bundle()` 和 `compile_prompt()` 生成 `PromptBundle` 与 `PromptManifest`，再由 `ModelTurnRequestBuilder.build_request()` 合并为 `ModelTurnRequest.messages`。溢出时 `ContextAssembler.needs_compression()` 触发 compaction；失败返回 `ContextOverflowError` 或带 excluded item 的 usage report，不把所有 context 无界送入 provider。
 
 ## 真实对象完整结构
 
@@ -182,30 +180,6 @@ class ContextSnapshot:
     created_at: str = field(default_factory=lambda: _now())
     retained_messages: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-
-@dataclass
-class ToolObservation:
-    id: str
-    tool_name: str
-    tool_call_id: str | None
-    ok: bool
-    raw_result: dict[str, Any]
-    preview: str
-    truncated: bool
-    metadata: dict[str, Any] = field(default_factory=dict)
-    run_id: str = ""
-    turn: int = 0
-    created_at: str = ""
-    input_tokens: int = 0
-    preview_tokens: int = 0
-    raw_digest: str = ""
-    source_refs: list[ContextReference] = field(default_factory=list)
-    cache_hit: bool = False
-    duration_seconds: float | None = None
-    error_code: str | None = None
-    tool_version: str | None = None
-    truncation_reason: str | None = None
-    sensitivity: ContextSensitivity = ContextSensitivity.WORKSPACE
 
 @dataclass
 class PlannerState:
@@ -334,7 +308,7 @@ class ContextSensitivity(str, Enum): # ContextItem.sensitivity
 
 ## 谁生成这些对象
 
-- `ContextManager._make_item()` 与各 `add_*` 入口生成 `ContextItem` 和 `ContextReference`；tool result、planner state、memory、project index、policy、verification 与 assistant message 都先转换成这两个内部对象。协议结果路径由 `ToolObservationView.observation_id` 决定共享身份，缺失时由 `ContextManager.add_tool_protocol_result()` 生成一次并复用到 observation、message、item 与 references。
+- `ContextManager._make_item()` 与各 `add_*` 入口生成 `ContextItem` 和 `ContextReference`；tool result、planner state、memory、project index、policy、verification 与 assistant message 都先转换成这两个内部对象。协议结果路径由安全 tool-result 投影中的 `observation_id` 决定共享身份，缺失时由 `ContextManager.add_tool_protocol_result()` 生成一次并复用到 observation、message、item 与 references。
 - `ContextAssembler.build_bundle()` 根据 token counter、phase、visibility、freshness、sensitivity、`ContextRenderPolicy` 和 `context/ranking.py` 中的共享排序权重生成 `ContextBudgetPlan`、`ContextBundle` 与初始 `ContextUsageReport`；usage reporter 再用实际 provider usage 更新报告。
 - compaction executor 生成并校验 `ContextSummaryPayload`，`summary_envelope_for_plan()` 生成 `ContextSummaryEnvelope`。`PromptAssemblyPipeline.build_for_model_turn()` 收集/解析 instruction sources，`PromptCompiler.compile()` 生成 `PromptManifest` 与 `PromptBundle`。
 
