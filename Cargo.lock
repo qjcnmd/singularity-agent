@@ -1392,6 +1392,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "singularity_evaluation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "singularity_model"
 version = "0.1.0"
 dependencies = [
