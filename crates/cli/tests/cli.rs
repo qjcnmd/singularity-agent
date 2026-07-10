@@ -25,6 +25,27 @@ fn cli_exposes_app_server_protocol_mode_without_direct_core_runtime() {
 }
 
 #[test]
+fn cli_requires_an_end_user_command_and_hides_protocol_debug_commands() {
+    let output = Command::cargo_bin("sg")
+        .expect("binary")
+        .output()
+        .expect("run cli without command");
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("Usage:"));
+
+    let help = Command::cargo_bin("sg")
+        .expect("binary")
+        .arg("--help")
+        .output()
+        .expect("run cli help");
+    assert!(help.status.success(), "stderr={}", stderr(&help));
+    let help = stdout(&help);
+    for internal in ["protocol-init", "thread-start", "daemon"] {
+        assert!(!help.contains(internal), "help exposed {internal}: {help}");
+    }
+}
+
+#[test]
 fn cli_help_does_not_expose_agent_host_selector() {
     let output = Command::cargo_bin("sg")
         .expect("binary")
@@ -1249,45 +1270,6 @@ fn cli_reports_app_server_exit_before_response() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(is_app_server_unavailable_error(&stderr), "stderr={stderr}");
-}
-
-#[test]
-fn cli_outputs_json_rpc_initialize_request() {
-    let mut command = Command::cargo_bin("sg").expect("binary");
-    let output = command.arg("protocol-init").output().expect("run cli");
-    assert!(output.status.success());
-
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("json-rpc initialize output");
-    assert_eq!(value["method"], "initialize");
-    assert_eq!(value["params"]["clientInfo"]["name"], "singularity_cli");
-    assert!(value.get("jsonrpc").is_none());
-    assert!(value.get("error").is_none());
-    assert!(value.get("result").is_none());
-}
-
-#[test]
-fn cli_outputs_json_rpc_thread_start_request() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let mut command = Command::cargo_bin("sg").expect("binary");
-    let output = command
-        .current_dir(temp.path())
-        .args(["thread-start", "--model", "gpt-test"])
-        .output()
-        .expect("run cli");
-    assert!(output.status.success());
-
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("json-rpc thread/start output");
-    assert_eq!(value["method"], "thread/start");
-    assert_eq!(value["params"]["model"], "gpt-test");
-    assert_eq!(
-        value["params"]["cwd"],
-        std::fs::canonicalize(temp.path())
-            .expect("canonical temp dir")
-            .to_string_lossy()
-            .as_ref()
-    );
 }
 
 #[test]

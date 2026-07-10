@@ -26,26 +26,14 @@ const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
-#[command(about = "Rust CLI client for the Singularity app-server protocol")]
+#[command(about = "Singularity coding agent")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Print the JSON-RPC initialize request used by the protocol client.
-    ProtocolInit,
-    /// Print a thread/start JSON-RPC request.
-    ThreadStart {
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// Run the stdio app-server until stdin closes.
-    Daemon {
-        #[arg(long)]
-        db: Option<PathBuf>,
-    },
     /// Start a thread, submit a goal, and render protocol events.
     Run {
         goal: String,
@@ -156,17 +144,7 @@ fn main() {
 }
 
 fn run_cli(cli: Cli) -> Result<(), String> {
-    match cli.command.unwrap_or(Command::ProtocolInit) {
-        Command::ProtocolInit => print_wire_request(initialize_request(0)),
-        Command::ThreadStart { model } => {
-            let cwd = canonical_current_dir()?;
-            print_wire_request(JsonRpcMessage::request(
-                Method::ThreadStart,
-                json!(1),
-                json!({"model": model, "cwd": cwd}),
-            ))
-        }
-        Command::Daemon { db } => run_daemon(db),
+    match cli.command {
         Command::Run { goal, model, json } => {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
@@ -391,26 +369,6 @@ fn run_eval(manifest: PathBuf, run_id: &str, json_output: bool) -> Result<(), St
             .as_str()
             .unwrap_or("evaluation_failed")
             .to_string())
-    }
-}
-
-fn print_wire_request(message: JsonRpcMessage) -> Result<(), String> {
-    println!("{}", message.to_wire_value());
-    Ok(())
-}
-
-fn run_daemon(db: Option<PathBuf>) -> Result<(), String> {
-    let mut command = ProcessCommand::new(app_server_bin()?);
-    if let Some(db) = db {
-        command.env(APP_SERVER_DB_ENV, db);
-    }
-    let status = command
-        .status()
-        .map_err(|error| format!("failed to start app-server daemon: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("app-server daemon exited with {status}"))
     }
 }
 

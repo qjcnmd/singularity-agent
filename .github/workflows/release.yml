@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x86_64:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+
+      - name: Build release binaries
+        run: cargo build --workspace --bins --release --locked
+
+      - name: Assemble archive
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = if ("${{ github.ref_type }}" -eq "tag") {
+            "${{ github.ref_name }}"
+          } else {
+            "dev-${{ github.run_number }}"
+          }
+          $name = "singularity-$version-windows-x86_64"
+          $directory = Join-Path $PWD "dist/$name"
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+
+          @(
+            "sg.exe",
+            "singularity_app_server.exe",
+            "singularity-command-runner.exe",
+            "singularity-windows-sandbox-setup.exe"
+          ) | ForEach-Object {
+            $source = Join-Path $PWD "target/release/$_"
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "missing release binary: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination $directory
+          }
+
+          Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md -Destination $directory
+          Copy-Item docs/INSTALL.md -Destination (Join-Path $directory "INSTALL.md")
+
+          $archive = Join-Path $PWD "dist/$name.zip"
+          Compress-Archive -LiteralPath $directory -DestinationPath $archive
+          $checksum = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$checksum  $name.zip" | Set-Content -Encoding ascii (Join-Path $PWD "dist/SHA256SUMS.txt")
+
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = "${{ steps.package.outputs.archive }}"
+          if (gh release view $env:GITHUB_REF_NAME *> $null) {
+            gh release upload $env:GITHUB_REF_NAME $archive dist/SHA256SUMS.txt --clobber
+          } else {
+            gh release create $env:GITHUB_REF_NAME $archive dist/SHA256SUMS.txt --verify-tag --generate-notes
+          }
