@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use uuid::Uuid;
 
 const DEFAULT_MAX_TOOL_CALLS: u32 = 8;
 const DEFAULT_MAX_RETRIES: u32 = 2;
@@ -24,6 +25,7 @@ const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
+const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
 const HTTP_STATUS_NOT_FOUND: u16 = 404;
@@ -259,6 +261,75 @@ pub struct ProviderConfigResolution {
     pub config: ModelProviderConfig,
 }
 
+#[derive(Clone)]
+pub struct ProviderConfigSnapshot {
+    snapshot_id: String,
+    source: Option<ProviderConfigSource>,
+    redacted_config: ModelProviderConfig,
+    readiness: ModelProviderStatus,
+    provider: Result<OpenAiProvider, ProviderError>,
+}
+
+impl fmt::Debug for ProviderConfigSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderConfigSnapshot")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("source", &self.source)
+            .field("redacted_config", &self.redacted_config)
+            .field("readiness", &self.readiness)
+            .finish()
+    }
+}
+
+impl ProviderConfigSnapshot {
+    pub fn capture<F>(get_env: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let project_dir = std::env::current_dir().ok();
+        let values = resolve_provider_values(get_env, project_dir.as_deref());
+        let source = values.source;
+        let redacted_config = provider_config_resolution(&values).config;
+        let provider =
+            OpenAiProviderConfig::from_resolved_values(values).and_then(OpenAiProvider::new);
+        let mut readiness = ModelProviderStatus::from_config(&redacted_config);
+        if readiness.ready
+            && let Err(error) = &provider
+        {
+            readiness.ready = false;
+            readiness.blocker = Some((&error.error.category()).into());
+        }
+        Self {
+            snapshot_id: format!("{PROVIDER_SNAPSHOT_ID_PREFIX}{}", Uuid::new_v4().simple()),
+            source,
+            redacted_config,
+            readiness,
+            provider,
+        }
+    }
+
+    pub fn source(&self) -> Option<ProviderConfigSource> {
+        self.source
+    }
+
+    pub fn redacted_config(&self) -> &ModelProviderConfig {
+        &self.redacted_config
+    }
+
+    pub fn readiness(&self) -> &ModelProviderStatus {
+        &self.readiness
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    pub fn provider(&self) -> Result<OpenAiProvider, ProviderError> {
+        self.provider.clone()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelBlockerKind {
@@ -270,6 +341,16 @@ pub enum ModelBlockerKind {
 }
 
 impl ModelBlockerKind {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::RequiredEnvMissing => "required_env_missing",
+            Self::AuthenticationProviderError => "authentication_provider_error",
+            Self::BaseUrlNetworkError => "base_url_network_error",
+            Self::ModelNameConfigError => "model_name_config_error",
+            Self::SandboxPermissionError => "sandbox_permission_error",
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::RequiredEnvMissing => "required env missing",
@@ -651,7 +732,10 @@ impl OpenAiProviderConfig {
         F: FnMut(&str) -> Option<String>,
     {
         let project_dir = std::env::current_dir().ok();
-        let values = resolve_provider_values(get_env, project_dir.as_deref());
+        Self::from_resolved_values(resolve_provider_values(get_env, project_dir.as_deref()))
+    }
+
+    fn from_resolved_values(values: ResolvedProviderValues) -> Result<Self, ProviderError> {
         let source = values.source;
         let provider_name = values
             .provider_name
@@ -689,6 +773,7 @@ impl OpenAiProviderConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     client: reqwest::blocking::Client,
@@ -815,21 +900,7 @@ where
 {
     let project_dir = std::env::current_dir().ok();
     let values = resolve_provider_values(get_env, project_dir.as_deref());
-    let provider_name = values.source.map(|_| {
-        values
-            .provider_name
-            .clone()
-            .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string())
-    });
-    ProviderConfigResolution {
-        source: values.source,
-        config: ModelProviderConfig {
-            provider_name,
-            model_name: values.model_name,
-            base_url_present: values.base_url.is_some(),
-            api_key_present: values.api_key.is_some(),
-        },
-    }
+    provider_config_resolution(&values)
 }
 
 pub fn provider_config_from_env<F>(get_env: F) -> ModelProviderConfig
@@ -1570,13 +1641,31 @@ impl ProviderConfigLayer {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ResolvedProviderValues {
     source: Option<ProviderConfigSource>,
     provider_name: Option<String>,
     model_name: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
+}
+
+fn provider_config_resolution(values: &ResolvedProviderValues) -> ProviderConfigResolution {
+    let provider_name = values.source.map(|_| {
+        values
+            .provider_name
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string())
+    });
+    ProviderConfigResolution {
+        source: values.source,
+        config: ModelProviderConfig {
+            provider_name,
+            model_name: values.model_name.clone(),
+            base_url_present: values.base_url.is_some(),
+            api_key_present: values.api_key.is_some(),
+        },
+    }
 }
 
 fn resolve_provider_values<F>(mut get_env: F, project_dir: Option<&Path>) -> ResolvedProviderValues

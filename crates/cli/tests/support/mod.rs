@@ -174,6 +174,9 @@ pub fn native_capability(available: bool, status: &str, reason: &str, blockers: 
         },
         "providerReadiness": {
             "source": "project_env",
+            "snapshotId": "provider_snapshot_fake_server",
+            "ready": true,
+            "blocker": null,
             "apiKeyPresent": true,
             "baseUrlPresent": true,
             "modelPresent": true,

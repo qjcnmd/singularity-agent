@@ -365,6 +365,9 @@ pub struct TurnStartResult {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderReadiness {
     pub source: Option<String>,
+    pub snapshot_id: String,
+    pub ready: bool,
+    pub blocker: Option<String>,
     pub api_key_present: bool,
     pub base_url_present: bool,
     pub model_present: bool,

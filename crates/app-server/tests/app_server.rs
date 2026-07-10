@@ -1,4 +1,5 @@
 use singularity_app_server::AppServer;
+use singularity_model::ProviderConfigSnapshot;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_store::SessionStore;
 use std::io::Write;
@@ -12,11 +13,14 @@ fn workspace_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
+fn app_server(store: SessionStore) -> AppServer {
+    AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
+}
 #[test]
 fn app_server_enforces_initialize_and_emits_item_events() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
 
     let not_initialized = server
         .handle_json(r#"{"method":"thread/start","id":1,"params":{}}"#)
@@ -229,6 +233,13 @@ fn app_server_binary_reports_only_redacted_provider_readiness() {
     let provider = &capability["result"]["providerReadiness"];
 
     assert_eq!(provider["source"], "process_env");
+    assert!(
+        provider["snapshotId"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("provider_snapshot_"))
+    );
+    assert_eq!(provider["ready"], true);
+    assert!(provider["blocker"].is_null());
     assert_eq!(provider["apiKeyPresent"], true);
     assert_eq!(provider["baseUrlPresent"], true);
     assert_eq!(provider["modelPresent"], true);
@@ -237,12 +248,43 @@ fn app_server_binary_reports_only_redacted_provider_readiness() {
     }
 }
 
+#[test]
+fn app_server_reuses_one_provider_snapshot_for_capability_reads() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let snapshot = ProviderConfigSnapshot::capture(|name| match name {
+        "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
+        "SINGULARITY_BASE_URL" => Some("https://snapshot.example/v1".to_string()),
+        "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
+        _ => None,
+    });
+    let expected_snapshot_id = snapshot.snapshot_id().to_string();
+    let mut server = AppServer::new(store, snapshot);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .unwrap();
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .unwrap();
+
+    for id in [2, 3] {
+        let capability = server
+            .handle_json(&format!(
+                r#"{{"method":"agent/capability","id":{id},"params":{{}}}}"#
+            ))
+            .unwrap();
+        let provider = &capability[0]["result"]["providerReadiness"];
+        assert_eq!(provider["snapshotId"], expected_snapshot_id);
+        assert_eq!(provider["ready"], true);
+        assert!(provider["blocker"].is_null());
+    }
+}
 #[cfg(windows)]
 #[test]
 fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
@@ -270,6 +312,13 @@ fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() 
     );
     let provider = &capability[0]["result"]["providerReadiness"];
     assert!(provider["source"].is_null() || provider["source"].is_string());
+    assert!(
+        provider["snapshotId"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("provider_snapshot_"))
+    );
+    assert!(provider["ready"].is_boolean());
+    assert!(provider["blocker"].is_null() || provider["blocker"].is_string());
     assert!(provider["apiKeyPresent"].is_boolean());
     assert!(provider["baseUrlPresent"].is_boolean());
     assert!(provider["modelPresent"].is_boolean());
@@ -280,7 +329,7 @@ fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() 
 fn app_server_reports_native_agent_loop_capability_as_unsupported_off_windows() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
@@ -313,7 +362,7 @@ fn app_server_reports_native_agent_loop_capability_as_unsupported_off_windows() 
 fn app_server_eval_run_writes_blocked_native_result_artifacts_without_python_sidecar() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     let manifest = dir.path().join("eval.json");
     let output_root = dir.path().join("eval-output");
     std::fs::write(
@@ -400,7 +449,7 @@ fn app_server_eval_run_writes_blocked_native_result_artifacts_without_python_sid
 fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     let manifest = dir.path().join("eval.json");
     let output_root = dir.path().join("eval-output");
     std::fs::write(
@@ -469,7 +518,7 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
 fn app_server_eval_run_fails_closed_when_native_capability_is_unavailable() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     let manifest = dir.path().join("eval.json");
     let output_root = dir.path().join("eval-output");
     std::fs::write(
@@ -529,7 +578,7 @@ fn app_server_eval_run_fails_closed_when_native_capability_is_unavailable() {
 fn app_server_rejects_public_agent_host_selector() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
@@ -561,7 +610,7 @@ fn app_server_rejects_public_agent_host_selector() {
 fn public_agent_host_rejection_does_not_create_turn() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
@@ -600,7 +649,7 @@ fn public_agent_host_rejection_does_not_create_turn() {
 fn turn_start_rejects_agent_host_selector_before_turn_creation() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
@@ -637,7 +686,7 @@ fn approval_decisions_consume_pending_requests_once_for_all_outcomes() {
     ] {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-        let mut server = AppServer::new(store);
+        let mut server = app_server(store);
         server
             .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
             .unwrap();
@@ -733,7 +782,7 @@ fn approval_decision_allow_without_pending_tool_call_is_rejected() {
     std::fs::write(workspace.join("README.md"), "before").expect("readme");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
@@ -834,7 +883,7 @@ fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_native_tur
         std::fs::write(workspace.join("README.md"), "before").expect("readme");
         let db_path = dir.path().join("sessions.sqlite3");
         let store = SessionStore::open(&db_path).expect("open store");
-        let mut server = AppServer::new(store);
+        let mut server = app_server(store);
         server
             .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
             .unwrap();
@@ -925,7 +974,7 @@ fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_native_tur
 fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
@@ -970,7 +1019,7 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
 fn turn_start_missing_thread_fails_before_turn_creation() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
@@ -1002,7 +1051,7 @@ fn turn_lifecycle_interrupt_on_terminal_turn_is_idempotent() {
             "completed",
         )
         .expect("completed turn");
-    let mut server = AppServer::new(store);
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();

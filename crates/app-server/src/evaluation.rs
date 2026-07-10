@@ -18,7 +18,9 @@ use singularity_evaluation::{
     PlannedWorkspaceSource, RunId, StageResult, StageStatus, TaskId, VerificationStagePlan,
     WorkspacePlan,
 };
-use singularity_model::{ModelErrorCategory, OpenAiProvider, ProviderError};
+use singularity_model::{
+    ModelErrorCategory, OpenAiProvider, ProviderConfigSnapshot, ProviderError,
+};
 use singularity_policy::{
     ApprovalPolicy, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
     PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
@@ -162,6 +164,7 @@ struct TaskExecution {
 pub(crate) fn run_evaluation(
     params: &EvalRunParams,
     sandbox_backend: SharedSandboxBackend,
+    provider_snapshot: &ProviderConfigSnapshot,
 ) -> Result<EvalRunResult, String> {
     let manifest = EvaluationManifest::load(&params.manifest)
         .map_err(|error| format!("invalid eval manifest: {error}"))?;
@@ -192,6 +195,7 @@ pub(crate) fn run_evaluation(
             &run_dir,
             &plan,
             Arc::clone(&sandbox_backend),
+            provider_snapshot,
         ));
     }
 
@@ -261,6 +265,7 @@ fn run_task(
     run_dir: &Path,
     plan: &WorkspacePlan,
     sandbox_backend: SharedSandboxBackend,
+    provider_snapshot: &ProviderConfigSnapshot,
 ) -> TaskExecution {
     let task_dir = run_dir.join(plan.task_id.as_str());
     let mut diagnostics = TaskDiagnostics {
@@ -288,7 +293,7 @@ fn run_task(
     }
 
     let mut provider = if matches!(plan.source, PlannedWorkspaceSource::RemoteGit { .. }) {
-        match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
+        match provider_snapshot.provider() {
             Ok(provider) => Some(provider),
             Err(error) => {
                 let blocker = provider_blocker(&error);
@@ -323,7 +328,7 @@ fn run_task(
 
     let provider = match provider.take() {
         Some(provider) => provider,
-        None => match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
+        None => match provider_snapshot.provider() {
             Ok(provider) => provider,
             Err(error) => {
                 let blocker = provider_blocker(&error);

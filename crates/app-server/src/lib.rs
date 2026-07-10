@@ -14,7 +14,7 @@ use singularity_agent::{
 use singularity_core::{
     ErrorCode, ProjectInstructionError, contains_sensitive_text, load_project_instructions_from_cwd,
 };
-use singularity_model::{OpenAiProvider, Provider, resolve_provider_config};
+use singularity_model::{Provider, ProviderConfigSnapshot};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecisionOutcome,
     PermissionOperation, PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
@@ -71,10 +71,11 @@ pub struct AppServer {
     event_filter: Option<Vec<String>>,
     shutdown_requested: bool,
     sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
+    provider_snapshot: ProviderConfigSnapshot,
 }
 
 impl AppServer {
-    pub fn new(store: SessionStore) -> Self {
+    pub fn new(store: SessionStore, provider_snapshot: ProviderConfigSnapshot) -> Self {
         Self {
             store,
             initialized: false,
@@ -82,6 +83,7 @@ impl AppServer {
             event_filter: None,
             shutdown_requested: false,
             sandbox_backend: Arc::new(WindowsSandboxBackend::new()),
+            provider_snapshot,
         }
     }
 
@@ -349,14 +351,18 @@ impl AppServer {
             message.id,
             AgentCapabilityResult {
                 native_agent_loop: serde_json::to_value(AgentLoopCapability::current())?,
-                provider_readiness: current_provider_readiness(),
+                provider_readiness: provider_readiness(&self.provider_snapshot),
             },
         )
     }
 
     fn eval_run(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: EvalRunParams = message.params_as()?;
-        match evaluation::run_evaluation(&params, Arc::clone(&self.sandbox_backend)) {
+        match evaluation::run_evaluation(
+            &params,
+            Arc::clone(&self.sandbox_backend),
+            &self.provider_snapshot,
+        ) {
             Ok(result) => json_response(message.id, result),
             Err(error) => json_error(message.id, ErrorCode::invalid_request(error)),
         }
@@ -368,7 +374,7 @@ impl AppServer {
         params: &TurnStartParams,
         turn_id: &str,
     ) -> AppServerResult<AgentRunStatus> {
-        let provider = match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
+        let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
             Err(error) => {
                 return Ok(AgentRunStatus::failed(error.message).with_status(AgentStatus::Failed));
@@ -397,7 +403,7 @@ impl AppServer {
         if pending_tool_call.is_none() {
             return Ok(None);
         }
-        let provider = match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
+        let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
             Err(error) => {
                 let turn_id = &request.turn_id;
@@ -1056,13 +1062,20 @@ fn native_agent_loop_ready() -> bool {
     native_capability_ready(&capability)
 }
 
-fn current_provider_readiness() -> ProviderReadiness {
-    let resolution = resolve_provider_config(|name| std::env::var(name).ok());
+fn provider_readiness(snapshot: &ProviderConfigSnapshot) -> ProviderReadiness {
+    let config = snapshot.redacted_config();
+    let readiness = snapshot.readiness();
     ProviderReadiness {
-        source: resolution.source.map(|source| source.as_str().to_string()),
-        api_key_present: resolution.config.api_key_present,
-        base_url_present: resolution.config.base_url_present,
-        model_present: resolution.config.model_name.is_some(),
+        source: snapshot.source().map(|source| source.as_str().to_string()),
+        snapshot_id: snapshot.snapshot_id().to_string(),
+        ready: readiness.ready,
+        blocker: readiness
+            .blocker
+            .as_ref()
+            .map(|blocker| blocker.code().to_string()),
+        api_key_present: config.api_key_present,
+        base_url_present: config.base_url_present,
+        model_present: config.model_name.is_some(),
     }
 }
 
@@ -1266,6 +1279,10 @@ mod tests {
 
     use super::*;
 
+    fn app_server(store: SessionStore) -> AppServer {
+        AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
+    }
+
     struct StaticProvider {
         responses: Vec<ModelTurnResponse>,
         seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
@@ -1320,7 +1337,7 @@ mod tests {
             )],
             seen_requests: Arc::clone(&seen_requests),
         };
-        let server = AppServer::new(store);
+        let server = app_server(store);
 
         let status = server
             .run_native_agent_loop_with_provider(provider, &thread, &params, "turn_1", None)
@@ -1403,7 +1420,7 @@ mod tests {
                 AgentStatus::Blocked.as_str(),
             )
             .expect("blocked turn");
-        let server = AppServer::new(store);
+        let server = app_server(store);
         let request = ApprovalRequest::new(
             format!("approval_{}_call_1", turn.turn_id),
             thread.thread_id.clone(),
@@ -1487,7 +1504,7 @@ mod tests {
             ApprovalOutcome::Allow,
             "approved",
         );
-        let server = AppServer::new(store);
+        let server = app_server(store);
 
         let (_turn, run_status) = server
             .native_approval_no_resume_status(&request, &decision, Some(&pending_payload))
@@ -1581,7 +1598,7 @@ mod tests {
             resources: Vec::new(),
         };
         let seen_requests = Arc::new(Mutex::new(Vec::new()));
-        let server = AppServer::new(store);
+        let server = app_server(store);
 
         let (_turn, mismatch_status) = server
             .resume_native_agent_loop_after_gate(
@@ -1703,7 +1720,7 @@ mod tests {
             responses: vec![final_response],
             seen_requests: Arc::clone(&seen_requests),
         };
-        let server = AppServer::new(store);
+        let server = app_server(store);
 
         let resumed = server
             .resume_native_agent_loop_after_gate(
@@ -1784,7 +1801,7 @@ mod tests {
             responses: vec![command_response, final_response],
             seen_requests: Arc::new(Mutex::new(Vec::new())),
         };
-        let server = AppServer::new(store).with_sandbox_backend(CompletedSandboxBackend);
+        let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
         let command_resource = command_scope_resource(
             &[
                 "cmd.exe".to_string(),

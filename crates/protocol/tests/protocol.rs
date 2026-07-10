@@ -189,6 +189,9 @@ fn new_trace_is_unredacted_until_the_store_sanitizes_it() {
 fn provider_readiness_uses_camel_case_redacted_wire_fields() {
     let readiness = ProviderReadiness {
         source: Some("process_env".to_string()),
+        snapshot_id: "provider_snapshot_test".to_string(),
+        ready: false,
+        blocker: Some("required_env_missing".to_string()),
         api_key_present: true,
         base_url_present: false,
         model_present: true,
@@ -198,6 +201,9 @@ fn provider_readiness_uses_camel_case_redacted_wire_fields() {
         serde_json::to_value(readiness).unwrap(),
         serde_json::json!({
             "source": "process_env",
+            "snapshotId": "provider_snapshot_test",
+            "ready": false,
+            "blocker": "required_env_missing",
             "apiKeyPresent": true,
             "baseUrlPresent": false,
             "modelPresent": true

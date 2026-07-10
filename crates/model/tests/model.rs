@@ -3,9 +3,9 @@ use singularity_model::{
     ModelBlockerKind, ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind,
     ModelMessage, ModelProviderConfig, ModelProviderStatus, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
-    ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider, ProviderConfigSource,
-    ProviderStreamEvent, ProviderStreamEventType, ToolChoiceMode, ToolChoicePolicy,
-    chat_completions_endpoint, classify_model_error, provider_config_from_env,
+    ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider, ProviderConfigSnapshot,
+    ProviderConfigSource, ProviderStreamEvent, ProviderStreamEventType, ToolChoiceMode,
+    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, provider_config_from_env,
     resolve_provider_config, retry_decision, validate_model_request, validate_model_response,
     validate_model_turn_response, validate_provider_config, validate_stream_events,
 };
@@ -313,6 +313,64 @@ fn provider_config_loads_presence_from_env_without_secret_values() {
     assert_eq!(status.base_url_status, "present(redacted)");
     assert!(!serialized.contains("sk-secret-value"));
     assert!(!serialized.contains("provider.example"));
+}
+
+#[test]
+fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
+    let mut reads = std::collections::HashMap::<String, usize>::new();
+    let snapshot = ProviderConfigSnapshot::capture(|name| {
+        let count = reads.entry(name.to_string()).or_default();
+        *count += 1;
+        assert_eq!(*count, 1, "provider setting {name} was read more than once");
+        match name {
+            "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+            "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
+            "SINGULARITY_BASE_URL" => Some("https://snapshot-provider.example/v1".to_string()),
+            "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
+            _ => None,
+        }
+    });
+
+    assert_eq!(
+        snapshot.source(),
+        Some(ProviderConfigSource::ProcessEnvironment)
+    );
+    assert_eq!(
+        snapshot.redacted_config().model_name.as_deref(),
+        Some("snapshot-model")
+    );
+    assert!(snapshot.readiness().ready);
+    assert!(snapshot.provider().is_ok());
+    assert!(snapshot.snapshot_id().starts_with("provider_snapshot_"));
+    let debug = format!("{snapshot:?}");
+    for secret in ["snapshot-secret", "snapshot-provider.example"] {
+        assert!(!debug.contains(secret));
+        assert!(!snapshot.snapshot_id().contains(secret));
+    }
+
+    let same_config = ProviderConfigSnapshot::capture(|name| match name {
+        "SINGULARITY_MODEL_PROVIDER" => Some("openai_compatible".to_string()),
+        "SINGULARITY_MODEL" => Some("snapshot-model".to_string()),
+        "SINGULARITY_BASE_URL" => Some("https://snapshot-provider.example/v1".to_string()),
+        "SINGULARITY_API_KEY" => Some("snapshot-secret".to_string()),
+        _ => None,
+    });
+    assert_ne!(snapshot.snapshot_id(), same_config.snapshot_id());
+}
+
+#[test]
+fn provider_config_snapshot_preserves_the_original_configuration_error() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let snapshot = in_current_dir(temp.path(), || ProviderConfigSnapshot::capture(|_| None));
+
+    assert_eq!(snapshot.source(), None);
+    assert!(!snapshot.readiness().ready);
+    let first = snapshot.provider().expect_err("missing provider config");
+    let second = snapshot
+        .provider()
+        .expect_err("same missing provider config");
+    assert_eq!(first, second);
+    assert!(first.message.contains("SINGULARITY_MODEL"));
 }
 
 #[test]

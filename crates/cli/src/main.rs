@@ -338,6 +338,23 @@ fn print_provider_readiness(provider: &Value) -> Result<(), String> {
         }
     };
     println!("provider_config_source={source}");
+    let snapshot_id = provider["snapshotId"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "invalid agent capability: providerReadiness.snapshotId".to_string())?;
+    println!("provider_snapshot_id={snapshot_id}");
+    let ready = provider["ready"]
+        .as_bool()
+        .ok_or_else(|| "invalid agent capability: providerReadiness.ready".to_string())?;
+    println!("provider_ready={ready}");
+    let blocker = match provider.get("blocker") {
+        Some(Value::Null) | None => "none",
+        Some(Value::String(blocker)) if !blocker.trim().is_empty() => blocker,
+        _ => {
+            return Err("invalid agent capability: providerReadiness.blocker".to_string());
+        }
+    };
+    println!("provider_blocker={blocker}");
     for (name, field) in [
         ("SINGULARITY_API_KEY", "apiKeyPresent"),
         ("SINGULARITY_BASE_URL", "baseUrlPresent"),

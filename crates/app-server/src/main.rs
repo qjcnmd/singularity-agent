@@ -3,6 +3,7 @@ use std::io::{self, BufRead, Write};
 use serde_json::Value;
 use singularity_app_server::AppServer;
 use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
+use singularity_model::ProviderConfigSnapshot;
 use singularity_protocol::JsonRpcMessage;
 use singularity_store::SessionStore;
 
@@ -13,7 +14,8 @@ fn main() {
         let _ = std::fs::create_dir_all(parent);
     }
     let store = SessionStore::open(&db_path).expect("open app-server store");
-    let mut server = AppServer::new(store);
+    let provider_snapshot = ProviderConfigSnapshot::capture(|name| std::env::var(name).ok());
+    let mut server = AppServer::new(store, provider_snapshot);
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
