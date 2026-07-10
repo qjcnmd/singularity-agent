@@ -1,7 +1,8 @@
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AppEvent, ArtifactFetchParams, ArtifactRef, EventSubscribeParams, InitializeParams, ItemKind,
-    JsonRpcMessage, Method, ProviderReadiness, ThreadIdParams, ThreadStartParams, TraceListParams,
+    AppEvent, ArtifactFetchParams, ArtifactRef, ConversationMessage, ConversationRole,
+    EventSubscribeParams, InitializeParams, ItemKind, JsonRpcMessage, Method, ProviderReadiness,
+    ThreadIdParams, ThreadReadParams, ThreadReadResult, ThreadStartParams, TraceListParams,
     TraceShowParams, TraceTailParams, TurnIdParams, TurnStartParams,
 };
 
@@ -17,6 +18,59 @@ fn json_rpc_accepts_omitted_jsonrpc_header_and_keeps_camel_case_params() {
     assert_eq!(params.thread_id, "thread_1");
 }
 
+#[test]
+fn thread_read_uses_typed_paginated_safe_conversation_history() {
+    let params: ThreadReadParams = serde_json::from_value(serde_json::json!({
+        "threadId": "thread_1",
+        "beforeTurnSequence": 7,
+        "limit": 5
+    }))
+    .expect("thread/read params");
+    assert_eq!(params.thread_id, "thread_1");
+    assert_eq!(params.before_turn_sequence, Some(7));
+    assert_eq!(params.limit, Some(5));
+
+    let result = ThreadReadResult {
+        thread: singularity_protocol::Thread {
+            thread_id: "thread_1".to_string(),
+            model: Some("gpt-test".to_string()),
+            cwd: Some("C:/workspace".to_string()),
+            status: singularity_protocol::ThreadStatus::Active,
+        },
+        messages: vec![ConversationMessage {
+            item_id: "item_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            turn_sequence: 1,
+            item_sequence: 1,
+            role: ConversationRole::User,
+            content: "hello".to_string(),
+            redacted: false,
+        }],
+        next_before_turn_sequence: Some(1),
+    };
+
+    assert_eq!(
+        serde_json::to_value(result).expect("thread/read result"),
+        serde_json::json!({
+            "thread": {
+                "thread_id": "thread_1",
+                "model": "gpt-test",
+                "cwd": "C:/workspace",
+                "status": "active"
+            },
+            "messages": [{
+                "itemId": "item_1",
+                "turnId": "turn_1",
+                "turnSequence": 1,
+                "itemSequence": 1,
+                "role": "user",
+                "content": "hello",
+                "redacted": false
+            }],
+            "nextBeforeTurnSequence": 1
+        })
+    );
+}
 #[test]
 fn turn_start_params_reject_agent_host_selector() {
     let raw = r#"{"method":"turn/start","id":2,"params":{"threadId":"thread_1","agentHost":"python","input":[{"type":"text","text":"hi"}]}}"#;

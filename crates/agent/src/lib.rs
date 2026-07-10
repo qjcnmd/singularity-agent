@@ -6,9 +6,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelMessage, ModelPreferences, ModelPurpose, ModelRole,
-    ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnStatus,
-    Provider, provider_error_response,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelMessage, ModelPreferences,
+    ModelPurpose, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
+    ModelTurnRequest, ModelTurnStatus, Provider, provider_error_response,
 };
 use singularity_policy::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
@@ -32,10 +32,14 @@ const NATIVE_AGENT_LOOP_READY_REASON: &str = "native Rust AgentLoop uses automat
 const NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
     "native Rust AgentLoop requires the Windows restricted-token command sandbox";
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 4;
-const APPROXIMATE_CHARS_PER_TOKEN: usize = 4;
+const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
+const MODEL_MESSAGE_FRAMING_TOKENS: u32 = 4;
+const MODEL_REQUEST_FIXED_OVERHEAD_TOKENS: u32 = 256;
 const EMPTY_FINAL_ANSWER_ERROR: &str = "empty final answer";
+const CURRENT_TURN_CONTEXT_OVERFLOW_ERROR: &str = "current turn exceeds the model context budget";
+const MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR: &str = "model request exceeds the model context budget";
 const COMMAND_SANDBOX_PROFILE_DENIED: &str =
     "command sandbox mode cannot exceed the permission profile";
 const COMMAND_NETWORK_PROFILE_DENIED: &str =
@@ -266,7 +270,7 @@ impl AgentLoopInput {
     pub fn with_history(mut self, history: impl IntoIterator<Item = AgentContextItem>) -> Self {
         let mut history: Vec<AgentContextItem> = history
             .into_iter()
-            .filter(AgentContextItem::is_safe_history)
+            .filter_map(AgentContextItem::into_safe_history)
             .collect();
         history.extend(self.input);
         self.input = history;
@@ -438,10 +442,31 @@ where
         let mut approval_requests = Vec::new();
         let mut pending_tool_calls = Vec::new();
         let mut used_approval_grants = HashSet::new();
-        let context = assemble_context_items(&input.input, DEFAULT_MAX_CONTEXT_TOKENS);
+        let context = assemble_context_items(
+            &input.input,
+            context_input_token_budget(input, &self.tool_broker),
+        );
+        if current_turn_excluded(input, &context) {
+            return context_overflow_result();
+        }
         let mut messages = model_messages_from_input(input, &context);
         let max_turns = input.max_turns.max(1);
         for turn_index in 0..max_turns {
+            if !model_request_fits_context(input, &self.tool_broker, &messages) {
+                return AgentLoopResult {
+                    status: AgentStatus::Failed,
+                    completed: false,
+                    final_answer: None,
+                    model_turns: turn_index,
+                    tool_calls: tool_results.len() as u32,
+                    approval_count: approval_requests.len() as u32,
+                    approval_requests,
+                    pending_tool_calls,
+                    tool_results,
+                    tool_repairs,
+                    error: Some(MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR.to_string()),
+                };
+            }
             let request = model_turn_request(
                 &self.tool_broker,
                 input,
@@ -647,7 +672,13 @@ where
                 };
             }
         };
-        let context = assemble_context_items(&input.input, DEFAULT_MAX_CONTEXT_TOKENS);
+        let context = assemble_context_items(
+            &input.input,
+            context_input_token_budget(input, &self.tool_broker),
+        );
+        if current_turn_excluded(input, &context) {
+            return context_overflow_result();
+        }
         let mut messages = model_messages_from_input(input, &context);
         messages.push(ModelMessage::assistant_tool_calls(vec![call.clone()]));
         let mut used_approval_grants = HashSet::new();
@@ -695,6 +726,21 @@ where
             };
         }
         let turn_index = 0;
+        if !model_request_fits_context(input, &self.tool_broker, &messages) {
+            return AgentLoopResult {
+                status: AgentStatus::Failed,
+                completed: false,
+                final_answer: None,
+                model_turns: 0,
+                tool_calls: tool_results.len() as u32,
+                approval_count: 1,
+                approval_requests: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_results,
+                tool_repairs,
+                error: Some(MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR.to_string()),
+            };
+        }
         let request = model_turn_request(&self.tool_broker, input, &context, turn_index, messages);
         let response = match self.provider.complete(&request) {
             Ok(response) => response,
@@ -996,18 +1042,32 @@ impl AgentContextItem {
         }
     }
 
-    fn is_safe_history(&self) -> bool {
-        self.priority == AgentContextItemPriority::History
-            && self.public
-            && !self.evaluator_only
-            && (self.role == USER_MESSAGE_ROLE || self.role == ASSISTANT_MESSAGE_ROLE)
+    fn into_safe_history(self) -> Option<Self> {
+        if self.priority != AgentContextItemPriority::History || !self.public || self.evaluator_only
+        {
+            return None;
+        }
+        match self.role.as_str() {
+            USER_MESSAGE_ROLE => Some(Self::history_user(self.item_id, self.content)),
+            ASSISTANT_MESSAGE_ROLE => Some(Self::history_assistant(self.item_id, self.content)),
+            _ => None,
+        }
     }
 }
 
 fn approximate_token_count(content: &str) -> u32 {
-    let char_count = content.chars().count();
-    let estimated =
-        char_count.saturating_add(APPROXIMATE_CHARS_PER_TOKEN - 1) / APPROXIMATE_CHARS_PER_TOKEN;
+    let mut ascii_chars = 0usize;
+    let mut non_ascii_chars = 0usize;
+    for character in content.chars() {
+        if character.is_ascii() {
+            ascii_chars = ascii_chars.saturating_add(1);
+        } else {
+            non_ascii_chars = non_ascii_chars.saturating_add(1);
+        }
+    }
+    let ascii_tokens = ascii_chars.saturating_add(APPROXIMATE_ASCII_CHARS_PER_TOKEN - 1)
+        / APPROXIMATE_ASCII_CHARS_PER_TOKEN;
+    let estimated = ascii_tokens.saturating_add(non_ascii_chars);
     u32::try_from(estimated.max(1)).unwrap_or(u32::MAX)
 }
 
@@ -1036,11 +1096,102 @@ pub struct CompletionGateInput {
     pub interrupted: bool,
 }
 
+fn context_input_token_budget(input: &AgentLoopInput, loop_tools: &ToolBroker) -> u32 {
+    let project_instruction_tokens = input
+        .project_instructions
+        .as_deref()
+        .map(approximate_token_count)
+        .unwrap_or_default();
+    let tool_tokens = serde_json::to_string(&model_tool_schemas(loop_tools))
+        .map_or(u32::MAX, |tools| approximate_token_count(&tools));
+    let message_count = u32::try_from(
+        input
+            .input
+            .len()
+            .saturating_add(usize::from(input.project_instructions.is_some())),
+    )
+    .unwrap_or(u32::MAX);
+    let framing_tokens = message_count.saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
+    let output_tokens = input
+        .model_preferences
+        .max_output_tokens
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    let reserved_tokens = output_tokens
+        .saturating_add(MODEL_REQUEST_FIXED_OVERHEAD_TOKENS)
+        .saturating_add(project_instruction_tokens)
+        .saturating_add(tool_tokens)
+        .saturating_add(framing_tokens);
+    DEFAULT_MAX_CONTEXT_TOKENS.saturating_sub(reserved_tokens)
+}
+
+fn model_request_fits_context(
+    input: &AgentLoopInput,
+    loop_tools: &ToolBroker,
+    messages: &[ModelMessage],
+) -> bool {
+    let projected_messages = messages
+        .iter()
+        .map(|message| {
+            let content = message
+                .content
+                .iter()
+                .filter_map(|block| block.text.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let tool_calls = message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.tool_call_id,
+                        "name": call.tool_name,
+                        "arguments": call.raw_arguments,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "role": message.role,
+                "content": content,
+                "name": message.name,
+                "tool_call_id": message.tool_call_id,
+                "tool_calls": tool_calls,
+            })
+        })
+        .collect::<Vec<_>>();
+    let projected_tools = model_tool_schemas(loop_tools)
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload_tokens = serde_json::to_string(&(projected_messages, projected_tools))
+        .map_or(u32::MAX, |payload| approximate_token_count(&payload));
+    let output_tokens = input
+        .model_preferences
+        .max_output_tokens
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    let message_framing = u32::try_from(messages.len())
+        .unwrap_or(u32::MAX)
+        .saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
+    payload_tokens
+        .saturating_add(output_tokens)
+        .saturating_add(message_framing)
+        .saturating_add(MODEL_REQUEST_FIXED_OVERHEAD_TOKENS)
+        <= DEFAULT_MAX_CONTEXT_TOKENS
+}
 pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> ContextBundle {
     let mut candidates: Vec<(usize, &AgentContextItem)> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| item.public && !item.evaluator_only)
+        .filter(|(_, item)| {
+            item.public
+                && !item.evaluator_only
+                && item.priority != AgentContextItemPriority::History
+        })
         .collect();
     candidates.sort_by_key(|(index, item)| (item.priority.rank(), *index));
 
@@ -1052,6 +1203,39 @@ pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> Co
         }
         used_tokens = used_tokens.saturating_add(item.token_count);
         included_indices.insert(index);
+    }
+
+    let history_indices: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.public
+                && !item.evaluator_only
+                && item.priority == AgentContextItemPriority::History
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let mut history_end = history_indices.len();
+    while history_end > 0 {
+        let mut history_start = history_end - 1;
+        let newest = &items[history_indices[history_start]];
+        if newest.role == ASSISTANT_MESSAGE_ROLE
+            && history_start > 0
+            && items[history_indices[history_start - 1]].role == USER_MESSAGE_ROLE
+        {
+            history_start -= 1;
+        }
+        let group_tokens = history_indices[history_start..history_end]
+            .iter()
+            .fold(0u32, |total, index| {
+                total.saturating_add(items[*index].token_count)
+            });
+        if group_tokens > max_tokens.saturating_sub(used_tokens) {
+            break;
+        }
+        used_tokens = used_tokens.saturating_add(group_tokens);
+        included_indices.extend(history_indices[history_start..history_end].iter().copied());
+        history_end = history_start;
     }
 
     let mut included_item_ids = Vec::new();
@@ -1082,7 +1266,8 @@ pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> Co
         included_item_ids,
         excluded_item_ids,
         budget: json!({
-            "model_context_window": max_tokens,
+            "model_context_window": DEFAULT_MAX_CONTEXT_TOKENS,
+            "input_token_budget": max_tokens,
             "message_tokens": used_tokens,
         }),
         compression_snapshot_id: None,
@@ -1097,6 +1282,30 @@ pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> Co
     }
 }
 
+fn current_turn_excluded(input: &AgentLoopInput, context: &ContextBundle) -> bool {
+    input.input.iter().any(|item| {
+        item.priority == AgentContextItemPriority::CurrentTurn
+            && item.public
+            && !item.evaluator_only
+            && !context.included_item_ids.contains(&item.item_id)
+    })
+}
+
+fn context_overflow_result() -> AgentLoopResult {
+    AgentLoopResult {
+        status: AgentStatus::Failed,
+        completed: false,
+        final_answer: None,
+        model_turns: 0,
+        tool_calls: 0,
+        approval_count: 0,
+        approval_requests: Vec::new(),
+        pending_tool_calls: Vec::new(),
+        tool_results: Vec::new(),
+        tool_repairs: Vec::new(),
+        error: Some(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string()),
+    }
+}
 pub fn planner_next_action(state: &PlannerState) -> PlannerNextAction {
     if state
         .open_actions

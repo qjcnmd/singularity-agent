@@ -54,7 +54,7 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
                     respond(json!({"thread": thread.clone()})),
                 ],
             )
-            .respond("thread/read", json!({"thread": thread.clone()}))
+            .respond("thread/resume", json!({"thread": thread.clone()}))
             .respond("thread/list", json!({"threads": [thread]}))
             .interaction(
                 "turn/start",
@@ -928,6 +928,53 @@ fn cli_requests_server_shutdown_before_process_teardown() {
 }
 
 #[test]
+fn cli_continue_resumes_thread_and_does_not_upload_history() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let method_trace = temp.path().join("methods.log");
+    let turn_params = temp.path().join("turn-params.json");
+    let thread = fake_thread("thread_resume");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .native_ready()
+            .respond("thread/resume", json!({"thread": thread}))
+            .interaction(
+                "turn/start",
+                vec![
+                    capture_params(&turn_params),
+                    respond(json!({
+                        "turn": fake_turn(
+                            "turn_resume",
+                            "thread_resume",
+                            "completed",
+                            "completed"
+                        )
+                    })),
+                ],
+            )
+            .trace_methods_to(&method_trace)
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["continue", "thread_resume", "continue safely"])
+        .output()
+        .expect("continue cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let methods = std::fs::read_to_string(method_trace).expect("method trace");
+    assert!(methods.contains("thread/resume"));
+    assert!(!methods.contains("thread/read"));
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(turn_params).expect("turn params"))
+            .expect("turn params json");
+    assert_eq!(params["threadId"], "thread_resume");
+    assert_eq!(params["input"][0]["text"], "continue safely");
+    assert!(params.get("history").is_none());
+}
+#[test]
 fn cli_continue_rejects_invalid_thread_id_through_app_server() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
@@ -1215,8 +1262,10 @@ fn cli_outputs_json_rpc_initialize_request() {
 
 #[test]
 fn cli_outputs_json_rpc_thread_start_request() {
+    let temp = tempfile::tempdir().expect("temp dir");
     let mut command = Command::cargo_bin("sg").expect("binary");
     let output = command
+        .current_dir(temp.path())
         .args(["thread-start", "--model", "gpt-test"])
         .output()
         .expect("run cli");
@@ -1226,6 +1275,13 @@ fn cli_outputs_json_rpc_thread_start_request() {
         serde_json::from_slice(&output.stdout).expect("json-rpc thread/start output");
     assert_eq!(value["method"], "thread/start");
     assert_eq!(value["params"]["model"], "gpt-test");
+    assert_eq!(
+        value["params"]["cwd"],
+        std::fs::canonicalize(temp.path())
+            .expect("canonical temp dir")
+            .to_string_lossy()
+            .as_ref()
+    );
 }
 
 #[test]

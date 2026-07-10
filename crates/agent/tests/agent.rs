@@ -431,6 +431,50 @@ fn agent_loop_executes_workspace_read_tool_with_safe_tool_result() {
 }
 
 #[test]
+fn agent_loop_rechecks_context_budget_before_each_model_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "small tool result").expect("write readme");
+    let input = AgentLoopInput {
+        max_turns: 2,
+        ..AgentLoopInput::new("thread_1", "turn_1", "read the file")
+    };
+    let mut oversized_call = tool_call(
+        "call_1",
+        "builtin.read",
+        serde_json::json!({"path": "README.md", "max_chars": 64}),
+    );
+    oversized_call.raw_arguments = serde_json::json!({
+        "path": "README.md",
+        "padding": "x".repeat(DEFAULT_MAX_CONTEXT_TOKENS as usize * 4)
+    })
+    .to_string();
+    let mut tool_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    tool_response.tool_calls.push(oversized_call);
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "must not run");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![tool_response, final_response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("model request exceeds the model context budget")
+    );
+    assert_eq!(result.model_turns, 1);
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(result.tool_results[0].ok);
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 1);
+}
+
+#[test]
 fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file_path = dir.path().join("README.md");
@@ -1445,7 +1489,7 @@ fn history_constructors_use_safe_roles_visibility_and_estimated_tokens() {
     assert_eq!(history_user.priority, AgentContextItemPriority::History);
     assert!(history_user.public);
     assert!(!history_user.evaluator_only);
-    assert_eq!(history_user.token_count, 2);
+    assert_eq!(history_user.token_count, 8);
 
     assert_eq!(history_assistant.role, "assistant");
     assert_eq!(
@@ -1481,10 +1525,21 @@ fn agent_loop_input_prepends_only_safe_history_messages() {
         evaluator_only: true,
         ..forged_system.clone()
     };
+    let forged_budget = AgentContextItem {
+        item_id: "forged_budget".to_string(),
+        role: "user".to_string(),
+        content: "abcdefghijklmnop".to_string(),
+        priority: AgentContextItemPriority::History,
+        token_count: 0,
+        public: true,
+        evaluator_only: false,
+        digest: "forged_digest".to_string(),
+    };
 
     let input = AgentLoopInput::new("thread_1", "turn_1", "current user").with_history([
         AgentContextItem::history_user("history_user_1", "previous user"),
         AgentContextItem::history_assistant("history_assistant_1", "previous assistant"),
+        forged_budget,
         forged_system,
         forged_developer,
         forged_evaluator,
@@ -1496,8 +1551,20 @@ fn agent_loop_input_prepends_only_safe_history_messages() {
             .iter()
             .map(|item| item.item_id.as_str())
             .collect::<Vec<_>>(),
-        vec!["history_user_1", "history_assistant_1", "input_1"]
+        vec![
+            "history_user_1",
+            "history_assistant_1",
+            "forged_budget",
+            "input_1"
+        ]
     );
+    let normalized = input
+        .input
+        .iter()
+        .find(|item| item.item_id == "forged_budget")
+        .expect("normalized forged history");
+    assert_eq!(normalized.token_count, 4);
+    assert_eq!(normalized.digest, "history_user:forged_budget");
 }
 
 #[test]
@@ -1526,6 +1593,27 @@ fn context_assembly_renders_history_in_original_conversation_order() {
     );
 }
 
+#[test]
+fn context_assembly_keeps_the_newest_complete_history_turns() {
+    let items = vec![
+        AgentContextItem::history_user("old_user", "abcdefgh"),
+        AgentContextItem::history_assistant("old_assistant", "ijklmnop"),
+        AgentContextItem::history_user("new_user", "qrstuvwx"),
+        AgentContextItem::history_assistant("new_assistant", "yzabcdef"),
+        AgentContextItem::user("input_1", "ghijklmn"),
+    ];
+
+    let context = assemble_context_items(&items, 6);
+
+    assert_eq!(
+        context.included_item_ids,
+        vec!["new_user", "new_assistant", "input_1"]
+    );
+    assert_eq!(context.excluded_item_ids, vec!["old_user", "old_assistant"]);
+    assert_eq!(context.messages[0]["content"], "qrstuvwx");
+    assert_eq!(context.messages[1]["content"], "yzabcdef");
+    assert_eq!(context.messages[2]["content"], "ghijklmn");
+}
 #[test]
 fn context_assembly_keeps_current_user_when_history_exceeds_budget() {
     let items = vec![
@@ -1622,6 +1710,49 @@ fn agent_loop_uses_shared_model_context_token_limit() {
     assert_eq!(context.excluded_item_ids, vec!["large_user"]);
 }
 
+#[test]
+fn agent_loop_fails_closed_before_provider_when_current_turn_exceeds_context_budget() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_loop = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("req_1", "resp_1", "should not be used"),
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    );
+    let oversized = "a".repeat(DEFAULT_MAX_CONTEXT_TOKENS as usize * 4 + 1);
+    let input = AgentLoopInput::new("thread_1", "turn_1", oversized);
+
+    let result = agent_loop.run(&input);
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("current turn exceeds the model context budget")
+    );
+    assert_eq!(result.model_turns, 0);
+    assert!(seen_requests.lock().expect("seen requests").is_empty());
+}
+
+#[test]
+fn agent_loop_reserves_the_requested_model_output_budget() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_loop = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("req_1", "resp_1", "should not be used"),
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    );
+    let mut input = AgentLoopInput::new("thread_1", "turn_1", "current user");
+    input.model_preferences.max_output_tokens = Some(DEFAULT_MAX_CONTEXT_TOKENS);
+
+    let result = agent_loop.run(&input);
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("current turn exceeds the model context budget")
+    );
+    assert_eq!(result.model_turns, 0);
+    assert!(seen_requests.lock().expect("seen requests").is_empty());
+}
 #[test]
 fn planner_repair_completion_and_final_mapping_are_deterministic() {
     let pending_approval = PlannerState {

@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-use std::time::Duration;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,9 +27,11 @@ const PENDING_TOOL_CALL_SCHEMA_MIGRATION: &str = "0004_pending_tool_calls";
 const STORE_HARDENING_SCHEMA_MIGRATION: &str = "0005_store_hardening";
 const CONVERSATION_HISTORY_SCHEMA_MIGRATION: &str = "0006_conversation_history";
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+const STORE_INITIALIZATION_LOCK_RETRY_MS: u64 = 10;
 const SQLITE_FOREIGN_KEYS_PRAGMA: &str = "foreign_keys";
 const SQLITE_JOURNAL_MODE_PRAGMA: &str = "journal_mode";
 const SQLITE_JOURNAL_MODE_WAL: &str = "WAL";
+const SQLITE_SECURE_DELETE_PRAGMA: &str = "secure_delete";
 const REDACTED_ARTIFACT_VALUE: &str = "[redacted]";
 const REDACTED_USER_INPUT: &str = "[redacted sensitive user input]";
 const REDACTED_ASSISTANT_OUTPUT: &str = "[redacted sensitive assistant output]";
@@ -60,6 +64,8 @@ pub enum StoreError {
     TraceIntegrity(String),
     #[error("invalid store state: {0}")]
     InvalidState(String),
+    #[error("store initialization lock error: {0}")]
+    InitializationLock(#[source] std::io::Error),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -83,6 +89,13 @@ pub struct StartedTurn {
     pub item: Item,
     pub trace: TraceEvent,
     pub history: ThreadHistoryPage,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommittedTurnOutcome {
+    pub turn: Turn,
+    pub assistant_item: Option<Item>,
+    pub trace: TraceEvent,
 }
 
 pub struct SessionStore {
@@ -111,6 +124,7 @@ pub struct RegisterArtifactRefParams<'a> {
 impl SessionStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
+        let _initialization_lock = acquire_store_initialization_lock(path)?;
         let connection = Connection::open(path)?;
         configure_connection(&connection)?;
         let store = Self {
@@ -267,7 +281,8 @@ impl SessionStore {
     }
 
     pub fn create_turn(&self, thread_id: &str, agent_loop_status: &str) -> StoreResult<Turn> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         Self::ensure_active_thread(&transaction, thread_id)?;
         let turn_sequence = Self::next_turn_sequence(&transaction, thread_id)?;
         let turn = Self::new_turn(thread_id, agent_loop_status);
@@ -304,7 +319,8 @@ impl SessionStore {
         summary: &str,
         history_turn_limit: usize,
     ) -> StoreResult<StartedTurn> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         Self::ensure_active_thread(&transaction, thread_id)?;
         let history =
             Self::read_thread_history_from(&transaction, thread_id, None, history_turn_limit)?;
@@ -356,6 +372,35 @@ impl SessionStore {
         Ok(history)
     }
 
+    pub fn read_thread_history_before_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        turn_limit: usize,
+    ) -> StoreResult<ThreadHistoryPage> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let turn_sequence = transaction
+            .query_row(
+                "select turn_sequence from turns where turn_id = ?1 and thread_id = ?2",
+                params![turn_id, thread_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("turn {turn_id} in thread {thread_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        let history = Self::read_thread_history_from(
+            &transaction,
+            thread_id,
+            Some(sequence_from_sql(turn_sequence, "turn sequence")?),
+            turn_limit,
+        )?;
+        transaction.commit()?;
+        Ok(history)
+    }
+
     pub fn get_turn(&self, turn_id: &str) -> StoreResult<Turn> {
         self.connection
             .query_row(
@@ -398,8 +443,81 @@ impl SessionStore {
         self.get_turn(turn_id)
     }
 
+    pub fn commit_turn_outcome(
+        &self,
+        turn_id: &str,
+        status: TurnStatus,
+        agent_loop_status: &str,
+        assistant_delta: Option<&str>,
+        trace: &TraceEvent,
+    ) -> StoreResult<CommittedTurnOutcome> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                "select turn_id, thread_id, status, agent_loop_status from turns where turn_id = ?1",
+                params![turn_id],
+                |row| self.turn_from_row(row),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("turn {turn_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        validate_turn_status_update(&current, &status, Some(agent_loop_status))?;
+        if trace.run_id != current.thread_id || trace.session_id != current.turn_id {
+            return Err(StoreError::InvalidState(
+                "turn outcome trace must be bound to the same thread and turn".to_string(),
+            ));
+        }
+        match (&status, assistant_delta) {
+            (TurnStatus::Completed, Some(delta)) if !delta.trim().is_empty() => {}
+            (TurnStatus::Completed, _) => {
+                return Err(StoreError::InvalidState(
+                    "completed turn outcome requires a non-empty assistant message".to_string(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(StoreError::InvalidState(
+                    "only a completed turn outcome may include an assistant message".to_string(),
+                ));
+            }
+            (_, None) => {}
+        }
+
+        transaction.execute(
+            "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
+            params![serde_json::to_string(&status)?, agent_loop_status, turn_id],
+        )?;
+        let turn = Turn {
+            status,
+            agent_loop_status: agent_loop_status.to_string(),
+            ..current
+        };
+        let assistant_item = assistant_delta
+            .map(|delta| -> StoreResult<Item> {
+                let kind = ItemKind::AgentMessage;
+                let (payload, redacted) =
+                    sanitize_item_payload(&kind, serde_json::json!({"delta": delta}))?;
+                let item = Self::new_item(turn_id, kind, payload);
+                let item_sequence = Self::next_item_sequence(&transaction, turn_id)?;
+                Self::insert_item(&transaction, &item, item_sequence, redacted)?;
+                Ok(item)
+            })
+            .transpose()?;
+        let trace = Self::insert_trace(&transaction, trace)?;
+        transaction.commit()?;
+        Ok(CommittedTurnOutcome {
+            turn,
+            assistant_item,
+            trace,
+        })
+    }
+
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if !Self::exists_in_transaction(
             &transaction,
             "select 1 from turns where turn_id = ?1",
@@ -596,6 +714,14 @@ impl SessionStore {
                 other => StoreError::Sqlite(other),
             })?;
         Ok(serde_json::from_str(&payload)?)
+    }
+
+    pub fn has_pending_tool_call(&self, request_id: &str) -> StoreResult<bool> {
+        Self::exists_in_transaction(
+            &self.connection,
+            "select 1 from pending_tool_calls where request_id = ?1",
+            request_id,
+        )
     }
 
     pub fn list_approval_decisions(&self) -> StoreResult<Vec<ApprovalDecision>> {
@@ -838,18 +964,55 @@ impl SessionStore {
         }
 
         let completed_turn = serde_json::to_string(&TurnStatus::Completed)?;
+        let completed_item = serde_json::to_string(&ItemStatus::Completed)?;
+        let user_message = serde_json::to_string(&ItemKind::UserMessage)?;
+        let agent_message = serde_json::to_string(&ItemKind::AgentMessage)?;
         let before_turn_sequence = before_turn_sequence
             .map(|sequence| sequence_to_sql(sequence, "before turn sequence"))
             .transpose()?;
         let candidate_limit = i64::try_from(turn_limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut statement = connection.prepare(
-            "select turn_sequence from turns where thread_id = ?1 and status = ?2 and (?3 is null or turn_sequence < ?3) order by turn_sequence desc limit ?4",
+            "select turns.turn_sequence
+             from turns
+             where turns.thread_id = ?1
+               and turns.status = ?2
+               and (?3 is null or turns.turn_sequence < ?3)
+               and exists (
+                   select 1
+                   from items as user_item
+                   join items as agent_item on agent_item.turn_id = user_item.turn_id
+                   where user_item.turn_id = turns.turn_id
+                     and user_item.status = ?4
+                     and agent_item.status = ?4
+                     and user_item.kind = ?5
+                     and agent_item.kind = ?6
+                     and user_item.item_sequence < agent_item.item_sequence
+               )
+               and 1 = (
+                   select count(*)
+                   from items
+                   where items.turn_id = turns.turn_id
+                     and items.status = ?4
+                     and items.kind = ?5
+               )
+               and 1 = (
+                   select count(*)
+                   from items
+                   where items.turn_id = turns.turn_id
+                     and items.status = ?4
+                     and items.kind = ?6
+               )
+             order by turns.turn_sequence desc
+             limit ?7",
         )?;
         let rows = statement.query_map(
             params![
                 thread_id,
                 completed_turn,
                 before_turn_sequence,
+                completed_item,
+                user_message,
+                agent_message,
                 candidate_limit
             ],
             |row| row.get::<_, i64>(0),
@@ -875,24 +1038,46 @@ impl SessionStore {
             None
         };
         let selected_turn_limit = i64::try_from(turn_sequences.len()).unwrap_or(i64::MAX);
-        let completed_item = serde_json::to_string(&ItemStatus::Completed)?;
-        let user_message = serde_json::to_string(&ItemKind::UserMessage)?;
-        let agent_message = serde_json::to_string(&ItemKind::AgentMessage)?;
         let mut statement = connection.prepare(
             "with selected_turns as (
-                select turn_id, turn_sequence
+                select turns.turn_id, turns.turn_sequence
                 from turns
-                where thread_id = ?1
-                  and status = ?2
-                  and (?3 is null or turn_sequence < ?3)
-                order by turn_sequence desc
-                limit ?4
+                where turns.thread_id = ?1
+                  and turns.status = ?2
+                  and (?3 is null or turns.turn_sequence < ?3)
+                  and exists (
+                      select 1
+                      from items as user_item
+                      join items as agent_item on agent_item.turn_id = user_item.turn_id
+                      where user_item.turn_id = turns.turn_id
+                        and user_item.status = ?4
+                        and agent_item.status = ?4
+                        and user_item.kind = ?5
+                        and agent_item.kind = ?6
+                        and user_item.item_sequence < agent_item.item_sequence
+                  )
+                  and 1 = (
+                      select count(*)
+                      from items
+                      where items.turn_id = turns.turn_id
+                        and items.status = ?4
+                        and items.kind = ?5
+                  )
+                  and 1 = (
+                      select count(*)
+                      from items
+                      where items.turn_id = turns.turn_id
+                        and items.status = ?4
+                        and items.kind = ?6
+                  )
+                order by turns.turn_sequence desc
+                limit ?7
             )
             select items.item_id, items.turn_id, selected_turns.turn_sequence,
                    items.item_sequence, items.kind, items.payload, items.redacted
             from selected_turns
             join items on items.turn_id = selected_turns.turn_id
-            where items.status = ?5 and items.kind in (?6, ?7)
+            where items.status = ?4 and items.kind in (?5, ?6)
             order by selected_turns.turn_sequence, items.item_sequence",
         )?;
         let rows = statement.query_map(
@@ -900,10 +1085,10 @@ impl SessionStore {
                 thread_id,
                 completed_turn,
                 before_turn_sequence,
-                selected_turn_limit,
                 completed_item,
                 user_message,
                 agent_message,
+                selected_turn_limit,
             ],
             |row| {
                 Ok((
@@ -1138,30 +1323,35 @@ impl SessionStore {
     }
 
     fn migrate_conversation_history(&self) -> StoreResult<()> {
-        let migration_applied = self.exists(
-            "select 1 from schema_migrations where migration_id = ?1",
-            CONVERSATION_HISTORY_SCHEMA_MIGRATION,
-        )?;
-        let has_turn_sequence = self.table_has_column("turns", "turn_sequence")?;
-        let has_item_sequence = self.table_has_column("items", "item_sequence")?;
-        let has_item_redacted = self.table_has_column("items", "redacted")?;
-        let has_complete_schema = has_turn_sequence && has_item_sequence && has_item_redacted;
-        let has_partial_schema = has_turn_sequence || has_item_sequence || has_item_redacted;
-        if migration_applied && !has_complete_schema {
-            return Err(StoreError::InvalidState(
-                "conversation history migration is recorded but schema is incomplete".to_string(),
-            ));
-        }
-        if !has_complete_schema && has_partial_schema {
-            return Err(StoreError::InvalidState(
-                "conversation history schema is partially migrated".to_string(),
-            ));
-        }
-
         self.connection
             .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "OFF")?;
-        let migration_result = (|| -> StoreResult<()> {
-            let transaction = self.connection.unchecked_transaction()?;
+        let migration_result = (|| -> StoreResult<(bool, bool)> {
+            let transaction =
+                Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            let migration_applied = Self::exists_in_transaction(
+                &transaction,
+                "select 1 from schema_migrations where migration_id = ?1",
+                CONVERSATION_HISTORY_SCHEMA_MIGRATION,
+            )?;
+            let has_turn_sequence = table_has_column(&transaction, "turns", "turn_sequence")?;
+            let has_item_sequence = table_has_column(&transaction, "items", "item_sequence")?;
+            let has_item_redacted = table_has_column(&transaction, "items", "redacted")?;
+            let has_complete_schema = has_turn_sequence && has_item_sequence && has_item_redacted;
+            let has_partial_schema = has_turn_sequence || has_item_sequence || has_item_redacted;
+            if migration_applied && !has_complete_schema {
+                return Err(StoreError::InvalidState(
+                    "conversation history migration is recorded but schema is incomplete"
+                        .to_string(),
+                ));
+            }
+            if !has_complete_schema && has_partial_schema {
+                return Err(StoreError::InvalidState(
+                    "conversation history schema is partially migrated".to_string(),
+                ));
+            }
+            let legacy_item_count: u64 =
+                transaction.query_row("select count(*) from items", [], |row| row.get(0))?;
+            let needs_secure_rewrite = !migration_applied && legacy_item_count > 0;
             if !has_complete_schema {
                 transaction.execute_batch(
                     "
@@ -1206,6 +1396,9 @@ impl SessionStore {
                     ",
                 )?;
             }
+            if !migration_applied {
+                sanitize_migrated_items(&transaction)?;
+            }
             let invalid_turn_sequences: u64 = transaction.query_row(
                 "select count(*) from turns where turn_sequence is null or turn_sequence <= 0",
                 [],
@@ -1228,27 +1421,39 @@ impl SessionStore {
                     on turns(thread_id, turn_sequence);
                 create unique index if not exists items_turn_sequence_unique
                     on items(turn_id, item_sequence);
+                create index if not exists turns_history_lookup
+                    on turns(thread_id, status, turn_sequence);
+                create index if not exists items_history_lookup
+                    on items(turn_id, status, kind, item_sequence);
                 ",
             )?;
             fail_closed_on_foreign_key_violations(&transaction)?;
-            transaction.execute(
-                "insert or ignore into schema_migrations(migration_id) values(?1)",
-                params![CONVERSATION_HISTORY_SCHEMA_MIGRATION],
-            )?;
-            transaction.execute("delete from schema_meta", [])?;
-            transaction.execute(
-                "insert into schema_meta(schema_version) values(?1)",
-                params![SCHEMA_VERSION],
-            )?;
+            if migration_applied {
+                write_schema_version(&transaction)?;
+            }
             transaction.commit()?;
-            Ok(())
+            Ok((migration_applied, needs_secure_rewrite))
         })();
         let foreign_keys_result = self
             .connection
             .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")
             .map_err(StoreError::Sqlite);
-        migration_result?;
+        let (migration_applied, needs_secure_rewrite) = migration_result?;
         foreign_keys_result?;
+        if needs_secure_rewrite {
+            secure_rewrite_database(&self.connection)?;
+        }
+        if !migration_applied {
+            let transaction =
+                Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            fail_closed_on_foreign_key_violations(&transaction)?;
+            transaction.execute(
+                "insert into schema_migrations(migration_id) values(?1)",
+                params![CONVERSATION_HISTORY_SCHEMA_MIGRATION],
+            )?;
+            write_schema_version(&transaction)?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -1380,6 +1585,10 @@ impl SessionStore {
                     on turns(thread_id, turn_sequence);
                 create unique index items_turn_sequence_unique
                     on items(turn_id, item_sequence);
+                create index turns_history_lookup
+                    on turns(thread_id, status, turn_sequence);
+                create index items_history_lookup
+                    on items(turn_id, status, kind, item_sequence);
 
                 create table approval_decisions_new(
                     decision_id text primary key,
@@ -1439,15 +1648,7 @@ impl SessionStore {
     }
 
     fn table_has_column(&self, table: &str, column: &str) -> StoreResult<bool> {
-        let query = format!("pragma table_info({table})");
-        let mut statement = self.connection.prepare(&query)?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-        for row in rows {
-            if row? == column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        table_has_column(&self.connection, table, column)
     }
 
     fn ensure_turn_status_update_allowed(
@@ -1457,19 +1658,7 @@ impl SessionStore {
         next_agent_loop_status: Option<&str>,
     ) -> StoreResult<()> {
         let current = self.get_turn(turn_id)?;
-        if is_terminal_turn_status(&current.status) {
-            if current.status != *next_status {
-                return Err(StoreError::InvalidState(
-                    "terminal turn status cannot be overwritten".to_string(),
-                ));
-            }
-            if next_agent_loop_status.is_some_and(|status| status != current.agent_loop_status) {
-                return Err(StoreError::InvalidState(
-                    "terminal turn agent_loop_status cannot be overwritten".to_string(),
-                ));
-            }
-        }
-        Ok(())
+        validate_turn_status_update(&current, next_status, next_agent_loop_status)
     }
 
     fn new_thread(model: Option<&str>, cwd: Option<&str>) -> Thread {
@@ -1576,10 +1765,83 @@ impl SessionStore {
 }
 
 fn configure_connection(connection: &Connection) -> StoreResult<()> {
+    connection.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+    connection.pragma_update(None, SQLITE_SECURE_DELETE_PRAGMA, "ON")?;
     connection.pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")?;
     connection.pragma_update(None, SQLITE_JOURNAL_MODE_PRAGMA, SQLITE_JOURNAL_MODE_WAL)?;
-    connection.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
     Ok(())
+}
+
+fn acquire_store_initialization_lock(path: &Path) -> StoreResult<Option<File>> {
+    if path == Path::new(":memory:") {
+        return Ok(None);
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".init.lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(StoreError::InitializationLock)?;
+    let deadline = Instant::now() + Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS);
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => return Ok(Some(lock_file)),
+            Err(error) => {
+                let error = std::io::Error::from(error);
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(StoreError::InitializationLock(error));
+                }
+                if Instant::now() >= deadline {
+                    return Err(StoreError::InvalidState(
+                        "timed out waiting for store initialization lock".to_string(),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(STORE_INITIALIZATION_LOCK_RETRY_MS));
+            }
+        }
+    }
+}
+
+fn write_schema_version(connection: &Connection) -> StoreResult<()> {
+    connection.execute("delete from schema_meta", [])?;
+    connection.execute(
+        "insert into schema_meta(schema_version) values(?1)",
+        params![SCHEMA_VERSION],
+    )?;
+    Ok(())
+}
+
+fn secure_rewrite_database(connection: &Connection) -> StoreResult<()> {
+    truncate_wal(connection)?;
+    connection.execute_batch("vacuum")?;
+    truncate_wal(connection)
+}
+
+fn truncate_wal(connection: &Connection) -> StoreResult<()> {
+    let busy: i64 =
+        connection.query_row("pragma wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(StoreError::InvalidState(
+            "sqlite WAL checkpoint remained busy during secure rewrite".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> StoreResult<bool> {
+    let query = format!("pragma table_info({table})");
+    let mut statement = connection.prepare(&query)?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn next_sequence(current: Option<i64>, label: &str) -> StoreResult<u64> {
@@ -1602,6 +1864,30 @@ fn sequence_from_sql(sequence: i64, label: &str) -> StoreResult<u64> {
         .map_err(|_| StoreError::InvalidState(format!("{label} must be non-negative")))
 }
 
+fn sanitize_migrated_items(connection: &Connection) -> StoreResult<()> {
+    let items = {
+        let mut statement = connection
+            .prepare("select item_id, kind, payload from items order by turn_id, item_sequence")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (item_id, kind, payload) in items {
+        let kind: ItemKind = serde_json::from_str(&kind)?;
+        let payload: Value = serde_json::from_str(&payload)?;
+        let (payload, redacted) = sanitize_item_payload(&kind, payload)?;
+        connection.execute(
+            "update items set payload = ?1, redacted = ?2 where item_id = ?3",
+            params![serde_json::to_string(&payload)?, redacted, item_id],
+        )?;
+    }
+    Ok(())
+}
 fn sanitize_item_payload(kind: &ItemKind, mut payload: Value) -> StoreResult<(Value, bool)> {
     match kind {
         ItemKind::UserMessage => {
@@ -1811,6 +2097,26 @@ fn is_terminal_turn_status(status: &TurnStatus) -> bool {
     )
 }
 
+fn validate_turn_status_update(
+    current: &Turn,
+    next_status: &TurnStatus,
+    next_agent_loop_status: Option<&str>,
+) -> StoreResult<()> {
+    if is_terminal_turn_status(&current.status) {
+        if current.status != *next_status {
+            return Err(StoreError::InvalidState(
+                "terminal turn status cannot be overwritten".to_string(),
+            ));
+        }
+        if next_agent_loop_status.is_some_and(|status| status != current.agent_loop_status) {
+            return Err(StoreError::InvalidState(
+                "terminal turn agent_loop_status cannot be overwritten".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn insert_approval(connection: &Connection, request: &ApprovalRequest) -> StoreResult<()> {
     ensure_approval_request_binding(connection, request)?;
     connection
@@ -1997,9 +2303,14 @@ mod tests {
             .connection
             .query_row("pragma busy_timeout", [], |row| row.get(0))
             .expect("busy timeout pragma");
+        let secure_delete: u32 = store
+            .connection
+            .query_row("pragma secure_delete", [], |row| row.get(0))
+            .expect("secure delete pragma");
 
         assert_eq!(foreign_keys, 1);
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         assert_eq!(busy_timeout_ms, SQLITE_BUSY_TIMEOUT_MS);
+        assert_eq!(secure_delete, 1);
     }
 }

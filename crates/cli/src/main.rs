@@ -168,11 +168,14 @@ fn main() {
 fn run_cli(cli: Cli) -> Result<(), String> {
     match cli.command.unwrap_or(Command::ProtocolInit) {
         Command::ProtocolInit => print_wire_request(initialize_request(0)),
-        Command::ThreadStart { model } => print_wire_request(JsonRpcMessage::request(
-            Method::ThreadStart,
-            json!(1),
-            json!({"model": model}),
-        )),
+        Command::ThreadStart { model } => {
+            let cwd = canonical_current_dir()?;
+            print_wire_request(JsonRpcMessage::request(
+                Method::ThreadStart,
+                json!(1),
+                json!({"model": model, "cwd": cwd}),
+            ))
+        }
         Command::Daemon { db } => run_daemon(db),
         Command::Run { goal, model, json } | Command::Chat { goal, model, json } => {
             let mut client = AppServerClient::spawn()?;
@@ -214,7 +217,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
             ensure_native_agent_loop_available(&mut client)?;
-            client.thread_read(&thread_id)?;
+            client.thread_resume(&thread_id)?;
             println!("thread {thread_id}");
             let (turn, _events) = client.turn_start(&thread_id, &instruction, true)?;
             fail_for_failed_turn(&turn["turn"])?;
@@ -485,10 +488,11 @@ impl AppServerClient {
         render: bool,
     ) -> Result<(Value, Vec<Value>), String> {
         let id = self.next_request_id();
+        let cwd = canonical_current_dir()?;
         let responses = self.request(JsonRpcMessage::request(
             Method::ThreadStart,
             json!(id),
-            json!({"model": model}),
+            json!({"model": model, "cwd": cwd}),
         ))?;
         if render {
             render_messages(&responses, false);
@@ -508,10 +512,10 @@ impl AppServerClient {
         first_result(responses)
     }
 
-    fn thread_read(&mut self, thread_id: &str) -> Result<Value, String> {
+    fn thread_resume(&mut self, thread_id: &str) -> Result<Value, String> {
         let id = self.next_request_id();
         first_result(self.request(JsonRpcMessage::request(
-            Method::ThreadRead,
+            Method::ThreadResume,
             json!(id),
             json!({"threadId": thread_id}),
         ))?)
@@ -836,6 +840,15 @@ fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<Result<String, String>>
     (receiver, handle)
 }
 
+fn canonical_current_dir() -> Result<String, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("failed to read current directory: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize current directory: {error}"))?;
+    cwd.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "current directory is not valid UTF-8".to_string())
+}
 fn initialize_request(id: i64) -> JsonRpcMessage {
     JsonRpcMessage::request(
         Method::Initialize,

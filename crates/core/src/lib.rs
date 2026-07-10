@@ -17,6 +17,7 @@ use time::format_description::well_known::Rfc3339;
 
 pub const JSON_RPC_INVALID_REQUEST: i64 = -32600;
 pub const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
+pub const JSON_RPC_INVALID_PARAMS: i64 = -32602;
 pub const JSON_RPC_INTERNAL_ERROR: i64 = -32603;
 pub const APP_ERROR_NOT_INITIALIZED: i64 = -32002;
 pub const APP_ERROR_ALREADY_INITIALIZED: i64 = -32003;
@@ -203,6 +204,10 @@ impl ErrorCode {
 
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::new(JSON_RPC_INVALID_REQUEST, message)
+    }
+
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Self::new(JSON_RPC_INVALID_PARAMS, message)
     }
 
     pub fn method_not_found(method: impl AsRef<str>) -> Self {

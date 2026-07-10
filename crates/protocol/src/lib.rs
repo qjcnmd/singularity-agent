@@ -239,6 +239,13 @@ pub struct ThreadIdParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadReadParams {
+    pub thread_id: String,
+    pub before_turn_sequence: Option<u64>,
+    pub limit: Option<u32>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ThreadForkParams {
     #[serde(rename = "threadId")]
     pub thread_id: String,
@@ -276,6 +283,33 @@ pub struct ThreadResult {
     pub thread: Thread,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationMessage {
+    pub item_id: String,
+    pub turn_id: String,
+    pub turn_sequence: u64,
+    pub item_sequence: u64,
+    pub role: ConversationRole,
+    pub content: String,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadResult {
+    pub thread: Thread,
+    pub messages: Vec<ConversationMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_before_turn_sequence: Option<u64>,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ThreadForkResult {
     #[serde(rename = "sourceThreadId")]

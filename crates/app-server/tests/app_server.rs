@@ -90,6 +90,15 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         .unwrap();
     let thread_result = result_message(&thread);
     let thread_id = thread_result["thread"]["thread_id"].as_str().unwrap();
+    assert_eq!(
+        thread_result["thread"]["cwd"],
+        std::env::current_dir()
+            .expect("current dir")
+            .canonicalize()
+            .expect("canonical current dir")
+            .to_string_lossy()
+            .as_ref()
+    );
     assert!(
         thread
             .iter()
@@ -176,6 +185,23 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         .unwrap();
     assert_eq!(archived[0]["result"]["thread"]["status"], "archived");
 
+    let rejected_turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":431,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"must resume first"}}]}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(
+        rejected_turn[0]["error"]["message"],
+        "Thread is archived; resume it before starting a turn"
+    );
+
+    let resumed = server
+        .handle_json(&format!(
+            r#"{{"method":"thread/resume","id":432,"params":{{"threadId":"{thread_id}"}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(resumed[0]["result"]["thread"]["status"], "active");
+
     let forked = server
         .handle_json(&format!(
             r#"{{"method":"thread/fork","id":44,"params":{{"threadId":"{thread_id}","model":"gpt-fork"}}}}"#
@@ -183,6 +209,10 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         .unwrap();
     assert_eq!(forked[0]["result"]["sourceThreadId"], thread_id);
     assert_eq!(forked[0]["result"]["thread"]["model"], "gpt-fork");
+    assert_eq!(
+        forked[0]["result"]["thread"]["cwd"],
+        thread_result["thread"]["cwd"]
+    );
 
     let deleted = server
         .handle_json(&format!(
@@ -190,6 +220,126 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         ))
         .unwrap();
     assert_eq!(deleted[0]["result"]["deleted"], true);
+}
+
+#[test]
+fn legacy_threads_without_an_absolute_workspace_fail_closed_on_resume_and_turn_start() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let mut server = app_server(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .expect("initialize");
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .expect("initialized");
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let missing = store.create_thread(None, None).expect("missing cwd thread");
+    store
+        .update_thread_status(
+            &missing.thread_id,
+            singularity_protocol::ThreadStatus::Archived,
+        )
+        .expect("archive missing cwd thread");
+    let relative = store
+        .create_thread(None, Some("relative-workspace"))
+        .expect("relative cwd thread");
+    store
+        .update_thread_status(
+            &relative.thread_id,
+            singularity_protocol::ThreadStatus::Archived,
+        )
+        .expect("archive relative cwd thread");
+    let active_missing = store
+        .create_thread(None, None)
+        .expect("active missing cwd thread");
+    drop(store);
+
+    for thread_id in [&missing.thread_id, &relative.thread_id] {
+        let response = server
+            .handle_json(&format!(
+                r#"{{"method":"thread/resume","id":2,"params":{{"threadId":"{thread_id}"}}}}"#
+            ))
+            .expect("resume response");
+        assert!(
+            response[0]["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("absolute workspace")
+        );
+    }
+
+    let turn = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{}","input":[{{"type":"text","text":"do not run"}}]}}}}"#,
+            active_missing.thread_id
+        ))
+        .expect("turn response");
+    assert!(
+        turn[0]["error"]["message"]
+            .as_str()
+            .expect("turn error")
+            .contains("absolute workspace")
+    );
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    assert_eq!(
+        store
+            .get_thread(&missing.thread_id)
+            .expect("missing thread")
+            .status,
+        singularity_protocol::ThreadStatus::Archived
+    );
+    assert_eq!(
+        store
+            .get_thread(&relative.thread_id)
+            .expect("relative thread")
+            .status,
+        singularity_protocol::ThreadStatus::Archived
+    );
+}
+
+#[test]
+fn thread_read_reports_invalid_params_and_keeps_the_connection_usable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut server = app_server(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .expect("initialize");
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .expect("initialized");
+    let started = server
+        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .expect("thread start");
+    let thread_id = result_message(&started)["thread"]["thread_id"]
+        .as_str()
+        .expect("thread id");
+
+    for request in [
+        r#"{"method":"thread/read","id":3,"params":{"limit":1}}"#.to_string(),
+        format!(
+            r#"{{"method":"thread/read","id":4,"params":{{"threadId":"{thread_id}","limit":"bad"}}}}"#
+        ),
+        format!(
+            r#"{{"method":"thread/read","id":5,"params":{{"threadId":"{thread_id}","unknown":true}}}}"#
+        ),
+    ] {
+        let response = server
+            .handle_json(&request)
+            .expect("invalid params response");
+        assert_eq!(response[0]["error"]["code"], -32602);
+    }
+
+    let valid = server
+        .handle_json(&format!(
+            r#"{{"method":"thread/read","id":6,"params":{{"threadId":"{thread_id}"}}}}"#
+        ))
+        .expect("valid read after invalid params");
+    assert_eq!(valid[0]["result"]["thread"]["thread_id"], thread_id);
 }
 
 #[test]
@@ -871,6 +1021,92 @@ fn approval_decision_allow_without_pending_tool_call_is_rejected() {
 }
 
 #[test]
+fn archived_thread_rejects_approval_decision_without_consuming_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let mut server = app_server(store);
+    server
+        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .expect("initialize");
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .expect("initialized");
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "blocked")
+        .expect("turn");
+    store
+        .update_turn_state(
+            &turn.turn_id,
+            singularity_protocol::TurnStatus::Blocked,
+            "blocked",
+        )
+        .expect("blocked turn");
+    let request = ApprovalRequest::new(
+        "approval_archived",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "builtin.edit",
+    )
+    .with_tool_call_id("call_1")
+    .with_resources(["README.md"]);
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(serde_json::json!({
+                "request_id": &request.request_id,
+                "tool_call_id": "call_1",
+                "tool_name": "builtin.edit",
+                "raw_arguments": "{}",
+                "resources": ["README.md"]
+            })),
+            "approval",
+            "approval requested",
+        )
+        .expect("approval");
+    store
+        .update_thread_status(
+            &thread.thread_id,
+            singularity_protocol::ThreadStatus::Archived,
+        )
+        .expect("archive thread");
+    drop(store);
+
+    let decision = ApprovalDecision::new(
+        request.request_id.clone(),
+        ApprovalOutcome::Allow,
+        "operator approved",
+    );
+    let response = server
+        .handle_json(
+            &serde_json::json!({
+                "method": "approval/decision",
+                "id": 4,
+                "params": decision,
+            })
+            .to_string(),
+        )
+        .expect("decision response");
+
+    assert_eq!(
+        response[0]["error"]["message"],
+        "Thread is archived; resume it before continuing the turn"
+    );
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    assert_eq!(
+        store
+            .list_pending_approvals()
+            .expect("pending approvals")
+            .iter()
+            .map(|request| request.request_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["approval_archived"]
+    );
+}
+
+#[test]
 fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_native_turn() {
     for (outcome, request_resource) in [
         (ApprovalOutcome::Deny, "README.md"),
@@ -1100,7 +1336,7 @@ fn app_server_binary_errors_are_valid_json_rpc_lines() {
     let value: serde_json::Value = serde_json::from_str(first_line).expect("valid json error");
 
     assert_eq!(value["id"], "quoted-id");
-    assert_eq!(value["error"]["code"], -32603);
+    assert_eq!(value["error"]["code"], -32602);
     assert!(
         value["error"]["message"]
             .as_str()

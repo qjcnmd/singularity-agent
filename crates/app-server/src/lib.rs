@@ -3,13 +3,13 @@
 mod evaluation;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentLoop, AgentLoopCapability, AgentLoopInput, AgentRunStatus, AgentStatus, ApprovalGrant,
-    PendingToolCall,
+    AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentRunStatus, AgentStatus,
+    ApprovalGrant, PendingToolCall,
 };
 use singularity_core::{
     ErrorCode, ProjectInstructionError, contains_sensitive_text, load_project_instructions_from_cwd,
@@ -21,15 +21,16 @@ use singularity_policy::{
 };
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams,
-    ArtifactFetchResult, EvalRunParams, EventSubscribeParams, EventSubscribeResult,
-    InitializeParams, InitializeResult, JsonRpcMessage, Method, ProviderReadiness,
-    ServerCapabilitiesResult, Thread, ThreadDeleteResult, ThreadForkParams, ThreadForkResult,
-    ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult,
+    ArtifactFetchResult, ConversationMessage, ConversationRole, EvalRunParams,
+    EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult, Item,
+    JsonRpcMessage, Method, ProviderReadiness, ServerCapabilitiesResult, Thread,
+    ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
+    ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
     TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceTailParams,
     TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
     TurnStartResult, TurnStatus,
 };
-use singularity_store::{SessionStore, StoreError};
+use singularity_store::{CommittedTurnOutcome, SessionStore, StoreError};
 use singularity_tools::{
     CommandToolInput, SandboxBackend, ToolBroker, ToolRegistry, ToolSpec, WindowsSandboxBackend,
     WorkspaceTools, command_scope_digest,
@@ -37,6 +38,9 @@ use singularity_tools::{
 use thiserror::Error;
 
 const THREAD_NOT_FOUND: &str = "Thread not found";
+const THREAD_ARCHIVED: &str = "Thread is archived; resume it before starting a turn";
+const THREAD_ARCHIVED_CONTINUATION: &str =
+    "Thread is archived; resume it before continuing the turn";
 const TURN_NOT_FOUND: &str = "Turn not found";
 const TRACE_RUN_NOT_FOUND: &str = "Trace run not found";
 const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
@@ -51,15 +55,21 @@ const TOOL_GREP: &str = "builtin.grep";
 const TOOL_EDIT: &str = "builtin.edit";
 const TOOL_PATCH: &str = "builtin.patch";
 const TOOL_COMMAND: &str = "builtin.command";
+const DEFAULT_THREAD_HISTORY_TURN_LIMIT: usize = 64;
+const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum AppServerError {
     #[error("invalid json: {0}")]
     InvalidJson(#[from] serde_json::Error),
+    #[error("invalid params: {0}")]
+    InvalidParams(String),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
     #[error("project instructions error: {0}")]
     ProjectInstructions(#[from] ProjectInstructionError),
+    #[error("workspace error: {0}")]
+    Workspace(String),
 }
 
 pub type AppServerResult<T> = Result<T, AppServerError>;
@@ -131,7 +141,7 @@ impl AppServer {
             ]);
         }
 
-        match method {
+        let result = match method {
             Method::Initialize => self.initialize(message),
             Method::Initialized => {
                 self.initialized_acknowledged = true;
@@ -139,7 +149,8 @@ impl AppServer {
             }
             Method::ServerCapabilities => self.server_capabilities(message),
             Method::ThreadList => self.thread_list(message),
-            Method::ThreadRead | Method::ThreadResume => self.thread_read(message),
+            Method::ThreadRead => self.thread_read(message),
+            Method::ThreadResume => self.thread_resume(message),
             Method::ThreadStart => self.thread_start(message),
             Method::ThreadFork => self.thread_fork(message),
             Method::ThreadArchive => self.thread_archive(message),
@@ -159,6 +170,12 @@ impl AppServer {
             Method::TraceShow => self.trace_show(message),
             Method::TraceTail => self.trace_tail(message),
             Method::ServerShutdown => self.server_shutdown(message),
+        };
+        match result {
+            Err(AppServerError::InvalidParams(error)) => {
+                json_error(id, ErrorCode::invalid_params(error))
+            }
+            result => result,
         }
     }
 
@@ -168,7 +185,7 @@ impl AppServer {
                 JsonRpcMessage::error(message.id, ErrorCode::already_initialized()).to_wire_value(),
             ]);
         }
-        let _params: InitializeParams = message.params_as()?;
+        let _params: InitializeParams = parse_params(&message)?;
         self.initialized = true;
         Ok(vec![
             JsonRpcMessage::response(message.id, serde_json::to_value(InitializeResult::local())?)
@@ -208,19 +225,66 @@ impl AppServer {
     }
 
     fn thread_read(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ThreadIdParams = message.params_as()?;
-        match self.store.get_thread(&params.thread_id) {
-            Ok(thread) => json_response(message.id, ThreadResult { thread }),
+        let params: ThreadReadParams = parse_params(&message)?;
+        let turn_limit = match history_turn_limit(params.limit) {
+            Ok(limit) => limit,
+            Err(error) => return invalid_request_response(message.id, error),
+        };
+        let thread = match self.store.get_thread(&params.thread_id) {
+            Ok(thread) => thread,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.id, THREAD_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match self.store.read_thread_history(
+            &params.thread_id,
+            params.before_turn_sequence,
+            turn_limit,
+        ) {
+            Ok(history) => json_response(
+                message.id,
+                ThreadReadResult {
+                    thread,
+                    messages: history.messages,
+                    next_before_turn_sequence: history.next_before_turn_sequence,
+                },
+            ),
             Err(StoreError::NotFound(_)) => not_found_response(message.id, THREAD_NOT_FOUND),
             Err(error) => Err(error.into()),
         }
     }
 
+    fn thread_resume(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: ThreadIdParams = parse_params(&message)?;
+        let thread = match self.store.get_thread(&params.thread_id) {
+            Ok(thread) => thread,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.id, THREAD_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = native_workspace_root(&thread) {
+            return invalid_request_response(message.id, error);
+        }
+        match self.store.update_thread_status(
+            &params.thread_id,
+            singularity_protocol::ThreadStatus::Active,
+        ) {
+            Ok(thread) => json_response(message.id, ThreadResult { thread }),
+            Err(StoreError::NotFound(_)) => not_found_response(message.id, THREAD_NOT_FOUND),
+            Err(error) => Err(error.into()),
+        }
+    }
     fn thread_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ThreadStartParams = message.params_as()?;
+        let params: ThreadStartParams = parse_params(&message)?;
+        let cwd = match canonical_thread_cwd(params.cwd.as_deref()) {
+            Ok(cwd) => cwd,
+            Err(error) => return invalid_request_response(message.id, error),
+        };
         let (thread, _trace) = self.store.create_thread_with_trace(
             params.model.as_deref(),
-            params.cwd.as_deref(),
+            Some(&cwd),
             "app_server",
             "thread started",
         )?;
@@ -239,16 +303,31 @@ impl AppServer {
     }
 
     fn thread_fork(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ThreadForkParams = message.params_as()?;
-        if let Err(error) = self.store.get_thread(&params.thread_id) {
-            return match error {
-                StoreError::NotFound(_) => not_found_response(message.id, THREAD_NOT_FOUND),
-                other => Err(other.into()),
-            };
-        }
-        let thread = self
-            .store
-            .create_thread(params.model.as_deref(), params.cwd.as_deref())?;
+        let params: ThreadForkParams = parse_params(&message)?;
+        let source = match self.store.get_thread(&params.thread_id) {
+            Ok(thread) => thread,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.id, THREAD_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let source_cwd = match params.cwd.as_deref().or(source.cwd.as_deref()) {
+            Some(cwd) => cwd,
+            None => {
+                return invalid_request_response(
+                    message.id,
+                    "source thread does not have an absolute workspace",
+                );
+            }
+        };
+        let cwd = match canonical_thread_cwd(Some(source_cwd)) {
+            Ok(cwd) => cwd,
+            Err(error) => return invalid_request_response(message.id, error),
+        };
+        let thread = self.store.create_thread(
+            params.model.as_deref().or(source.model.as_deref()),
+            Some(&cwd),
+        )?;
         Ok(vec![
             JsonRpcMessage::response(
                 message.id,
@@ -262,7 +341,7 @@ impl AppServer {
     }
 
     fn thread_archive(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ThreadIdParams = message.params_as()?;
+        let params: ThreadIdParams = parse_params(&message)?;
         match self.store.update_thread_status(
             &params.thread_id,
             singularity_protocol::ThreadStatus::Archived,
@@ -274,7 +353,7 @@ impl AppServer {
     }
 
     fn thread_delete(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ThreadIdParams = message.params_as()?;
+        let params: ThreadIdParams = parse_params(&message)?;
         match self.store.delete_thread(&params.thread_id) {
             Ok(()) => Ok(vec![
                 JsonRpcMessage::response(
@@ -292,15 +371,7 @@ impl AppServer {
     }
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TurnStartParams = match message.params_as() {
-            Ok(params) => params,
-            Err(error) => {
-                return json_error(
-                    message.id,
-                    ErrorCode::invalid_request(format!("invalid turn/start params: {error}")),
-                );
-            }
-        };
+        let params: TurnStartParams = parse_params(&message)?;
         let thread = match self.store.get_thread(&params.thread_id) {
             Ok(thread) => thread,
             Err(StoreError::NotFound(_)) => {
@@ -308,6 +379,12 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
+        if thread.status != singularity_protocol::ThreadStatus::Active {
+            return invalid_request_response(message.id, THREAD_ARCHIVED);
+        }
+        if let Err(error) = native_workspace_root(&thread) {
+            return invalid_request_response(message.id, error);
+        }
         let capability = AgentLoopCapability::current();
         if !native_capability_ready(&capability) {
             return invalid_request_response(
@@ -316,12 +393,13 @@ impl AppServer {
             );
         }
         let payload = serde_json::to_value(&params.input)?;
-        let (turn, _item, _trace) = match self.store.create_turn_with_input_and_trace(
+        let started = match self.store.create_turn_with_input_trace_and_history(
             &params.thread_id,
             AgentStatus::Running.as_str(),
             payload,
             "app_server",
             "turn started",
+            DEFAULT_THREAD_HISTORY_TURN_LIMIT,
         ) {
             Ok(result) => result,
             Err(StoreError::NotFound(_)) => {
@@ -329,13 +407,15 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
+        let turn = started.turn;
 
         let mut messages = Vec::new();
         messages.extend(self.event_notification(AppEvent::turn_started(&turn)));
-        let status = self.run_native_agent_loop(&thread, &params, &turn.turn_id)?;
-        let turn = self.update_turn_from_run_status(turn, &status)?;
-        self.append_native_trace(&params.thread_id, &turn.turn_id, &status)?;
-        messages.extend(self.agent_terminal_item_events(&status, &turn)?);
+        let status =
+            self.run_native_agent_loop(&thread, &params, &turn.turn_id, &started.history.messages)?;
+        let committed = self.commit_turn_run_status(turn, &status)?;
+        let turn = committed.turn;
+        messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
         messages.push(
             JsonRpcMessage::response(
                 message.id,
@@ -357,7 +437,7 @@ impl AppServer {
     }
 
     fn eval_run(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: EvalRunParams = message.params_as()?;
+        let params: EvalRunParams = parse_params(&message)?;
         match evaluation::run_evaluation(
             &params,
             Arc::clone(&self.sandbox_backend),
@@ -373,6 +453,7 @@ impl AppServer {
         thread: &Thread,
         params: &TurnStartParams,
         turn_id: &str,
+        history: &[ConversationMessage],
     ) -> AppServerResult<AgentRunStatus> {
         let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
@@ -380,9 +461,14 @@ impl AppServer {
                 return Ok(AgentRunStatus::failed(error.message).with_status(AgentStatus::Failed));
             }
         };
-        match self.run_native_agent_loop_with_provider(provider, thread, params, turn_id, None) {
+        match self
+            .run_native_agent_loop_with_provider(provider, thread, params, turn_id, history, None)
+        {
             Err(AppServerError::ProjectInstructions(error)) => {
                 Ok(AgentRunStatus::failed(error.to_string()).with_status(AgentStatus::Failed))
+            }
+            Err(AppServerError::Workspace(error)) => {
+                Ok(AgentRunStatus::failed(error).with_status(AgentStatus::Failed))
             }
             result => result,
         }
@@ -474,6 +560,24 @@ impl AppServer {
             return Ok(Some((turn, run_status)));
         }
         let thread = self.store.get_thread(&turn.thread_id)?;
+        if thread.status != singularity_protocol::ThreadStatus::Active {
+            return Ok(None);
+        }
+        let workspace_root = match native_workspace_root(&thread) {
+            Ok(workspace_root) => workspace_root,
+            Err(error) => {
+                let run_status = native_approval_terminal_status(
+                    &turn,
+                    request,
+                    decision,
+                    Some(&pending_tool_call),
+                    AgentStatus::Failed,
+                    "unavailable",
+                    error,
+                );
+                return Ok(Some((turn, run_status)));
+            }
+        };
         let user_input = self.store.get_turn_user_input(turn_id)?;
         let params = TurnStartParams {
             thread_id: turn.thread_id.clone(),
@@ -484,11 +588,21 @@ impl AppServer {
             request.action.clone(),
             request.resources.clone(),
         );
+        let history = self.store.read_thread_history_before_turn(
+            &thread.thread_id,
+            turn_id,
+            DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+        )?;
         let registry = native_workspace_registry();
-        let workspace_root = native_workspace_root(&thread);
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
         let policy = native_workspace_policy(workspace_root_display);
-        let loop_input = match native_loop_input(&thread, &params, turn_id, &workspace_root) {
+        let loop_input = match native_loop_input(
+            &thread,
+            &params,
+            turn_id,
+            &workspace_root,
+            &history.messages,
+        ) {
             Ok(input) => input.with_approval_grant(grant),
             Err(error) => {
                 let run_status = native_approval_terminal_status(
@@ -534,16 +648,17 @@ impl AppServer {
         thread: &Thread,
         params: &TurnStartParams,
         turn_id: &str,
+        history: &[ConversationMessage],
         approval_grant: Option<ApprovalGrant>,
     ) -> AppServerResult<AgentRunStatus>
     where
         P: Provider,
     {
         let registry = native_workspace_registry();
-        let workspace_root = native_workspace_root(thread);
+        let workspace_root = native_workspace_root(thread).map_err(AppServerError::Workspace)?;
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
         let policy = native_workspace_policy(workspace_root_display);
-        let mut loop_input = native_loop_input(thread, params, turn_id, &workspace_root)?;
+        let mut loop_input = native_loop_input(thread, params, turn_id, &workspace_root, history)?;
         if let Some(grant) = approval_grant {
             loop_input = loop_input.with_approval_grant(grant);
         }
@@ -577,40 +692,25 @@ impl AppServer {
         Ok(result.to_run_status(&loop_input))
     }
 
-    fn update_turn_from_run_status(
+    fn commit_turn_run_status(
         &self,
         turn: Turn,
         run_status: &AgentRunStatus,
-    ) -> AppServerResult<Turn> {
+    ) -> AppServerResult<CommittedTurnOutcome> {
         let status = match run_status.status {
-            singularity_agent::AgentStatus::Completed => Some(TurnStatus::Completed),
-            singularity_agent::AgentStatus::Blocked => Some(TurnStatus::Blocked),
-            singularity_agent::AgentStatus::Failed => Some(TurnStatus::Failed),
-            singularity_agent::AgentStatus::CancelRequested => Some(TurnStatus::Interrupted),
-            singularity_agent::AgentStatus::Cancelled => Some(TurnStatus::Interrupted),
-            singularity_agent::AgentStatus::Running => Some(TurnStatus::Running),
-            singularity_agent::AgentStatus::NotMigrated => None,
+            singularity_agent::AgentStatus::Completed => TurnStatus::Completed,
+            singularity_agent::AgentStatus::Blocked => TurnStatus::Blocked,
+            singularity_agent::AgentStatus::Failed => TurnStatus::Failed,
+            singularity_agent::AgentStatus::CancelRequested => TurnStatus::Interrupted,
+            singularity_agent::AgentStatus::Cancelled => TurnStatus::Interrupted,
+            singularity_agent::AgentStatus::Running => TurnStatus::Running,
+            singularity_agent::AgentStatus::NotMigrated => TurnStatus::Failed,
         };
-        if let Some(status) = status {
-            return Ok(self.store.update_turn_state(
-                &turn.turn_id,
-                status,
-                run_status.status.as_str(),
-            )?);
-        }
-        Ok(turn)
-    }
-
-    fn append_native_trace(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        run_status: &AgentRunStatus,
-    ) -> AppServerResult<()> {
+        let assistant_delta = agent_completed_delta(run_status);
         let mut event = TraceEvent::new(
-            format!("trace_{turn_id}_native_agent_loop"),
-            thread_id,
-            turn_id,
+            format!("trace_{}_native_agent_loop", turn.turn_id),
+            &turn.thread_id,
+            &turn.turn_id,
             "agent_loop",
             "Rust native AgentLoop result translated",
         );
@@ -626,12 +726,17 @@ impl AppServer {
             "audit_events": run_status.audit_events,
             "error": run_status.error.as_deref().map(redact_app_server_text),
         });
-        self.store.append_trace(&event)?;
-        Ok(())
+        Ok(self.store.commit_turn_outcome(
+            &turn.turn_id,
+            status,
+            run_status.status.as_str(),
+            assistant_delta.as_deref(),
+            &event,
+        )?)
     }
 
     fn turn_interrupt(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TurnIdParams = message.params_as()?;
+        let params: TurnIdParams = parse_params(&message)?;
         match self.store.get_turn(&params.turn_id) {
             Ok(turn) if is_terminal_turn_status(&turn.status) => Ok(vec![
                 JsonRpcMessage::response(
@@ -683,7 +788,7 @@ impl AppServer {
     }
 
     fn turn_status(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TurnIdParams = message.params_as()?;
+        let params: TurnIdParams = parse_params(&message)?;
         match self.store.get_turn(&params.turn_id) {
             Ok(turn) => json_response(message.id, TurnResult { turn }),
             Err(StoreError::NotFound(_)) => not_found_response(message.id, TURN_NOT_FOUND),
@@ -720,12 +825,31 @@ impl AppServer {
     }
 
     fn approval_request(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let _request: ApprovalRequest = message.params_as()?;
+        let _request: ApprovalRequest = parse_params(&message)?;
         invalid_request_response(message.id, APPROVAL_REQUEST_INTERNAL_ONLY)
     }
 
     fn approval_decision(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let decision: ApprovalDecision = message.params_as()?;
+        let decision: ApprovalDecision = parse_params(&message)?;
+        let pending_request = match self.store.get_pending_approval(&decision.request_id) {
+            Ok(request) => request,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let pending_thread = self.store.get_thread(&pending_request.thread_id)?;
+        if self
+            .store
+            .has_pending_tool_call(&pending_request.request_id)?
+        {
+            if pending_thread.status != singularity_protocol::ThreadStatus::Active {
+                return invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION);
+            }
+            if let Err(error) = native_workspace_root(&pending_thread) {
+                return invalid_request_response(message.id, error);
+            }
+        }
         let recorded = match self.store.record_approval_decision(
             &decision,
             "approval",
@@ -755,9 +879,8 @@ impl AppServer {
             )?
         };
         if let Some((turn, run_status)) = terminal {
-            let turn = self.update_turn_from_run_status(turn, &run_status)?;
-            self.append_native_trace(&turn.thread_id, &turn.turn_id, &run_status)?;
-            messages.extend(self.agent_terminal_item_events(&run_status, &turn)?);
+            let committed = self.commit_turn_run_status(turn, &run_status)?;
+            messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
         }
         messages.push(
             JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
@@ -809,7 +932,7 @@ impl AppServer {
     }
 
     fn event_subscribe(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: EventSubscribeParams = message.params_as()?;
+        let params: EventSubscribeParams = parse_params(&message)?;
         self.event_filter = Some(params.event_types.clone());
         json_response(
             message.id,
@@ -821,7 +944,7 @@ impl AppServer {
     }
 
     fn artifact_fetch(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: ArtifactFetchParams = message.params_as()?;
+        let params: ArtifactFetchParams = parse_params(&message)?;
         match self.store.get_artifact_ref(&params.artifact_id) {
             Ok(artifact) => json_response(message.id, ArtifactFetchResult { artifact }),
             Err(StoreError::NotFound(_)) => not_found_response(message.id, ARTIFACT_NOT_FOUND),
@@ -842,21 +965,24 @@ impl AppServer {
 
     fn agent_terminal_item_events(
         &self,
-        run_status: &AgentRunStatus,
-        turn: &Turn,
+        assistant_item: Option<&Item>,
     ) -> AppServerResult<Vec<Value>> {
-        let Some(agent_delta) = agent_completed_delta(run_status) else {
+        let Some(agent_item) = assistant_item else {
             return Ok(Vec::new());
         };
-        let agent_item = self.store.append_item(
-            &turn.turn_id,
-            singularity_protocol::ItemKind::AgentMessage,
-            json!({"delta": agent_delta}),
-        )?;
+        let agent_delta = agent_item
+            .payload
+            .get("delta")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                StoreError::InvalidState(
+                    "committed assistant item is missing its string delta".to_string(),
+                )
+            })?;
         Ok([
             AppEvent::item_started(agent_item.item_id.clone()),
             AppEvent::item_agent_message_delta(agent_item.item_id.clone(), agent_delta),
-            AppEvent::item_completed(agent_item.item_id),
+            AppEvent::item_completed(agent_item.item_id.clone()),
         ]
         .into_iter()
         .filter_map(|event| self.event_notification(event))
@@ -864,7 +990,7 @@ impl AppServer {
     }
 
     fn trace_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TraceListParams = message.params_as()?;
+        let params: TraceListParams = parse_params(&message)?;
         match self
             .store
             .list_trace_page(&params.run_id, params.limit, params.offset)
@@ -876,7 +1002,7 @@ impl AppServer {
     }
 
     fn trace_show(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TraceShowParams = message.params_as()?;
+        let params: TraceShowParams = parse_params(&message)?;
         match self.store.show_trace(&params.event_id) {
             Ok(event) => Ok(vec![
                 JsonRpcMessage::response(message.id, json!({"event": event})).to_wire_value(),
@@ -887,7 +1013,7 @@ impl AppServer {
     }
 
     fn trace_tail(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: TraceTailParams = message.params_as()?;
+        let params: TraceTailParams = parse_params(&message)?;
         match self
             .store
             .tail_trace(&params.run_id, params.limit.unwrap_or(50), params.offset)
@@ -1018,14 +1144,50 @@ fn native_workspace_registry() -> ToolRegistry {
     registry
 }
 
-fn native_workspace_root(thread: &Thread) -> PathBuf {
-    thread
+fn history_turn_limit(limit: Option<u32>) -> Result<usize, String> {
+    let limit = limit.unwrap_or(DEFAULT_THREAD_HISTORY_TURN_LIMIT as u32);
+    if limit == 0 || limit > MAX_THREAD_HISTORY_TURN_LIMIT as u32 {
+        return Err(format!(
+            "thread history limit must be between 1 and {MAX_THREAD_HISTORY_TURN_LIMIT}"
+        ));
+    }
+    usize::try_from(limit).map_err(|_| "thread history limit is unsupported".to_string())
+}
+fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
+    let path = match cwd {
+        Some(cwd) if !cwd.trim().is_empty() => Path::new(cwd).to_path_buf(),
+        Some(_) => return Err("thread cwd must not be empty".to_string()),
+        None => std::env::current_dir()
+            .map_err(|error| format!("failed to read current directory: {error}"))?,
+    };
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize thread cwd: {error}"))?;
+    if !canonical.is_dir() {
+        return Err("thread cwd must be an existing directory".to_string());
+    }
+    canonical
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())
+}
+fn native_workspace_root(thread: &Thread) -> Result<PathBuf, String> {
+    let cwd = thread
         .cwd
         .as_deref()
         .filter(|cwd| !cwd.trim().is_empty())
-        .map(Into::into)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| ".".into())
+        .ok_or_else(|| "thread does not have an absolute workspace".to_string())?;
+    let path = Path::new(cwd);
+    if !path.is_absolute() {
+        return Err("thread does not have an absolute workspace".to_string());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize thread workspace: {error}"))?;
+    if !canonical.is_dir() {
+        return Err("thread workspace must be an existing directory".to_string());
+    }
+    Ok(canonical)
 }
 
 fn native_workspace_tools(
@@ -1040,6 +1202,7 @@ fn native_loop_input(
     params: &TurnStartParams,
     turn_id: &str,
     cwd: &std::path::Path,
+    history: &[ConversationMessage],
 ) -> Result<AgentLoopInput, ProjectInstructionError> {
     let goal = params
         .input
@@ -1049,8 +1212,17 @@ fn native_loop_input(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut input =
-        AgentLoopInput::new(&params.thread_id, turn_id, goal).with_model_name(thread.model.clone());
+    let history = history.iter().map(|message| match message.role {
+        ConversationRole::User => {
+            AgentContextItem::history_user(&message.item_id, &message.content)
+        }
+        ConversationRole::Assistant => {
+            AgentContextItem::history_assistant(&message.item_id, &message.content)
+        }
+    });
+    let mut input = AgentLoopInput::new(&params.thread_id, turn_id, goal)
+        .with_history(history)
+        .with_model_name(thread.model.clone());
     if let Some(instructions) = load_project_instructions_from_cwd(cwd)? {
         input = input.with_project_instructions(instructions.content);
     }
@@ -1214,6 +1386,15 @@ fn json_error(id: Option<Value>, error: ErrorCode) -> AppServerResult<Vec<Value>
     Ok(vec![JsonRpcMessage::error(id, error).to_wire_value()])
 }
 
+fn parse_params<T>(message: &JsonRpcMessage) -> Result<T, AppServerError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    message
+        .params_as()
+        .map_err(|error| AppServerError::InvalidParams(error.to_string()))
+}
+
 fn is_terminal_turn_status(status: &TurnStatus) -> bool {
     !matches!(status, TurnStatus::Running)
 }
@@ -1272,6 +1453,7 @@ mod tests {
         ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
         Provider, ProviderError,
     };
+    use singularity_protocol::ItemKind;
     use singularity_tools::{
         CommandRequest, CommandResult, SandboxFilesystemMode, SandboxNetworkMode,
         command_scope_resource,
@@ -1340,7 +1522,7 @@ mod tests {
         let server = app_server(store);
 
         let status = server
-            .run_native_agent_loop_with_provider(provider, &thread, &params, "turn_1", None)
+            .run_native_agent_loop_with_provider(provider, &thread, &params, "turn_1", &[], None)
             .expect("native loop");
 
         assert_eq!(status.status, AgentStatus::Completed);
@@ -1374,6 +1556,174 @@ mod tests {
                 .expect("serialize status")
                 .contains(hidden_workspace_marker.as_ref())
         );
+    }
+
+    #[test]
+    fn native_agent_loop_replays_only_completed_store_history_in_order() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+        std::fs::write(workspace.join("AGENTS.md"), "project instructions")
+            .expect("agents instructions");
+        let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+
+        let (prior, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "previous user"}]),
+                "app_server",
+                "prior turn",
+            )
+            .expect("prior turn");
+        store
+            .append_item(
+                &prior.turn_id,
+                ItemKind::AgentMessage,
+                json!({"delta": "previous assistant"}),
+            )
+            .expect("prior assistant");
+        store
+            .append_item(
+                &prior.turn_id,
+                ItemKind::Reasoning,
+                json!({"summary": "private tool metadata must not replay"}),
+            )
+            .expect("private prior item");
+        store
+            .update_turn_state(
+                &prior.turn_id,
+                TurnStatus::Completed,
+                AgentStatus::Completed.as_str(),
+            )
+            .expect("complete prior turn");
+
+        let (failed, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "failed user must not replay"}]),
+                "app_server",
+                "failed turn",
+            )
+            .expect("failed turn");
+        store
+            .append_item(
+                &failed.turn_id,
+                ItemKind::AgentMessage,
+                json!({"delta": "failed assistant must not replay"}),
+            )
+            .expect("failed assistant");
+        store
+            .update_turn_state(
+                &failed.turn_id,
+                TurnStatus::Failed,
+                AgentStatus::Failed.as_str(),
+            )
+            .expect("fail turn");
+
+        let (blocked, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "blocked user must not replay"}]),
+                "app_server",
+                "blocked turn",
+            )
+            .expect("blocked turn");
+        store
+            .update_turn_state(
+                &blocked.turn_id,
+                TurnStatus::Blocked,
+                AgentStatus::Blocked.as_str(),
+            )
+            .expect("block turn");
+
+        let started = store
+            .create_turn_with_input_trace_and_history(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "current user"}]),
+                "app_server",
+                "current turn",
+                DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+            )
+            .expect("current turn");
+        assert_eq!(
+            started
+                .history
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["previous user", "previous assistant"]
+        );
+
+        let params = TurnStartParams {
+            thread_id: thread.thread_id.clone(),
+            input: vec![singularity_protocol::InputItem::Text {
+                text: "current user".to_string(),
+            }],
+        };
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = StaticProvider {
+            responses: vec![ModelTurnResponse::completed("request", "response", "done")],
+            seen_requests: Arc::clone(&seen_requests),
+        };
+        let server = app_server(store);
+
+        let status = server
+            .run_native_agent_loop_with_provider(
+                provider,
+                &thread,
+                &params,
+                &started.turn.turn_id,
+                &started.history.messages,
+                None,
+            )
+            .expect("native loop");
+
+        assert_eq!(status.status, AgentStatus::Completed);
+        let requests = seen_requests.lock().expect("seen requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .messages
+                .iter()
+                .map(|message| message.role.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ModelRole::Developer,
+                ModelRole::User,
+                ModelRole::Assistant,
+                ModelRole::User,
+            ]
+        );
+        assert_eq!(
+            requests[0]
+                .messages
+                .iter()
+                .map(|message| message.content[0].text.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("project instructions"),
+                Some("previous user"),
+                Some("previous assistant"),
+                Some("current user"),
+            ]
+        );
+        let request_json = serde_json::to_string(&requests[0]).expect("request json");
+        for forbidden in [
+            "private tool metadata must not replay",
+            "failed user must not replay",
+            "failed assistant must not replay",
+            "blocked user must not replay",
+        ] {
+            assert!(!request_json.contains(forbidden), "leaked {forbidden}");
+        }
     }
 
     #[test]
@@ -1671,6 +2021,29 @@ mod tests {
         let thread = store
             .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
             .expect("thread");
+        let (prior, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "previous approval user"}]),
+                "app_server",
+                "prior turn",
+            )
+            .expect("prior turn");
+        store
+            .append_item(
+                &prior.turn_id,
+                ItemKind::AgentMessage,
+                json!({"delta": "previous approval assistant"}),
+            )
+            .expect("prior assistant");
+        store
+            .update_turn_state(
+                &prior.turn_id,
+                TurnStatus::Completed,
+                AgentStatus::Completed.as_str(),
+            )
+            .expect("complete prior turn");
         let (turn, _item, _trace) = store
             .create_turn_with_input_and_trace(
                 &thread.thread_id,
@@ -1687,6 +2060,29 @@ mod tests {
                 AgentStatus::Blocked.as_str(),
             )
             .expect("blocked turn");
+        let (future, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "future user must not replay"}]),
+                "app_server",
+                "future turn",
+            )
+            .expect("future turn");
+        store
+            .append_item(
+                &future.turn_id,
+                ItemKind::AgentMessage,
+                json!({"delta": "future assistant must not replay"}),
+            )
+            .expect("future assistant");
+        store
+            .update_turn_state(
+                &future.turn_id,
+                TurnStatus::Completed,
+                AgentStatus::Completed.as_str(),
+            )
+            .expect("complete future turn");
         let request = ApprovalRequest::new(
             format!("approval_{}_call_1", turn.turn_id),
             thread.thread_id.clone(),
@@ -1739,7 +2135,108 @@ mod tests {
             std::fs::read_to_string(&file_path).expect("read readme"),
             "after"
         );
-        assert_eq!(seen_requests.lock().expect("seen requests").len(), 1);
+        let requests = seen_requests.lock().expect("seen requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].messages[0].role, ModelRole::User);
+        assert_eq!(
+            requests[0].messages[0].content[0].text.as_deref(),
+            Some("previous approval user")
+        );
+        assert_eq!(requests[0].messages[1].role, ModelRole::Assistant);
+        assert_eq!(
+            requests[0].messages[1].content[0].text.as_deref(),
+            Some("previous approval assistant")
+        );
+        assert_eq!(requests[0].messages[2].role, ModelRole::User);
+        assert_eq!(
+            requests[0].messages[2].content[0].text.as_deref(),
+            Some("edit readme")
+        );
+        let request_json = serde_json::to_string(&requests[0]).expect("request json");
+        assert!(!request_json.contains("future user must not replay"));
+        assert!(!request_json.contains("future assistant must not replay"));
+    }
+
+    #[test]
+    fn archived_thread_cannot_resume_a_pending_approval_tool() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let file_path = workspace.join("README.md");
+        std::fs::write(&file_path, "before").expect("write readme");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Blocked.as_str(),
+                json!([{"type": "text", "text": "edit readme"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                TurnStatus::Blocked,
+                AgentStatus::Blocked.as_str(),
+            )
+            .expect("blocked turn");
+        store
+            .update_thread_status(
+                &thread.thread_id,
+                singularity_protocol::ThreadStatus::Archived,
+            )
+            .expect("archive thread");
+        let request = ApprovalRequest::new(
+            format!("approval_{}_call_1", turn.turn_id),
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            TOOL_EDIT,
+        )
+        .with_tool_call_id("call_1")
+        .with_resources(["README.md"]);
+        let pending = PendingToolCall {
+            request_id: request.request_id.clone(),
+            tool_call_id: "call_1".to_string(),
+            tool_name: TOOL_EDIT.to_string(),
+            raw_arguments: json!({
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "after"
+            })
+            .to_string(),
+            resources: vec!["README.md".to_string()],
+        };
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = StaticProvider {
+            responses: vec![ModelTurnResponse::completed("request", "response", "done")],
+            seen_requests: Arc::clone(&seen_requests),
+        };
+        let server = app_server(store);
+
+        let resumed = server
+            .resume_native_agent_loop_after_gate(
+                &request,
+                &decision,
+                Some(serde_json::to_value(pending).expect("pending payload")),
+                provider,
+            )
+            .expect("resume check");
+
+        assert!(resumed.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read readme"),
+            "before"
+        );
+        assert!(seen_requests.lock().expect("seen requests").is_empty());
     }
 
     struct CompletedSandboxBackend;
@@ -1820,7 +2317,14 @@ mod tests {
         );
 
         let status = server
-            .run_native_agent_loop_with_provider(provider, &thread, &params, "turn_1", Some(grant))
+            .run_native_agent_loop_with_provider(
+                provider,
+                &thread,
+                &params,
+                "turn_1",
+                &[],
+                Some(grant),
+            )
             .expect("native loop");
 
         assert_eq!(status.status, AgentStatus::Completed);
