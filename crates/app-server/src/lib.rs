@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod evaluation;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 use singularity_agent::{
@@ -15,13 +16,12 @@ use singularity_core::{
 };
 use singularity_model::{OpenAiProvider, Provider, resolve_provider_config};
 use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess,
-    PermissionDecisionOutcome, PermissionOperation, PermissionProfile, PermissionRule,
-    PolicyEngine, SettingsScope,
+    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecisionOutcome,
+    PermissionOperation, PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
 };
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams,
-    ArtifactFetchResult, EvalRunParams, EvalRunResult, EventSubscribeParams, EventSubscribeResult,
+    ArtifactFetchResult, EvalRunParams, EventSubscribeParams, EventSubscribeResult,
     InitializeParams, InitializeResult, JsonRpcMessage, Method, ProviderReadiness,
     ServerCapabilitiesResult, Thread, ThreadDeleteResult, ThreadForkParams, ThreadForkResult,
     ThreadIdParams, ThreadListResult, ThreadResult, ThreadStartParams, ThreadStartResult,
@@ -31,9 +31,8 @@ use singularity_protocol::{
 };
 use singularity_store::{SessionStore, StoreError};
 use singularity_tools::{
-    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, CommandToolInput,
-    SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolRegistry, ToolSpec,
-    WindowsSandboxBackend, WorkspaceTools, command_scope_digest, command_scope_resource,
+    CommandToolInput, SandboxBackend, ToolBroker, ToolRegistry, ToolSpec, WindowsSandboxBackend,
+    WorkspaceTools, command_scope_digest,
 };
 use thiserror::Error;
 
@@ -52,22 +51,6 @@ const TOOL_GREP: &str = "builtin.grep";
 const TOOL_EDIT: &str = "builtin.edit";
 const TOOL_PATCH: &str = "builtin.patch";
 const TOOL_COMMAND: &str = "builtin.command";
-const EVAL_TASK_SET_SCHEMA: &str = "evaluation.task_set/v1";
-const EVAL_RESULT_SCHEMA: &str = "evaluation.result/v1";
-const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
-const EVAL_PROVIDER_BLOCKER: &str = "provider_config_missing";
-const EVAL_WORKSPACE_BLOCKER: &str = "eval_workspace_failed";
-const EVAL_CAPABILITY_BLOCKER: &str = "native_agent_loop_unavailable";
-const EVAL_AGENT_BLOCKER: &str = "agent_loop_failed";
-const EVAL_VERIFICATION_BLOCKER: &str = "verification_failed";
-const EVAL_RUNNER_NAME: &str = "rust_native";
-const EVAL_REPO_DIR: &str = "repo";
-const EVAL_TEST_PATCH_FILE: &str = "eval-test.patch";
-const EVAL_DEFAULT_MAX_TURNS: u32 = 24;
-const EVAL_DEFAULT_TIMEOUT_SECONDS: u64 = 300;
-const EVAL_PREPARE_TIMEOUT_SECONDS: u64 = 900;
-const EVAL_GIT_TIMEOUT_SECONDS: u64 = 900;
-static EVAL_COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum AppServerError {
@@ -373,54 +356,10 @@ impl AppServer {
 
     fn eval_run(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: EvalRunParams = message.params_as()?;
-        let manifest_text = match std::fs::read_to_string(&params.manifest) {
-            Ok(text) => text,
-            Err(error) => {
-                return json_error(
-                    message.id,
-                    ErrorCode::invalid_request(format!("invalid eval manifest: {error}")),
-                );
-            }
-        };
-        let manifest: Value = match serde_json::from_str(&manifest_text) {
-            Ok(value) => value,
-            Err(error) => {
-                return json_error(
-                    message.id,
-                    ErrorCode::invalid_request(format!("invalid eval manifest: {error}")),
-                );
-            }
-        };
-        if manifest.get("schema_version").and_then(Value::as_str) != Some(EVAL_TASK_SET_SCHEMA) {
-            return json_error(
-                message.id,
-                ErrorCode::invalid_request("invalid eval manifest: unsupported schema_version"),
-            );
+        match evaluation::run_evaluation(&params, Arc::clone(&self.sandbox_backend)) {
+            Ok(result) => json_response(message.id, result),
+            Err(error) => json_error(message.id, ErrorCode::invalid_request(error)),
         }
-        let Some(tasks) = manifest.get("tasks").and_then(Value::as_array) else {
-            return json_error(
-                message.id,
-                ErrorCode::invalid_request("invalid eval manifest: tasks must be an array"),
-            );
-        };
-        if tasks.is_empty() {
-            return json_error(
-                message.id,
-                ErrorCode::invalid_request("invalid eval manifest: tasks must not be empty"),
-            );
-        }
-        let mut result = if native_agent_loop_ready() {
-            run_native_eval(&params, tasks)
-        } else {
-            run_native_eval_blocked_by_capability(&params, tasks)
-        };
-        if let Err(error) = write_eval_artifacts(&mut result, params.output_root.as_deref()) {
-            return json_error(
-                message.id,
-                ErrorCode::invalid_request(format!("failed to write eval artifacts: {error}")),
-            );
-        }
-        json_response(message.id, result)
     }
 
     fn run_native_agent_loop(
@@ -1019,12 +958,16 @@ fn pending_command_audit_metadata(pending_tool_call: Option<&Value>) -> Option<V
         "sandbox_enforcement": "not_executed",
     });
     let Some(raw_arguments) = raw_arguments else {
+        audit["cwd"] = json!("unknown");
+        audit["timeout_seconds"] = json!("unknown");
         audit["sandbox_mode"] = json!("unknown");
         audit["network_access"] = json!("unknown");
         audit["command_scope_digest"] = json!("unavailable");
         return Some(audit);
     };
     let Ok(input) = serde_json::from_str::<CommandToolInput>(&raw_arguments) else {
+        audit["cwd"] = json!("unknown");
+        audit["timeout_seconds"] = json!("unknown");
         audit["sandbox_mode"] = json!("unknown");
         audit["network_access"] = json!("unknown");
         audit["command_scope_digest"] = json!("unavailable");
@@ -1035,10 +978,14 @@ fn pending_command_audit_metadata(pending_tool_call: Option<&Value>) -> Option<V
     merge_json_object(
         &mut audit,
         json!({
+            "cwd": input.effective_cwd(),
+            "timeout_seconds": input.effective_timeout_seconds(),
             "sandbox_mode": sandbox_mode,
             "network_access": network_access,
             "command_scope_digest": command_scope_digest(
                 &input.argv,
+                input.effective_cwd(),
+                input.effective_timeout_seconds(),
                 &sandbox_mode,
                 &network_access,
             ),
@@ -1102,886 +1049,6 @@ fn native_loop_input(
         input = input.with_project_instructions(instructions.content);
     }
     Ok(input)
-}
-
-struct EvalWorkspace {
-    task_dir: PathBuf,
-    repo_dir: PathBuf,
-}
-
-fn run_native_eval(params: &EvalRunParams, tasks: &[Value]) -> EvalRunResult {
-    let run_dir =
-        eval_output_root(params.output_root.as_deref()).join(safe_path_segment(&params.run_id));
-    let task_results = tasks
-        .iter()
-        .map(|task| run_native_eval_task(task, &params.run_id, &run_dir))
-        .collect::<Vec<_>>();
-    let evaluation_passed = task_results
-        .iter()
-        .all(|task| task.get("evaluation_passed").and_then(Value::as_bool) == Some(true));
-    let blocker = if evaluation_passed {
-        None
-    } else {
-        task_results
-            .iter()
-            .filter_map(|task| task.get("blocker").and_then(Value::as_str))
-            .next()
-            .map(str::to_string)
-            .or_else(|| Some(EVAL_VERIFICATION_BLOCKER.to_string()))
-    };
-    let status = if evaluation_passed {
-        "completed"
-    } else if task_results
-        .iter()
-        .any(|task| task.get("status").and_then(Value::as_str) == Some("blocked"))
-    {
-        "blocked"
-    } else {
-        "failed"
-    };
-    EvalRunResult {
-        run_id: params.run_id.clone(),
-        manifest: params.manifest.clone(),
-        runner: EVAL_RUNNER_NAME.to_string(),
-        status: status.to_string(),
-        blocker,
-        tasks: task_results,
-        result_path: None,
-        report_path: None,
-        evaluation_passed,
-    }
-}
-
-fn run_native_eval_blocked_by_capability(params: &EvalRunParams, tasks: &[Value]) -> EvalRunResult {
-    let capability = AgentLoopCapability::current();
-    let message = format!("{}: {}", capability.status.as_str(), capability.reason);
-    let task_results = tasks
-        .iter()
-        .map(|task| blocked_eval_task_result(task, EVAL_CAPABILITY_BLOCKER, message.clone()))
-        .collect::<Vec<_>>();
-    EvalRunResult {
-        run_id: params.run_id.clone(),
-        manifest: params.manifest.clone(),
-        runner: EVAL_RUNNER_NAME.to_string(),
-        status: "blocked".to_string(),
-        blocker: Some(EVAL_CAPABILITY_BLOCKER.to_string()),
-        tasks: task_results,
-        result_path: None,
-        report_path: None,
-        evaluation_passed: false,
-    }
-}
-
-fn run_native_eval_task(task: &Value, run_id: &str, run_dir: &Path) -> Value {
-    let task_id = eval_task_id(task);
-    if let Err(error) = validate_eval_workspace(task) {
-        return blocked_eval_task_result(task, EVAL_WORKSPACE_BLOCKER, error);
-    }
-    let provider = match OpenAiProvider::from_env(|name| std::env::var(name).ok()) {
-        Ok(provider) => provider,
-        Err(error) => return blocked_eval_task_result(task, EVAL_PROVIDER_BLOCKER, error.message),
-    };
-    let workspace = match prepare_eval_workspace(task, run_dir) {
-        Ok(workspace) => workspace,
-        Err(error) => return blocked_eval_task_result(task, EVAL_WORKSPACE_BLOCKER, error),
-    };
-    if let Err(error) = run_prepare_commands(task, &workspace) {
-        return blocked_eval_task_result(task, EVAL_WORKSPACE_BLOCKER, error);
-    }
-    let max_turns = task
-        .pointer("/strategy/max_turns")
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(EVAL_DEFAULT_MAX_TURNS);
-    let project_instructions = match load_project_instructions_from_cwd(&workspace.repo_dir) {
-        Ok(instructions) => instructions,
-        Err(error) => {
-            return blocked_eval_task_result(task, EVAL_WORKSPACE_BLOCKER, error.to_string());
-        }
-    };
-    let mut agent_input = AgentLoopInput::new(
-        &task_id,
-        format!("{run_id}_{task_id}"),
-        eval_agent_prompt(task),
-    )
-    .with_max_turns(max_turns);
-    if let Some(instructions) = project_instructions {
-        agent_input = agent_input.with_project_instructions(instructions.content);
-    }
-    let agent_result = AgentLoop::new(
-        provider,
-        ToolBroker::new(native_workspace_registry()),
-        native_eval_policy(workspace.repo_dir.to_string_lossy().into_owned(), task),
-    )
-    .with_workspace_tools(native_eval_workspace_tools(
-        workspace.repo_dir.clone(),
-        task,
-    ))
-    .run(&agent_input);
-    let changed_files = git_changed_files(&workspace).unwrap_or_default();
-    if let Err(error) = apply_eval_test_patch(task, &workspace) {
-        return eval_task_result(
-            task,
-            &agent_result,
-            changed_files,
-            Some(EVAL_WORKSPACE_BLOCKER),
-            Some(error),
-            EvalTaskChecks {
-                public: json!({"passed": false, "status": "not_run"}),
-                hidden: json!({"passed": false, "status": "not_run"}),
-                smoke: blocked_smoke_check_payload(task),
-            },
-        );
-    }
-    let public_check = run_verification(task, &workspace, "public_verification_command")
-        .or_else(|| run_verification(task, &workspace, "verification_command"))
-        .unwrap_or_else(|| json!({"passed": false, "status": "not_run"}));
-    let hidden_check = run_verification(task, &workspace, "hidden_verification_command")
-        .unwrap_or_else(|| public_check.clone());
-    let public_passed = public_check.get("passed").and_then(Value::as_bool) == Some(true);
-    let hidden_passed = hidden_check.get("passed").and_then(Value::as_bool) == Some(true);
-    let expected_change = expected_file_change_satisfied(task, &changed_files);
-    let summary_ok = summary_requirement_satisfied(task, agent_result.final_answer.as_deref());
-    let agent_completed = agent_result.completed;
-    let smoke_check = run_smoke_check(task, &workspace, &agent_result);
-    let smoke_command_satisfied = smoke_check.get("passed").and_then(Value::as_bool) == Some(true);
-    let evaluation_passed = agent_completed
-        && public_passed
-        && hidden_passed
-        && expected_change
-        && summary_ok
-        && smoke_command_satisfied;
-    let blocker = if evaluation_passed {
-        None
-    } else if !agent_completed {
-        Some(EVAL_AGENT_BLOCKER)
-    } else {
-        Some(EVAL_VERIFICATION_BLOCKER)
-    };
-    eval_task_result(
-        task,
-        &agent_result,
-        changed_files,
-        blocker,
-        agent_result.error.clone(),
-        EvalTaskChecks {
-            public: public_check,
-            hidden: hidden_check,
-            smoke: smoke_check,
-        },
-    )
-}
-
-fn prepare_eval_workspace(task: &Value, run_dir: &Path) -> Result<EvalWorkspace, String> {
-    let task_dir = run_dir.join(safe_path_segment(&eval_task_id(task)));
-    if task_dir.exists() {
-        std::fs::remove_dir_all(&task_dir).map_err(|error| error.to_string())?;
-    }
-    std::fs::create_dir_all(&task_dir).map_err(|error| error.to_string())?;
-    let repo_dir = task_dir.join(EVAL_REPO_DIR);
-    let workspace = task
-        .get("workspace")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "eval task workspace must be an object".to_string())?;
-    match workspace.get("type").and_then(Value::as_str) {
-        Some("fixture") => {
-            std::fs::create_dir_all(&repo_dir).map_err(|error| error.to_string())?;
-            let files = workspace
-                .get("files")
-                .and_then(Value::as_object)
-                .ok_or_else(|| "fixture workspace files must be an object".to_string())?;
-            for (path, content) in files {
-                let content = content
-                    .as_str()
-                    .ok_or_else(|| format!("fixture file content must be text: {path}"))?;
-                write_eval_workspace_file(&repo_dir, path, content)?;
-            }
-        }
-        Some("repo") => {
-            let repo = workspace
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "repo workspace path must be a string".to_string())?;
-            let clone = run_eval_command(
-                &task_dir,
-                &task_dir,
-                vec![
-                    "git".to_string(),
-                    "clone".to_string(),
-                    "--quiet".to_string(),
-                    repo.to_string(),
-                    EVAL_REPO_DIR.to_string(),
-                ],
-                EVAL_GIT_TIMEOUT_SECONDS,
-                SandboxNetworkMode::Allowed,
-                SandboxFilesystemMode::WorkspaceWrite,
-            );
-            ensure_command_success(&clone, "git clone")?;
-            if let Some(commit) = workspace.get("start_commit").and_then(Value::as_str) {
-                let checkout = run_eval_command(
-                    &task_dir,
-                    &repo_dir,
-                    vec![
-                        "git".to_string(),
-                        "checkout".to_string(),
-                        "--quiet".to_string(),
-                        commit.to_string(),
-                    ],
-                    EVAL_GIT_TIMEOUT_SECONDS,
-                    SandboxNetworkMode::Allowed,
-                    SandboxFilesystemMode::WorkspaceWrite,
-                );
-                ensure_command_success(&checkout, "git checkout")?;
-            }
-        }
-        Some(other) => return Err(format!("unsupported eval workspace type: {other}")),
-        None => return Err("eval task workspace type is missing".to_string()),
-    }
-    Ok(EvalWorkspace { task_dir, repo_dir })
-}
-
-fn validate_eval_workspace(task: &Value) -> Result<(), String> {
-    let workspace = task
-        .get("workspace")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "eval task workspace must be an object".to_string())?;
-    match workspace.get("type").and_then(Value::as_str) {
-        Some("fixture") => workspace
-            .get("files")
-            .and_then(Value::as_object)
-            .map(|_| ())
-            .ok_or_else(|| "fixture workspace files must be an object".to_string()),
-        Some("repo") => workspace
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|_| ())
-            .ok_or_else(|| "repo workspace path must be a string".to_string()),
-        Some(other) => Err(format!("unsupported eval workspace type: {other}")),
-        None => Err("eval task workspace type is missing".to_string()),
-    }
-}
-
-fn run_prepare_commands(task: &Value, workspace: &EvalWorkspace) -> Result<(), String> {
-    let Some(commands) = task.get("prepare_commands").and_then(Value::as_array) else {
-        return Ok(());
-    };
-    for command in commands {
-        let command = command
-            .as_str()
-            .ok_or_else(|| "prepare command must be a string".to_string())?;
-        let result = run_eval_shell_command(
-            workspace,
-            command,
-            EVAL_PREPARE_TIMEOUT_SECONDS,
-            eval_network_mode(task),
-            SandboxFilesystemMode::WorkspaceWrite,
-        );
-        ensure_command_success(&result, "prepare command")?;
-    }
-    Ok(())
-}
-
-fn run_verification(task: &Value, workspace: &EvalWorkspace, field: &str) -> Option<Value> {
-    let command = task.get(field).and_then(Value::as_str)?;
-    let timeout = task
-        .get("verification_timeout_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(EVAL_DEFAULT_TIMEOUT_SECONDS);
-    let result = run_eval_shell_command(
-        workspace,
-        command,
-        timeout,
-        eval_network_mode(task),
-        SandboxFilesystemMode::WorkspaceWrite,
-    );
-    Some(command_check_payload(result))
-}
-
-fn apply_eval_test_patch(task: &Value, workspace: &EvalWorkspace) -> Result<(), String> {
-    let Some(patch) = task.get("test_patch").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    let patch_path = workspace.repo_dir.join(EVAL_TEST_PATCH_FILE);
-    std::fs::write(&patch_path, patch).map_err(|error| error.to_string())?;
-    let result = run_eval_command(
-        &workspace.task_dir,
-        &workspace.repo_dir,
-        vec![
-            "git".to_string(),
-            "apply".to_string(),
-            EVAL_TEST_PATCH_FILE.to_string(),
-        ],
-        EVAL_DEFAULT_TIMEOUT_SECONDS,
-        SandboxNetworkMode::Allowed,
-        SandboxFilesystemMode::WorkspaceWrite,
-    );
-    let _ = std::fs::remove_file(&patch_path);
-    ensure_command_success(&result, "git apply test patch")
-}
-
-fn git_changed_files(workspace: &EvalWorkspace) -> Result<Vec<String>, String> {
-    let result = run_eval_command(
-        &workspace.task_dir,
-        &workspace.repo_dir,
-        vec![
-            "git".to_string(),
-            "diff".to_string(),
-            "--name-only".to_string(),
-        ],
-        EVAL_DEFAULT_TIMEOUT_SECONDS,
-        SandboxNetworkMode::Allowed,
-        SandboxFilesystemMode::WorkspaceWrite,
-    );
-    ensure_command_success(&result, "git diff")?;
-    Ok(result
-        .stdout_preview
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
-fn run_eval_shell_command(
-    workspace: &EvalWorkspace,
-    command: &str,
-    timeout_seconds: u64,
-    network_mode: SandboxNetworkMode,
-    filesystem_mode: SandboxFilesystemMode,
-) -> CommandResult {
-    #[cfg(windows)]
-    {
-        let script_id = next_eval_command_id();
-        let script_path = workspace.task_dir.join(format!("{script_id}.cmd"));
-        if let Err(error) = std::fs::write(&script_path, format!("@echo off\r\n{command}\r\n")) {
-            return CommandResult::spawn_failed(
-                script_id,
-                format!("failed to write eval command script: {error}"),
-            );
-        }
-        let script_arg = eval_command_path_arg(&script_path);
-        let result = run_eval_command(
-            &workspace.task_dir,
-            &workspace.repo_dir,
-            vec!["cmd.exe".to_string(), "/C".to_string(), script_arg],
-            timeout_seconds,
-            network_mode,
-            filesystem_mode,
-        );
-        let _ = std::fs::remove_file(script_path);
-        result
-    }
-    #[cfg(not(windows))]
-    {
-        run_eval_command(
-            &workspace.task_dir,
-            &workspace.repo_dir,
-            shell_argv(command),
-            timeout_seconds,
-            network_mode,
-            filesystem_mode,
-        )
-    }
-}
-
-#[cfg(windows)]
-fn eval_command_path_arg(path: &PathBuf) -> String {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let value = path.to_string_lossy();
-    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
-        return format!(r"\\{rest}");
-    }
-    if let Some(rest) = value.strip_prefix(r"\\?\") {
-        return rest.to_string();
-    }
-    value.to_string()
-}
-
-fn run_eval_command(
-    workspace_root: &PathBuf,
-    cwd: &PathBuf,
-    argv: Vec<String>,
-    timeout_seconds: u64,
-    network_mode: SandboxNetworkMode,
-    filesystem_mode: SandboxFilesystemMode,
-) -> CommandResult {
-    let workspace_root = std::fs::canonicalize(workspace_root)
-        .unwrap_or_else(|_| workspace_root.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    let cwd = std::fs::canonicalize(cwd)
-        .unwrap_or_else(|_| cwd.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    let mut request =
-        CommandRequest::project_verification(next_eval_command_id(), argv, cwd, workspace_root);
-    request.timeout_seconds = timeout_seconds;
-    request.network.mode = network_mode;
-    request.filesystem.mode = filesystem_mode;
-    WindowsSandboxBackend::new().execute(&request)
-}
-
-fn ensure_command_success(result: &CommandResult, label: &str) -> Result<(), String> {
-    if result.execution_status == CommandExecutionStatus::Completed
-        && result.semantic_status == CommandSemanticStatus::Succeeded
-    {
-        Ok(())
-    } else {
-        Err(format!("{label} failed: {}", result.stderr_preview))
-    }
-}
-
-fn command_check_payload(result: CommandResult) -> Value {
-    let passed = result.execution_status == CommandExecutionStatus::Completed
-        && result.semantic_status == CommandSemanticStatus::Succeeded;
-    json!({
-        "passed": passed,
-        "status": if passed { "passed" } else { "failed" },
-        "exit_code": result.exit_code,
-        "execution_status": result.execution_status,
-        "semantic_status": result.semantic_status,
-        "stdout_preview": result.stdout_preview,
-        "stderr_preview": result.stderr_preview,
-        "timed_out": result.timed_out,
-        "output_truncated": result.output_truncated,
-    })
-}
-
-fn run_smoke_check(
-    task: &Value,
-    workspace: &EvalWorkspace,
-    agent_result: &singularity_agent::AgentLoopResult,
-) -> Value {
-    if !smoke_command_required(task) {
-        return json!({"passed": true, "status": "not_required"});
-    }
-    if smoke_command_satisfied(task, agent_result) {
-        return json!({"passed": true, "status": "passed", "source": "agent_tool_result"});
-    }
-    let Some(command) = task.get("smoke_command").and_then(Value::as_str) else {
-        return json!({"passed": false, "status": "not_run"});
-    };
-    let Some(argv) = parse_smoke_command_argv(command.trim()) else {
-        return json!({"passed": false, "status": "not_run", "error": "invalid_smoke_command"});
-    };
-    let timeout = task
-        .get("verification_timeout_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(EVAL_DEFAULT_TIMEOUT_SECONDS);
-    let mut payload = command_check_payload(run_eval_command(
-        &workspace.task_dir,
-        &workspace.repo_dir,
-        argv,
-        timeout,
-        eval_network_mode(task),
-        SandboxFilesystemMode::WorkspaceWrite,
-    ));
-    payload["source"] = json!("eval_runner_command");
-    payload
-}
-
-struct EvalTaskChecks {
-    public: Value,
-    hidden: Value,
-    smoke: Value,
-}
-
-fn eval_task_result(
-    task: &Value,
-    agent_result: &singularity_agent::AgentLoopResult,
-    changed_files: Vec<String>,
-    blocker: Option<&str>,
-    error: Option<String>,
-    checks: EvalTaskChecks,
-) -> Value {
-    let public_passed = checks.public.get("passed").and_then(Value::as_bool) == Some(true);
-    let hidden_passed = checks.hidden.get("passed").and_then(Value::as_bool) == Some(true);
-    let smoke_command_satisfied = checks.smoke.get("passed").and_then(Value::as_bool) == Some(true);
-    let evaluation_passed = blocker.is_none()
-        && agent_result.completed
-        && public_passed
-        && hidden_passed
-        && smoke_command_satisfied;
-    json!({
-        "task_id": eval_task_id(task),
-        "agent_completed": agent_result.completed,
-        "tests_passed": public_passed && hidden_passed,
-        "public_verification_passed": public_passed,
-        "hidden_verification_passed": hidden_passed,
-        "smoke_command_satisfied": smoke_command_satisfied,
-        "evaluation_passed": evaluation_passed,
-        "local_process_fallback_count": 0,
-        "status": if evaluation_passed { "completed" } else if blocker == Some(EVAL_WORKSPACE_BLOCKER) || blocker == Some(EVAL_PROVIDER_BLOCKER) { "blocked" } else { "failed" },
-        "blocker": blocker,
-        "error": error,
-        "changed_files": changed_files,
-        "model_turns": agent_result.model_turns,
-        "tool_calls": agent_result.tool_calls,
-        "approval_count": agent_result.approval_count,
-        "checks": {
-            "public": checks.public,
-            "hidden": checks.hidden,
-            "smoke": checks.smoke,
-        }
-    })
-}
-
-fn blocked_eval_task_result(task: &Value, blocker: &str, message: String) -> Value {
-    json!({
-        "task_id": eval_task_id(task),
-        "agent_completed": false,
-        "tests_passed": false,
-        "public_verification_passed": false,
-        "hidden_verification_passed": false,
-        "smoke_command_satisfied": !smoke_command_required(task),
-        "evaluation_passed": false,
-        "local_process_fallback_count": 0,
-        "status": "blocked",
-        "blocker": blocker,
-        "error": message,
-        "checks": {
-            "public": {"passed": false, "status": "not_run"},
-            "hidden": {"passed": false, "status": "not_run"},
-            "smoke": blocked_smoke_check_payload(task)
-        }
-    })
-}
-
-fn smoke_command_required(task: &Value) -> bool {
-    task.get("smoke_command")
-        .and_then(Value::as_str)
-        .is_some_and(|command| !command.trim().is_empty())
-}
-
-fn smoke_command_satisfied(
-    task: &Value,
-    agent_result: &singularity_agent::AgentLoopResult,
-) -> bool {
-    let Some(expected_result_id) = expected_smoke_command_result_id(task) else {
-        return !smoke_command_required(task);
-    };
-    agent_result.tool_results.iter().any(|result| {
-        result.tool_name == TOOL_COMMAND
-            && result.ok
-            && result.result_id.as_deref() == Some(expected_result_id.as_str())
-    })
-}
-
-fn expected_smoke_command_result_id(task: &Value) -> Option<String> {
-    let command = task.get("smoke_command").and_then(Value::as_str)?.trim();
-    if command.is_empty() {
-        return None;
-    }
-    let argv = parse_smoke_command_argv(command)?;
-    Some(command_scope_digest(
-        &argv,
-        &SandboxFilesystemMode::WorkspaceWrite,
-        &eval_network_mode(task),
-    ))
-}
-
-fn expected_smoke_command_resource(task: &Value) -> Option<String> {
-    let command = task.get("smoke_command").and_then(Value::as_str)?.trim();
-    if command.is_empty() {
-        return None;
-    }
-    let argv = parse_smoke_command_argv(command)?;
-    Some(command_scope_resource(
-        &argv,
-        &SandboxFilesystemMode::WorkspaceWrite,
-        &eval_network_mode(task),
-    ))
-}
-
-fn eval_network_mode(task: &Value) -> SandboxNetworkMode {
-    match task
-        .pointer("/strategy/network_access")
-        .and_then(Value::as_str)
-    {
-        Some("allowed") => SandboxNetworkMode::Allowed,
-        _ => SandboxNetworkMode::Denied,
-    }
-}
-
-fn parse_smoke_command_argv(command: &str) -> Option<Vec<String>> {
-    let mut argv = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for ch in command.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        match quote {
-            Some(marker) if ch == marker => quote = None,
-            Some(_) => current.push(ch),
-            None if ch == '\'' || ch == '"' => quote = Some(ch),
-            None if ch.is_whitespace() => {
-                if !current.is_empty() {
-                    argv.push(std::mem::take(&mut current));
-                }
-            }
-            None => current.push(ch),
-        }
-    }
-    if escaped || quote.is_some() {
-        return None;
-    }
-    if !current.is_empty() {
-        argv.push(current);
-    }
-    (!argv.is_empty()).then_some(argv)
-}
-
-#[cfg(test)]
-fn smoke_check_payload(task: &Value, satisfied: bool) -> Value {
-    if !smoke_command_required(task) {
-        return json!({"passed": true, "status": "not_required"});
-    }
-    let status = if satisfied {
-        "passed"
-    } else if expected_smoke_command_result_id(task).is_some() {
-        "failed"
-    } else {
-        "not_run"
-    };
-    json!({
-        "passed": satisfied,
-        "status": status
-    })
-}
-
-fn blocked_smoke_check_payload(task: &Value) -> Value {
-    if smoke_command_required(task) {
-        json!({"passed": false, "status": "not_run"})
-    } else {
-        json!({"passed": true, "status": "not_required"})
-    }
-}
-
-fn native_eval_workspace_tools(workspace_root: PathBuf, _task: &Value) -> WorkspaceTools {
-    WorkspaceTools::new(workspace_root).with_sandbox_backend(WindowsSandboxBackend::new())
-}
-
-fn native_eval_policy(workspace_root: String, task: &Value) -> PolicyEngine {
-    let mut profile = PermissionProfile::workspace_write(workspace_root);
-    profile.approval_policy = ApprovalPolicy::Never;
-    if eval_network_mode(task) == SandboxNetworkMode::Allowed {
-        profile.network_access = NetworkAccess::Allowed;
-    }
-    let mut policy = PolicyEngine::new(profile).with_rule(native_read_tool_rule());
-    if let Some(resource) = expected_smoke_command_resource(task) {
-        policy = policy.with_rule(native_execute_tool_rule(resource.clone()));
-        if eval_network_mode(task) != SandboxNetworkMode::Denied {
-            policy = policy.with_rule(native_network_tool_rule(resource));
-        }
-    }
-    if let Some(paths) = task.get("allowed_paths").and_then(Value::as_array) {
-        for (index, path) in paths.iter().filter_map(Value::as_str).enumerate() {
-            policy = policy.with_rule(native_write_tool_rule(index, path));
-        }
-    } else {
-        policy = policy.with_rule(native_write_tool_rule(0, ""));
-    }
-    policy
-}
-
-fn native_write_tool_rule(index: usize, path: &str) -> PermissionRule {
-    let rule = PermissionRule::new(
-        format!("allow_native_eval_write_tool_{index}"),
-        SettingsScope::Project,
-        PermissionDecisionOutcome::Allow,
-    )
-    .for_operation(PermissionOperation::Write);
-    if path.is_empty() {
-        rule
-    } else {
-        rule.for_resource(path)
-    }
-}
-
-fn native_execute_tool_rule(resource: String) -> PermissionRule {
-    PermissionRule::new(
-        "allow_native_eval_command_tools",
-        SettingsScope::Project,
-        PermissionDecisionOutcome::Allow,
-    )
-    .for_operation(PermissionOperation::Execute)
-    .for_resource(resource)
-}
-
-fn native_network_tool_rule(resource: String) -> PermissionRule {
-    PermissionRule::new(
-        "allow_native_eval_command_network",
-        SettingsScope::Project,
-        PermissionDecisionOutcome::Allow,
-    )
-    .for_operation(PermissionOperation::Network)
-    .for_resource(resource)
-}
-
-fn eval_agent_prompt(task: &Value) -> String {
-    let mut parts = Vec::new();
-    if let Some(user_task) = task.get("user_task").and_then(Value::as_str) {
-        parts.push(user_task.to_string());
-    }
-    if let Some(paths) = task.get("allowed_paths").and_then(Value::as_array) {
-        let allowed = paths
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
-        if !allowed.is_empty() {
-            parts.push(format!("Only modify these workspace paths unless the task proves another path is required: {allowed}."));
-        }
-    }
-    if let Some(command) = task.get("smoke_command").and_then(Value::as_str) {
-        let instruction = if let Some(argv) = parse_smoke_command_argv(command.trim()) {
-            let payload = json!({"argv": argv});
-            format!(
-                "Before the final answer, call the command tool exactly once with these arguments: {payload}. The evaluation fails if this command tool result is missing."
-            )
-        } else {
-            format!(
-                "Before the final answer, use the command tool with argv to run this smoke command: {command}. The evaluation fails if this command tool result is missing."
-            )
-        };
-        parts.push(instruction);
-    }
-    parts.push("Available tools are read, list, grep, edit, patch, and command. Finish with a concise final answer that mentions verification.".to_string());
-    parts.join("\n\n")
-}
-
-fn expected_file_change_satisfied(task: &Value, changed_files: &[String]) -> bool {
-    let Some(expected) = task.get("expected_file_changes").and_then(Value::as_array) else {
-        return true;
-    };
-    expected.iter().filter_map(Value::as_str).all(|path| {
-        changed_files
-            .iter()
-            .any(|changed| changed.replace('\\', "/") == path.replace('\\', "/"))
-    })
-}
-
-fn summary_requirement_satisfied(task: &Value, final_answer: Option<&str>) -> bool {
-    let Some(required) = task
-        .pointer("/success/summary_contains")
-        .and_then(Value::as_str)
-    else {
-        return true;
-    };
-    final_answer
-        .map(|answer| {
-            answer
-                .to_ascii_lowercase()
-                .contains(&required.to_ascii_lowercase())
-        })
-        .unwrap_or(false)
-}
-
-fn write_eval_workspace_file(root: &Path, relative: &str, content: &str) -> Result<(), String> {
-    if relative.contains("..") || relative.starts_with('/') || relative.starts_with('\\') {
-        return Err(format!(
-            "fixture file path is outside workspace: {relative}"
-        ));
-    }
-    let path = root.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    std::fs::write(path, content).map_err(|error| error.to_string())
-}
-
-#[cfg(not(windows))]
-fn shell_argv(command: &str) -> Vec<String> {
-    vec!["sh".to_string(), "-c".to_string(), command.to_string()]
-}
-
-fn eval_task_id(task: &Value) -> String {
-    task.get("task_id")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-fn next_eval_command_id() -> String {
-    let sequence = EVAL_COMMAND_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("eval_command_{sequence}")
-}
-
-fn write_eval_artifacts(
-    result: &mut EvalRunResult,
-    output_root: Option<&str>,
-) -> Result<(), String> {
-    let run_dir = eval_output_root(output_root).join(safe_path_segment(&result.run_id));
-    std::fs::create_dir_all(&run_dir).map_err(|error| error.to_string())?;
-    let result_path = run_dir.join("result.json");
-    let report_path = run_dir.join("report.json");
-    result.result_path = Some(result_path.to_string_lossy().to_string());
-    result.report_path = Some(report_path.to_string_lossy().to_string());
-    let payload = eval_result_payload(result, &run_dir);
-    let serialized = serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?;
-    std::fs::write(&result_path, format!("{serialized}\n")).map_err(|error| error.to_string())?;
-    std::fs::write(&report_path, format!("{serialized}\n")).map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-fn eval_result_payload(result: &EvalRunResult, run_dir: &std::path::Path) -> Value {
-    let total = result.tasks.len();
-    let passed = result
-        .tasks
-        .iter()
-        .filter(|task| task.get("evaluation_passed").and_then(Value::as_bool) == Some(true))
-        .count();
-    json!({
-        "schema_version": EVAL_RESULT_SCHEMA,
-        "run_id": &result.run_id,
-        "output_dir": run_dir.to_string_lossy(),
-        "runner": &result.runner,
-        "status": &result.status,
-        "blocker": &result.blocker,
-        "summary": {
-            "total": total,
-            "passed": passed,
-            "failed": total.saturating_sub(passed),
-            "evaluation_passed": result.evaluation_passed,
-        },
-        "tasks": &result.tasks,
-        "result_path": &result.result_path,
-        "report_path": &result.report_path,
-        "evaluation_passed": result.evaluation_passed,
-    })
-}
-
-fn eval_output_root(output_root: Option<&str>) -> PathBuf {
-    output_root
-        .map(PathBuf::from)
-        .or_else(|| std::env::var(EVAL_OUTPUT_DIR_ENV).ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("work").join("evaluations"))
-}
-
-fn safe_path_segment(value: &str) -> String {
-    let safe = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if safe.trim_matches('.').is_empty() {
-        "eval_run".to_string()
-    } else {
-        safe
-    }
 }
 
 fn native_agent_loop_ready() -> bool {
@@ -2187,13 +1254,15 @@ fn invalid_request_response(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use singularity_agent::{AgentLoopResult, PendingToolCall};
+    use singularity_agent::PendingToolCall;
     use singularity_model::{
         ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
         Provider, ProviderError,
     };
-    use singularity_policy::PermissionRequest;
-    use singularity_tools::{ToolResult, command_scope_digest, command_scope_resource};
+    use singularity_tools::{
+        CommandRequest, CommandResult, SandboxFilesystemMode, SandboxNetworkMode,
+        command_scope_resource,
+    };
 
     use super::*;
 
@@ -2291,73 +1360,6 @@ mod tests {
     }
 
     #[test]
-    fn native_eval_smoke_gate_requires_matching_command_scope_digest() {
-        let task = json!({"task_id": "smoke", "smoke_command": "python -m py_compile src/app.py"});
-        let expected_id = expected_smoke_command_result_id(&task).expect("expected smoke digest");
-        let wrong_id = command_scope_digest(
-            &[
-                "python".to_string(),
-                "-c".to_string(),
-                "print('ok')".to_string(),
-            ],
-            &SandboxFilesystemMode::ReadOnly,
-            &SandboxNetworkMode::Allowed,
-        );
-        let mut wrong_tool = ToolResult::summary(
-            "call_wrong",
-            TOOL_COMMAND,
-            true,
-            "wrong command ok",
-            "digest_wrong",
-        );
-        wrong_tool.result_id = Some(wrong_id);
-        let mut right_tool = ToolResult::summary(
-            "call_right",
-            TOOL_COMMAND,
-            true,
-            "smoke command ok",
-            "digest_right",
-        );
-        right_tool.result_id = Some(expected_id);
-        let base_result = AgentLoopResult {
-            status: AgentStatus::Completed,
-            completed: true,
-            final_answer: Some("done".to_string()),
-            model_turns: 1,
-            tool_calls: 1,
-            approval_count: 0,
-            approval_requests: Vec::new(),
-            pending_tool_calls: Vec::new(),
-            tool_results: vec![wrong_tool],
-            tool_repairs: Vec::new(),
-            error: None,
-        };
-
-        assert!(!smoke_command_satisfied(&task, &base_result));
-        assert_eq!(smoke_check_payload(&task, false)["status"], "failed");
-
-        let mut matching_result = base_result;
-        matching_result.tool_results = vec![right_tool];
-        assert!(smoke_command_satisfied(&task, &matching_result));
-        assert_eq!(smoke_check_payload(&task, true)["status"], "passed");
-    }
-
-    #[test]
-    fn native_eval_prompt_includes_exact_smoke_command_tool_arguments() {
-        let task = json!({
-            "user_task": "fix it",
-            "smoke_command": "python -m py_compile src/app.py"
-        });
-
-        let prompt = eval_agent_prompt(&task);
-
-        assert!(prompt.contains("\"argv\":[\"python\",\"-m\",\"py_compile\",\"src/app.py\"]"));
-        assert!(!prompt.contains("sandbox_mode"));
-        assert!(!prompt.contains("network_access"));
-        assert!(prompt.contains("evaluation fails if this command tool result is missing"));
-    }
-
-    #[test]
     fn native_command_schema_does_not_expose_permission_expansion_fields() {
         let command = native_workspace_tool_specs()
             .into_iter()
@@ -2373,114 +1375,7 @@ mod tests {
         assert!(!properties.contains_key("network_access"));
     }
 
-    #[test]
-    fn native_eval_network_policy_is_denied_by_default_and_exact_when_enabled() {
-        let denied_task =
-            json!({"task_id": "smoke", "smoke_command": "python -m py_compile src/app.py"});
-        let denied_resource =
-            expected_smoke_command_resource(&denied_task).expect("denied smoke resource");
-        let denied = native_eval_policy("C:/repo".to_string(), &denied_task).evaluate(
-            &PermissionRequest::new(TOOL_COMMAND, PermissionOperation::Network, denied_resource),
-        );
-
-        let allowed_task = json!({
-            "task_id": "smoke",
-            "smoke_command": "python -m py_compile src/app.py",
-            "strategy": {"network_access": "allowed"}
-        });
-        let allowed_resource =
-            expected_smoke_command_resource(&allowed_task).expect("allowed smoke resource");
-        let allowed = native_eval_policy("C:/repo".to_string(), &allowed_task).evaluate(
-            &PermissionRequest::new(TOOL_COMMAND, PermissionOperation::Network, allowed_resource),
-        );
-
-        assert_eq!(denied.outcome, PermissionDecisionOutcome::Deny);
-        assert_eq!(allowed.outcome, PermissionDecisionOutcome::Allow);
-    }
-
-    #[test]
-    fn native_eval_policy_only_allows_exact_smoke_command_resource() {
-        let task = json!({"task_id": "smoke", "smoke_command": "python -m py_compile src/app.py"});
-        let policy = native_eval_policy("C:/repo".to_string(), &task);
-        let expected_resource = expected_smoke_command_resource(&task).expect("smoke resource");
-        let wrong_resource = command_scope_resource(
-            &[
-                "python".to_string(),
-                "-c".to_string(),
-                "print('ok')".to_string(),
-            ],
-            &SandboxFilesystemMode::WorkspaceWrite,
-            &SandboxNetworkMode::Allowed,
-        );
-        let wider_resource = command_scope_resource(
-            &[
-                "python".to_string(),
-                "-m".to_string(),
-                "py_compile".to_string(),
-                "src/app.py".to_string(),
-            ],
-            &SandboxFilesystemMode::DangerFullAccess,
-            &SandboxNetworkMode::Allowed,
-        );
-
-        let allowed = policy.evaluate(&PermissionRequest::new(
-            TOOL_COMMAND,
-            PermissionOperation::Execute,
-            expected_resource,
-        ));
-        let wrong = policy.evaluate(&PermissionRequest::new(
-            TOOL_COMMAND,
-            PermissionOperation::Execute,
-            wrong_resource,
-        ));
-        let wider = policy.evaluate(&PermissionRequest::new(
-            TOOL_COMMAND,
-            PermissionOperation::Execute,
-            wider_resource,
-        ));
-
-        assert_eq!(allowed.outcome, PermissionDecisionOutcome::Allow);
-        assert_eq!(wrong.outcome, PermissionDecisionOutcome::Deny);
-        assert_eq!(wider.outcome, PermissionDecisionOutcome::Deny);
-    }
-
     #[cfg(windows)]
-    #[test]
-    fn native_eval_smoke_check_runs_real_command_when_agent_omits_it() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let repo_dir = dir.path().join("repo");
-        std::fs::create_dir_all(repo_dir.join("src")).expect("src dir");
-        std::fs::write(repo_dir.join("src").join("app.py"), "print('ok')\n").expect("app file");
-        let workspace = EvalWorkspace {
-            task_dir: dir.path().to_path_buf(),
-            repo_dir,
-        };
-        let task = json!({
-            "task_id": "smoke",
-            "smoke_command": "python -m py_compile src/app.py",
-            "strategy": {"network_access": "allowed"}
-        });
-        let agent_result = AgentLoopResult {
-            status: AgentStatus::Completed,
-            completed: true,
-            final_answer: Some("done".to_string()),
-            model_turns: 1,
-            tool_calls: 0,
-            approval_count: 0,
-            approval_requests: Vec::new(),
-            pending_tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-            tool_repairs: Vec::new(),
-            error: None,
-        };
-
-        let payload = run_smoke_check(&task, &workspace, &agent_result);
-
-        assert_eq!(payload["passed"], true);
-        assert_eq!(payload["status"], "passed");
-        assert_eq!(payload["source"], "eval_runner_command");
-    }
-
     #[test]
     fn native_approval_resume_without_pending_tool_call_fails_closed_after_gate() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2620,7 +1515,7 @@ mod tests {
             run_status.audit_events[0]["command_scope_digest"]
                 .as_str()
                 .expect("command scope digest")
-                .starts_with("hash:")
+                .starts_with("sha256:")
         );
         assert_eq!(
             run_status.audit_events[0]["approval_decision"],
@@ -2713,7 +1608,7 @@ mod tests {
             mismatch_status.audit_events[0]["command_scope_digest"]
                 .as_str()
                 .expect("command scope digest")
-                .starts_with("hash:")
+                .starts_with("sha256:")
         );
 
         let (_turn, invalid_args_status) = server
@@ -2896,6 +1791,8 @@ mod tests {
                 "/C".to_string(),
                 "echo app-server-sandbox-ok".to_string(),
             ],
+            ".",
+            5,
             &SandboxFilesystemMode::WorkspaceWrite,
             &SandboxNetworkMode::Denied,
         );

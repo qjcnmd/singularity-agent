@@ -5,7 +5,7 @@ use singularity_sandbox::{
 use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
     ToolBrokerDecision, ToolCallRequest, ToolOutput, ToolRegistry, ToolResult, ToolSpec,
-    WorkspacePatch, WorkspacePatchChange, WorkspaceToolError, WorkspaceTools,
+    WorkspacePatch, WorkspacePatchChange, WorkspaceToolError, WorkspaceTools, command_scope_digest,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1036,6 +1036,8 @@ fn command_tool_defaults_to_read_only_filesystem_and_denied_network() {
     }))
     .expect("command input");
 
+    assert_eq!(input.effective_cwd(), ".");
+    assert_eq!(input.effective_timeout_seconds(), 30);
     assert_eq!(input.sandbox_mode(), SandboxFilesystemMode::ReadOnly);
     assert_eq!(input.network_access(), SandboxNetworkMode::Denied);
 }
@@ -1110,7 +1112,7 @@ fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
         result.metadata["result_id"]
             .as_str()
             .expect("command scope digest")
-            .starts_with("hash:")
+            .starts_with("sha256:")
     );
     assert!(result.content.get("argv").is_none());
     assert!(result.content.get("env").is_none());
@@ -1149,10 +1151,97 @@ fn workspace_command_tool_records_audit_for_explicit_danger_full_access() {
         result.metadata["audit"]["command_scope_digest"]
             .as_str()
             .expect("command scope digest")
-            .starts_with("hash:")
+            .starts_with("sha256:")
     );
+    assert_eq!(result.metadata["audit"]["cwd"], ".");
+    assert_eq!(result.metadata["audit"]["timeout_seconds"], 5);
     assert!(result.content.get("argv").is_none());
     remove_workspace(&workspace);
+}
+
+#[test]
+fn command_scope_digest_binds_exact_argv_cwd_and_timeout() {
+    let argv = vec![
+        "python".to_string(),
+        "-c".to_string(),
+        "print('A')".to_string(),
+    ];
+    let base = command_scope_digest(
+        &argv,
+        ".",
+        5,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Denied,
+    );
+    assert_eq!(
+        base,
+        "sha256:09435cb1188173d01bddfe96a06a92333a3242b26ff7c68c7df670791c37cc0c"
+    );
+    let resource = singularity_tools::command_scope_resource(
+        &argv,
+        ".",
+        5,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Denied,
+    );
+    assert!(resource.contains("\"cwd\":\".\""));
+    assert!(resource.contains("\"timeout_seconds\":5"));
+    assert!(resource.contains("\"sandbox_mode\":\"workspace_write\""));
+    assert!(resource.contains("\"network_access\":\"denied\""));
+    assert_ne!(
+        base,
+        command_scope_digest(
+            &[
+                "python".to_string(),
+                "-c".to_string(),
+                "print('a')".to_string()
+            ],
+            ".",
+            5,
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Denied,
+        )
+    );
+    assert_ne!(
+        base,
+        command_scope_digest(
+            &argv,
+            "src",
+            5,
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Denied,
+        )
+    );
+    assert_ne!(
+        base,
+        command_scope_digest(
+            &argv,
+            ".",
+            6,
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Denied,
+        )
+    );
+    assert_ne!(
+        resource,
+        singularity_tools::command_scope_resource(
+            &argv,
+            "src",
+            5,
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Denied,
+        )
+    );
+    assert_ne!(
+        resource,
+        singularity_tools::command_scope_resource(
+            &argv,
+            ".",
+            6,
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Denied,
+        )
+    );
 }
 
 struct RecordingSandboxBackend;

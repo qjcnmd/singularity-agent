@@ -1336,6 +1336,12 @@ fn command_audit_metadata(
 ) -> Value {
     let mut audit = existing.cloned().unwrap_or_else(|| json!({}));
     if let Ok(input) = command_tool_input(&call.arguments) {
+        if audit.get("cwd").is_none() {
+            audit["cwd"] = json!(input.effective_cwd());
+        }
+        if audit.get("timeout_seconds").is_none() {
+            audit["timeout_seconds"] = json!(input.effective_timeout_seconds());
+        }
         if audit.get("sandbox_mode").is_none() {
             audit["sandbox_mode"] =
                 serde_json::to_value(input.sandbox_mode()).unwrap_or(json!("unknown"));
@@ -1347,6 +1353,8 @@ fn command_audit_metadata(
         if audit.get("command_scope_digest").is_none() {
             audit["command_scope_digest"] = json!(command_scope_digest(
                 &input.argv,
+                input.effective_cwd(),
+                input.effective_timeout_seconds(),
                 &input.sandbox_mode(),
                 &input.network_access(),
             ));
@@ -1453,7 +1461,11 @@ fn bind_tool_call_to_profile(
         return Ok(call.clone());
     }
     let mut input = command_tool_input(&call.arguments).map_err(|error| error.to_string())?;
+    let cwd = input.effective_cwd().to_string();
+    let timeout_seconds = input.effective_timeout_seconds();
     let (sandbox_mode, network_access) = effective_command_policy(profile, &input)?;
+    input.cwd = Some(cwd);
+    input.timeout_seconds = Some(timeout_seconds);
     input.sandbox_mode = Some(sandbox_mode);
     input.network_access = Some(network_access);
     let arguments = serde_json::to_value(input).map_err(|error| error.to_string())?;
@@ -1533,8 +1545,13 @@ fn command_permission_resources(arguments: &Value, fallback: &str) -> Vec<String
     let Ok(input) = serde_json::from_value::<CommandToolInput>(arguments.clone()) else {
         return vec![fallback.to_string()];
     };
-    let resource =
-        command_scope_resource(&input.argv, &input.sandbox_mode(), &input.network_access());
+    let resource = command_scope_resource(
+        &input.argv,
+        input.effective_cwd(),
+        input.effective_timeout_seconds(),
+        &input.sandbox_mode(),
+        &input.network_access(),
+    );
     if resource.is_empty() {
         vec![fallback.to_string()]
     } else {
@@ -1619,12 +1636,16 @@ fn command_workspace_tool_failure(
 ) -> ToolOutput {
     let mut output = workspace_tool_failure(error);
     output.metadata["audit"] = json!({
+        "cwd": input.effective_cwd(),
+        "timeout_seconds": input.effective_timeout_seconds(),
         "sandbox_mode": input.sandbox_mode(),
         "network_access": input.network_access(),
         "sandbox_backend": "unavailable",
         "sandbox_enforcement": "unavailable",
         "command_scope_digest": command_scope_digest(
             &input.argv,
+            input.effective_cwd(),
+            input.effective_timeout_seconds(),
             &input.sandbox_mode(),
             &input.network_access(),
         ),

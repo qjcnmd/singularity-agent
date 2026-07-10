@@ -124,6 +124,7 @@ pub struct PermissionRule {
     pub outcome: PermissionDecisionOutcome,
     pub operation: Option<PermissionOperation>,
     pub resource: Option<String>,
+    pub resource_prefix: Option<String>,
 }
 
 impl PermissionRule {
@@ -138,6 +139,7 @@ impl PermissionRule {
             outcome,
             operation: None,
             resource: None,
+            resource_prefix: None,
         }
     }
 
@@ -146,8 +148,15 @@ impl PermissionRule {
         self
     }
 
-    pub fn for_resource(mut self, pattern: impl Into<String>) -> Self {
-        self.resource = Some(pattern.into());
+    pub fn for_resource(mut self, resource: impl Into<String>) -> Self {
+        self.resource = Some(resource.into());
+        self.resource_prefix = None;
+        self
+    }
+
+    pub fn for_resource_prefix(mut self, resource_prefix: impl Into<String>) -> Self {
+        self.resource = None;
+        self.resource_prefix = Some(resource_prefix.into());
         self
     }
 
@@ -158,7 +167,19 @@ impl PermissionRule {
                 .resource
                 .as_ref()
                 .is_none_or(|resource| request.resource == *resource)
+            && self
+                .resource_prefix
+                .as_ref()
+                .is_none_or(|prefix| resource_matches_prefix(&request.resource, prefix))
     }
+}
+
+fn resource_matches_prefix(resource: &str, prefix: &str) -> bool {
+    !prefix.is_empty()
+        && (resource == prefix
+            || resource
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with(['/', '\\'])))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

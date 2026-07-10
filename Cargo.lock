@@ -1414,8 +1414,10 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "singularity_agent",
  "singularity_core",
+ "singularity_evaluation",
  "singularity_model",
  "singularity_policy",
  "singularity_protocol",
@@ -1455,6 +1457,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "singularity_policy",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -1528,6 +1531,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "singularity_core",
  "singularity_sandbox",
 ]

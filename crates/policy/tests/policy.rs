@@ -38,6 +38,30 @@ fn permission_profile_and_approval_objects_keep_wire_names() {
 }
 
 #[test]
+fn resource_prefix_rules_match_only_the_named_path_tree() {
+    let rule = PermissionRule::new(
+        "allow_src_tree",
+        SettingsScope::Project,
+        PermissionDecisionOutcome::Allow,
+    )
+    .for_operation(PermissionOperation::Write)
+    .for_resource_prefix("src");
+
+    for resource in ["src", "src/lib.rs", "src\\lib.rs"] {
+        assert!(rule.matches(&PermissionRequest::new(
+            "builtin.edit",
+            PermissionOperation::Write,
+            resource,
+        )));
+    }
+    assert!(!rule.matches(&PermissionRequest::new(
+        "builtin.edit",
+        PermissionOperation::Write,
+        "src2/lib.rs",
+    )));
+}
+
+#[test]
 fn denied_profile_network_cannot_be_enabled_by_permission_rule() {
     let profile = PermissionProfile::workspace_write("C:/repo");
     let decision = PolicyEngine::new(profile)

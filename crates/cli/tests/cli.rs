@@ -554,18 +554,21 @@ fn cli_eval_run_uses_native_app_server_and_reports_verification_result() {
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v1",
+  "schema_version": "evaluation.task_set/v2",
   "tasks": [{
     "task_id": "fixture_native",
-    "workspace": {"type": "fixture", "files": {"solution.txt": "value = 0
-"}},
-    "user_task": "Change solution.txt so value is 1.",
-    "allowed_paths": ["solution.txt"],
-    "expected_file_changes": ["solution.txt"],
-    "verification_command": "rustc --version",
-    "public_verification_command": "rustc --version",
-    "hidden_verification_command": "rustc --version",
-    "success": {"type": "verification_exit_code", "exit_code": 0}
+    "description": "Exercise the native Rust evaluation transport.",
+    "workspace": {"source": {"type": "local", "path": "."}},
+    "agent": {
+      "instructions": "Change solution.txt so value is 1.",
+      "allowed_paths": ["solution.txt"],
+      "allowed_tools": ["builtin.read", "builtin.edit"]
+    },
+    "evaluator": {
+      "baseline": {"commands": [{"argv": ["rustc", "--version"]}]},
+      "public": {"commands": [{"argv": ["rustc", "--version"]}]},
+      "hidden": {"commands": [{"argv": ["rustc", "--version"]}]}
+    }
   }]
 }"#,
     )
@@ -587,11 +590,24 @@ fn cli_eval_run_uses_native_app_server_and_reports_verification_result() {
                         "evaluation_passed": true,
                         "tasks": [{
                             "task_id": "fixture_native",
+                            "status": "completed",
+                            "blocker": null,
+                            "stages": {
+                                "baseline": {"status": "passed", "blocker": null},
+                                "agent": {"status": "passed", "blocker": null},
+                                "public": {"status": "passed", "blocker": null},
+                                "hidden": {"status": "passed", "blocker": null}
+                            },
                             "agent_completed": true,
                             "tests_passed": true,
                             "evaluation_passed": true,
-                            "local_process_fallback_count": 0
-                        }]
+                            "diagnostics": {
+                                "smoke_command_satisfied": true,
+                                "local_process_fallback_count": 0
+                            }
+                        }],
+                        "result_path": path_str(&eval_output.join("eval_native/result.json")),
+                        "report_path": path_str(&eval_output.join("eval_native/report.json"))
                     })),
                 ],
             )
@@ -617,7 +633,12 @@ fn cli_eval_run_uses_native_app_server_and_reports_verification_result() {
     assert_eq!(value["evaluation_passed"], true);
     assert_eq!(value["tasks"][0]["agent_completed"], true);
     assert_eq!(value["tasks"][0]["tests_passed"], true);
-    assert_eq!(value["tasks"][0]["local_process_fallback_count"], 0);
+    assert_eq!(
+        value["tasks"][0]["diagnostics"]["local_process_fallback_count"],
+        0
+    );
+    assert!(value["result_path"].as_str().is_some());
+    assert!(value["report_path"].as_str().is_some());
     let params: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(native_trace).expect("native trace"))
             .expect("native turn params");

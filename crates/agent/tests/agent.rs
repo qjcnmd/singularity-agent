@@ -592,6 +592,8 @@ fn agent_loop_command_fails_closed_without_sandbox_backend() {
         audit["command_scope_digest"],
         command_scope_digest(
             &python_command("print('command ok')"),
+            ".",
+            5,
             &SandboxFilesystemMode::WorkspaceWrite,
             &SandboxNetworkMode::Denied,
         )
@@ -715,6 +717,8 @@ fn agent_loop_approval_grant_cannot_override_denied_profile_network() {
     let argv = python_command("print('must not execute')");
     let resource = command_scope_resource(
         &argv,
+        ".",
+        5,
         &SandboxFilesystemMode::ReadOnly,
         &SandboxNetworkMode::Allowed,
     );
@@ -779,6 +783,15 @@ fn agent_loop_command_approval_grant_requires_exact_command_resource() {
     let argv = python_command("print('command ok')");
     let command_resource = command_scope_resource(
         &argv,
+        ".",
+        5,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Denied,
+    );
+    let mismatched_resource = command_scope_resource(
+        &argv,
+        ".",
+        6,
         &SandboxFilesystemMode::WorkspaceWrite,
         &SandboxNetworkMode::Denied,
     );
@@ -788,7 +801,7 @@ fn agent_loop_command_approval_grant_requires_exact_command_resource() {
             ApprovalGrant::allow(
                 "approval_turn_1_call_1",
                 "builtin.command",
-                ["builtin.command"],
+                [mismatched_resource],
             ),
         )
     };
@@ -820,6 +833,13 @@ fn agent_loop_command_approval_grant_requires_exact_command_resource() {
         result.tool_results[0].error_code.as_deref(),
         Some("approval_required")
     );
+    let pending = result.pending_tool_calls.first().expect("pending command");
+    let pending_arguments: serde_json::Value =
+        serde_json::from_str(&pending.raw_arguments).expect("pending arguments");
+    assert_eq!(pending_arguments["cwd"], ".");
+    assert_eq!(pending_arguments["timeout_seconds"], 5);
+    assert_eq!(pending_arguments["sandbox_mode"], "workspace_write");
+    assert_eq!(pending_arguments["network_access"], "denied");
 }
 
 #[test]
@@ -879,6 +899,8 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         run_status.audit_events[0]["sandbox_mode"],
         "danger_full_access"
     );
+    assert_eq!(run_status.audit_events[0]["cwd"], ".");
+    assert_eq!(run_status.audit_events[0]["timeout_seconds"], 5);
     assert_eq!(run_status.audit_events[0]["network_access"], "allowed");
     assert_eq!(
         run_status.audit_events[0]["sandbox_backend"],
@@ -890,6 +912,8 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         run_status.audit_events[0]["command_scope_digest"],
         command_scope_digest(
             &python_command("print('command ok')"),
+            ".",
+            5,
             &SandboxFilesystemMode::DangerFullAccess,
             &SandboxNetworkMode::Allowed,
         )

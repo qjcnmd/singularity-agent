@@ -3,11 +3,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use singularity_policy::NetworkAccess;
 
 use crate::{
     Argv, EvaluationError, GitCommit, RelativePath, RemoteRepository, Result,
     TASK_SET_SCHEMA_VERSION, TaskId, ToolName, require_schema_version, validation_error,
 };
+
+const BUILTIN_COMMAND_TOOL_NAME: &str = "builtin.command";
+const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskSetSchemaVersion {
@@ -74,11 +78,25 @@ impl EvaluationTask {
         }
     }
 
-    fn workspace_plan(&self, manifest_dir: &Path) -> WorkspacePlan {
+    fn workspace_plan(&self, manifest_dir: &Path) -> Result<WorkspacePlan> {
         let source = match &self.workspace.source {
-            WorkspaceSource::Local { path } => PlannedWorkspaceSource::Local {
-                path: manifest_dir.join(path.as_str()),
-            },
+            WorkspaceSource::Local { path } => {
+                let candidate = manifest_dir.join(path.as_str());
+                let path = if candidate.exists() {
+                    let path = canonicalize(&candidate)?;
+                    if !path.starts_with(manifest_dir) {
+                        return Err(validation_error(format!(
+                            "evaluation task {} local workspace source escapes the manifest directory: {}",
+                            self.task_id,
+                            path.display()
+                        )));
+                    }
+                    path
+                } else {
+                    candidate
+                };
+                PlannedWorkspaceSource::Local { path }
+            }
             WorkspaceSource::RemoteGit { repository, commit } => {
                 PlannedWorkspaceSource::RemoteGit {
                     repository: repository.clone(),
@@ -87,7 +105,7 @@ impl EvaluationTask {
             }
         };
         let test_patch = self.evaluator.test_patch.clone();
-        WorkspacePlan {
+        Ok(WorkspacePlan {
             task_id: self.task_id.clone(),
             source,
             baseline: BaselineStagePlan {
@@ -120,7 +138,7 @@ impl EvaluationTask {
                 test_patch,
                 commands: self.evaluator.hidden.commands.clone(),
             },
-        }
+        })
     }
 }
 
@@ -174,6 +192,16 @@ impl AgentTaskSpec {
         }
         validate_nonempty_unique(task_id, "agent.allowed_paths", &self.allowed_paths)?;
         validate_nonempty_unique(task_id, "agent.allowed_tools", &self.allowed_tools)?;
+        if !self.smoke_commands.is_empty()
+            && !self
+                .allowed_tools
+                .iter()
+                .any(|tool| tool.as_str() == BUILTIN_COMMAND_TOOL_NAME)
+        {
+            return Err(validation_error(format!(
+                "evaluation task {task_id} agent.smoke_commands requires {BUILTIN_COMMAND_TOOL_NAME} in agent.allowed_tools"
+            )));
+        }
         validate_commands(task_id, "agent.smoke_commands", &self.smoke_commands, false)
     }
 }
@@ -219,6 +247,19 @@ pub struct CommandSpec {
     pub cwd: Option<RelativePath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    #[serde(
+        default = "denied_network_access",
+        skip_serializing_if = "network_access_is_denied"
+    )]
+    pub network_access: NetworkAccess,
+}
+
+fn denied_network_access() -> NetworkAccess {
+    NetworkAccess::Denied
+}
+
+fn network_access_is_denied(network_access: &NetworkAccess) -> bool {
+    *network_access == NetworkAccess::Denied
 }
 
 impl CommandSpec {
@@ -226,6 +267,14 @@ impl CommandSpec {
         if self.timeout_seconds == Some(0) {
             return Err(validation_error(format!(
                 "evaluation task {task_id} {field} timeout_seconds must be greater than zero"
+            )));
+        }
+        if self
+            .timeout_seconds
+            .is_some_and(|timeout| timeout > MAX_COMMAND_TIMEOUT_SECONDS)
+        {
+            return Err(validation_error(format!(
+                "evaluation task {task_id} {field} timeout_seconds must not exceed {MAX_COMMAND_TIMEOUT_SECONDS}"
             )));
         }
         Ok(())
@@ -312,8 +361,8 @@ impl EvaluationManifest {
             .tasks
             .iter()
             .find(|task| &task.task_id == task_id)
-            .map(|task| task.workspace_plan(&self.manifest_dir))
-            .ok_or_else(|| EvaluationError::TaskNotFound(task_id.clone()))
+            .ok_or_else(|| EvaluationError::TaskNotFound(task_id.clone()))?
+            .workspace_plan(&self.manifest_dir)
     }
 }
 

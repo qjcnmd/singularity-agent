@@ -11,11 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use singularity_core::contains_sensitive_text;
 pub use singularity_sandbox::{
-    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
-    SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    WindowsSandboxBackend, command_permission_resource,
+    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus,
+    DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend, SandboxBackendEnforcement,
+    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, WindowsSandboxBackend,
+    command_permission_resource,
 };
 
 const TOOL_PROTOCOL_VERSION: &str = "1.0";
@@ -812,6 +814,8 @@ impl WorkspaceTools {
         }
         let scope_digest = command_scope_digest(
             &request.argv,
+            &request.cwd,
+            request.timeout_seconds,
             &request.filesystem.mode,
             &request.network.mode,
         );
@@ -820,6 +824,8 @@ impl WorkspaceTools {
         let mut output = command_tool_output(result);
         output.metadata["result_id"] = json!(scope_digest);
         output.metadata["audit"] = json!({
+            "cwd": request.cwd,
+            "timeout_seconds": request.timeout_seconds,
             "sandbox_mode": filesystem_mode,
             "network_access": network_mode,
             "sandbox_backend": execution.backend,
@@ -943,6 +949,15 @@ pub struct CommandToolInput {
 }
 
 impl CommandToolInput {
+    pub fn effective_cwd(&self) -> &str {
+        self.cwd.as_deref().unwrap_or(".")
+    }
+
+    pub fn effective_timeout_seconds(&self) -> u64 {
+        self.timeout_seconds
+            .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    }
+
     pub fn sandbox_mode(&self) -> SandboxFilesystemMode {
         self.sandbox_mode
             .clone()
@@ -956,8 +971,45 @@ impl CommandToolInput {
     }
 }
 
+#[derive(Serialize)]
+struct CommandScope<'a> {
+    argv: &'a [String],
+    cwd: &'a str,
+    timeout_seconds: u64,
+    sandbox_mode: &'a SandboxFilesystemMode,
+    network_access: &'a SandboxNetworkMode,
+}
+
+impl<'a> CommandScope<'a> {
+    fn new(
+        argv: &'a [String],
+        cwd: &'a str,
+        timeout_seconds: u64,
+        sandbox_mode: &'a SandboxFilesystemMode,
+        network_access: &'a SandboxNetworkMode,
+    ) -> Self {
+        Self {
+            argv,
+            cwd,
+            timeout_seconds,
+            sandbox_mode,
+            network_access,
+        }
+    }
+
+    fn encoded(&self) -> String {
+        serde_json::to_string(self).expect("command scope is serializable")
+    }
+
+    fn digest(&self) -> String {
+        format!("sha256:{:x}", Sha256::digest(self.encoded().as_bytes()))
+    }
+}
+
 pub fn command_scope_resource(
     argv: &[String],
+    cwd: &str,
+    timeout_seconds: u64,
     sandbox_mode: &SandboxFilesystemMode,
     network_access: &SandboxNetworkMode,
 ) -> String {
@@ -965,26 +1017,23 @@ pub fn command_scope_resource(
     if command.is_empty() {
         String::new()
     } else {
-        let sandbox = serde_json::to_value(sandbox_mode)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_string))
-            .unwrap_or_else(|| format!("{sandbox_mode:?}"));
-        let network = serde_json::to_value(network_access)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_string))
-            .unwrap_or_else(|| format!("{network_access:?}"));
-        format!("command:{command};sandbox:{sandbox};network:{network}")
+        let scope = CommandScope::new(argv, cwd, timeout_seconds, sandbox_mode, network_access);
+        format!(
+            "command:{command};scope:{};digest:{}",
+            scope.encoded(),
+            scope.digest()
+        )
     }
 }
 
 pub fn command_scope_digest(
     argv: &[String],
+    cwd: &str,
+    timeout_seconds: u64,
     sandbox_mode: &SandboxFilesystemMode,
     network_access: &SandboxNetworkMode,
 ) -> String {
-    stable_digest(&json!({
-        "command_scope": command_scope_resource(argv, sandbox_mode, network_access)
-    }))
+    CommandScope::new(argv, cwd, timeout_seconds, sandbox_mode, network_access).digest()
 }
 
 fn validate_tool_name(name: &str) -> Result<(), String> {

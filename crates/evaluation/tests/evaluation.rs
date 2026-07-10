@@ -357,6 +357,64 @@ fn legacy_tool_names_are_rejected_instead_of_aliased() {
 }
 
 #[test]
+fn evaluation_commands_default_to_denied_network_and_allow_explicit_opt_in() {
+    let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
+    let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");
+    let plan = manifest.workspace_plan(&task_id).expect("build plan");
+    let default_command =
+        serde_json::to_value(&plan.public.commands[0]).expect("serialize command");
+    assert_eq!(default_command.get("network_access"), None);
+
+    let mut explicit = valid_manifest();
+    explicit["tasks"][0]["workspace"]["setup_commands"][0]["network_access"] = json!("allowed");
+    let manifest = parse_manifest(&explicit).expect("parse explicit network command");
+    let plan = manifest
+        .workspace_plan(&task_id)
+        .expect("build explicit plan");
+    let setup = serde_json::to_value(&plan.agent.setup_commands[0]).expect("serialize setup");
+    assert_eq!(setup["network_access"], "allowed");
+}
+
+#[test]
+fn evaluation_rejects_unimplemented_tool_namespaces() {
+    for unsupported in ["python.plugin.tool", "mcp.server.tool", "builtin.unknown"] {
+        let mut manifest = valid_manifest();
+        manifest["tasks"][0]["agent"]["allowed_tools"] = json!([unsupported]);
+        let error = parse_manifest(&manifest).expect_err("reject unsupported tool");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported evaluation tool name"),
+            "{unsupported}: {error}"
+        );
+    }
+}
+
+#[test]
+fn smoke_commands_require_the_command_tool() {
+    let mut manifest = valid_manifest();
+    manifest["tasks"][0]["agent"]["allowed_tools"] = json!(["builtin.read"]);
+    let error = parse_manifest(&manifest).expect_err("smoke command without command tool");
+    assert!(
+        error
+            .to_string()
+            .contains("agent.smoke_commands requires builtin.command"),
+        "{error}"
+    );
+}
+
+#[test]
+fn command_timeout_has_a_bounded_upper_limit() {
+    let mut manifest = valid_manifest();
+    manifest["tasks"][0]["agent"]["smoke_commands"][0]["timeout_seconds"] = json!(3_601);
+    let error = parse_manifest(&manifest).expect_err("reject excessive command timeout");
+    assert!(
+        error.to_string().contains("must not exceed 3600"),
+        "{error}"
+    );
+}
+
+#[test]
 fn workspace_plan_has_typed_isolated_baseline_agent_public_and_hidden_stages() {
     let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
     let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");

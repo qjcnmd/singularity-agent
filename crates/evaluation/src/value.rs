@@ -5,6 +5,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 const IDENTIFIER_MAX_BYTES: usize = 128;
 const SHA1_HEX_LENGTH: usize = 40;
 const SHA256_HEX_LENGTH: usize = 64;
+const BUILTIN_TOOL_NAMES: [&str; 6] = [
+    "builtin.read",
+    "builtin.list",
+    "builtin.grep",
+    "builtin.edit",
+    "builtin.patch",
+    "builtin.command",
+];
+
 const LEGACY_TOOL_NAMES: [&str; 6] = [
     "read_file",
     "search_text",
@@ -349,15 +358,13 @@ fn validate_tool_name(value: &str) -> Result<(), String> {
     if LEGACY_TOOL_NAMES.contains(&value) {
         return Err(format!("unsupported legacy tool name: {value}"));
     }
-    let parts = value.split('.').collect::<Vec<_>>();
-    if parts.iter().any(|part| part.is_empty()) {
-        return Err(format!("tool name has an empty namespace segment: {value}"));
-    }
-    match parts.as_slice() {
-        ["builtin", _] | ["mcp", _, _] | ["python", _, _] => Ok(()),
-        _ => Err(format!(
-            "tool name must use builtin.*, mcp.<server>.<tool>, or python.<plugin>.<tool>: {value}"
-        )),
+    if BUILTIN_TOOL_NAMES.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported evaluation tool name {value}; expected one of {}",
+            BUILTIN_TOOL_NAMES.join(", ")
+        ))
     }
 }
 

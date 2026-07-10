@@ -319,13 +319,24 @@ fn app_server_eval_run_writes_blocked_native_result_artifacts_without_python_sid
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v1",
+  "schema_version": "evaluation.task_set/v2",
   "tasks": [
     {
       "task_id": "fixture_eval",
-      "workspace": {"type": "unsupported"},
-      "user_task": "finish",
-      "verification_command": "python -c pass"
+      "description": "Exercise a blocked typed evaluation task.",
+      "workspace": {
+        "source": {"type": "local", "path": "missing-source"}
+      },
+      "agent": {
+        "instructions": "Finish the task.",
+        "allowed_paths": ["README.md"],
+        "allowed_tools": ["builtin.read"]
+      },
+      "evaluator": {
+        "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
+        "public": {"commands": [{"argv": ["git", "status", "--short"]}]},
+        "hidden": {"commands": [{"argv": ["git", "status", "--short"]}]}
+      }
     }
   ]
 }"#,
@@ -353,12 +364,18 @@ fn app_server_eval_run_writes_blocked_native_result_artifacts_without_python_sid
 
     assert_eq!(result["runner"], "rust_native");
     assert_eq!(result["status"], "blocked");
-    assert_eq!(result["blocker"], "eval_workspace_failed");
+    assert_eq!(result["blocker"], "workspace_preparation");
     assert_eq!(result["evaluation_passed"], false);
     assert_eq!(result["tasks"][0]["agent_completed"], false);
     assert_eq!(result["tasks"][0]["tests_passed"], false);
-    assert_eq!(result["tasks"][0]["smoke_command_satisfied"], true);
-    assert_eq!(result["tasks"][0]["local_process_fallback_count"], 0);
+    assert_eq!(
+        result["tasks"][0]["diagnostics"]["smoke_command_satisfied"],
+        true
+    );
+    assert_eq!(
+        result["tasks"][0]["diagnostics"]["local_process_fallback_count"],
+        0
+    );
     let result_path = result["result_path"].as_str().expect("result path");
     let report_path = result["report_path"].as_str().expect("report path");
     assert!(std::path::Path::new(result_path).exists());
@@ -366,14 +383,17 @@ fn app_server_eval_run_writes_blocked_native_result_artifacts_without_python_sid
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
             .expect("result payload");
-    assert_eq!(payload["schema_version"], "evaluation.result/v1");
-    assert_eq!(payload["runner"], "rust_native");
-    assert_eq!(payload["tasks"][0]["blocker"], "eval_workspace_failed");
-    assert_eq!(payload["tasks"][0]["checks"]["public"]["status"], "not_run");
+    assert_eq!(payload["schema_version"], "evaluation.result/v2");
+    assert_eq!(payload["status"], "blocked");
     assert_eq!(
-        payload["tasks"][0]["checks"]["smoke"]["status"],
-        "not_required"
+        payload["tasks"][0]["blocker"]["kind"],
+        "workspace_preparation"
     );
+    assert_eq!(
+        payload["tasks"][0]["stages"]["baseline"]["status"],
+        "blocked"
+    );
+    assert_eq!(payload["tasks"][0]["stages"]["public"]["status"], "skipped");
 }
 
 #[test]
@@ -382,17 +402,31 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = AppServer::new(store);
     let manifest = dir.path().join("eval.json");
+    let output_root = dir.path().join("eval-output");
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v1",
+  "schema_version": "evaluation.task_set/v2",
   "tasks": [
     {
       "task_id": "fixture_eval",
-      "workspace": {"type": "unsupported"},
-      "user_task": "finish",
-      "verification_command": "python -c pass",
-      "smoke_command": "python -m py_compile src/app.py"
+      "description": "Exercise a blocked typed evaluation smoke command.",
+      "workspace": {
+        "source": {"type": "local", "path": "missing-source"}
+      },
+      "agent": {
+        "instructions": "Finish the task.",
+        "allowed_paths": ["README.md"],
+        "allowed_tools": ["builtin.read", "builtin.command"],
+        "smoke_commands": [
+          {"argv": ["git", "status", "--short"], "timeout_seconds": 30}
+        ]
+      },
+      "evaluator": {
+        "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
+        "public": {"commands": [{"argv": ["git", "status", "--short"]}]},
+        "hidden": {"commands": [{"argv": ["git", "status", "--short"]}]}
+      }
     }
   ]
 }"#,
@@ -411,6 +445,7 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
         "params": {
             "manifest": manifest,
             "runId": "eval_smoke_not_run",
+            "outputRoot": output_root,
         }
     })
     .to_string();
@@ -418,9 +453,15 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     let result = result_message(&response);
 
     assert_eq!(result["status"], "blocked");
-    assert_eq!(result["tasks"][0]["blocker"], "eval_workspace_failed");
-    assert_eq!(result["tasks"][0]["smoke_command_satisfied"], false);
-    assert_eq!(result["tasks"][0]["checks"]["smoke"]["status"], "not_run");
+    assert_eq!(
+        result["tasks"][0]["blocker"]["kind"],
+        "workspace_preparation"
+    );
+    assert_eq!(
+        result["tasks"][0]["diagnostics"]["smoke_command_satisfied"],
+        false
+    );
+    assert_eq!(result["tasks"][0]["stages"]["agent"]["status"], "skipped");
 }
 
 #[cfg(not(windows))]
@@ -434,13 +475,24 @@ fn app_server_eval_run_fails_closed_when_native_capability_is_unavailable() {
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v1",
+  "schema_version": "evaluation.task_set/v2",
   "tasks": [
     {
       "task_id": "fixture_eval",
-      "workspace": {"type": "fixture", "files": {"README.md": "hello"}},
-      "user_task": "finish",
-      "verification_command": "python -c pass"
+      "description": "Exercise a blocked typed evaluation task.",
+      "workspace": {
+        "source": {"type": "local", "path": "missing-source"}
+      },
+      "agent": {
+        "instructions": "Finish the task.",
+        "allowed_paths": ["README.md"],
+        "allowed_tools": ["builtin.read"]
+      },
+      "evaluator": {
+        "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
+        "public": {"commands": [{"argv": ["git", "status", "--short"]}]},
+        "hidden": {"commands": [{"argv": ["git", "status", "--short"]}]}
+      }
     }
   ]
 }"#,
@@ -468,12 +520,9 @@ fn app_server_eval_run_fails_closed_when_native_capability_is_unavailable() {
 
     assert_eq!(result["runner"], "rust_native");
     assert_eq!(result["status"], "blocked");
-    assert_eq!(result["blocker"], "native_agent_loop_unavailable");
+    assert_eq!(result["blocker"], "environment");
     assert_eq!(result["tasks"][0]["agent_completed"], false);
-    assert_eq!(
-        result["tasks"][0]["blocker"],
-        "native_agent_loop_unavailable"
-    );
+    assert_eq!(result["tasks"][0]["blocker"]["kind"], "environment");
 }
 
 #[test]
