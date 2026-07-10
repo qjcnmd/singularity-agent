@@ -5,6 +5,7 @@ members = [
     "crates/store",
     "crates/policy",
     "crates/sandbox",
+    "crates/windows-sandbox",
     "crates/tools",
     "crates/model",
     "crates/agent",
