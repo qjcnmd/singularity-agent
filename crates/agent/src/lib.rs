@@ -731,65 +731,13 @@ where
                 error: Some(format!("tool execution failed: {error_code}")),
             };
         }
-        let max_turns = input.max_turns.max(1);
-        for turn_index in 0..max_turns {
-            let request = model_turn_request(
-                &self.tool_broker,
-                input,
-                &context,
-                turn_index,
-                messages.clone(),
-            );
-            let response = match self.provider.complete(&request) {
-                Ok(response) => response,
-                Err(error) => provider_error_response(&request, error),
-            };
-            if response.status != ModelTurnStatus::Success {
-                return AgentLoopResult {
-                    status: AgentStatus::Failed,
-                    completed: false,
-                    final_answer: None,
-                    model_turns: turn_index + 1,
-                    tool_calls: tool_results.len() as u32,
-                    approval_count: 1,
-                    approval_requests: Vec::new(),
-                    pending_tool_calls: Vec::new(),
-                    tool_results,
-                    tool_repairs,
-                    error: response.error.map(|error| error.message),
-                };
-            }
-            if response.tool_calls.is_empty() {
-                let final_answer = assistant_message_text(response.assistant_message.as_ref());
-                if final_answer.trim().is_empty() {
-                    return AgentLoopResult {
-                        status: AgentStatus::Failed,
-                        completed: false,
-                        final_answer: None,
-                        model_turns: turn_index + 1,
-                        tool_calls: tool_results.len() as u32,
-                        approval_count: 1,
-                        approval_requests: Vec::new(),
-                        pending_tool_calls: Vec::new(),
-                        tool_results,
-                        tool_repairs,
-                        error: Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
-                    };
-                }
-                return AgentLoopResult {
-                    status: AgentStatus::Completed,
-                    completed: true,
-                    final_answer: Some(final_answer),
-                    model_turns: turn_index + 1,
-                    tool_calls: tool_results.len() as u32,
-                    approval_count: 1,
-                    approval_requests: Vec::new(),
-                    pending_tool_calls: Vec::new(),
-                    tool_results,
-                    tool_repairs,
-                    error: None,
-                };
-            }
+        let turn_index = 0;
+        let request = model_turn_request(&self.tool_broker, input, &context, turn_index, messages);
+        let response = match self.provider.complete(&request) {
+            Ok(response) => response,
+            Err(error) => provider_error_response(&request, error),
+        };
+        if response.status != ModelTurnStatus::Success {
             return AgentLoopResult {
                 status: AgentStatus::Failed,
                 completed: false,
@@ -801,21 +749,52 @@ where
                 pending_tool_calls: Vec::new(),
                 tool_results,
                 tool_repairs,
-                error: Some("tool call after approval resume is not supported".to_string()),
+                error: response.error.map(|error| error.message),
+            };
+        }
+        if response.tool_calls.is_empty() {
+            let final_answer = assistant_message_text(response.assistant_message.as_ref());
+            if final_answer.trim().is_empty() {
+                return AgentLoopResult {
+                    status: AgentStatus::Failed,
+                    completed: false,
+                    final_answer: None,
+                    model_turns: turn_index + 1,
+                    tool_calls: tool_results.len() as u32,
+                    approval_count: 1,
+                    approval_requests: Vec::new(),
+                    pending_tool_calls: Vec::new(),
+                    tool_results,
+                    tool_repairs,
+                    error: Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
+                };
+            }
+            return AgentLoopResult {
+                status: AgentStatus::Completed,
+                completed: true,
+                final_answer: Some(final_answer),
+                model_turns: turn_index + 1,
+                tool_calls: tool_results.len() as u32,
+                approval_count: 1,
+                approval_requests: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_results,
+                tool_repairs,
+                error: None,
             };
         }
         AgentLoopResult {
             status: AgentStatus::Failed,
             completed: false,
             final_answer: None,
-            model_turns: max_turns,
+            model_turns: turn_index + 1,
             tool_calls: tool_results.len() as u32,
             approval_count: 1,
             approval_requests: Vec::new(),
             pending_tool_calls: Vec::new(),
             tool_results,
             tool_repairs,
-            error: Some("max turns exceeded".to_string()),
+            error: Some("tool call after approval resume is not supported".to_string()),
         }
     }
 
@@ -1327,7 +1306,6 @@ fn model_messages_from_context(context: &ContextBundle) -> Vec<ModelMessage> {
     context
         .messages
         .iter()
-        .into_iter()
         .filter_map(|message| {
             let role = match message.get("role").and_then(Value::as_str) {
                 Some("system") => ModelRole::System,
@@ -1437,11 +1415,10 @@ fn command_audit_metadata(
 }
 
 fn is_repairable_tool_result(tool_result: &ToolResult) -> bool {
-    tool_result.error_code.as_deref().is_some_and(|error_code| {
-        REPAIRABLE_TOOL_ERROR_CODES
-            .iter()
-            .any(|repairable| error_code == *repairable)
-    })
+    tool_result
+        .error_code
+        .as_deref()
+        .is_some_and(|error_code| REPAIRABLE_TOOL_ERROR_CODES.contains(&error_code))
 }
 
 fn tool_repair(input: &AgentLoopInput, turn_index: u32, tool_result: &ToolResult) -> ToolRepair {
