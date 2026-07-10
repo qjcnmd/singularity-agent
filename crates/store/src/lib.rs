@@ -75,6 +75,16 @@ pub struct RecordedApprovalDecision {
     pub trace: TraceEvent,
 }
 
+pub struct RegisterArtifactRefParams<'a> {
+    pub run_id: &'a str,
+    pub item_id: Option<&'a str>,
+    pub kind: &'a str,
+    pub uri: &'a str,
+    pub content_digest: &'a str,
+    pub summary: &'a str,
+    pub metadata: Value,
+}
+
 impl SessionStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
@@ -649,14 +659,17 @@ impl SessionStore {
 
     pub fn register_artifact_ref(
         &self,
-        run_id: &str,
-        item_id: Option<&str>,
-        kind: &str,
-        uri: &str,
-        content_digest: &str,
-        summary: &str,
-        metadata: Value,
+        params: RegisterArtifactRefParams<'_>,
     ) -> StoreResult<ArtifactRef> {
+        let RegisterArtifactRefParams {
+            run_id,
+            item_id,
+            kind,
+            uri,
+            content_digest,
+            summary,
+            metadata,
+        } = params;
         let artifact = ArtifactRef {
             artifact_id: format!("artifact_{}", short_id()),
             run_id: run_id.to_string(),
@@ -895,13 +908,13 @@ impl SessionStore {
             })
             .optional()?
             .flatten();
-        if let Some(found) = schema_version {
-            if found > SCHEMA_VERSION {
-                return Err(StoreError::UnsupportedSchema {
-                    found,
-                    supported: SCHEMA_VERSION,
-                });
-            }
+        if let Some(found) = schema_version
+            && found > SCHEMA_VERSION
+        {
+            return Err(StoreError::UnsupportedSchema {
+                found,
+                supported: SCHEMA_VERSION,
+            });
         }
         Ok(())
     }
@@ -1278,33 +1291,6 @@ fn is_terminal_turn_status(status: &TurnStatus) -> bool {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn open_configures_sqlite_connection_pragmas() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-        let foreign_keys: u32 = store
-            .connection
-            .query_row("pragma foreign_keys", [], |row| row.get(0))
-            .expect("foreign keys pragma");
-        let journal_mode: String = store
-            .connection
-            .query_row("pragma journal_mode", [], |row| row.get(0))
-            .expect("journal mode pragma");
-        let busy_timeout_ms: u64 = store
-            .connection
-            .query_row("pragma busy_timeout", [], |row| row.get(0))
-            .expect("busy timeout pragma");
-
-        assert_eq!(foreign_keys, 1);
-        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-        assert_eq!(busy_timeout_ms, SQLITE_BUSY_TIMEOUT_MS);
-    }
-}
-
 fn insert_approval(connection: &Connection, request: &ApprovalRequest) -> StoreResult<()> {
     ensure_approval_request_binding(connection, request)?;
     connection
@@ -1400,4 +1386,31 @@ fn contains_secret_like(text: &str) -> bool {
     SENSITIVE_ARTIFACT_MARKERS
         .iter()
         .any(|marker| lowered.contains(marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_configures_sqlite_connection_pragmas() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+        let foreign_keys: u32 = store
+            .connection
+            .query_row("pragma foreign_keys", [], |row| row.get(0))
+            .expect("foreign keys pragma");
+        let journal_mode: String = store
+            .connection
+            .query_row("pragma journal_mode", [], |row| row.get(0))
+            .expect("journal mode pragma");
+        let busy_timeout_ms: u64 = store
+            .connection
+            .query_row("pragma busy_timeout", [], |row| row.get(0))
+            .expect("busy timeout pragma");
+
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(busy_timeout_ms, SQLITE_BUSY_TIMEOUT_MS);
+    }
 }

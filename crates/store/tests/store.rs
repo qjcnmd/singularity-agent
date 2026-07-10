@@ -1,7 +1,9 @@
 use schemars::schema_for;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_protocol::{ItemKind, TraceEvent, TurnStatus};
-use singularity_store::{SessionStore, SessionStoreDescriptor, StoreError};
+use singularity_store::{
+    RegisterArtifactRefParams, SessionStore, SessionStoreDescriptor, StoreError,
+};
 
 #[test]
 fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
@@ -755,19 +757,19 @@ fn artifact_refs_are_durable_and_redact_secret_like_metadata() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
 
     let artifact = store
-        .register_artifact_ref(
-            "run_1",
-            Some("item_1"),
-            "file",
-            "artifact://safe/result.txt",
-            "sha256:abc",
-            "contains token output",
-            serde_json::json!({
+        .register_artifact_ref(RegisterArtifactRefParams {
+            run_id: "run_1",
+            item_id: Some("item_1"),
+            kind: "file",
+            uri: "artifact://safe/result.txt",
+            content_digest: "sha256:abc",
+            summary: "contains token output",
+            metadata: serde_json::json!({
                 "path": "safe/result.txt",
                 "api_key": "abc123",
                 "nested": {"authorization": "Bearer abc123"}
             }),
-        )
+        })
         .expect("artifact");
 
     assert!(artifact.redacted);

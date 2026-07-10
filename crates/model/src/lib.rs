@@ -217,7 +217,7 @@ impl Default for ModelCapabilities {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelPreferences {
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
@@ -228,22 +228,6 @@ pub struct ModelPreferences {
     pub structured_output_schema: Option<Value>,
     pub stream: bool,
     pub fallback_models: Vec<String>,
-}
-
-impl Default for ModelPreferences {
-    fn default() -> Self {
-        Self {
-            provider_name: None,
-            model_name: None,
-            temperature: None,
-            top_p: None,
-            max_output_tokens: None,
-            json_mode: false,
-            structured_output_schema: None,
-            stream: false,
-            fallback_models: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -348,7 +332,7 @@ impl Default for ModelBudget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -356,19 +340,6 @@ pub struct ModelUsage {
     pub cached_input_tokens: u64,
     pub reasoning_tokens: u64,
     pub cost_estimate: Option<f64>,
-}
-
-impl Default for ModelUsage {
-    fn default() -> Self {
-        Self {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            cached_input_tokens: 0,
-            reasoning_tokens: 0,
-            cost_estimate: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -792,14 +763,14 @@ impl Provider for OpenAiProvider {
 #[error("{message}")]
 pub struct ProviderError {
     pub message: String,
-    pub error: ModelError,
+    pub error: Box<ModelError>,
 }
 
 impl ProviderError {
     pub fn from_model_error(error: ModelError) -> Self {
         Self {
             message: error.message.clone(),
-            error,
+            error: Box::new(error),
         }
     }
 }
@@ -828,7 +799,7 @@ pub fn provider_error_response(
         usage: ModelUsage::default(),
         finish_reason: None,
         validation: None,
-        error: Some(error.error),
+        error: Some(*error.error),
         provider_name: None,
         model_name: request.model_preferences.model_name.clone(),
         latency_ms: None,

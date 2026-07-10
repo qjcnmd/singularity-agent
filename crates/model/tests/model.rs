@@ -919,7 +919,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
     let call = tool_call("call_1", "builtin.read_file");
     let none_result = validate_model_response(
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
-        &[call.clone()],
+        std::slice::from_ref(&call),
         &ToolChoicePolicy {
             mode: ToolChoiceMode::None,
             ..Default::default()
