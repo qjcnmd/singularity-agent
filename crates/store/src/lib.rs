@@ -14,19 +14,23 @@ use singularity_policy::{ApprovalDecision, ApprovalRequest};
 use singularity_protocol::{
     ArtifactRef, Item, ItemKind, ItemStatus, Thread, ThreadStatus, TraceEvent, Turn, TurnStatus,
 };
+pub use singularity_protocol::{ConversationMessage, ConversationRole};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
 const DURABLE_LEDGER_SCHEMA_MIGRATION: &str = "0002_durable_ledger";
 const PENDING_TOOL_CALL_SCHEMA_MIGRATION: &str = "0004_pending_tool_calls";
 const STORE_HARDENING_SCHEMA_MIGRATION: &str = "0005_store_hardening";
+const CONVERSATION_HISTORY_SCHEMA_MIGRATION: &str = "0006_conversation_history";
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const SQLITE_FOREIGN_KEYS_PRAGMA: &str = "foreign_keys";
 const SQLITE_JOURNAL_MODE_PRAGMA: &str = "journal_mode";
 const SQLITE_JOURNAL_MODE_WAL: &str = "WAL";
 const REDACTED_ARTIFACT_VALUE: &str = "[redacted]";
+const REDACTED_USER_INPUT: &str = "[redacted sensitive user input]";
+const REDACTED_ASSISTANT_OUTPUT: &str = "[redacted sensitive assistant output]";
 const TRACE_HASH_PREFIX: &str = "sha256:";
 const SENSITIVE_ARTIFACT_MARKERS: [&str; 5] =
     ["api_key", "authorization", "password", "secret", "token"];
@@ -65,6 +69,20 @@ pub struct SessionStoreDescriptor {
     pub backend: String,
     pub path: String,
     pub schema_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ThreadHistoryPage {
+    pub messages: Vec<ConversationMessage>,
+    pub next_before_turn_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct StartedTurn {
+    pub turn: Turn,
+    pub item: Item,
+    pub trace: TraceEvent,
+    pub history: ThreadHistoryPage,
 }
 
 pub struct SessionStore {
@@ -249,11 +267,12 @@ impl SessionStore {
     }
 
     pub fn create_turn(&self, thread_id: &str, agent_loop_status: &str) -> StoreResult<Turn> {
-        if !self.thread_exists(thread_id)? {
-            return Err(StoreError::NotFound(format!("thread {thread_id}")));
-        }
+        let transaction = self.connection.unchecked_transaction()?;
+        Self::ensure_active_thread(&transaction, thread_id)?;
+        let turn_sequence = Self::next_turn_sequence(&transaction, thread_id)?;
         let turn = Self::new_turn(thread_id, agent_loop_status);
-        Self::insert_turn(&self.connection, &turn)?;
+        Self::insert_turn(&transaction, &turn, turn_sequence)?;
+        transaction.commit()?;
         Ok(turn)
     }
 
@@ -265,18 +284,37 @@ impl SessionStore {
         component: &str,
         summary: &str,
     ) -> StoreResult<(Turn, Item, TraceEvent)> {
-        let transaction = self.connection.unchecked_transaction()?;
-        if !Self::exists_in_transaction(
-            &transaction,
-            "select 1 from threads where thread_id = ?1",
+        let started = self.create_turn_with_input_trace_and_history(
             thread_id,
-        )? {
-            return Err(StoreError::NotFound(format!("thread {thread_id}")));
-        }
+            agent_loop_status,
+            input,
+            component,
+            summary,
+            0,
+        )?;
+        Ok((started.turn, started.item, started.trace))
+    }
+
+    pub fn create_turn_with_input_trace_and_history(
+        &self,
+        thread_id: &str,
+        agent_loop_status: &str,
+        input: Value,
+        component: &str,
+        summary: &str,
+        history_turn_limit: usize,
+    ) -> StoreResult<StartedTurn> {
+        let transaction = self.connection.unchecked_transaction()?;
+        Self::ensure_active_thread(&transaction, thread_id)?;
+        let history =
+            Self::read_thread_history_from(&transaction, thread_id, None, history_turn_limit)?;
+        let turn_sequence = Self::next_turn_sequence(&transaction, thread_id)?;
         let turn = Self::new_turn(thread_id, agent_loop_status);
-        Self::insert_turn(&transaction, &turn)?;
+        Self::insert_turn(&transaction, &turn, turn_sequence)?;
+        let item_sequence = Self::next_item_sequence(&transaction, &turn.turn_id)?;
+        let (input, redacted) = sanitize_item_payload(&ItemKind::UserMessage, input)?;
         let item = Self::new_item(&turn.turn_id, ItemKind::UserMessage, input);
-        Self::insert_item(&transaction, &item)?;
+        Self::insert_item(&transaction, &item, item_sequence, redacted)?;
         let trace = TraceEvent::new(
             format!("trace_{}", turn.turn_id),
             thread_id,
@@ -286,7 +324,36 @@ impl SessionStore {
         );
         let trace = Self::insert_trace(&transaction, &trace)?;
         transaction.commit()?;
-        Ok((turn, item, trace))
+        Ok(StartedTurn {
+            turn,
+            item,
+            trace,
+            history,
+        })
+    }
+
+    pub fn read_thread_history(
+        &self,
+        thread_id: &str,
+        before_turn_sequence: Option<u64>,
+        turn_limit: usize,
+    ) -> StoreResult<ThreadHistoryPage> {
+        let transaction = self.connection.unchecked_transaction()?;
+        if !Self::exists_in_transaction(
+            &transaction,
+            "select 1 from threads where thread_id = ?1",
+            thread_id,
+        )? {
+            return Err(StoreError::NotFound(format!("thread {thread_id}")));
+        }
+        let history = Self::read_thread_history_from(
+            &transaction,
+            thread_id,
+            before_turn_sequence,
+            turn_limit,
+        )?;
+        transaction.commit()?;
+        Ok(history)
     }
 
     pub fn get_turn(&self, turn_id: &str) -> StoreResult<Turn> {
@@ -332,11 +399,19 @@ impl SessionStore {
     }
 
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
-        if !self.turn_exists(turn_id)? {
+        let transaction = self.connection.unchecked_transaction()?;
+        if !Self::exists_in_transaction(
+            &transaction,
+            "select 1 from turns where turn_id = ?1",
+            turn_id,
+        )? {
             return Err(StoreError::NotFound(format!("turn {turn_id}")));
         }
+        let item_sequence = Self::next_item_sequence(&transaction, turn_id)?;
+        let (payload, redacted) = sanitize_item_payload(&kind, payload)?;
         let item = Self::new_item(turn_id, kind, payload);
-        Self::insert_item(&self.connection, &item)?;
+        Self::insert_item(&transaction, &item, item_sequence, redacted)?;
+        transaction.commit()?;
         Ok(item)
     }
 
@@ -344,7 +419,7 @@ impl SessionStore {
         let payload: String = self
             .connection
             .query_row(
-                "select payload from items where turn_id = ?1 and kind = ?2 order by rowid limit 1",
+                "select payload from items where turn_id = ?1 and kind = ?2 order by item_sequence limit 1",
                 params![turn_id, serde_json::to_string(&ItemKind::UserMessage)?],
                 |row| row.get(0),
             )
@@ -356,7 +431,6 @@ impl SessionStore {
             })?;
         Ok(serde_json::from_str(&payload)?)
     }
-
     pub fn append_trace(&self, event: &TraceEvent) -> StoreResult<()> {
         let _ = Self::insert_trace(&self.connection, event)?;
         Ok(())
@@ -750,15 +824,174 @@ impl SessionStore {
         Ok(migrations)
     }
 
+    fn read_thread_history_from(
+        connection: &Connection,
+        thread_id: &str,
+        before_turn_sequence: Option<u64>,
+        turn_limit: usize,
+    ) -> StoreResult<ThreadHistoryPage> {
+        if turn_limit == 0 {
+            return Ok(ThreadHistoryPage {
+                messages: Vec::new(),
+                next_before_turn_sequence: None,
+            });
+        }
+
+        let completed_turn = serde_json::to_string(&TurnStatus::Completed)?;
+        let before_turn_sequence = before_turn_sequence
+            .map(|sequence| sequence_to_sql(sequence, "before turn sequence"))
+            .transpose()?;
+        let candidate_limit = i64::try_from(turn_limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut statement = connection.prepare(
+            "select turn_sequence from turns where thread_id = ?1 and status = ?2 and (?3 is null or turn_sequence < ?3) order by turn_sequence desc limit ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                thread_id,
+                completed_turn,
+                before_turn_sequence,
+                candidate_limit
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let mut turn_sequences = Vec::new();
+        for row in rows {
+            turn_sequences.push(sequence_from_sql(row?, "turn sequence")?);
+        }
+        if turn_sequences.is_empty() {
+            return Ok(ThreadHistoryPage {
+                messages: Vec::new(),
+                next_before_turn_sequence: None,
+            });
+        }
+
+        let has_more = turn_sequences.len() > turn_limit;
+        turn_sequences.truncate(turn_limit);
+        let next_before_turn_sequence = if has_more {
+            Some(*turn_sequences.last().ok_or_else(|| {
+                StoreError::InvalidState("history page lost its oldest turn".to_string())
+            })?)
+        } else {
+            None
+        };
+        let selected_turn_limit = i64::try_from(turn_sequences.len()).unwrap_or(i64::MAX);
+        let completed_item = serde_json::to_string(&ItemStatus::Completed)?;
+        let user_message = serde_json::to_string(&ItemKind::UserMessage)?;
+        let agent_message = serde_json::to_string(&ItemKind::AgentMessage)?;
+        let mut statement = connection.prepare(
+            "with selected_turns as (
+                select turn_id, turn_sequence
+                from turns
+                where thread_id = ?1
+                  and status = ?2
+                  and (?3 is null or turn_sequence < ?3)
+                order by turn_sequence desc
+                limit ?4
+            )
+            select items.item_id, items.turn_id, selected_turns.turn_sequence,
+                   items.item_sequence, items.kind, items.payload, items.redacted
+            from selected_turns
+            join items on items.turn_id = selected_turns.turn_id
+            where items.status = ?5 and items.kind in (?6, ?7)
+            order by selected_turns.turn_sequence, items.item_sequence",
+        )?;
+        let rows = statement.query_map(
+            params![
+                thread_id,
+                completed_turn,
+                before_turn_sequence,
+                selected_turn_limit,
+                completed_item,
+                user_message,
+                agent_message,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, bool>(6)?,
+                ))
+            },
+        )?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (item_id, turn_id, turn_sequence, item_sequence, kind, payload, stored_redacted) =
+                row?;
+            let kind: ItemKind = serde_json::from_str(&kind).map_err(|_| {
+                StoreError::InvalidState("malformed conversation item kind".to_string())
+            })?;
+            let payload: Value = serde_json::from_str(&payload).map_err(|_| {
+                StoreError::InvalidState("malformed conversation item payload".to_string())
+            })?;
+            let (payload, detected_redaction) = sanitize_item_payload(&kind, payload)?;
+            let (role, content) = conversation_projection(&kind, &payload)?;
+            messages.push(ConversationMessage {
+                item_id,
+                turn_id,
+                turn_sequence: sequence_from_sql(turn_sequence, "turn sequence")?,
+                item_sequence: sequence_from_sql(item_sequence, "item sequence")?,
+                role,
+                content,
+                redacted: stored_redacted || detected_redaction,
+            });
+        }
+
+        Ok(ThreadHistoryPage {
+            messages,
+            next_before_turn_sequence,
+        })
+    }
+
+    fn ensure_active_thread(connection: &Connection, thread_id: &str) -> StoreResult<()> {
+        let status = connection
+            .query_row(
+                "select status from threads where thread_id = ?1",
+                params![thread_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("thread {thread_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        let status: ThreadStatus = serde_json::from_str(&status).map_err(|_| {
+            StoreError::InvalidState(format!("thread {thread_id} has malformed status"))
+        })?;
+        if status != ThreadStatus::Active {
+            return Err(StoreError::InvalidState(format!(
+                "thread {thread_id} is not active"
+            )));
+        }
+        Ok(())
+    }
+
+    fn next_turn_sequence(connection: &Connection, thread_id: &str) -> StoreResult<u64> {
+        let current = connection.query_row(
+            "select max(turn_sequence) from turns where thread_id = ?1",
+            params![thread_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        next_sequence(current, "turn sequence")
+    }
+
+    fn next_item_sequence(connection: &Connection, turn_id: &str) -> StoreResult<u64> {
+        let current = connection.query_row(
+            "select max(item_sequence) from items where turn_id = ?1",
+            params![turn_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        next_sequence(current, "item sequence")
+    }
     fn trace_run_exists(&self, run_id: &str) -> StoreResult<bool> {
         self.exists(
             "select 1 from trace_events where run_id = ?1 limit 1",
             run_id,
         )
-    }
-
-    fn thread_exists(&self, thread_id: &str) -> StoreResult<bool> {
-        self.exists("select 1 from threads where thread_id = ?1", thread_id)
     }
 
     fn thread_from_row(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
@@ -791,10 +1024,6 @@ impl SessionStore {
             })?,
             agent_loop_status: row.get(3)?,
         })
-    }
-
-    fn turn_exists(&self, turn_id: &str) -> StoreResult<bool> {
-        self.exists("select 1 from turns where turn_id = ?1", turn_id)
     }
 
     fn exists(&self, query: &str, value: &str) -> StoreResult<bool> {
@@ -830,6 +1059,7 @@ impl SessionStore {
             create table if not exists turns(
                 turn_id text primary key,
                 thread_id text not null,
+                turn_sequence integer not null check(turn_sequence > 0),
                 status text not null,
                 agent_loop_status text not null,
                 foreign key(thread_id) references threads(thread_id)
@@ -837,9 +1067,11 @@ impl SessionStore {
             create table if not exists items(
                 item_id text primary key,
                 turn_id text not null,
+                item_sequence integer not null check(item_sequence > 0),
                 kind text not null,
                 payload text not null,
                 status text not null,
+                redacted integer not null check(redacted in (0, 1)),
                 foreign key(turn_id) references turns(turn_id)
             );
             create table if not exists trace_events(
@@ -888,28 +1120,135 @@ impl SessionStore {
         self.ensure_trace_session_id_column()?;
         self.ensure_pending_tool_call_thread_id_column()?;
         self.ensure_pending_tool_call_tool_call_id_column()?;
+        for migration in [
+            INITIAL_SCHEMA_MIGRATION,
+            DURABLE_LEDGER_SCHEMA_MIGRATION,
+            PENDING_TOOL_CALL_SCHEMA_MIGRATION,
+            STORE_HARDENING_SCHEMA_MIGRATION,
+        ] {
+            self.connection.execute(
+                "insert or ignore into schema_migrations(migration_id) values(?1)",
+                params![migration],
+            )?;
+        }
+        self.migrate_conversation_history()?;
         self.ensure_required_foreign_keys()?;
-        self.connection.execute(
-            "insert or ignore into schema_migrations(migration_id) values(?1)",
-            params![INITIAL_SCHEMA_MIGRATION],
+        self.fail_closed_on_foreign_key_violations()?;
+        Ok(())
+    }
+
+    fn migrate_conversation_history(&self) -> StoreResult<()> {
+        let migration_applied = self.exists(
+            "select 1 from schema_migrations where migration_id = ?1",
+            CONVERSATION_HISTORY_SCHEMA_MIGRATION,
         )?;
-        self.connection.execute(
-            "insert or ignore into schema_migrations(migration_id) values(?1)",
-            params![DURABLE_LEDGER_SCHEMA_MIGRATION],
-        )?;
-        self.connection.execute(
-            "insert or ignore into schema_migrations(migration_id) values(?1)",
-            params![PENDING_TOOL_CALL_SCHEMA_MIGRATION],
-        )?;
-        self.connection.execute(
-            "insert or ignore into schema_migrations(migration_id) values(?1)",
-            params![STORE_HARDENING_SCHEMA_MIGRATION],
-        )?;
-        self.connection.execute("delete from schema_meta", [])?;
-        self.connection.execute(
-            "insert into schema_meta(schema_version) values(?1)",
-            params![SCHEMA_VERSION],
-        )?;
+        let has_turn_sequence = self.table_has_column("turns", "turn_sequence")?;
+        let has_item_sequence = self.table_has_column("items", "item_sequence")?;
+        let has_item_redacted = self.table_has_column("items", "redacted")?;
+        let has_complete_schema = has_turn_sequence && has_item_sequence && has_item_redacted;
+        let has_partial_schema = has_turn_sequence || has_item_sequence || has_item_redacted;
+        if migration_applied && !has_complete_schema {
+            return Err(StoreError::InvalidState(
+                "conversation history migration is recorded but schema is incomplete".to_string(),
+            ));
+        }
+        if !has_complete_schema && has_partial_schema {
+            return Err(StoreError::InvalidState(
+                "conversation history schema is partially migrated".to_string(),
+            ));
+        }
+
+        self.connection
+            .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "OFF")?;
+        let migration_result = (|| -> StoreResult<()> {
+            let transaction = self.connection.unchecked_transaction()?;
+            if !has_complete_schema {
+                transaction.execute_batch(
+                    "
+                    create table turns_v6(
+                        turn_id text primary key,
+                        thread_id text not null,
+                        turn_sequence integer not null check(turn_sequence > 0),
+                        status text not null,
+                        agent_loop_status text not null,
+                        foreign key(thread_id) references threads(thread_id)
+                    );
+                    insert into turns_v6(
+                        turn_id, thread_id, turn_sequence, status, agent_loop_status
+                    )
+                    select turn_id, thread_id,
+                           row_number() over(partition by thread_id order by rowid),
+                           status, agent_loop_status
+                    from turns;
+
+                    create table items_v6(
+                        item_id text primary key,
+                        turn_id text not null,
+                        item_sequence integer not null check(item_sequence > 0),
+                        kind text not null,
+                        payload text not null,
+                        status text not null,
+                        redacted integer not null check(redacted in (0, 1)),
+                        foreign key(turn_id) references turns_v6(turn_id)
+                    );
+                    insert into items_v6(
+                        item_id, turn_id, item_sequence, kind, payload, status, redacted
+                    )
+                    select item_id, turn_id,
+                           row_number() over(partition by turn_id order by rowid),
+                           kind, payload, status, 0
+                    from items;
+
+                    drop table items;
+                    drop table turns;
+                    alter table turns_v6 rename to turns;
+                    alter table items_v6 rename to items;
+                    ",
+                )?;
+            }
+            let invalid_turn_sequences: u64 = transaction.query_row(
+                "select count(*) from turns where turn_sequence is null or turn_sequence <= 0",
+                [],
+                |row| row.get(0),
+            )?;
+            let invalid_items: u64 = transaction.query_row(
+                "select count(*) from items where item_sequence is null or item_sequence <= 0 or redacted not in (0, 1)",
+                [],
+                |row| row.get(0),
+            )?;
+            if invalid_turn_sequences != 0 || invalid_items != 0 {
+                return Err(StoreError::InvalidState(
+                    "conversation history contains invalid sequence or redaction values"
+                        .to_string(),
+                ));
+            }
+            transaction.execute_batch(
+                "
+                create unique index if not exists turns_thread_sequence_unique
+                    on turns(thread_id, turn_sequence);
+                create unique index if not exists items_turn_sequence_unique
+                    on items(turn_id, item_sequence);
+                ",
+            )?;
+            fail_closed_on_foreign_key_violations(&transaction)?;
+            transaction.execute(
+                "insert or ignore into schema_migrations(migration_id) values(?1)",
+                params![CONVERSATION_HISTORY_SCHEMA_MIGRATION],
+            )?;
+            transaction.execute("delete from schema_meta", [])?;
+            transaction.execute(
+                "insert into schema_meta(schema_version) values(?1)",
+                params![SCHEMA_VERSION],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        let foreign_keys_result = self
+            .connection
+            .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")
+            .map_err(StoreError::Sqlite);
+        migration_result?;
+        foreign_keys_result?;
         Ok(())
     }
 
@@ -1002,82 +1341,89 @@ impl SessionStore {
     fn rebuild_foreign_key_tables(&self) -> StoreResult<()> {
         self.connection
             .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "OFF")?;
-        self.connection.execute_batch(
-            "
-            create table turns_new(
-                turn_id text primary key,
-                thread_id text not null,
-                status text not null,
-                agent_loop_status text not null,
-                foreign key(thread_id) references threads(thread_id)
-            );
-            insert into turns_new(turn_id, thread_id, status, agent_loop_status)
-            select turn_id, thread_id, status, agent_loop_status from turns;
-            drop table turns;
-            alter table turns_new rename to turns;
+        let rebuild_result = (|| -> StoreResult<()> {
+            let transaction = self.connection.unchecked_transaction()?;
+            transaction.execute_batch(
+                "
+                create table turns_new(
+                    turn_id text primary key,
+                    thread_id text not null,
+                    turn_sequence integer not null check(turn_sequence > 0),
+                    status text not null,
+                    agent_loop_status text not null,
+                    foreign key(thread_id) references threads(thread_id)
+                );
+                insert into turns_new(
+                    turn_id, thread_id, turn_sequence, status, agent_loop_status
+                )
+                select turn_id, thread_id, turn_sequence, status, agent_loop_status from turns;
 
-            create table items_new(
-                item_id text primary key,
-                turn_id text not null,
-                kind text not null,
-                payload text not null,
-                status text not null,
-                foreign key(turn_id) references turns(turn_id)
-            );
-            insert into items_new(item_id, turn_id, kind, payload, status)
-            select item_id, turn_id, kind, payload, status from items;
-            drop table items;
-            alter table items_new rename to items;
+                create table items_new(
+                    item_id text primary key,
+                    turn_id text not null,
+                    item_sequence integer not null check(item_sequence > 0),
+                    kind text not null,
+                    payload text not null,
+                    status text not null,
+                    redacted integer not null check(redacted in (0, 1)),
+                    foreign key(turn_id) references turns_new(turn_id)
+                );
+                insert into items_new(
+                    item_id, turn_id, item_sequence, kind, payload, status, redacted
+                )
+                select item_id, turn_id, item_sequence, kind, payload, status, redacted from items;
+                drop table items;
+                drop table turns;
+                alter table turns_new rename to turns;
+                alter table items_new rename to items;
+                create unique index turns_thread_sequence_unique
+                    on turns(thread_id, turn_sequence);
+                create unique index items_turn_sequence_unique
+                    on items(turn_id, item_sequence);
 
-            create table approval_decisions_new(
-                decision_id text primary key,
-                request_id text not null,
-                outcome text not null,
-                reason text not null,
-                payload text not null,
-                foreign key(request_id) references approvals(request_id)
-            );
-            insert into approval_decisions_new(decision_id, request_id, outcome, reason, payload)
-            select decision_id, request_id, outcome, reason, payload from approval_decisions;
-            drop table approval_decisions;
-            alter table approval_decisions_new rename to approval_decisions;
+                create table approval_decisions_new(
+                    decision_id text primary key,
+                    request_id text not null,
+                    outcome text not null,
+                    reason text not null,
+                    payload text not null,
+                    foreign key(request_id) references approvals(request_id)
+                );
+                insert into approval_decisions_new(decision_id, request_id, outcome, reason, payload)
+                select decision_id, request_id, outcome, reason, payload from approval_decisions;
+                drop table approval_decisions;
+                alter table approval_decisions_new rename to approval_decisions;
 
-            create table pending_tool_calls_new(
-                request_id text primary key,
-                thread_id text not null,
-                turn_id text not null,
-                tool_call_id text not null,
-                payload text not null,
-                foreign key(request_id) references approvals(request_id),
-                foreign key(thread_id) references threads(thread_id),
-                foreign key(turn_id) references turns(turn_id)
-            );
-            insert into pending_tool_calls_new(request_id, thread_id, turn_id, tool_call_id, payload)
-            select request_id, thread_id, turn_id, tool_call_id, payload from pending_tool_calls;
-            drop table pending_tool_calls;
-            alter table pending_tool_calls_new rename to pending_tool_calls;
-            ",
-        )?;
-        self.connection
-            .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")?;
+                create table pending_tool_calls_new(
+                    request_id text primary key,
+                    thread_id text not null,
+                    turn_id text not null,
+                    tool_call_id text not null,
+                    payload text not null,
+                    foreign key(request_id) references approvals(request_id),
+                    foreign key(thread_id) references threads(thread_id),
+                    foreign key(turn_id) references turns(turn_id)
+                );
+                insert into pending_tool_calls_new(request_id, thread_id, turn_id, tool_call_id, payload)
+                select request_id, thread_id, turn_id, tool_call_id, payload from pending_tool_calls;
+                drop table pending_tool_calls;
+                alter table pending_tool_calls_new rename to pending_tool_calls;
+                ",
+            )?;
+            fail_closed_on_foreign_key_violations(&transaction)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        let foreign_keys_result = self
+            .connection
+            .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")
+            .map_err(StoreError::Sqlite);
+        rebuild_result?;
+        foreign_keys_result?;
         Ok(())
     }
-
     fn fail_closed_on_foreign_key_violations(&self) -> StoreResult<()> {
-        let violation = self
-            .connection
-            .query_row("pragma foreign_key_check", [], |row| {
-                let table: String = row.get(0)?;
-                let row_id: i64 = row.get(1)?;
-                Ok(format!("{table}:{row_id}"))
-            })
-            .optional()?;
-        if let Some(violation) = violation {
-            return Err(StoreError::InvalidState(format!(
-                "store foreign key violation after migration: {violation}"
-            )));
-        }
-        Ok(())
+        fail_closed_on_foreign_key_violations(&self.connection)
     }
 
     fn table_references(&self, table: &str, parent: &str) -> StoreResult<bool> {
@@ -1167,12 +1513,13 @@ impl SessionStore {
         Ok(())
     }
 
-    fn insert_turn(connection: &Connection, turn: &Turn) -> StoreResult<()> {
+    fn insert_turn(connection: &Connection, turn: &Turn, turn_sequence: u64) -> StoreResult<()> {
         connection.execute(
-            "insert into turns(turn_id, thread_id, status, agent_loop_status) values(?1, ?2, ?3, ?4)",
+            "insert into turns(turn_id, thread_id, turn_sequence, status, agent_loop_status) values(?1, ?2, ?3, ?4, ?5)",
             params![
                 turn.turn_id,
                 turn.thread_id,
+                sequence_to_sql(turn_sequence, "turn sequence")?,
                 serde_json::to_string(&turn.status)?,
                 turn.agent_loop_status
             ],
@@ -1180,20 +1527,26 @@ impl SessionStore {
         Ok(())
     }
 
-    fn insert_item(connection: &Connection, item: &Item) -> StoreResult<()> {
+    fn insert_item(
+        connection: &Connection,
+        item: &Item,
+        item_sequence: u64,
+        redacted: bool,
+    ) -> StoreResult<()> {
         connection.execute(
-            "insert into items(item_id, turn_id, kind, payload, status) values(?1, ?2, ?3, ?4, ?5)",
+            "insert into items(item_id, turn_id, item_sequence, kind, payload, status, redacted) values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 item.item_id,
                 item.turn_id,
+                sequence_to_sql(item_sequence, "item sequence")?,
                 serde_json::to_string(&item.kind)?,
                 serde_json::to_string(&item.payload)?,
-                serde_json::to_string(&item.status)?
+                serde_json::to_string(&item.status)?,
+                redacted,
             ],
         )?;
         Ok(())
     }
-
     fn insert_trace(connection: &Connection, event: &TraceEvent) -> StoreResult<TraceEvent> {
         let event = sanitize_trace_event(event);
         connection.execute(
@@ -1226,6 +1579,159 @@ fn configure_connection(connection: &Connection) -> StoreResult<()> {
     connection.pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")?;
     connection.pragma_update(None, SQLITE_JOURNAL_MODE_PRAGMA, SQLITE_JOURNAL_MODE_WAL)?;
     connection.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+    Ok(())
+}
+
+fn next_sequence(current: Option<i64>, label: &str) -> StoreResult<u64> {
+    let current = current
+        .map(|sequence| sequence_from_sql(sequence, label))
+        .transpose()?
+        .unwrap_or(0);
+    current
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidState(format!("{label} overflow")))
+}
+
+fn sequence_to_sql(sequence: u64, label: &str) -> StoreResult<i64> {
+    i64::try_from(sequence)
+        .map_err(|_| StoreError::InvalidState(format!("{label} exceeds sqlite integer range")))
+}
+
+fn sequence_from_sql(sequence: i64, label: &str) -> StoreResult<u64> {
+    u64::try_from(sequence)
+        .map_err(|_| StoreError::InvalidState(format!("{label} must be non-negative")))
+}
+
+fn sanitize_item_payload(kind: &ItemKind, mut payload: Value) -> StoreResult<(Value, bool)> {
+    match kind {
+        ItemKind::UserMessage => {
+            let items = payload.as_array_mut().ok_or_else(|| {
+                StoreError::InvalidState(
+                    "user message payload must be an InputItem array".to_string(),
+                )
+            })?;
+            let mut redacted = false;
+            for item in items {
+                let object = item.as_object_mut().ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "user message contains malformed InputItem".to_string(),
+                    )
+                })?;
+                let valid = object.len() == 2
+                    && object.get("type").and_then(Value::as_str) == Some("text")
+                    && object.get("text").is_some_and(Value::is_string);
+                if !valid {
+                    return Err(StoreError::InvalidState(
+                        "user message contains malformed InputItem".to_string(),
+                    ));
+                }
+                let text = object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "user message contains malformed InputItem".to_string(),
+                        )
+                    })?
+                    .to_string();
+                if contains_sensitive_text(&text) {
+                    object.insert(
+                        "text".to_string(),
+                        Value::String(REDACTED_USER_INPUT.to_string()),
+                    );
+                    redacted = true;
+                }
+            }
+            Ok((payload, redacted))
+        }
+        ItemKind::AgentMessage => {
+            let object = payload.as_object_mut().ok_or_else(|| {
+                StoreError::InvalidState("agent message payload must contain delta".to_string())
+            })?;
+            let valid = object.len() == 1 && object.get("delta").is_some_and(Value::is_string);
+            if !valid {
+                return Err(StoreError::InvalidState(
+                    "agent message payload must contain only a string delta".to_string(),
+                ));
+            }
+            let delta = object
+                .get("delta")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "agent message payload must contain only a string delta".to_string(),
+                    )
+                })?
+                .to_string();
+            let redacted = contains_sensitive_text(&delta);
+            if redacted {
+                object.insert(
+                    "delta".to_string(),
+                    Value::String(REDACTED_ASSISTANT_OUTPUT.to_string()),
+                );
+            }
+            Ok((payload, redacted))
+        }
+        _ => {
+            let serialized = serde_json::to_string(&payload)?;
+            if contains_sensitive_text(&serialized) {
+                Ok((serde_json::json!({"redacted": true}), true))
+            } else {
+                Ok((payload, false))
+            }
+        }
+    }
+}
+
+fn conversation_projection(
+    kind: &ItemKind,
+    payload: &Value,
+) -> StoreResult<(ConversationRole, String)> {
+    match kind {
+        ItemKind::UserMessage => {
+            let items = payload.as_array().ok_or_else(|| {
+                StoreError::InvalidState("malformed user message payload".to_string())
+            })?;
+            let content = items
+                .iter()
+                .map(|item| {
+                    item.get("text").and_then(Value::as_str).ok_or_else(|| {
+                        StoreError::InvalidState("malformed user message InputItem".to_string())
+                    })
+                })
+                .collect::<StoreResult<Vec<_>>>()?
+                .join("\n");
+            Ok((ConversationRole::User, content))
+        }
+        ItemKind::AgentMessage => {
+            let content = payload
+                .get("delta")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    StoreError::InvalidState("malformed agent message payload".to_string())
+                })?
+                .to_string();
+            Ok((ConversationRole::Assistant, content))
+        }
+        _ => Err(StoreError::InvalidState(
+            "non-conversation item selected for history".to_string(),
+        )),
+    }
+}
+
+fn fail_closed_on_foreign_key_violations(connection: &Connection) -> StoreResult<()> {
+    let violation = connection
+        .query_row("pragma foreign_key_check", [], |row| {
+            let table: String = row.get(0)?;
+            let row_id: i64 = row.get(1)?;
+            Ok(format!("{table}:{row_id}"))
+        })
+        .optional()?;
+    if let Some(violation) = violation {
+        return Err(StoreError::InvalidState(format!(
+            "store foreign key violation after migration: {violation}"
+        )));
+    }
     Ok(())
 }
 

@@ -1,8 +1,8 @@
 use schemars::schema_for;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
-use singularity_protocol::{ItemKind, TraceEvent, TurnStatus};
+use singularity_protocol::{ItemKind, ThreadStatus, TraceEvent, TurnStatus};
 use singularity_store::{
-    RegisterArtifactRefParams, SessionStore, SessionStoreDescriptor, StoreError,
+    ConversationRole, RegisterArtifactRefParams, SessionStore, SessionStoreDescriptor, StoreError,
 };
 
 #[test]
@@ -12,14 +12,15 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let descriptor = store.descriptor();
 
     assert_eq!(descriptor.backend, "sqlite");
-    assert_eq!(descriptor.schema_version, 5);
+    assert_eq!(descriptor.schema_version, 6);
     assert_eq!(
         store.applied_migrations().expect("migrations"),
         vec![
             "0001_initial_session_store".to_string(),
             "0002_durable_ledger".to_string(),
             "0004_pending_tool_calls".to_string(),
-            "0005_store_hardening".to_string()
+            "0005_store_hardening".to_string(),
+            "0006_conversation_history".to_string()
         ]
     );
     assert_eq!(
@@ -42,7 +43,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
         .append_item(
             &turn.turn_id,
             ItemKind::UserMessage,
-            serde_json::json!({"text": "hello"}),
+            serde_json::json!([{"type": "text", "text": "hello"}]),
         )
         .expect("item");
     let trace = TraceEvent::new(
@@ -92,7 +93,7 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
         .query_row("pragma journal_mode", [], |row| row.get(0))
         .expect("journal mode");
 
-    assert_eq!(schema_version, 5);
+    assert_eq!(schema_version, 6);
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
 }
 
@@ -115,7 +116,7 @@ fn sqlite_store_rejects_future_schema_version() {
         SessionStore::open(&db_path),
         Err(StoreError::UnsupportedSchema {
             found: 999,
-            supported: 5
+            supported: 6
         })
     ));
 }
@@ -896,4 +897,521 @@ fn artifact_refs_are_durable_and_redact_secret_like_metadata() {
         store.list_artifact_refs("run_1").expect("list")[0].artifact_id,
         artifact.artifact_id
     );
+}
+
+#[test]
+fn v5_reopen_backfills_stable_explicit_turn_and_item_sequences() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    create_v5_history_database(&db_path);
+
+    let store = SessionStore::open(&db_path).expect("migrate v5 store");
+    assert!(
+        store
+            .applied_migrations()
+            .expect("migrations")
+            .contains(&"0006_conversation_history".to_string())
+    );
+    drop(store);
+
+    let first = read_history_sequences(&db_path);
+    assert_eq!(
+        first,
+        (
+            vec![
+                ("turn_a_1".to_string(), 1),
+                ("turn_a_2".to_string(), 2),
+                ("turn_b_1".to_string(), 1),
+            ],
+            vec![
+                ("item_a_1_user".to_string(), 1, false),
+                ("item_a_1_agent".to_string(), 2, false),
+                ("item_a_2_user".to_string(), 1, false),
+                ("item_b_1_user".to_string(), 1, false),
+            ],
+        )
+    );
+
+    let reopened = SessionStore::open(&db_path).expect("reopen migrated store");
+    drop(reopened);
+    assert_eq!(read_history_sequences(&db_path), first);
+}
+
+#[test]
+fn completed_history_is_durable_ordered_and_paged_by_turn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn_1 =
+        append_completed_conversation(&store, &thread.thread_id, "user one", "assistant one");
+    let turn_2 =
+        append_completed_conversation(&store, &thread.thread_id, "user two", "assistant two");
+    let turn_3 =
+        append_completed_conversation(&store, &thread.thread_id, "user three", "assistant three");
+    drop(store);
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let full = store
+        .read_thread_history(&thread.thread_id, None, 10)
+        .expect("full history");
+    assert_eq!(
+        full.messages
+            .iter()
+            .map(|message| (
+                message.turn_id.as_str(),
+                message.role.clone(),
+                message.content.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (turn_1.as_str(), ConversationRole::User, "user one"),
+            (
+                turn_1.as_str(),
+                ConversationRole::Assistant,
+                "assistant one"
+            ),
+            (turn_2.as_str(), ConversationRole::User, "user two"),
+            (
+                turn_2.as_str(),
+                ConversationRole::Assistant,
+                "assistant two"
+            ),
+            (turn_3.as_str(), ConversationRole::User, "user three"),
+            (
+                turn_3.as_str(),
+                ConversationRole::Assistant,
+                "assistant three"
+            ),
+        ]
+    );
+    assert_eq!(full.next_before_turn_sequence, None);
+
+    let latest = store
+        .read_thread_history(&thread.thread_id, None, 2)
+        .expect("latest page");
+    assert_eq!(
+        latest
+            .messages
+            .iter()
+            .map(|message| message.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            turn_2.as_str(),
+            turn_2.as_str(),
+            turn_3.as_str(),
+            turn_3.as_str()
+        ]
+    );
+    assert_eq!(latest.next_before_turn_sequence, Some(2));
+
+    let earlier = store
+        .read_thread_history(&thread.thread_id, latest.next_before_turn_sequence, 2)
+        .expect("earlier page");
+    assert_eq!(
+        earlier
+            .messages
+            .iter()
+            .map(|message| message.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![turn_1.as_str(), turn_1.as_str()]
+    );
+    assert_eq!(earlier.next_before_turn_sequence, None);
+}
+
+#[test]
+fn history_excludes_non_completed_turns_and_non_conversation_items() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let completed =
+        append_completed_conversation(&store, &thread.thread_id, "safe user", "safe assistant");
+
+    for status in [
+        TurnStatus::Blocked,
+        TurnStatus::Failed,
+        TurnStatus::Interrupted,
+    ] {
+        let started = store
+            .create_turn_with_input_trace_and_history(
+                &thread.thread_id,
+                "running",
+                serde_json::json!([{"type": "text", "text": "must not replay"}]),
+                "test",
+                "turn started",
+                10,
+            )
+            .expect("start non-completed turn");
+        store
+            .append_item(
+                &started.turn.turn_id,
+                ItemKind::AgentMessage,
+                serde_json::json!({"delta": "must not replay"}),
+            )
+            .expect("assistant item");
+        store
+            .update_turn_status(&started.turn.turn_id, status)
+            .expect("terminal status");
+    }
+
+    store
+        .append_item(
+            &completed,
+            ItemKind::Reasoning,
+            serde_json::json!({"summary": "private reasoning"}),
+        )
+        .expect("reasoning");
+    store
+        .append_item(
+            &completed,
+            ItemKind::CommandExecution,
+            serde_json::json!({"command": "secret tool metadata"}),
+        )
+        .expect("tool item");
+    store
+        .append_trace(&TraceEvent::new(
+            "history_trace",
+            &thread.thread_id,
+            &thread.thread_id,
+            "test",
+            "trace metadata",
+        ))
+        .expect("trace");
+    let approval = ApprovalRequest::new(
+        "history_approval",
+        thread.thread_id.clone(),
+        completed.clone(),
+        "builtin.read",
+    );
+    store.create_approval(&approval).expect("approval");
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "insert into items(item_id, turn_id, item_sequence, kind, payload, status, redacted) values('started_agent_item', ?1, 5, ?2, '{\"delta\":\"not completed\"}', ?3, 0)",
+            rusqlite::params![
+                completed,
+                serde_json::to_string(&ItemKind::AgentMessage).expect("agent kind"),
+                serde_json::to_string(&singularity_protocol::ItemStatus::Started)
+                    .expect("started status"),
+            ],
+        )
+        .expect("started item");
+    drop(connection);
+    store
+        .register_artifact_ref(RegisterArtifactRefParams {
+            run_id: &thread.thread_id,
+            item_id: None,
+            kind: "file",
+            uri: "artifact://history/result.txt",
+            content_digest: "sha256:history",
+            summary: "artifact metadata",
+            metadata: serde_json::json!({"safe": true}),
+        })
+        .expect("artifact");
+
+    let history = store
+        .read_thread_history(&thread.thread_id, None, 20)
+        .expect("history");
+    assert_eq!(history.messages.len(), 2);
+    assert_eq!(history.messages[0].content, "safe user");
+    assert_eq!(history.messages[1].content, "safe assistant");
+}
+
+#[test]
+fn item_storage_and_history_redact_sensitive_user_and_assistant_text() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let raw_user_secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+    let raw_assistant_secret = "Bearer abcdefghijklmnopqrstuvwxyz123456";
+    let raw_tool_secret = "token=abcdefghijklmnopqrstuvwxyz123456";
+    let started = store
+        .create_turn_with_input_trace_and_history(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": raw_user_secret}]),
+            "test",
+            "turn started",
+            10,
+        )
+        .expect("start turn");
+    store
+        .append_item(
+            &started.turn.turn_id,
+            ItemKind::AgentMessage,
+            serde_json::json!({"delta": raw_assistant_secret}),
+        )
+        .expect("assistant item");
+    store
+        .append_item(
+            &started.turn.turn_id,
+            ItemKind::Reasoning,
+            serde_json::json!({"token": raw_tool_secret}),
+        )
+        .expect("sensitive non-conversation item");
+    store
+        .update_turn_status(&started.turn.turn_id, TurnStatus::Completed)
+        .expect("complete turn");
+
+    let stored_input = store
+        .get_turn_user_input(&started.turn.turn_id)
+        .expect("stored input");
+    assert_eq!(
+        stored_input,
+        serde_json::json!([{"type": "text", "text": "[redacted sensitive user input]"}])
+    );
+    let history = store
+        .read_thread_history(&thread.thread_id, None, 10)
+        .expect("history");
+    assert_eq!(
+        history.messages[0].content,
+        "[redacted sensitive user input]"
+    );
+    assert!(history.messages[0].redacted);
+    assert_eq!(
+        history.messages[1].content,
+        "[redacted sensitive assistant output]"
+    );
+    assert!(history.messages[1].redacted);
+
+    drop(store);
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    let stored_items = connection
+        .prepare("select payload, redacted from items order by item_sequence")
+        .expect("prepare items")
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
+        .expect("query items")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect items");
+    assert!(stored_items.iter().all(|(_, redacted)| *redacted));
+    let serialized = serde_json::to_string(&stored_items).expect("serialize stored items");
+    assert!(!serialized.contains(raw_user_secret));
+    assert!(!serialized.contains(raw_assistant_secret));
+    assert!(!serialized.contains(raw_tool_secret));
+    assert_eq!(stored_items[2].0, "{\"redacted\":true}");
+}
+
+#[test]
+fn malformed_conversation_payload_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn_id = append_completed_conversation(&store, &thread.thread_id, "user", "assistant");
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "update items set payload = '{\"delta\":42}' where turn_id = ?1 and kind = ?2",
+            rusqlite::params![
+                turn_id,
+                serde_json::to_string(&ItemKind::AgentMessage).expect("kind")
+            ],
+        )
+        .expect("tamper payload");
+
+    assert!(matches!(
+        store.read_thread_history(&thread.thread_id, None, 10),
+        Err(StoreError::InvalidState(_))
+    ));
+}
+
+#[test]
+fn archived_thread_cannot_start_a_turn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    store
+        .update_thread_status(&thread.thread_id, ThreadStatus::Archived)
+        .expect("archive thread");
+
+    assert!(matches!(
+        store.create_turn(&thread.thread_id, "running"),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        store.create_turn_with_input_trace_and_history(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "cannot start"}]),
+            "test",
+            "turn started",
+            10,
+        ),
+        Err(StoreError::InvalidState(_))
+    ));
+}
+
+#[test]
+fn turn_and_item_sequence_unique_indexes_reject_duplicates() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    store
+        .append_item(
+            &turn.turn_id,
+            ItemKind::Reasoning,
+            serde_json::json!({"summary": "safe"}),
+        )
+        .expect("item");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    assert!(connection
+        .execute(
+            "insert into turns(turn_id, thread_id, turn_sequence, status, agent_loop_status) values('duplicate_turn', ?1, 1, '\"running\"', 'running')",
+            [&thread.thread_id],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "insert into items(item_id, turn_id, item_sequence, kind, payload, status, redacted) values('duplicate_item', ?1, 1, '\"reasoning\"', '{}', '\"completed\"', 0)",
+            [&turn.turn_id],
+        )
+        .is_err());
+}
+
+#[test]
+fn started_turn_returns_prior_history_from_the_same_atomic_start_boundary() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let prior_turn =
+        append_completed_conversation(&store, &thread.thread_id, "prior user", "prior assistant");
+
+    let started = store
+        .create_turn_with_input_trace_and_history(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "current user"}]),
+            "test",
+            "turn started",
+            10,
+        )
+        .expect("start turn");
+
+    assert_eq!(started.history.messages.len(), 2);
+    assert!(
+        started
+            .history
+            .messages
+            .iter()
+            .all(|message| message.turn_id == prior_turn)
+    );
+    assert_eq!(started.item.turn_id, started.turn.turn_id);
+    assert_eq!(started.trace.run_id, thread.thread_id);
+    assert_eq!(started.trace.session_id, started.turn.turn_id);
+}
+
+fn append_completed_conversation(
+    store: &SessionStore,
+    thread_id: &str,
+    user: &str,
+    assistant: &str,
+) -> String {
+    let (turn, _, _) = store
+        .create_turn_with_input_and_trace(
+            thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": user}]),
+            "test",
+            "turn started",
+        )
+        .expect("start turn");
+    store
+        .append_item(
+            &turn.turn_id,
+            ItemKind::AgentMessage,
+            serde_json::json!({"delta": assistant}),
+        )
+        .expect("assistant item");
+    store
+        .update_turn_status(&turn.turn_id, TurnStatus::Completed)
+        .expect("complete turn");
+    turn.turn_id
+}
+
+fn create_v5_history_database(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).expect("open v5 sqlite");
+    connection
+        .execute_batch(
+            r#"
+            create table schema_meta(schema_version integer not null);
+            insert into schema_meta(schema_version) values(5);
+            create table schema_migrations(
+                migration_id text primary key,
+                applied_at text not null default current_timestamp
+            );
+            insert into schema_migrations(migration_id) values
+                ('0001_initial_session_store'),
+                ('0002_durable_ledger'),
+                ('0004_pending_tool_calls'),
+                ('0005_store_hardening');
+            create table threads(
+                thread_id text primary key,
+                model text,
+                cwd text,
+                status text not null
+            );
+            create table turns(
+                turn_id text primary key,
+                thread_id text not null,
+                status text not null,
+                agent_loop_status text not null,
+                foreign key(thread_id) references threads(thread_id)
+            );
+            create table items(
+                item_id text primary key,
+                turn_id text not null,
+                kind text not null,
+                payload text not null,
+                status text not null,
+                foreign key(turn_id) references turns(turn_id)
+            );
+            insert into threads(thread_id, model, cwd, status) values
+                ('thread_a', null, null, '"active"'),
+                ('thread_b', null, null, '"active"');
+            insert into turns(turn_id, thread_id, status, agent_loop_status) values
+                ('turn_a_1', 'thread_a', '"completed"', 'completed'),
+                ('turn_b_1', 'thread_b', '"completed"', 'completed'),
+                ('turn_a_2', 'thread_a', '"completed"', 'completed');
+            insert into items(item_id, turn_id, kind, payload, status) values
+                ('item_a_1_user', 'turn_a_1', '"userMessage"', '[{"type":"text","text":"a1"}]', '"completed"'),
+                ('item_b_1_user', 'turn_b_1', '"userMessage"', '[{"type":"text","text":"b1"}]', '"completed"'),
+                ('item_a_1_agent', 'turn_a_1', '"agentMessage"', '{"delta":"a1 reply"}', '"completed"'),
+                ('item_a_2_user', 'turn_a_2', '"userMessage"', '[{"type":"text","text":"a2"}]', '"completed"');
+            "#,
+        )
+        .expect("create v5 schema");
+}
+
+type HistorySequences = (Vec<(String, u64)>, Vec<(String, u64, bool)>);
+
+fn read_history_sequences(path: &std::path::Path) -> HistorySequences {
+    let connection = rusqlite::Connection::open(path).expect("open sqlite");
+    let turns = connection
+        .prepare("select turn_id, turn_sequence from turns order by thread_id, turn_sequence")
+        .expect("prepare turns")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query turns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect turns");
+    let items = connection
+        .prepare(
+            "select item_id, item_sequence, redacted from items order by turn_id, item_sequence",
+        )
+        .expect("prepare items")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query items")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect items");
+    (turns, items)
 }
